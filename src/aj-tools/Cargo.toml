@@ -1,12 +1,11 @@
 [package]
-name = "aj"
-version = { workspace = true }
-edition = { workspace = true }
+name = "aj-tools"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-aj-agent = { path = "../aj-agent/" }
-aj-tools = { path = "../aj-tools/" }
 anthropic-sdk = { path = "../anthropic-sdk/" }
+
 anyhow = { workspace = true }
 dotenv = { workspace = true }
 futures = { workspace = true }

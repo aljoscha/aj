@@ -1,0 +1,16 @@
+[package]
+name = "aj-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+anthropic-sdk = { path = "../anthropic-sdk" }
+aj-tools = { path = "../aj-tools" }
+futures = { workspace = true }
+nu-ansi-term = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
