@@ -549,6 +549,10 @@ pub struct MessageDelta {
 pub enum ContentBlockDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
 }
