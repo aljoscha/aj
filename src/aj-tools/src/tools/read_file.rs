@@ -1,6 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::{fs, path::Path};
 
 use crate::{SessionState, ToolDefinition, TurnState};
 
@@ -14,7 +14,7 @@ impl ToolDefinition for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the contents of a file from the working directory with line numbers. Supports optional offset (line to start from) and limit (number of lines to read) parameters."
+        "Read the contents of a file with line numbers. Requires an absolute path. Supports optional offset (line to start from) and limit (number of lines to read) parameters."
     }
 
     fn execute(
@@ -23,6 +23,14 @@ impl ToolDefinition for ReadFileTool {
         _turn_state: &dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
+        let path = Path::new(&input.path);
+        if !path.is_absolute() {
+            return Err(anyhow::anyhow!(
+                "Path must be absolute, got: {}",
+                input.path
+            ));
+        }
+
         let content = fs::read_to_string(&input.path)
             .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", input.path, e))?;
 
@@ -53,7 +61,7 @@ impl ToolDefinition for ReadFileTool {
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
 pub struct ReadFileInput {
-    /// The relative path of a file in the working directory.
+    /// The absolute path to the file to read.
     path: String,
     /// The line number to start reading from (1-indexed). If not provided, starts from the beginning.
     #[serde(default)]
