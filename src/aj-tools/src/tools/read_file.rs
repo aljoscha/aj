@@ -14,7 +14,7 @@ impl ToolDefinition for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the contents of a file from the working directory"
+        "Read the contents of a file from the working directory with line numbers. Supports optional offset (line to start from) and limit (number of lines to read) parameters."
     }
 
     fn execute(
@@ -26,7 +26,28 @@ impl ToolDefinition for ReadFileTool {
         let content = fs::read_to_string(&input.path)
             .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", input.path, e))?;
 
-        Ok(content)
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Calculate start and end indices
+        let start_idx = input.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
+        let end_idx = match input.limit {
+            Some(limit) => (start_idx + limit).min(lines.len()),
+            None => lines.len(),
+        };
+
+        // Ensure start_idx is within bounds
+        if start_idx >= lines.len() {
+            return Ok(String::new());
+        }
+
+        // Format lines with line numbers
+        let formatted_lines: Vec<String> = lines[start_idx..end_idx]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:5}→{}", start_idx + i + 1, line))
+            .collect();
+
+        Ok(formatted_lines.join("\n"))
     }
 }
 
@@ -34,4 +55,10 @@ impl ToolDefinition for ReadFileTool {
 pub struct ReadFileInput {
     /// The relative path of a file in the working directory.
     path: String,
+    /// The line number to start reading from (1-indexed). If not provided, starts from the beginning.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// The number of lines to read. If not provided, reads all lines from offset to end.
+    #[serde(default)]
+    limit: Option<usize>,
 }
