@@ -181,7 +181,10 @@ impl<U: GetUserMessage> Agent<U> {
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
             system: Some(self.assemble_system_prompt()),
-            max_tokens: 1024,
+            // thinking: Some(anthropic_sdk::messages::Thinking::Enabled {
+            //     budget_tokens: 10_000,
+            // }),
+            max_tokens: 32_000,
             messages: conversation,
             tools: self.tools.clone(),
             ..Default::default()
@@ -198,7 +201,10 @@ impl<U: GetUserMessage> Agent<U> {
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
             system: Some(self.assemble_system_prompt()),
-            max_tokens: 1024,
+            // thinking: Some(anthropic_sdk::messages::Thinking::Enabled {
+            //     budget_tokens: 10_000,
+            // }),
+            max_tokens: 32_000,
             messages: conversation,
             tools: self.tools.clone(),
             ..Default::default()
