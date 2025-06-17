@@ -3,8 +3,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::pin::pin;
 
+use anyhow::anyhow;
 use futures::{Stream, StreamExt};
-use nu_ansi_term::Color::{Blue, Green, Yellow};
+use nu_ansi_term::Color::{Blue, Green, Red, Yellow};
 
 use aj_conf::AgentEnv;
 use aj_tools::{
@@ -156,7 +157,22 @@ impl<U: GetUserMessage> Agent<U> {
                     let tool_result =
                         self.execute_tool(&tool_id, &tool_name, tool_input, &mut turn_state);
 
-                    tool_result_contents.push(tool_result);
+                    let (result_content, is_error) = match tool_result {
+                        Ok(result) => (result, false),
+                        Err(err) => {
+                            println!("{}: {:?}", Red.paint("tool_error"), err);
+                            (format!("{}", err), true)
+                        }
+                    };
+
+                    let result_content_block = ContentBlockParam::ToolResultBlock {
+                        tool_use_id: tool_id.to_owned(),
+                        content: result_content,
+                        is_error,
+                        cache_control: None,
+                    };
+
+                    tool_result_contents.push(result_content_block);
                 }
 
                 if tool_result_contents.len() > 0 {
@@ -230,30 +246,15 @@ impl<U: GetUserMessage> Agent<U> {
         tool_name: &str,
         tool_input: serde_json::Value,
         turn_state: &mut dyn ToolTurnState,
-    ) -> ContentBlockParam {
+    ) -> Result<String, anyhow::Error> {
         let tool_def = if let Some(tool_def) = self.tool_definitions.get(tool_name) {
             tool_def
         } else {
-            return ContentBlockParam::ToolResultBlock {
-                tool_use_id: tool_id.to_owned(),
-                content: "tool not found".to_string(),
-                is_error: true,
-                cache_control: None,
-            };
+            return Err(anyhow!("tool not found!"));
         };
+
         let tool_result = (tool_def.func)(&mut self.session_state, turn_state, tool_input);
-
-        let (result_content, is_error) = match tool_result {
-            Ok(result) => (result, false),
-            Err(err) => (format!("error executing tool: {}", err), true),
-        };
-
-        ContentBlockParam::ToolResultBlock {
-            tool_use_id: tool_id.to_owned(),
-            content: result_content,
-            is_error,
-            cache_control: None,
-        }
+        tool_result
     }
 }
 
