@@ -6,25 +6,28 @@ use std::pin::pin;
 use futures::{Stream, StreamExt};
 use nu_ansi_term::Color::{Blue, Green, Yellow};
 
-use aj_tools::{ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState};
+use aj_conf::AgentEnv;
+use aj_tools::{
+    ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState,
+};
 use anthropic_sdk::messages::{
     ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, StreamingEvent, Tool,
 };
 
 pub struct Agent<U: GetUserMessage> {
-    client: anthropic_sdk::client::Client,
+    env: AgentEnv,
     get_user_message: U,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
+    client: anthropic_sdk::client::Client,
     session_state: SessionState,
     turn_counter: usize,
 }
 
 impl<U: GetUserMessage> Agent<U> {
-    pub fn new(get_user_message: U, tools: Vec<ErasedToolDefinition>) -> Self {
+    pub fn new(env: AgentEnv, tools: Vec<ErasedToolDefinition>, get_user_message: U) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
         let client = anthropic_sdk::client::Client::new(api_key.clone());
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         // Convert ErasedToolDefinition to Tool for Anthropic API
         let api_tools: Vec<Tool> = tools
@@ -49,8 +52,9 @@ impl<U: GetUserMessage> Agent<U> {
             get_user_message,
             tool_definitions,
             tools: api_tools,
-            session_state: SessionState::new(workspace_root),
+            session_state: SessionState::new(env.working_directory.clone()),
             turn_counter: 0,
+            env,
         }
     }
 

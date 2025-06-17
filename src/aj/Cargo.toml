@@ -5,6 +5,7 @@ edition = { workspace = true }
 
 [dependencies]
 aj-agent = { path = "../aj-agent/" }
+aj-conf = { path = "../aj-conf/" }
 aj-tools = { path = "../aj-tools/" }
 anthropic-sdk = { path = "../anthropic-sdk/" }
 anyhow = { workspace = true }

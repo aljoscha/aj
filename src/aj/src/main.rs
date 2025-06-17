@@ -2,6 +2,7 @@ use nu_ansi_term::Color::Red;
 use tracing_subscriber::EnvFilter;
 
 use aj_agent::{Agent, StdinUserMessage};
+use aj_conf::AgentEnv;
 use aj_tools::get_builtin_tools;
 
 /// A harness that's setting up our logging and environment variables and calls
@@ -23,7 +24,8 @@ async fn main() {
 }
 
 async fn run() -> Result<(), anyhow::Error> {
-    let mut agent = Agent::new(StdinUserMessage, get_builtin_tools());
+    let env = AgentEnv::new();
+    let mut agent = Agent::new(env, get_builtin_tools(), StdinUserMessage);
 
     agent.run().await?;
 

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = { workspace = true }
 anthropic-sdk = { path = "../anthropic-sdk" }
+aj-conf = { path = "../aj-conf" }
 aj-tools = { path = "../aj-tools" }
 futures = { workspace = true }
 nu-ansi-term = { workspace = true }
