@@ -1,5 +1,7 @@
 //! Framework and implementations for builtin tools.
 
+use std::path::PathBuf;
+
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -61,7 +63,9 @@ impl<T: ToolDefinition + 'static> From<T> for ErasedToolDefinition {
 }
 
 /// Access to state that is scoped to one agent session or thread.
-pub trait SessionState {}
+pub trait SessionState {
+    fn working_directory(&self) -> PathBuf;
+}
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
 /// a turn.

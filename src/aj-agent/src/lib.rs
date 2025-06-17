@@ -283,16 +283,20 @@ impl GetUserMessage for StdinUserMessage {
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
-    pub workspace_root: PathBuf,
+    pub working_directory: PathBuf,
 }
 
 impl SessionState {
-    pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+    pub fn new(working_directory: PathBuf) -> Self {
+        Self { working_directory }
     }
 }
 
-impl ToolSessionState for SessionState {}
+impl ToolSessionState for SessionState {
+    fn working_directory(&self) -> PathBuf {
+        self.working_directory.to_owned()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TurnState {
