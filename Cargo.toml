@@ -2,6 +2,7 @@
 members = [
     "src/aj",
     "src/aj-agent",
+    "src/aj-conf",
     "src/aj-tools",
     "src/anthropic-sdk",
 ]
