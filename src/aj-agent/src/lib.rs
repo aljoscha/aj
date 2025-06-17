@@ -16,6 +16,7 @@ use anthropic_sdk::messages::{
 
 pub struct Agent<U: GetUserMessage> {
     env: AgentEnv,
+    system_prompt: &'static str,
     get_user_message: U,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
@@ -25,7 +26,12 @@ pub struct Agent<U: GetUserMessage> {
 }
 
 impl<U: GetUserMessage> Agent<U> {
-    pub fn new(env: AgentEnv, tools: Vec<ErasedToolDefinition>, get_user_message: U) -> Self {
+    pub fn new(
+        env: AgentEnv,
+        system_prompt: &'static str,
+        tools: Vec<ErasedToolDefinition>,
+        get_user_message: U,
+    ) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
         let client = anthropic_sdk::client::Client::new(api_key.clone());
 
@@ -48,13 +54,14 @@ impl<U: GetUserMessage> Agent<U> {
             .collect();
 
         Self {
-            client,
+            system_prompt,
             get_user_message,
             tool_definitions,
             tools: api_tools,
+            client,
             session_state: SessionState::new(env.working_directory.clone()),
-            turn_counter: 0,
             env,
+            turn_counter: 0,
         }
     }
 
@@ -173,6 +180,7 @@ impl<U: GetUserMessage> Agent<U> {
     ) -> Result<Message, anyhow::Error> {
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
+            system: Some(self.assemble_system_prompt()),
             max_tokens: 1024,
             messages: conversation,
             tools: self.tools.clone(),
@@ -189,6 +197,7 @@ impl<U: GetUserMessage> Agent<U> {
     ) -> Result<impl Stream<Item = StreamingEvent> + use<'_, U>, anyhow::Error> {
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
+            system: Some(self.assemble_system_prompt()),
             max_tokens: 1024,
             messages: conversation,
             tools: self.tools.clone(),
@@ -197,6 +206,16 @@ impl<U: GetUserMessage> Agent<U> {
         let response = self.client.messages_stream(messages).await?;
 
         Ok(response)
+    }
+
+    /// Assemble the system prompt we pass to the model from the actual system
+    /// prompt and additional information we might want or need, such as
+    /// information about the environment.
+    fn assemble_system_prompt(&self) -> String {
+        format!(
+            "{}\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
+            self.system_prompt, self.env
+        )
     }
 
     fn execute_tool(
