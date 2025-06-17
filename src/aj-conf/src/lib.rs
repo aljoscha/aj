@@ -8,6 +8,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
+
 /// The working environment of the agent, includes configuration, the system
 /// prompt, working directories, etc.
 #[derive(Debug, Clone)]
