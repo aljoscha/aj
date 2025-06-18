@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -528,6 +530,12 @@ pub struct Container {
 pub struct ApiError {
     pub r#type: String,
     pub message: String,
+}
+
+impl Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "API error ({}): {}", self.r#type, self.message)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

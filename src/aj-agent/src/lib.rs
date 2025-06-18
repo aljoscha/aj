@@ -122,7 +122,7 @@ impl<U: GetUserMessage> Agent<U> {
                         StreamingEvent::FinalizedMessage { message } => {
                             response = Some(message);
                         }
-                        StreamingEvent::Error { error } => return Err(anyhow!(error.message)),
+                        StreamingEvent::Error { error } => return Err(anyhow!("{}", error)),
                         StreamingEvent::TextStart { text } => {
                             print!("{}: {}", Yellow.paint("aj"), text);
                         }
