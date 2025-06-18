@@ -14,6 +14,7 @@ pub use tools::glob::GlobTool;
 pub use tools::grep::GrepTool;
 pub use tools::ls::LsTool;
 pub use tools::read_file::ReadFileTool;
+pub use tools::write_file::WriteFileTool;
 use util::derive_schema;
 
 /// A builtin tool that can be used by the agent.
@@ -80,6 +81,7 @@ pub trait TurnState {}
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
         ReadFileTool.into(),
+        WriteFileTool.into(),
         LsTool.into(),
         GlobTool.into(),
         GrepTool.into(),
