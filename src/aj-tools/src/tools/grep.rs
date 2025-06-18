@@ -28,11 +28,11 @@ pub struct GrepTool;
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
 pub struct GrepInput {
     /// The absolute path to start the recursive search from.
-    path: String,
+    pub path: String,
     /// File patterns to include in the search (e.g., "*.rs" or "*.{rs,toml}").
-    include: String,
+    pub include: String,
     /// The regular expression to use for searching.
-    pattern: String,
+    pub pattern: String,
 }
 
 impl ToolDefinition for GrepTool {

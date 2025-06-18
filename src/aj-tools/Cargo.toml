@@ -3,6 +3,14 @@ name = "aj-tools"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "glob"
+path = "src/bin/glob.rs"
+
+[[bin]]
+name = "grep"
+path = "src/bin/grep.rs"
+
 [dependencies]
 anthropic-sdk = { path = "../anthropic-sdk/" }
 

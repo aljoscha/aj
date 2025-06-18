@@ -25,9 +25,9 @@ pub struct GlobTool;
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
 pub struct GlobInput {
     /// The absolute path to start the recursive search from.
-    path: String,
+    pub path: String,
     /// The glob pattern to match against relative paths from the starting directory.
-    pattern: String,
+    pub pattern: String,
 }
 
 impl ToolDefinition for GlobTool {
