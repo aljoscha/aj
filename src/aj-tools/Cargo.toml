@@ -11,8 +11,10 @@ chrono = { workspace = true }
 dotenv = { workspace = true }
 futures = { workspace = true }
 globset = { workspace = true }
+grep = { workspace = true }
 itertools = { workspace = true }
 nu-ansi-term = { workspace = true }
+regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
