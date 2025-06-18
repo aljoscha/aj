@@ -9,6 +9,7 @@ anthropic-sdk = { path = "../anthropic-sdk/" }
 anyhow = { workspace = true }
 dotenv = { workspace = true }
 futures = { workspace = true }
+globset = { workspace = true }
 itertools = { workspace = true }
 nu-ansi-term = { workspace = true }
 schemars = { workspace = true }

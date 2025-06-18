@@ -9,6 +9,7 @@ use serde_json::Value;
 pub mod tools;
 mod util;
 
+pub use tools::ls::LsTool;
 pub use tools::read_file::ReadFileTool;
 use util::derive_schema;
 
@@ -72,5 +73,5 @@ pub trait SessionState {
 pub trait TurnState {}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
-    vec![ReadFileTool.into()]
+    vec![ReadFileTool.into(), LsTool.into()]
 }

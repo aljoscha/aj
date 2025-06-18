@@ -19,6 +19,7 @@ async-stream = "0.3.6"
 dotenv = "0.15.0"
 eventsource-stream = "0.2"
 futures = "0.3"
+globset = "0.4"
 itertools = "0.14.0"
 nu-ansi-term = "0.46"
 reqwest = { version = "0.12", features = ["json", "stream"] }
