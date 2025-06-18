@@ -43,7 +43,7 @@ impl ToolDefinition for ReadFileTool {
 
     fn execute(
         &self,
-        _session_state: &mut dyn SessionState,
+        session_state: &mut dyn SessionState,
         _turn_state: &dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
@@ -78,6 +78,8 @@ impl ToolDefinition for ReadFileTool {
             .enumerate()
             .map(|(i, line)| format!("{:5}→{}", start_idx + i + 1, line))
             .collect();
+
+        session_state.record_file_access(path.to_path_buf());
 
         Ok(formatted_lines.join("\n"))
     }

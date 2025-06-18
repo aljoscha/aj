@@ -1,6 +1,7 @@
 //! Framework and implementations for builtin tools.
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -68,6 +69,8 @@ impl<T: ToolDefinition + 'static> From<T> for ErasedToolDefinition {
 /// Access to state that is scoped to one agent session or thread.
 pub trait SessionState {
     fn working_directory(&self) -> PathBuf;
+    fn record_file_access(&mut self, path: PathBuf);
+    fn get_file_access_time(&self, path: &PathBuf) -> Option<SystemTime>;
 }
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
@@ -75,5 +78,10 @@ pub trait SessionState {
 pub trait TurnState {}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
-    vec![ReadFileTool.into(), LsTool.into(), GlobTool.into(), GrepTool.into()]
+    vec![
+        ReadFileTool.into(),
+        LsTool.into(),
+        GlobTool.into(),
+        GrepTool.into(),
+    ]
 }

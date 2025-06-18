@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::time::SystemTime;
 
 use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
@@ -289,17 +290,29 @@ impl GetUserMessage for StdinUserMessage {
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub working_directory: PathBuf,
+    pub accessed_files: HashMap<PathBuf, SystemTime>,
 }
 
 impl SessionState {
     pub fn new(working_directory: PathBuf) -> Self {
-        Self { working_directory }
+        Self {
+            working_directory,
+            accessed_files: HashMap::new(),
+        }
     }
 }
 
 impl ToolSessionState for SessionState {
     fn working_directory(&self) -> PathBuf {
         self.working_directory.to_owned()
+    }
+
+    fn record_file_access(&mut self, path: PathBuf) {
+        self.accessed_files.insert(path, SystemTime::now());
+    }
+
+    fn get_file_access_time(&self, path: &PathBuf) -> Option<SystemTime> {
+        self.accessed_files.get(path).copied()
     }
 }
 

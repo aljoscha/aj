@@ -2,11 +2,20 @@ use aj_tools::tools::grep::{GrepInput, GrepTool};
 use aj_tools::{SessionState, ToolDefinition, TurnState};
 use std::env;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 struct DummySessionState;
 impl SessionState for DummySessionState {
     fn working_directory(&self) -> PathBuf {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    fn record_file_access(&mut self, _path: PathBuf) {
+        // No-op for test binary
+    }
+
+    fn get_file_access_time(&self, _path: &PathBuf) -> Option<SystemTime> {
+        None
     }
 }
 
