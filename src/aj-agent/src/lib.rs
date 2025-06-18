@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::pin::pin;
 
+use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use nu_ansi_term::Color::{Blue, Green, Red, Yellow};
@@ -12,7 +13,7 @@ use aj_tools::{
     ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState,
 };
 use anthropic_sdk::messages::{
-    ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, StreamingEvent, Tool,
+    ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
 };
 
 pub struct Agent<U: GetUserMessage> {

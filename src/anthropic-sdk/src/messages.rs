@@ -479,6 +479,35 @@ pub struct Usage {
     service_tier: Option<ServiceTier>,
 }
 
+impl Usage {
+    pub fn update(&mut self, delta: &UsageDelta) {
+        // TODO: most of these would also have to be accumulated, but we only
+        // care about input/output tokens right now. Pluswhich, we currently
+        // don't even look into most of these and treat them as opaque.
+        if let Some(cache_creation) = delta.cache_creation.as_ref() {
+            self.cache_creation = Some(cache_creation.clone());
+        }
+        if let Some(cache_creation_input_tokens) = delta.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = Some(cache_creation_input_tokens);
+        }
+        if let Some(cache_read_input_tokens) = delta.cache_read_input_tokens {
+            self.cache_read_input_tokens = Some(cache_read_input_tokens);
+        }
+        if let Some(input_tokens) = delta.input_tokens {
+            self.input_tokens += input_tokens;
+        }
+        if let Some(output_tokens) = delta.output_tokens {
+            self.output_tokens += output_tokens;
+        }
+        if let Some(server_tool_use) = delta.server_tool_use.as_ref() {
+            self.server_tool_use = Some(server_tool_use.clone());
+        }
+        if let Some(service_tier) = delta.service_tier.as_ref() {
+            self.service_tier = Some(service_tier.clone());
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServiceTier {
     #[serde(rename = "standard")]
@@ -508,7 +537,7 @@ pub struct ApiErrorResponse {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
-pub enum StreamingEvent {
+pub enum ServerSentEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: Message },
     #[serde(rename = "message_delta")]

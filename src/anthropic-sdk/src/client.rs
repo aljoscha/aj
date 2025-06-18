@@ -6,7 +6,8 @@ use futures::{Stream, StreamExt};
 use reqwest;
 use reqwest::{Client as ReqwestClient, StatusCode};
 
-use crate::messages::{ApiErrorResponse, Message, Messages, StreamingEvent};
+use crate::messages::{ApiErrorResponse, Message, Messages, ServerSentEvent};
+use crate::streaming::{StreamProcessor, StreamingEvent};
 
 pub struct Client {
     client: ReqwestClient,
@@ -69,10 +70,10 @@ impl Client {
         }
     }
 
-    pub async fn messages_stream(
+    pub async fn messages_stream_raw(
         &self,
         mut messages: Messages,
-    ) -> Result<impl Stream<Item = StreamingEvent>, anyhow::Error> {
+    ) -> Result<impl Stream<Item = ServerSentEvent>, anyhow::Error> {
         messages.stream = Some(true);
 
         let request_builder = self
@@ -93,7 +94,7 @@ impl Client {
                 let stream = response.bytes_stream().eventsource();
 
                 let stream = stream.map(|event| match event {
-                    Ok(event) => match serde_json::from_str::<StreamingEvent>(&event.data) {
+                    Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
                         Ok(json_event) => json_event,
                         Err(err) => {
                             panic!("could not parse event {}: {}", event.data, err);
@@ -120,6 +121,33 @@ impl Client {
             _ => {
                 let error_message = format!("unexpected status code: {:?}", response.text().await?);
                 Err(anyhow!(error_message))
+            }
+        }
+    }
+
+    pub async fn messages_stream(
+        &self,
+        messages: Messages,
+    ) -> Result<impl Stream<Item = StreamingEvent>, anyhow::Error> {
+        let stream = self.messages_stream_raw(messages).await?;
+        Ok(create_high_level_stream(stream))
+    }
+}
+
+// Helper function to create a high-level stream
+fn create_high_level_stream<S>(stream: S) -> impl Stream<Item = StreamingEvent>
+where
+    S: Stream<Item = ServerSentEvent>,
+{
+    use async_stream::stream;
+
+    stream! {
+        let mut processor = StreamProcessor::new();
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(event) = futures::StreamExt::next(&mut stream).await {
+            if let Some(high_level_event) = processor.process_event(event) {
+                yield high_level_event;
             }
         }
     }
