@@ -1,5 +1,3 @@
-use core::panic;
-
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
@@ -93,15 +91,23 @@ impl Client {
             StatusCode::OK => {
                 let stream = response.bytes_stream().eventsource();
 
-                let stream = stream.map(|event| match event {
-                    Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
-                        Ok(json_event) => json_event,
-                        Err(err) => {
-                            panic!("could not parse event {}: {}", event.data, err);
+                let stream = stream.filter_map(|event| async move {
+                    match event {
+                        Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
+                            Ok(json_event) => Some(json_event),
+                            Err(err) => {
+                                tracing::error!(
+                                    "could not parse server-sent event {}: {}",
+                                    event.data,
+                                    err
+                                );
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!("event-stream error: {e}");
+                            None
                         }
-                    },
-                    Err(e) => {
-                        panic!("event-stream error: {e}");
                     }
                 });
                 Ok(stream)

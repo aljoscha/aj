@@ -145,6 +145,12 @@ impl<U: GetUserMessage> Agent<U> {
                         StreamingEvent::ThinkingStop => {
                             println!()
                         }
+                        StreamingEvent::ParseError { error, raw_data } => {
+                            eprintln!("Parse error: {} (raw data: {})", error, raw_data);
+                        }
+                        StreamingEvent::ProtocolError { error } => {
+                            eprintln!("Protocol error: {}", error);
+                        }
                     }
                 }
             }

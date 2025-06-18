@@ -22,6 +22,8 @@ pub enum StreamingEvent {
     ThinkingStart { thinking: String },
     ThinkingUpdate { diff: String, snapshot: String },
     ThinkingStop,
+    ParseError { error: String, raw_data: String },
+    ProtocolError { error: String },
 }
 
 #[derive(Debug)]
@@ -63,17 +65,23 @@ impl StreamProcessor {
         match event {
             ServerSentEvent::MessageStart { message } => {
                 let prev = self.current_message.replace(message.clone());
-                assert!(
-                    prev.is_none(),
-                    "got new message start while we're already assembling a message"
-                );
+                if prev.is_some() {
+                    return Some(StreamingEvent::ProtocolError {
+                        error: "got new message start while we're already assembling a message"
+                            .to_string(),
+                    });
+                }
                 Some(StreamingEvent::MessageStart { message })
             }
             ServerSentEvent::MessageDelta { delta, usage } => {
-                let message = self
-                    .current_message
-                    .as_mut()
-                    .expect("got message delta but don't have a current message");
+                let message = match self.current_message.as_mut() {
+                    Some(msg) => msg,
+                    None => {
+                        return Some(StreamingEvent::ProtocolError {
+                            error: "got message delta but don't have a current message".to_string(),
+                        });
+                    }
+                };
 
                 message.stop_reason = delta.stop_reason;
                 message.stop_sequence = delta.stop_sequence;
@@ -83,10 +91,14 @@ impl StreamProcessor {
                 Some(StreamingEvent::UsageUpdate { usage })
             }
             ServerSentEvent::MessageStop => {
-                let message = self
-                    .current_message
-                    .take()
-                    .expect("got message stop but don't have a current message");
+                let message = match self.current_message.take() {
+                    Some(msg) => msg,
+                    None => {
+                        return Some(StreamingEvent::ProtocolError {
+                            error: "got message stop but don't have a current message".to_string(),
+                        });
+                    }
+                };
                 Some(StreamingEvent::FinalizedMessage { message })
             }
             ServerSentEvent::Ping => {
@@ -100,10 +112,11 @@ impl StreamProcessor {
                 content_block,
             } => {
                 let prev = self.current_content_block.replace(content_block.clone());
-                assert!(
-                    prev.is_none(),
-                    "got new content block start while we're already assembling a content block"
-                );
+                if prev.is_some() {
+                    return Some(StreamingEvent::ProtocolError {
+                        error: "got new content block start while we're already assembling a content block".to_string(),
+                    });
+                }
                 match content_block {
                     ContentBlock::TextBlock { text } => Some(StreamingEvent::TextStart { text }),
                     ContentBlock::ThinkingBlock { thinking, .. } => {
@@ -117,30 +130,45 @@ impl StreamProcessor {
             }
 
             ServerSentEvent::ContentBlockDelta { index, delta } => {
-                let content_block = self
-                    .current_content_block
-                    .as_mut()
-                    .expect("got content block delta but don't have a current content block");
+                let content_block = match self.current_content_block.as_mut() {
+                    Some(block) => block,
+                    None => {
+                        return Some(StreamingEvent::ProtocolError {
+                            error: "got content block delta but don't have a current content block"
+                                .to_string(),
+                        });
+                    }
+                };
 
-                let current_message = self
-                    .current_message
-                    .as_ref()
-                    .expect("got content block delta but don't have a current message");
+                let current_message = match self.current_message.as_ref() {
+                    Some(msg) => msg,
+                    None => {
+                        return Some(StreamingEvent::ProtocolError {
+                            error: "got content block delta but don't have a current message"
+                                .to_string(),
+                        });
+                    }
+                };
 
-                assert!(
-                    current_message.content.len() == index as usize,
-                    "got
-                content block delta for index {} but current message has {}
-                content blocks",
-                    index,
-                    current_message.content.len()
-                );
+                if current_message.content.len() != index as usize {
+                    return Some(StreamingEvent::ProtocolError {
+                        error: format!(
+                            "got content block delta for index {} but current message has {} content blocks",
+                            index,
+                            current_message.content.len()
+                        ),
+                    });
+                }
 
                 match delta {
                     ContentBlockDelta::TextDelta { text } => {
                         let current_text = match content_block {
                             ContentBlock::TextBlock { text } => text,
-                            _ => panic!("got text delta for non-text content block"),
+                            _ => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got text delta for non-text content block".to_string(),
+                                });
+                            }
                         };
                         current_text.push_str(&text);
                         Some(StreamingEvent::TextUpdate {
@@ -151,7 +179,12 @@ impl StreamProcessor {
                     ContentBlockDelta::ThinkingDelta { thinking } => {
                         let current_thinking = match content_block {
                             ContentBlock::ThinkingBlock { thinking, .. } => thinking,
-                            _ => panic!("got thinking delta for non-thinking content block"),
+                            _ => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got thinking delta for non-thinking content block"
+                                        .to_string(),
+                                });
+                            }
                         };
                         current_thinking.push_str(&thinking);
                         Some(StreamingEvent::ThinkingUpdate {
@@ -162,16 +195,26 @@ impl StreamProcessor {
                     ContentBlockDelta::SignatureDelta { signature } => {
                         let current_signature = match content_block {
                             ContentBlock::ThinkingBlock { signature, .. } => signature,
-                            _ => panic!("got signature delta for non-thinking content block"),
+                            _ => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got signature delta for non-thinking content block"
+                                        .to_string(),
+                                });
+                            }
                         };
                         current_signature.push_str(&signature);
                         None
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        let current_json = self
-                            .current_json
-                            .as_mut()
-                            .expect("got input json delta but don't have a current json");
+                        let current_json = match self.current_json.as_mut() {
+                            Some(json) => json,
+                            None => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got input json delta but don't have a current json"
+                                        .to_string(),
+                                });
+                            }
+                        };
                         current_json.push_str(&partial_json);
                         None
                     }
@@ -179,15 +222,25 @@ impl StreamProcessor {
             }
 
             ServerSentEvent::ContentBlockStop { index: _ } => {
-                let content_block = self
-                    .current_content_block
-                    .take()
-                    .expect("got content block stop but don't have a current content block");
+                let content_block = match self.current_content_block.take() {
+                    Some(block) => block,
+                    None => {
+                        return Some(StreamingEvent::ProtocolError {
+                            error: "got content block stop but don't have a current content block"
+                                .to_string(),
+                        });
+                    }
+                };
 
-                let current_message = self
-                    .current_message
-                    .as_mut()
-                    .expect("got content block stop but don't have a current message");
+                let current_message = match self.current_message.as_mut() {
+                    Some(msg) => msg,
+                    None => {
+                        return Some(StreamingEvent::ProtocolError {
+                            error: "got content block stop but don't have a current message"
+                                .to_string(),
+                        });
+                    }
+                };
 
                 match content_block {
                     text_block @ ContentBlock::TextBlock { .. } => {
@@ -199,12 +252,23 @@ impl StreamProcessor {
                         Some(StreamingEvent::ThinkingStop)
                     }
                     ContentBlock::ToolUseBlock { id, name, input: _ } => {
-                        let input_json = self
-                            .current_json
-                            .take()
-                            .expect("got tool use but don't have a current json");
-                        let input = serde_json::from_str(&input_json)
-                            .expect("failed to parse tool use input json");
+                        let input_json = match self.current_json.take() {
+                            Some(json) => json,
+                            None => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got tool use but don't have a current json".to_string(),
+                                });
+                            }
+                        };
+                        let input = match serde_json::from_str(&input_json) {
+                            Ok(input) => input,
+                            Err(e) => {
+                                return Some(StreamingEvent::ParseError {
+                                    error: format!("failed to parse tool use input json: {}", e),
+                                    raw_data: input_json,
+                                });
+                            }
+                        };
                         current_message.content.push(ContentBlock::ToolUseBlock {
                             id,
                             name,
@@ -213,12 +277,27 @@ impl StreamProcessor {
                         None
                     }
                     ContentBlock::ServerToolUseBlock { id, name, input: _ } => {
-                        let input_json = self
-                            .current_json
-                            .take()
-                            .expect("got server tool use but don't have a current json");
-                        let input = serde_json::from_str(&input_json)
-                            .expect("failed to parse server tool use input json");
+                        let input_json = match self.current_json.take() {
+                            Some(json) => json,
+                            None => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got server tool use but don't have a current json"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        let input = match serde_json::from_str(&input_json) {
+                            Ok(input) => input,
+                            Err(e) => {
+                                return Some(StreamingEvent::ParseError {
+                                    error: format!(
+                                        "failed to parse server tool use input json: {}",
+                                        e
+                                    ),
+                                    raw_data: input_json,
+                                });
+                            }
+                        };
                         current_message
                             .content
                             .push(ContentBlock::ServerToolUseBlock { id, name, input });
@@ -230,12 +309,27 @@ impl StreamProcessor {
                         server_name,
                         input: _,
                     } => {
-                        let input_json = self
-                            .current_json
-                            .take()
-                            .expect("got mcp tool use but don't have a current json");
-                        let input = serde_json::from_str(&input_json)
-                            .expect("failed to parse mcp tool use input json");
+                        let input_json = match self.current_json.take() {
+                            Some(json) => json,
+                            None => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got mcp tool use but don't have a current json"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        let input = match serde_json::from_str(&input_json) {
+                            Ok(input) => input,
+                            Err(e) => {
+                                return Some(StreamingEvent::ParseError {
+                                    error: format!(
+                                        "failed to parse mcp tool use input json: {}",
+                                        e
+                                    ),
+                                    raw_data: input_json,
+                                });
+                            }
+                        };
                         current_message.content.push(ContentBlock::MCPToolUseBlock {
                             id,
                             name,
