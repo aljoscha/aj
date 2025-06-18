@@ -10,6 +10,7 @@ use serde_json::Value;
 pub mod tools;
 mod util;
 
+pub use tools::edit_file::EditFileTool;
 pub use tools::glob::GlobTool;
 pub use tools::grep::GrepTool;
 pub use tools::ls::LsTool;
@@ -32,7 +33,7 @@ pub trait ToolDefinition {
     fn execute(
         &self,
         session_state: &mut dyn SessionState,
-        turn_state: &dyn TurnState,
+        turn_state: &mut dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error>;
 
@@ -49,8 +50,9 @@ pub struct ErasedToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-    pub func:
-        Box<dyn Fn(&mut dyn SessionState, &dyn TurnState, Value) -> Result<String, anyhow::Error>>,
+    pub func: Box<
+        dyn Fn(&mut dyn SessionState, &mut dyn TurnState, Value) -> Result<String, anyhow::Error>,
+    >,
 }
 
 impl<T: ToolDefinition + 'static> From<T> for ErasedToolDefinition {
@@ -76,12 +78,24 @@ pub trait SessionState {
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
 /// a turn.
-pub trait TurnState {}
+pub trait TurnState {
+    /// Get the staged content of a file, or None if not staged.
+    fn get_staged_file_content(&self, path: &std::path::PathBuf) -> Option<&String>;
+
+    /// Stage a file modification for later application.
+    fn stage_file_modification(
+        &mut self,
+        path: std::path::PathBuf,
+        original_content: Option<String>,
+        new_content: String,
+    );
+}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
         ReadFileTool.into(),
         WriteFileTool.into(),
+        EditFileTool.into(),
         LsTool.into(),
         GlobTool.into(),
         GrepTool.into(),

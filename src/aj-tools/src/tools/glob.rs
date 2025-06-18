@@ -44,7 +44,7 @@ impl ToolDefinition for GlobTool {
     fn execute(
         &self,
         _session_state: &mut dyn SessionState,
-        _turn_state: &dyn TurnState,
+        _turn_state: &mut dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         let path = Path::new(&input.path);

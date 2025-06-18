@@ -20,11 +20,24 @@ impl SessionState for DummySessionState {
 }
 
 struct DummyTurnState;
-impl TurnState for DummyTurnState {}
+impl TurnState for DummyTurnState {
+    fn get_staged_file_content(&self, _path: &std::path::PathBuf) -> Option<&String> {
+        None
+    }
+
+    fn stage_file_modification(
+        &mut self,
+        _path: std::path::PathBuf,
+        _original_content: Option<String>,
+        _new_content: String,
+    ) {
+        // No-op for standalone tool
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() != 4 {
         eprintln!("Usage: {} <path> <include> <pattern>", args[0]);
         eprintln!("  path:    Absolute path to start search from");
@@ -37,12 +50,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let include = args[2].clone();
     let pattern = args[3].clone();
 
-    let input = GrepInput { path, include: Some(include), pattern };
+    let input = GrepInput {
+        path,
+        include: Some(include),
+        pattern,
+    };
     let tool = GrepTool;
     let mut session_state = DummySessionState;
-    let turn_state = DummyTurnState;
+    let mut turn_state = DummyTurnState;
 
-    match tool.execute(&mut session_state, &turn_state, input) {
+    match tool.execute(&mut session_state, &mut turn_state, input) {
         Ok(result) => println!("{}", result),
         Err(e) => {
             eprintln!("Error: {}", e);
