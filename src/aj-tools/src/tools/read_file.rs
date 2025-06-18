@@ -4,7 +4,31 @@ use std::{fs, path::Path};
 
 use crate::{SessionState, ToolDefinition, TurnState};
 
+const DESCRIPTION: &str = r#"
+Read the contents of a file from the local file system. If a file does not exist
+an error will be returned.
+
+Usage:
+
+- The path parameter must be an absolute path
+- Results include line numbers, starting at 1
+- You can specify an offset and a limit but it's usually better to read the
+  whole file. Use this for reading very big files.
+"#;
+
 pub struct ReadFileTool;
+
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
+pub struct ReadFileInput {
+    /// The absolute path to the file to read.
+    path: String,
+    /// The line number to start reading from (1-indexed). If not provided, starts from the beginning.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// The number of lines to read. If not provided, reads all lines from offset to end.
+    #[serde(default)]
+    limit: Option<usize>,
+}
 
 impl ToolDefinition for ReadFileTool {
     type Input = ReadFileInput;
@@ -14,7 +38,7 @@ impl ToolDefinition for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the contents of a file with line numbers. Requires an absolute path. Supports optional offset (line to start from) and limit (number of lines to read) parameters."
+        DESCRIPTION
     }
 
     fn execute(
@@ -57,16 +81,4 @@ impl ToolDefinition for ReadFileTool {
 
         Ok(formatted_lines.join("\n"))
     }
-}
-
-#[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
-pub struct ReadFileInput {
-    /// The absolute path to the file to read.
-    path: String,
-    /// The line number to start reading from (1-indexed). If not provided, starts from the beginning.
-    #[serde(default)]
-    offset: Option<usize>,
-    /// The number of lines to read. If not provided, reads all lines from offset to end.
-    #[serde(default)]
-    limit: Option<usize>,
 }
