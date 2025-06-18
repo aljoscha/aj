@@ -14,6 +14,7 @@ Usage:
 - Optional ignore parameter accepts an array of glob patterns to exclude from results
 - Returns a list of entries with their type (file/directory) and size
 - Entries are sorted alphabetically
+- You should prefer the glob tool instead if you need recursive search or pattern matching
 "#;
 
 pub struct LsTool;
