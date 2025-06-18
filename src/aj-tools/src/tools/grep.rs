@@ -18,7 +18,7 @@ Usage:
 
 - The path parameter must be an absolute path to start the search from
 - The pattern parameter is the regular expression to use for searching
-- The include parameter specifies file patterns to include in the search (e.g., "*.rs" or "*.{rs,toml}")
+- The include parameter specifies file patterns to include in the search (e.g., "*.rs" or "*.{rs,toml}"). Defaults to "*" (all files) if not provided.
 - Returns a list of file paths with at least one match, including file size and modification time
 - Results are sorted by modification time (most recent first)
 "#;
@@ -29,8 +29,9 @@ pub struct GrepTool;
 pub struct GrepInput {
     /// The absolute path to start the recursive search from.
     pub path: String,
-    /// File patterns to include in the search (e.g., "*.rs" or "*.{rs,toml}").
-    pub include: String,
+    /// File patterns to include in the search (e.g., "*.rs" or "*.{rs,toml}"). Defaults to "*" if not provided.
+    #[serde(default)]
+    pub include: Option<String>,
     /// The regular expression to use for searching.
     pub pattern: String,
 }
@@ -72,8 +73,9 @@ impl ToolDefinition for GrepTool {
             .map_err(|e| anyhow::anyhow!("Invalid regex pattern '{}': {}", input.pattern, e))?;
 
         // Build glob pattern for file filtering
-        let glob = globset::Glob::new(&input.include)
-            .map_err(|e| anyhow::anyhow!("Invalid include pattern '{}': {}", input.include, e))?;
+        let include_pattern = input.include.as_deref().unwrap_or("*");
+        let glob = globset::Glob::new(include_pattern)
+            .map_err(|e| anyhow::anyhow!("Invalid include pattern '{}': {}", include_pattern, e))?;
         let mut builder = globset::GlobSetBuilder::new();
         builder.add(glob);
         let glob_set = builder
@@ -156,9 +158,10 @@ impl ToolDefinition for GrepTool {
         results.sort_by(|a, b| b.modified.cmp(&a.modified));
 
         if results.is_empty() {
+            let include_pattern = input.include.as_deref().unwrap_or("*");
             Ok(format!(
                 "No files matching pattern '{}' with include filter '{}' found.",
-                input.pattern, input.include
+                input.pattern, include_pattern
             ))
         } else {
             let formatted_results: Vec<String> = results

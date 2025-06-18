@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let include = args[2].clone();
     let pattern = args[3].clone();
 
-    let input = GrepInput { path, include, pattern };
+    let input = GrepInput { path, include: Some(include), pattern };
     let tool = GrepTool;
     let mut session_state = DummySessionState;
     let turn_state = DummyTurnState;
