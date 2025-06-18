@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
 use std::pin::pin;
 
 use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
-use nu_ansi_term::Color::{Blue, Green, Red, Yellow};
+use nu_ansi_term::Color::{Blue, DarkGray, Green, LightGray, Red, Yellow};
 
 use aj_conf::AgentEnv;
 use aj_tools::{
@@ -111,21 +110,46 @@ impl<U: GetUserMessage> Agent<U> {
                 conversation.push(user_message);
             }
 
-            // {
-            //     let response = self.run_inference_streaming(conversation.clone()).await?;
-            //
-            //     print!("{}: ", Yellow.paint("Claude"));
-            //     let mut response = pin!(response);
-            //     while let Some(response) = response.next().await {
-            //         // let response = response:
-            //         println!("{:?}", response,);
-            //     }
-            //     println!();
-            // }
+            let response_stream = self.run_inference_streaming(conversation.clone()).await?;
 
-            let response = self
-                .run_inference(conversation.clone(), &mut turn_state)
-                .await?;
+            let mut response: Option<Message> = None;
+            {
+                let mut response_stream = pin!(response_stream);
+                while let Some(event) = response_stream.next().await {
+                    match event {
+                        StreamingEvent::MessageStart { message: _ } => (),
+                        StreamingEvent::UsageUpdate { usage: _ } => (),
+                        StreamingEvent::FinalizedMessage { message } => {
+                            response = Some(message);
+                        }
+                        StreamingEvent::Error { error } => return Err(anyhow!(error.message)),
+                        StreamingEvent::TextStart { text } => {
+                            print!("{}: {}", Yellow.paint("aj"), text);
+                        }
+                        StreamingEvent::TextUpdate { diff, snapshot: _ } => {
+                            print!("{}", diff);
+                        }
+                        StreamingEvent::TextStop => {
+                            println!()
+                        }
+                        StreamingEvent::ThinkingStart { thinking } => {
+                            print!(
+                                "{}: {}",
+                                DarkGray.paint("aj is thinking"),
+                                LightGray.paint(thinking)
+                            );
+                        }
+                        StreamingEvent::ThinkingUpdate { diff, snapshot: _ } => {
+                            print!("{}", diff);
+                        }
+                        StreamingEvent::ThinkingStop => {
+                            println!()
+                        }
+                    }
+                }
+            }
+
+            let response = response.expect("missing message");
 
             // Collect tool use blocks from the response
             let mut tool_calls = Vec::new();
@@ -133,17 +157,12 @@ impl<U: GetUserMessage> Agent<U> {
 
             for content in response.content.iter() {
                 match content {
-                    ContentBlock::TextBlock { text } => {
-                        println!("{}: {}", Yellow.paint("aj"), text);
-                    }
                     ContentBlock::ToolUseBlock { id, name, input } => {
                         tool_calls.push((id.clone(), name.clone(), input.clone()));
                         has_tool_use = true;
                         println!("{}: {}({})", Green.paint("tool"), name, input,);
                     }
-                    other => {
-                        println!("{}: {:?}", Yellow.paint("aj"), other);
-                    }
+                    _ => {}
                 }
             }
 
@@ -188,27 +207,6 @@ impl<U: GetUserMessage> Agent<U> {
         }
 
         Ok(())
-    }
-
-    async fn run_inference(
-        &self,
-        conversation: Vec<MessageParam>,
-        _turn_state: &mut TurnState,
-    ) -> Result<Message, anyhow::Error> {
-        let messages = Messages {
-            model: "claude-sonnet-4-20250514".to_string(),
-            system: Some(self.assemble_system_prompt()),
-            // thinking: Some(anthropic_sdk::messages::Thinking::Enabled {
-            //     budget_tokens: 10_000,
-            // }),
-            max_tokens: 32_000,
-            messages: conversation,
-            tools: self.tools.clone(),
-            ..Default::default()
-        };
-        let response = self.client.messages(messages).await?;
-
-        Ok(response)
     }
 
     async fn run_inference_streaming(
