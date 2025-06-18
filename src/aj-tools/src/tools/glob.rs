@@ -87,6 +87,19 @@ impl ToolDefinition for GlobTool {
         for entry in WalkDir::new(&input.path) {
             let entry = entry.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
 
+            // Skip hidden directories (starting with '.')
+            if entry.file_type().is_dir() {
+                if let Some(file_name) = entry.path().file_name() {
+                    if let Some(name_str) = file_name.to_str() {
+                        // Don't exclude if this is the root directory, by
+                        // checking for depth.
+                        if name_str.starts_with('.') && entry.depth() > 0 {
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Get relative path from the starting directory
             let relative_path = entry
                 .path()

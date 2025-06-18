@@ -1,7 +1,7 @@
 use chrono::DateTime;
 use grep::regex::RegexMatcher;
-use grep::searcher::sinks::UTF8;
 use grep::searcher::SearcherBuilder;
+use grep::searcher::sinks::UTF8;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +97,19 @@ impl ToolDefinition for GrepTool {
         for entry in WalkDir::new(&input.path) {
             let entry = entry.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
 
+            // Skip hidden directories (starting with '.')
+            if entry.file_type().is_dir() {
+                if let Some(file_name) = entry.path().file_name() {
+                    if let Some(name_str) = file_name.to_str() {
+                        // Don't exclude if this is the root directory, by
+                        // checking for depth.
+                        if name_str.starts_with('.') && entry.depth() > 0 {
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Only process files
             if !entry.file_type().is_file() {
                 continue;
@@ -166,12 +179,7 @@ impl ToolDefinition for GrepTool {
         } else {
             let formatted_results: Vec<String> = results
                 .iter()
-                .map(|r| {
-                    format!(
-                        "{:<15} {:<20} {}",
-                        r.size, r.modified_str, r.path
-                    )
-                })
+                .map(|r| format!("{:<15} {:<20} {}", r.size, r.modified_str, r.path))
                 .collect();
 
             Ok(format!(
