@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::time::SystemTime;
 
@@ -309,7 +309,16 @@ impl SessionState {
     pub fn display_file(&self, path: &str, contents: &str) {
         let lines: Vec<&str> = contents.lines().collect();
 
-        println!("{}: {}", style("file").bold(), path);
+        let display_path = Path::new(path)
+            .strip_prefix(&self.working_directory)
+            .unwrap_or(Path::new(path))
+            .display();
+
+        println!(
+            "{} {}",
+            "file",
+            style(display_path).fg(Color::Blue).bright()
+        );
 
         if lines.len() <= 20 {
             // Display all lines with line numbers
@@ -341,7 +350,16 @@ impl SessionState {
     /// Display a diff to the user. For example, for displaying the results of
     /// edit/write operations.
     pub fn display_file_modification(&self, path: &str, old_content: &str, new_content: &str) {
-        println!("{}: {}", style("diff").bold(), path);
+        let display_path = Path::new(path)
+            .strip_prefix(&self.working_directory)
+            .unwrap_or(Path::new(path))
+            .display();
+
+        println!(
+            "{} {}",
+            "diff",
+            style(display_path).fg(Color::Blue).bright()
+        );
 
         let diff = TextDiff::from_lines(old_content, new_content);
 
