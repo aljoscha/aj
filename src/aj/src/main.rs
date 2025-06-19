@@ -21,6 +21,8 @@ async fn main() {
     if let Err(err) = result {
         println!("{}: {err}", style("Error:").bold().fg(Color::Red));
     }
+
+    println!("\nShutting down, bye...");
 }
 
 async fn run() -> Result<(), anyhow::Error> {
