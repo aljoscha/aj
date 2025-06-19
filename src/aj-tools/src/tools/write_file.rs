@@ -55,6 +55,11 @@ impl ToolDefinition for WriteFileTool {
         let path_buf = path.to_path_buf();
 
         let file_exists = path.exists();
+        let original_content = if file_exists {
+            Some(fs::read_to_string(&input.path).unwrap_or_default())
+        } else {
+            None
+        };
 
         if file_exists {
             // File exists - check if we've accessed it recently
@@ -89,6 +94,14 @@ impl ToolDefinition for WriteFileTool {
                     ));
                 }
             }
+        }
+
+        // Display the diff or file contents to the user
+        if let Some(original) = &original_content {
+            session_state.display_file_modification(&input.path, original, &input.content);
+        } else {
+            // New file - display the content
+            session_state.display_file(&input.path, &input.content);
         }
 
         fs::write(&input.path, &input.content)

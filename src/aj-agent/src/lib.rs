@@ -5,8 +5,10 @@ use std::time::SystemTime;
 
 use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
+use console::{style, Color};
 use futures::{Stream, StreamExt};
 use nu_ansi_term::Color::{Blue, DarkGray, Green, LightGray, Red, Yellow};
+use similar::{ChangeTag, TextDiff};
 
 use aj_conf::AgentEnv;
 use aj_tools::{
@@ -202,8 +204,6 @@ impl<U: GetUserMessage> Agent<U> {
                     tool_result_contents.push(result_content_block);
                 }
 
-
-
                 if tool_result_contents.len() > 0 {
                     let tool_result_message = MessageParam::new_user_message(tool_result_contents);
 
@@ -302,6 +302,73 @@ impl SessionState {
             accessed_files: HashMap::new(),
         }
     }
+
+    /// Display file contents to the user. For example, for displaying the
+    /// results of a read_file tool call.
+    ///
+    /// Abbreviating of longer than 20 lines.
+    pub fn display_file(&self, path: &str, contents: &str) {
+        let lines: Vec<&str> = contents.lines().collect();
+
+        println!("{}: {}", style("file").bold(), path);
+
+        if lines.len() <= 20 {
+            // Display all lines with line numbers
+            for (i, line) in lines.iter().enumerate() {
+                println!("{:5>}: {}", i + 1, line);
+            }
+        } else {
+            // Display first 8 lines
+            for (i, line) in lines.iter().take(8).enumerate() {
+                println!("{:5>}: {}", i + 1, line);
+            }
+
+            // Show truncation indicator with count
+            let truncated_lines = lines.len() - 16; // Total lines minus first 8 and last 8
+            println!(
+                "{}",
+                style(format!("[... {} lines truncated ...]", truncated_lines)).dim()
+            );
+
+            // Display last 8 lines
+            let start_line = lines.len() - 8;
+            for (i, line) in lines.iter().skip(start_line).enumerate() {
+                println!("{:5>}: {}", start_line + i + 1, line);
+            }
+        }
+        println!(); // Add blank line after file display
+    }
+
+    /// Display a diff to the user. For example, for displaying the results of
+    /// edit/write operations.
+    pub fn display_file_modification(&self, path: &str, old_content: &str, new_content: &str) {
+        println!("{}: {}", style("diff").bold(), path);
+
+        let diff = TextDiff::from_lines(old_content, new_content);
+
+        for change in diff.iter_all_changes() {
+            let sign = match change.tag() {
+                ChangeTag::Delete => "-",
+                ChangeTag::Insert => "+",
+                ChangeTag::Equal => " ",
+            };
+
+            let styled_line = match change.tag() {
+                ChangeTag::Delete => style(format!("{} {}", sign, change.value().trim_end()))
+                    .bg(Color::Red)
+                    .on_bright()
+                    .black(),
+                ChangeTag::Insert => style(format!("{} {}", sign, change.value().trim_end()))
+                    .bg(Color::Green)
+                    .on_bright()
+                    .black(),
+                ChangeTag::Equal => style(format!("{} {}", sign, change.value().trim_end())).dim(),
+            };
+
+            println!("{}", styled_line);
+        }
+        println!(); // Add blank line after diff
+    }
 }
 
 impl ToolSessionState for SessionState {
@@ -315,6 +382,14 @@ impl ToolSessionState for SessionState {
 
     fn get_file_access_time(&self, path: &PathBuf) -> Option<SystemTime> {
         self.accessed_files.get(path).copied()
+    }
+
+    fn display_file(&self, path: &str, contents: &str) {
+        self.display_file(path, contents);
+    }
+
+    fn display_file_modification(&self, path: &str, old_content: &str, new_content: &str) {
+        self.display_file_modification(path, old_content, new_content);
     }
 }
 

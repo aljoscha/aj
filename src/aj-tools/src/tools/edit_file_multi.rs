@@ -111,8 +111,9 @@ impl ToolDefinition for EditFileMultiTool {
         }
 
         // Get current content from disk
-        let mut content = fs::read_to_string(&input.path)
+        let original_content = fs::read_to_string(&input.path)
             .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", input.path, e))?;
+        let mut content = original_content.clone();
 
         // Apply each edit sequentially
         let mut edit_results = Vec::new();
@@ -146,6 +147,8 @@ impl ToolDefinition for EditFileMultiTool {
                 ));
             }
         }
+
+        session_state.display_file_modification(&input.path, &original_content, &content);
 
         // Write the modified content back to disk
         fs::write(&input.path, &content)

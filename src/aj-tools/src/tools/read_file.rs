@@ -72,14 +72,18 @@ impl ToolDefinition for ReadFileTool {
             return Ok(String::new());
         }
 
-        // Format lines with line numbers
+        // Display the file contents to the user
+        let selected_content = lines[start_idx..end_idx].join("\n");
+        session_state.display_file(&input.path, &selected_content);
+
+        session_state.record_file_access(path.to_path_buf());
+
+        // Format lines with line numbers for the tool result
         let formatted_lines: Vec<String> = lines[start_idx..end_idx]
             .iter()
             .enumerate()
-            .map(|(i, line)| format!("{:5}→{}", start_idx + i + 1, line))
+            .map(|(i, line)| format!("{:5>}: {}", start_idx + i + 1, line))
             .collect();
-
-        session_state.record_file_access(path.to_path_buf());
 
         Ok(formatted_lines.join("\n"))
     }
