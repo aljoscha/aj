@@ -20,20 +20,7 @@ impl SessionState for DummySessionState {
 }
 
 struct DummyTurnState;
-impl TurnState for DummyTurnState {
-    fn get_staged_file_content(&self, _path: &std::path::PathBuf) -> Option<&String> {
-        None
-    }
-
-    fn stage_file_modification(
-        &mut self,
-        _path: std::path::PathBuf,
-        _original_content: Option<String>,
-        _new_content: String,
-    ) {
-        // No-op for standalone tool
-    }
-}
+impl TurnState for DummyTurnState {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();

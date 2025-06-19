@@ -11,6 +11,7 @@ pub mod tools;
 mod util;
 
 pub use tools::edit_file::EditFileTool;
+pub use tools::edit_file_multi::EditFileMultiTool;
 pub use tools::glob::GlobTool;
 pub use tools::grep::GrepTool;
 pub use tools::ls::LsTool;
@@ -78,24 +79,14 @@ pub trait SessionState {
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
 /// a turn.
-pub trait TurnState {
-    /// Get the staged content of a file, or None if not staged.
-    fn get_staged_file_content(&self, path: &std::path::PathBuf) -> Option<&String>;
-
-    /// Stage a file modification for later application.
-    fn stage_file_modification(
-        &mut self,
-        path: std::path::PathBuf,
-        original_content: Option<String>,
-        new_content: String,
-    );
-}
+pub trait TurnState {}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
         ReadFileTool.into(),
         WriteFileTool.into(),
         EditFileTool.into(),
+        EditFileMultiTool.into(),
         LsTool.into(),
         GlobTool.into(),
         GrepTool.into(),

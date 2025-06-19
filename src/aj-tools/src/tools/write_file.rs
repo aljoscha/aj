@@ -41,7 +41,7 @@ impl ToolDefinition for WriteFileTool {
     fn execute(
         &self,
         session_state: &mut dyn SessionState,
-        turn_state: &mut dyn TurnState,
+        _turn_state: &mut dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -54,20 +54,7 @@ impl ToolDefinition for WriteFileTool {
 
         let path_buf = path.to_path_buf();
 
-        // Get current content (from staging or disk)
-        let current_content = turn_state
-            .get_staged_file_content(&path_buf)
-            .map(|s| s.clone())
-            .or_else(|| {
-                if path.exists() {
-                    fs::read_to_string(&path).ok()
-                } else {
-                    None
-                }
-            });
-
-        // Check if file exists (on disk or staged)
-        let file_exists = path.exists() || turn_state.get_staged_file_content(&path_buf).is_some();
+        let file_exists = path.exists();
 
         if file_exists {
             // File exists - check if we've accessed it recently
@@ -104,13 +91,10 @@ impl ToolDefinition for WriteFileTool {
             }
         }
 
-        turn_state.stage_file_modification(path_buf.clone(), current_content, input.content);
+        fs::write(&input.path, &input.content)
+            .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", input.path, e))?;
 
-        let action = if file_exists {
-            "staged overwrite of"
-        } else {
-            "staged creation of"
-        };
+        let action = if file_exists { "overwrote" } else { "created" };
         Ok(format!("Successfully {} file '{}'", action, input.path))
     }
 }

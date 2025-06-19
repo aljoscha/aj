@@ -5,23 +5,24 @@ use std::{fs, path::Path};
 use crate::{SessionState, ToolDefinition, TurnState};
 
 const DESCRIPTION: &str = r#"
-Edit files by doing exact string replacement.
+Edit files by doing multiple exact string replacements sequentially.
 
 Usage:
 
 - The path parameter must be an absolute path
 - The file must exist and have been accessed recently using the read_file tool (access time check prevents changing files that haven't been examined recently enough)
-- old_string must match exactly one occurrence in the file, you can provide a larger string with more context to make it more unique, or use replace_all to replace all occurences
-- If there are zero matches or multiple matches, the operation will fail
-- If replace_all is set to true, all occurrences of old_string will be replaced with new_string
+- Each edit's old_string must match exactly one occurrence in the file at the time it's applied, you can provide a larger string with more context to make it more unique, or use replace_all to replace all occurences
+- If there are zero matches or multiple matches for any edit, the operation will fail
+- If replace_all is set to true for an edit, all occurrences of that edit's old_string will be replaced with new_string
+- Edits are applied sequentially, so each subsequent edit works on the state of the file after the previous edit
+- All edits are applied atomically, either all succeed or the whole operation fails
+- Prefer this tool over edit_file if there are multiple changes to a file that can be batched together in one call to edit_file_multi
 "#;
 
-pub struct EditFileTool;
+pub struct EditFileMultiTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
-pub struct EditFileInput {
-    /// The absolute path to the file to modify.
-    path: String,
+pub struct EditOperation {
     /// The exact string to find and replace.
     old_string: String,
     /// The string to replace old_string with.
@@ -32,11 +33,19 @@ pub struct EditFileInput {
     replace_all: bool,
 }
 
-impl ToolDefinition for EditFileTool {
-    type Input = EditFileInput;
+#[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
+pub struct EditFileMultiInput {
+    /// The absolute path to the file to modify.
+    path: String,
+    /// Array of edit operations to apply sequentially.
+    edits: Vec<EditOperation>,
+}
+
+impl ToolDefinition for EditFileMultiTool {
+    type Input = EditFileMultiInput;
 
     fn name(&self) -> &'static str {
-        "edit_file"
+        "edit_file_multi"
     }
 
     fn description(&self) -> &'static str {
@@ -101,36 +110,52 @@ impl ToolDefinition for EditFileTool {
             }
         }
 
-        let content = fs::read_to_string(&input.path)
+        // Get current content from disk
+        let mut content = fs::read_to_string(&input.path)
             .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", input.path, e))?;
 
-        let matches: Vec<_> = content.match_indices(&input.old_string).collect();
+        // Apply each edit sequentially
+        let mut edit_results = Vec::new();
+        for (i, edit) in input.edits.iter().enumerate() {
+            let matches: Vec<_> = content.match_indices(&edit.old_string).collect();
 
-        if matches.len() == 0 {
-            return Err(anyhow::anyhow!(
-                "No occurrences of '{}' found in file '{}'",
-                input.old_string,
-                input.path
-            ));
+            if matches.len() == 0 {
+                return Err(anyhow::anyhow!(
+                    "Edit #{}: No occurrences of '{}' found in file '{}'",
+                    i + 1,
+                    edit.old_string,
+                    input.path
+                ));
+            }
+
+            if matches.len() == 1 || edit.replace_all {
+                content = content.replace(&edit.old_string, &edit.new_string);
+                edit_results.push(format!(
+                    "Edit #{}: replaced '{}' with '{}'",
+                    i + 1,
+                    edit.old_string,
+                    edit.new_string
+                ));
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Edit #{}: Found {} occurrences of '{}' in file '{}'. Exactly one occurrence is required for safe replacement. Set replace_all to true to replace all occurrences.",
+                    i + 1,
+                    matches.len(),
+                    edit.old_string,
+                    input.path
+                ));
+            }
         }
 
-        if matches.len() == 1 || input.replace_all {
-            let new_content = content.replace(&input.old_string, &input.new_string);
+        // Write the modified content back to disk
+        fs::write(&input.path, &content)
+            .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", input.path, e))?;
 
-            fs::write(&input.path, &new_content)
-                .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", input.path, e))?;
-
-            return Ok(format!(
-                "Successfully replaced '{}' with '{}' in file '{}'",
-                input.old_string, input.new_string, input.path
-            ));
-        }
-
-        return Err(anyhow::anyhow!(
-            "Found {} occurrences of '{}' in file '{}'. Exactly one occurrence is required for safe replacement. Set replace_all to true to replace all occurrences.",
-            matches.len(),
-            input.old_string,
-            input.path
-        ));
+        Ok(format!(
+            "Successfully applied {} edits to file '{}':\n{}",
+            input.edits.len(),
+            input.path,
+            edit_results.join("\n")
+        ))
     }
 }

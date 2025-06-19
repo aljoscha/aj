@@ -202,16 +202,7 @@ impl<U: GetUserMessage> Agent<U> {
                     tool_result_contents.push(result_content_block);
                 }
 
-                // Apply all staged file modifications. It's safer to just fail
-                // when we can't apply. This probably means someone manually
-                // futzed with our files...
-                if let Err(e) = turn_state.apply_file_modifications(&mut self.session_state) {
-                    return Err(anyhow!(
-                        "{}: Failed to apply file modifications: {}",
-                        Red.paint("error"),
-                        e
-                    ));
-                }
+
 
                 if tool_result_contents.len() > 0 {
                     let tool_result_message = MessageParam::new_user_message(tool_result_contents);
@@ -328,76 +319,14 @@ impl ToolSessionState for SessionState {
 }
 
 #[derive(Debug, Clone)]
-pub struct FileModification {
-    pub original_content: Option<String>,
-    pub new_content: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct TurnState {
     pub turn_id: usize,
-    pub file_modifications: HashMap<PathBuf, FileModification>,
 }
 
 impl TurnState {
     pub fn new(turn_id: usize) -> Self {
-        Self {
-            turn_id,
-            file_modifications: HashMap::new(),
-        }
-    }
-
-    pub fn get_file_content(&self, path: &PathBuf) -> Option<&String> {
-        self.file_modifications.get(path).map(|fm| &fm.new_content)
-    }
-
-    pub fn stage_file_modification(
-        &mut self,
-        path: PathBuf,
-        original_content: Option<String>,
-        new_content: String,
-    ) {
-        self.file_modifications.insert(
-            path,
-            FileModification {
-                original_content,
-                new_content,
-            },
-        );
-    }
-
-    pub fn apply_file_modifications(
-        &self,
-        session_state: &mut SessionState,
-    ) -> Result<(), anyhow::Error> {
-        use std::fs;
-
-        for (path, modification) in &self.file_modifications {
-            fs::write(path, &modification.new_content)
-                .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", path.display(), e))?;
-
-            // Make sure we also mark this, so that successive writes don't need to
-            // read again.
-            session_state.record_file_access(path.clone());
-
-            println!("{}: {}", Green.paint("file_modification"), path.display());
-        }
-
-        Ok(())
+        Self { turn_id }
     }
 }
 
-impl ToolTurnState for TurnState {
-    fn get_staged_file_content(&self, path: &PathBuf) -> Option<&String> {
-        self.get_file_content(path)
-    }
-
-    fn stage_file_modification(
-        &mut self,
-        path: PathBuf,
-        original_content: Option<String>,
-        new_content: String,
-    ) {
-        self.stage_file_modification(path, original_content, new_content)
-    }
-}
+impl ToolTurnState for TurnState {}
