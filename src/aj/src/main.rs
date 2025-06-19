@@ -1,4 +1,4 @@
-use nu_ansi_term::Color::Red;
+use console::{Color, style};
 use tracing_subscriber::EnvFilter;
 
 use aj_agent::{Agent, StdinUserMessage};
@@ -19,7 +19,7 @@ async fn main() {
     let result = run().await;
 
     if let Err(err) = result {
-        println!("{}: {err}", Red.paint("Error:"));
+        println!("{}: {err}", style("Error:").bold().fg(Color::Red));
     }
 }
 

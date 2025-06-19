@@ -10,7 +10,6 @@ aj-conf = { path = "../aj-conf" }
 aj-tools = { path = "../aj-tools" }
 console = { workspace = true }
 futures = { workspace = true }
-nu-ansi-term = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

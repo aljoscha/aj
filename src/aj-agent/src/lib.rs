@@ -7,7 +7,6 @@ use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
 use console::{style, Color};
 use futures::{Stream, StreamExt};
-use nu_ansi_term::Color::{Blue, DarkGray, Green, LightGray, Red, Yellow};
 use similar::{ChangeTag, TextDiff};
 
 use aj_conf::AgentEnv;
@@ -99,7 +98,7 @@ impl<U: GetUserMessage> Agent<U> {
                 }
             };
             if need_user_input {
-                print!("{}: ", Blue.paint("you"));
+                print!("{}: ", style("you").fg(Color::Blue));
                 let user_input = self.get_user_message.get_user_message();
                 let user_input = if let Some(user_input) = user_input {
                     user_input
@@ -127,7 +126,7 @@ impl<U: GetUserMessage> Agent<U> {
                         }
                         StreamingEvent::Error { error } => return Err(anyhow!("{}", error)),
                         StreamingEvent::TextStart { text } => {
-                            print!("{}: {}", Yellow.paint("aj"), text);
+                            print!("{}: {}", style("aj").fg(Color::Yellow), text);
                         }
                         StreamingEvent::TextUpdate { diff, snapshot: _ } => {
                             print!("{}", diff);
@@ -138,8 +137,8 @@ impl<U: GetUserMessage> Agent<U> {
                         StreamingEvent::ThinkingStart { thinking } => {
                             print!(
                                 "{}: {}",
-                                DarkGray.paint("aj is thinking"),
-                                LightGray.paint(thinking)
+                                style("aj is thinking").fg(Color::Black).bright(),
+                                style(thinking).fg(Color::Black).on_bright()
                             );
                         }
                         StreamingEvent::ThinkingUpdate { diff, snapshot: _ } => {
@@ -169,7 +168,7 @@ impl<U: GetUserMessage> Agent<U> {
                     ContentBlock::ToolUseBlock { id, name, input } => {
                         tool_calls.push((id.clone(), name.clone(), input.clone()));
                         has_tool_use = true;
-                        println!("{}: {}({})", Green.paint("tool"), name, input,);
+                        println!("{}: {}({})", style("tool").fg(Color::Green), name, input,);
                     }
                     _ => {}
                 }
@@ -189,7 +188,7 @@ impl<U: GetUserMessage> Agent<U> {
                     let (result_content, is_error) = match tool_result {
                         Ok(result) => (result, false),
                         Err(err) => {
-                            println!("{}: {:?}", Red.paint("tool_error"), err);
+                            println!("{}: {:?}", style("tool_error").fg(Color::Red), err);
                             (format!("{}", err), true)
                         }
                     };
