@@ -1,5 +1,6 @@
 //! Built-in tools for AJ.
 
+pub mod bash;
 pub mod edit_file;
 pub mod edit_file_multi;
 pub mod glob;

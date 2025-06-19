@@ -10,6 +10,7 @@ use serde_json::Value;
 pub mod tools;
 mod util;
 
+pub use tools::bash::BashTool;
 pub use tools::edit_file::EditFileTool;
 pub use tools::edit_file_multi::EditFileMultiTool;
 pub use tools::glob::GlobTool;
@@ -95,6 +96,7 @@ pub trait TurnState {}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
+        BashTool.into(),
         ReadFileTool.into(),
         WriteFileTool.into(),
         EditFileTool.into(),
