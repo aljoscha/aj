@@ -83,7 +83,7 @@ impl<U: GetUserMessage> Agent<U> {
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
         let mut conversation: Vec<MessageParam> = Vec::new();
 
-        println!("Chat with AJ (use 'ctrl-c' to quit)");
+        println!("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
 
         loop {
             self.turn_counter += 1;
