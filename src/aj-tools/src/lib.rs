@@ -1,6 +1,6 @@
 //! Framework and implementations for builtin tools.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use schemars::JsonSchema;
@@ -52,10 +52,11 @@ pub struct ErasedToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-    pub func: Box<
-        dyn Fn(&mut dyn SessionState, &mut dyn TurnState, Value) -> Result<String, anyhow::Error>,
-    >,
+    pub func: ToolFn,
 }
+
+type ToolFn =
+    Box<dyn Fn(&mut dyn SessionState, &mut dyn TurnState, Value) -> Result<String, anyhow::Error>>;
 
 impl<T: ToolDefinition + 'static> From<T> for ErasedToolDefinition {
     fn from(tool: T) -> Self {
@@ -75,7 +76,7 @@ impl<T: ToolDefinition + 'static> From<T> for ErasedToolDefinition {
 pub trait SessionState {
     fn working_directory(&self) -> PathBuf;
     fn record_file_access(&mut self, path: PathBuf);
-    fn get_file_access_time(&self, path: &PathBuf) -> Option<SystemTime>;
+    fn get_file_access_time(&self, path: &Path) -> Option<SystemTime>;
 
     /// Display file contents to the user. For example, for displaying the
     /// results of a read_file tool call.

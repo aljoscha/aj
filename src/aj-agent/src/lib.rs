@@ -167,13 +167,10 @@ impl<U: GetUserMessage> Agent<U> {
             let mut has_tool_use = false;
 
             for content in response.content.iter() {
-                match content {
-                    ContentBlock::ToolUseBlock { id, name, input } => {
-                        tool_calls.push((id.clone(), name.clone(), input.clone()));
-                        has_tool_use = true;
-                        println!("{}: {}({})", style("tool").fg(Color::Green), name, input,);
-                    }
-                    _ => {}
+                if let ContentBlock::ToolUseBlock { id, name, input } = content {
+                    tool_calls.push((id.clone(), name.clone(), input.clone()));
+                    has_tool_use = true;
+                    println!("{}: {}({})", style("tool").fg(Color::Green), name, input,);
                 }
             }
 
@@ -206,7 +203,7 @@ impl<U: GetUserMessage> Agent<U> {
                     tool_result_contents.push(result_content_block);
                 }
 
-                if tool_result_contents.len() > 0 {
+                if !tool_result_contents.is_empty() {
                     let tool_result_message = MessageParam::new_user_message(tool_result_contents);
 
                     conversation.push(tool_result_message);
@@ -224,12 +221,12 @@ impl<U: GetUserMessage> Agent<U> {
         &self,
         conversation: &[MessageParam],
     ) -> Result<impl Stream<Item = StreamingEvent> + use<'_, U>, anyhow::Error> {
-        let mut messages: Vec<_> = conversation.iter().cloned().collect();
+        let mut messages: Vec<_> = conversation.to_vec();
 
         let last_user_message = messages
             .iter_mut()
             .filter(|m| matches!(m.role, Role::User))
-            .last();
+            .next_back();
 
         if let Some(last_user_message) = last_user_message {
             let last_content = last_user_message.content.iter_mut().last();
@@ -241,7 +238,7 @@ impl<U: GetUserMessage> Agent<U> {
         let last_assistant_message = messages
             .iter_mut()
             .filter(|m| matches!(m.role, Role::Assistant))
-            .last();
+            .next_back();
 
         if let Some(last_assistant_message) = last_assistant_message {
             let last_content = last_assistant_message.content.iter_mut().last();
@@ -305,8 +302,7 @@ impl<U: GetUserMessage> Agent<U> {
             return Err(anyhow!("tool not found!"));
         };
 
-        let tool_result = (tool_def.func)(&mut self.session_state, turn_state, tool_input);
-        tool_result
+        (tool_def.func)(&mut self.session_state, turn_state, tool_input)
     }
 }
 
@@ -360,8 +356,7 @@ impl SessionState {
             .display();
 
         println!(
-            "{} {}",
-            "file",
+            "file {}",
             style(display_path).fg(Color::Blue).bright()
         );
 
@@ -401,8 +396,7 @@ impl SessionState {
             .display();
 
         println!(
-            "{} {}",
-            "diff",
+            "diff {}",
             style(display_path).fg(Color::Blue).bright()
         );
 
@@ -442,8 +436,8 @@ impl ToolSessionState for SessionState {
         self.accessed_files.insert(path, SystemTime::now());
     }
 
-    fn get_file_access_time(&self, path: &PathBuf) -> Option<SystemTime> {
-        self.accessed_files.get(path).copied()
+    fn get_file_access_time(&self, path: &Path) -> Option<SystemTime> {
+        self.accessed_files.get(&path.to_path_buf()).copied()
     }
 
     fn display_file(&self, path: &str, contents: &str) {

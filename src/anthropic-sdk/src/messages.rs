@@ -408,9 +408,9 @@ impl ContentBlock {
                 cache_control: None,
             },
             ContentBlock::ToolUseBlock { id, input, name } => ContentBlockParam::ToolUseBlock {
-                id: id,
-                input: input,
-                name: name,
+                id,
+                input,
+                name,
                 cache_control: None,
             },
             ContentBlock::ServerToolUseBlock { id, input, name } => {

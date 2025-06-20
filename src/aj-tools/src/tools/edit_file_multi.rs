@@ -83,7 +83,7 @@ impl ToolDefinition for EditFileMultiTool {
         match access_time {
             Some(access_time) => {
                 // Get file modification time
-                let metadata = fs::metadata(&path).map_err(|e| {
+                let metadata = fs::metadata(path).map_err(|e| {
                     anyhow::anyhow!("Failed to get file metadata for '{}': {}", input.path, e)
                 })?;
                 let modified_time = metadata.modified().map_err(|e| {
@@ -120,7 +120,7 @@ impl ToolDefinition for EditFileMultiTool {
         for (i, edit) in input.edits.iter().enumerate() {
             let matches: Vec<_> = content.match_indices(&edit.old_string).collect();
 
-            if matches.len() == 0 {
+            if matches.is_empty() {
                 return Err(anyhow::anyhow!(
                     "Edit #{}: No occurrences of '{}' found in file '{}'",
                     i + 1,

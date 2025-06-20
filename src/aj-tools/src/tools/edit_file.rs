@@ -74,7 +74,7 @@ impl ToolDefinition for EditFileTool {
         match access_time {
             Some(access_time) => {
                 // Get file modification time
-                let metadata = fs::metadata(&path).map_err(|e| {
+                let metadata = fs::metadata(path).map_err(|e| {
                     anyhow::anyhow!("Failed to get file metadata for '{}': {}", input.path, e)
                 })?;
                 let modified_time = metadata.modified().map_err(|e| {
@@ -106,7 +106,7 @@ impl ToolDefinition for EditFileTool {
 
         let matches: Vec<_> = content.match_indices(&input.old_string).collect();
 
-        if matches.len() == 0 {
+        if matches.is_empty() {
             return Err(anyhow::anyhow!(
                 "No occurrences of '{}' found in file '{}'",
                 input.old_string,
@@ -128,11 +128,11 @@ impl ToolDefinition for EditFileTool {
             ));
         }
 
-        return Err(anyhow::anyhow!(
+        Err(anyhow::anyhow!(
             "Found {} occurrences of '{}' in file '{}'. Exactly one occurrence is required for safe replacement. Set replace_all to true to replace all occurrences.",
             matches.len(),
             input.old_string,
             input.path
-        ));
+        ))
     }
 }

@@ -68,7 +68,7 @@ impl ToolDefinition for WriteFileTool {
             match access_time {
                 Some(access_time) => {
                     // Get file modification time
-                    let metadata = fs::metadata(&path).map_err(|e| {
+                    let metadata = fs::metadata(path).map_err(|e| {
                         anyhow::anyhow!("Failed to get file metadata for '{}': {}", input.path, e)
                     })?;
                     let modified_time = metadata.modified().map_err(|e| {

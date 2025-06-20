@@ -1,7 +1,7 @@
 use aj_tools::tools::glob::{GlobInput, GlobTool};
 use aj_tools::{SessionState, ToolDefinition, TurnState};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 struct DummySessionState;
@@ -14,7 +14,7 @@ impl SessionState for DummySessionState {
         // No-op for test binary
     }
 
-    fn get_file_access_time(&self, _path: &PathBuf) -> Option<SystemTime> {
+    fn get_file_access_time(&self, _path: &Path) -> Option<SystemTime> {
         None
     }
 }

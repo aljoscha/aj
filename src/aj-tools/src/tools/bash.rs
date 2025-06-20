@@ -169,7 +169,7 @@ impl ToolDefinition for BashTool {
                 }
                 if !stderr.is_empty() {
                     if !result.is_empty() {
-                        result.push_str("\n");
+                        result.push('\n');
                     }
                     result.push_str("STDERR:\n");
                     result.push_str(&stderr);
@@ -201,7 +201,7 @@ impl ToolDefinition for BashTool {
                     use std::process;
                     let _ = process::Command::new("kill")
                         .arg("-9")
-                        .arg(&child_id.to_string())
+                        .arg(child_id.to_string())
                         .output();
                 }
 
@@ -240,9 +240,9 @@ fn parse_command(command: &str) -> Result<ParsedCommand, anyhow::Error> {
     let mut current_part = String::new();
     let mut in_quotes = false;
     let mut quote_char = ' ';
-    let mut chars = command.chars().peekable();
+    let chars = command.chars();
 
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         match ch {
             '"' | '\'' if !in_quotes => {
                 in_quotes = true;
