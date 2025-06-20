@@ -1,6 +1,4 @@
-use std::env;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -18,6 +16,7 @@ working directory of the agent session.
 Safety:
 - Commands have a configurable timeout to prevent hanging
 - No shell metacharacters (pipes, redirection, etc.) are supported
+- Output is truncated to 35000 characters to prevent excessive output
 
 Usage:
 - Provide a clear description of what the command does and why you want to run it
@@ -181,6 +180,15 @@ impl ToolDefinition for BashTool {
                         "\nCommand failed with exit code: {}",
                         output.status.code().unwrap_or(-1)
                     ));
+                }
+
+                // A full run of cargo clippy on the materialize repo, with
+                // compiling deps and everything outputs about 35k of data. So
+                // an incremental run should be below that, even when there are
+                // warnings and stuff.
+                if result.len() > 35000 {
+                    result.truncate(35000);
+                    result.push_str("\n[Output truncated at 35000 characters]");
                 }
 
                 Ok(result)
