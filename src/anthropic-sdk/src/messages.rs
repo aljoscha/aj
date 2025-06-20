@@ -163,6 +163,34 @@ impl ContentBlockParam {
             citations: None,
         }
     }
+
+    // Sets the given cache control if-and-only-if the content type can take
+    // one.
+    pub fn set_cache_control(&mut self, cache_control: CacheControl) {
+        let cache_control_field = match self {
+            ContentBlockParam::TextBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::ImageBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::DocumentBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::ThinkingBlock { .. } => None,
+            ContentBlockParam::RedactedThinkingBlock { .. } => None,
+            ContentBlockParam::ToolUseBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::ToolResultBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::ServerToolUseBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::WebSearchToolResultBlock { cache_control, .. } => {
+                Some(cache_control)
+            }
+            ContentBlockParam::CodeExecutionToolResultBlock { cache_control, .. } => {
+                Some(cache_control)
+            }
+            ContentBlockParam::MCPToolUseBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::MCPToolResultBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::ContainerUploadBlock { cache_control, .. } => Some(cache_control),
+        };
+
+        if let Some(cache_control_field) = cache_control_field {
+            *cache_control_field = Some(cache_control);
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
