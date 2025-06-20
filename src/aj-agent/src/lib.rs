@@ -14,7 +14,7 @@ use aj_tools::{
     ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState,
 };
 use anthropic_sdk::messages::{
-    ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
+    CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
 };
 
 pub struct Agent<U: GetUserMessage> {
@@ -112,7 +112,7 @@ impl<U: GetUserMessage> Agent<U> {
                 conversation.push(user_message);
             }
 
-            let response_stream = self.run_inference_streaming(conversation.clone()).await?;
+            let response_stream = self.run_inference_streaming(&conversation).await?;
 
             let mut response: Option<Message> = None;
             {
@@ -219,8 +219,34 @@ impl<U: GetUserMessage> Agent<U> {
 
     async fn run_inference_streaming(
         &self,
-        conversation: Vec<MessageParam>,
+        conversation: &[MessageParam],
     ) -> Result<impl Stream<Item = StreamingEvent> + use<'_, U>, anyhow::Error> {
+        let mut messages: Vec<_> = conversation.iter().cloned().collect();
+
+        let last_user_message = messages
+            .iter_mut()
+            .filter(|m| matches!(m.role, Role::User))
+            .last();
+
+        if let Some(last_user_message) = last_user_message {
+            let last_content = last_user_message.content.iter_mut().last();
+            if let Some(last_content) = last_content {
+                last_content.set_cache_control(CacheControl::Ephemeral { ttl: None });
+            }
+        }
+
+        let last_assistant_message = messages
+            .iter_mut()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .last();
+
+        if let Some(last_assistant_message) = last_assistant_message {
+            let last_content = last_assistant_message.content.iter_mut().last();
+            if let Some(last_content) = last_content {
+                last_content.set_cache_control(CacheControl::Ephemeral { ttl: None });
+            }
+        }
+
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
             system: Some(self.assemble_system_prompt()),
@@ -228,7 +254,7 @@ impl<U: GetUserMessage> Agent<U> {
             //     budget_tokens: 10_000,
             // }),
             max_tokens: 32_000,
-            messages: conversation,
+            messages,
             tools: self.tools.clone(),
             ..Default::default()
         };
@@ -240,11 +266,17 @@ impl<U: GetUserMessage> Agent<U> {
     /// Assemble the system prompt we pass to the model from the actual system
     /// prompt and additional information we might want or need, such as
     /// information about the environment.
-    fn assemble_system_prompt(&self) -> String {
-        format!(
+    fn assemble_system_prompt(&self) -> Vec<ContentBlockParam> {
+        let text = format!(
             "{}\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
             self.system_prompt, self.env
-        )
+        );
+
+        vec![ContentBlockParam::TextBlock {
+            text,
+            cache_control: Some(CacheControl::Ephemeral { ttl: None }),
+            citations: None,
+        }]
     }
 
     fn execute_tool(
