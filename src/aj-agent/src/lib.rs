@@ -17,6 +17,9 @@ use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
 };
 
+const DARK_GRAY: Color = Color::Color256(239);
+const LIGHT_GRAY: Color = Color::Color256(248);
+
 pub struct Agent<U: GetUserMessage> {
     env: AgentEnv,
     system_prompt: &'static str,
@@ -137,8 +140,8 @@ impl<U: GetUserMessage> Agent<U> {
                         StreamingEvent::ThinkingStart { thinking } => {
                             print!(
                                 "{}: {}",
-                                style("aj is thinking").fg(Color::Black).bright(),
-                                style(thinking).fg(Color::Black).on_bright()
+                                style("aj is thinking").fg(DARK_GRAY),
+                                style(thinking).fg(LIGHT_GRAY).on_bright()
                             );
                         }
                         StreamingEvent::ThinkingUpdate { diff, snapshot: _ } => {
