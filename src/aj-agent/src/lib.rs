@@ -267,10 +267,20 @@ impl<U: GetUserMessage> Agent<U> {
     /// prompt and additional information we might want or need, such as
     /// information about the environment.
     fn assemble_system_prompt(&self) -> Vec<ContentBlockParam> {
-        let text = format!(
-            "{}\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
-            self.system_prompt, self.env
-        );
+        let mut text = self.system_prompt.to_string();
+
+        if let Some(agent_md_content) = &self.env.agent_md {
+            text.push_str(&format!(
+                "\n\n{}\n<agent-md>\n{}\n</agent-md>",
+                aj_conf::AGENT_MD_PREFIX,
+                agent_md_content
+            ));
+        }
+
+        text.push_str(&format!(
+            "\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
+            self.env
+        ));
 
         vec![ContentBlockParam::TextBlock {
             text,

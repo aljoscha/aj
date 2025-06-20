@@ -10,6 +10,12 @@ use thiserror::Error;
 
 pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
 
+pub const AGENT_MD_PREFIX: &str = r#"
+Here are instructions about the code base from the user. It's the contents
+of a AGENT.md file. These instructions override default behavior and you
+MUST follow them exactly as written:
+"#;
+
 /// The working environment of the agent, includes configuration, the system
 /// prompt, working directories, etc.
 #[derive(Debug, Clone)]
@@ -18,6 +24,8 @@ pub struct AgentEnv {
     pub git_root_directory: Option<PathBuf>,
     pub operating_system: String,
     pub today_date: String,
+    /// Contents of AGENT.md, if present.
+    pub agent_md: Option<String>,
 }
 
 impl AgentEnv {
@@ -26,12 +34,14 @@ impl AgentEnv {
         let git_root_directory = Self::find_git_root(&working_directory);
         let operating_system = env::consts::OS.to_string();
         let today_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let agent_md_content = Self::load_agent_md(&working_directory);
 
         AgentEnv {
             working_directory,
             git_root_directory,
             operating_system,
             today_date,
+            agent_md: agent_md_content,
         }
     }
 
@@ -49,6 +59,11 @@ impl AgentEnv {
                 None => return None,
             }
         }
+    }
+
+    fn load_agent_md(working_directory: &Path) -> Option<String> {
+        let agent_md_path = working_directory.join("AGENT.md");
+        fs::read_to_string(agent_md_path).ok()
     }
 }
 
