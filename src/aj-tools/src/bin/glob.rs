@@ -17,6 +17,19 @@ impl SessionState for DummySessionState {
     fn get_file_access_time(&self, _path: &Path) -> Option<SystemTime> {
         None
     }
+
+    fn display_tool_result(&self, _tool_name: &str, _input: &str, _output: &str) {}
+
+    fn display_tool_result_diff(
+        &self,
+        _tool_name: &str,
+        _input: &str,
+        _before: &str,
+        _after: &str,
+    ) {
+    }
+
+    fn display_tool_error(&self, _tool_name: &str, _input: &str, _error: &str) {}
 }
 
 struct DummyTurnState;

@@ -5,6 +5,7 @@ members = [
     "src/aj-conf",
     "src/aj-tools",
     "src/anthropic-sdk",
+    "src/aj-ui",
 ]
 resolver = "2"
 

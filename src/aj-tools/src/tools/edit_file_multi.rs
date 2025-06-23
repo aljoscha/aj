@@ -148,7 +148,17 @@ impl ToolDefinition for EditFileMultiTool {
             }
         }
 
-        session_state.display_file_modification(&input.path, &original_content, &content);
+        let display_path = Path::new(path)
+            .strip_prefix(session_state.working_directory())
+            .unwrap_or(Path::new(path))
+            .display()
+            .to_string();
+        session_state.display_tool_result_diff(
+            "edit_file_multi",
+            &display_path,
+            &original_content,
+            &content,
+        );
 
         // Write the modified content back to disk
         fs::write(&input.path, &content)

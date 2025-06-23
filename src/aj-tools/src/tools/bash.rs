@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -110,17 +109,13 @@ impl ToolDefinition for BashTool {
     ) -> Result<String, anyhow::Error> {
         // Check if command is allowed
         if !is_command_allowed(&input.command) {
-            // Ask user for confirmation
-            println!("\nCommand not on allowlist: {}", input.command);
-            println!("Description: {}", input.description);
-            print!("Allow this command? (y/n): ");
-            std::io::stdout().flush()?;
+            let message = format!(
+                "Command not on allowlist: {}\nDescription: {}",
+                input.command, input.description
+            );
 
-            let mut user_input = String::new();
-            std::io::stdin().read_line(&mut user_input)?;
-            let user_input = user_input.trim().to_lowercase();
-
-            if user_input != "y" && user_input != "yes" {
+            // Use the SessionState's ask_permission method
+            if !session_state.ask_permission(&message) {
                 return Err(anyhow::anyhow!("Command execution cancelled by user"));
             }
         }

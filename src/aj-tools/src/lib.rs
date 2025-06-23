@@ -78,17 +78,16 @@ pub trait SessionState {
     fn record_file_access(&mut self, path: PathBuf);
     fn get_file_access_time(&self, path: &Path) -> Option<SystemTime>;
 
-    /// Display file contents to the user. For example, for displaying the
-    /// results of a read_file tool call.
-    ///
-    /// Default implementation does nothing.
-    fn display_file(&self, _path: &str, _contents: &str) {}
+    fn display_tool_result(&self, tool_name: &str, input: &str, output: &str);
+    fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str);
+    fn display_tool_error(&self, tool_name: &str, input: &str, error: &str);
 
-    /// Display a diff to the user. For example, for displaying the results of
-    /// edit/write operations.
+    /// Ask the user for permission to perform an action.
     ///
-    /// Default implementation does nothing.
-    fn display_file_modification(&self, _path: &str, _old_content: &str, _new_content: &str) {}
+    /// Default implementation returns false (deny permission).
+    fn ask_permission(&self, _message: &str) -> bool {
+        false
+    }
 }
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.

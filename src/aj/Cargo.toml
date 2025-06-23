@@ -8,6 +8,7 @@ aj-agent = { path = "../aj-agent/" }
 aj-conf = { path = "../aj-conf/" }
 aj-tools = { path = "../aj-tools/" }
 anthropic-sdk = { path = "../anthropic-sdk/" }
+aj-ui = { path = "../aj-ui/" }
 anyhow = { workspace = true }
 console = { workspace = true }
 dotenv = { workspace = true }

@@ -33,6 +33,7 @@ dependencies = [
  "aj-agent",
  "aj-conf",
  "aj-tools",
+ "aj-ui",
  "anthropic-sdk",
  "anyhow",
  "console",
@@ -53,6 +54,7 @@ version = "0.1.0"
 dependencies = [
  "aj-conf",
  "aj-tools",
+ "aj-ui",
  "anthropic-sdk",
  "anyhow",
  "console",
@@ -81,6 +83,7 @@ dependencies = [
 name = "aj-tools"
 version = "0.1.0"
 dependencies = [
+ "aj-ui",
  "anthropic-sdk",
  "anyhow",
  "chrono",
@@ -98,6 +101,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+]
+
+[[package]]
+name = "aj-ui"
+version = "0.1.0"
+dependencies = [
+ "console",
+ "similar",
 ]
 
 [[package]]

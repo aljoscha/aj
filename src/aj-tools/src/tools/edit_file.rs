@@ -117,7 +117,17 @@ impl ToolDefinition for EditFileTool {
         if matches.len() == 1 || input.replace_all {
             let new_content = content.replace(&input.old_string, &input.new_string);
 
-            session_state.display_file_modification(&input.path, &content, &new_content);
+            let display_path = Path::new(path)
+                .strip_prefix(session_state.working_directory())
+                .unwrap_or(Path::new(path))
+                .display()
+                .to_string();
+            session_state.display_tool_result_diff(
+                "edit_file",
+                &display_path,
+                &content,
+                &new_content,
+            );
 
             fs::write(&input.path, &new_content)
                 .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", input.path, e))?;

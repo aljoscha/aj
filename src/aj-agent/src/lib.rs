@@ -3,40 +3,35 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::time::SystemTime;
 
-use anthropic_sdk::streaming::StreamingEvent;
-use anyhow::anyhow;
-use console::{style, Color};
-use futures::{Stream, StreamExt};
-use similar::{ChangeTag, TextDiff};
-
 use aj_conf::AgentEnv;
 use aj_tools::{
     ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState,
 };
+use aj_ui::AjUi;
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
 };
+use anthropic_sdk::streaming::StreamingEvent;
+use anyhow::anyhow;
+use futures::{Stream, StreamExt};
 
-const DARK_GRAY: Color = Color::Color256(239);
-const LIGHT_GRAY: Color = Color::Color256(248);
-
-pub struct Agent<U: GetUserMessage> {
+pub struct Agent<UI: AjUi> {
     env: AgentEnv,
     system_prompt: &'static str,
-    get_user_message: U,
+    ui: UI,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
     client: anthropic_sdk::client::Client,
-    session_state: SessionState,
+    session_state: SessionState<UI>,
     turn_counter: usize,
 }
 
-impl<U: GetUserMessage> Agent<U> {
+impl<UI: AjUi> Agent<UI> {
     pub fn new(
         env: AgentEnv,
         system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
-        get_user_message: U,
+        ui: UI,
     ) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
         let client = anthropic_sdk::client::Client::new(api_key.clone());
@@ -61,21 +56,21 @@ impl<U: GetUserMessage> Agent<U> {
 
         Self {
             system_prompt,
-            get_user_message,
             tool_definitions,
             tools: api_tools,
             client,
             session_state: SessionState::new(env.working_directory.clone()),
             env,
             turn_counter: 0,
+            ui,
         }
     }
 
-    pub fn session_state(&self) -> &SessionState {
+    pub fn session_state(&self) -> &SessionState<UI> {
         &self.session_state
     }
 
-    pub fn session_state_mut(&mut self) -> &mut SessionState {
+    pub fn session_state_mut(&mut self) -> &mut SessionState<UI> {
         &mut self.session_state
     }
 
@@ -83,10 +78,15 @@ impl<U: GetUserMessage> Agent<U> {
         self.turn_counter
     }
 
+    pub fn into_ui(self) -> UI {
+        self.ui
+    }
+
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
         let mut conversation: Vec<MessageParam> = Vec::new();
 
-        println!("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
+        self.ui
+            .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
 
         loop {
             self.turn_counter += 1;
@@ -101,8 +101,7 @@ impl<U: GetUserMessage> Agent<U> {
                 }
             };
             if need_user_input {
-                print!("{}: ", style("you").fg(Color::Blue));
-                let user_input = self.get_user_message.get_user_message();
+                let user_input = self.ui.get_user_input();
                 let user_input = if let Some(user_input) = user_input {
                     user_input
                 } else {
@@ -129,32 +128,31 @@ impl<U: GetUserMessage> Agent<U> {
                         }
                         StreamingEvent::Error { error } => return Err(anyhow!("{}", error)),
                         StreamingEvent::TextStart { text, citations: _ } => {
-                            print!("{}: {}", style("aj").fg(Color::Yellow), text);
+                            self.ui.agent_text_start(&text);
                         }
                         StreamingEvent::TextUpdate { diff, snapshot: _ } => {
-                            print!("{}", diff);
+                            self.ui.agent_text_update(&diff);
                         }
                         StreamingEvent::TextStop => {
-                            println!()
+                            self.ui.agent_text_stop();
                         }
                         StreamingEvent::ThinkingStart { thinking } => {
-                            print!(
-                                "{}: {}",
-                                style("aj is thinking").fg(DARK_GRAY),
-                                style(thinking).fg(LIGHT_GRAY).on_bright()
-                            );
+                            self.ui.agent_thinking_start(&thinking);
                         }
                         StreamingEvent::ThinkingUpdate { diff, snapshot: _ } => {
-                            print!("{}", diff);
+                            self.ui.agent_thinking_update(&diff);
                         }
                         StreamingEvent::ThinkingStop => {
-                            println!()
+                            self.ui.agent_thinking_stop();
                         }
                         StreamingEvent::ParseError { error, raw_data } => {
-                            eprintln!("Parse error: {} (raw data: {})", error, raw_data);
+                            self.ui.display_error(&format!(
+                                "Parse error: {} (raw data: {})",
+                                error, raw_data
+                            ));
                         }
                         StreamingEvent::ProtocolError { error } => {
-                            eprintln!("Protocol error: {}", error);
+                            self.ui.display_error(&format!("Protocol error: {}", error));
                         }
                     }
                 }
@@ -170,7 +168,6 @@ impl<U: GetUserMessage> Agent<U> {
                 if let ContentBlock::ToolUseBlock { id, name, input } = content {
                     tool_calls.push((id.clone(), name.clone(), input.clone()));
                     has_tool_use = true;
-                    println!("{}: {}({})", style("tool").fg(Color::Green), name, input,);
                 }
             }
 
@@ -188,7 +185,8 @@ impl<U: GetUserMessage> Agent<U> {
                     let (result_content, is_error) = match tool_result {
                         Ok(result) => (result, false),
                         Err(err) => {
-                            println!("{}: {:?}", style("tool_error").fg(Color::Red), err);
+                            self.ui
+                                .display_tool_error(&tool_name, "tool_input", &err.to_string());
                             (format!("{}", err), true)
                         }
                     };
@@ -220,7 +218,7 @@ impl<U: GetUserMessage> Agent<U> {
     async fn run_inference_streaming(
         &self,
         conversation: &[MessageParam],
-    ) -> Result<impl Stream<Item = StreamingEvent> + use<'_, U>, anyhow::Error> {
+    ) -> Result<impl Stream<Item = StreamingEvent> + '_, anyhow::Error> {
         let mut messages: Vec<_> = conversation.to_vec();
 
         let last_user_message = messages
@@ -250,9 +248,9 @@ impl<U: GetUserMessage> Agent<U> {
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
             system: Some(self.assemble_system_prompt()),
-            // thinking: Some(anthropic_sdk::messages::Thinking::Enabled {
-            //     budget_tokens: 10_000,
-            // }),
+            thinking: Some(anthropic_sdk::messages::Thinking::Enabled {
+                budget_tokens: 10_000,
+            }),
             max_tokens: 32_000,
             messages,
             tools: self.tools.clone(),
@@ -302,126 +300,69 @@ impl<U: GetUserMessage> Agent<U> {
             return Err(anyhow!("tool not found!"));
         };
 
-        (tool_def.func)(&mut self.session_state, turn_state, tool_input)
+        // Create a wrapper that provides UI access to the session state
+        let mut session_state_wrapper = SessionStateWrapper {
+            session_state: &mut self.session_state,
+            ui: &self.ui,
+        };
+
+        (tool_def.func)(&mut session_state_wrapper, turn_state, tool_input)
     }
 }
 
-/// Trait for getting the next message from the user, for passing to the model.
-pub trait GetUserMessage {
-    fn get_user_message(&self) -> Option<String>;
+/// Wrapper that provides UI access to session state operations
+struct SessionStateWrapper<'a, UI: AjUi> {
+    session_state: &'a mut SessionState<UI>,
+    ui: &'a UI,
 }
 
-/// A [GetUserMessage] that reads user messages from stdin.
-pub struct StdinUserMessage;
+impl<'a, UI: AjUi> ToolSessionState for SessionStateWrapper<'a, UI> {
+    fn working_directory(&self) -> PathBuf {
+        self.session_state.working_directory()
+    }
 
-impl GetUserMessage for StdinUserMessage {
-    fn get_user_message(&self) -> Option<String> {
-        use std::io::{self, Write};
+    fn record_file_access(&mut self, path: PathBuf) {
+        self.session_state.record_file_access(path);
+    }
 
-        io::stdout().flush().unwrap();
+    fn get_file_access_time(&self, path: &Path) -> Option<SystemTime> {
+        self.session_state.get_file_access_time(path)
+    }
 
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(0) => None, // EOF (ctrl-d)
-            Ok(_) => Some(input.trim().to_string()),
-            Err(_) => None, // Error (ctrl-c or other)
-        }
+    fn display_tool_result(&self, tool_name: &str, input: &str, output: &str) {
+        self.ui.display_tool_result(tool_name, input, output);
+    }
+
+    fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str) {
+        self.ui
+            .display_tool_result_diff(tool_name, input, before, after);
+    }
+
+    fn display_tool_error(&self, tool_name: &str, input: &str, error: &str) {
+        self.ui.display_tool_error(tool_name, input, error);
+    }
+
+    fn ask_permission(&self, message: &str) -> bool {
+        self.ui.ask_permission(message)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SessionState {
+#[derive(Debug)]
+pub struct SessionState<UI: AjUi> {
     pub working_directory: PathBuf,
     pub accessed_files: HashMap<PathBuf, SystemTime>,
+    ui: std::marker::PhantomData<UI>,
 }
 
-impl SessionState {
+impl<UI: AjUi> SessionState<UI> {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
             working_directory,
             accessed_files: HashMap::new(),
+            ui: std::marker::PhantomData,
         }
     }
 
-    /// Display file contents to the user. For example, for displaying the
-    /// results of a read_file tool call.
-    ///
-    /// Abbreviating of longer than 20 lines.
-    pub fn display_file(&self, path: &str, contents: &str) {
-        let lines: Vec<&str> = contents.lines().collect();
-
-        let display_path = Path::new(path)
-            .strip_prefix(&self.working_directory)
-            .unwrap_or(Path::new(path))
-            .display();
-
-        println!("file {}", style(display_path).fg(Color::Blue).bright());
-
-        if lines.len() <= 20 {
-            // Display all lines with line numbers
-            for (i, line) in lines.iter().enumerate() {
-                println!("{:5>}: {}", i + 1, line);
-            }
-        } else {
-            // Display first 8 lines
-            for (i, line) in lines.iter().take(8).enumerate() {
-                println!("{:5>}: {}", i + 1, line);
-            }
-
-            // Show truncation indicator with count
-            let truncated_lines = lines.len() - 16; // Total lines minus first 8 and last 8
-            println!(
-                "{}",
-                style(format!("[... {} lines truncated ...]", truncated_lines)).dim()
-            );
-
-            // Display last 8 lines
-            let start_line = lines.len() - 8;
-            for (i, line) in lines.iter().skip(start_line).enumerate() {
-                println!("{:5>}: {}", start_line + i + 1, line);
-            }
-        }
-        println!(); // Add blank line after file display
-    }
-
-    /// Display a diff to the user. For example, for displaying the results of
-    /// edit/write operations.
-    pub fn display_file_modification(&self, path: &str, old_content: &str, new_content: &str) {
-        let display_path = Path::new(path)
-            .strip_prefix(&self.working_directory)
-            .unwrap_or(Path::new(path))
-            .display();
-
-        println!("diff {}", style(display_path).fg(Color::Blue).bright());
-
-        let diff = TextDiff::from_lines(old_content, new_content);
-
-        for change in diff.iter_all_changes() {
-            let sign = match change.tag() {
-                ChangeTag::Delete => "-",
-                ChangeTag::Insert => "+",
-                ChangeTag::Equal => " ",
-            };
-
-            let styled_line = match change.tag() {
-                ChangeTag::Delete => style(format!("{} {}", sign, change.value().trim_end()))
-                    .bg(Color::Red)
-                    .on_bright()
-                    .black(),
-                ChangeTag::Insert => style(format!("{} {}", sign, change.value().trim_end()))
-                    .bg(Color::Green)
-                    .on_bright()
-                    .black(),
-                ChangeTag::Equal => style(format!("{} {}", sign, change.value().trim_end())).dim(),
-            };
-
-            println!("{}", styled_line);
-        }
-        println!(); // Add blank line after diff
-    }
-}
-
-impl ToolSessionState for SessionState {
     fn working_directory(&self) -> PathBuf {
         self.working_directory.to_owned()
     }
@@ -432,14 +373,6 @@ impl ToolSessionState for SessionState {
 
     fn get_file_access_time(&self, path: &Path) -> Option<SystemTime> {
         self.accessed_files.get(&path.to_path_buf()).copied()
-    }
-
-    fn display_file(&self, path: &str, contents: &str) {
-        self.display_file(path, contents);
-    }
-
-    fn display_file_modification(&self, path: &str, old_content: &str, new_content: &str) {
-        self.display_file_modification(path, old_content, new_content);
     }
 }
 

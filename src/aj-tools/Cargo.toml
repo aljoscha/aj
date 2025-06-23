@@ -13,6 +13,7 @@ path = "src/bin/grep.rs"
 
 [dependencies]
 anthropic-sdk = { path = "../anthropic-sdk/" }
+aj-ui = { path = "../aj-ui/" }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }
