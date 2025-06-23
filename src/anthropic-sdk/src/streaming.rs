@@ -66,10 +66,7 @@ impl StreamProcessor {
         }
     }
 
-    pub fn process_stream<S>(
-        &mut self,
-        stream: S,
-    ) -> impl Stream<Item = StreamingEvent> + use<'_, S>
+    pub fn process_stream<S>(mut self, stream: S) -> impl Stream<Item = StreamingEvent>
     where
         S: Stream<Item = ServerSentEvent>,
     {

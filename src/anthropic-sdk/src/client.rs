@@ -145,16 +145,6 @@ fn create_high_level_stream<S>(stream: S) -> impl Stream<Item = StreamingEvent>
 where
     S: Stream<Item = ServerSentEvent>,
 {
-    use async_stream::stream;
-
-    stream! {
-        let mut processor = StreamProcessor::new();
-        let mut stream = std::pin::pin!(stream);
-
-        while let Some(event) = futures::StreamExt::next(&mut stream).await {
-            if let Some(high_level_event) = processor.process_event(event) {
-                yield high_level_event;
-            }
-        }
-    }
+    let processor = StreamProcessor::new();
+    processor.process_stream(stream)
 }
