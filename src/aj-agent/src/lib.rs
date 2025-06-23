@@ -128,7 +128,7 @@ impl<U: GetUserMessage> Agent<U> {
                             response = Some(message);
                         }
                         StreamingEvent::Error { error } => return Err(anyhow!("{}", error)),
-                        StreamingEvent::TextStart { text } => {
+                        StreamingEvent::TextStart { text, citations: _ } => {
                             print!("{}: {}", style("aj").fg(Color::Yellow), text);
                         }
                         StreamingEvent::TextUpdate { diff, snapshot: _ } => {

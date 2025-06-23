@@ -68,7 +68,7 @@ pub enum ContentBlockParam {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        citations: Option<Value>,
+        citations: Option<Vec<Citation>>,
     },
     #[serde(rename = "image")]
     ImageBlock {
@@ -82,7 +82,7 @@ pub enum ContentBlockParam {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        citations: Option<Value>,
+        citations: Option<Vec<Citation>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         context: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,6 +220,46 @@ pub enum DocumentSource {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
+pub enum Citation {
+    #[serde(rename = "char_location")]
+    CharLocation {
+        cited_text: String,
+        document_index: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        document_title: Option<String>,
+        end_char_index: u64,
+        start_char_index: u64,
+    },
+    #[serde(rename = "page_location")]
+    PageLocation {
+        cited_text: String,
+        document_index: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        document_title: Option<String>,
+        end_page_number: u64,
+        start_page_number: u64,
+    },
+    #[serde(rename = "content_block_location")]
+    ContentBlockLocation {
+        cited_text: String,
+        document_index: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        document_title: Option<String>,
+        end_block_index: u64,
+        start_block_index: u64,
+    },
+    #[serde(rename = "web_search_result_location")]
+    WebSearchResultLocation {
+        cited_text: String,
+        encrypted_index: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        url: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
 pub enum WebSearchToolResultContent {
     #[serde(rename = "web_search_result")]
     WebSearchResult {
@@ -351,7 +391,12 @@ pub enum MessageType {
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
-    TextBlock { text: String },
+    TextBlock {
+        text: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        citations: Vec<Citation>,
+    },
     #[serde(rename = "tool_use")]
     ToolUseBlock {
         id: String,
@@ -397,14 +442,21 @@ pub enum ContentBlock {
 
 impl ContentBlock {
     pub fn new_text_block(text: String) -> Self {
-        Self::TextBlock { text }
+        Self::TextBlock {
+            text,
+            citations: Vec::new(),
+        }
     }
 
     pub fn into_content_block_param(self) -> ContentBlockParam {
         match self {
-            Self::TextBlock { text, .. } => ContentBlockParam::TextBlock {
+            Self::TextBlock { text, citations } => ContentBlockParam::TextBlock {
                 text,
-                citations: None,
+                citations: if citations.is_empty() {
+                    None
+                } else {
+                    Some(citations)
+                },
                 cache_control: None,
             },
             ContentBlock::ToolUseBlock { id, input, name } => ContentBlockParam::ToolUseBlock {
@@ -491,22 +543,24 @@ pub enum StopReason {
     ToolUse,
     #[serde(rename = "pause_turn")]
     PauseTurn,
+    #[serde(rename = "refusal")]
+    Refusal,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_creation: Option<Value>,
+    pub cache_creation: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_creation_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_read_input_tokens: Option<u64>,
-    input_tokens: u64,
-    output_tokens: u64,
+    pub cache_read_input_tokens: Option<u64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    server_tool_use: Option<Value>,
+    pub server_tool_use: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    service_tier: Option<ServiceTier>,
+    pub service_tier: Option<ServiceTier>,
 }
 
 impl Usage {

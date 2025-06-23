@@ -5,25 +5,49 @@ use async_stream::stream;
 use futures::Stream;
 
 use crate::messages::{
-    ApiError, ContentBlock, ContentBlockDelta, Message, ServerSentEvent, UsageDelta,
+    ApiError, Citation, ContentBlock, ContentBlockDelta, Message, ServerSentEvent, UsageDelta,
 };
 
 // High-level streaming events with both diff updates and a running snapshot of
 // the accumulated message.
 #[derive(Clone, Debug)]
 pub enum StreamingEvent {
-    MessageStart { message: Message },
-    UsageUpdate { usage: UsageDelta },
-    FinalizedMessage { message: Message },
-    Error { error: ApiError },
-    TextStart { text: String },
-    TextUpdate { diff: String, snapshot: String },
+    MessageStart {
+        message: Message,
+    },
+    UsageUpdate {
+        usage: UsageDelta,
+    },
+    FinalizedMessage {
+        message: Message,
+    },
+    Error {
+        error: ApiError,
+    },
+    TextStart {
+        text: String,
+        citations: Vec<Citation>,
+    },
+    TextUpdate {
+        diff: String,
+        snapshot: String,
+    },
     TextStop,
-    ThinkingStart { thinking: String },
-    ThinkingUpdate { diff: String, snapshot: String },
+    ThinkingStart {
+        thinking: String,
+    },
+    ThinkingUpdate {
+        diff: String,
+        snapshot: String,
+    },
     ThinkingStop,
-    ParseError { error: String, raw_data: String },
-    ProtocolError { error: String },
+    ParseError {
+        error: String,
+        raw_data: String,
+    },
+    ProtocolError {
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -118,7 +142,9 @@ impl StreamProcessor {
                     });
                 }
                 match content_block {
-                    ContentBlock::TextBlock { text } => Some(StreamingEvent::TextStart { text }),
+                    ContentBlock::TextBlock { text, citations } => {
+                        Some(StreamingEvent::TextStart { text, citations })
+                    }
                     ContentBlock::ThinkingBlock { thinking, .. } => {
                         Some(StreamingEvent::ThinkingStart { thinking })
                     }
@@ -163,7 +189,7 @@ impl StreamProcessor {
                 match delta {
                     ContentBlockDelta::TextDelta { text } => {
                         let current_text = match content_block {
-                            ContentBlock::TextBlock { text } => text,
+                            ContentBlock::TextBlock { text, .. } => text,
                             _ => {
                                 return Some(StreamingEvent::ProtocolError {
                                     error: "got text delta for non-text content block".to_string(),
