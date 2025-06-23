@@ -550,7 +550,7 @@ pub enum StopReason {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_creation: Option<Value>,
+    pub cache_creation: Option<CacheCreation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,9 +558,23 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_tool_use: Option<Value>,
+    pub server_tool_use: Option<ServerToolUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u64,
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServerToolUsage {
+    #[serde(default)]
+    pub web_search_requests: u64,
 }
 
 impl Usage {
@@ -679,7 +693,7 @@ pub enum ContentBlockDelta {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UsageDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_creation: Option<Value>,
+    cache_creation: Option<CacheCreation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -689,7 +703,7 @@ pub struct UsageDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    server_tool_use: Option<Value>,
+    server_tool_use: Option<ServerToolUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<ServiceTier>,
 }
