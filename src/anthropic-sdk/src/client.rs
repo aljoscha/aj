@@ -96,12 +96,7 @@ impl Client {
                         Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
                             Ok(json_event) => Some(json_event),
                             Err(err) => {
-                                tracing::error!(
-                                    "could not parse server-sent event {}: {}",
-                                    event.data,
-                                    err
-                                );
-                                None
+                                panic!("could not parse server-sent event {}: {}", event.data, err);
                             }
                         },
                         Err(e) => {
