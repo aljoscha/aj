@@ -355,10 +355,7 @@ impl SessionState {
             .unwrap_or(Path::new(path))
             .display();
 
-        println!(
-            "file {}",
-            style(display_path).fg(Color::Blue).bright()
-        );
+        println!("file {}", style(display_path).fg(Color::Blue).bright());
 
         if lines.len() <= 20 {
             // Display all lines with line numbers
@@ -395,10 +392,7 @@ impl SessionState {
             .unwrap_or(Path::new(path))
             .display();
 
-        println!(
-            "diff {}",
-            style(display_path).fg(Color::Blue).bright()
-        );
+        println!("diff {}", style(display_path).fg(Color::Blue).bright());
 
         let diff = TextDiff::from_lines(old_content, new_content);
 
