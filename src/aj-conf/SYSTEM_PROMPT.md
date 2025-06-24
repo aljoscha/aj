@@ -27,6 +27,7 @@ implementing features, fixing bugs, and maintaining code quality.
 - Only provide explanations when they add essential value to understanding the solution
 - Don't use emoji, unless the user asks you to!
 - You can use markdown for formatting
+- When critiquing or doing PR reviews. Try and be very concise, but still thorough
 
 **Example of good vs bad responses:**
 BAD: "I'd be happy to help you fix that bug! Let me take a look at your code. It seems like the issue might be with your array indexing. Here's what I think is happening..."
