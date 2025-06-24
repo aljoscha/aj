@@ -43,7 +43,7 @@ impl ToolDefinition for GlobTool {
 
     fn execute(
         &self,
-        _session_state: &mut dyn SessionState,
+        session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
@@ -157,11 +157,11 @@ impl ToolDefinition for GlobTool {
         // Sort results by modification time (most recent first)
         results.sort_by(|a, b| b.modified.cmp(&a.modified));
 
-        if results.is_empty() {
-            Ok(format!(
+        let output = if results.is_empty() {
+            format!(
                 "No entries matching pattern '{}' found.",
                 input.pattern
-            ))
+            )
         } else {
             let formatted_results: Vec<String> = results
                 .iter()
@@ -173,14 +173,20 @@ impl ToolDefinition for GlobTool {
                 })
                 .collect();
 
-            Ok(format!(
+            format!(
                 "{:<10} {:<15} {:<20} {}\n{}",
                 "Type",
                 "Size",
                 "Modified",
                 "Path",
                 formatted_results.join("\n")
-            ))
-        }
+            )
+        };
+
+        // Display to user
+        let display_input = format!("path: {}, pattern: {}", input.path, input.pattern);
+        session_state.display_tool_result("glob", &display_input, &output);
+
+        Ok(output)
     }
 }

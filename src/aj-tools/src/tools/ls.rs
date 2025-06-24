@@ -41,7 +41,7 @@ impl ToolDefinition for LsTool {
 
     fn execute(
         &self,
-        _session_state: &mut dyn SessionState,
+        session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
@@ -120,16 +120,25 @@ impl ToolDefinition for LsTool {
         // Sort results alphabetically
         results.sort();
 
-        if results.is_empty() {
-            Ok("No entries found.".to_string())
+        let output = if results.is_empty() {
+            "No entries found.".to_string()
         } else {
-            Ok(format!(
+            format!(
                 "{:<20} {:<10} {}\n{}",
                 "Name",
                 "Type",
                 "Size",
                 results.join("\n")
-            ))
-        }
+            )
+        };
+
+        // Display to user
+        let display_input = match input.ignore.as_ref() {
+            Some(ignore_patterns) => format!("path: {}, ignore: {:?}", input.path, ignore_patterns),
+            None => format!("path: {}", input.path),
+        };
+        session_state.display_tool_result("ls", &display_input, &output);
+
+        Ok(output)
     }
 }

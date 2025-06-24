@@ -49,7 +49,7 @@ impl ToolDefinition for GrepTool {
 
     fn execute(
         &self,
-        _session_state: &mut dyn SessionState,
+        session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
@@ -170,25 +170,34 @@ impl ToolDefinition for GrepTool {
         // Sort results by modification time (most recent first)
         results.sort_by(|a, b| b.modified.cmp(&a.modified));
 
-        if results.is_empty() {
+        let output = if results.is_empty() {
             let include_pattern = input.include.as_deref().unwrap_or("*");
-            Ok(format!(
+            format!(
                 "No files matching pattern '{}' with include filter '{}' found.",
                 input.pattern, include_pattern
-            ))
+            )
         } else {
             let formatted_results: Vec<String> = results
                 .iter()
                 .map(|r| format!("{:<15} {:<20} {}", r.size, r.modified_str, r.path))
                 .collect();
 
-            Ok(format!(
+            format!(
                 "{:<15} {:<20} {}\n{}",
                 "Size",
                 "Modified",
                 "Path",
                 formatted_results.join("\n")
-            ))
-        }
+            )
+        };
+
+        // Display to user
+        let display_input = match input.include.as_ref() {
+            Some(include) => format!("path: {}, pattern: {}, include: {}", input.path, input.pattern, include),
+            None => format!("path: {}, pattern: {}", input.path, input.pattern),
+        };
+        session_state.display_tool_result("grep", &display_input, &output);
+
+        Ok(output)
     }
 }
