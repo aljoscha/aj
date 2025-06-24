@@ -1,9 +1,9 @@
-use tracing_subscriber::EnvFilter;
-
+use aj::ui_cli::AjCli;
 use aj_agent::Agent;
 use aj_conf::{AgentEnv, SYSTEM_PROMPT};
 use aj_tools::get_builtin_tools;
-use aj_ui::{AjCli, AjUi};
+use aj_ui::AjUi;
+use tracing_subscriber::EnvFilter;
 
 /// A harness that's setting up our logging and environment variables and calls
 /// into our "real" `run()`.
