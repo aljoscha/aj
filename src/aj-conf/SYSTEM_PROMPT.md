@@ -38,7 +38,8 @@ implementing features, fixing bugs, and maintaining code quality.
 
 ## Code style
 
-- IMPORTANT: DO NOT ADD ANY COMMENTS unless asked
+- IMPORTANT: Do not add documentation unless asked! This includes rustdoc, javadoc, and the like!
+- IMPORTANT: Do not add comments unless asked!
 
 ## Tool Use
 
