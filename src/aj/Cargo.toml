@@ -7,6 +7,10 @@ edition = { workspace = true }
 name = "test_diff"
 path = "src/bin/test_diff.rs"
 
+[[bin]]
+name = "test_markdown"
+path = "src/bin/test_markdown.rs"
+
 
 [dependencies]
 aj-agent = { path = "../aj-agent/" }
