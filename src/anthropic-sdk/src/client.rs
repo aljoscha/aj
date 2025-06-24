@@ -79,6 +79,7 @@ impl Client {
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", self.api_key.clone())
             .header("anthropic-version", self.version.clone())
+            .header("anthropic-beta", "interleaved-thinking-2025-05-14")
             .header("content-type", "application/json")
             .json(&messages);
 
