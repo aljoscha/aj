@@ -96,27 +96,127 @@ impl AjUi for AjCli {
         );
 
         let diff = TextDiff::from_lines(before, after);
+        const CONTEXT_LINES: usize = 3;
 
-        for change in diff.iter_all_changes() {
-            let sign = match change.tag() {
-                ChangeTag::Delete => "-",
-                ChangeTag::Insert => "+",
-                ChangeTag::Equal => " ",
-            };
+        // Collect all changes with line numbers
+        let changes: Vec<_> = diff.iter_all_changes().enumerate().collect();
 
-            let styled_line = match change.tag() {
-                ChangeTag::Delete => style(format!("{} {}", sign, change.value().trim_end()))
+        // Find ranges of changes with context
+        let mut ranges = Vec::new();
+        let mut current_start = None;
+
+        for (i, change) in &changes {
+            match change.tag() {
+                ChangeTag::Delete | ChangeTag::Insert => {
+                    if current_start.is_none() {
+                        current_start = Some(i.saturating_sub(CONTEXT_LINES));
+                    }
+                }
+                ChangeTag::Equal => {
+                    if let Some(start) = current_start {
+                        ranges.push((start, (i + CONTEXT_LINES).min(changes.len())));
+                        current_start = None;
+                    }
+                }
+            }
+        }
+
+        // Handle case where diff ends with changes
+        if let Some(start) = current_start {
+            ranges.push((start, changes.len()));
+        }
+
+        // Merge overlapping ranges
+        ranges.sort_by_key(|(start, _)| *start);
+        let mut merged_ranges = Vec::new();
+        for (start, end) in ranges {
+            if let Some((_, last_end)) = merged_ranges.last_mut() {
+                if start <= *last_end {
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+            }
+            merged_ranges.push((start, end));
+        }
+
+        let mut old_line_num = 1;
+        let mut new_line_num = 1;
+        let mut is_first_range = true;
+
+        for (range_start, range_end) in &merged_ranges {
+            // Show separator if not the first range
+            if !is_first_range && *range_start > 0 {
+                println!("{}", style("...").dim());
+            }
+            is_first_range = false;
+
+            // Calculate line numbers at range start
+            for (i, _) in changes.iter().take(*range_start) {
+                let change = &changes[*i].1;
+                match change.tag() {
+                    ChangeTag::Delete => old_line_num += 1,
+                    ChangeTag::Insert => new_line_num += 1,
+                    ChangeTag::Equal => {
+                        old_line_num += 1;
+                        new_line_num += 1;
+                    }
+                }
+            }
+
+            // Display changes in this range
+            for (_, change) in changes.iter().take(*range_end).skip(*range_start) {
+                let sign = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+
+                let line_num_str = match change.tag() {
+                    ChangeTag::Delete => format!("{:4}     ", old_line_num),
+                    ChangeTag::Insert => format!("     {:4}", new_line_num),
+                    ChangeTag::Equal => format!("{:4}:{:4}", old_line_num, new_line_num),
+                };
+
+                let styled_line = match change.tag() {
+                    ChangeTag::Delete => style(format!(
+                        "{} {} {}",
+                        line_num_str,
+                        sign,
+                        change.value().trim_end()
+                    ))
                     .bg(Color::Red)
                     .on_bright()
                     .black(),
-                ChangeTag::Insert => style(format!("{} {}", sign, change.value().trim_end()))
+                    ChangeTag::Insert => style(format!(
+                        "{} {} {}",
+                        line_num_str,
+                        sign,
+                        change.value().trim_end()
+                    ))
                     .bg(Color::Green)
                     .on_bright()
                     .black(),
-                ChangeTag::Equal => style(format!("{} {}", sign, change.value().trim_end())).dim(),
-            };
+                    ChangeTag::Equal => style(format!(
+                        "{} {} {}",
+                        line_num_str,
+                        sign,
+                        change.value().trim_end()
+                    ))
+                    .dim(),
+                };
 
-            println!("{}", styled_line);
+                println!("{}", styled_line);
+
+                // Update line numbers
+                match change.tag() {
+                    ChangeTag::Delete => old_line_num += 1,
+                    ChangeTag::Insert => new_line_num += 1,
+                    ChangeTag::Equal => {
+                        old_line_num += 1;
+                        new_line_num += 1;
+                    }
+                }
+            }
         }
         println!();
     }
