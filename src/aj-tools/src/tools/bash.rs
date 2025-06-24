@@ -21,6 +21,8 @@ Usage:
 - Provide a clear description of what the command does and why you want to run it
 - Set an appropriate timeout (default is 30 seconds)
 - The command will be parsed and executed directly, not inside a shell
+- IMPORTANT: Don't use search commands like find and grep. Instead use the grep and glob tools. Also don't use commands like cat and ls, instead use the read_file and ls tools.
+- If you absolutely must use a grep-like tool, use ripgrep (rg).
 "#;
 
 pub struct BashTool;
