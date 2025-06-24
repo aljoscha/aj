@@ -189,7 +189,7 @@ impl<UI: AjUi> Agent<UI> {
                         Ok(result) => (result, false),
                         Err(err) => {
                             self.ui
-                                .display_tool_error(&tool_name, "tool_input", &err.to_string());
+                                .display_tool_error(&tool_name, "[...]", &err.to_string());
                             (format!("{}", err), true)
                         }
                     };

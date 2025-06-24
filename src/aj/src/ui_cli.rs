@@ -32,7 +32,7 @@ impl AjUi for AjCli {
     fn get_user_input(&self) -> Option<String> {
         use std::io::{self, Write};
 
-        print!("{}: ", style("you").fg(Color::Blue));
+        print!("{}: ", style("you").bold().fg(Color::Blue));
 
         io::stdout().flush().unwrap();
 
@@ -49,7 +49,7 @@ impl AjUi for AjCli {
     }
 
     fn agent_text_start(&self, text: &str) {
-        print!("{}: {}", style("aj").fg(Color::Yellow), text);
+        print!("{}: {}", style("aj").bold().fg(Color::Yellow), text);
     }
 
     fn agent_text_update(&self, diff: &str) {
@@ -63,7 +63,7 @@ impl AjUi for AjCli {
     fn agent_thinking_start(&self, thinking: &str) {
         print!(
             "{}: {}",
-            style("aj is thinking").fg(DARK_GRAY),
+            style("aj is thinking").bold().fg(DARK_GRAY),
             style(thinking).fg(LIGHT_GRAY).on_bright()
         );
     }
@@ -79,8 +79,8 @@ impl AjUi for AjCli {
     fn display_tool_result(&self, tool_name: &str, input: &str, result: &str) {
         println!(
             "{}: {}({})",
-            style("tool").fg(Color::Green),
-            tool_name,
+            style("tool").bold().fg(Color::Green),
+            style(tool_name).bold(),
             input
         );
 
@@ -91,7 +91,7 @@ impl AjUi for AjCli {
         println!(
             "{}: {}({})",
             style("tool").fg(Color::Green),
-            tool_name,
+            style(tool_name).bold(),
             input
         );
 
@@ -225,7 +225,7 @@ impl AjUi for AjCli {
         println!(
             "{}: {}({})",
             style("tool").fg(Color::Green),
-            tool_name,
+            style(tool_name).bold(),
             input
         );
         println!("{}: {}", style("tool_error").bold().fg(Color::Red), error);
