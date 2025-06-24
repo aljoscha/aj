@@ -1,6 +1,7 @@
 use aj_ui::AjUi;
 use console::{Color, style};
 use similar::{ChangeTag, TextDiff};
+use termimad::{Alignment, MadSkin};
 
 /// Cli-based implementation of [AjUi].
 pub struct AjCli;
@@ -48,16 +49,17 @@ impl AjUi for AjCli {
         input
     }
 
-    fn agent_text_start(&self, text: &str) {
-        print!("{}: {}", style("aj").bold().fg(Color::Yellow), text);
+    fn agent_text_start(&self, _text: &str) {
+        print!("{}:\n", style("aj").bold().fg(Color::Yellow));
     }
 
-    fn agent_text_update(&self, diff: &str) {
-        print!("{}", diff);
+    fn agent_text_update(&self, _diff: &str) {
+        // print!("{}", diff);
     }
 
-    fn agent_text_stop(&self) {
-        println!("\n");
+    fn agent_text_stop(&self, text: &str) {
+        render_markdown(text);
+        println!();
     }
 
     fn agent_thinking_start(&self, thinking: &str) {
@@ -246,4 +248,24 @@ impl AjUi for AjCli {
 
         user_input == "y" || user_input == "yes"
     }
+}
+
+fn render_markdown(text: &str) {
+    let mut skin = MadSkin::default_light();
+    skin.headers[0].align = Alignment::Left;
+    skin.headers[0].add_attr(termimad::crossterm::style::Attribute::Underlined);
+    skin.headers[0].add_attr(termimad::crossterm::style::Attribute::Bold);
+
+    skin.headers[1].add_attr(termimad::crossterm::style::Attribute::NoUnderline);
+    skin.headers[1].add_attr(termimad::crossterm::style::Attribute::Bold);
+
+    skin.headers[2].add_attr(termimad::crossterm::style::Attribute::NoUnderline);
+    skin.headers[2].add_attr(termimad::crossterm::style::Attribute::Bold);
+
+    skin.inline_code
+        .set_fg(termimad::crossterm::style::Color::Blue);
+    skin.inline_code
+        .set_bg(termimad::crossterm::style::Color::White);
+
+    skin.print_text(text);
 }
