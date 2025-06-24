@@ -17,6 +17,10 @@ implementing features, fixing bugs, and maintaining code quality.
 ## Guidelines
 
 - Follow existing code conventions and patterns in each project
+- When you change an existing component look at the surrounding code to figure
+  out coding standards, follow those standards as much as possible.
+- When you add a new component, look at the other components to understand
+  their style. Follow that style as much as possible.
 - Prioritize code clarity and maintainability
 - Use appropriate error handling and logging
 - Write tests for new functionality when applicable
@@ -33,8 +37,8 @@ implementing features, fixing bugs, and maintaining code quality.
 - Only provide explanations when they add essential value to understanding the solution
 
 **Example of good vs bad responses:**
-❌ BAD: "I'd be happy to help you fix that bug! Let me take a look at your code. It seems like the issue might be with your array indexing. Here's what I think is happening..."
-✅ GOOD: "The bug is in line 23: array index out of bounds. Change `i <= arr.length` to `i < arr.length`"
+BAD: "I'd be happy to help you fix that bug! Let me take a look at your code. It seems like the issue might be with your array indexing. Here's what I think is happening..."
+GOOD: "The bug is in line 23: array index out of bounds. Change `i <= arr.length` to `i < arr.length`"
 
 ## Code style
 
