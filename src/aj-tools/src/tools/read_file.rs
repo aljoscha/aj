@@ -75,11 +75,19 @@ impl ToolDefinition for ReadFileTool {
         // Display the file contents to the user
         let selected_content = &lines[start_idx..end_idx];
 
-        let display_path = Path::new(path)
+        let mut display_path = Path::new(path)
             .strip_prefix(session_state.working_directory())
             .unwrap_or(Path::new(path))
             .display()
             .to_string();
+
+        // Append offset and limit information to display path
+        if input.offset.is_some() || input.limit.is_some() {
+            let start_line = start_idx + 1; // Convert to 1-based line number
+            let end_line = end_idx; // Already 1-based for display
+            display_path.push_str(&format!(" {}:{}", start_line, end_line));
+        }
+
         let formatted_for_display = format_for_display(start_idx, selected_content);
         session_state.display_tool_result("read_file", &display_path, &formatted_for_display);
 
