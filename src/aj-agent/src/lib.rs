@@ -133,8 +133,8 @@ impl<UI: AjUi> Agent<UI> {
                         StreamingEvent::TextUpdate { diff, snapshot: _ } => {
                             self.ui.agent_text_update(&diff);
                         }
-                        StreamingEvent::TextStop => {
-                            self.ui.agent_text_stop();
+                        StreamingEvent::TextStop { text } => {
+                            self.ui.agent_text_stop(&text);
                         }
                         StreamingEvent::ThinkingStart { thinking: _ } => {
                             self.ui.agent_thinking_start("...");

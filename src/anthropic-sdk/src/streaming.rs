@@ -32,7 +32,10 @@ pub enum StreamingEvent {
         diff: String,
         snapshot: String,
     },
-    TextStop,
+    TextStop {
+        /// The complete text block.
+        text: String,
+    },
     ThinkingStart {
         thinking: String,
     },
@@ -266,9 +269,12 @@ impl StreamProcessor {
                 };
 
                 match content_block {
-                    text_block @ ContentBlock::TextBlock { .. } => {
-                        current_message.content.push(text_block);
-                        Some(StreamingEvent::TextStop)
+                    ContentBlock::TextBlock { text, citations } => {
+                        current_message.content.push(ContentBlock::TextBlock {
+                            text: text.clone(),
+                            citations,
+                        });
+                        Some(StreamingEvent::TextStop { text })
                     }
                     thinking_block @ ContentBlock::ThinkingBlock { .. } => {
                         current_message.content.push(thinking_block);

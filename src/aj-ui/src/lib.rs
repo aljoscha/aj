@@ -8,7 +8,7 @@ pub trait AjUi {
 
     fn agent_text_start(&self, text: &str);
     fn agent_text_update(&self, diff: &str);
-    fn agent_text_stop(&self);
+    fn agent_text_stop(&self, text: &str);
 
     fn agent_thinking_start(&self, thinking: &str);
     fn agent_thinking_update(&self, diff: &str);
