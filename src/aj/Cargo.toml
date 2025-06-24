@@ -3,6 +3,11 @@ name = "aj"
 version = { workspace = true }
 edition = { workspace = true }
 
+[[bin]]
+name = "test_diff"
+path = "src/bin/test_diff.rs"
+
+
 [dependencies]
 aj-agent = { path = "../aj-agent/" }
 aj-conf = { path = "../aj-conf/" }
