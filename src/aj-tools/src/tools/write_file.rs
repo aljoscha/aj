@@ -96,17 +96,23 @@ impl ToolDefinition for WriteFileTool {
             }
         }
 
+        let display_path = Path::new(path)
+            .strip_prefix(session_state.working_directory())
+            .unwrap_or(Path::new(path))
+            .display()
+            .to_string();
+
         // Display the diff or file contents to the user
         if let Some(original) = &original_content {
             session_state.display_tool_result_diff(
                 "write_file",
-                &input.path,
+                &display_path,
                 original,
                 &input.content,
             );
         } else {
             // New file - display the content
-            session_state.display_tool_result("write_file", &input.path, &input.content);
+            session_state.display_tool_result("write_file", &display_path, &input.content);
         }
 
         fs::write(&input.path, &input.content)
