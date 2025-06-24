@@ -5,7 +5,9 @@ use grep::searcher::sinks::UTF8;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
@@ -22,6 +24,45 @@ Usage:
 - Returns a list of file paths with at least one match, including file size and modification time
 - Results are sorted by modification time (most recent first)
 "#;
+
+/// Get the set of files tracked by git in the given directory, if it's a git repository.
+/// Returns None if not in a git repository or if git command fails.
+fn get_git_tracked_files(path: &Path) -> Option<HashSet<PathBuf>> {
+    // Check if we're in a git repository by running git status
+    let output = Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .current_dir(path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // Get the list of tracked files
+    let output = Command::new("git")
+        .arg("ls-files")
+        .current_dir(path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let files_str = String::from_utf8_lossy(&output.stdout);
+    let mut tracked_files = HashSet::new();
+
+    for line in files_str.lines() {
+        let file_path = PathBuf::from(line);
+        // Convert to absolute path
+        let absolute_path = path.join(&file_path);
+        tracked_files.insert(absolute_path);
+    }
+
+    Some(tracked_files)
+}
 
 pub struct GrepTool;
 
@@ -71,6 +112,9 @@ impl ToolDefinition for GrepTool {
 
         let matcher = RegexMatcher::new(&input.pattern)
             .map_err(|e| anyhow::anyhow!("Invalid regex pattern '{}': {}", input.pattern, e))?;
+
+        // Get git tracked files if we're in a git repository
+        let git_tracked_files = get_git_tracked_files(path);
 
         // Build glob pattern for file filtering
         let include_pattern = input.include.as_deref().unwrap_or("*");
@@ -124,6 +168,13 @@ impl ToolDefinition for GrepTool {
             // Check if the relative path matches our include pattern
             if !glob_set.is_match(relative_path) {
                 continue;
+            }
+
+            // If we're in a git repository, only process git-tracked files
+            if let Some(ref tracked_files) = git_tracked_files {
+                if !tracked_files.contains(entry.path()) {
+                    continue;
+                }
             }
 
             let absolute_path = entry.path().to_string_lossy().to_string();
@@ -193,7 +244,10 @@ impl ToolDefinition for GrepTool {
 
         // Display to user
         let display_input = match input.include.as_ref() {
-            Some(include) => format!("path: {}, pattern: {}, include: {}", input.path, input.pattern, include),
+            Some(include) => format!(
+                "path: {}, pattern: {}, include: {}",
+                input.path, input.pattern, include
+            ),
             None => format!("path: {}, pattern: {}", input.path, input.pattern),
         };
         session_state.display_tool_result("grep", &display_input, &output);
