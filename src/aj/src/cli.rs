@@ -1,4 +1,4 @@
-use aj_ui::AjUi;
+use aj_ui::{AjUi, TokenUsage};
 use console::{Color, style};
 use rustyline::config::Config;
 use rustyline::config::EditMode;
@@ -241,6 +241,28 @@ impl AjUi for AjCli {
         println!();
 
         user_input == "y" || user_input == "yes"
+    }
+
+    fn display_token_usage(&self, usage: &TokenUsage) {
+        let format_tokens = |acc: u64, turn: u64| -> String {
+            if turn == 0 {
+                format!("{}", acc)
+            } else {
+                format!("{}+{}", acc, turn)
+            }
+        };
+
+        let input_str = format_tokens(usage.accumulated_input, usage.turn_input);
+        let output_str = format_tokens(usage.accumulated_output, usage.turn_output);
+        let cache_creation_str =
+            format_tokens(usage.accumulated_cache_creation, usage.turn_cache_creation);
+        let cache_read_str = format_tokens(usage.accumulated_cache_read, usage.turn_cache_read);
+
+        let usage_string = format!(
+            "Token Usage - Input: {} | Output: {} | Cache Creation: {} | Cache Read: {}",
+            input_str, output_str, cache_creation_str, cache_read_str,
+        );
+        println!("{}\n", style(usage_string).dim())
     }
 }
 

@@ -563,22 +563,22 @@ pub struct Usage {
     pub service_tier: Option<ServiceTier>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CacheCreation {
-    #[serde(default)]
-    pub ephemeral_1h_input_tokens: u64,
-    #[serde(default)]
-    pub ephemeral_5m_input_tokens: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ServerToolUsage {
-    #[serde(default)]
-    pub web_search_requests: u64,
+impl Default for Usage {
+    fn default() -> Self {
+        Self {
+            cache_creation: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            server_tool_use: None,
+            service_tier: None,
+        }
+    }
 }
 
 impl Usage {
-    pub fn update(&mut self, delta: &UsageDelta) {
+    pub fn add(&mut self, delta: &UsageDelta) {
         // Accumulate cache creation tokens
         if let Some(delta_cache_creation) = delta.cache_creation.as_ref() {
             match &mut self.cache_creation {
@@ -630,6 +630,32 @@ impl Usage {
             self.service_tier = Some(service_tier.clone());
         }
     }
+
+    pub fn into_usage_delta(self) -> UsageDelta {
+        UsageDelta {
+            cache_creation: self.cache_creation,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            input_tokens: Some(self.input_tokens),
+            output_tokens: Some(self.output_tokens),
+            server_tool_use: self.server_tool_use,
+            service_tier: self.service_tier,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u64,
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServerToolUsage {
+    #[serde(default)]
+    pub web_search_requests: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

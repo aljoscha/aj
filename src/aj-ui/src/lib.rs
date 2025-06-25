@@ -19,4 +19,19 @@ pub trait AjUi {
     fn display_tool_error(&self, tool_name: &str, input: &str, error: &str);
 
     fn ask_permission(&self, message: &str) -> bool;
+
+    fn display_token_usage(&self, usage: &TokenUsage);
+}
+
+/// Token usage information for display
+#[derive(Debug, Clone)]
+pub struct TokenUsage {
+    pub accumulated_input: u64,
+    pub turn_input: u64,
+    pub accumulated_output: u64,
+    pub turn_output: u64,
+    pub accumulated_cache_creation: u64,
+    pub turn_cache_creation: u64,
+    pub accumulated_cache_read: u64,
+    pub turn_cache_read: u64,
 }

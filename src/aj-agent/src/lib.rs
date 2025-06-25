@@ -7,9 +7,10 @@ use aj_conf::AgentEnv;
 use aj_tools::{
     ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState,
 };
-use aj_ui::AjUi;
+use aj_ui::{AjUi, TokenUsage};
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
+    Usage,
 };
 use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
@@ -24,6 +25,7 @@ pub struct Agent<UI: AjUi> {
     client: anthropic_sdk::client::Client,
     session_state: SessionState<UI>,
     turn_counter: usize,
+    accumulated_usage: Usage,
 }
 
 impl<UI: AjUi> Agent<UI> {
@@ -63,6 +65,15 @@ impl<UI: AjUi> Agent<UI> {
             env,
             turn_counter: 0,
             ui,
+            accumulated_usage: Usage {
+                cache_creation: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                server_tool_use: None,
+                service_tier: None,
+            },
         }
     }
 
@@ -117,12 +128,16 @@ impl<UI: AjUi> Agent<UI> {
             let response_stream = self.run_inference_streaming(&conversation).await?;
 
             let mut response: Option<Message> = None;
+            let mut turn_usage_update = Usage::default();
+
             {
                 let mut response_stream = pin!(response_stream);
                 while let Some(event) = response_stream.next().await {
                     match event {
-                        StreamingEvent::MessageStart { message: _ } => (),
-                        StreamingEvent::UsageUpdate { usage: _ } => (),
+                        StreamingEvent::MessageStart { message } => {
+                            turn_usage_update.add(&message.usage.into_usage_delta());
+                        }
+                        StreamingEvent::UsageUpdate { usage } => turn_usage_update.add(&usage),
                         StreamingEvent::FinalizedMessage { message } => {
                             response = Some(message);
                         }
@@ -176,6 +191,24 @@ impl<UI: AjUi> Agent<UI> {
 
             // Add the assistant's message to conversation
             conversation.push(response.into_message_param());
+
+            let usage = TokenUsage {
+                accumulated_input: self.accumulated_usage.input_tokens,
+                turn_input: turn_usage_update.input_tokens,
+                accumulated_output: self.accumulated_usage.output_tokens,
+                turn_output: turn_usage_update.output_tokens,
+                accumulated_cache_creation: self
+                    .accumulated_usage
+                    .cache_creation_input_tokens
+                    .unwrap_or(0),
+                turn_cache_creation: turn_usage_update.cache_creation_input_tokens.unwrap_or(0),
+                accumulated_cache_read: self.accumulated_usage.cache_read_input_tokens.unwrap_or(0),
+                turn_cache_read: turn_usage_update.cache_read_input_tokens.unwrap_or(0),
+            };
+            self.ui.display_token_usage(&usage);
+
+            self.accumulated_usage
+                .add(&turn_usage_update.into_usage_delta());
 
             // Execute tool calls if any
             if has_tool_use {

@@ -110,7 +110,7 @@ impl StreamProcessor {
                 message.stop_reason = delta.stop_reason;
                 message.stop_sequence = delta.stop_sequence;
 
-                message.usage.update(&usage);
+                message.usage.add(&usage);
 
                 Some(StreamingEvent::UsageUpdate { usage })
             }
