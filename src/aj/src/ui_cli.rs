@@ -79,23 +79,13 @@ impl AjUi for AjCli {
     }
 
     fn display_tool_result(&self, tool_name: &str, input: &str, result: &str) {
-        println!(
-            "{}: {}({})",
-            style("tool").bold().fg(Color::Green),
-            style(tool_name).bold(),
-            input
-        );
+        println!("{}({})", style(tool_name).bold().fg(Color::Green), input);
 
         println!("{}\n", result);
     }
 
     fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str) {
-        println!(
-            "{}: {}({})",
-            style("tool").fg(Color::Green),
-            style(tool_name).bold(),
-            input
-        );
+        println!("{}({})", style(tool_name).bold().fg(Color::Green), input);
 
         let diff = TextDiff::from_lines(before, after);
         const CONTEXT_LINES: usize = 3;
@@ -224,12 +214,7 @@ impl AjUi for AjCli {
     }
 
     fn display_tool_error(&self, tool_name: &str, input: &str, error: &str) {
-        println!(
-            "{}: {}({})",
-            style("tool").fg(Color::Green),
-            style(tool_name).bold(),
-            input
-        );
+        println!("{}({})", style(tool_name).bold().fg(Color::Green), input);
         println!("{}: {}", style("tool_error").bold().fg(Color::Red), error);
     }
 
