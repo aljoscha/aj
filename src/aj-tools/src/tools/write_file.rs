@@ -15,6 +15,7 @@ Usage:
 - For existing files, the agent must have read the file recently (access time check prevents overwriting files that haven't been examined)
 - Prefer editing existing files over creating new ones - only create new files when explicitly required
 - The tool will fail if attempting to overwrite a file that hasn't been accessed recently enough
+- IMPORTANT: Don't use this tool for renaming a file. Prefer to use the bash tool with the mv command.
 "#;
 
 pub struct WriteFileTool;
