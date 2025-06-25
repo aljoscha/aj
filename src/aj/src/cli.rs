@@ -1,5 +1,9 @@
 use aj_ui::AjUi;
 use console::{Color, style};
+use rustyline::config::Config;
+use rustyline::config::EditMode;
+use rustyline::history::FileHistory;
+use rustyline::{Cmd, Editor, KeyEvent};
 use similar::{ChangeTag, TextDiff};
 use termimad::{Alignment, MadSkin};
 
@@ -31,22 +35,27 @@ impl AjUi for AjCli {
     }
 
     fn get_user_input(&self) -> Option<String> {
-        use std::io::{self, Write};
+        let config = Config::builder().edit_mode(EditMode::Emacs).build();
 
-        print!("{}: ", style("you").bold().fg(Color::Blue));
+        let mut rl: Editor<(), FileHistory> = Editor::with_config(config).unwrap();
 
-        io::stdout().flush().unwrap();
+        rl.bind_sequence(KeyEvent::ctrl('S'), Cmd::Newline);
 
-        let mut input = String::new();
-        let input = match io::stdin().read_line(&mut input) {
-            Ok(0) => None, // EOF (ctrl-d)
-            Ok(_) => Some(input.trim().to_string()),
-            Err(_) => None, // Error (ctrl-c or other)
-        };
+        let prompt = format!("{}: ", style("you").bold().fg(Color::Blue));
 
-        println!();
-
-        input
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                if line.trim().is_empty() {
+                    println!();
+                    return None;
+                }
+                println!();
+                Some(line)
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => None, // Ctrl-C
+            Err(rustyline::error::ReadlineError::Eof) => None,         // Ctrl-D
+            Err(_) => None,
+        }
     }
 
     fn agent_text_start(&self, _text: &str) {
