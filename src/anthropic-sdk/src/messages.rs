@@ -719,17 +719,17 @@ pub enum ContentBlockDelta {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UsageDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_creation: Option<CacheCreation>,
+    pub cache_creation: Option<CacheCreation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_creation_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cache_read_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    input_tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    server_tool_use: Option<ServerToolUsage>,
+    pub server_tool_use: Option<ServerToolUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    service_tier: Option<ServiceTier>,
+    pub service_tier: Option<ServiceTier>,
 }
