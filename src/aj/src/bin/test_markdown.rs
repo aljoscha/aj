@@ -1,4 +1,4 @@
-use aj::ui_cli::AjCli;
+use aj::cli::AjCli;
 use aj_ui::AjUi;
 
 fn main() {

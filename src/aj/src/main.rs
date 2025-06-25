@@ -1,4 +1,4 @@
-use aj::ui_cli::AjCli;
+use aj::cli::AjCli;
 use aj_agent::Agent;
 use aj_conf::{AgentEnv, SYSTEM_PROMPT};
 use aj_tools::get_builtin_tools;

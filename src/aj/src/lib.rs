@@ -1,1 +1,1 @@
-pub mod ui_cli;
+pub mod cli;
