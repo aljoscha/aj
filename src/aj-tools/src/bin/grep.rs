@@ -1,4 +1,5 @@
 use aj_tools::tools::grep::{GrepInput, GrepTool};
+use aj_tools::tools::todo::TodoItem;
 use aj_tools::{SessionState, ToolDefinition, TurnState};
 use std::env;
 use std::path::PathBuf;
@@ -21,6 +22,14 @@ impl SessionState for DummySessionState {
     }
 
     fn display_tool_error(&self, _tool_name: &str, _input: &str, _error: &str) {}
+
+    fn get_todo_list(&self) -> Vec<TodoItem> {
+        Vec::new()
+    }
+
+    fn set_todo_list(&mut self, _todos: Vec<TodoItem>) {
+        // No-op for dummy implementation
+    }
 }
 
 struct DummyTurnState;

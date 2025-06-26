@@ -6,6 +6,7 @@ use aj_conf::AgentEnv;
 use aj_tools::{
     ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState,
 };
+use aj_tools::tools::todo::TodoItem;
 use aj_ui::{AjUi, TokenUsage};
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
@@ -372,11 +373,20 @@ impl<'a, UI: AjUi> ToolSessionState for SessionStateWrapper<'a, UI> {
     fn ask_permission(&self, message: &str) -> bool {
         self.ui.ask_permission(message)
     }
+
+    fn get_todo_list(&self) -> Vec<TodoItem> {
+        self.session_state.get_todo_list()
+    }
+
+    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
+        self.session_state.set_todo_list(todos);
+    }
 }
 
 #[derive(Debug)]
 pub struct SessionState<UI: AjUi> {
     pub working_directory: PathBuf,
+    todo_list: Vec<TodoItem>,
     ui: std::marker::PhantomData<UI>,
 }
 
@@ -384,12 +394,21 @@ impl<UI: AjUi> SessionState<UI> {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
             working_directory,
+            todo_list: Vec::new(),
             ui: std::marker::PhantomData,
         }
     }
 
     fn working_directory(&self) -> PathBuf {
         self.working_directory.to_owned()
+    }
+
+    fn get_todo_list(&self) -> Vec<TodoItem> {
+        self.todo_list.clone()
+    }
+
+    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
+        self.todo_list = todos;
     }
 }
 

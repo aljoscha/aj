@@ -6,6 +6,8 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::tools::todo::TodoItem;
+
 pub mod tools;
 mod util;
 
@@ -16,6 +18,7 @@ pub use tools::glob::GlobTool;
 pub use tools::grep::GrepTool;
 pub use tools::ls::LsTool;
 pub use tools::read_file::ReadFileTool;
+pub use tools::todo::{TodoReadTool, TodoWriteTool};
 pub use tools::write_file::WriteFileTool;
 use util::derive_schema;
 
@@ -101,6 +104,12 @@ pub trait SessionState: Send {
     fn ask_permission(&self, _message: &str) -> bool {
         false
     }
+
+    /// Get the current todo list for the session.
+    fn get_todo_list(&self) -> Vec<TodoItem>;
+
+    /// Set the todo list for the session.
+    fn set_todo_list(&mut self, todos: Vec<TodoItem>);
 }
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
@@ -117,5 +126,7 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
         LsTool.into(),
         GlobTool.into(),
         GrepTool.into(),
+        TodoReadTool.into(),
+        TodoWriteTool.into(),
     ]
 }
