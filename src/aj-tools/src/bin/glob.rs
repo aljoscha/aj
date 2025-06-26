@@ -1,21 +1,12 @@
 use aj_tools::tools::glob::{GlobInput, GlobTool};
 use aj_tools::{SessionState, ToolDefinition, TurnState};
 use std::env;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::PathBuf;
 
 struct DummySessionState;
 impl SessionState for DummySessionState {
     fn working_directory(&self) -> PathBuf {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
-
-    fn record_file_access(&mut self, _path: PathBuf) {
-        // No-op for test binary
-    }
-
-    fn get_file_access_time(&self, _path: &Path) -> Option<SystemTime> {
-        None
     }
 
     fn display_tool_result(&self, _tool_name: &str, _input: &str, _output: &str) {}

@@ -91,8 +91,6 @@ impl ToolDefinition for ReadFileTool {
         let formatted_for_display = format_for_display(start_idx, selected_content);
         session_state.display_tool_result("read_file", &display_path, &formatted_for_display);
 
-        session_state.record_file_access(path.to_path_buf());
-
         // Format lines with line numbers for the tool result
         let formatted_lines: Vec<String> = lines[start_idx..end_idx]
             .iter()

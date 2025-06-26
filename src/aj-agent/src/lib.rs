@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::pin;
-use std::time::SystemTime;
 
 use aj_conf::AgentEnv;
 use aj_tools::{
@@ -357,14 +356,6 @@ impl<'a, UI: AjUi> ToolSessionState for SessionStateWrapper<'a, UI> {
         self.session_state.working_directory()
     }
 
-    fn record_file_access(&mut self, path: PathBuf) {
-        self.session_state.record_file_access(path);
-    }
-
-    fn get_file_access_time(&self, path: &Path) -> Option<SystemTime> {
-        self.session_state.get_file_access_time(path)
-    }
-
     fn display_tool_result(&self, tool_name: &str, input: &str, output: &str) {
         self.ui.display_tool_result(tool_name, input, output);
     }
@@ -386,7 +377,6 @@ impl<'a, UI: AjUi> ToolSessionState for SessionStateWrapper<'a, UI> {
 #[derive(Debug)]
 pub struct SessionState<UI: AjUi> {
     pub working_directory: PathBuf,
-    pub accessed_files: HashMap<PathBuf, SystemTime>,
     ui: std::marker::PhantomData<UI>,
 }
 
@@ -394,21 +384,12 @@ impl<UI: AjUi> SessionState<UI> {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
             working_directory,
-            accessed_files: HashMap::new(),
             ui: std::marker::PhantomData,
         }
     }
 
     fn working_directory(&self) -> PathBuf {
         self.working_directory.to_owned()
-    }
-
-    fn record_file_access(&mut self, path: PathBuf) {
-        self.accessed_files.insert(path, SystemTime::now());
-    }
-
-    fn get_file_access_time(&self, path: &Path) -> Option<SystemTime> {
-        self.accessed_files.get(&path.to_path_buf()).copied()
     }
 }
 
