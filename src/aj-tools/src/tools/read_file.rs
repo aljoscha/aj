@@ -88,7 +88,7 @@ impl ToolDefinition for ReadFileTool {
             display_path.push_str(&format!(" {}:{}", start_line, end_line));
         }
 
-        let formatted_for_display = format_for_display(start_idx, selected_content);
+        let formatted_for_display = format_for_display(selected_content);
         session_state.display_tool_result("read_file", &display_path, &formatted_for_display);
 
         // Format lines with line numbers for the tool result
@@ -102,36 +102,11 @@ impl ToolDefinition for ReadFileTool {
     }
 }
 
-/// Formats `read_file` results for display to the user. This will add line
-/// numbers and omit lines in the middle if the output is too long.
-pub fn format_for_display(start_idx: usize, lines: &[&str]) -> String {
-    if lines.len() <= 20 {
-        // Display all lines with line numbers
-        let mut result = String::new();
-        for (i, line) in lines.iter().enumerate() {
-            result.push_str(&format!("{:5>}: {}\n", i + 1, line));
-        }
-        result
-    } else {
-        // Display first 8 lines
-        let mut result = String::new();
-        for (i, line) in lines.iter().take(8).enumerate() {
-            result.push_str(&format!("{:5>}: {}\n", i + 1 + start_idx, line));
-        }
-
-        // Show truncation indicator with count
-        let truncated_lines = lines.len() - 16; // Total lines minus first 8 and last 8
-        result.push_str(&format!("[... {} lines truncated ...]\n", truncated_lines));
-
-        // Display last 8 lines
-        let start_line = lines.len() - 8;
-        for (i, line) in lines.iter().skip(start_line).enumerate() {
-            result.push_str(&format!(
-                "{:5>}: {}\n",
-                start_line + i + 1 + start_idx,
-                line
-            ));
-        }
-        result
+/// Formats `read_file` results for display to the user by adding line numbers.
+pub fn format_for_display(lines: &[&str]) -> String {
+    let mut result = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        result.push_str(&format!("{:5>}: {}\n", i + 1, line));
     }
+    result
 }

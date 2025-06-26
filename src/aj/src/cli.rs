@@ -90,7 +90,9 @@ impl AjUi for AjCli {
     fn display_tool_result(&self, tool_name: &str, input: &str, result: &str) {
         println!("{}({})", style(tool_name).bold().fg(Color::Green), input);
 
-        println!("{}\n", result);
+        let truncated_result = truncate_output(result);
+
+        println!("{}\n", truncated_result);
     }
 
     fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str) {
@@ -263,6 +265,40 @@ impl AjUi for AjCli {
             input_str, output_str, cache_creation_str, cache_read_str,
         );
         println!("{}\n", style(usage_string).dim())
+    }
+}
+
+/// Truncates output for display if it's too long, showing first and last
+/// portions with an indicator of omitted content in the middle.
+fn truncate_output(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+
+    if lines.len() <= 20 {
+        // Display all lines
+        output.to_string()
+    } else {
+        // Display first 8 lines
+        let mut result = String::new();
+        for line in lines.iter().take(8) {
+            result.push_str(line);
+            result.push('\n');
+        }
+
+        // Show omitted indicator with count
+        let omitted_lines = lines.len() - 16; // Total lines minus first 8 and last 8
+        result.push_str(&format!("[... {} lines omitted ...]\n", omitted_lines));
+
+        // Display last 8 lines
+        for line in lines.iter().skip(lines.len() - 8) {
+            result.push_str(line);
+            result.push('\n');
+        }
+
+        // Pop off final newline, so that we get consistent output regardless of
+        // whether, say, files had a final newline or not.
+        result.pop();
+
+        result
     }
 }
 
