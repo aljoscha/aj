@@ -161,7 +161,6 @@ impl ToolDefinition for BashTool {
 
                 let mut result = String::new();
                 if !stdout.is_empty() {
-                    result.push_str("STDOUT:\n");
                     result.push_str(&stdout);
                 }
                 if !stderr.is_empty() {
@@ -187,6 +186,10 @@ impl ToolDefinition for BashTool {
                     result.truncate(35000);
                     result.push_str("\n[Output truncated at 35000 characters]");
                 }
+
+                // Display the command and output to the user
+                let display_command = format!("$ {}", input.command);
+                session_state.display_tool_result("bash", &display_command, &result);
 
                 Ok(result)
             }
