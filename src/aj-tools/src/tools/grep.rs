@@ -11,7 +11,7 @@ use std::process::Command;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-use crate::{SessionState, ToolDefinition, TurnState};
+use crate::{SessionContext, ToolDefinition, TurnContext};
 
 const DESCRIPTION: &str = r#"
 Search file contents using regular expressions, recursively in a given path.
@@ -91,8 +91,8 @@ impl ToolDefinition for GrepTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -251,7 +251,7 @@ impl ToolDefinition for GrepTool {
             ),
             None => format!("path: {}, pattern: {}", input.path, input.pattern),
         };
-        session_state.display_tool_result("grep", &display_input, &output);
+        session_ctx.display_tool_result("grep", &display_input, &output);
 
         Ok(output)
     }

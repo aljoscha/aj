@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::pin::pin;
 
 use aj_conf::AgentEnv;
-use aj_tools::{
-    ErasedToolDefinition, SessionState as ToolSessionState, TurnState as ToolTurnState,
-};
 use aj_tools::tools::todo::TodoItem;
+use aj_tools::{
+    ErasedToolDefinition, SessionContext as ToolSessionContext, TurnContext as ToolTurnContext,
+};
 use aj_ui::{AjUi, TokenUsage};
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
@@ -23,7 +23,7 @@ pub struct Agent<UI: AjUi> {
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
     client: anthropic_sdk::client::Client,
-    session_state: SessionState<UI>,
+    session_ctx: SessionContext<UI>,
     turn_counter: usize,
     accumulated_usage: Usage,
 }
@@ -61,7 +61,7 @@ impl<UI: AjUi> Agent<UI> {
             tool_definitions,
             tools: api_tools,
             client,
-            session_state: SessionState::new(env.working_directory.clone()),
+            session_ctx: SessionContext::new(env.working_directory.clone()),
             env,
             turn_counter: 0,
             ui,
@@ -77,12 +77,12 @@ impl<UI: AjUi> Agent<UI> {
         }
     }
 
-    pub fn session_state(&self) -> &SessionState<UI> {
-        &self.session_state
+    pub fn session_ctx(&self) -> &SessionContext<UI> {
+        &self.session_ctx
     }
 
-    pub fn session_state_mut(&mut self) -> &mut SessionState<UI> {
-        &mut self.session_state
+    pub fn session_ctx_mut(&mut self) -> &mut SessionContext<UI> {
+        &mut self.session_ctx
     }
 
     pub fn current_turn(&self) -> usize {
@@ -101,7 +101,7 @@ impl<UI: AjUi> Agent<UI> {
 
         loop {
             self.turn_counter += 1;
-            let mut turn_state = TurnState::new(self.turn_counter);
+            let mut turn_ctx = TurnContext::new(self.turn_counter);
 
             let need_user_input = {
                 match conversation.last() {
@@ -215,8 +215,9 @@ impl<UI: AjUi> Agent<UI> {
                 let mut tool_result_contents = Vec::new();
 
                 for (tool_id, tool_name, tool_input) in tool_calls {
-                    let tool_result =
-                        self.execute_tool(&tool_id, &tool_name, tool_input, &mut turn_state).await;
+                    let tool_result = self
+                        .execute_tool(&tool_id, &tool_name, tool_input, &mut turn_ctx)
+                        .await;
 
                     let (result_content, is_error) = match tool_result {
                         Ok(result) => (result, false),
@@ -328,7 +329,7 @@ impl<UI: AjUi> Agent<UI> {
         _tool_id: &str,
         tool_name: &str,
         tool_input: serde_json::Value,
-        turn_state: &mut dyn ToolTurnState,
+        turn_ctx: &mut dyn ToolTurnContext,
     ) -> Result<String, anyhow::Error> {
         let tool_def = if let Some(tool_def) = self.tool_definitions.get(tool_name) {
             tool_def
@@ -337,24 +338,24 @@ impl<UI: AjUi> Agent<UI> {
         };
 
         // Create a wrapper that provides UI access to the session state
-        let mut session_state_wrapper = SessionStateWrapper {
-            session_state: &mut self.session_state,
+        let mut session_ctx_wrapper = SessionContextWrapper {
+            session_ctx: &mut self.session_ctx,
             ui: &self.ui,
         };
 
-        (tool_def.func)(&mut session_state_wrapper, turn_state, tool_input).await
+        (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, tool_input).await
     }
 }
 
 /// Wrapper that provides UI access to session state operations
-struct SessionStateWrapper<'a, UI: AjUi> {
-    session_state: &'a mut SessionState<UI>,
+struct SessionContextWrapper<'a, UI: AjUi> {
+    session_ctx: &'a mut SessionContext<UI>,
     ui: &'a UI,
 }
 
-impl<'a, UI: AjUi> ToolSessionState for SessionStateWrapper<'a, UI> {
+impl<'a, UI: AjUi> ToolSessionContext for SessionContextWrapper<'a, UI> {
     fn working_directory(&self) -> PathBuf {
-        self.session_state.working_directory()
+        self.session_ctx.working_directory()
     }
 
     fn display_tool_result(&self, tool_name: &str, input: &str, output: &str) {
@@ -375,22 +376,22 @@ impl<'a, UI: AjUi> ToolSessionState for SessionStateWrapper<'a, UI> {
     }
 
     fn get_todo_list(&self) -> Vec<TodoItem> {
-        self.session_state.get_todo_list()
+        self.session_ctx.get_todo_list()
     }
 
     fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
-        self.session_state.set_todo_list(todos);
+        self.session_ctx.set_todo_list(todos);
     }
 }
 
 #[derive(Debug)]
-pub struct SessionState<UI: AjUi> {
+pub struct SessionContext<UI: AjUi> {
     pub working_directory: PathBuf,
     todo_list: Vec<TodoItem>,
     ui: std::marker::PhantomData<UI>,
 }
 
-impl<UI: AjUi> SessionState<UI> {
+impl<UI: AjUi> SessionContext<UI> {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
             working_directory,
@@ -413,14 +414,14 @@ impl<UI: AjUi> SessionState<UI> {
 }
 
 #[derive(Debug, Clone)]
-pub struct TurnState {
+pub struct TurnContext {
     pub turn_id: usize,
 }
 
-impl TurnState {
+impl TurnContext {
     pub fn new(turn_id: usize) -> Self {
         Self { turn_id }
     }
 }
 
-impl ToolTurnState for TurnState {}
+impl ToolTurnContext for TurnContext {}

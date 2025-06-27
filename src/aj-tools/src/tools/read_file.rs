@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionState, ToolDefinition, TurnState};
+use crate::{SessionContext, ToolDefinition, TurnContext};
 
 const DESCRIPTION: &str = r#"
 Read the contents of a file from the local file system. If a file does not exist
@@ -44,8 +44,8 @@ impl ToolDefinition for ReadFileTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -77,7 +77,7 @@ impl ToolDefinition for ReadFileTool {
         let selected_content = &lines[start_idx..end_idx];
 
         let mut display_path = Path::new(path)
-            .strip_prefix(session_state.working_directory())
+            .strip_prefix(session_ctx.working_directory())
             .unwrap_or(Path::new(path))
             .display()
             .to_string();
@@ -90,7 +90,7 @@ impl ToolDefinition for ReadFileTool {
         }
 
         let formatted_for_display = format_for_display(selected_content);
-        session_state.display_tool_result("read_file", &display_path, &formatted_for_display);
+        session_ctx.display_tool_result("read_file", &display_path, &formatted_for_display);
 
         // Format lines with line numbers for the tool result
         let formatted_lines: Vec<String> = lines[start_idx..end_idx]

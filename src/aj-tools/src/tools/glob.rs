@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-use crate::{SessionState, ToolDefinition, TurnState};
+use crate::{SessionContext, ToolDefinition, TurnContext};
 
 const DESCRIPTION: &str = r#"
 Recursively find files and directories matching a glob pattern.
@@ -44,8 +44,8 @@ impl ToolDefinition for GlobTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -159,10 +159,7 @@ impl ToolDefinition for GlobTool {
         results.sort_by(|a, b| b.modified.cmp(&a.modified));
 
         let output = if results.is_empty() {
-            format!(
-                "No entries matching pattern '{}' found.",
-                input.pattern
-            )
+            format!("No entries matching pattern '{}' found.", input.pattern)
         } else {
             let formatted_results: Vec<String> = results
                 .iter()
@@ -186,7 +183,7 @@ impl ToolDefinition for GlobTool {
 
         // Display to user
         let display_input = format!("path: {}, pattern: {}", input.path, input.pattern);
-        session_state.display_tool_result("glob", &display_input, &output);
+        session_ctx.display_tool_result("glob", &display_input, &output);
 
         Ok(output)
     }

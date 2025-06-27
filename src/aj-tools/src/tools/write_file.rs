@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionState, ToolDefinition, TurnState};
+use crate::{SessionContext, ToolDefinition, TurnContext};
 
 const DESCRIPTION: &str = r#"
 Write a file to the local file system.
@@ -39,8 +39,8 @@ impl ToolDefinition for WriteFileTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -59,14 +59,14 @@ impl ToolDefinition for WriteFileTool {
         };
 
         let display_path = Path::new(path)
-            .strip_prefix(session_state.working_directory())
+            .strip_prefix(session_ctx.working_directory())
             .unwrap_or(Path::new(path))
             .display()
             .to_string();
 
         // Display the diff or file contents to the user
         if let Some(original) = &original_content {
-            session_state.display_tool_result_diff(
+            session_ctx.display_tool_result_diff(
                 "write_file",
                 &display_path,
                 original,
@@ -74,7 +74,7 @@ impl ToolDefinition for WriteFileTool {
             );
         } else {
             // New file - display the content
-            session_state.display_tool_result("write_file", &display_path, &input.content);
+            session_ctx.display_tool_result("write_file", &display_path, &input.content);
         }
 
         fs::write(&input.path, &input.content)

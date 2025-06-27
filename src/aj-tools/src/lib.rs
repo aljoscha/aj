@@ -36,8 +36,8 @@ pub trait ToolDefinition {
     /// Execute the tool with the given input.
     fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> impl std::future::Future<Output = Result<String, anyhow::Error>> + Send;
 
@@ -59,8 +59,8 @@ pub struct ErasedToolDefinition {
 
 type ToolFn = Box<
     dyn for<'a> Fn(
-            &'a mut dyn SessionState,
-            &'a mut dyn TurnState,
+            &'a mut dyn SessionContext,
+            &'a mut dyn TurnContext,
             Value,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + 'a>,
@@ -74,24 +74,22 @@ impl<T: ToolDefinition + Send + Sync + Clone + 'static> From<T> for ErasedToolDe
             name: tool.name().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
-            func: Box::new(move |session_state, turn_state, input| {
+            func: Box::new(move |session_ctx, turn_ctx, input| {
                 let typed_input: T::Input = match serde_json::from_value(input) {
                     Ok(input) => input,
                     Err(e) => return Box::pin(async move { Err(e.into()) }),
                 };
                 let tool_clone = tool.clone();
-                Box::pin(async move {
-                    tool_clone
-                        .execute(session_state, turn_state, typed_input)
-                        .await
-                })
+                Box::pin(
+                    async move { tool_clone.execute(session_ctx, turn_ctx, typed_input).await },
+                )
             }),
         }
     }
 }
 
 /// Access to state that is scoped to one agent session or thread.
-pub trait SessionState: Send {
+pub trait SessionContext: Send {
     fn working_directory(&self) -> PathBuf;
 
     fn display_tool_result(&self, tool_name: &str, input: &str, output: &str);
@@ -114,7 +112,7 @@ pub trait SessionState: Send {
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
 /// a turn.
-pub trait TurnState: Send {}
+pub trait TurnContext: Send {}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![

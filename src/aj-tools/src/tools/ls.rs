@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionState, ToolDefinition, TurnState};
+use crate::{SessionContext, ToolDefinition, TurnContext};
 
 const DESCRIPTION: &str = r#"
 List entries (files and directories) in a given directory path.
@@ -42,8 +42,8 @@ impl ToolDefinition for LsTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -138,7 +138,7 @@ impl ToolDefinition for LsTool {
             Some(ignore_patterns) => format!("path: {}, ignore: {:?}", input.path, ignore_patterns),
             None => format!("path: {}", input.path),
         };
-        session_state.display_tool_result("ls", &display_input, &output);
+        session_ctx.display_tool_result("ls", &display_input, &output);
 
         Ok(output)
     }

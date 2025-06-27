@@ -6,7 +6,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionState, ToolDefinition, TurnState};
+use crate::{SessionContext, ToolDefinition, TurnContext};
 
 const DESCRIPTION: &str = r#"
 Execute a command in the system shell (bash/sh). The command will be run in the
@@ -106,8 +106,8 @@ impl ToolDefinition for BashTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         // Check if command is allowed
@@ -117,8 +117,7 @@ impl ToolDefinition for BashTool {
                 input.command, input.description
             );
 
-            // Use the SessionState's ask_permission method
-            if !session_state.ask_permission(&message) {
+            if !session_ctx.ask_permission(&message) {
                 return Err(anyhow::anyhow!("Command execution cancelled by user"));
             }
         }
@@ -129,7 +128,7 @@ impl ToolDefinition for BashTool {
         // let executable_path = resolve_executable(&parsed_command.executable)?;
 
         // Execute the command with timeout
-        let working_dir = session_state.working_directory();
+        let working_dir = session_ctx.working_directory();
         let child = Command::new(&parsed_command.executable)
             .args(&parsed_command.args)
             .current_dir(&working_dir)
@@ -190,7 +189,7 @@ impl ToolDefinition for BashTool {
 
                 // Display the command and output to the user
                 let display_command = format!("$ {}", input.command);
-                session_state.display_tool_result("bash", &display_command, &result);
+                session_ctx.display_tool_result("bash", &display_command, &result);
 
                 Ok(result)
             }

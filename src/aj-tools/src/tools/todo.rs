@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use termimad::crossterm::style::{Attribute, Stylize};
 
-use crate::{SessionState, ToolDefinition, TurnState};
+use crate::{SessionContext, ToolDefinition, TurnContext};
 
 /// Formats a list of todo items for display
 fn format_todo_list(todos: &[TodoItem]) -> String {
@@ -94,14 +94,14 @@ impl ToolDefinition for TodoReadTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         _input: Self::Input,
     ) -> Result<String, anyhow::Error> {
-        let todos = session_state.get_todo_list();
+        let todos = session_ctx.get_todo_list();
         let result = format_todo_list(&todos);
 
-        session_state.display_tool_result("todo_read", "", &result);
+        session_ctx.display_tool_result("todo_read", "", &result);
         Ok(result)
     }
 }
@@ -128,8 +128,8 @@ impl ToolDefinition for TodoWriteTool {
 
     async fn execute(
         &self,
-        session_state: &mut dyn SessionState,
-        _turn_state: &mut dyn TurnState,
+        session_ctx: &mut dyn SessionContext,
+        _turn_ctx: &mut dyn TurnContext,
         input: Self::Input,
     ) -> Result<String, anyhow::Error> {
         // Validate that there's at most one in-progress item
@@ -147,13 +147,13 @@ impl ToolDefinition for TodoWriteTool {
         }
 
         // Set the new todo list
-        session_state.set_todo_list(input.todos.clone());
+        session_ctx.set_todo_list(input.todos.clone());
 
         let update_result = format!("Updated todo list with {} items.", input.todos.len());
         let formatted_todos = format_todo_list(&input.todos);
         let result = format!("{}\n{}", update_result, formatted_todos);
 
-        session_state.display_tool_result("todo_write", "", &result);
+        session_ctx.display_tool_result("todo_write", "", &result);
 
         Ok(result)
     }

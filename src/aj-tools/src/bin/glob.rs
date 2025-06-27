@@ -1,11 +1,11 @@
 use aj_tools::tools::glob::{GlobInput, GlobTool};
 use aj_tools::tools::todo::TodoItem;
-use aj_tools::{SessionState, ToolDefinition, TurnState};
+use aj_tools::{SessionContext, ToolDefinition, TurnContext};
 use std::env;
 use std::path::PathBuf;
 
-struct DummySessionState;
-impl SessionState for DummySessionState {
+struct DummySessionContext;
+impl SessionContext for DummySessionContext {
     fn working_directory(&self) -> PathBuf {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
@@ -32,8 +32,8 @@ impl SessionState for DummySessionState {
     }
 }
 
-struct DummyTurnState;
-impl TurnState for DummyTurnState {}
+struct DummyTurnContext;
+impl TurnContext for DummyTurnContext {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,10 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let input = GlobInput { path, pattern };
     let tool = GlobTool;
-    let mut session_state = DummySessionState;
-    let mut turn_state = DummyTurnState;
+    let mut session_ctx = DummySessionContext;
+    let mut turn_ctx = DummyTurnContext;
 
-    match tool.execute(&mut session_state, &mut turn_state, input).await {
+    match tool.execute(&mut session_ctx, &mut turn_ctx, input).await {
         Ok(result) => println!("{}", result),
         Err(e) => {
             eprintln!("Error: {}", e);
