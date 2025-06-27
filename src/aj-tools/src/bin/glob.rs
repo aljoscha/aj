@@ -26,7 +26,8 @@ impl SessionState for DummySessionState {
 struct DummyTurnState;
 impl TurnState for DummyTurnState {}
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() != 3 {
@@ -44,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session_state = DummySessionState;
     let mut turn_state = DummyTurnState;
 
-    match tool.execute(&mut session_state, &mut turn_state, input) {
+    match tool.execute(&mut session_state, &mut turn_state, input).await {
         Ok(result) => println!("{}", result),
         Err(e) => {
             eprintln!("Error: {}", e);

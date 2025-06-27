@@ -25,6 +25,7 @@ Usage:
 - If you absolutely must use a grep-like tool, use ripgrep (rg).
 "#;
 
+#[derive(Clone)]
 pub struct BashTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -103,7 +104,7 @@ impl ToolDefinition for BashTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

@@ -64,6 +64,7 @@ fn get_git_tracked_files(path: &Path) -> Option<HashSet<PathBuf>> {
     Some(tracked_files)
 }
 
+#[derive(Clone)]
 pub struct GrepTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -88,7 +89,7 @@ impl ToolDefinition for GrepTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

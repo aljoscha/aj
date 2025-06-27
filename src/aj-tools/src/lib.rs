@@ -22,7 +22,7 @@ use util::derive_schema;
 /// A builtin tool that can be used by the agent.
 pub trait ToolDefinition {
     /// The input type for this tool.
-    type Input: JsonSchema + DeserializeOwned;
+    type Input: JsonSchema + DeserializeOwned + Send;
 
     /// The name of the tool.
     fn name(&self) -> &'static str;
@@ -36,7 +36,7 @@ pub trait ToolDefinition {
         session_state: &mut dyn SessionState,
         turn_state: &mut dyn TurnState,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error>;
+    ) -> impl std::future::Future<Output = Result<String, anyhow::Error>> + Send;
 
     /// Derive the JSON schema for this tool's input type. Default
     /// implementation uses the derive_schema utility.
@@ -54,25 +54,41 @@ pub struct ErasedToolDefinition {
     pub func: ToolFn,
 }
 
-type ToolFn =
-    Box<dyn Fn(&mut dyn SessionState, &mut dyn TurnState, Value) -> Result<String, anyhow::Error>>;
+type ToolFn = Box<
+    dyn for<'a> Fn(
+            &'a mut dyn SessionState,
+            &'a mut dyn TurnState,
+            Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
 
-impl<T: ToolDefinition + 'static> From<T> for ErasedToolDefinition {
+impl<T: ToolDefinition + Send + Sync + Clone + 'static> From<T> for ErasedToolDefinition {
     fn from(tool: T) -> Self {
         ErasedToolDefinition {
             name: tool.name().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
             func: Box::new(move |session_state, turn_state, input| {
-                let typed_input: T::Input = serde_json::from_value(input)?;
-                tool.execute(session_state, turn_state, typed_input)
+                let typed_input: T::Input = match serde_json::from_value(input) {
+                    Ok(input) => input,
+                    Err(e) => return Box::pin(async move { Err(e.into()) }),
+                };
+                let tool_clone = tool.clone();
+                Box::pin(async move {
+                    tool_clone
+                        .execute(session_state, turn_state, typed_input)
+                        .await
+                })
             }),
         }
     }
 }
 
 /// Access to state that is scoped to one agent session or thread.
-pub trait SessionState {
+pub trait SessionState: Send {
     fn working_directory(&self) -> PathBuf;
 
     fn display_tool_result(&self, tool_name: &str, input: &str, output: &str);
@@ -89,7 +105,7 @@ pub trait SessionState {
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
 /// a turn.
-pub trait TurnState {}
+pub trait TurnState: Send {}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![

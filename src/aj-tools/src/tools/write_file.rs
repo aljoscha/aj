@@ -15,6 +15,7 @@ Usage:
 - IMPORTANT: Don't use this tool for renaming a file. Prefer to use the bash tool with the mv command.
 "#;
 
+#[derive(Clone)]
 pub struct WriteFileTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -36,7 +37,7 @@ impl ToolDefinition for WriteFileTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

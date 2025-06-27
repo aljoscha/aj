@@ -20,6 +20,7 @@ Usage:
 - Use this tool instead of ls when you need to search recursively or match patterns
 "#;
 
+#[derive(Clone)]
 pub struct GlobTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -41,7 +42,7 @@ impl ToolDefinition for GlobTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

@@ -16,6 +16,7 @@ Usage:
 - If replace_all is set to true, all occurrences of old_string will be replaced with new_string
 "#;
 
+#[derive(Clone)]
 pub struct EditFileTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -43,7 +44,7 @@ impl ToolDefinition for EditFileTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

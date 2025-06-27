@@ -19,6 +19,7 @@ Usage:
 - Prefer this tool over edit_file if there are multiple changes to a file that can be batched together in one call to edit_file_multi
 "#;
 
+#[derive(Clone)]
 pub struct EditFileMultiTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -52,7 +53,7 @@ impl ToolDefinition for EditFileMultiTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

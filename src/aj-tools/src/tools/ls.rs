@@ -17,6 +17,7 @@ Usage:
 - You should prefer the glob tool instead if you need recursive search or pattern matching
 "#;
 
+#[derive(Clone)]
 pub struct LsTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -39,7 +40,7 @@ impl ToolDefinition for LsTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

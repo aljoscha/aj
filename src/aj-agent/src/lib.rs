@@ -215,7 +215,7 @@ impl<UI: AjUi> Agent<UI> {
 
                 for (tool_id, tool_name, tool_input) in tool_calls {
                     let tool_result =
-                        self.execute_tool(&tool_id, &tool_name, tool_input, &mut turn_state);
+                        self.execute_tool(&tool_id, &tool_name, tool_input, &mut turn_state).await;
 
                     let (result_content, is_error) = match tool_result {
                         Ok(result) => (result, false),
@@ -322,7 +322,7 @@ impl<UI: AjUi> Agent<UI> {
         }]
     }
 
-    fn execute_tool(
+    async fn execute_tool(
         &mut self,
         _tool_id: &str,
         tool_name: &str,
@@ -341,7 +341,7 @@ impl<UI: AjUi> Agent<UI> {
             ui: &self.ui,
         };
 
-        (tool_def.func)(&mut session_state_wrapper, turn_state, tool_input)
+        (tool_def.func)(&mut session_state_wrapper, turn_state, tool_input).await
     }
 }
 

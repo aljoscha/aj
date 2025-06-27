@@ -16,6 +16,7 @@ Usage:
   whole file. Use this for reading very big files.
 "#;
 
+#[derive(Clone)]
 pub struct ReadFileTool;
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
@@ -41,7 +42,7 @@ impl ToolDefinition for ReadFileTool {
         DESCRIPTION
     }
 
-    fn execute(
+    async fn execute(
         &self,
         session_state: &mut dyn SessionState,
         _turn_state: &mut dyn TurnState,

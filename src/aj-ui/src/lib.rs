@@ -1,6 +1,6 @@
 /// Ui abstraction for AJ. The agent and all tools must use this when displaying
 /// information to the user or requesting input from the user.
-pub trait AjUi {
+pub trait AjUi: Send + Sync {
     fn display_notice(&self, notice: &str);
     fn display_error(&self, error: &str);
 
