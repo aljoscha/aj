@@ -80,4 +80,3 @@ def process_data(items):
     println!("Testing agent_text_stop with markdown content:\n");
     ui.agent_text_stop(markdown_text);
 }
-

@@ -11,6 +11,7 @@ use crate::tools::todo::TodoItem;
 pub mod tools;
 mod util;
 
+pub use tools::agent::AgentTool;
 pub use tools::bash::BashTool;
 pub use tools::edit_file::EditFileTool;
 pub use tools::edit_file_multi::EditFileMultiTool;
@@ -108,6 +109,16 @@ pub trait SessionContext: Send {
 
     /// Set the todo list for the session.
     fn set_todo_list(&mut self, todos: Vec<TodoItem>);
+
+    /// Spawn a sub-agent to perform a specific task.
+    ///
+    /// The sub-agent will run independently with its own UI wrapper and return a report.
+    fn spawn_agent(
+        &self,
+        task: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,
+    >;
 }
 
 /// Access to state that is scoped to one iteration through the agent loop, aka.
@@ -116,6 +127,7 @@ pub trait TurnContext: Send {}
 
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
+        AgentTool.into(),
         BashTool.into(),
         ReadFileTool.into(),
         WriteFileTool.into(),

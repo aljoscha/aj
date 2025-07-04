@@ -5,7 +5,8 @@ use std::pin::pin;
 use aj_conf::AgentEnv;
 use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
-    ErasedToolDefinition, SessionContext as ToolSessionContext, TurnContext as ToolTurnContext,
+    get_builtin_tools, ErasedToolDefinition, SessionContext as ToolSessionContext,
+    TurnContext as ToolTurnContext,
 };
 use aj_ui::{AjUi, TokenUsage};
 use anthropic_sdk::messages::{
@@ -385,6 +386,8 @@ impl<UI: AjUi> Agent<UI> {
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_ctx: &mut self.session_ctx,
             ui: &self.ui,
+            env: &self.env,
+            system_prompt: self.system_prompt,
         };
 
         (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, tool_input).await
@@ -395,6 +398,8 @@ impl<UI: AjUi> Agent<UI> {
 struct SessionContextWrapper<'a, UI: AjUi> {
     session_ctx: &'a mut SessionContext<UI>,
     ui: &'a UI,
+    env: &'a AgentEnv,
+    system_prompt: &'static str,
 }
 
 impl<'a, UI: AjUi> ToolSessionContext for SessionContextWrapper<'a, UI> {
@@ -425,6 +430,35 @@ impl<'a, UI: AjUi> ToolSessionContext for SessionContextWrapper<'a, UI> {
 
     fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
         self.session_ctx.set_todo_list(todos);
+    }
+
+    fn spawn_agent(
+        &self,
+        task: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            // Create a sub-agent UI wrapper
+            let sub_ui = self.ui.get_subagent_ui();
+
+            // Get tools excluding the agent tool to prevent infinite recursion
+            let sub_agent_tools = get_builtin_tools()
+                .into_iter()
+                .filter(|tool| tool.name != "agent")
+                .collect();
+
+            // Create a new agent with the sub-agent UI
+            let mut sub_agent = Agent::new(
+                self.env.clone(),
+                self.system_prompt,
+                sub_agent_tools,
+                sub_ui,
+            );
+
+            // Run the sub-agent with the task
+            sub_agent.run_single_turn(task).await
+        })
     }
 }
 

@@ -21,6 +21,8 @@ pub trait AjUi: Send + Sync {
     fn ask_permission(&self, message: &str) -> bool;
 
     fn display_token_usage(&self, usage: &TokenUsage);
+
+    fn get_subagent_ui(&self) -> impl AjUi;
 }
 
 /// Token usage information for display

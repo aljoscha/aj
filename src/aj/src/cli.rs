@@ -7,7 +7,10 @@ use rustyline::{Cmd, Editor, KeyEvent};
 use similar::{ChangeTag, TextDiff};
 use termimad::{Alignment, MadSkin};
 
+pub mod sub_agent_cli;
+
 /// Cli-based implementation of [AjUi].
+#[derive(Clone)]
 pub struct AjCli;
 
 impl Default for AjCli {
@@ -246,26 +249,36 @@ impl AjUi for AjCli {
     }
 
     fn display_token_usage(&self, usage: &TokenUsage) {
-        let format_tokens = |acc: u64, turn: u64| -> String {
-            if turn == 0 {
-                format!("{}", acc)
-            } else {
-                format!("{}+{}", acc, turn)
-            }
-        };
-
-        let input_str = format_tokens(usage.accumulated_input, usage.turn_input);
-        let output_str = format_tokens(usage.accumulated_output, usage.turn_output);
-        let cache_creation_str =
-            format_tokens(usage.accumulated_cache_creation, usage.turn_cache_creation);
-        let cache_read_str = format_tokens(usage.accumulated_cache_read, usage.turn_cache_read);
-
-        let usage_string = format!(
-            "Token Usage - Input: {} | Output: {} | Cache Creation: {} | Cache Read: {}",
-            input_str, output_str, cache_creation_str, cache_read_str,
-        );
+        let usage_string = format_token_usage(usage);
         println!("{}\n", style(usage_string).dim())
     }
+
+    fn get_subagent_ui(&self) -> impl AjUi {
+        return sub_agent_cli::SubAgentCli::new();
+    }
+}
+
+pub(crate) fn format_token_usage(usage: &TokenUsage) -> String {
+    let format_tokens = |acc: u64, turn: u64| -> String {
+        if turn == 0 {
+            format!("{}", acc)
+        } else {
+            format!("{}+{}", acc, turn)
+        }
+    };
+
+    let input_str = format_tokens(usage.accumulated_input, usage.turn_input);
+    let output_str = format_tokens(usage.accumulated_output, usage.turn_output);
+    let cache_creation_str =
+        format_tokens(usage.accumulated_cache_creation, usage.turn_cache_creation);
+    let cache_read_str = format_tokens(usage.accumulated_cache_read, usage.turn_cache_read);
+
+    let usage_string = format!(
+        "Token Usage - Input: {} | Output: {} | Cache Creation: {} | Cache Read: {}",
+        input_str, output_str, cache_creation_str, cache_read_str,
+    );
+
+    usage_string
 }
 
 /// Truncates output for display if it's too long, showing first and last
@@ -302,7 +315,7 @@ fn truncate_output(output: &str) -> String {
     }
 }
 
-fn render_markdown(text: &str) {
+pub(crate) fn render_markdown(text: &str) {
     let mut skin = MadSkin::default_light();
     skin.headers[0].align = Alignment::Left;
     skin.headers[0].add_attr(termimad::crossterm::style::Attribute::Underlined);

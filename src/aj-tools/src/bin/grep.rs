@@ -1,6 +1,7 @@
 use aj_tools::tools::grep::{GrepInput, GrepTool};
 use aj_tools::tools::todo::TodoItem;
 use aj_tools::{SessionContext, ToolDefinition, TurnContext};
+use anyhow;
 use std::env;
 use std::path::PathBuf;
 
@@ -29,6 +30,19 @@ impl SessionContext for DummySessionContext {
 
     fn set_todo_list(&mut self, _todos: Vec<TodoItem>) {
         // No-op for dummy implementation
+    }
+
+    fn spawn_agent(
+        &self,
+        _task: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "spawn_agent not supported in dummy implementation"
+            ))
+        })
     }
 }
 
