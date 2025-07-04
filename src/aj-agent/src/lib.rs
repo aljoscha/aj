@@ -100,9 +100,6 @@ impl<UI: AjUi> Agent<UI> {
             .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
 
         loop {
-            self.turn_counter += 1;
-            let mut turn_ctx = TurnContext::new(self.turn_counter);
-
             let need_user_input = {
                 match conversation.last() {
                     Some(last) => {
@@ -125,7 +122,51 @@ impl<UI: AjUi> Agent<UI> {
                 conversation.push(user_message);
             }
 
-            let response_stream = self.run_inference_streaming(&conversation).await?;
+            self.execute_turn(&mut conversation).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn run_single_turn(&mut self, prompt: String) -> Result<String, anyhow::Error> {
+        let mut conversation: Vec<MessageParam> = Vec::new();
+        let user_message =
+            MessageParam::new_user_message(vec![ContentBlockParam::new_text_block(prompt)]);
+        conversation.push(user_message);
+
+        let mut last_assistant_text = String::new();
+
+        self.execute_turn(&mut conversation).await?;
+
+        // Extract the last assistant message text
+        if let Some(last_msg) = conversation.last() {
+            if matches!(last_msg.role, Role::Assistant) {
+                last_assistant_text.clear();
+                for content in &last_msg.content {
+                    if let ContentBlockParam::TextBlock { text, .. } = content {
+                        last_assistant_text.push_str(text);
+                    }
+                }
+            } else {
+                return Err(anyhow!("did not get a response from the model"));
+            }
+        }
+
+        Ok(last_assistant_text)
+    }
+
+    /// Executes a single "turn" of the conversation, this will potentially
+    /// include mutliple back-and-forth interactions with the model, in case
+    /// there are thinking blocks or tool calls.
+    async fn execute_turn(
+        &mut self,
+        conversation: &mut Vec<MessageParam>,
+    ) -> Result<(), anyhow::Error> {
+        self.turn_counter += 1;
+        let mut turn_ctx = TurnContext::new(self.turn_counter);
+
+        loop {
+            let response_stream = self.run_inference_streaming(conversation).await?;
 
             let mut response: Option<Message> = None;
             let mut turn_usage_update = Usage::default();
@@ -246,6 +287,9 @@ impl<UI: AjUi> Agent<UI> {
 
                 // Continue the conversation loop to get the model's response to tool results
                 continue;
+            } else {
+                // We are now ready to finish this turn.
+                break;
             }
         }
 
