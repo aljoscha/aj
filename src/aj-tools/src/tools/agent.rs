@@ -64,8 +64,9 @@ impl ToolDefinition for AgentTool {
             .description
             .unwrap_or_else(|| "Running sub-agent task".to_string());
 
-        // Display that we're spawning a sub-agent
-        session_ctx.display_tool_result("agent", &description, "Spawning sub-agent...");
+        // Display that we're spawning a sub-agent with the task prompt
+        let display_message = format!("Spawning sub-agent...\n\nTask: {}", input.task);
+        session_ctx.display_tool_result("agent", &description, &display_message);
 
         // Spawn the sub-agent
         let result = session_ctx.spawn_agent(input.task).await?;
