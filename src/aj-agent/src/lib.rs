@@ -330,9 +330,7 @@ impl<UI: AjUi> Agent<UI> {
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
             system: Some(self.assemble_system_prompt()),
-            thinking: Some(anthropic_sdk::messages::Thinking::Enabled {
-                budget_tokens: self.determine_thinking_budget(conversation),
-            }),
+            thinking: self.determine_thinking(conversation),
             max_tokens: 32_000,
             messages,
             tools: self.tools.clone(),
@@ -343,13 +341,17 @@ impl<UI: AjUi> Agent<UI> {
         Ok(response)
     }
 
-    /// Determine the thinking budget based on trigger texts in the user prompt.
-    /// Returns thinking budget tokens based on specific trigger phrases:
+    /// Determine the thinking configuration based on trigger texts in the user
+    /// prompt. Returns thinking configuration based on specific trigger
+    /// phrases:
     /// - "think harder" -> 32,000 tokens
     /// - "think hard" -> 10,000 tokens
     /// - "think" -> 4,000 tokens
-    /// - default -> 10,000 tokens
-    fn determine_thinking_budget(&self, conversation: &[MessageParam]) -> u64 {
+    /// - default -> None (no thinking)
+    fn determine_thinking(
+        &self,
+        conversation: &[MessageParam],
+    ) -> Option<anthropic_sdk::messages::Thinking> {
         // Get the last user message
         let last_user_message = conversation
             .iter()
@@ -375,16 +377,22 @@ impl<UI: AjUi> Agent<UI> {
 
             // Check for trigger phrases in order of specificity
             if text_lower.contains("think harder") {
-                return 32_000;
+                return Some(anthropic_sdk::messages::Thinking::Enabled {
+                    budget_tokens: 32_000,
+                });
             } else if text_lower.contains("think hard") {
-                return 10_000;
+                return Some(anthropic_sdk::messages::Thinking::Enabled {
+                    budget_tokens: 10_000,
+                });
             } else if text_lower.contains("think") {
-                return 4_000;
+                return Some(anthropic_sdk::messages::Thinking::Enabled {
+                    budget_tokens: 4_000,
+                });
             }
         }
 
-        // Default thinking budget
-        10_000
+        // Default: no thinking
+        None
     }
 
     /// Assemble the system prompt we pass to the model from the actual system
