@@ -331,7 +331,7 @@ impl<UI: AjUi> Agent<UI> {
             model: "claude-sonnet-4-20250514".to_string(),
             system: Some(self.assemble_system_prompt()),
             thinking: Some(anthropic_sdk::messages::Thinking::Enabled {
-                budget_tokens: 10_000,
+                budget_tokens: self.determine_thinking_budget(conversation),
             }),
             max_tokens: 32_000,
             messages,
@@ -341,6 +341,50 @@ impl<UI: AjUi> Agent<UI> {
         let response = self.client.messages_stream(messages).await?;
 
         Ok(response)
+    }
+
+    /// Determine the thinking budget based on trigger texts in the user prompt.
+    /// Returns thinking budget tokens based on specific trigger phrases:
+    /// - "think harder" -> 32,000 tokens
+    /// - "think hard" -> 10,000 tokens
+    /// - "think" -> 4,000 tokens
+    /// - default -> 10,000 tokens
+    fn determine_thinking_budget(&self, conversation: &[MessageParam]) -> u64 {
+        // Get the last user message
+        let last_user_message = conversation
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .last();
+
+        if let Some(message) = last_user_message {
+            // Extract text content from the message
+            let text_content = message
+                .content
+                .iter()
+                .filter_map(|content| {
+                    if let ContentBlockParam::TextBlock { text, .. } = content {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let text_lower = text_content.to_lowercase();
+
+            // Check for trigger phrases in order of specificity
+            if text_lower.contains("think harder") {
+                return 32_000;
+            } else if text_lower.contains("think hard") {
+                return 10_000;
+            } else if text_lower.contains("think") {
+                return 4_000;
+            }
+        }
+
+        // Default thinking budget
+        10_000
     }
 
     /// Assemble the system prompt we pass to the model from the actual system
