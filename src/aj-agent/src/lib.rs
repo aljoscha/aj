@@ -167,6 +167,10 @@ impl<UI: AjUi> Agent<UI> {
         let mut turn_ctx = TurnContext::new(self.turn_counter);
 
         loop {
+            // Check if we're going to enable thinking for this call
+            let thinking_config = self.determine_thinking(conversation);
+            let thinking_will_be_enabled = thinking_config.is_some();
+
             let response_stream = self.run_inference_streaming(conversation).await?;
 
             let mut response: Option<Message> = None;
@@ -216,6 +220,11 @@ impl<UI: AjUi> Agent<UI> {
                         }
                     }
                 }
+            }
+
+            // If thinking was enabled for this call, mark it as used
+            if thinking_will_be_enabled {
+                self.session_ctx.set_thinking_used(true);
             }
 
             let response = response.expect("missing message");
@@ -342,11 +351,13 @@ impl<UI: AjUi> Agent<UI> {
     }
 
     /// Determine the thinking configuration based on trigger texts in the user
-    /// prompt. Returns thinking configuration based on specific trigger
-    /// phrases:
+    /// prompt and session state. Returns thinking configuration based on
+    /// specific trigger phrases:
     /// - "think harder" -> 32,000 tokens
     /// - "think hard" -> 10,000 tokens
     /// - "think" -> 4,000 tokens
+    /// - If thinking has been used before but no trigger phrase -> 1,024 tokens
+    /// (minimum)
     /// - default -> None (no thinking)
     fn determine_thinking(
         &self,
@@ -357,6 +368,8 @@ impl<UI: AjUi> Agent<UI> {
             .iter()
             .filter(|m| matches!(m.role, Role::User))
             .last();
+
+        let mut thinking_budget = None;
 
         if let Some(message) = last_user_message {
             // Extract text content from the message
@@ -377,22 +390,24 @@ impl<UI: AjUi> Agent<UI> {
 
             // Check for trigger phrases in order of specificity
             if text_lower.contains("think harder") {
-                return Some(anthropic_sdk::messages::Thinking::Enabled {
-                    budget_tokens: 32_000,
-                });
+                thinking_budget = Some(32_000);
             } else if text_lower.contains("think hard") {
-                return Some(anthropic_sdk::messages::Thinking::Enabled {
-                    budget_tokens: 10_000,
-                });
+                thinking_budget = Some(10_000);
             } else if text_lower.contains("think") {
-                return Some(anthropic_sdk::messages::Thinking::Enabled {
-                    budget_tokens: 4_000,
-                });
+                thinking_budget = Some(4_000);
             }
         }
 
-        // Default: no thinking
-        None
+        // If thinking has been used before but no trigger phrase was found, use
+        // minimum budget
+        if thinking_budget.is_none() && self.session_ctx.is_thinking_used() {
+            thinking_budget = Some(1024);
+        }
+
+        // Return thinking configuration if we have a budget
+        thinking_budget.map(|budget| anthropic_sdk::messages::Thinking::Enabled {
+            budget_tokens: budget,
+        })
     }
 
     /// Assemble the system prompt we pass to the model from the actual system
@@ -518,6 +533,7 @@ impl<'a, UI: AjUi> ToolSessionContext for SessionContextWrapper<'a, UI> {
 pub struct SessionContext<UI: AjUi> {
     pub working_directory: PathBuf,
     todo_list: Vec<TodoItem>,
+    thinking_used: bool,
     ui: std::marker::PhantomData<UI>,
 }
 
@@ -526,6 +542,7 @@ impl<UI: AjUi> SessionContext<UI> {
         Self {
             working_directory,
             todo_list: Vec::new(),
+            thinking_used: false,
             ui: std::marker::PhantomData,
         }
     }
@@ -540,6 +557,14 @@ impl<UI: AjUi> SessionContext<UI> {
 
     fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
         self.todo_list = todos;
+    }
+
+    fn is_thinking_used(&self) -> bool {
+        self.thinking_used
+    }
+
+    fn set_thinking_used(&mut self, used: bool) {
+        self.thinking_used = used;
     }
 }
 
