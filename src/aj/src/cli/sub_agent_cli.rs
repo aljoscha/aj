@@ -35,9 +35,7 @@ impl AjUi for SubAgentCli {
     fn agent_text_start(&self, _text: &str) {
         print!(
             "{}:\n",
-            style(&format!("{} aj", self.prefix))
-                .bold()
-                .fg(Color::Yellow)
+            style(&format!("{}", self.prefix)).bold().fg(Color::Yellow)
         );
     }
 
