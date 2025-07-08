@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use aj_ui::{AjUi, TokenUsage};
+use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary};
 use console::{Color, style};
 use rustyline::config::Config;
 use rustyline::config::EditMode;
@@ -270,8 +270,12 @@ impl AjUi for AjCli {
         println!("{}\n", style(usage_string).dim())
     }
 
-    fn get_subagent_ui(&self) -> impl AjUi {
-        return sub_agent_cli::SubAgentCli::new();
+    fn display_token_usage_summary(&self, summary: &UsageSummary) {
+        println!("{}\n", style(format_usage_summary(summary)).dim())
+    }
+
+    fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi {
+        return sub_agent_cli::SubAgentCli::new(agent_number);
     }
 }
 
@@ -296,6 +300,45 @@ pub(crate) fn format_token_usage(usage: &TokenUsage) -> String {
     );
 
     usage_string
+}
+
+pub(crate) fn format_usage_summary(summary: &UsageSummary) -> String {
+    let format_single_usage = |usage: &SubAgentUsage| -> String {
+        format!(
+            "Input: {} | Output: {} | Cache Creation: {} | Cache Read: {}",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_read_tokens
+        )
+    };
+
+    let mut result = String::new();
+
+    // Main agent usage
+    result.push_str(&format!(
+        "Main Agent - {}\n",
+        format_single_usage(&summary.main_agent_usage)
+    ));
+
+    // Sub-agent usage
+    for sub_usage in &summary.sub_agent_usage {
+        if let Some(agent_id) = sub_usage.agent_id {
+            result.push_str(&format!(
+                "Sub-agent {} - {}\n",
+                agent_id,
+                format_single_usage(sub_usage)
+            ));
+        }
+    }
+
+    // Total usage
+    result.push_str(&format!(
+        "TOTAL - {}",
+        format_single_usage(&summary.total_usage)
+    ));
+
+    result
 }
 
 /// Truncates output for display if it's too long, showing first and last

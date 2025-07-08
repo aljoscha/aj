@@ -7,7 +7,7 @@ use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, TurnContext as ToolTurnContext,
 };
-use aj_ui::{AjUi, TokenUsage};
+use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary};
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
     Usage,
@@ -93,6 +93,7 @@ impl<UI: AjUi> Agent<UI> {
                 let user_input = if let Some(user_input) = user_input {
                     user_input
                 } else {
+                    self.display_usage_summary();
                     break;
                 };
                 let user_message =
@@ -444,6 +445,69 @@ impl<UI: AjUi> Agent<UI> {
 
         (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, tool_input).await
     }
+
+    fn display_usage_summary(&self) {
+        // Create main agent usage
+        let main_agent_usage = SubAgentUsage {
+            agent_id: None,
+            input_tokens: self.session_state.accumulated_usage.input_tokens,
+            output_tokens: self.session_state.accumulated_usage.output_tokens,
+            cache_creation_tokens: self
+                .session_state
+                .accumulated_usage
+                .cache_creation_input_tokens
+                .unwrap_or(0),
+            cache_read_tokens: self
+                .session_state
+                .accumulated_usage
+                .cache_read_input_tokens
+                .unwrap_or(0),
+        };
+
+        // Create sub-agent usage list
+        let mut sub_agent_usage = Vec::new();
+        let mut total_sub_agent_input = 0;
+        let mut total_sub_agent_output = 0;
+        let mut total_sub_agent_cache_creation = 0;
+        let mut total_sub_agent_cache_read = 0;
+
+        for (agent_id, usage) in &self.session_state.sub_agent_usage {
+            let sub_usage = SubAgentUsage {
+                agent_id: Some(*agent_id),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+            };
+
+            total_sub_agent_input += sub_usage.input_tokens;
+            total_sub_agent_output += sub_usage.output_tokens;
+            total_sub_agent_cache_creation += sub_usage.cache_creation_tokens;
+            total_sub_agent_cache_read += sub_usage.cache_read_tokens;
+
+            sub_agent_usage.push(sub_usage);
+        }
+
+        // Create total usage
+        let total_usage = SubAgentUsage {
+            agent_id: None,
+            input_tokens: main_agent_usage.input_tokens + total_sub_agent_input,
+            output_tokens: main_agent_usage.output_tokens + total_sub_agent_output,
+            cache_creation_tokens: main_agent_usage.cache_creation_tokens
+                + total_sub_agent_cache_creation,
+            cache_read_tokens: main_agent_usage.cache_read_tokens + total_sub_agent_cache_read,
+        };
+
+        // Create usage summary
+        let summary = UsageSummary {
+            main_agent_usage,
+            sub_agent_usage,
+            total_usage,
+        };
+
+        // Display using UI
+        self.ui.display_token_usage_summary(&summary);
+    }
 }
 
 /// Mutable state of an [Agent] session.
@@ -454,6 +518,8 @@ pub struct SessionState {
     thinking_used: bool,
     turn_counter: usize,
     accumulated_usage: Usage,
+    sub_agent_counter: usize,
+    sub_agent_usage: HashMap<usize, Usage>,
 }
 
 impl SessionState {
@@ -472,6 +538,8 @@ impl SessionState {
                 server_tool_use: None,
                 service_tier: None,
             },
+            sub_agent_counter: 0,
+            sub_agent_usage: HashMap::new(),
         }
     }
 
@@ -501,6 +569,15 @@ impl SessionState {
 
     pub fn accumulated_usage(&self) -> &Usage {
         &self.accumulated_usage
+    }
+
+    fn next_sub_agent_id(&mut self) -> usize {
+        self.sub_agent_counter += 1;
+        self.sub_agent_counter
+    }
+
+    fn record_sub_agent_usage(&mut self, agent_id: usize, usage: Usage) {
+        self.sub_agent_usage.insert(agent_id, usage);
     }
 }
 
@@ -544,14 +621,17 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
     }
 
     fn spawn_agent(
-        &self,
+        &mut self,
         task: String,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,
     > {
         Box::pin(async move {
-            // Create a sub-agent UI wrapper
-            let sub_ui = self.ui.get_subagent_ui();
+            // Get the next agent ID
+            let agent_id = self.session_ctx.next_sub_agent_id();
+
+            // Create a sub-agent UI wrapper with the agent number
+            let sub_ui = self.ui.get_subagent_ui(agent_id);
 
             // Get tools excluding the agent tool to prevent infinite recursion
             let sub_agent_tools = get_builtin_tools()
@@ -568,7 +648,16 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             );
 
             // Run the sub-agent with the task
-            sub_agent.run_single_turn(task).await
+            let result = sub_agent.run_single_turn(task).await;
+
+            // Get the sub-agent's accumulated usage
+            let sub_agent_usage = sub_agent.session_state.accumulated_usage.clone();
+
+            // Record the usage in the main session state
+            self.session_ctx
+                .record_sub_agent_usage(agent_id, sub_agent_usage);
+
+            result
         })
     }
 }

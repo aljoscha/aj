@@ -33,7 +33,7 @@ impl SessionContext for DummySessionContext {
     }
 
     fn spawn_agent(
-        &self,
+        &mut self,
         _task: String,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,

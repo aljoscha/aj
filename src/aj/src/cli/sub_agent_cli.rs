@@ -1,19 +1,21 @@
-use aj_ui::{AjUi, TokenUsage};
+use aj_ui::{AjUi, TokenUsage, UsageSummary};
 use console::{Color, style};
 
-use crate::cli::{DARK_GRAY, LIGHT_GRAY, format_token_usage, render_markdown};
+use crate::cli::{
+    DARK_GRAY, LIGHT_GRAY, format_token_usage, format_usage_summary, render_markdown,
+};
 
-/// A wrapper UI for sub-agents that prefixes output with "(sub agent)" and only
-/// shows headings for tool use.
+/// A wrapper UI for sub-agents that prefixes output with "(sub agent N)" and
+/// only shows headings for tool use.
 #[derive(Clone)]
 pub struct SubAgentCli {
     prefix: String,
 }
 
 impl SubAgentCli {
-    pub fn new() -> Self {
+    pub fn new(agent_number: usize) -> Self {
         Self {
-            prefix: "(sub agent)".to_string(),
+            prefix: format!("(sub agent {})", agent_number),
         }
     }
 }
@@ -114,7 +116,16 @@ impl AjUi for SubAgentCli {
         )
     }
 
-    fn get_subagent_ui(&self) -> impl AjUi {
-        return SubAgentCli::new();
+    fn display_token_usage_summary(&self, summary: &UsageSummary) {
+        let usage_string = format_usage_summary(summary);
+        println!(
+            "{} {}\n",
+            style(self.prefix.to_string()).dim(),
+            style(usage_string).dim()
+        )
+    }
+
+    fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi {
+        return SubAgentCli::new(agent_number);
     }
 }

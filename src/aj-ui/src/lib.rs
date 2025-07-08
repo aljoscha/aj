@@ -22,7 +22,9 @@ pub trait AjUi: Send + Sync {
 
     fn display_token_usage(&self, usage: &TokenUsage);
 
-    fn get_subagent_ui(&self) -> impl AjUi;
+    fn display_token_usage_summary(&self, summary: &UsageSummary);
+
+    fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi;
 }
 
 /// Token usage information for display
@@ -36,4 +38,22 @@ pub struct TokenUsage {
     pub turn_cache_creation: u64,
     pub accumulated_cache_read: u64,
     pub turn_cache_read: u64,
+}
+
+/// Usage summary for display including main agent and sub-agents
+#[derive(Debug, Clone)]
+pub struct UsageSummary {
+    pub main_agent_usage: SubAgentUsage,
+    pub sub_agent_usage: Vec<SubAgentUsage>,
+    pub total_usage: SubAgentUsage,
+}
+
+/// Usage information for a single agent (main or sub-agent)
+#[derive(Debug, Clone)]
+pub struct SubAgentUsage {
+    pub agent_id: Option<usize>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
 }

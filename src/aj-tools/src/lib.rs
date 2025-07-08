@@ -114,7 +114,7 @@ pub trait SessionContext: Send {
     ///
     /// The sub-agent will run independently with its own UI wrapper and return a report.
     fn spawn_agent(
-        &self,
+        &mut self,
         task: String,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,
