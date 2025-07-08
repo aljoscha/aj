@@ -117,6 +117,18 @@ impl Config {
         let config: Config = serde_json::from_str(&content)?;
         Ok(config)
     }
+
+    pub fn get_history_file_path() -> Result<PathBuf, ConfigError> {
+        let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
+        let aj_dir = Path::new(&home_dir).join(".aj");
+
+        // Create the .aj directory if it doesn't exist
+        if !aj_dir.exists() {
+            fs::create_dir_all(&aj_dir)?;
+        }
+
+        Ok(aj_dir.join("history.txt"))
+    }
 }
 
 #[cfg(test)]

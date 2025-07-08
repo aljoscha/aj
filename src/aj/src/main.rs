@@ -16,7 +16,15 @@ async fn main() {
         .with_ansi(true)
         .init();
 
-    let ui = AjCli::new();
+    let history_path = match aj_conf::Config::get_history_file_path() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Could not get history file path: {}", e);
+            return;
+        }
+    };
+
+    let ui = AjCli::new(Some(history_path));
     let result = run(ui).await;
 
     let ui = match result {

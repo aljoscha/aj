@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use aj_ui::{AjUi, TokenUsage};
 use console::{Color, style};
 use rustyline::config::Config;
@@ -11,17 +13,13 @@ pub mod sub_agent_cli;
 
 /// Cli-based implementation of [AjUi].
 #[derive(Clone)]
-pub struct AjCli;
-
-impl Default for AjCli {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct AjCli {
+    history_path: Option<PathBuf>,
 }
 
 impl AjCli {
-    pub fn new() -> Self {
-        Self
+    pub fn new(history_path: Option<PathBuf>) -> Self {
+        Self { history_path }
     }
 }
 
@@ -40,25 +38,44 @@ impl AjUi for AjCli {
     fn get_user_input(&self) -> Option<String> {
         let config = Config::builder().edit_mode(EditMode::Emacs).build();
 
-        let mut rl: Editor<(), FileHistory> = Editor::with_config(config).unwrap();
+        let mut rl: Editor<(), FileHistory> =
+            Editor::with_history(config, FileHistory::new()).unwrap();
+
+        if let Some(history_path) = self.history_path.as_ref() {
+            if history_path.exists() {
+                let _ = rl.load_history(history_path);
+            }
+        }
 
         rl.bind_sequence(KeyEvent::ctrl('S'), Cmd::Newline);
 
         let prompt = format!("{}: ", style("you").bold().fg(Color::Blue));
 
-        match rl.readline(&prompt) {
+        let result = match rl.readline(&prompt) {
             Ok(line) => {
                 if line.trim().is_empty() {
                     println!();
                     return None;
                 }
+
+                // Add to history if not empty and not a duplicate
+                if !line.trim().is_empty() {
+                    let _ = rl.add_history_entry(&line);
+                }
+
+                if let Some(history_path) = self.history_path.as_ref() {
+                    let _ = rl.save_history(history_path);
+                }
+
                 println!();
                 Some(line)
             }
             Err(rustyline::error::ReadlineError::Interrupted) => None, // Ctrl-C
             Err(rustyline::error::ReadlineError::Eof) => None,         // Ctrl-D
             Err(_) => None,
-        }
+        };
+
+        result
     }
 
     fn agent_text_start(&self, _text: &str) {

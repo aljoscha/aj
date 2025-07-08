@@ -2,7 +2,7 @@ use aj::cli::AjCli;
 use aj_ui::AjUi;
 
 fn main() {
-    let ui = AjCli;
+    let ui = AjCli::new(None);
 
     let markdown_text = r#"# Example Markdown Output
 
