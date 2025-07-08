@@ -5,8 +5,7 @@ use std::pin::pin;
 use aj_conf::AgentEnv;
 use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
-    get_builtin_tools, ErasedToolDefinition, SessionContext as ToolSessionContext,
-    TurnContext as ToolTurnContext,
+    get_builtin_tools, ErasedToolDefinition, SessionContext, TurnContext as ToolTurnContext,
 };
 use aj_ui::{AjUi, TokenUsage};
 use anthropic_sdk::messages::{
@@ -24,9 +23,7 @@ pub struct Agent<UI: AjUi> {
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
     client: anthropic_sdk::client::Client,
-    session_ctx: SessionContext<UI>,
-    turn_counter: usize,
-    accumulated_usage: Usage,
+    session_state: SessionState,
 }
 
 impl<UI: AjUi> Agent<UI> {
@@ -62,32 +59,18 @@ impl<UI: AjUi> Agent<UI> {
             tool_definitions,
             tools: api_tools,
             client,
-            session_ctx: SessionContext::new(env.working_directory.clone()),
+            session_state: SessionState::new(env.working_directory.clone()),
             env,
-            turn_counter: 0,
             ui,
-            accumulated_usage: Usage {
-                cache_creation: None,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                server_tool_use: None,
-                service_tier: None,
-            },
         }
     }
 
-    pub fn session_ctx(&self) -> &SessionContext<UI> {
-        &self.session_ctx
-    }
-
-    pub fn session_ctx_mut(&mut self) -> &mut SessionContext<UI> {
-        &mut self.session_ctx
-    }
-
     pub fn current_turn(&self) -> usize {
-        self.turn_counter
+        self.session_state.turn_counter()
+    }
+
+    pub fn accumulated_usage(&self) -> &Usage {
+        self.session_state.accumulated_usage()
     }
 
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
@@ -159,8 +142,8 @@ impl<UI: AjUi> Agent<UI> {
         &mut self,
         conversation: &mut Vec<MessageParam>,
     ) -> Result<(), anyhow::Error> {
-        self.turn_counter += 1;
-        let mut turn_ctx = TurnContext::new(self.turn_counter);
+        self.session_state.turn_counter += 1;
+        let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
 
         loop {
             // Check if we're going to enable thinking for this call
@@ -220,7 +203,7 @@ impl<UI: AjUi> Agent<UI> {
 
             // If thinking was enabled for this call, mark it as used
             if thinking_will_be_enabled {
-                self.session_ctx.set_thinking_used(true);
+                self.session_state.set_thinking_used(true);
             }
 
             let response = response.expect("missing message");
@@ -240,21 +223,27 @@ impl<UI: AjUi> Agent<UI> {
             conversation.push(response.into_message_param());
 
             let usage = TokenUsage {
-                accumulated_input: self.accumulated_usage.input_tokens,
+                accumulated_input: self.session_state.accumulated_usage.input_tokens,
                 turn_input: turn_usage_update.input_tokens,
-                accumulated_output: self.accumulated_usage.output_tokens,
+                accumulated_output: self.session_state.accumulated_usage.output_tokens,
                 turn_output: turn_usage_update.output_tokens,
                 accumulated_cache_creation: self
+                    .session_state
                     .accumulated_usage
                     .cache_creation_input_tokens
                     .unwrap_or(0),
                 turn_cache_creation: turn_usage_update.cache_creation_input_tokens.unwrap_or(0),
-                accumulated_cache_read: self.accumulated_usage.cache_read_input_tokens.unwrap_or(0),
+                accumulated_cache_read: self
+                    .session_state
+                    .accumulated_usage
+                    .cache_read_input_tokens
+                    .unwrap_or(0),
                 turn_cache_read: turn_usage_update.cache_read_input_tokens.unwrap_or(0),
             };
             self.ui.display_token_usage(&usage);
 
-            self.accumulated_usage
+            self.session_state
+                .accumulated_usage
                 .add(&turn_usage_update.into_usage_delta());
 
             // Execute tool calls if any
@@ -396,7 +385,7 @@ impl<UI: AjUi> Agent<UI> {
 
         // If thinking has been used before but no trigger phrase was found, use
         // minimum budget
-        if thinking_budget.is_none() && self.session_ctx.is_thinking_used() {
+        if thinking_budget.is_none() && self.session_state.is_thinking_used() {
             thinking_budget = Some(1024);
         }
 
@@ -447,7 +436,7 @@ impl<UI: AjUi> Agent<UI> {
 
         // Create a wrapper that provides UI access to the session state
         let mut session_ctx_wrapper = SessionContextWrapper {
-            session_ctx: &mut self.session_ctx,
+            session_ctx: &mut self.session_state,
             ui: &self.ui,
             env: &self.env,
             system_prompt: self.system_prompt,
@@ -457,15 +446,74 @@ impl<UI: AjUi> Agent<UI> {
     }
 }
 
-/// Wrapper that provides UI access to session state operations
+/// Mutable state of an [Agent] session.
+#[derive(Debug)]
+pub struct SessionState {
+    working_directory: PathBuf,
+    todo_list: Vec<TodoItem>,
+    thinking_used: bool,
+    turn_counter: usize,
+    accumulated_usage: Usage,
+}
+
+impl SessionState {
+    pub fn new(working_directory: PathBuf) -> Self {
+        Self {
+            working_directory,
+            todo_list: Vec::new(),
+            thinking_used: false,
+            turn_counter: 0,
+            accumulated_usage: Usage {
+                cache_creation: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                server_tool_use: None,
+                service_tier: None,
+            },
+        }
+    }
+
+    fn working_directory(&self) -> PathBuf {
+        self.working_directory.to_owned()
+    }
+
+    fn get_todo_list(&self) -> Vec<TodoItem> {
+        self.todo_list.clone()
+    }
+
+    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
+        self.todo_list = todos;
+    }
+
+    fn is_thinking_used(&self) -> bool {
+        self.thinking_used
+    }
+
+    fn set_thinking_used(&mut self, used: bool) {
+        self.thinking_used = used;
+    }
+
+    pub fn turn_counter(&self) -> usize {
+        self.turn_counter
+    }
+
+    pub fn accumulated_usage(&self) -> &Usage {
+        &self.accumulated_usage
+    }
+}
+
+/// Wrapper that provides partial access to mutable [Agent] state, while we have
+/// partial immutable access to other parts. Used in [Agent::execute_tool].
 struct SessionContextWrapper<'a, UI: AjUi> {
-    session_ctx: &'a mut SessionContext<UI>,
+    session_ctx: &'a mut SessionState,
     ui: &'a UI,
     env: &'a AgentEnv,
     system_prompt: &'static str,
 }
 
-impl<'a, UI: AjUi> ToolSessionContext for SessionContextWrapper<'a, UI> {
+impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
     fn working_directory(&self) -> PathBuf {
         self.session_ctx.working_directory()
     }
@@ -522,45 +570,6 @@ impl<'a, UI: AjUi> ToolSessionContext for SessionContextWrapper<'a, UI> {
             // Run the sub-agent with the task
             sub_agent.run_single_turn(task).await
         })
-    }
-}
-
-#[derive(Debug)]
-pub struct SessionContext<UI: AjUi> {
-    pub working_directory: PathBuf,
-    todo_list: Vec<TodoItem>,
-    thinking_used: bool,
-    ui: std::marker::PhantomData<UI>,
-}
-
-impl<UI: AjUi> SessionContext<UI> {
-    pub fn new(working_directory: PathBuf) -> Self {
-        Self {
-            working_directory,
-            todo_list: Vec::new(),
-            thinking_used: false,
-            ui: std::marker::PhantomData,
-        }
-    }
-
-    fn working_directory(&self) -> PathBuf {
-        self.working_directory.to_owned()
-    }
-
-    fn get_todo_list(&self) -> Vec<TodoItem> {
-        self.todo_list.clone()
-    }
-
-    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
-        self.todo_list = todos;
-    }
-
-    fn is_thinking_used(&self) -> bool {
-        self.thinking_used
-    }
-
-    fn set_thinking_used(&mut self, used: bool) {
-        self.thinking_used = used;
     }
 }
 
