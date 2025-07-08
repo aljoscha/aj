@@ -90,10 +90,6 @@ impl<UI: AjUi> Agent<UI> {
         self.turn_counter
     }
 
-    pub fn into_ui(self) -> UI {
-        self.ui
-    }
-
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
         let mut conversation: Vec<MessageParam> = Vec::new();
 
