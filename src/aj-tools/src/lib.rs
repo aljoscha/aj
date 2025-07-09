@@ -10,6 +10,7 @@ use crate::tools::todo::TodoItem;
 
 pub mod tools;
 mod util;
+pub mod testing;
 
 pub use tools::agent::AgentTool;
 pub use tools::bash::BashTool;
