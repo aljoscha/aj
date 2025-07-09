@@ -33,7 +33,9 @@ impl<UI: AjUi> Agent<UI> {
         tools: Vec<ErasedToolDefinition>,
         ui: UI,
     ) -> Self {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        let api_key = std::env::var("ANTHROPIC_API_KEY").expect(
+            "need ANTHROPIC_API_KEY in environment, maybe you forget to set up a .env file",
+        );
         let client = anthropic_sdk::client::Client::new(api_key.clone());
 
         // Convert ErasedToolDefinition to Tool for Anthropic API
