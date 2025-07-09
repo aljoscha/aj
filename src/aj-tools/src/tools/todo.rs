@@ -31,7 +31,7 @@ fn format_todo_list(todos: &[TodoItem]) -> String {
             todo.content.clone()
         };
 
-        result.push_str(&format!("{} {}{}\n", status_symbol, content, priority_text));
+        result.push_str(&format!("{status_symbol} {content}{priority_text}\n"));
     }
 
     result
@@ -151,7 +151,7 @@ impl ToolDefinition for TodoWriteTool {
 
         let update_result = format!("Updated todo list with {} items.", input.todos.len());
         let formatted_todos = format_todo_list(&input.todos);
-        let result = format!("{}\n{}", update_result, formatted_todos);
+        let result = format!("{update_result}\n{formatted_todos}");
 
         session_ctx.display_tool_result("todo_write", "", &result);
 

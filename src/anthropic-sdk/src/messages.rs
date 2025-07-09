@@ -548,6 +548,7 @@ pub enum StopReason {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Default)]
 pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<CacheCreation>,
@@ -563,19 +564,6 @@ pub struct Usage {
     pub service_tier: Option<ServiceTier>,
 }
 
-impl Default for Usage {
-    fn default() -> Self {
-        Self {
-            cache_creation: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            server_tool_use: None,
-            service_tier: None,
-        }
-    }
-}
 
 impl Usage {
     pub fn add(&mut self, delta: &UsageDelta) {

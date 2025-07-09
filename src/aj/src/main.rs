@@ -18,7 +18,7 @@ async fn main() {
     let history_path = match aj_conf::Config::get_history_file_path() {
         Ok(path) => path,
         Err(e) => {
-            eprintln!("Could not get history file path: {}", e);
+            eprintln!("Could not get history file path: {e}");
             return;
         }
     };
@@ -29,7 +29,7 @@ async fn main() {
     match result {
         Ok(()) => (),
         Err(err) => {
-            eprintln!("Error running agent: {}", err);
+            eprintln!("Error running agent: {err}");
         }
     }
 

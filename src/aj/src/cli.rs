@@ -28,7 +28,7 @@ const LIGHT_GRAY: Color = Color::Color256(248);
 
 impl AjUi for AjCli {
     fn display_notice(&self, notice: &str) {
-        println!("{}\n", notice);
+        println!("{notice}\n");
     }
 
     fn display_error(&self, error: &str) {
@@ -51,7 +51,9 @@ impl AjUi for AjCli {
 
         let prompt = format!("{}: ", style("you").bold().fg(Color::Blue));
 
-        let result = match rl.readline(&prompt) {
+        
+
+        match rl.readline(&prompt) {
             Ok(line) => {
                 if line.trim().is_empty() {
                     println!();
@@ -73,13 +75,11 @@ impl AjUi for AjCli {
             Err(rustyline::error::ReadlineError::Interrupted) => None, // Ctrl-C
             Err(rustyline::error::ReadlineError::Eof) => None,         // Ctrl-D
             Err(_) => None,
-        };
-
-        result
+        }
     }
 
     fn agent_text_start(&self, _text: &str) {
-        print!("{}:\n", style("aj").bold().fg(Color::Yellow));
+        println!("{}:", style("aj").bold().fg(Color::Yellow));
     }
 
     fn agent_text_update(&self, _diff: &str) {
@@ -100,7 +100,7 @@ impl AjUi for AjCli {
     }
 
     fn agent_thinking_update(&self, diff: &str) {
-        print!("{}", diff);
+        print!("{diff}");
     }
 
     fn agent_thinking_stop(&self) {
@@ -112,7 +112,7 @@ impl AjUi for AjCli {
 
         let truncated_result = truncate_output(result);
 
-        println!("{}\n", truncated_result);
+        println!("{truncated_result}\n");
     }
 
     fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str) {
@@ -195,9 +195,9 @@ impl AjUi for AjCli {
                 };
 
                 let line_num_str = match change.tag() {
-                    ChangeTag::Delete => format!("{:4}     ", old_line_num),
-                    ChangeTag::Insert => format!("     {:4}", new_line_num),
-                    ChangeTag::Equal => format!("{:4}:{:4}", old_line_num, new_line_num),
+                    ChangeTag::Delete => format!("{old_line_num:4}     "),
+                    ChangeTag::Insert => format!("     {new_line_num:4}"),
+                    ChangeTag::Equal => format!("{old_line_num:4}:{new_line_num:4}"),
                 };
 
                 let styled_line = match change.tag() {
@@ -228,7 +228,7 @@ impl AjUi for AjCli {
                     .dim(),
                 };
 
-                println!("{}", styled_line);
+                println!("{styled_line}");
 
                 // Update line numbers
                 match change.tag() {
@@ -252,7 +252,7 @@ impl AjUi for AjCli {
     fn ask_permission(&self, message: &str) -> bool {
         use std::io::{self, Write};
 
-        println!("\n{}", message);
+        println!("\n{message}");
         print!("Allow this command? (y/n): ");
         io::stdout().flush().unwrap();
 
@@ -275,16 +275,16 @@ impl AjUi for AjCli {
     }
 
     fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi {
-        return sub_agent_cli::SubAgentCli::new(agent_number);
+        sub_agent_cli::SubAgentCli::new(agent_number)
     }
 }
 
 pub(crate) fn format_token_usage(usage: &TokenUsage) -> String {
     let format_tokens = |acc: u64, turn: u64| -> String {
         if turn == 0 {
-            format!("{}", acc)
+            format!("{acc}")
         } else {
-            format!("{}+{}", acc, turn)
+            format!("{acc}+{turn}")
         }
     };
 
@@ -295,8 +295,7 @@ pub(crate) fn format_token_usage(usage: &TokenUsage) -> String {
     let cache_read_str = format_tokens(usage.accumulated_cache_read, usage.turn_cache_read);
 
     let usage_string = format!(
-        "Token Usage - Input: {} | Output: {} | Cache Creation: {} | Cache Read: {}",
-        input_str, output_str, cache_creation_str, cache_read_str,
+        "Token Usage - Input: {input_str} | Output: {output_str} | Cache Creation: {cache_creation_str} | Cache Read: {cache_read_str}",
     );
 
     usage_string
@@ -359,7 +358,7 @@ fn truncate_output(output: &str) -> String {
 
         // Show omitted indicator with count
         let omitted_lines = lines.len() - 16; // Total lines minus first 8 and last 8
-        result.push_str(&format!("[... {} lines omitted ...]\n", omitted_lines));
+        result.push_str(&format!("[... {omitted_lines} lines omitted ...]\n"));
 
         // Display last 8 lines
         for line in lines.iter().skip(lines.len() - 8) {

@@ -293,7 +293,7 @@ impl StreamProcessor {
                             Ok(input) => input,
                             Err(e) => {
                                 return Some(StreamingEvent::ParseError {
-                                    error: format!("failed to parse tool use input json: {}", e),
+                                    error: format!("failed to parse tool use input json: {e}"),
                                     raw_data: input_json,
                                 });
                             }
@@ -320,8 +320,7 @@ impl StreamProcessor {
                             Err(e) => {
                                 return Some(StreamingEvent::ParseError {
                                     error: format!(
-                                        "failed to parse server tool use input json: {}",
-                                        e
+                                        "failed to parse server tool use input json: {e}"
                                     ),
                                     raw_data: input_json,
                                 });
@@ -352,8 +351,7 @@ impl StreamProcessor {
                             Err(e) => {
                                 return Some(StreamingEvent::ParseError {
                                     error: format!(
-                                        "failed to parse mcp tool use input json: {}",
-                                        e
+                                        "failed to parse mcp tool use input json: {e}"
                                     ),
                                     raw_data: input_json,
                                 });

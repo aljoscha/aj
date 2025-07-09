@@ -191,12 +191,11 @@ impl<UI: AjUi> Agent<UI> {
                         }
                         StreamingEvent::ParseError { error, raw_data } => {
                             self.ui.display_error(&format!(
-                                "Parse error: {} (raw data: {})",
-                                error, raw_data
+                                "Parse error: {error} (raw data: {raw_data})"
                             ));
                         }
                         StreamingEvent::ProtocolError { error } => {
-                            self.ui.display_error(&format!("Protocol error: {}", error));
+                            self.ui.display_error(&format!("Protocol error: {error}"));
                         }
                     }
                 }
@@ -261,7 +260,7 @@ impl<UI: AjUi> Agent<UI> {
                         Err(err) => {
                             self.ui
                                 .display_tool_error(&tool_name, "[...]", &err.to_string());
-                            (format!("{}", err), true)
+                            (format!("{err}"), true)
                         }
                     };
 
@@ -343,7 +342,7 @@ impl<UI: AjUi> Agent<UI> {
     /// - "think hard" -> 10,000 tokens
     /// - "think" -> 4,000 tokens
     /// - If thinking has been used before but no trigger phrase -> 1,024 tokens
-    /// (minimum)
+    ///   (minimum)
     /// - default -> None (no thinking)
     fn determine_thinking(
         &self,
@@ -353,7 +352,7 @@ impl<UI: AjUi> Agent<UI> {
         let last_user_message = conversation
             .iter()
             .filter(|m| matches!(m.role, Role::User))
-            .last();
+            .next_back();
 
         let mut thinking_budget = None;
 

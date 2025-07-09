@@ -115,7 +115,7 @@ impl ToolDefinition for LsTool {
                 "-".to_string()
             };
 
-            results.push(format!("{:<20} {:<10} {}", file_name, entry_type, size));
+            results.push(format!("{file_name:<20} {entry_type:<10} {size}"));
         }
 
         // Sort results alphabetically

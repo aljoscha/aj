@@ -1,7 +1,6 @@
 use aj_tools::tools::grep::{GrepInput, GrepTool};
 use aj_tools::tools::todo::TodoItem;
 use aj_tools::{SessionContext, ToolDefinition, TurnContext};
-use anyhow;
 use std::env;
 use std::path::PathBuf;
 
@@ -75,9 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut turn_ctx = DummyTurnContext;
 
     match tool.execute(&mut session_ctx, &mut turn_ctx, input).await {
-        Ok(result) => println!("{}", result),
+        Ok(result) => println!("{result}"),
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             std::process::exit(1);
         }
     }

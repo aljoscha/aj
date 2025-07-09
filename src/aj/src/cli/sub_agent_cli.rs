@@ -15,7 +15,7 @@ pub struct SubAgentCli {
 impl SubAgentCli {
     pub fn new(agent_number: usize) -> Self {
         Self {
-            prefix: format!("(sub agent {})", agent_number),
+            prefix: format!("(sub agent {agent_number})"),
         }
     }
 }
@@ -35,9 +35,9 @@ impl AjUi for SubAgentCli {
     }
 
     fn agent_text_start(&self, _text: &str) {
-        print!(
-            "{}:\n",
-            style(&format!("{}", self.prefix)).bold().fg(Color::Yellow)
+        println!(
+            "{}:",
+            style(&self.prefix.to_string()).bold().fg(Color::Yellow)
         );
     }
 
@@ -60,7 +60,7 @@ impl AjUi for SubAgentCli {
     }
 
     fn agent_thinking_update(&self, diff: &str) {
-        print!("{}", diff);
+        print!("{diff}");
     }
 
     fn agent_thinking_stop(&self) {
@@ -126,6 +126,6 @@ impl AjUi for SubAgentCli {
     }
 
     fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi {
-        return SubAgentCli::new(agent_number);
+        SubAgentCli::new(agent_number)
     }
 }
