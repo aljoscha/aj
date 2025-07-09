@@ -38,12 +38,7 @@ dependencies = [
  "anyhow",
  "console",
  "dotenv",
- "futures",
- "itertools",
  "rustyline",
- "schemars",
- "serde",
- "serde_json",
  "similar",
  "termimad",
  "tokio",
@@ -60,12 +55,10 @@ dependencies = [
  "aj-ui",
  "anthropic-sdk",
  "anyhow",
- "console",
  "futures",
  "schemars",
  "serde",
  "serde_json",
- "similar",
  "tokio",
  "tracing",
 ]
@@ -90,20 +83,15 @@ dependencies = [
  "anthropic-sdk",
  "anyhow",
  "chrono",
- "dotenv",
  "futures",
  "globset",
  "grep",
- "itertools",
- "nu-ansi-term",
- "regex",
  "schemars",
  "serde",
  "serde_json",
  "termimad",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "walkdir",
 ]
 
@@ -486,12 +474,6 @@ name = "dyn-clone"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c7a8fb8a9fbf66c1f703fe16184d10ca0ee9d23be5b4436400408ba54a95005"
-
-[[package]]
-name = "either"
-version = "1.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "encode_unicode"
@@ -1120,15 +1102,6 @@ checksum = "dbc5ebe9c3a1a7a5127f920a418f7585e9e758e911d0466ed004f393b0e380b2"
 dependencies = [
  "memchr",
  "serde",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
 ]
 
 [[package]]
