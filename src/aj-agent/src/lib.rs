@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::time::Duration;
 
 use aj_conf::AgentEnv;
 use aj_tools::tools::todo::TodoItem;
@@ -8,6 +9,7 @@ use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, TurnContext as ToolTurnContext,
 };
 use aj_ui::{AjUi, ProcessUserOutput, SubAgentUsage, TokenUsage, UsageSummary};
+use anthropic_sdk::client::ClientError;
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
     Usage,
@@ -15,6 +17,7 @@ use anthropic_sdk::messages::{
 use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
+use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
@@ -148,7 +151,9 @@ impl<UI: AjUi> Agent<UI> {
         self.session_state.turn_counter += 1;
         let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
 
-        loop {
+        let mut retry_strategy = None;
+
+        'outer: loop {
             let response_stream = self.run_inference_streaming(conversation).await?;
 
             let mut response: Option<Message> = None;
@@ -165,7 +170,33 @@ impl<UI: AjUi> Agent<UI> {
                         StreamingEvent::FinalizedMessage { message } => {
                             response = Some(message);
                         }
-                        StreamingEvent::Error { error } => return Err(anyhow!("{}", error)),
+                        StreamingEvent::Error { error } if error.is_overloaded() => {
+                            // We initialize the strategy when we see the first
+                            // overloaded error.
+                            if retry_strategy.is_none() {
+                                retry_strategy = Some(Self::create_retry_strategy());
+                            }
+
+                            let retry_sleep =
+                                retry_strategy.as_mut().expect("known to be some").next();
+
+                            if let Some(retry_sleep) = retry_sleep {
+                                self.ui.display_error(&format!(
+                                    "{}, retrying in {}s...",
+                                    error,
+                                    retry_sleep.as_secs()
+                                ));
+
+                                tokio::time::sleep(retry_sleep).await;
+
+                                continue 'outer;
+                            } else {
+                                return Err(error.into());
+                            }
+                        }
+                        StreamingEvent::Error { error } => {
+                            return Err(error.into());
+                        }
                         StreamingEvent::TextStart { text, citations: _ } => {
                             self.ui.agent_text_start(&text);
                         }
@@ -196,6 +227,11 @@ impl<UI: AjUi> Agent<UI> {
                             self.ui.display_error(&format!("Protocol error: {error}"));
                         }
                     }
+
+                    // We've successfully received an event, reset the retry
+                    // strategy. That way, when we get an Overloaded error again
+                    // we'll initialize with a fresh retry_strategy.
+                    retry_strategy = None
                 }
             }
 
@@ -284,10 +320,18 @@ impl<UI: AjUi> Agent<UI> {
         Ok(())
     }
 
+    /// Creates a retry strategy for handling overloaded API errors.
+    fn create_retry_strategy() -> impl Iterator<Item = Duration> {
+        ExponentialBackoff::from_millis(100)
+            .max_delay(Duration::from_secs(2))
+            .take(10)
+            .map(jitter)
+    }
+
     async fn run_inference_streaming(
         &self,
         conversation: &[MessageParam],
-    ) -> Result<impl Stream<Item = StreamingEvent> + '_, anyhow::Error> {
+    ) -> Result<impl Stream<Item = StreamingEvent> + '_, ClientError> {
         let mut messages: Vec<_> = conversation.to_vec();
 
         let last_user_message = messages

@@ -34,6 +34,7 @@ serde_json = "1.0"
 similar = "2.6"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["full"] }
+tokio-retry2 = { version = "0.5", features = ["jitter"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 walkdir = "2.5"
