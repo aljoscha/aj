@@ -118,7 +118,7 @@ impl Config {
         Ok(config)
     }
 
-    pub fn get_history_file_path() -> Result<PathBuf, ConfigError> {
+    fn get_config_dir() -> Result<PathBuf, ConfigError> {
         let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
         let aj_dir = Path::new(&home_dir).join(".aj");
 
@@ -127,18 +127,16 @@ impl Config {
             fs::create_dir_all(&aj_dir)?;
         }
 
+        Ok(aj_dir)
+    }
+
+    pub fn get_history_file_path() -> Result<PathBuf, ConfigError> {
+        let aj_dir = Self::get_config_dir()?;
         Ok(aj_dir.join("history.txt"))
     }
 
     pub fn get_dotenv_file_path() -> Result<PathBuf, ConfigError> {
-        let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
-        let aj_dir = Path::new(&home_dir).join(".aj");
-
-        // Create the .aj directory if it doesn't exist
-        if !aj_dir.exists() {
-            fs::create_dir_all(&aj_dir)?;
-        }
-
+        let aj_dir = Self::get_config_dir()?;
         Ok(aj_dir.join(".env"))
     }
 }
