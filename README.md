@@ -17,4 +17,4 @@ $ cargo install --path src/aj
 ```
 
 You will need a `.env` file with an `ANTHROPIC_API_KEY` either in the working
-directory or a global one in `~/.aj/`.
+directory or a global one in `~/.config/aj/`.

@@ -103,8 +103,8 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self, ConfigError> {
-        let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
-        let config_path = Path::new(&home_dir).join(".aj").join("config.json");
+        let config_dir = Config::get_config_dir()?;
+        let config_path = config_dir.join("config.json");
 
         if !config_path.exists() {
             tracing::debug!(config_path = %config_path.display(), "no config file found, using empty config");
@@ -120,9 +120,9 @@ impl Config {
 
     fn get_config_dir() -> Result<PathBuf, ConfigError> {
         let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
-        let aj_dir = Path::new(&home_dir).join(".aj");
+        let aj_dir = Path::new(&home_dir).join(".config").join("aj");
 
-        // Create the .aj directory if it doesn't exist
+        // Create the ~/.config/aj directory if it doesn't exist
         if !aj_dir.exists() {
             fs::create_dir_all(&aj_dir)?;
         }
