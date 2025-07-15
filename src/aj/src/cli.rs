@@ -32,7 +32,7 @@ impl AjUi for AjCli {
     }
 
     fn display_error(&self, error: &str) {
-        println!("{}: {}\n", style("Error").bold().fg(Color::Red), error);
+        println!("{}: {}\n", style("error").bold().fg(Color::Red), error);
     }
 
     fn get_user_input(&self) -> Option<String> {
