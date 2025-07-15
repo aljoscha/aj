@@ -350,9 +350,7 @@ impl StreamProcessor {
                             Ok(input) => input,
                             Err(e) => {
                                 return Some(StreamingEvent::ParseError {
-                                    error: format!(
-                                        "failed to parse mcp tool use input json: {e}"
-                                    ),
+                                    error: format!("failed to parse mcp tool use input json: {e}"),
                                     raw_data: input_json,
                                 });
                             }

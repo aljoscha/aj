@@ -547,8 +547,7 @@ pub enum StopReason {
     Refusal,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<CacheCreation>,
@@ -563,7 +562,6 @@ pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
 }
-
 
 impl Usage {
     pub fn add(&mut self, delta: &UsageDelta) {
