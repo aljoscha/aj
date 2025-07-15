@@ -2,7 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 Edit files by doing multiple exact string replacements sequentially.
@@ -57,8 +58,9 @@ impl ToolDefinition for EditFileMultiTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
         if !path.is_absolute() {
             return Err(anyhow::anyhow!(
@@ -115,22 +117,25 @@ impl ToolDefinition for EditFileMultiTool {
             .unwrap_or(Path::new(path))
             .display()
             .to_string();
-        session_ctx.display_tool_result_diff(
-            "edit_file_multi",
-            &display_path,
-            &original_content,
-            &content,
-        );
 
         // Write the modified content back to disk
         fs::write(&input.path, &content)
             .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", input.path, e))?;
 
-        Ok(format!(
+        let return_value = format!(
             "Successfully applied {} edits to file '{}':\n{}",
             input.edits.len(),
             input.path,
             edit_results.join("\n")
-        ))
+        );
+
+        let user_output = UserOutput::ToolResultDiff {
+            tool_name: "edit_file_multi".to_string(),
+            input: display_path,
+            before: original_content,
+            after: content,
+        };
+
+        Ok(ToolResult::with_outputs(return_value, vec![user_output]))
     }
 }

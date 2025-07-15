@@ -11,7 +11,8 @@ use std::process::Command;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 Search file contents using regular expressions, recursively in a given path.
@@ -91,10 +92,11 @@ impl ToolDefinition for GrepTool {
 
     async fn execute(
         &self,
-        session_ctx: &mut dyn SessionContext,
+        _session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
         if !path.is_absolute() {
             return Err(anyhow::anyhow!(
@@ -243,7 +245,7 @@ impl ToolDefinition for GrepTool {
             )
         };
 
-        // Display to user
+        // Create display input
         let display_input = match input.include.as_ref() {
             Some(include) => format!(
                 "path: {}, pattern: {}, include: {}",
@@ -251,8 +253,13 @@ impl ToolDefinition for GrepTool {
             ),
             None => format!("path: {}, pattern: {}", input.path, input.pattern),
         };
-        session_ctx.display_tool_result("grep", &display_input, &output);
 
-        Ok(output)
+        let user_output = UserOutput::ToolResult {
+            tool_name: "grep".to_string(),
+            input: display_input,
+            output: output.clone(),
+        };
+
+        Ok(ToolResult::with_outputs(output, vec![user_output]))
     }
 }

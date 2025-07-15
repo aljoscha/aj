@@ -3,7 +3,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 List entries (files and directories) in a given directory path.
@@ -42,10 +43,11 @@ impl ToolDefinition for LsTool {
 
     async fn execute(
         &self,
-        session_ctx: &mut dyn SessionContext,
+        _session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
         if !path.is_absolute() {
             return Err(anyhow::anyhow!(
@@ -133,13 +135,18 @@ impl ToolDefinition for LsTool {
             )
         };
 
-        // Display to user
+        // Create display input
         let display_input = match input.ignore.as_ref() {
             Some(ignore_patterns) => format!("path: {}, ignore: {:?}", input.path, ignore_patterns),
             None => format!("path: {}", input.path),
         };
-        session_ctx.display_tool_result("ls", &display_input, &output);
 
-        Ok(output)
+        let user_output = UserOutput::ToolResult {
+            tool_name: "ls".to_string(),
+            input: display_input,
+            output: output.clone(),
+        };
+
+        Ok(ToolResult::with_outputs(output, vec![user_output]))
     }
 }

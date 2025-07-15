@@ -51,8 +51,6 @@ impl AjUi for AjCli {
 
         let prompt = format!("{}: ", style("you").bold().fg(Color::Blue));
 
-        
-
         match rl.readline(&prompt) {
             Ok(line) => {
                 if line.trim().is_empty() {

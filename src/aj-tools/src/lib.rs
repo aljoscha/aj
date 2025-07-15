@@ -2,15 +2,42 @@
 
 use std::path::PathBuf;
 
+use aj_ui::{AjUiAskPermission, UserOutput};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::tools::todo::TodoItem;
 
+pub mod testing;
 pub mod tools;
 mod util;
-pub mod testing;
+
+/// Result of tool execution that includes both the return value and user outputs
+pub struct ToolResult {
+    /// The return value of the tool (what goes back to the LLM)
+    pub return_value: String,
+    /// User outputs that should be displayed to the user
+    pub user_outputs: Vec<UserOutput>,
+}
+
+impl ToolResult {
+    /// Create a new ToolResult with just a return value
+    pub fn new(return_value: String) -> Self {
+        Self {
+            return_value,
+            user_outputs: Vec::new(),
+        }
+    }
+
+    /// Create a new ToolResult with return value and user outputs
+    pub fn with_outputs(return_value: String, user_outputs: Vec<UserOutput>) -> Self {
+        Self {
+            return_value,
+            user_outputs,
+        }
+    }
+}
 
 pub use tools::agent::AgentTool;
 pub use tools::bash::BashTool;
@@ -40,8 +67,9 @@ pub trait ToolDefinition {
         &self,
         session_ctx: &mut dyn SessionContext,
         turn_ctx: &mut dyn TurnContext,
+        permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> impl std::future::Future<Output = Result<String, anyhow::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send;
 
     /// Derive the JSON schema for this tool's input type. Default
     /// implementation uses the derive_schema utility.
@@ -63,9 +91,10 @@ type ToolFn = Box<
     dyn for<'a> Fn(
             &'a mut dyn SessionContext,
             &'a mut dyn TurnContext,
+            &'a dyn AjUiAskPermission,
             Value,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send + 'a>,
         > + Send
         + Sync,
 >;
@@ -76,15 +105,17 @@ impl<T: ToolDefinition + Send + Sync + Clone + 'static> From<T> for ErasedToolDe
             name: tool.name().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
-            func: Box::new(move |session_ctx, turn_ctx, input| {
+            func: Box::new(move |session_ctx, turn_ctx, permission_handler, input| {
                 let typed_input: T::Input = match serde_json::from_value(input) {
                     Ok(input) => input,
                     Err(e) => return Box::pin(async move { Err(e.into()) }),
                 };
                 let tool_clone = tool.clone();
-                Box::pin(
-                    async move { tool_clone.execute(session_ctx, turn_ctx, typed_input).await },
-                )
+                Box::pin(async move {
+                    tool_clone
+                        .execute(session_ctx, turn_ctx, permission_handler, typed_input)
+                        .await
+                })
             }),
         }
     }
@@ -93,17 +124,6 @@ impl<T: ToolDefinition + Send + Sync + Clone + 'static> From<T> for ErasedToolDe
 /// Access to state that is scoped to one agent session or thread.
 pub trait SessionContext: Send {
     fn working_directory(&self) -> PathBuf;
-
-    fn display_tool_result(&self, tool_name: &str, input: &str, output: &str);
-    fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str);
-    fn display_tool_error(&self, tool_name: &str, input: &str, error: &str);
-
-    /// Ask the user for permission to perform an action.
-    ///
-    /// Default implementation returns false (deny permission).
-    fn ask_permission(&self, _message: &str) -> bool {
-        false
-    }
 
     /// Get the current todo list for the session.
     fn get_todo_list(&self) -> Vec<TodoItem>;

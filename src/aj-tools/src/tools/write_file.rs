@@ -2,7 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 Write a file to the local file system.
@@ -41,8 +42,9 @@ impl ToolDefinition for WriteFileTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
         if !path.is_absolute() {
             return Err(anyhow::anyhow!(
@@ -64,23 +66,28 @@ impl ToolDefinition for WriteFileTool {
             .display()
             .to_string();
 
-        // Display the diff or file contents to the user
-        if let Some(original) = &original_content {
-            session_ctx.display_tool_result_diff(
-                "write_file",
-                &display_path,
-                original,
-                &input.content,
-            );
-        } else {
-            // New file - display the content
-            session_ctx.display_tool_result("write_file", &display_path, &input.content);
-        }
-
         fs::write(&input.path, &input.content)
             .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", input.path, e))?;
 
         let action = if file_exists { "overwrote" } else { "created" };
-        Ok(format!("Successfully {} file '{}'", action, input.path))
+        let return_value = format!("Successfully {} file '{}'", action, input.path);
+
+        // Create user output for display
+        let user_output = if let Some(original) = &original_content {
+            UserOutput::ToolResultDiff {
+                tool_name: "write_file".to_string(),
+                input: display_path,
+                before: original.clone(),
+                after: input.content,
+            }
+        } else {
+            UserOutput::ToolResult {
+                tool_name: "write_file".to_string(),
+                input: display_path,
+                output: input.content,
+            }
+        };
+
+        Ok(ToolResult::with_outputs(return_value, vec![user_output]))
     }
 }

@@ -2,7 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 Read the contents of a file from the local file system. If a file does not exist
@@ -46,8 +47,9 @@ impl ToolDefinition for ReadFileTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
         if !path.is_absolute() {
             return Err(anyhow::anyhow!(
@@ -70,10 +72,18 @@ impl ToolDefinition for ReadFileTool {
 
         // Ensure start_idx is within bounds
         if start_idx >= lines.len() {
-            return Ok(String::new());
+            return Ok(ToolResult::new(String::new()));
         }
 
-        // Display the file contents to the user
+        // Format lines with line numbers for the tool result (LLM)
+        let formatted_lines: Vec<String> = lines[start_idx..end_idx]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:5>}: {}", start_idx + i + 1, line))
+            .collect();
+        let return_value = formatted_lines.join("\n");
+
+        // Prepare user display
         let selected_content = &lines[start_idx..end_idx];
 
         let mut display_path = Path::new(path)
@@ -90,16 +100,13 @@ impl ToolDefinition for ReadFileTool {
         }
 
         let formatted_for_display = format_for_display(selected_content);
-        session_ctx.display_tool_result("read_file", &display_path, &formatted_for_display);
+        let user_output = UserOutput::ToolResult {
+            tool_name: "read_file".to_string(),
+            input: display_path,
+            output: formatted_for_display,
+        };
 
-        // Format lines with line numbers for the tool result
-        let formatted_lines: Vec<String> = lines[start_idx..end_idx]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:5>}: {}", start_idx + i + 1, line))
-            .collect();
-
-        Ok(formatted_lines.join("\n"))
+        Ok(ToolResult::with_outputs(return_value, vec![user_output]))
     }
 }
 

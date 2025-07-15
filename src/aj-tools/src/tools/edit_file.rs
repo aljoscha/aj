@@ -2,7 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 Edit files by doing exact string replacement.
@@ -48,8 +49,9 @@ impl ToolDefinition for EditFileTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
         if !path.is_absolute() {
             return Err(anyhow::anyhow!(
@@ -84,20 +86,23 @@ impl ToolDefinition for EditFileTool {
                 .unwrap_or(Path::new(path))
                 .display()
                 .to_string();
-            session_ctx.display_tool_result_diff(
-                "edit_file",
-                &display_path,
-                &content,
-                &new_content,
-            );
 
             fs::write(&input.path, &new_content)
                 .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", input.path, e))?;
 
-            return Ok(format!(
+            let return_value = format!(
                 "Successfully replaced '{}' with '{}' in file '{}'",
                 input.old_string, input.new_string, input.path
-            ));
+            );
+
+            let user_output = UserOutput::ToolResultDiff {
+                tool_name: "edit_file".to_string(),
+                input: display_path,
+                before: content,
+                after: new_content,
+            };
+
+            return Ok(ToolResult::with_outputs(return_value, vec![user_output]));
         }
 
         Err(anyhow::anyhow!(

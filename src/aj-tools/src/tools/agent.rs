@@ -2,7 +2,8 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 Spawn a sub-agent to perform a specific task like research, analysis, or implementation.
@@ -58,19 +59,25 @@ impl ToolDefinition for AgentTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: AgentInput,
-    ) -> Result<String> {
+    ) -> Result<ToolResult> {
         let description = input
             .description
             .unwrap_or_else(|| "Running sub-agent task".to_string());
 
         // Display that we're spawning a sub-agent with the task prompt
         let display_message = format!("Spawning sub-agent...\n\nTask: {}", input.task);
-        session_ctx.display_tool_result("agent", &description, &display_message);
+
+        let user_output = UserOutput::ToolResult {
+            tool_name: "agent".to_string(),
+            input: description,
+            output: display_message,
+        };
 
         // Spawn the sub-agent
         let result = session_ctx.spawn_agent(input.task).await?;
 
-        Ok(result)
+        Ok(ToolResult::with_outputs(result, vec![user_output]))
     }
 }

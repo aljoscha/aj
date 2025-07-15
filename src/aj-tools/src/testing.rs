@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::tools::todo::TodoItem;
 use crate::{SessionContext, TurnContext};
+use aj_ui::AjUiAskPermission;
 
 /// A dummy implementation of SessionContext for testing and CLI tools.
 pub struct DummySessionContext;
@@ -12,19 +13,6 @@ impl SessionContext for DummySessionContext {
     fn working_directory(&self) -> PathBuf {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
-
-    fn display_tool_result(&self, _tool_name: &str, _input: &str, _output: &str) {}
-
-    fn display_tool_result_diff(
-        &self,
-        _tool_name: &str,
-        _input: &str,
-        _before: &str,
-        _after: &str,
-    ) {
-    }
-
-    fn display_tool_error(&self, _tool_name: &str, _input: &str, _error: &str) {}
 
     fn get_todo_list(&self) -> Vec<TodoItem> {
         Vec::new()
@@ -53,3 +41,12 @@ pub struct DummyTurnContext;
 
 impl TurnContext for DummyTurnContext {}
 
+/// A dummy implementation of AjUiAskPermission for testing and CLI tools.
+pub struct DummyPermissionHandler;
+
+impl AjUiAskPermission for DummyPermissionHandler {
+    fn ask_permission(&self, _message: &str) -> bool {
+        // Always grant permission in dummy implementation
+        true
+    }
+}

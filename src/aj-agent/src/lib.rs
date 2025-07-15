@@ -7,7 +7,7 @@ use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, TurnContext as ToolTurnContext,
 };
-use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary};
+use aj_ui::{AjUi, ProcessUserOutput, SubAgentUsage, TokenUsage, UsageSummary};
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
     Usage,
@@ -444,7 +444,13 @@ impl<UI: AjUi> Agent<UI> {
             system_prompt: self.system_prompt,
         };
 
-        (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, tool_input).await
+        let result =
+            (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, &self.ui, tool_input).await?;
+
+        // Process user outputs
+        self.ui.process_user_outputs(&result.user_outputs);
+
+        Ok(result.return_value)
     }
 
     fn display_usage_summary(&self) {
@@ -594,23 +600,6 @@ struct SessionContextWrapper<'a, UI: AjUi> {
 impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
     fn working_directory(&self) -> PathBuf {
         self.session_ctx.working_directory()
-    }
-
-    fn display_tool_result(&self, tool_name: &str, input: &str, output: &str) {
-        self.ui.display_tool_result(tool_name, input, output);
-    }
-
-    fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str) {
-        self.ui
-            .display_tool_result_diff(tool_name, input, before, after);
-    }
-
-    fn display_tool_error(&self, tool_name: &str, input: &str, error: &str) {
-        self.ui.display_tool_error(tool_name, input, error);
-    }
-
-    fn ask_permission(&self, message: &str) -> bool {
-        self.ui.ask_permission(message)
     }
 
     fn get_todo_list(&self) -> Vec<TodoItem> {

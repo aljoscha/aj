@@ -6,7 +6,8 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 const DESCRIPTION: &str = r#"
 Execute a command in the system shell (bash/sh). The command will be run in the
@@ -108,8 +109,9 @@ impl ToolDefinition for BashTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         // Check if command is allowed
         if !is_command_allowed(&input.command) {
             let message = format!(
@@ -117,8 +119,9 @@ impl ToolDefinition for BashTool {
                 input.command, input.description
             );
 
-            if !session_ctx.ask_permission(&message) {
-                return Err(anyhow::anyhow!("Command execution cancelled by user"));
+            if !permission_handler.ask_permission(&message) {
+                let error_msg = format!("Permission denied to execute command: {}", input.command);
+                return Err(anyhow::anyhow!(error_msg));
             }
         }
 
@@ -187,11 +190,15 @@ impl ToolDefinition for BashTool {
                     result.push_str("\n[Output truncated at 35000 characters]");
                 }
 
-                // Display the command and output to the user
+                // Create user output to display the command and result
                 let display_command = format!("$ {}", input.command);
-                session_ctx.display_tool_result("bash", &display_command, &result);
+                let user_output = UserOutput::ToolResult {
+                    tool_name: "bash".to_string(),
+                    input: display_command,
+                    output: result.clone(),
+                };
 
-                Ok(result)
+                Ok(ToolResult::with_outputs(result, vec![user_output]))
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("Command execution failed: {}", e)),
             Err(_) => {
@@ -205,10 +212,8 @@ impl ToolDefinition for BashTool {
                         .output();
                 }
 
-                Err(anyhow::anyhow!(
-                    "Command timed out after {} seconds",
-                    input.timeout
-                ))
+                let error_msg = format!("Command timed out after {} seconds", input.timeout);
+                Err(anyhow::anyhow!(error_msg))
             }
         }
     }

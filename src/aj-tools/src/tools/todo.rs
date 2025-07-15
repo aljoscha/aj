@@ -2,7 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use termimad::crossterm::style::{Attribute, Stylize};
 
-use crate::{SessionContext, ToolDefinition, TurnContext};
+use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
+use aj_ui::{AjUiAskPermission, UserOutput};
 
 /// Formats a list of todo items for display
 fn format_todo_list(todos: &[TodoItem]) -> String {
@@ -96,13 +97,19 @@ impl ToolDefinition for TodoReadTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         _input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let todos = session_ctx.get_todo_list();
         let result = format_todo_list(&todos);
 
-        session_ctx.display_tool_result("todo_read", "", &result);
-        Ok(result)
+        let user_output = UserOutput::ToolResult {
+            tool_name: "todo_read".to_string(),
+            input: "".to_string(),
+            output: result.clone(),
+        };
+
+        Ok(ToolResult::with_outputs(result, vec![user_output]))
     }
 }
 
@@ -130,8 +137,9 @@ impl ToolDefinition for TodoWriteTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
+        _permission_handler: &dyn AjUiAskPermission,
         input: Self::Input,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         // Validate that there's at most one in-progress item
         let in_progress_count = input
             .todos
@@ -153,9 +161,13 @@ impl ToolDefinition for TodoWriteTool {
         let formatted_todos = format_todo_list(&input.todos);
         let result = format!("{update_result}\n{formatted_todos}");
 
-        session_ctx.display_tool_result("todo_write", "", &result);
+        let user_output = UserOutput::ToolResult {
+            tool_name: "todo_write".to_string(),
+            input: "".to_string(),
+            output: result.clone(),
+        };
 
-        Ok(result)
+        Ok(ToolResult::with_outputs(result, vec![user_output]))
     }
 }
 

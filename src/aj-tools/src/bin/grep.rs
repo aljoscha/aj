@@ -1,5 +1,5 @@
 use aj_tools::ToolDefinition;
-use aj_tools::testing::{DummySessionContext, DummyTurnContext};
+use aj_tools::testing::{DummyPermissionHandler, DummySessionContext, DummyTurnContext};
 use aj_tools::tools::grep::{GrepInput, GrepTool};
 use std::env;
 
@@ -27,9 +27,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tool = GrepTool;
     let mut session_ctx = DummySessionContext;
     let mut turn_ctx = DummyTurnContext;
+    let permission_handler = DummyPermissionHandler;
 
-    match tool.execute(&mut session_ctx, &mut turn_ctx, input).await {
-        Ok(result) => println!("{result}"),
+    match tool
+        .execute(&mut session_ctx, &mut turn_ctx, &permission_handler, input)
+        .await
+    {
+        Ok(result) => println!("{}", result.return_value),
         Err(e) => {
             eprintln!("Error: {e}");
             std::process::exit(1);
