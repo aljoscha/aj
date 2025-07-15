@@ -129,6 +129,18 @@ impl Config {
 
         Ok(aj_dir.join("history.txt"))
     }
+
+    pub fn get_dotenv_file_path() -> Result<PathBuf, ConfigError> {
+        let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
+        let aj_dir = Path::new(&home_dir).join(".aj");
+
+        // Create the .aj directory if it doesn't exist
+        if !aj_dir.exists() {
+            fs::create_dir_all(&aj_dir)?;
+        }
+
+        Ok(aj_dir.join(".env"))
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,13 @@ async fn main() {
         .with_ansi(true)
         .init();
 
+    if let Ok(dotenv_path) = aj_conf::Config::get_dotenv_file_path() {
+        tracing::info!("loading .env from {:?}", dotenv_path);
+        dotenv::from_path(dotenv_path).ok();
+    } else {
+        tracing::info!("no .env in config directory");
+    }
+
     let history_path = match aj_conf::Config::get_history_file_path() {
         Ok(path) => path,
         Err(e) => {
