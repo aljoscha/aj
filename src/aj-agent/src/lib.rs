@@ -149,10 +149,6 @@ impl<UI: AjUi> Agent<UI> {
         let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
 
         loop {
-            // Check if we're going to enable thinking for this call
-            let thinking_config = self.determine_thinking(conversation);
-            let thinking_will_be_enabled = thinking_config.is_some();
-
             let response_stream = self.run_inference_streaming(conversation).await?;
 
             let mut response: Option<Message> = None;
@@ -201,11 +197,6 @@ impl<UI: AjUi> Agent<UI> {
                         }
                     }
                 }
-            }
-
-            // If thinking was enabled for this call, mark it as used
-            if thinking_will_be_enabled {
-                self.session_state.set_thinking_used(true);
             }
 
             let response = response.expect("missing message");
@@ -323,10 +314,12 @@ impl<UI: AjUi> Agent<UI> {
             }
         }
 
+        let thinking = self.determine_thinking(conversation);
+        tracing::info!(?thinking, "thinking");
         let messages = Messages {
             model: "claude-sonnet-4-20250514".to_string(),
             system: Some(self.assemble_system_prompt()),
-            thinking: self.determine_thinking(conversation),
+            thinking,
             max_tokens: 32_000,
             messages,
             tools: self.tools.clone(),
@@ -343,8 +336,6 @@ impl<UI: AjUi> Agent<UI> {
     /// - "think harder" -> 32,000 tokens
     /// - "think hard" -> 10,000 tokens
     /// - "think" -> 4,000 tokens
-    /// - If thinking has been used before but no trigger phrase -> 1,024 tokens
-    ///   (minimum)
     /// - default -> None (no thinking)
     fn determine_thinking(
         &self,
@@ -353,7 +344,23 @@ impl<UI: AjUi> Agent<UI> {
         // Get the last user message
         let last_user_message = conversation
             .iter()
-            .filter(|m| matches!(m.role, Role::User))
+            .filter(|m| {
+                let is_user = matches!(m.role, Role::User);
+                if !is_user {
+                    return false;
+                }
+
+                // Only sniff out messages that have actual user-input. The last
+                // user input determines thinking, and so, for example, when
+                // there is back-and-forth with tool results, we need to
+                // maintain the thinking flag enabled.
+                let is_user_input = m
+                    .content
+                    .iter()
+                    .any(|c| matches!(c, ContentBlockParam::TextBlock { .. }));
+
+                is_user_input
+            })
             .next_back();
 
         let mut thinking_budget = None;
@@ -383,12 +390,6 @@ impl<UI: AjUi> Agent<UI> {
             } else if text_lower.contains("think") {
                 thinking_budget = Some(4_000);
             }
-        }
-
-        // If thinking has been used before but no trigger phrase was found, use
-        // minimum budget
-        if thinking_budget.is_none() && self.session_state.is_thinking_used() {
-            thinking_budget = Some(1024);
         }
 
         // Return thinking configuration if we have a budget
@@ -522,7 +523,6 @@ impl<UI: AjUi> Agent<UI> {
 pub struct SessionState {
     working_directory: PathBuf,
     todo_list: Vec<TodoItem>,
-    thinking_used: bool,
     turn_counter: usize,
     accumulated_usage: Usage,
     sub_agent_counter: usize,
@@ -534,7 +534,6 @@ impl SessionState {
         Self {
             working_directory,
             todo_list: Vec::new(),
-            thinking_used: false,
             turn_counter: 0,
             accumulated_usage: Usage {
                 cache_creation: None,
@@ -560,14 +559,6 @@ impl SessionState {
 
     fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
         self.todo_list = todos;
-    }
-
-    fn is_thinking_used(&self) -> bool {
-        self.thinking_used
-    }
-
-    fn set_thinking_used(&mut self, used: bool) {
-        self.thinking_used = used;
     }
 
     pub fn turn_counter(&self) -> usize {
