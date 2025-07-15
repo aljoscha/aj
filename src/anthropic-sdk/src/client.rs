@@ -53,9 +53,8 @@ impl Client {
                 let error_text = response.text().await?;
                 match serde_json::from_str::<ApiErrorResponse>(&error_text) {
                     Ok(error_response) => Err(anyhow!(
-                        "API Error: {} - {}",
-                        error_response.error.r#type,
-                        error_response.error.message
+                        "API Error: {}",
+                        error_response.error
                     )),
                     Err(_) => Err(anyhow!("bad request: {}", error_text)),
                 }
@@ -112,9 +111,8 @@ impl Client {
                 let error_text = response.text().await?;
                 match serde_json::from_str::<ApiErrorResponse>(&error_text) {
                     Ok(error_response) => Err(anyhow!(
-                        "API Error: {} - {}",
-                        error_response.error.r#type,
-                        error_response.error.message
+                        "API Error: {}",
+                        error_response.error
                     )),
                     Err(_) => Err(anyhow!("bad request: {}", error_text)),
                 }
