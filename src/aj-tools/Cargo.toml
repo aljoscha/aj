@@ -11,6 +11,10 @@ path = "src/bin/glob.rs"
 name = "grep"
 path = "src/bin/grep.rs"
 
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
+
 [dependencies]
 anthropic-sdk = { path = "../anthropic-sdk/" }
 aj-ui = { path = "../aj-ui/" }
