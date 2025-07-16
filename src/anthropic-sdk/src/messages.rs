@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Messages {
@@ -660,7 +661,7 @@ pub struct Container {
     id: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Error)]
 #[serde(tag = "type")]
 pub enum ApiError {
     #[serde(rename = "api_error")]
@@ -687,14 +688,20 @@ impl Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::ApiError { message } => write!(f, "API error: {}", message),
-            ApiError::AuthenticationError { message } => write!(f, "Authentication error: {}", message),
+            ApiError::AuthenticationError { message } => {
+                write!(f, "Authentication error: {}", message)
+            }
             ApiError::BillingError { message } => write!(f, "Billing error: {}", message),
-            ApiError::InvalidRequestError { message } => write!(f, "Invalid request error: {}", message),
+            ApiError::InvalidRequestError { message } => {
+                write!(f, "Invalid request error: {}", message)
+            }
             ApiError::NotFoundError { message } => write!(f, "Not found error: {}", message),
             ApiError::OverloadedError { message } => write!(f, "Overloaded error: {}", message),
             ApiError::PermissionError { message } => write!(f, "Permission error: {}", message),
             ApiError::RateLimitError { message } => write!(f, "Rate limit error: {}", message),
-            ApiError::GatewayTimeoutError { message } => write!(f, "Gateway timeout error: {}", message),
+            ApiError::GatewayTimeoutError { message } => {
+                write!(f, "Gateway timeout error: {}", message)
+            }
         }
     }
 }

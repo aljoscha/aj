@@ -3,8 +3,9 @@ use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use reqwest;
 use reqwest::{Client as ReqwestClient, StatusCode};
+use thiserror::Error;
 
-use crate::messages::{ApiErrorResponse, Message, Messages, ServerSentEvent};
+use crate::messages::{ApiError, ApiErrorResponse, Message, Messages, ServerSentEvent};
 use crate::streaming::{StreamProcessor, StreamingEvent};
 
 pub struct Client {
@@ -49,17 +50,17 @@ impl Client {
                 let response: Message = serde_json::from_str(&json_text)?;
                 Ok(response)
             }
-            StatusCode::BAD_REQUEST => {
+            StatusCode::BAD_REQUEST
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::INTERNAL_SERVER_ERROR => {
                 let error_text = response.text().await?;
                 match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(anyhow!(
-                        "API Error: {}",
-                        error_response.error
-                    )),
-                    Err(_) => Err(anyhow!("bad request: {}", error_text)),
+                    Ok(error_response) => Err(anyhow!("API Error: {}", error_response.error)),
+                    Err(_) => Err(anyhow!("request failed: {}", error_text)),
                 }
             }
-            StatusCode::UNAUTHORIZED => Err(anyhow!("unauthorized")),
             _ => {
                 let error_message = format!("unexpected status code: {:?}", response.text().await?);
                 Err(anyhow!(error_message))
@@ -70,7 +71,7 @@ impl Client {
     pub async fn messages_stream_raw(
         &self,
         mut messages: Messages,
-    ) -> Result<impl Stream<Item = ServerSentEvent>, anyhow::Error> {
+    ) -> Result<impl Stream<Item = ServerSentEvent>, ClientError> {
         messages.stream = Some(true);
 
         let request_builder = self
@@ -82,10 +83,7 @@ impl Client {
             .header("content-type", "application/json")
             .json(&messages);
 
-        let response = request_builder
-            .send()
-            .await
-            .context("failed to send request")?;
+        let response = request_builder.send().await?;
 
         match response.status() {
             StatusCode::OK => {
@@ -107,20 +105,26 @@ impl Client {
                 });
                 Ok(stream)
             }
-            StatusCode::BAD_REQUEST => {
+            StatusCode::BAD_REQUEST
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::INTERNAL_SERVER_ERROR => {
                 let error_text = response.text().await?;
                 match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(anyhow!(
-                        "API Error: {}",
-                        error_response.error
-                    )),
-                    Err(_) => Err(anyhow!("bad request: {}", error_text)),
+                    Ok(error_response) => Err(error_response.error.into()),
+                    Err(_) => Err(ApiError::ApiError {
+                        message: error_text,
+                    }
+                    .into()),
                 }
             }
-            StatusCode::UNAUTHORIZED => Err(anyhow!("unauthorized")),
-            _ => {
-                let error_message = format!("unexpected status code: {:?}", response.text().await?);
-                Err(anyhow!(error_message))
+            status_code => {
+                let error_message = format!(
+                    "unexpected status code ({status_code}), response text: {:?}",
+                    response.text().await?
+                );
+                Err(ClientError::InternalError(error_message))
             }
         }
     }
@@ -128,10 +132,22 @@ impl Client {
     pub async fn messages_stream(
         &self,
         messages: Messages,
-    ) -> Result<impl Stream<Item = StreamingEvent>, anyhow::Error> {
+    ) -> Result<impl Stream<Item = StreamingEvent>, ClientError> {
         let stream = self.messages_stream_raw(messages).await?;
         Ok(create_high_level_stream(stream))
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("{0}")]
+    ApiError(#[from] ApiError),
+    #[error("{0}")]
+    TransportError(#[from] reqwest::Error),
+    #[error("{0}")]
+    ParseError(String),
+    #[error("{0}")]
+    InternalError(String),
 }
 
 // Helper function to create a high-level stream
