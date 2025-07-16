@@ -696,13 +696,19 @@ impl Display for ApiError {
                 write!(f, "Invalid request error: {}", message)
             }
             ApiError::NotFoundError { message } => write!(f, "Not found error: {}", message),
-            ApiError::OverloadedError { message } => write!(f, "Overloaded error: {}", message),
+            ApiError::OverloadedError { message } => write!(f, "API Overloaded error: {}", message),
             ApiError::PermissionError { message } => write!(f, "Permission error: {}", message),
             ApiError::RateLimitError { message } => write!(f, "Rate limit error: {}", message),
             ApiError::GatewayTimeoutError { message } => {
                 write!(f, "Gateway timeout error: {}", message)
             }
         }
+    }
+}
+
+impl ApiError {
+    pub fn is_overloaded(&self) -> bool {
+        matches!(self, ApiError::OverloadedError { message: _ })
     }
 }
 
