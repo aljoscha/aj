@@ -11,13 +11,16 @@ use aj_tools::{
 use aj_ui::{AjUi, ProcessUserOutput, SubAgentUsage, TokenUsage, UsageSummary};
 use anthropic_sdk::client::ClientError;
 use anthropic_sdk::messages::{
-    CacheControl, ContentBlock, ContentBlockParam, Message, MessageParam, Messages, Role, Tool,
-    Usage,
+    CacheControl, ContentBlock, ContentBlockParam, Message, Messages, Role, Tool, Usage,
 };
 use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
+
+pub mod conversation;
+
+use conversation::Conversation;
 
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
@@ -79,14 +82,14 @@ impl<UI: AjUi> Agent<UI> {
     }
 
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
-        let mut conversation: Vec<MessageParam> = Vec::new();
+        let mut conversation = Conversation::new();
 
         self.ui
             .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
 
         loop {
             let need_user_input = {
-                match conversation.last() {
+                match conversation.last_message() {
                     Some(last) => {
                         matches!(last.role, Role::Assistant)
                     }
@@ -101,11 +104,7 @@ impl<UI: AjUi> Agent<UI> {
                     self.display_usage_summary();
                     break;
                 };
-                let user_message =
-                    MessageParam::new_user_message(vec![ContentBlockParam::new_text_block(
-                        user_input,
-                    )]);
-                conversation.push(user_message);
+                conversation.add_user_message(vec![ContentBlockParam::new_text_block(user_input)]);
             }
 
             self.execute_turn(&mut conversation).await?;
@@ -115,17 +114,15 @@ impl<UI: AjUi> Agent<UI> {
     }
 
     pub async fn run_single_turn(&mut self, prompt: String) -> Result<String, anyhow::Error> {
-        let mut conversation: Vec<MessageParam> = Vec::new();
-        let user_message =
-            MessageParam::new_user_message(vec![ContentBlockParam::new_text_block(prompt)]);
-        conversation.push(user_message);
+        let mut conversation = Conversation::new();
+        conversation.add_user_message(vec![ContentBlockParam::new_text_block(prompt)]);
 
         let mut last_assistant_text = String::new();
 
         self.execute_turn(&mut conversation).await?;
 
         // Extract the last assistant message text
-        if let Some(last_msg) = conversation.last() {
+        if let Some(last_msg) = conversation.last_message() {
             if matches!(last_msg.role, Role::Assistant) {
                 last_assistant_text.clear();
                 for content in &last_msg.content {
@@ -144,10 +141,7 @@ impl<UI: AjUi> Agent<UI> {
     /// Executes a single "turn" of the conversation, this will potentially
     /// include mutliple back-and-forth interactions with the model, in case
     /// there are thinking blocks or tool calls.
-    async fn execute_turn(
-        &mut self,
-        conversation: &mut Vec<MessageParam>,
-    ) -> Result<(), anyhow::Error> {
+    async fn execute_turn(&mut self, conversation: &mut Conversation) -> Result<(), anyhow::Error> {
         self.session_state.turn_counter += 1;
         let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
 
@@ -249,7 +243,8 @@ impl<UI: AjUi> Agent<UI> {
             }
 
             // Add the assistant's message to conversation
-            conversation.push(response.into_message_param());
+            let message_param = response.into_message_param();
+            conversation.add_assistant_message(message_param.content);
 
             let usage = TokenUsage {
                 accumulated_input: self.session_state.accumulated_usage.input_tokens,
@@ -304,9 +299,7 @@ impl<UI: AjUi> Agent<UI> {
                 }
 
                 if !tool_result_contents.is_empty() {
-                    let tool_result_message = MessageParam::new_user_message(tool_result_contents);
-
-                    conversation.push(tool_result_message);
+                    conversation.add_user_message(tool_result_contents);
                 }
 
                 // Continue the conversation loop to get the model's response to tool results
@@ -330,9 +323,9 @@ impl<UI: AjUi> Agent<UI> {
 
     async fn run_inference_streaming(
         &self,
-        conversation: &[MessageParam],
+        conversation: &Conversation,
     ) -> Result<impl Stream<Item = StreamingEvent> + '_, ClientError> {
-        let mut messages: Vec<_> = conversation.to_vec();
+        let mut messages = conversation.to_message_params();
 
         let last_user_message = messages
             .iter_mut()
@@ -383,10 +376,11 @@ impl<UI: AjUi> Agent<UI> {
     /// - default -> None (no thinking)
     fn determine_thinking(
         &self,
-        conversation: &[MessageParam],
+        conversation: &Conversation,
     ) -> Option<anthropic_sdk::messages::Thinking> {
         // Get the last user message
-        let last_user_message = conversation
+        let messages = conversation.to_message_params();
+        let last_user_message = messages
             .iter()
             .filter(|m| {
                 let is_user = matches!(m.role, Role::User);

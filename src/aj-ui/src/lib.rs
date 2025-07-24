@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 /// Ui abstraction for AJ. The agent and all tools must use this when displaying
 /// information to the user or requesting input from the user.
 pub trait AjUi: Send + Sync {
@@ -28,7 +30,7 @@ pub trait AjUi: Send + Sync {
 }
 
 /// Token usage information for display
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub accumulated_input: u64,
     pub turn_input: u64,
@@ -41,7 +43,7 @@ pub struct TokenUsage {
 }
 
 /// Usage summary for display including main agent and sub-agents
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSummary {
     pub main_agent_usage: SubAgentUsage,
     pub sub_agent_usage: Vec<SubAgentUsage>,
@@ -49,7 +51,7 @@ pub struct UsageSummary {
 }
 
 /// Usage information for a single agent (main or sub-agent)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentUsage {
     pub agent_id: Option<usize>,
     pub input_tokens: u64,
@@ -65,7 +67,7 @@ pub trait AjUiAskPermission: Send + Sync {
 }
 
 /// Represents different types of output that tools can produce for the user
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UserOutput {
     /// Display a notice message to the user
     Notice(String),
