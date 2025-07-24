@@ -95,7 +95,7 @@ impl AjUi for SubAgentCli {
             input
         );
         println!(
-            "{} {}: {}",
+            "{} {}: {}\n",
             self.prefix,
             style("tool_error").bold().fg(Color::Red),
             error

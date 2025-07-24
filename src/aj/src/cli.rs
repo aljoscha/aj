@@ -244,7 +244,7 @@ impl AjUi for AjCli {
 
     fn display_tool_error(&self, tool_name: &str, input: &str, error: &str) {
         println!("{}({})", style(tool_name).bold().fg(Color::Green), input);
-        println!("{}: {}", style("tool_error").bold().fg(Color::Red), error);
+        println!("{}: {}\n", style("tool_error").bold().fg(Color::Red), error);
     }
 
     fn ask_permission(&self, message: &str) -> bool {
