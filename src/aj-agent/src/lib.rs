@@ -6,7 +6,8 @@ use std::time::Duration;
 use aj_conf::AgentEnv;
 use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
-    get_builtin_tools, ErasedToolDefinition, SessionContext, TurnContext as ToolTurnContext,
+    get_builtin_tools, ErasedToolDefinition, SessionContext, ToolResult,
+    TurnContext as ToolTurnContext,
 };
 use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 use anthropic_sdk::client::ClientError;
@@ -276,26 +277,36 @@ impl<UI: AjUi> Agent<UI> {
 
                 for (tool_id, tool_name, tool_input) in tool_calls {
                     let tool_result = self
-                        .execute_tool(&tool_id, &tool_name, tool_input, &mut turn_ctx)
+                        .execute_tool(&mut turn_ctx, &tool_id, &tool_name, tool_input.clone())
                         .await;
 
-                    let (result_content, is_error) = match tool_result {
+                    let (tool_result, is_error) = match tool_result {
                         Ok(result) => (result, false),
                         Err(err) => {
-                            self.ui
-                                .display_tool_error(&tool_name, "[...]", &err.to_string());
-                            (format!("{err}"), true)
+                            let user_error_output = UserOutput::ToolError {
+                                tool_name: tool_name.clone(),
+                                input: tool_input.to_string(),
+                                error: err.to_string(),
+                            };
+                            let tool_result = ToolResult {
+                                return_value: format!("{err}"),
+                                user_outputs: vec![user_error_output],
+                            };
+                            (tool_result, true)
                         }
                     };
 
                     let result_content_block = ContentBlockParam::ToolResultBlock {
                         tool_use_id: tool_id.to_owned(),
-                        content: result_content,
+                        content: tool_result.return_value,
                         is_error,
                         cache_control: None,
                     };
 
                     tool_result_contents.push(result_content_block);
+
+                    Self::record_user_output(conversation, &tool_result.user_outputs);
+                    self.display_user_output(&tool_result.user_outputs);
                 }
 
                 if !tool_result_contents.is_empty() {
@@ -464,11 +475,11 @@ impl<UI: AjUi> Agent<UI> {
 
     async fn execute_tool(
         &mut self,
+        turn_ctx: &mut dyn ToolTurnContext,
         _tool_id: &str,
         tool_name: &str,
         tool_input: serde_json::Value,
-        turn_ctx: &mut dyn ToolTurnContext,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<ToolResult, anyhow::Error> {
         let tool_def = if let Some(tool_def) = self.tool_definitions.get(tool_name) {
             tool_def
         } else {
@@ -486,13 +497,17 @@ impl<UI: AjUi> Agent<UI> {
         let result =
             (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, &self.ui, tool_input).await?;
 
-        self.display_user_output(&result.user_outputs);
-
-        Ok(result.return_value)
+        Ok(result)
     }
 
-    fn display_user_output(&self, user_output: &[UserOutput]) {
-        for output in user_output {
+    fn record_user_output(conversation: &mut Conversation, user_outputs: &[UserOutput]) {
+        for output in user_outputs {
+            conversation.add_user_output(output.clone());
+        }
+    }
+
+    fn display_user_output(&self, user_outputs: &[UserOutput]) {
+        for output in user_outputs {
             match output {
                 UserOutput::Notice(msg) => {
                     self.ui.display_notice(msg);

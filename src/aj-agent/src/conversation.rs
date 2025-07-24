@@ -57,6 +57,12 @@ impl Conversation {
         self.add_message(Role::Assistant, content);
     }
 
+    /// Add user output to the conversation
+    pub fn add_user_output(&mut self, user_output: UserOutput) {
+        self.entries
+            .push(ConversationEntry::UserOutput(user_output));
+    }
+
     /// Convert the conversation to a `Vec<MessageParam>` for API calls. This
     /// extracts only the Message entries and converts them to the format
     /// expected by the API
