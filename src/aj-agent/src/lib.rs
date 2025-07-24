@@ -8,7 +8,7 @@ use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, TurnContext as ToolTurnContext,
 };
-use aj_ui::{AjUi, ProcessUserOutput, SubAgentUsage, TokenUsage, UsageSummary};
+use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 use anthropic_sdk::client::ClientError;
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock, ContentBlockParam, Message, Messages, Role, Tool, Usage,
@@ -486,10 +486,51 @@ impl<UI: AjUi> Agent<UI> {
         let result =
             (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, &self.ui, tool_input).await?;
 
-        // Process user outputs
-        self.ui.process_user_outputs(&result.user_outputs);
+        self.display_user_output(&result.user_outputs);
 
         Ok(result.return_value)
+    }
+
+    fn display_user_output(&self, user_output: &[UserOutput]) {
+        for output in user_output {
+            match output {
+                UserOutput::Notice(msg) => {
+                    self.ui.display_notice(msg);
+                }
+                UserOutput::Error(msg) => {
+                    self.ui.display_error(msg);
+                }
+                UserOutput::ToolResult {
+                    tool_name,
+                    input,
+                    output,
+                } => {
+                    self.ui.display_tool_result(tool_name, input, output);
+                }
+                UserOutput::ToolResultDiff {
+                    tool_name,
+                    input,
+                    before,
+                    after,
+                } => {
+                    self.ui
+                        .display_tool_result_diff(tool_name, input, before, after);
+                }
+                UserOutput::ToolError {
+                    tool_name,
+                    input,
+                    error,
+                } => {
+                    self.ui.display_tool_error(tool_name, input, error);
+                }
+                UserOutput::TokenUsage(usage) => {
+                    self.ui.display_token_usage(usage);
+                }
+                UserOutput::TokenUsageSummary(summary) => {
+                    self.ui.display_token_usage_summary(summary);
+                }
+            }
+        }
     }
 
     fn display_usage_summary(&self) {
