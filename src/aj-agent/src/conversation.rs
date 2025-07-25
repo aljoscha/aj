@@ -1,13 +1,31 @@
+use aj_conf::{Config, ConfigError};
 use aj_ui::UserOutput;
 use anthropic_sdk::messages::{ContentBlockParam, MessageParam, Role};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::{
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::PathBuf,
+};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ConversationError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON parsing error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Config error: {0}")]
+    Config(#[from] ConfigError),
+}
 
 /// A conversation represents the full interaction history between the user and
 /// agent, including messages, tool outputs, and UI display content for
 /// potential replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
+    conversation_id: String,
     entries: Vec<ConversationEntry>,
 }
 
@@ -33,7 +51,11 @@ pub struct ConversationMessage {
 impl Conversation {
     /// Create a new empty conversation
     pub fn new() -> Self {
+        let now: DateTime<Utc> = Utc::now();
+        let conversation_id = now.format("%Y-%m-%d-%H-%M-%S").to_string();
+        
         Self {
+            conversation_id,
             entries: Vec::new(),
         }
     }
@@ -78,6 +100,11 @@ impl Conversation {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Get the conversation ID
+    pub fn conversation_id(&self) -> &str {
+        &self.conversation_id
     }
 
     /// Get all entries in the conversation
@@ -137,6 +164,55 @@ impl Conversation {
             },
             _ => None,
         })
+    }
+
+    /// Save the conversation to a JSONL file in the threads directory
+    pub fn save_to_file(&self) -> Result<PathBuf, ConversationError> {
+        let threads_dir = Config::get_threads_dir_path()?;
+        let file_path = threads_dir.join(format!("{}.jsonl", self.conversation_id));
+        
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&file_path)?;
+
+        // Write each entry as a separate JSON line
+        for entry in &self.entries {
+            let json_line = serde_json::to_string(entry)?;
+            writeln!(file, "{json_line}")?;
+        }
+
+        Ok(file_path)
+    }
+
+    /// Restore a conversation from a JSONL file
+    pub fn restore_from_file(conversation_id: &str) -> Result<Self, ConversationError> {
+        let threads_dir = Config::get_threads_dir_path()?;
+        let file_path = threads_dir.join(format!("{conversation_id}.jsonl"));
+        
+        let file = File::open(file_path)?;
+        let reader = BufReader::new(file);
+        
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                let entry: ConversationEntry = serde_json::from_str(&line)?;
+                entries.push(entry);
+            }
+        }
+
+        Ok(Self {
+            conversation_id: conversation_id.to_string(),
+            entries,
+        })
+    }
+
+    /// Get the file path where this conversation would be saved
+    pub fn get_file_path(&self) -> Result<PathBuf, ConversationError> {
+        let threads_dir = Config::get_threads_dir_path()?;
+        Ok(threads_dir.join(format!("{}.jsonl", self.conversation_id)))
     }
 }
 

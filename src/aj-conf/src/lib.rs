@@ -31,7 +31,7 @@ pub struct AgentEnv {
 impl AgentEnv {
     pub fn new() -> Self {
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let git_root_directory = Self::find_git_root(&working_directory);
+        let git_root_directory = find_git_root(&working_directory);
         let operating_system = env::consts::OS.to_string();
         let today_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let agent_md_content = Self::load_agent_md(&working_directory);
@@ -42,22 +42,6 @@ impl AgentEnv {
             operating_system,
             today_date,
             agent_md: agent_md_content,
-        }
-    }
-
-    fn find_git_root(start_path: &Path) -> Option<PathBuf> {
-        let mut current = start_path;
-
-        loop {
-            let git_dir = current.join(".git");
-            if git_dir.exists() {
-                return Some(current.to_path_buf());
-            }
-
-            match current.parent() {
-                Some(parent) => current = parent,
-                None => return None,
-            }
         }
     }
 
@@ -139,6 +123,84 @@ impl Config {
         let aj_dir = Self::get_config_dir()?;
         Ok(aj_dir.join(".env"))
     }
+
+    /// Get the threads directory path for the current project. The threads are
+    /// stored in subdirectories based on the git root directory. For example,
+    /// if the git root is /Users/user/Dev/project, the subdirectory name will
+    /// be "Dev-project".
+    pub fn get_threads_dir_path() -> Result<PathBuf, ConfigError> {
+        let aj_dir = Self::get_config_dir()?;
+        let threads_base_dir = aj_dir.join("threads");
+
+        // Find the git root directory
+        let working_directory = env::current_dir().map_err(|e| ConfigError::Io(e))?;
+        if let Some(git_root) = find_git_root(&working_directory) {
+            // Convert the git root path to a directory name
+            let project_dir_name = path_to_dir_name(&git_root);
+            let project_threads_dir = threads_base_dir.join(project_dir_name);
+
+            // Create the directory if it doesn't exist
+            if !project_threads_dir.exists() {
+                fs::create_dir_all(&project_threads_dir)?;
+            }
+
+            Ok(project_threads_dir)
+        } else {
+            // Fallback to a default directory if no git root is found
+            let default_threads_dir = threads_base_dir.join("default");
+            if !default_threads_dir.exists() {
+                fs::create_dir_all(&default_threads_dir)?;
+            }
+            Ok(default_threads_dir)
+        }
+    }
+}
+
+fn find_git_root(start_path: &Path) -> Option<PathBuf> {
+    let mut current = start_path;
+
+    loop {
+        let git_dir = current.join(".git");
+        if git_dir.exists() {
+            return Some(current.to_path_buf());
+        }
+
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
+}
+
+/// Convert a path to a directory name by taking components after the home
+/// directory and joining them with dashes. For example, /Users/user/Dev/project
+/// becomes "Dev-project".
+fn path_to_dir_name(path: &Path) -> String {
+    // Get the home directory
+    if let Ok(home_dir) = env::var("HOME") {
+        let home_path = Path::new(&home_dir);
+
+        // Try to get the relative path from home
+        if let Ok(relative_path) = path.strip_prefix(home_path) {
+            return relative_path
+                .components()
+                .filter_map(|comp| {
+                    if let std::path::Component::Normal(os_str) = comp {
+                        os_str.to_str()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("-");
+        }
+    }
+
+    // Fallback: use the last component of the path
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 #[cfg(test)]
