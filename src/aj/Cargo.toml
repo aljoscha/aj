@@ -19,6 +19,8 @@ aj-tools = { path = "../aj-tools/" }
 aj-ui = { path = "../aj-ui/" }
 anthropic-sdk = { path = "../anthropic-sdk/" }
 anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
 console = { workspace = true }
 similar = { workspace = true }
 dotenv = { workspace = true }
