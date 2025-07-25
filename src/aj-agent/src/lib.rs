@@ -321,6 +321,11 @@ impl<UI: AjUi> Agent<UI> {
             }
         }
 
+        // Save the conversation after completing the turn
+        if let Err(e) = conversation.save_to_file() {
+            tracing::warn!("Failed to save conversation: {e}");
+        }
+
         Ok(())
     }
 
