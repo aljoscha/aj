@@ -50,6 +50,18 @@ impl AjUi for SubAgentCli {
         println!();
     }
 
+    fn user_text_start(&self, _text: &str) {
+        println!("{} {}:", self.prefix, style("you").bold().fg(Color::Blue));
+    }
+
+    fn user_text_update(&self, _diff: &str) {
+        // No-op for user text updates
+    }
+
+    fn user_text_stop(&self, text: &str) {
+        println!("{} {text}\n", self.prefix);
+    }
+
     fn agent_thinking_start(&self, thinking: &str) {
         print!(
             "{} {}: {}",

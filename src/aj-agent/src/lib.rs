@@ -21,12 +21,14 @@ use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 
 pub mod conversation;
 
-use conversation::Conversation;
+use crate::conversation::Conversation;
+use crate::conversation::ConversationPersistence;
 
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
-    system_prompt: &'static str,
+    conversation_persistence: ConversationPersistence,
     ui: UI,
+    system_prompt: &'static str,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
     client: anthropic_sdk::client::Client,
@@ -36,9 +38,10 @@ pub struct Agent<UI: AjUi> {
 impl<UI: AjUi> Agent<UI> {
     pub fn new(
         env: AgentEnv,
+        ui: UI,
+        conversation_persistence: ConversationPersistence,
         system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
-        ui: UI,
     ) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY").expect(
             "need ANTHROPIC_API_KEY in environment, maybe you forget to set up a .env file",
@@ -63,14 +66,17 @@ impl<UI: AjUi> Agent<UI> {
             .map(|tool_def| (tool_def.name.clone(), tool_def))
             .collect();
 
+        let session_state = SessionState::new(env.working_directory.clone());
+
         Self {
+            env,
+            ui,
+            conversation_persistence,
             system_prompt,
             tool_definitions,
             tools: api_tools,
             client,
-            session_state: SessionState::new(env.working_directory.clone()),
-            env,
-            ui,
+            session_state,
         }
     }
 
@@ -82,11 +88,23 @@ impl<UI: AjUi> Agent<UI> {
         self.session_state.accumulated_usage()
     }
 
-    pub async fn run(&mut self) -> Result<(), anyhow::Error> {
-        let mut conversation = Conversation::new();
+    pub async fn run(&mut self, conversation: Option<Conversation>) -> Result<(), anyhow::Error> {
+        let mut conversation = if let Some(conversation) = conversation {
+            // Display existing conversation entries
+            self.display_conversation_history(&conversation);
 
-        self.ui
-            .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
+            self.ui.display_notice(&format!(
+                "Resuming conversation {} (use 'ctrl-c' or 'ctrl-d' to quit)",
+                conversation.conversation_id()
+            ));
+
+            conversation
+        } else {
+            self.ui
+                .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
+
+            Conversation::new()
+        };
 
         loop {
             let need_user_input = {
@@ -322,7 +340,10 @@ impl<UI: AjUi> Agent<UI> {
         }
 
         // Save the conversation after completing the turn
-        if let Err(e) = conversation.save_to_file() {
+        if let Err(e) = self
+            .conversation_persistence
+            .save_conversation(conversation)
+        {
             tracing::warn!("Failed to save conversation: {e}");
         }
 
@@ -496,6 +517,7 @@ impl<UI: AjUi> Agent<UI> {
             session_ctx: &mut self.session_state,
             ui: &self.ui,
             env: &self.env,
+            conversation_persistence: &self.conversation_persistence,
             system_prompt: self.system_prompt,
         };
 
@@ -615,6 +637,68 @@ impl<UI: AjUi> Agent<UI> {
         // Display using UI
         self.ui.display_token_usage_summary(&summary);
     }
+
+    fn display_conversation_history(&self, conversation: &Conversation) {
+        if conversation.is_empty() {
+            return;
+        }
+
+        for entry in conversation.entries() {
+            match entry {
+                conversation::ConversationEntry::Message(msg) => {
+                    match msg.role {
+                        Role::User => {
+                            // Extract text content from user message
+                            let text_content = msg
+                                .content
+                                .iter()
+                                .filter_map(|content| {
+                                    if let ContentBlockParam::TextBlock { text, .. } = content {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+
+                            if !text_content.is_empty() {
+                                self.ui.user_text_start("");
+                                self.ui.user_text_stop(&text_content);
+                            }
+                        }
+                        Role::Assistant => {
+                            // Extract text content from assistant message
+                            let text_content = msg
+                                .content
+                                .iter()
+                                .filter_map(|content| {
+                                    if let ContentBlockParam::TextBlock { text, .. } = content {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+
+                            if !text_content.is_empty() {
+                                self.ui.agent_text_start("");
+                                self.ui.agent_text_stop(&text_content);
+                            }
+                        }
+                    }
+                }
+                conversation::ConversationEntry::UserOutput(user_output) => {
+                    // Display user output (tool results, etc.)
+                    self.display_user_output(&[user_output.clone()]);
+                }
+            }
+        }
+
+        self.ui
+            .display_notice("--- End of conversation history ---");
+    }
 }
 
 /// Mutable state of an [Agent] session.
@@ -682,8 +766,9 @@ impl SessionState {
 /// partial immutable access to other parts. Used in [Agent::execute_tool].
 struct SessionContextWrapper<'a, UI: AjUi> {
     session_ctx: &'a mut SessionState,
-    ui: &'a UI,
     env: &'a AgentEnv,
+    ui: &'a UI,
+    conversation_persistence: &'a ConversationPersistence,
     system_prompt: &'static str,
 }
 
@@ -722,9 +807,10 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             // Create a new agent with the sub-agent UI
             let mut sub_agent = Agent::new(
                 self.env.clone(),
+                sub_ui,
+                self.conversation_persistence.clone(),
                 self.system_prompt,
                 sub_agent_tools,
-                sub_ui,
             );
 
             // Run the sub-agent with the task

@@ -12,6 +12,10 @@ pub trait AjUi: Send + Sync {
     fn agent_text_update(&self, diff: &str);
     fn agent_text_stop(&self, text: &str);
 
+    fn user_text_start(&self, text: &str);
+    fn user_text_update(&self, diff: &str);
+    fn user_text_stop(&self, text: &str);
+
     fn agent_thinking_start(&self, thinking: &str);
     fn agent_thinking_update(&self, diff: &str);
     fn agent_thinking_stop(&self);
@@ -97,7 +101,6 @@ pub enum UserOutput {
     /// Display token usage summary
     TokenUsageSummary(UsageSummary),
 }
-
 
 impl<T: AjUi> AjUiAskPermission for T {
     fn ask_permission(&self, message: &str) -> bool {
