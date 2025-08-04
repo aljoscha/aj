@@ -29,10 +29,19 @@ pub struct Conversation {
     entries: Vec<ConversationEntry>,
 }
 
-/// An entry in the conversation that can represent different types of
-/// interaction data.
+/// An entry in the conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConversationEntry {
+pub struct ConversationEntry {
+    #[serde(default)]
+    pub timestamp: Option<DateTime<Utc>>,
+    #[serde(flatten)]
+    pub entry: ConversationEntryKind,
+}
+
+/// The different types of conversation entries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConversationEntryKind {
     /// A message exchanged between user and assistant (maps to MessageParam)
     Message(ConversationMessage),
     /// Information that is displayed to the user.
@@ -62,11 +71,10 @@ impl Conversation {
 
     /// Add a message to the conversation
     pub fn add_message(&mut self, role: Role, content: Vec<ContentBlockParam>) {
-        self.entries
-            .push(ConversationEntry::Message(ConversationMessage {
-                role,
-                content,
-            }));
+        self.entries.push(ConversationEntry {
+            timestamp: Some(Utc::now()),
+            entry: ConversationEntryKind::Message(ConversationMessage { role, content }),
+        });
     }
 
     /// Add a user message to the conversation
@@ -81,8 +89,10 @@ impl Conversation {
 
     /// Add user output to the conversation
     pub fn add_user_output(&mut self, user_output: UserOutput) {
-        self.entries
-            .push(ConversationEntry::UserOutput(user_output));
+        self.entries.push(ConversationEntry {
+            timestamp: Some(Utc::now()),
+            entry: ConversationEntryKind::UserOutput(user_output),
+        });
     }
 
     /// Convert the conversation to a `Vec<MessageParam>` for API calls. This
@@ -91,8 +101,8 @@ impl Conversation {
     pub fn to_message_params(&self) -> Vec<MessageParam> {
         self.entries
             .iter()
-            .filter_map(|entry| match entry {
-                ConversationEntry::Message(msg) => Some(MessageParam {
+            .filter_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message(msg) => Some(MessageParam {
                     role: msg.role.clone(),
                     content: msg.content.clone(),
                 }),
@@ -132,38 +142,47 @@ impl Conversation {
     pub fn message_count(&self) -> usize {
         self.entries
             .iter()
-            .filter(|entry| matches!(entry, ConversationEntry::Message(_)))
+            .filter(|entry| matches!(entry.entry, ConversationEntryKind::Message(_)))
             .count()
     }
 
     /// Get the last message in the conversation, if any
     pub fn last_message(&self) -> Option<&ConversationMessage> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            ConversationEntry::Message(msg) => Some(msg),
-            _ => None,
-        })
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message(msg) => Some(msg),
+                _ => None,
+            })
     }
 
     /// Get the last user message in the conversation, if any
     pub fn last_user_message(&self) -> Option<&ConversationMessage> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            ConversationEntry::Message(msg) => match msg.role {
-                Role::User => Some(msg),
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message(msg) => match msg.role {
+                    Role::User => Some(msg),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        })
+            })
     }
 
     /// Get the last assistant message in the conversation, if any
     pub fn last_assistant_message(&self) -> Option<&ConversationMessage> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            ConversationEntry::Message(msg) => match msg.role {
-                Role::Assistant => Some(msg),
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message(msg) => match msg.role {
+                    Role::Assistant => Some(msg),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        })
+            })
     }
 }
 

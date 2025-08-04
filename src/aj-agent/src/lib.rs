@@ -644,8 +644,8 @@ impl<UI: AjUi> Agent<UI> {
         }
 
         for entry in conversation.entries() {
-            match entry {
-                conversation::ConversationEntry::Message(msg) => {
+            match &entry.entry {
+                conversation::ConversationEntryKind::Message(msg) => {
                     match msg.role {
                         Role::User => {
                             // Extract text content from user message
@@ -689,7 +689,7 @@ impl<UI: AjUi> Agent<UI> {
                         }
                     }
                 }
-                conversation::ConversationEntry::UserOutput(user_output) => {
+                conversation::ConversationEntryKind::UserOutput(user_output) => {
                     // Display user output (tool results, etc.)
                     self.display_user_output(&[user_output.clone()]);
                 }
