@@ -8,19 +8,29 @@ use thiserror::Error;
 use crate::messages::{ApiError, ApiErrorResponse, Message, Messages, ServerSentEvent};
 use crate::streaming::{StreamProcessor, StreamingEvent};
 
+const BASE_URL: &str = "https://api.anthropic.com";
+
 pub struct Client {
     client: ReqwestClient,
     api_key: String,
     version: String,
+    base_url: String,
 }
 
 impl Client {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(base_url: Option<String>, api_key: String) -> Self {
+        let base_url = base_url.unwrap_or_else(|| BASE_URL.to_string());
+
         Self {
             client: ReqwestClient::new(),
             api_key,
             version: "2023-06-01".to_string(),
+            base_url,
         }
+    }
+
+    pub fn base_url(&self) -> String {
+        self.base_url.clone()
     }
 }
 
@@ -28,7 +38,7 @@ impl Client {
     pub async fn messages(&self, messages: Messages) -> Result<Message, anyhow::Error> {
         let request_builder = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", self.api_key.clone())
             .header("anthropic-version", self.version.clone())
             .header("content-type", "application/json")
@@ -76,7 +86,7 @@ impl Client {
 
         let request_builder = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", self.api_key.clone())
             .header("anthropic-version", self.version.clone())
             // .header("anthropic-beta", "interleaved-thinking-2025-05-14")

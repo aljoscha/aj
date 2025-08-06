@@ -1,5 +1,6 @@
 use futures::Stream;
 use std::pin::Pin;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::conversation::Conversation;
@@ -23,12 +24,50 @@ pub trait Model: Send + Sync {
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send + '_>>, ModelError>;
+
+    /// Returns the name of the model.
+    fn model_name(&self) -> String;
+
+    /// Returns the URL of the model endpoint.
+    fn model_url(&self) -> String;
 }
 
 /// Thinking configuration for models that support it
 #[derive(Debug, Clone)]
 pub enum ThinkingConfig {
     Enabled { budget_tokens: u64 },
+}
+
+/// Configuration arguments for model client creation.
+#[derive(Debug, Clone)]
+pub struct ModelArgs {
+    /// The model API to use (e.g., "anthropic")
+    pub api: String,
+    /// Optional custom endpoint URL
+    pub url: Option<String>,
+    /// Optional model name to use
+    pub model_name: Option<String>,
+}
+
+/// Create a model instance based on the provided [ModelArgs].
+pub fn create_model(model_args: ModelArgs) -> Result<Arc<dyn Model>, ModelError> {
+    match model_args.api.as_str() {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                ModelError::Client(anyhow::anyhow!(
+                    "ANTHROPIC_API_KEY not found in environment variables"
+                ))
+            })?;
+
+            let model = crate::anthropic::AnthropicModel::new(model_args, api_key);
+
+            Ok(Arc::new(model))
+        }
+        _ => Err(ModelError::Client(anyhow::anyhow!(
+            "Unsupported model API: {}",
+            model_args.api
+        ))),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -38,14 +77,3 @@ pub enum ModelError {
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
 }
-
-// /// Convert a list of conversation messages to message parameters
-// pub fn to_message_params(messages: &[ConversationMessage]) -> Vec<MessageParam> {
-//     messages
-//         .iter()
-//         .map(|msg| MessageParam {
-//             role: msg.role.clone(),
-//             content: msg.content.clone(),
-//         })
-//         .collect()
-// }

@@ -23,17 +23,24 @@ use crate::messages::{
 };
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
-use crate::{Model, ModelError, ThinkingConfig};
+use crate::{Model, ModelArgs, ModelError, ThinkingConfig};
+
+const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 
 /// Anthropic Claude model implementation
 pub struct AnthropicModel {
     client: Client,
+    model_name: String,
 }
 
 impl AnthropicModel {
-    pub fn new(api_key: String) -> Self {
-        let client = Client::new(api_key);
-        Self { client }
+    pub fn new(model_args: ModelArgs, api_key: String) -> Self {
+        let client = Client::new(model_args.url, api_key);
+        let model_name = model_args
+            .model_name
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+        Self { client, model_name }
     }
 }
 
@@ -85,7 +92,7 @@ impl Model for AnthropicModel {
         }
 
         let messages_request = Messages {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: self.model_name.clone(),
             system: Some(system_prompt),
             thinking,
             max_tokens: 32_000,
@@ -102,6 +109,14 @@ impl Model for AnthropicModel {
             .map_err(|e| ModelError::Client(e.into()))?;
 
         Ok(response_stream.boxed())
+    }
+
+    fn model_name(&self) -> String {
+        self.model_name.to_string()
+    }
+
+    fn model_url(&self) -> String {
+        self.client.base_url()
     }
 }
 

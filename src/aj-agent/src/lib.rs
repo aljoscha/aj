@@ -8,7 +8,7 @@ use aj_models::messages::{ContentBlock, ContentBlockParam, Message, Role, Usage}
 use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
 use aj_models::ModelError;
-use aj_models::{anthropic::AnthropicModel, Model, ThinkingConfig};
+use aj_models::{Model, ThinkingConfig};
 use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, ToolResult,
@@ -41,11 +41,8 @@ impl<UI: AjUi> Agent<UI> {
         conversation_persistence: ConversationPersistence,
         system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
+        model: Arc<dyn Model>,
     ) -> Self {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").expect(
-            "need ANTHROPIC_API_KEY in environment, maybe you forget to set up a .env file",
-        );
-        let model: Arc<dyn Model> = Arc::new(AnthropicModel::new(api_key));
 
         // Convert ErasedToolDefinition to Tool for Model API
         let api_tools: Vec<Tool> = tools
@@ -96,10 +93,14 @@ impl<UI: AjUi> Agent<UI> {
                 conversation.conversation_id()
             ));
 
+            self.ui.display_notice(&format!("Model: {}, at {}", self.model.model_name(), self.model.model_url()));
+
             conversation
         } else {
             self.ui
                 .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
+
+            self.ui.display_notice(&format!("Model: {}, at {}", self.model.model_name(), self.model.model_url()));
 
             Conversation::new()
         };
@@ -463,6 +464,7 @@ impl<UI: AjUi> Agent<UI> {
             env: &self.env,
             conversation_persistence: &self.conversation_persistence,
             system_prompt: self.system_prompt,
+            model: self.model.clone(),
         };
 
         let result =
@@ -714,6 +716,7 @@ struct SessionContextWrapper<'a, UI: AjUi> {
     ui: &'a UI,
     conversation_persistence: &'a ConversationPersistence,
     system_prompt: &'static str,
+    model: Arc<dyn Model>,
 }
 
 impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
@@ -755,6 +758,7 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 self.conversation_persistence.clone(),
                 self.system_prompt,
                 sub_agent_tools,
+                self.model.clone(),
             );
 
             // Run the sub-agent with the task

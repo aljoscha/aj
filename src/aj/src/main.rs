@@ -1,7 +1,7 @@
 use aj::cli::AjCli;
 use aj_agent::Agent;
 use aj_conf::{AgentEnv, Config, SYSTEM_PROMPT};
-use aj_models::conversation::ConversationPersistence;
+use aj_models::{ModelArgs, conversation::ConversationPersistence, create_model};
 use aj_tools::get_builtin_tools;
 use aj_ui::AjUi;
 use anyhow::Result;
@@ -12,6 +12,18 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "aj")]
 #[command(about = "AI-driven agent for software engineering")]
 struct Cli {
+    /// Model API to use.
+    #[arg(long, env, default_value = "anthropic")]
+    model_api: String,
+
+    /// Model endpoint URL.
+    #[arg(long, env)]
+    model_url: Option<String>,
+
+    /// Model name to use.
+    #[arg(long, env)]
+    model_name: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -69,12 +81,20 @@ async fn main() -> Result<()> {
     let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
 
+    let model_args = ModelArgs {
+        api: cli.model_api,
+        url: cli.model_url,
+        model_name: cli.model_name,
+    };
+    let model = create_model(model_args)?;
+
     let mut agent = Agent::new(
         env,
         ui.clone(),
         conversation_persistence.clone(),
         SYSTEM_PROMPT,
         get_builtin_tools(),
+        model,
     );
 
     match cli.command {
