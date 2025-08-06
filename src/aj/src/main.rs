@@ -51,8 +51,6 @@ enum ThreadsAction {
 /// calls into [Agent::run].
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv::dotenv().ok();
-
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_ansi(true)
@@ -64,6 +62,8 @@ async fn main() -> Result<()> {
     } else {
         tracing::info!("no .env in config directory");
     }
+
+    dotenv::dotenv().ok();
 
     let cli = Cli::parse();
 
