@@ -7,9 +7,10 @@ edition.workspace = true
 anyhow.workspace = true
 anthropic-sdk = { path = "../anthropic-sdk" }
 aj-ui = { path = "../aj-ui" }
+async-openai.workspace = true
 async-stream.workspace = true
 async-trait = "0.1"
-chrono.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
