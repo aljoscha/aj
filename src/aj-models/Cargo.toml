@@ -1,0 +1,18 @@
+[package]
+name = "aj-models"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+anthropic-sdk = { path = "../anthropic-sdk" }
+aj-ui = { path = "../aj-ui" }
+async-stream.workspace = true
+async-trait = "0.1"
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

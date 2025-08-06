@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
-anthropic-sdk = { path = "../anthropic-sdk" }
 aj-conf = { path = "../aj-conf" }
+aj-models = { path = "../aj-models" }
 aj-tools = { path = "../aj-tools" }
 aj-ui = { path = "../aj-ui" }
 chrono = { workspace = true, features = ["serde"] }

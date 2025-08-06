@@ -1,3 +1,7 @@
+//! A 1-to-1 copy of our Anthropic API message definitions, but meant as our
+//! generic model independent API. Let's see how far we get with this when
+//! adding support for other providers and models.
+
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
@@ -67,21 +71,13 @@ pub enum ContentBlockParam {
     TextBlock {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         citations: Option<Vec<Citation>>,
     },
     #[serde(rename = "image")]
-    ImageBlock {
-        source: ImageSource,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
-    },
+    ImageBlock { source: ImageSource },
     #[serde(rename = "document")]
     DocumentBlock {
         source: DocumentSource,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
         #[serde(skip_serializing_if = "Option::is_none")]
         citations: Option<Vec<Citation>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,14 +94,10 @@ pub enum ContentBlockParam {
         id: String,
         input: Value,
         name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "tool_result")]
     ToolResultBlock {
         tool_use_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
         content: String,
         is_error: bool,
     },
@@ -114,22 +106,16 @@ pub enum ContentBlockParam {
         id: String,
         input: Value,
         name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "web_search_tool_result")]
     WebSearchToolResultBlock {
         content: Vec<WebSearchToolResultContent>,
         tool_use_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "code_execution_tool_result")]
     CodeExecutionToolResultBlock {
         content: Vec<Value>,
         tool_use_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "mcp_tool_use")]
     MCPToolUseBlock {
@@ -137,59 +123,22 @@ pub enum ContentBlockParam {
         input: Value,
         name: String,
         server_name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "mcp_tool_result")]
     MCPToolResultBlock {
         tool_use_id: String,
         content: Vec<Value>,
         is_error: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "container_upload")]
-    ContainerUploadBlock {
-        file_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
-    },
+    ContainerUploadBlock { file_id: String },
 }
 
 impl ContentBlockParam {
     pub fn new_text_block(text: String) -> Self {
         Self::TextBlock {
             text,
-            cache_control: None,
             citations: None,
-        }
-    }
-
-    // Sets the given cache control if-and-only-if the content type can take
-    // one.
-    pub fn set_cache_control(&mut self, cache_control: CacheControl) {
-        let cache_control_field = match self {
-            ContentBlockParam::TextBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::ImageBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::DocumentBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::ThinkingBlock { .. } => None,
-            ContentBlockParam::RedactedThinkingBlock { .. } => None,
-            ContentBlockParam::ToolUseBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::ToolResultBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::ServerToolUseBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::WebSearchToolResultBlock { cache_control, .. } => {
-                Some(cache_control)
-            }
-            ContentBlockParam::CodeExecutionToolResultBlock { cache_control, .. } => {
-                Some(cache_control)
-            }
-            ContentBlockParam::MCPToolUseBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::MCPToolResultBlock { cache_control, .. } => Some(cache_control),
-            ContentBlockParam::ContainerUploadBlock { cache_control, .. } => Some(cache_control),
-        };
-
-        if let Some(cache_control_field) = cache_control_field {
-            *cache_control_field = Some(cache_control);
         }
     }
 }
@@ -275,16 +224,6 @@ pub enum WebSearchToolResultContent {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
-pub enum CacheControl {
-    #[serde(rename = "ephemeral")]
-    Ephemeral {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        ttl: Option<String>,
-    },
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MCPServer {
     pub name: String,
     pub r#type: MCPServerType,
@@ -347,8 +286,6 @@ pub struct Tool {
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -458,21 +395,12 @@ impl ContentBlock {
                 } else {
                     Some(citations)
                 },
-                cache_control: None,
             },
-            ContentBlock::ToolUseBlock { id, input, name } => ContentBlockParam::ToolUseBlock {
-                id,
-                input,
-                name,
-                cache_control: None,
-            },
+            ContentBlock::ToolUseBlock { id, input, name } => {
+                ContentBlockParam::ToolUseBlock { id, input, name }
+            }
             ContentBlock::ServerToolUseBlock { id, input, name } => {
-                ContentBlockParam::ServerToolUseBlock {
-                    id,
-                    input,
-                    name,
-                    cache_control: None,
-                }
+                ContentBlockParam::ServerToolUseBlock { id, input, name }
             }
             ContentBlock::WebSearchToolResultBlock {
                 content,
@@ -480,7 +408,6 @@ impl ContentBlock {
             } => ContentBlockParam::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
-                cache_control: None,
             },
             ContentBlock::CodeExecutionToolResultBlock {
                 content,
@@ -488,7 +415,6 @@ impl ContentBlock {
             } => ContentBlockParam::CodeExecutionToolResultBlock {
                 content,
                 tool_use_id,
-                cache_control: None,
             },
             ContentBlock::MCPToolUseBlock {
                 id,
@@ -500,7 +426,6 @@ impl ContentBlock {
                 input,
                 name,
                 server_name,
-                cache_control: None,
             },
             ContentBlock::MCPToolResultBlock {
                 content,
@@ -510,13 +435,9 @@ impl ContentBlock {
                 tool_use_id,
                 content,
                 is_error,
-                cache_control: None,
             },
             ContentBlock::ContainerUploadBlock { file_id } => {
-                ContentBlockParam::ContainerUploadBlock {
-                    file_id,
-                    cache_control: None,
-                }
+                ContentBlockParam::ContainerUploadBlock { file_id }
             }
             ContentBlock::ThinkingBlock {
                 signature,
@@ -715,36 +636,6 @@ impl ApiError {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ApiErrorResponse {
     pub error: ApiError,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
-pub enum ServerSentEvent {
-    #[serde(rename = "message_start")]
-    MessageStart { message: Message },
-    #[serde(rename = "message_delta")]
-    MessageDelta {
-        delta: MessageDelta,
-        usage: UsageDelta,
-    },
-    #[serde(rename = "message_stop")]
-    MessageStop,
-    #[serde(rename = "content_block_start")]
-    ContentBlockStart {
-        index: u64,
-        content_block: ContentBlock,
-    },
-    #[serde(rename = "content_block_delta")]
-    ContentBlockDelta {
-        index: u64,
-        delta: ContentBlockDelta,
-    },
-    #[serde(rename = "content_block_stop")]
-    ContentBlockStop { index: u64 },
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "error")]
-    Error { error: ApiError },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

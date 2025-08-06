@@ -4,25 +4,24 @@ use std::pin::pin;
 use std::time::Duration;
 
 use aj_conf::AgentEnv;
+use aj_models::messages::{ContentBlock, ContentBlockParam, Message, Role, Usage};
+use aj_models::streaming::StreamingEvent;
+use aj_models::tools::Tool;
+use aj_models::ModelError;
+use aj_models::{anthropic::AnthropicModel, Model, ThinkingConfig};
 use aj_tools::tools::todo::TodoItem;
 use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, ToolResult,
     TurnContext as ToolTurnContext,
 };
 use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
-use anthropic_sdk::client::ClientError;
-use anthropic_sdk::messages::{
-    CacheControl, ContentBlock, ContentBlockParam, Message, Messages, Role, Tool, Usage,
-};
-use anthropic_sdk::streaming::StreamingEvent;
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
+use std::sync::Arc;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 
-pub mod conversation;
-
-use crate::conversation::Conversation;
-use crate::conversation::ConversationPersistence;
+use aj_models::conversation::ConversationPersistence;
+use aj_models::conversation::{Conversation, ConversationEntryKind};
 
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
@@ -31,7 +30,7 @@ pub struct Agent<UI: AjUi> {
     system_prompt: &'static str,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
-    client: anthropic_sdk::client::Client,
+    model: Arc<dyn Model>,
     session_state: SessionState,
 }
 
@@ -46,9 +45,9 @@ impl<UI: AjUi> Agent<UI> {
         let api_key = std::env::var("ANTHROPIC_API_KEY").expect(
             "need ANTHROPIC_API_KEY in environment, maybe you forget to set up a .env file",
         );
-        let client = anthropic_sdk::client::Client::new(api_key.clone());
+        let model = Arc::new(AnthropicModel::new(api_key)) as Arc<dyn Model>;
 
-        // Convert ErasedToolDefinition to Tool for Anthropic API
+        // Convert ErasedToolDefinition to Tool for Model API
         let api_tools: Vec<Tool> = tools
             .iter()
             .map(|tool_def| Tool {
@@ -56,7 +55,6 @@ impl<UI: AjUi> Agent<UI> {
                 description: tool_def.description.clone(),
                 input_schema: tool_def.input_schema.clone(),
                 r#type: None,
-                cache_control: None,
             })
             .collect();
 
@@ -75,7 +73,7 @@ impl<UI: AjUi> Agent<UI> {
             system_prompt,
             tool_definitions,
             tools: api_tools,
-            client,
+            model,
             session_state,
         }
     }
@@ -318,7 +316,6 @@ impl<UI: AjUi> Agent<UI> {
                         tool_use_id: tool_id.to_owned(),
                         content: tool_result.return_value,
                         is_error,
-                        cache_control: None,
                     };
 
                     tool_result_contents.push(result_content_block);
@@ -361,45 +358,20 @@ impl<UI: AjUi> Agent<UI> {
     async fn run_inference_streaming(
         &self,
         conversation: &Conversation,
-    ) -> Result<impl Stream<Item = StreamingEvent> + '_, ClientError> {
-        let mut messages = conversation.to_message_params();
-
-        let last_user_message = messages
-            .iter_mut()
-            .filter(|m| matches!(m.role, Role::User))
-            .next_back();
-
-        if let Some(last_user_message) = last_user_message {
-            let last_content = last_user_message.content.iter_mut().last();
-            if let Some(last_content) = last_content {
-                last_content.set_cache_control(CacheControl::Ephemeral { ttl: None });
-            }
-        }
-
-        let last_assistant_message = messages
-            .iter_mut()
-            .filter(|m| matches!(m.role, Role::Assistant))
-            .next_back();
-
-        if let Some(last_assistant_message) = last_assistant_message {
-            let last_content = last_assistant_message.content.iter_mut().last();
-            if let Some(last_content) = last_content {
-                last_content.set_cache_control(CacheControl::Ephemeral { ttl: None });
-            }
-        }
-
+    ) -> Result<impl Stream<Item = StreamingEvent> + '_, ModelError> {
         let thinking = self.determine_thinking(conversation);
-        tracing::info!(?thinking, "thinking");
-        let messages = Messages {
-            model: "claude-sonnet-4-20250514".to_string(),
-            system: Some(self.assemble_system_prompt()),
-            thinking,
-            max_tokens: 32_000,
-            messages,
-            tools: self.tools.clone(),
-            ..Default::default()
-        };
-        let response = self.client.messages_stream(messages).await?;
+
+        tracing::debug!(?thinking, "thinking budget");
+
+        let response = self
+            .model
+            .run_inference_streaming(
+                conversation,
+                self.assemble_system_prompt(),
+                self.tools.clone(),
+                thinking,
+            )
+            .await?;
 
         Ok(response)
     }
@@ -411,32 +383,8 @@ impl<UI: AjUi> Agent<UI> {
     /// - "think hard" -> 10,000 tokens
     /// - "think" -> 4,000 tokens
     /// - default -> None (no thinking)
-    fn determine_thinking(
-        &self,
-        conversation: &Conversation,
-    ) -> Option<anthropic_sdk::messages::Thinking> {
-        // Get the last user message
-        let messages = conversation.to_message_params();
-        let last_user_message = messages
-            .iter()
-            .filter(|m| {
-                let is_user = matches!(m.role, Role::User);
-                if !is_user {
-                    return false;
-                }
-
-                // Only sniff out messages that have actual user-input. The last
-                // user input determines thinking, and so, for example, when
-                // there is back-and-forth with tool results, we need to
-                // maintain the thinking flag enabled.
-                let is_user_input = m
-                    .content
-                    .iter()
-                    .any(|c| matches!(c, ContentBlockParam::TextBlock { .. }));
-
-                is_user_input
-            })
-            .next_back();
+    fn determine_thinking(&self, conversation: &Conversation) -> Option<ThinkingConfig> {
+        let last_user_message = conversation.last_user_message();
 
         let mut thinking_budget = None;
 
@@ -468,7 +416,7 @@ impl<UI: AjUi> Agent<UI> {
         }
 
         // Return thinking configuration if we have a budget
-        thinking_budget.map(|budget| anthropic_sdk::messages::Thinking::Enabled {
+        thinking_budget.map(|budget| ThinkingConfig::Enabled {
             budget_tokens: budget,
         })
     }
@@ -476,7 +424,7 @@ impl<UI: AjUi> Agent<UI> {
     /// Assemble the system prompt we pass to the model from the actual system
     /// prompt and additional information we might want or need, such as
     /// information about the environment.
-    fn assemble_system_prompt(&self) -> Vec<ContentBlockParam> {
+    fn assemble_system_prompt(&self) -> String {
         let mut text = self.system_prompt.to_string();
 
         if let Some(agent_md_content) = &self.env.agent_md {
@@ -492,11 +440,7 @@ impl<UI: AjUi> Agent<UI> {
             self.env
         ));
 
-        vec![ContentBlockParam::TextBlock {
-            text,
-            cache_control: Some(CacheControl::Ephemeral { ttl: None }),
-            citations: None,
-        }]
+        text
     }
 
     async fn execute_tool(
@@ -645,7 +589,7 @@ impl<UI: AjUi> Agent<UI> {
 
         for entry in conversation.entries() {
             match &entry.entry {
-                conversation::ConversationEntryKind::Message(msg) => {
+                ConversationEntryKind::Message(msg) => {
                     match msg.role {
                         Role::User => {
                             // Extract text content from user message
@@ -689,7 +633,7 @@ impl<UI: AjUi> Agent<UI> {
                         }
                     }
                 }
-                conversation::ConversationEntryKind::UserOutput(user_output) => {
+                ConversationEntryKind::UserOutput(user_output) => {
                     // Display user output (tool results, etc.)
                     self.display_user_output(&[user_output.clone()]);
                 }

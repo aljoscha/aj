@@ -1,6 +1,4 @@
-use aj_conf::ConfigError;
 use aj_ui::UserOutput;
-use anthropic_sdk::messages::{ContentBlockParam, MessageParam, Role};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,14 +8,14 @@ use std::{
 };
 use thiserror::Error;
 
+use crate::messages::{ContentBlockParam, MessageParam, Role};
+
 #[derive(Debug, Error)]
 pub enum ConversationError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Config error: {0}")]
-    Config(#[from] ConfigError),
 }
 
 /// A conversation represents the full interaction history between the user and
@@ -43,18 +41,9 @@ pub struct ConversationEntry {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConversationEntryKind {
     /// A message exchanged between user and assistant (maps to MessageParam)
-    Message(ConversationMessage),
+    Message(MessageParam),
     /// Information that is displayed to the user.
     UserOutput(UserOutput),
-}
-
-/// Internal representation of a conversation message that maps to MessageParam
-// NOTE: Once we want to support different model APIs/providers, we'll have to
-// make this independent of the Anthropic SDK.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationMessage {
-    pub role: Role,
-    pub content: Vec<ContentBlockParam>,
 }
 
 impl Conversation {
@@ -73,7 +62,7 @@ impl Conversation {
     pub fn add_message(&mut self, role: Role, content: Vec<ContentBlockParam>) {
         self.entries.push(ConversationEntry {
             timestamp: Some(Utc::now()),
-            entry: ConversationEntryKind::Message(ConversationMessage { role, content }),
+            entry: ConversationEntryKind::Message(MessageParam { role, content }),
         });
     }
 
@@ -95,22 +84,20 @@ impl Conversation {
         });
     }
 
-    /// Convert the conversation to a `Vec<MessageParam>` for API calls. This
-    /// extracts only the Message entries and converts them to the format
-    /// expected by the API
-    pub fn to_message_params(&self) -> Vec<MessageParam> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message(msg) => Some(MessageParam {
-                    role: msg.role.clone(),
-                    content: msg.content.clone(),
-                }),
-                // Future entries like ToolOutput and UiDisplay are not included in API calls
-                _ => None,
-            })
-            .collect()
-    }
+    // /// Convert the conversation to a `Vec<aj_models::ConversationMessage>` for API calls
+    // pub fn to_conversation_messages(&self) -> Vec<aj_models::ConversationMessage> {
+    //     self.entries
+    //         .iter()
+    //         .filter_map(|entry| match &entry.entry {
+    //             ConversationEntryKind::Message(msg) => Some(aj_models::ConversationMessage {
+    //                 role: msg.role.clone(),
+    //                 content: msg.content.clone(),
+    //             }),
+    //             // Future entries like ToolOutput and UiDisplay are not included in API calls
+    //             _ => None,
+    //         })
+    //         .collect()
+    // }
 
     /// Get the conversation ID
     pub fn conversation_id(&self) -> &str {
@@ -147,7 +134,7 @@ impl Conversation {
     }
 
     /// Get the last message in the conversation, if any
-    pub fn last_message(&self) -> Option<&ConversationMessage> {
+    pub fn last_message(&self) -> Option<&MessageParam> {
         self.entries
             .iter()
             .rev()
@@ -157,22 +144,36 @@ impl Conversation {
             })
     }
 
-    /// Get the last user message in the conversation, if any
-    pub fn last_user_message(&self) -> Option<&ConversationMessage> {
+    /// Get the last user message in the conversation, if any. Only returns a
+    /// message if it has actual input from the user, meaning a `TextBlock`.
+    pub fn last_user_message(&self) -> Option<&MessageParam> {
         self.entries
             .iter()
             .rev()
             .find_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message(msg) => match msg.role {
-                    Role::User => Some(msg),
-                    _ => None,
-                },
+                ConversationEntryKind::Message(m) => {
+                    let is_user = matches!(m.role, Role::User);
+                    if !is_user {
+                        return None;
+                    }
+
+                    // Only sniff out messages that have actual user-input. The last
+                    // user input determines thinking, and so, for example, when
+                    // there is back-and-forth with tool results, we need to
+                    // maintain the thinking flag enabled.
+                    let is_user_input = m
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlockParam::TextBlock { .. }));
+
+                    if is_user_input { Some(m) } else { None }
+                }
                 _ => None,
             })
     }
 
     /// Get the last assistant message in the conversation, if any
-    pub fn last_assistant_message(&self) -> Option<&ConversationMessage> {
+    pub fn last_assistant_message(&self) -> Option<&MessageParam> {
         self.entries
             .iter()
             .rev()
