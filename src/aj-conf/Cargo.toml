@@ -10,3 +10,6 @@ thiserror = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = { workspace = true }
 schemars = { workspace = true }
+
+[lints]
+workspace = true

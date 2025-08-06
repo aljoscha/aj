@@ -176,7 +176,7 @@ impl StreamProcessor {
                     }
                 };
 
-                if current_message.content.len() != index as usize {
+                if current_message.content.len() != usize::try_from(index).expect("must cast") {
                     return Some(StreamingEvent::ProtocolError {
                         error: format!(
                             "got content block delta for index {} but current message has {} content blocks",

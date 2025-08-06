@@ -45,7 +45,7 @@ impl<UI: AjUi> Agent<UI> {
         let api_key = std::env::var("ANTHROPIC_API_KEY").expect(
             "need ANTHROPIC_API_KEY in environment, maybe you forget to set up a .env file",
         );
-        let model = Arc::new(AnthropicModel::new(api_key)) as Arc<dyn Model>;
+        let model: Arc<dyn Model> = Arc::new(AnthropicModel::new(api_key));
 
         // Convert ErasedToolDefinition to Tool for Model API
         let api_tools: Vec<Tool> = tools

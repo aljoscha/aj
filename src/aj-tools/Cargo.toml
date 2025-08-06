@@ -31,3 +31,6 @@ termimad = "0.33.0"
 tokio = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
+
+[lints]
+workspace = true

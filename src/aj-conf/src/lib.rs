@@ -133,7 +133,7 @@ impl Config {
         let threads_base_dir = aj_dir.join("threads");
 
         // Find the git root directory
-        let working_directory = env::current_dir().map_err(|e| ConfigError::Io(e))?;
+        let working_directory = env::current_dir().map_err(ConfigError::Io)?;
         if let Some(git_root) = find_git_root(&working_directory) {
             // Convert the git root path to a directory name
             let project_dir_name = path_to_dir_name(&git_root);

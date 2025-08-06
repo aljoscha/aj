@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::ListThreads) => {
-            list_threads(&conversation_persistence).await?;
+            list_threads(&conversation_persistence)?;
         }
         Some(Commands::Resume { conversation_id }) => {
             let latest_conversation =
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn list_threads(conversation_persistence: &ConversationPersistence) -> Result<()> {
+fn list_threads(conversation_persistence: &ConversationPersistence) -> Result<()> {
     let threads = conversation_persistence.list_threads()?;
 
     if threads.is_empty() {

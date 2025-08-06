@@ -88,7 +88,7 @@ impl ToolDefinition for ReadFileTool {
 
         let mut display_path = Path::new(path)
             .strip_prefix(session_ctx.working_directory())
-            .unwrap_or(Path::new(path))
+            .unwrap_or_else(|_| Path::new(path))
             .display()
             .to_string();
 
