@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::SystemTime;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
 use aj_ui::{AjUiAskPermission, UserOutput};
@@ -86,22 +86,27 @@ impl ToolDefinition for GlobTool {
 
         let mut results = Vec::new();
 
-        // Walk directory recursively
-        for entry in WalkDir::new(&input.path) {
-            let entry = entry.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
+        fn is_ignored(entry: &DirEntry) -> bool {
+            let is_hidden = entry
+                .file_name()
+                .to_str()
+                .map(|s| s.starts_with("."))
+                .unwrap_or(false);
+            let is_cargo = entry
+                .file_name()
+                .to_str()
+                .map(|s| s.starts_with("target"))
+                .unwrap_or(false);
 
-            // Skip hidden directories (starting with '.')
-            if entry.file_type().is_dir() {
-                if let Some(file_name) = entry.path().file_name() {
-                    if let Some(name_str) = file_name.to_str() {
-                        // Don't exclude if this is the root directory, by
-                        // checking for depth.
-                        if name_str.starts_with('.') && entry.depth() > 0 {
-                            continue;
-                        }
-                    }
-                }
-            }
+            is_hidden || is_cargo
+        }
+
+        // Walk directory recursively
+        for entry in WalkDir::new(&input.path)
+            .into_iter()
+            .filter_entry(|e| !is_ignored(e))
+        {
+            let entry = entry.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
 
             // Get relative path from the starting directory
             let relative_path = entry
