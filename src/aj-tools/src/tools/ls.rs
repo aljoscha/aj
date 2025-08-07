@@ -149,6 +149,11 @@ fn list_directory(
             continue;
         }
 
+        // Skip cargo target directory.
+        if file_name.starts_with("target") {
+            continue;
+        }
+
         // Check if entry should be ignored
         if let Some(glob_set) = glob_set {
             if glob_set.is_match(&file_name) {
@@ -193,9 +198,6 @@ fn list_directory_recursive(
     let entries = fs::read_dir(path)
         .map_err(|e| anyhow::anyhow!("Failed to read directory '{}': {}", path, e))?;
 
-    let mut dir_entries = Vec::new();
-    let mut subdirs = Vec::new();
-
     for entry in entries {
         let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read directory entry: {}", e))?;
 
@@ -203,6 +205,11 @@ fn list_directory_recursive(
 
         // Skip hidden files and directories (starting with '.')
         if file_name.starts_with('.') {
+            continue;
+        }
+
+        // Skip cargo target directory.
+        if file_name.starts_with("target") {
             continue;
         }
 
@@ -233,22 +240,12 @@ fn list_directory_recursive(
 
         let indent = "  ".repeat(depth);
         let formatted_entry = format!("{indent}{file_name:<20} {entry_type:<10} {size}");
-        dir_entries.push(formatted_entry);
+        results.push(formatted_entry);
 
         if metadata.is_dir() {
-            subdirs.push(entry.path());
-        }
-    }
-
-    // Sort results alphabetically
-    dir_entries.sort();
-    results.extend(dir_entries);
-
-    // Recursively process subdirectories
-    subdirs.sort();
-    for subdir in subdirs {
-        if let Some(subdir_str) = subdir.to_str() {
-            list_directory_recursive(subdir_str, glob_set, depth + 1, results)?;
+            if let Some(subdir_str) = entry.path().to_str() {
+                list_directory_recursive(subdir_str, glob_set, depth + 1, results)?;
+            }
         }
     }
 
