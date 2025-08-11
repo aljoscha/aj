@@ -394,7 +394,7 @@ impl<UI: AjUi> Agent<UI> {
     fn determine_thinking(&self, conversation: &Conversation) -> Option<ThinkingConfig> {
         let last_user_message = conversation.last_user_message();
 
-        let mut thinking_budget = None;
+        let mut thinking_config = None;
 
         if let Some(message) = last_user_message {
             // Extract text content from the message
@@ -415,18 +415,15 @@ impl<UI: AjUi> Agent<UI> {
 
             // Check for trigger phrases in order of specificity
             if text_lower.contains("think harder") {
-                thinking_budget = Some(32_000);
+                thinking_config = Some(ThinkingConfig::High);
             } else if text_lower.contains("think hard") {
-                thinking_budget = Some(10_000);
+                thinking_config = Some(ThinkingConfig::Medium);
             } else if text_lower.contains("think") {
-                thinking_budget = Some(4_000);
+                thinking_config = Some(ThinkingConfig::Low);
             }
         }
 
-        // Return thinking configuration if we have a budget
-        thinking_budget.map(|budget| ThinkingConfig::Enabled {
-            budget_tokens: budget,
-        })
+        thinking_config
     }
 
     /// Assemble the system prompt we pass to the model from the actual system

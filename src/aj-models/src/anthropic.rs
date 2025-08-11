@@ -477,9 +477,15 @@ impl From<&AnthropicWebSearchToolResultContent> for WebSearchToolResultContent {
 impl From<ThinkingConfig> for AnthropicThinking {
     fn from(thinking: ThinkingConfig) -> Self {
         match thinking {
-            ThinkingConfig::Enabled { budget_tokens } => {
-                AnthropicThinking::Enabled { budget_tokens }
-            }
+            ThinkingConfig::Low => AnthropicThinking::Enabled {
+                budget_tokens: 4_000,
+            },
+            ThinkingConfig::Medium => AnthropicThinking::Enabled {
+                budget_tokens: 10_000,
+            },
+            ThinkingConfig::High => AnthropicThinking::Enabled {
+                budget_tokens: 31_999,
+            },
         }
     }
 }

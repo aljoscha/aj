@@ -7,8 +7,8 @@ use openai_sdk::client::{Client as OpenAIClient, ClientError};
 use openai_sdk::types::{
     ChatCompletionRequestMessage, ChatCompletionUserContent, CreateChatCompletionRequest,
     CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, FunctionCall,
-    FunctionDefinition, ServiceTier as OpenAIServiceTier, StreamOptions, Tool as OpenAITool,
-    ToolCall as OpenAIToolCall, Usage as OpenAIUsage,
+    FunctionDefinition, ReasoningEffort, ServiceTier as OpenAIServiceTier, StreamOptions,
+    Tool as OpenAITool, ToolCall as OpenAIToolCall, Usage as OpenAIUsage,
 };
 
 use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
@@ -47,7 +47,7 @@ impl Model for OpenAiModel {
         conversation: &Conversation,
         system_prompt: String,
         tools: Vec<Tool>,
-        _thinking: Option<ThinkingConfig>,
+        thinking: Option<ThinkingConfig>,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send + '_>>, ModelError> {
         // Convert system prompt to system message
         let mut messages = vec![ChatCompletionRequestMessage::System {
@@ -79,6 +79,7 @@ impl Model for OpenAiModel {
             } else {
                 openai_tools
             },
+            reasoning_effort: thinking.map(Into::into),
             stream_options: Some(StreamOptions {
                 include_usage: Some(true),
             }),
@@ -235,6 +236,16 @@ impl From<OpenAIUsage> for UsageDelta {
             output_tokens: Some(usage.completion_tokens as u64),
             server_tool_use: None,
             service_tier: None,
+        }
+    }
+}
+
+impl From<ThinkingConfig> for ReasoningEffort {
+    fn from(thinking: ThinkingConfig) -> Self {
+        match thinking {
+            ThinkingConfig::Low => ReasoningEffort::Low,
+            ThinkingConfig::Medium => ReasoningEffort::Medium,
+            ThinkingConfig::High => ReasoningEffort::High,
         }
     }
 }

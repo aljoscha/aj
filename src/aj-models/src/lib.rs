@@ -37,7 +37,9 @@ pub trait Model: Send + Sync {
 /// Thinking configuration for models that support it
 #[derive(Debug, Clone)]
 pub enum ThinkingConfig {
-    Enabled { budget_tokens: u64 },
+    Low,
+    Medium,
+    High,
 }
 
 /// Configuration arguments for model client creation.
