@@ -43,7 +43,6 @@ impl<UI: AjUi> Agent<UI> {
         tools: Vec<ErasedToolDefinition>,
         model: Arc<dyn Model>,
     ) -> Self {
-
         // Convert ErasedToolDefinition to Tool for Model API
         let api_tools: Vec<Tool> = tools
             .iter()
@@ -93,14 +92,22 @@ impl<UI: AjUi> Agent<UI> {
                 conversation.conversation_id()
             ));
 
-            self.ui.display_notice(&format!("Model: {}, at {}", self.model.model_name(), self.model.model_url()));
+            self.ui.display_notice(&format!(
+                "Model: {}, at {}",
+                self.model.model_name(),
+                self.model.model_url()
+            ));
 
             conversation
         } else {
             self.ui
                 .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
 
-            self.ui.display_notice(&format!("Model: {}, at {}", self.model.model_name(), self.model.model_url()));
+            self.ui.display_notice(&format!(
+                "Model: {}, at {}",
+                self.model.model_name(),
+                self.model.model_url()
+            ));
 
             Conversation::new()
         };
