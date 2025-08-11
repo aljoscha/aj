@@ -11,6 +11,7 @@ pub mod anthropic;
 pub mod conversation;
 pub mod messages;
 pub mod openai;
+pub mod openai_ng;
 pub mod streaming;
 pub mod tools;
 
@@ -72,6 +73,17 @@ pub fn create_model(model_args: ModelArgs) -> Result<Arc<dyn Model>, ModelError>
             })?;
 
             let model = crate::openai::OpenAiModel::new(model_args, api_key);
+
+            Ok(Arc::new(model))
+        }
+        "openai-ng" => {
+            let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+                ModelError::Client(anyhow::anyhow!(
+                    "OPENAI_API_KEY not found in environment variables"
+                ))
+            })?;
+
+            let model = crate::openai_ng::OpenAiModel::new(model_args, api_key);
 
             Ok(Arc::new(model))
         }

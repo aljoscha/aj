@@ -93,6 +93,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "openai-sdk",
  "serde",
  "serde_json",
  "thiserror 2.0.12",
