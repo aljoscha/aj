@@ -1,7 +1,8 @@
 use globset::{Glob, GlobSetBuilder};
+use ignore::WalkBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::path::Path;
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
 use aj_ui::{AjUiAskPermission, UserOutput};
@@ -16,6 +17,7 @@ Usage:
 - Optional recursive parameter enables recursive directory traversal with indentation
 - Returns a list of entries with their type (file/directory) and size
 - Entries are sorted alphabetically
+- Automatically respects .gitignore files and ignores hidden files
 - You should prefer the glob or grep tool if you know roughly what you're looking for and can use pattern matching
 "#;
 
@@ -134,27 +136,24 @@ fn list_directory(
     glob_set: &Option<globset::GlobSet>,
     results: &mut Vec<String>,
 ) -> Result<(), anyhow::Error> {
-    let entries = fs::read_dir(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read directory '{}': {}", path, e))?;
-
     let mut dir_entries = Vec::new();
 
-    for entry in entries {
-        let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read directory entry: {}", e))?;
+    // Use ignore crate with max_depth(1) to list only immediate directory
+    // contents. This respects gitignore files and ignores hidden files by
+    // default.
+    let walker = WalkBuilder::new(path).max_depth(Some(1)).build();
 
-        let file_name = entry.file_name().to_string_lossy().to_string();
+    for result in walker {
+        let entry = result.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
 
-        // Skip hidden files and directories (starting with '.')
-        if file_name.starts_with('.') {
+        // Skip the root directory itself
+        if entry.path() == Path::new(path) {
             continue;
         }
 
-        // Skip cargo target directory.
-        if file_name.starts_with("target") {
-            continue;
-        }
+        let file_name = entry.file_name().to_str().unwrap_or("").to_string();
 
-        // Check if entry should be ignored
+        // Check if entry should be ignored by user-provided patterns
         if let Some(glob_set) = glob_set {
             if glob_set.is_match(&file_name) {
                 continue;
@@ -192,28 +191,23 @@ fn list_directory(
 fn list_directory_recursive(
     path: &str,
     glob_set: &Option<globset::GlobSet>,
-    depth: usize,
+    _depth: usize,
     results: &mut Vec<String>,
 ) -> Result<(), anyhow::Error> {
-    let entries = fs::read_dir(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read directory '{}': {}", path, e))?;
+    // This respects gitignore files and ignores hidden files by default.
+    let walker = WalkBuilder::new(path).build();
 
-    for entry in entries {
-        let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read directory entry: {}", e))?;
+    for result in walker {
+        let entry = result.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
 
-        let file_name = entry.file_name().to_string_lossy().to_string();
-
-        // Skip hidden files and directories (starting with '.')
-        if file_name.starts_with('.') {
+        // Skip the root directory itself
+        if entry.path() == Path::new(path) {
             continue;
         }
 
-        // Skip cargo target directory.
-        if file_name.starts_with("target") {
-            continue;
-        }
+        let file_name = entry.file_name().to_str().unwrap_or("").to_string();
 
-        // Check if entry should be ignored
+        // Check if entry should be ignored by user-provided patterns
         if let Some(glob_set) = glob_set {
             if glob_set.is_match(&file_name) {
                 continue;
@@ -238,15 +232,16 @@ fn list_directory_recursive(
             "-".to_string()
         };
 
+        // Calculate depth from the path difference
+        let relative_path = entry
+            .path()
+            .strip_prefix(path)
+            .unwrap_or_else(|_| entry.path());
+        let depth = relative_path.components().count().saturating_sub(1);
         let indent = "  ".repeat(depth);
+
         let formatted_entry = format!("{indent}{file_name:<20} {entry_type:<10} {size}");
         results.push(formatted_entry);
-
-        if metadata.is_dir() {
-            if let Some(subdir_str) = entry.path().to_str() {
-                list_directory_recursive(subdir_str, glob_set, depth + 1, results)?;
-            }
-        }
     }
 
     Ok(())

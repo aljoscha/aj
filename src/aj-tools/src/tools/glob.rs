@@ -1,10 +1,10 @@
 use chrono::DateTime;
 use globset::{Glob, GlobSetBuilder};
+use ignore::WalkBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::SystemTime;
-use walkdir::{DirEntry, WalkDir};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
 use aj_ui::{AjUiAskPermission, UserOutput};
@@ -18,6 +18,7 @@ Usage:
 - The pattern parameter is a glob pattern to match against relative paths
 - Returns a list of matching entries with their absolute paths, type, size, and modification time
 - Entries are sorted by modification time (most recent first)
+- Automatically respects .gitignore files and ignores hidden files
 - Use this tool instead of ls when you need to search recursively or match patterns
 "#;
 
@@ -86,27 +87,11 @@ impl ToolDefinition for GlobTool {
 
         let mut results = Vec::new();
 
-        fn is_ignored(entry: &DirEntry) -> bool {
-            let is_hidden = entry
-                .file_name()
-                .to_str()
-                .map(|s| s.starts_with("."))
-                .unwrap_or(false);
-            let is_cargo = entry
-                .file_name()
-                .to_str()
-                .map(|s| s.starts_with("target"))
-                .unwrap_or(false);
+        // This respects gitignore files and ignores hidden files by default.
+        let walker = WalkBuilder::new(&input.path).build();
 
-            is_hidden || is_cargo
-        }
-
-        // Walk directory recursively
-        for entry in WalkDir::new(&input.path)
-            .into_iter()
-            .filter_entry(|e| !is_ignored(e))
-        {
-            let entry = entry.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
+        for result in walker {
+            let entry = result.map_err(|e| anyhow::anyhow!("Failed to walk directory: {}", e))?;
 
             // Get relative path from the starting directory
             let relative_path = entry
