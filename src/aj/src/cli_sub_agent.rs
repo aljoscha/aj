@@ -1,6 +1,6 @@
 use aj_ui::{AjUi, TokenUsage, UsageSummary};
 
-use crate::cli::common_cli::AjCliCommon;
+use crate::cli_common::AjCliCommon;
 
 /// A wrapper UI for sub-agents that prefixes output with "(sub agent N)" and
 /// only shows headings for tool use.

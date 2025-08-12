@@ -7,10 +7,7 @@ use rustyline::config::EditMode;
 use rustyline::history::FileHistory;
 use rustyline::{Cmd, Editor, KeyEvent};
 
-pub mod common_cli;
-pub mod sub_agent_cli;
-
-use common_cli::AjCliCommon;
+use crate::cli_common::AjCliCommon;
 
 /// Cli-based implementation of [AjUi].
 #[derive(Clone)]
@@ -28,8 +25,8 @@ impl AjCli {
     }
 }
 
-const DARK_GRAY: Color = Color::Color256(239);
-const LIGHT_GRAY: Color = Color::Color256(248);
+pub(crate) const DARK_GRAY: Color = Color::Color256(239);
+pub(crate) const LIGHT_GRAY: Color = Color::Color256(248);
 
 impl AjUi for AjCli {
     fn display_notice(&self, notice: &str) {
@@ -143,6 +140,6 @@ impl AjUi for AjCli {
     }
 
     fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi {
-        sub_agent_cli::SubAgentCli::new(agent_number)
+        crate::cli_sub_agent::SubAgentCli::new(agent_number)
     }
 }
