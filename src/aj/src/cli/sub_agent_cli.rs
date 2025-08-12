@@ -1,32 +1,33 @@
 use aj_ui::{AjUi, TokenUsage, UsageSummary};
-use console::{Color, style};
 
-use crate::cli::{
-    DARK_GRAY, LIGHT_GRAY, format_token_usage, format_usage_summary, render_markdown,
-};
+use crate::cli::common_cli::AjCliCommon;
 
 /// A wrapper UI for sub-agents that prefixes output with "(sub agent N)" and
 /// only shows headings for tool use.
 #[derive(Clone)]
 pub struct SubAgentCli {
-    prefix: String,
+    common: AjCliCommon,
 }
 
 impl SubAgentCli {
     pub fn new(agent_number: usize) -> Self {
         Self {
-            prefix: format!("(sub agent {agent_number})"),
+            common: AjCliCommon::new(
+                Some(format!("(sub agent {agent_number})")),
+                false, // Don't show full tool output, only headers
+                false, // Don't enable streaming
+            ),
         }
     }
 }
 
 impl AjUi for SubAgentCli {
     fn display_notice(&self, notice: &str) {
-        println!("{} {}", self.prefix, notice);
+        self.common.display_notice(notice);
     }
 
     fn display_error(&self, error: &str) {
-        println!("{} Error: {}", self.prefix, error);
+        self.common.display_error(error);
     }
 
     fn get_user_input(&self) -> Option<String> {
@@ -34,107 +35,64 @@ impl AjUi for SubAgentCli {
         None
     }
 
-    fn agent_text_start(&self, _text: &str) {
-        println!(
-            "{}:",
-            style(&self.prefix.to_string()).bold().fg(Color::Yellow)
-        );
+    fn agent_text_start(&self, text: &str) {
+        self.common.agent_text_start(text);
     }
 
-    fn agent_text_update(&self, _diff: &str) {
-        // Sub-agents don't show streaming updates
+    fn agent_text_update(&self, diff: &str) {
+        self.common.agent_text_update(diff);
     }
 
     fn agent_text_stop(&self, text: &str) {
-        render_markdown(text);
-        println!();
+        self.common.agent_text_stop(text);
     }
 
-    fn user_text_start(&self, _text: &str) {
-        println!("{} {}:", self.prefix, style("you").bold().fg(Color::Blue));
+    fn user_text_start(&self, text: &str) {
+        self.common.user_text_start(text);
     }
 
-    fn user_text_update(&self, _diff: &str) {
-        // No-op for user text updates
+    fn user_text_update(&self, diff: &str) {
+        self.common.user_text_update(diff);
     }
 
     fn user_text_stop(&self, text: &str) {
-        println!("{} {text}\n", self.prefix);
+        self.common.user_text_stop(text);
     }
 
     fn agent_thinking_start(&self, thinking: &str) {
-        print!(
-            "{} {}: {}",
-            self.prefix,
-            style("aj is thinking").bold().fg(DARK_GRAY),
-            style(thinking).fg(LIGHT_GRAY).on_bright()
-        );
+        self.common.agent_thinking_start(thinking);
     }
 
     fn agent_thinking_update(&self, diff: &str) {
-        print!("{diff}");
+        self.common.agent_thinking_update(diff);
     }
 
     fn agent_thinking_stop(&self) {
-        println!("\n");
+        self.common.agent_thinking_stop();
     }
 
-    fn display_tool_result(&self, tool_name: &str, input: &str, _output: &str) {
-        // Only show the tool execution heading, not the full output
-        println!(
-            "{} {}({})",
-            self.prefix,
-            style(tool_name).bold().fg(Color::Green),
-            input
-        );
+    fn display_tool_result(&self, tool_name: &str, input: &str, output: &str) {
+        self.common.display_tool_result(tool_name, input, output);
     }
 
-    fn display_tool_result_diff(&self, tool_name: &str, input: &str, _before: &str, _after: &str) {
-        // Only show the tool execution heading, not the full diff
-        println!(
-            "{} {}({})",
-            self.prefix,
-            style(tool_name).bold().fg(Color::Green),
-            input
-        );
+    fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str) {
+        self.common.display_tool_result_diff(tool_name, input, before, after);
     }
 
     fn display_tool_error(&self, tool_name: &str, input: &str, error: &str) {
-        println!(
-            "{} {}({})",
-            self.prefix,
-            style(tool_name).bold().fg(Color::Green),
-            input
-        );
-        println!(
-            "{} {}: {}\n",
-            self.prefix,
-            style("tool_error").bold().fg(Color::Red),
-            error
-        );
+        self.common.display_tool_error(tool_name, input, error);
     }
 
-    fn ask_permission(&self, _message: &str) -> bool {
-        // Sub-agents cannot ask for permission
-        false
+    fn ask_permission(&self, message: &str) -> bool {
+        self.common.ask_permission(message)
     }
 
     fn display_token_usage(&self, usage: &TokenUsage) {
-        let usage_string = format_token_usage(usage);
-        println!(
-            "{} {}\n",
-            style(self.prefix.to_string()).dim(),
-            style(usage_string).dim()
-        )
+        self.common.display_token_usage(usage);
     }
 
     fn display_token_usage_summary(&self, summary: &UsageSummary) {
-        let usage_string = format_usage_summary(summary);
-        println!(
-            "{} {}\n",
-            style(self.prefix.to_string()).dim(),
-            style(usage_string).dim()
-        )
+        self.common.display_token_usage_summary(summary);
     }
 
     fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi {
