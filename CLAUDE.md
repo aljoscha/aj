@@ -30,3 +30,5 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 - Merge imports from same module, don't merge different modules
 - Error handling: Use `thiserror` for structured errors, not `anyhow!`
 - Follow clippy/rustfmt (enforced with strict workspace lints)
+- Use proper capitalization and punctuation when writing docstrings or
+  comments.
