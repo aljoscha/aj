@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use termimad::crossterm::style::{Attribute, Stylize};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 /// Formats a list of todo items for display
 fn format_todo_list(todos: &[TodoItem]) -> String {
@@ -97,19 +97,15 @@ impl ToolDefinition for TodoReadTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         _input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let todos = session_ctx.get_todo_list();
         let result = format_todo_list(&todos);
 
-        let user_output = UserOutput::ToolResult {
-            tool_name: "todo_read".to_string(),
-            input: "".to_string(),
-            output: result.clone(),
-        };
+        ui.display_tool_result("todo_read", "", &result);
 
-        Ok(ToolResult::with_outputs(result, vec![user_output]))
+        Ok(ToolResult::new(result))
     }
 }
 
@@ -137,7 +133,7 @@ impl ToolDefinition for TodoWriteTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         // Validate that there's at most one in-progress item
@@ -161,13 +157,9 @@ impl ToolDefinition for TodoWriteTool {
         let formatted_todos = format_todo_list(&input.todos);
         let result = format!("{update_result}\n{formatted_todos}");
 
-        let user_output = UserOutput::ToolResult {
-            tool_name: "todo_write".to_string(),
-            input: "".to_string(),
-            output: result.clone(),
-        };
+        ui.display_tool_result("todo_write", "", &result);
 
-        Ok(ToolResult::with_outputs(result, vec![user_output]))
+        Ok(ToolResult::new(result))
     }
 }
 

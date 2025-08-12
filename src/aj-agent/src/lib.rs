@@ -14,7 +14,7 @@ use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, ToolResult,
     TurnContext as ToolTurnContext,
 };
-use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
+use aj_ui::{AjUi, RecordingAjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
@@ -471,10 +471,17 @@ impl<UI: AjUi> Agent<UI> {
             model: self.model.clone(),
         };
 
+        // Create recording wrapper to capture UI output
+        let recording_ui = RecordingAjUi::new(&self.ui);
+        
         let result =
-            (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, &self.ui, tool_input).await?;
+            (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, &recording_ui, tool_input).await?;
+        
+        // Extract recorded outputs and add them to the result
+        let recorded_outputs = recording_ui.take_recorded_outputs();
+        let result_with_outputs = ToolResult::with_outputs(result.return_value, recorded_outputs);
 
-        Ok(result)
+        Ok(result_with_outputs)
     }
 
     fn record_user_output(conversation: &mut Conversation, user_outputs: &[UserOutput]) {

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Write a file to the local file system.
@@ -42,7 +42,7 @@ impl ToolDefinition for WriteFileTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -72,22 +72,13 @@ impl ToolDefinition for WriteFileTool {
         let action = if file_exists { "overwrote" } else { "created" };
         let return_value = format!("Successfully {} file '{}'", action, input.path);
 
-        // Create user output for display
-        let user_output = if let Some(original) = &original_content {
-            UserOutput::ToolResultDiff {
-                tool_name: "write_file".to_string(),
-                input: display_path,
-                before: original.clone(),
-                after: input.content,
-            }
+        // Display the file changes using ui
+        if let Some(original) = &original_content {
+            ui.display_tool_result_diff("write_file", &display_path, original, &input.content);
         } else {
-            UserOutput::ToolResult {
-                tool_name: "write_file".to_string(),
-                input: display_path,
-                output: input.content,
-            }
-        };
+            ui.display_tool_result("write_file", &display_path, &input.content);
+        }
 
-        Ok(ToolResult::with_outputs(return_value, vec![user_output]))
+        Ok(ToolResult::new(return_value))
     }
 }

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::{AjUi, UserOutput};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -67,7 +67,7 @@ pub trait ToolDefinition {
         &self,
         session_ctx: &mut dyn SessionContext,
         turn_ctx: &mut dyn TurnContext,
-        permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> impl std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send;
 
@@ -91,7 +91,7 @@ type ToolFn = Box<
     dyn for<'a> Fn(
             &'a mut dyn SessionContext,
             &'a mut dyn TurnContext,
-            &'a dyn AjUiAskPermission,
+            &'a dyn AjUi,
             Value,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send + 'a>,
@@ -105,7 +105,7 @@ impl<T: ToolDefinition + Send + Sync + Clone + 'static> From<T> for ErasedToolDe
             name: tool.name().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
-            func: Box::new(move |session_ctx, turn_ctx, permission_handler, input| {
+            func: Box::new(move |session_ctx, turn_ctx, ui, input| {
                 let typed_input: T::Input = match serde_json::from_value(input) {
                     Ok(input) => input,
                     Err(e) => return Box::pin(async move { Err(e.into()) }),
@@ -113,7 +113,7 @@ impl<T: ToolDefinition + Send + Sync + Clone + 'static> From<T> for ErasedToolDe
                 let tool_clone = tool.clone();
                 Box::pin(async move {
                     tool_clone
-                        .execute(session_ctx, turn_ctx, permission_handler, typed_input)
+                        .execute(session_ctx, turn_ctx, ui, typed_input)
                         .await
                 })
             }),

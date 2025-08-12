@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 List entries (files and directories) in a given directory path.
@@ -51,7 +51,7 @@ impl ToolDefinition for LsTool {
         &self,
         _session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -121,13 +121,9 @@ impl ToolDefinition for LsTool {
             (None, _) => format!("path: {}", input.path),
         };
 
-        let user_output = UserOutput::ToolResult {
-            tool_name: "ls".to_string(),
-            input: display_input,
-            output: output.clone(),
-        };
+        ui.display_tool_result("ls", &display_input, &output);
 
-        Ok(ToolResult::with_outputs(output, vec![user_output]))
+        Ok(ToolResult::new(output))
     }
 }
 

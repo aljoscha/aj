@@ -139,7 +139,7 @@ impl AjUi for AjCli {
         self.common.display_token_usage_summary(summary);
     }
 
-    fn get_subagent_ui(&self, agent_number: usize) -> impl AjUi {
-        crate::cli_sub_agent::SubAgentCli::new(agent_number)
+    fn get_subagent_ui(&self, agent_number: usize) -> Box<dyn AjUi> {
+        Box::new(crate::cli_sub_agent::SubAgentCli::new(agent_number))
     }
 }

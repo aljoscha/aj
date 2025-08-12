@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Execute a command in the system shell (bash/sh). The command will be run in the
@@ -109,7 +109,7 @@ impl ToolDefinition for BashTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         // Check if command is allowed
@@ -119,7 +119,7 @@ impl ToolDefinition for BashTool {
                 input.command, input.description
             );
 
-            if !permission_handler.ask_permission(&message) {
+            if !ui.ask_permission(&message) {
                 let error_msg = format!("Permission denied to execute command: {}", input.command);
                 return Err(anyhow::anyhow!(error_msg));
             }
@@ -190,15 +190,11 @@ impl ToolDefinition for BashTool {
                     result.push_str("\n[Output truncated at 35000 characters]");
                 }
 
-                // Create user output to display the command and result
+                // Display the command and result using ui
                 let display_command = format!("$ {}", input.command);
-                let user_output = UserOutput::ToolResult {
-                    tool_name: "bash".to_string(),
-                    input: display_command,
-                    output: result.clone(),
-                };
+                ui.display_tool_result("bash", &display_command, &result);
 
-                Ok(ToolResult::with_outputs(result, vec![user_output]))
+                Ok(ToolResult::new(result))
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("Command execution failed: {}", e)),
             Err(_) => {

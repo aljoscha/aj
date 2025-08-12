@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Edit files by doing multiple exact string replacements sequentially.
@@ -58,7 +58,7 @@ impl ToolDefinition for EditFileMultiTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -129,13 +129,8 @@ impl ToolDefinition for EditFileMultiTool {
             edit_results.join("\n")
         );
 
-        let user_output = UserOutput::ToolResultDiff {
-            tool_name: "edit_file_multi".to_string(),
-            input: display_path,
-            before: original_content,
-            after: content,
-        };
+        ui.display_tool_result_diff("edit_file_multi", &display_path, &original_content, &content);
 
-        Ok(ToolResult::with_outputs(return_value, vec![user_output]))
+        Ok(ToolResult::new(return_value))
     }
 }

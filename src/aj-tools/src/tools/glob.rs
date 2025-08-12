@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Recursively find files and directories matching a glob pattern.
@@ -48,7 +48,7 @@ impl ToolDefinition for GlobTool {
         &self,
         _session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -176,12 +176,8 @@ impl ToolDefinition for GlobTool {
         // Create display input
         let display_input = format!("path: {}, pattern: {}", input.path, input.pattern);
 
-        let user_output = UserOutput::ToolResult {
-            tool_name: "glob".to_string(),
-            input: display_input,
-            output: output.clone(),
-        };
+        ui.display_tool_result("glob", &display_input, &output);
 
-        Ok(ToolResult::with_outputs(output, vec![user_output]))
+        Ok(ToolResult::new(output))
     }
 }

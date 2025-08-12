@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Read the contents of a file from the local file system. If a file does not exist
@@ -47,7 +47,7 @@ impl ToolDefinition for ReadFileTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -100,13 +100,9 @@ impl ToolDefinition for ReadFileTool {
         }
 
         let formatted_for_display = format_for_display(selected_content);
-        let user_output = UserOutput::ToolResult {
-            tool_name: "read_file".to_string(),
-            input: display_path,
-            output: formatted_for_display,
-        };
+        ui.display_tool_result("read_file", &display_path, &formatted_for_display);
 
-        Ok(ToolResult::with_outputs(return_value, vec![user_output]))
+        Ok(ToolResult::new(return_value))
     }
 }
 

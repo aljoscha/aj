@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::{AjUiAskPermission, UserOutput};
+use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Edit files by doing exact string replacement.
@@ -49,7 +49,7 @@ impl ToolDefinition for EditFileTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        _permission_handler: &dyn AjUiAskPermission,
+        ui: &dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);
@@ -95,14 +95,9 @@ impl ToolDefinition for EditFileTool {
                 input.old_string, input.new_string, input.path
             );
 
-            let user_output = UserOutput::ToolResultDiff {
-                tool_name: "edit_file".to_string(),
-                input: display_path,
-                before: content,
-                after: new_content,
-            };
+            ui.display_tool_result_diff("edit_file", &display_path, &content, &new_content);
 
-            return Ok(ToolResult::with_outputs(return_value, vec![user_output]));
+            return Ok(ToolResult::new(return_value));
         }
 
         Err(anyhow::anyhow!(
