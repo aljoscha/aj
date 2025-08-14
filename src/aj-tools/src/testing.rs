@@ -45,38 +45,49 @@ impl TurnContext for DummyTurnContext {}
 pub struct DummyPermissionHandler;
 
 impl AjUi for DummyPermissionHandler {
-    fn agent_text_start(&self, _text: &str) {}
-    fn agent_text_update(&self, _diff: &str) {}
-    fn agent_text_stop(&self, _text: &str) {}
+    fn agent_text_start(&mut self, _text: &str) {}
+    fn agent_text_update(&mut self, _diff: &str) {}
+    fn agent_text_stop(&mut self, _text: &str) {}
 
-    fn user_text_start(&self, _text: &str) {}
-    fn user_text_update(&self, _diff: &str) {}
-    fn user_text_stop(&self, _text: &str) {}
+    fn user_text_start(&mut self, _text: &str) {}
+    fn user_text_update(&mut self, _diff: &str) {}
+    fn user_text_stop(&mut self, _text: &str) {}
 
-    fn agent_thinking_start(&self, _thinking: &str) {}
-    fn agent_thinking_update(&self, _diff: &str) {}
-    fn agent_thinking_stop(&self) {}
+    fn agent_thinking_start(&mut self, _thinking: &str) {}
+    fn agent_thinking_update(&mut self, _diff: &str) {}
+    fn agent_thinking_stop(&mut self) {}
 
-    fn display_notice(&self, _notice: &str) {}
-    fn display_error(&self, _error: &str) {}
+    fn display_notice(&mut self, _notice: &str) {}
+    fn display_error(&mut self, _error: &str) {}
 
-    fn ask_permission(&self, _message: &str) -> bool {
+    fn ask_permission(&mut self, _message: &str) -> bool {
         // Always grant permission in dummy implementation
         true
     }
 
-    fn display_tool_result(&self, _tool_name: &str, _input: &str, _output: &str) {}
-    fn display_tool_result_diff(&self, _tool_name: &str, _input: &str, _before: &str, _after: &str) {}
-    fn display_tool_error(&self, _tool_name: &str, _input: &str, _error: &str) {}
+    fn display_tool_result(&mut self, _tool_name: &str, _input: &str, _output: &str) {}
+    fn display_tool_result_diff(
+        &mut self,
+        _tool_name: &str,
+        _input: &str,
+        _before: &str,
+        _after: &str,
+    ) {
+    }
+    fn display_tool_error(&mut self, _tool_name: &str, _input: &str, _error: &str) {}
 
-    fn display_token_usage(&self, _usage: &TokenUsage) {}
-    fn display_token_usage_summary(&self, _summary: &UsageSummary) {}
+    fn display_token_usage(&mut self, _usage: &TokenUsage) {}
+    fn display_token_usage_summary(&mut self, _summary: &UsageSummary) {}
 
-    fn get_subagent_ui(&self, _agent_number: usize) -> Box<dyn AjUi> {
+    fn get_subagent_ui(&mut self, _agent_number: usize) -> Box<dyn AjUi> {
         Box::new(DummyPermissionHandler)
     }
 
-    fn get_user_input(&self) -> Option<String> {
+    fn shallow_clone(&mut self) -> Box<dyn AjUi> {
+        Box::new(DummyPermissionHandler)
+    }
+
+    fn get_user_input(&mut self) -> Option<String> {
         None
     }
 }

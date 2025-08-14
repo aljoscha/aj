@@ -29,15 +29,15 @@ pub(crate) const DARK_GRAY: Color = Color::Color256(239);
 pub(crate) const LIGHT_GRAY: Color = Color::Color256(248);
 
 impl AjUi for AjCli {
-    fn display_notice(&self, notice: &str) {
+    fn display_notice(&mut self, notice: &str) {
         self.common.display_notice(notice);
     }
 
-    fn display_error(&self, error: &str) {
+    fn display_error(&mut self, error: &str) {
         self.common.display_error(error);
     }
 
-    fn get_user_input(&self) -> Option<String> {
+    fn get_user_input(&mut self) -> Option<String> {
         let config = Config::builder().edit_mode(EditMode::Emacs).build();
 
         let mut rl: Editor<(), FileHistory> =
@@ -78,68 +78,78 @@ impl AjUi for AjCli {
         }
     }
 
-    fn agent_text_start(&self, text: &str) {
+    fn agent_text_start(&mut self, text: &str) {
         self.common.agent_text_start(text);
     }
 
-    fn agent_text_update(&self, diff: &str) {
+    fn agent_text_update(&mut self, diff: &str) {
         self.common.agent_text_update(diff);
     }
 
-    fn agent_text_stop(&self, text: &str) {
+    fn agent_text_stop(&mut self, text: &str) {
         self.common.agent_text_stop(text);
     }
 
-    fn user_text_start(&self, text: &str) {
+    fn user_text_start(&mut self, text: &str) {
         self.common.user_text_start(text);
     }
 
-    fn user_text_update(&self, diff: &str) {
+    fn user_text_update(&mut self, diff: &str) {
         self.common.user_text_update(diff);
     }
 
-    fn user_text_stop(&self, text: &str) {
+    fn user_text_stop(&mut self, text: &str) {
         self.common.user_text_stop(text);
     }
 
-    fn agent_thinking_start(&self, thinking: &str) {
+    fn agent_thinking_start(&mut self, thinking: &str) {
         self.common.agent_thinking_start(thinking);
     }
 
-    fn agent_thinking_update(&self, diff: &str) {
+    fn agent_thinking_update(&mut self, diff: &str) {
         self.common.agent_thinking_update(diff);
     }
 
-    fn agent_thinking_stop(&self) {
+    fn agent_thinking_stop(&mut self) {
         self.common.agent_thinking_stop();
     }
 
-    fn display_tool_result(&self, tool_name: &str, input: &str, result: &str) {
+    fn display_tool_result(&mut self, tool_name: &str, input: &str, result: &str) {
         self.common.display_tool_result(tool_name, input, result);
     }
 
-    fn display_tool_result_diff(&self, tool_name: &str, input: &str, before: &str, after: &str) {
+    fn display_tool_result_diff(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        before: &str,
+        after: &str,
+    ) {
         self.common
             .display_tool_result_diff(tool_name, input, before, after);
     }
 
-    fn display_tool_error(&self, tool_name: &str, input: &str, error: &str) {
+    fn display_tool_error(&mut self, tool_name: &str, input: &str, error: &str) {
         self.common.display_tool_error(tool_name, input, error);
     }
 
-    fn ask_permission(&self, message: &str) -> bool {
+    fn ask_permission(&mut self, message: &str) -> bool {
         self.common.ask_permission(message)
     }
 
-    fn display_token_usage(&self, usage: &TokenUsage) {
+    fn display_token_usage(&mut self, usage: &TokenUsage) {
         self.common.display_token_usage(usage);
     }
 
-    fn display_token_usage_summary(&self, summary: &UsageSummary) {
+    fn display_token_usage_summary(&mut self, summary: &UsageSummary) {
         self.common.display_token_usage_summary(summary);
     }
 
-    fn get_subagent_ui(&self, agent_number: usize) -> Box<dyn AjUi> {
+    fn get_subagent_ui(&mut self, agent_number: usize) -> Box<dyn AjUi> {
         Box::new(crate::cli_sub_agent::SubAgentCli::new(agent_number))
+    }
+
+    fn shallow_clone(&mut self) -> Box<dyn AjUi> {
+        Box::new(crate::cli::AjCli::new(self.history_path.clone()))
     }
 }

@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
 
     let threads_dir = Config::get_threads_dir_path()?;
 
-    let ui = AjCli::new(Some(history_path));
+    let mut ui = AjCli::new(Some(history_path));
     let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
 
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
 
     let mut agent = Agent::new(
         env,
-        ui.clone(),
+        ui.shallow_clone(),
         conversation_persistence.clone(),
         SYSTEM_PROMPT,
         get_builtin_tools(),

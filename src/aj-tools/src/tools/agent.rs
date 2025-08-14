@@ -59,7 +59,7 @@ impl ToolDefinition for AgentTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        ui: &dyn AjUi,
+        ui: &mut dyn AjUi,
         input: AgentInput,
     ) -> Result<ToolResult> {
         let description = input

@@ -47,7 +47,7 @@ impl ToolDefinition for ReadFileTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        ui: &dyn AjUi,
+        ui: &mut dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let path = Path::new(&input.path);

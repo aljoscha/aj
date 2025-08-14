@@ -67,7 +67,7 @@ pub trait ToolDefinition {
         &self,
         session_ctx: &mut dyn SessionContext,
         turn_ctx: &mut dyn TurnContext,
-        ui: &dyn AjUi,
+        ui: &mut dyn AjUi,
         input: Self::Input,
     ) -> impl std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send;
 
@@ -91,7 +91,7 @@ type ToolFn = Box<
     dyn for<'a> Fn(
             &'a mut dyn SessionContext,
             &'a mut dyn TurnContext,
-            &'a dyn AjUi,
+            &'a mut dyn AjUi,
             Value,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send + 'a>,

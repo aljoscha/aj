@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::time::Duration;
 
 use aj_conf::AgentEnv;
@@ -14,7 +14,7 @@ use aj_tools::{
     get_builtin_tools, ErasedToolDefinition, SessionContext, ToolResult,
     TurnContext as ToolTurnContext,
 };
-use aj_ui::{AjUi, RecordingAjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
+use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
@@ -366,7 +366,7 @@ impl<UI: AjUi> Agent<UI> {
     async fn run_inference_streaming(
         &self,
         conversation: &Conversation,
-    ) -> Result<impl Stream<Item = StreamingEvent> + '_, ModelError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
         let thinking = self.determine_thinking(conversation);
 
         tracing::debug!(?thinking, "thinking budget");
@@ -464,7 +464,7 @@ impl<UI: AjUi> Agent<UI> {
         // Create a wrapper that provides UI access to the session state
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_ctx: &mut self.session_state,
-            ui: &self.ui,
+            ui: self.ui.shallow_clone(),
             env: &self.env,
             conversation_persistence: &self.conversation_persistence,
             system_prompt: self.system_prompt,
@@ -472,14 +472,20 @@ impl<UI: AjUi> Agent<UI> {
         };
 
         // Create recording wrapper to capture UI output
-        let recording_ui = RecordingAjUi::new(&self.ui);
-        
-        let result =
-            (tool_def.func)(&mut session_ctx_wrapper, turn_ctx, &recording_ui, tool_input).await?;
-        
+        let mut recording_ui = RecordingAjUi::new(&mut self.ui);
+
+        let result = (tool_def.func)(
+            &mut session_ctx_wrapper,
+            turn_ctx,
+            &mut recording_ui,
+            tool_input,
+        )
+        .await?;
+
         // Extract recorded outputs and add them to the result
-        let recorded_outputs = recording_ui.take_recorded_outputs();
-        let result_with_outputs = ToolResult::with_outputs(result.return_value, recorded_outputs);
+        // let recorded_outputs = recording_ui.take_recorded_outputs();
+        // let result_with_outputs = ToolResult::with_outputs(result.return_value, recorded_outputs);
+        let result_with_outputs = ToolResult::with_outputs(result.return_value, Vec::new());
 
         Ok(result_with_outputs)
     }
@@ -490,7 +496,7 @@ impl<UI: AjUi> Agent<UI> {
         }
     }
 
-    fn display_user_output(&self, user_outputs: &[UserOutput]) {
+    fn display_user_output(&mut self, user_outputs: &[UserOutput]) {
         for output in user_outputs {
             match output {
                 UserOutput::Notice(msg) => {
@@ -532,7 +538,7 @@ impl<UI: AjUi> Agent<UI> {
         }
     }
 
-    fn display_usage_summary(&self) {
+    fn display_usage_summary(&mut self) {
         // Create main agent usage
         let main_agent_usage = SubAgentUsage {
             agent_id: None,
@@ -595,7 +601,7 @@ impl<UI: AjUi> Agent<UI> {
         self.ui.display_token_usage_summary(&summary);
     }
 
-    fn display_conversation_history(&self, conversation: &Conversation) {
+    fn display_conversation_history(&mut self, conversation: &Conversation) {
         if conversation.is_empty() {
             return;
         }
@@ -724,7 +730,7 @@ impl SessionState {
 struct SessionContextWrapper<'a, UI: AjUi> {
     session_ctx: &'a mut SessionState,
     env: &'a AgentEnv,
-    ui: &'a UI,
+    ui: UI,
     conversation_persistence: &'a ConversationPersistence,
     system_prompt: &'static str,
     model: Arc<dyn Model>,
@@ -799,3 +805,141 @@ impl TurnContext {
 }
 
 impl ToolTurnContext for TurnContext {}
+
+/// A wrapper around AjUi that records all UserOutput for later retrieval
+pub struct RecordingAjUi<'a> {
+    inner: &'a mut dyn AjUi,
+    recorded_outputs: Vec<UserOutput>,
+}
+
+impl<'a> RecordingAjUi<'a> {
+    pub fn new(inner: &'a mut dyn AjUi) -> Self {
+        Self {
+            inner,
+            recorded_outputs: Vec::new(),
+        }
+    }
+
+    pub fn take_recorded_outputs(&mut self) -> Vec<UserOutput> {
+        std::mem::take(&mut self.recorded_outputs)
+    }
+
+    fn record_output(&mut self, output: UserOutput) {
+        self.recorded_outputs.push(output);
+    }
+}
+
+impl<'a> AjUi for RecordingAjUi<'a> {
+    fn display_notice(&mut self, notice: &str) {
+        self.inner.display_notice(notice);
+        self.record_output(UserOutput::Notice(notice.to_string()));
+    }
+
+    fn display_error(&mut self, error: &str) {
+        self.inner.display_error(error);
+        self.record_output(UserOutput::Error(error.to_string()));
+    }
+
+    fn get_user_input(&mut self) -> Option<String> {
+        self.inner.get_user_input()
+    }
+
+    fn agent_text_start(&mut self, text: &str) {
+        self.inner.agent_text_start(text);
+    }
+
+    fn agent_text_update(&mut self, diff: &str) {
+        self.inner.agent_text_update(diff);
+    }
+
+    fn agent_text_stop(&mut self, text: &str) {
+        self.inner.agent_text_stop(text);
+    }
+
+    fn user_text_start(&mut self, text: &str) {
+        self.inner.user_text_start(text);
+    }
+
+    fn user_text_update(&mut self, diff: &str) {
+        self.inner.user_text_update(diff);
+    }
+
+    fn user_text_stop(&mut self, text: &str) {
+        self.inner.user_text_stop(text);
+    }
+
+    fn agent_thinking_start(&mut self, thinking: &str) {
+        self.inner.agent_thinking_start(thinking);
+    }
+
+    fn agent_thinking_update(&mut self, diff: &str) {
+        self.inner.agent_thinking_update(diff);
+    }
+
+    fn agent_thinking_stop(&mut self) {
+        self.inner.agent_thinking_stop();
+    }
+
+    fn display_tool_result(&mut self, tool_name: &str, input: &str, output: &str) {
+        self.inner.display_tool_result(tool_name, input, output);
+        self.record_output(UserOutput::ToolResult {
+            tool_name: tool_name.to_string(),
+            input: input.to_string(),
+            output: output.to_string(),
+        });
+    }
+
+    fn display_tool_result_diff(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        before: &str,
+        after: &str,
+    ) {
+        self.inner
+            .display_tool_result_diff(tool_name, input, before, after);
+        self.record_output(UserOutput::ToolResultDiff {
+            tool_name: tool_name.to_string(),
+            input: input.to_string(),
+            before: before.to_string(),
+            after: after.to_string(),
+        });
+    }
+
+    fn display_tool_error(&mut self, tool_name: &str, input: &str, error: &str) {
+        self.inner.display_tool_error(tool_name, input, error);
+        self.record_output(UserOutput::ToolError {
+            tool_name: tool_name.to_string(),
+            input: input.to_string(),
+            error: error.to_string(),
+        });
+    }
+
+    fn ask_permission(&mut self, message: &str) -> bool {
+        self.inner.ask_permission(message)
+    }
+
+    fn display_token_usage(&mut self, usage: &TokenUsage) {
+        self.inner.display_token_usage(usage);
+        self.record_output(UserOutput::TokenUsage(usage.clone()));
+    }
+
+    fn display_token_usage_summary(&mut self, summary: &UsageSummary) {
+        self.inner.display_token_usage_summary(summary);
+        self.record_output(UserOutput::TokenUsageSummary(summary.clone()));
+    }
+
+    fn get_subagent_ui(&mut self, _agent_number: usize) -> Box<dyn AjUi> {
+        // We could solve these by splitting them into it's own interface and
+        // only giving what is allowed to tools. But we have larger seafood to
+        // cook...
+        panic!("tools are not allowed to spawn subagent ui");
+    }
+
+    fn shallow_clone(&mut self) -> Box<dyn AjUi> {
+        // We could solve these by splitting them into it's own interface and
+        // only giving what is allowed to tools. But we have larger seafood to
+        // cook...
+        panic!("tools are not allowed to clone ui");
+    }
+}

@@ -27,10 +27,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tool = GrepTool;
     let mut session_ctx = DummySessionContext;
     let mut turn_ctx = DummyTurnContext;
-    let permission_handler = DummyPermissionHandler;
+    let mut permission_handler = DummyPermissionHandler;
 
     match tool
-        .execute(&mut session_ctx, &mut turn_ctx, &permission_handler, input)
+        .execute(&mut session_ctx, &mut turn_ctx, &mut permission_handler, input)
         .await
     {
         Ok(result) => println!("{}", result.return_value),

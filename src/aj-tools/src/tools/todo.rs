@@ -97,7 +97,7 @@ impl ToolDefinition for TodoReadTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        ui: &dyn AjUi,
+        ui: &mut dyn AjUi,
         _input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         let todos = session_ctx.get_todo_list();
@@ -133,7 +133,7 @@ impl ToolDefinition for TodoWriteTool {
         &self,
         session_ctx: &mut dyn SessionContext,
         _turn_ctx: &mut dyn TurnContext,
-        ui: &dyn AjUi,
+        ui: &mut dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
         // Validate that there's at most one in-progress item
