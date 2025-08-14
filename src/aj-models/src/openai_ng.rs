@@ -48,7 +48,7 @@ impl Model for OpenAiModel {
         system_prompt: String,
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send + '_>>, ModelError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
         // Convert system prompt to system message
         let mut messages = vec![ChatCompletionRequestMessage::System {
             content: system_prompt,
@@ -97,7 +97,7 @@ impl Model for OpenAiModel {
         let processor = OpenAiStreamProcessor::new();
         let processed_stream = processor.process_stream(stream);
 
-        Ok(processed_stream.boxed())
+        Ok(processed_stream)
     }
 
     fn model_name(&self) -> String {
@@ -275,11 +275,14 @@ impl OpenAiStreamProcessor {
         }
     }
 
-    pub fn process_stream<S>(mut self, stream: S) -> impl Stream<Item = StreamingEvent>
+    pub fn process_stream<S>(
+        mut self,
+        stream: S,
+    ) -> Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>
     where
-        S: Stream<Item = Result<CreateChatCompletionStreamResponse, ClientError>>,
+        S: Stream<Item = Result<CreateChatCompletionStreamResponse, ClientError>> + Send + 'static,
     {
-        stream! {
+        let stream = stream! {
             let mut stream = std::pin::pin!(stream);
 
             while let Some(chunk_result) = futures::StreamExt::next(&mut stream).await {
@@ -303,7 +306,9 @@ impl OpenAiStreamProcessor {
             for final_event in self.finalize() {
                 yield final_event;
             }
-        }
+        };
+
+        stream.boxed()
     }
 
     fn process_chunk(&mut self, chunk: CreateChatCompletionStreamResponse) -> Vec<StreamingEvent> {

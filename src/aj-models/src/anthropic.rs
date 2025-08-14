@@ -52,7 +52,7 @@ impl Model for AnthropicModel {
         system_prompt: String,
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send + '_>>, ModelError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
         let system_prompt = vec![AnthropicContentBlockParam::TextBlock {
             text: system_prompt,
             cache_control: Some(CacheControl::Ephemeral { ttl: None }),

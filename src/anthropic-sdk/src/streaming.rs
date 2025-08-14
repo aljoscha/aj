@@ -1,8 +1,10 @@
 //! Types for a higher-level streaming API built on the low-lever server-sent
 //! events defined in the messages API.
 
+use std::pin::Pin;
+
 use async_stream::stream;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
 use crate::messages::{
     ApiError, Citation, ContentBlock, ContentBlockDelta, Message, ServerSentEvent, UsageDelta,
@@ -69,11 +71,14 @@ impl StreamProcessor {
         }
     }
 
-    pub fn process_stream<S>(mut self, stream: S) -> impl Stream<Item = StreamingEvent>
+    pub fn process_stream<S>(
+        mut self,
+        stream: S,
+    ) -> Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>
     where
-        S: Stream<Item = ServerSentEvent>,
+        S: Stream<Item = ServerSentEvent> + Send + 'static,
     {
-        stream! {
+        let result = stream! {
             let mut stream = std::pin::pin!(stream);
 
             while let Some(event) = futures::StreamExt::next(&mut stream).await {
@@ -82,7 +87,9 @@ impl StreamProcessor {
                     None => continue,
                 }
             }
-        }
+        };
+
+        result.boxed()
     }
 
     pub fn process_event(&mut self, event: ServerSentEvent) -> Option<StreamingEvent> {

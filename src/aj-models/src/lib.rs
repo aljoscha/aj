@@ -25,7 +25,7 @@ pub trait Model: Send + Sync {
         system_prompt: String,
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send + '_>>, ModelError>;
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError>;
 
     /// Returns the name of the model.
     fn model_name(&self) -> String;

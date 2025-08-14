@@ -1,3 +1,5 @@
+use std::pin::Pin;
+
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
@@ -79,7 +81,7 @@ impl Client {
         &self,
         mut request: CreateChatCompletionRequest,
     ) -> Result<
-        impl Stream<Item = Result<CreateChatCompletionStreamResponse, ClientError>>,
+        Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse, ClientError>> + Send>>,
         ClientError,
     > {
         request.stream = Some(true);
@@ -119,7 +121,7 @@ impl Client {
                         Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
                     }
                 });
-                Ok(stream)
+                Ok(stream.boxed())
             }
             StatusCode::BAD_REQUEST
             | StatusCode::UNAUTHORIZED

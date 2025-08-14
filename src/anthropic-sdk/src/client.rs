@@ -1,3 +1,5 @@
+use std::pin::Pin;
+
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
@@ -81,7 +83,7 @@ impl Client {
     pub async fn messages_stream_raw(
         &self,
         mut messages: Messages,
-    ) -> Result<impl Stream<Item = ServerSentEvent>, ClientError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = ServerSentEvent> + Send>>, ClientError> {
         messages.stream = Some(true);
 
         let request_builder = self
@@ -113,7 +115,7 @@ impl Client {
                         }
                     }
                 });
-                Ok(stream)
+                Ok(stream.boxed())
             }
             StatusCode::BAD_REQUEST
             | StatusCode::UNAUTHORIZED
@@ -142,7 +144,7 @@ impl Client {
     pub async fn messages_stream(
         &self,
         messages: Messages,
-    ) -> Result<impl Stream<Item = StreamingEvent>, ClientError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ClientError> {
         let stream = self.messages_stream_raw(messages).await?;
         Ok(create_high_level_stream(stream))
     }
@@ -161,9 +163,9 @@ pub enum ClientError {
 }
 
 // Helper function to create a high-level stream
-fn create_high_level_stream<S>(stream: S) -> impl Stream<Item = StreamingEvent>
+fn create_high_level_stream<S>(stream: S) -> Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>
 where
-    S: Stream<Item = ServerSentEvent>,
+    S: Stream<Item = ServerSentEvent> + Send + 'static,
 {
     let processor = StreamProcessor::new();
     processor.process_stream(stream)

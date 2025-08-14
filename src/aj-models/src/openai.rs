@@ -59,7 +59,7 @@ impl Model for OpenAiModel {
         system_prompt: String,
         tools: Vec<Tool>,
         _thinking: Option<ThinkingConfig>,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send + '_>>, ModelError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
         // Convert system prompt to system message
         let mut messages = vec![ChatCompletionRequestMessage::System(
             ChatCompletionRequestSystemMessage {
