@@ -147,7 +147,7 @@ impl<UI: AjUi> Agent<UI> {
         self.execute_turn(&mut conversation).await?;
 
         // Extract the last assistant message text
-        if let Some(last_msg) = conversation.last_message() {
+        if let Some(last_msg) = conversation.last_assistant_message() {
             if matches!(last_msg.role, Role::Assistant) {
                 last_assistant_text.clear();
                 for content in &last_msg.content {

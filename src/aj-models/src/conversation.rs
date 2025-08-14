@@ -172,16 +172,28 @@ impl Conversation {
             })
     }
 
-    /// Get the last assistant message in the conversation, if any
+    /// Get the last assistant message in the conversation, if any. Only returns
+    /// a message if it has actual text output from the assistant, meaning a
+    /// `TextBlock`.
     pub fn last_assistant_message(&self) -> Option<&MessageParam> {
         self.entries
             .iter()
             .rev()
             .find_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message(msg) => match msg.role {
-                    Role::Assistant => Some(msg),
-                    _ => None,
-                },
+                ConversationEntryKind::Message(m) => {
+                    let is_assistant = matches!(m.role, Role::Assistant);
+                    if !is_assistant {
+                        return None;
+                    }
+
+                    // Only sniff out messages that have actual text output.
+                    let is_text_output = m
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlockParam::TextBlock { .. }));
+
+                    if is_text_output { Some(m) } else { None }
+                }
                 _ => None,
             })
     }
