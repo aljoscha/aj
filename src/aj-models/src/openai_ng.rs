@@ -74,11 +74,8 @@ impl Model for OpenAiModel {
             messages,
             max_completion_tokens: Some(32_000),
             stream: Some(true),
-            tools: if openai_tools.is_empty() {
-                vec![]
-            } else {
-                openai_tools
-            },
+            tools: openai_tools,
+            parallel_tool_calls: Some(true),
             reasoning_effort: thinking.map(Into::into),
             stream_options: Some(StreamOptions {
                 include_usage: Some(true),
