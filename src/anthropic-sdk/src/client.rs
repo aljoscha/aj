@@ -69,7 +69,7 @@ impl Client {
             | StatusCode::INTERNAL_SERVER_ERROR => {
                 let error_text = response.text().await?;
                 match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(anyhow!("API Error: {}", error_response.error)),
+                    Ok(error_response) => Err(anyhow!(error_response.error)),
                     Err(_) => Err(anyhow!("request failed: {}", error_text)),
                 }
             }

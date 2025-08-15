@@ -88,7 +88,7 @@ impl Model for OpenAiModel {
             .client
             .chat_completions_stream(request)
             .await
-            .map_err(|e| ModelError::Client(anyhow::anyhow!("OpenAI API error: {}", e)))?;
+            .map_err(|e| ModelError::Client(anyhow::anyhow!(e)))?;
 
         // Use our stream processor to convert OpenAI format to internal format
         let processor = OpenAiStreamProcessor::new();
