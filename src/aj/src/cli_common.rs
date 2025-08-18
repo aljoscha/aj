@@ -111,7 +111,7 @@ impl AjCliCommon {
     }
 
     pub fn agent_thinking_update(&self, diff: &str) {
-        print!("{diff}");
+        print!("{}", style(diff).fg(LIGHT_GRAY).on_bright(),);
     }
 
     pub fn agent_thinking_stop(&self) {
