@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "aj")]
 #[command(about = "AI-driven agent for software engineering")]
+#[command(flatten_help = true)]
 struct Cli {
     /// Model API to use.
     #[arg(long, env)]
@@ -37,6 +38,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[command(flatten_help = true)]
 enum Commands {
     /// Manage conversation threads.
     Threads {
@@ -46,6 +48,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+#[command(flatten_help = true)]
 enum ThreadsAction {
     /// List existing conversation threads.
     List,
