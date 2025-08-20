@@ -38,21 +38,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List conversation threads for this project.
-    ListThreads,
-    /// Resume a conversation thread.
-    Resume {
-        /// Conversation ID to resume.
-        conversation_id: String,
+    /// Manage conversation threads.
+    Threads {
+        #[command(subcommand)]
+        action: ThreadsAction,
     },
-    /// Resume the latest conversation thread.
-    ResumeLatest,
 }
 
 #[derive(Subcommand)]
 enum ThreadsAction {
-    /// List existing conversation threads
+    /// List existing conversation threads.
     List,
+    /// Continue a conversation thread.
+    Continue {
+        /// Conversation ID to continue (if not provided, continues latest
+        /// thread).
+        thread_id: Option<String>,
+    },
 }
 
 /// A harness that's setting up our logging, environment variables, etc. and
@@ -136,24 +138,26 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Some(Commands::ListThreads) => {
-            list_threads(&conversation_persistence)?;
-        }
-        Some(Commands::Resume { conversation_id }) => {
-            let latest_conversation =
-                conversation_persistence.load_conversation(&conversation_id)?;
-            agent.run(Some(latest_conversation)).await?;
-        }
-        Some(Commands::ResumeLatest) => {
-            let latest_thread_id = conversation_persistence.get_latest_thread_id()?;
-            if let Some(latest_thread_id) = latest_thread_id {
-                let latest_conversation =
-                    conversation_persistence.load_conversation(&latest_thread_id)?;
-                agent.run(Some(latest_conversation)).await?;
-            } else {
-                ui.display_notice("No latest conversation to resume");
+        Some(Commands::Threads { action }) => match action {
+            ThreadsAction::List => {
+                list_threads(&conversation_persistence)?;
             }
-        }
+            ThreadsAction::Continue { thread_id } => {
+                if let Some(thread_id) = thread_id {
+                    let conversation = conversation_persistence.load_conversation(&thread_id)?;
+                    agent.run(Some(conversation)).await?;
+                } else {
+                    let latest_thread_id = conversation_persistence.get_latest_thread_id()?;
+                    if let Some(latest_thread_id) = latest_thread_id {
+                        let latest_conversation =
+                            conversation_persistence.load_conversation(&latest_thread_id)?;
+                        agent.run(Some(latest_conversation)).await?;
+                    } else {
+                        ui.display_notice("No latest conversation to resume");
+                    }
+                }
+            }
+        },
         None => {
             // Default behavior: run agent with new/empty conversation.
             agent.run(None).await?;
