@@ -654,7 +654,18 @@ impl<UI: AjUi> Agent<UI> {
                             }
                         }
                         Role::Assistant => {
-                            // Extract text content from assistant message
+                            // First, display thinking content
+                            for content in &msg.content {
+                                if let ContentBlockParam::ThinkingBlock { thinking, .. } = content {
+                                    self.ui.agent_thinking_start(thinking);
+                                    self.ui.agent_thinking_stop();
+                                } else if let ContentBlockParam::RedactedThinkingBlock { data } = content {
+                                    self.ui.agent_thinking_start(&format!("[Redacted thinking: {}]", data));
+                                    self.ui.agent_thinking_stop();
+                                }
+                            }
+
+                            // Then, display text content
                             let text_content = msg
                                 .content
                                 .iter()
