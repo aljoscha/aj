@@ -5,8 +5,10 @@ implementation and the reference implementation (pi-ai). It covers Anthropic and
 OpenAI only. Each section describes what pi-ai does, what we have today, and
 what needs to change.
 
-> **Implementation note:** The pi-ai codebase (in `/tmp/pi-mono/packages/ai/`)
-> is a useful reference for understanding design decisions and expected behavior.
+> **Implementation note:** The pi-ai codebase
+> ([`packages/ai/`](https://github.com/badlogic/pi-mono/tree/main/packages/ai)
+> in [pi-mono](https://github.com/badlogic/pi-mono)) is a useful reference for
+> understanding design decisions and expected behavior.
 > Implementers are encouraged to study it. However, all code and comments in our
 > project must be fully self-contained — do not reference pi, pi-ai, or pi-mono
 > in source code, comments, commit messages, or documentation outside this spec.
