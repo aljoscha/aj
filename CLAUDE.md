@@ -5,9 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build/Test/Lint Commands
 
 - Build: `cargo check` or `cargo build`
-- Run all tests: `cargo nextest run`
-- Run specific test: `cargo nextest run --package package_name -- test_name`
-- Single test with pattern: `cargo nextest run --package package_name -- pattern`
+- Run all tests: `cargo test`
+- Run specific test: `cargo test --package package_name -- test_name`
 - Format code: `cargo fmt`
 - Lint: `cargo clippy`
 
@@ -15,31 +14,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AJ is an AI-driven agent for software engineering built as a Rust workspace with these core components:
 
-- **aj** (`src/aj/`): Main binary that sets up the agent harness and tools
-- **aj-agent** (`src/aj-agent/`): Core agent implementation with conversation loop and Anthropic API integration
-- **aj-tools** (`src/aj-tools/`): Framework for builtin tools (currently includes read_file tool)
-- **anthropic-sdk** (`src/anthropic-sdk/`): Minimal SDK for Anthropic API with messages and streaming support
+- **aj** (`src/aj/`): Main binary that sets up the agent harness and tools.
+- **aj-agent** (`src/aj-agent/`): Core agent implementation with conversation loop.
+- **aj-conf** (`src/aj-conf/`): Configuration, working directory, git root detection, and loading agent/project instructions from AGENT.md files.
+- **aj-models** (`src/aj-models/`): Abstraction layer supporting multiple LLM providers (Anthropic, OpenAI) with streaming inference and conversation management.
+- **aj-tools** (`src/aj-tools/`): Framework for builtin tools (currently includes read_file tool).
+- **aj-ui** (`src/aj-ui/`): UI abstraction trait for displaying agent output, user input, tool results, and token usage.
+- **anthropic-sdk** (`src/anthropic-sdk/`): Minimal SDK for the Anthropic API with messages and streaming support.
+- **openai-sdk** (`src/openai-sdk/`): Minimal SDK for the OpenAI chat completions API.
 
 The agent follows a minimal agent loop pattern, focusing on providing the right set of builtin tools rather than complex scaffolding. The main entry point creates tools with JSON schemas and passes them to the Agent which manages the conversation loop.
 
 ## Code Style
 
-- Rust edition 2024, 4-space tabs.
+- Rust edition 2024, 4-space indentation (spaces, not tabs).
 - Import grouping: std → external crates (including aj_*) → crate imports.
 - Use absolute paths for crate imports (`crate::` not `super::`).
 - Merge imports from same module, don't merge different modules.
-- Error handling: Use `thiserror` for structured errors, not `anyhow!`.
+- Error handling: Use `thiserror` for defining error types in library crates. `anyhow` is acceptable for top-level application error propagation.
 - Follow clippy/rustfmt (enforced with strict workspace lints).
 - `snake_case` for functions/variables, `PascalCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
-- Use proper capitalization and punctuation when writing docstrings or
-  comments.
+- Use proper capitalization and punctuation when writing docstrings or comments.
 
 ## Rust Compilation
 
-- Always run `cargo fmt` and `cargo build` after making edits before reporting success.
+- Always run `cargo fmt` and `cargo build` after each logical unit of change. Fix all compilation errors before editing the next file.
 - When refactoring function signatures or types, grep for all call sites and update them in the same pass.
 - Check visibility (`pub`) before accessing fields/methods from other modules.
-- Run `cargo build` after each logical unit of change. Fix all compilation errors before editing the next file.
+- Read and understand existing code before modifying it. Don't edit blind.
+
+## Testing
+
+- Unit tests live in the same module with `#[cfg(test)]`.
+- Integration tests go in `<crate>/tests/`.
+- `cargo test` must pass before committing.
 
 ## Debugging & Refactoring Approach
 
