@@ -24,7 +24,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut permission_handler = DummyPermissionHandler;
 
     match tool
-        .execute(&mut session_ctx, &mut turn_ctx, &mut permission_handler, input)
+        .execute(
+            &mut session_ctx,
+            &mut turn_ctx,
+            &mut permission_handler,
+            input,
+        )
         .await
     {
         Ok(result) => println!("{}", result.return_value),

@@ -129,7 +129,12 @@ impl ToolDefinition for EditFileMultiTool {
             edit_results.join("\n")
         );
 
-        ui.display_tool_result_diff("edit_file_multi", &display_path, &original_content, &content);
+        ui.display_tool_result_diff(
+            "edit_file_multi",
+            &display_path,
+            &original_content,
+            &content,
+        );
 
         Ok(ToolResult::new(return_value))
     }
