@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build: `cargo check` or `cargo build`
 - Run all tests: `cargo test`
 - Run specific test: `cargo test --package package_name -- test_name`
+- Run CLI: `cargo run -p aj -- [args]` (e.g., `list-threads`, `resume <id>`, `resume-latest`)
+- Run specific bin: `cargo run -p aj --bin test_diff`
 - Format code: `cargo fmt`
 - Lint: `cargo clippy`
 
@@ -14,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AJ is an AI-driven agent for software engineering built as a Rust workspace with these core components:
 
-- **aj** (`src/aj/`): Main binary that sets up the agent harness and tools.
+- **aj** (`src/aj/`): Main binary (`src/aj/src/main.rs`) that sets up the agent harness and tools. Extra bins in `src/aj/src/bin/`.
 - **aj-agent** (`src/aj-agent/`): Core agent implementation with conversation loop.
 - **aj-conf** (`src/aj-conf/`): Configuration, working directory, git root detection, and loading agent/project instructions from AGENT.md files.
 - **aj-models** (`src/aj-models/`): Abstraction layer supporting multiple LLM providers (Anthropic, OpenAI) with streaming inference and conversation management.
@@ -66,3 +68,9 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 
 - Commit style: `area: short, imperative summary` (e.g., `tools: fix hidden directory filter`, `agent: add streaming support`).
 - Include a concise body for context and rationale when needed.
+
+## Configuration & Runtime
+
+- Persistent data lives in `~/.config/aj/` (threads/, history.txt, .env).
+- Configuration `.env` is loaded from `~/.config/aj/.env` and project `.env`; never commit secrets.
+- Model selection via flags or env: `--model_api`, `--model_url`, `--model_name` (env: `MODEL_API`, `MODEL_URL`, `MODEL_NAME`).
