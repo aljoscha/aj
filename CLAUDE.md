@@ -40,7 +40,7 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 
 ## Rust Compilation
 
-- Always run `cargo fmt` and `cargo build` after each logical unit of change. Fix all compilation errors before editing the next file.
+- When you make code changes, run `cargo fmt` and `cargo build` after each logical unit of change. Fix any compilation errors before committing.
 - When refactoring function signatures or types, grep for all call sites and update them in the same pass.
 - Check visibility (`pub`) before accessing fields/methods from other modules.
 - Read and understand existing code before modifying it. Don't edit blind.
@@ -49,7 +49,7 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 
 - Unit tests live in the same module with `#[cfg(test)]`.
 - Integration tests go in `<crate>/tests/`.
-- `cargo test` must pass before committing.
+- If you changed code, `cargo test` must pass before committing.
 
 ## Debugging & Refactoring Approach
 
@@ -61,7 +61,7 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 
 - Code should be simple and clean, well-commented explaining what/how/why.
 - Before committing, verify that what you produced is high quality and works.
-- When working through a TODO or task list, pick the first unchecked task, implement, verify, check off, commit, then continue with the next.
+- When working through a TODO or task list, pick the first unchecked task, complete one self-contained unit of work, implement, verify, check off, commit, then stop. Do not continue automatically to the next task.
 - Use agent teams when it would speed things up — for example, to explore existing code, research patterns, or implement independent pieces in parallel.
 
 ## Commit Style
