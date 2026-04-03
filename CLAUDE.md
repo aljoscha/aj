@@ -63,6 +63,7 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 - Before committing, verify that what you produced is high quality and works.
 - When working through a TODO or task list, pick the first unchecked task, complete one self-contained unit of work, implement, verify, check off, commit, then stop. Do not continue automatically to the next task.
 - Use agent teams when it would speed things up — for example, to explore existing code, research patterns, or implement independent pieces in parallel.
+- Never silently cut scope. When designing, specifying, or implementing a feature, deliver the full capability — do not substitute hardcoded values, stubs, or simplified approximations for functionality that should be dynamic or generated. If a reference implementation fetches data from a source, scrapes a website, or generates code programmatically, do the same rather than replacing it with a static snapshot. If reducing scope is genuinely warranted (e.g., for a prototype), flag it explicitly and get confirmation before proceeding.
 
 ## Commit Style
 
