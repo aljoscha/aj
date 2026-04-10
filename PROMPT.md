@@ -1,8 +1,12 @@
 # Session Prompt
 
-Read @TODO.md for the task list. For design context, see @SPEC.md (or the relevant spec file).
+The current spec is `docs/models-spec.md` — read it for design context.
 
-Pick the first unchecked task (`- [ ]`) from the TODO and complete one self-contained unit of work. Do not chain multiple TODO items in one session. Implement, verify, check off, commit, then stop.
+Before starting work, check `git log` to understand what has already been implemented. The spec may describe features that are already done. Use the git history (commits, diffs) as the source of truth for current implementation state.
+
+When working on a spec, create or update a tracking file (e.g. `docs/models-progress.md`) that records which parts of the spec have been implemented and which remain. Check off items as you complete them. This file is the bridge between the spec and the git history — it should stay accurate.
+
+Pick the first unfinished item from the tracking file and complete one self-contained unit of work. Do not chain multiple items in one session. Implement, verify, update the tracking file, commit, then stop.
 
 Use agent teams when it would speed things up — for example, to explore existing code, research patterns, or implement independent pieces in parallel.
 
@@ -17,6 +21,6 @@ Use agent teams when it would speed things up — for example, to explore existi
 1. If you changed code, verify it compiles: `cargo build`.
 2. If you changed Rust code, run `cargo fmt`.
 3. If you changed code, run tests for any modified code to verify they still pass.
-4. Mark the completed task as done (`- [x]`) in the TODO.
+4. Mark the completed item as done in the tracking file.
 5. Create a commit with a descriptive message (e.g. `agent: add streaming support`).
 6. Stop after this self-contained unit of work. Do not continue to the next task automatically.
