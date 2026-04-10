@@ -468,7 +468,7 @@ impl<UI: AjUi> Agent<UI> {
             env: &self.env,
             conversation_persistence: &self.conversation_persistence,
             system_prompt: self.system_prompt,
-            model: self.model.clone(),
+            model: Arc::clone(&self.model),
         };
 
         // Create recording wrapper to capture UI output
@@ -654,7 +654,7 @@ impl<UI: AjUi> Agent<UI> {
                 }
                 ConversationEntryKind::UserOutput(user_output) => {
                     // Display user output (tool results, etc.)
-                    self.display_user_output(&[user_output.clone()]);
+                    self.display_user_output(std::slice::from_ref(user_output));
                 }
             }
         }
@@ -775,7 +775,7 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 self.conversation_persistence.clone(),
                 self.system_prompt,
                 sub_agent_tools,
-                self.model.clone(),
+                Arc::clone(&self.model),
             );
 
             // Run the sub-agent with the task

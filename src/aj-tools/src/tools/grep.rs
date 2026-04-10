@@ -145,7 +145,9 @@ impl ToolDefinition for GrepTool {
                 let modified_str = match modified.duration_since(SystemTime::UNIX_EPOCH) {
                     Ok(duration) => {
                         let secs = duration.as_secs();
-                        let datetime = DateTime::from_timestamp(secs as i64, 0).unwrap_or_default();
+                        let datetime =
+                            DateTime::from_timestamp(i64::try_from(secs).unwrap_or(i64::MAX), 0)
+                                .unwrap_or_default();
                         datetime.format("%Y-%m-%d %H:%M:%S").to_string()
                     }
                     Err(_) => "unknown".to_string(),

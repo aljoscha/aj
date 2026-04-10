@@ -331,7 +331,7 @@ impl From<ServiceTierResponse> for ServiceTier {
 impl From<CompletionUsage> for UsageDelta {
     fn from(usage: CompletionUsage) -> Self {
         let cache_read_input_tokens = if let Some(details) = usage.prompt_tokens_details {
-            details.cached_tokens.map(|t| t as u64)
+            details.cached_tokens.map(u64::from)
         } else {
             None
         };
@@ -340,8 +340,8 @@ impl From<CompletionUsage> for UsageDelta {
             cache_creation: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens,
-            input_tokens: Some(usage.prompt_tokens as u64),
-            output_tokens: Some(usage.completion_tokens as u64),
+            input_tokens: Some(u64::from(usage.prompt_tokens)),
+            output_tokens: Some(u64::from(usage.completion_tokens)),
             server_tool_use: None,
             service_tier: None,
         }
@@ -466,7 +466,7 @@ impl OpenAiStreamProcessor {
                     }
                 }
             }
-            let tool_calls = choice.delta.tool_calls.unwrap_or_else(|| Vec::new());
+            let tool_calls = choice.delta.tool_calls.unwrap_or_default();
 
             for tool_call in tool_calls {
                 let partial_call =
