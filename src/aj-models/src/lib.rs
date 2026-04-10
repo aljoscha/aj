@@ -14,6 +14,7 @@ pub mod openai;
 pub mod openai_ng;
 pub mod streaming;
 pub mod tools;
+pub mod types;
 
 /// Trait for LLM model providers
 #[async_trait::async_trait]
