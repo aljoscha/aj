@@ -6,7 +6,7 @@ Before starting work, check `git log` to understand what has already been implem
 
 When working on a spec, create or update a tracking file (e.g. `docs/models-progress.md`) that records which parts of the spec have been implemented and which remain. Check off items as you complete them. This file is the bridge between the spec and the git history — it should stay accurate.
 
-Pick the first unfinished item from the tracking file and complete one self-contained unit of work. Do not chain multiple items in one session. Implement, verify, update the tracking file, commit, then stop.
+Pick the first unimplemented item from the spec and complete one self-contained unit of work. Do not chain multiple items in one session. Implement, verify, update the tracking file, commit, then stop.
 
 Use agent teams when it would speed things up — for example, to explore existing code, research patterns, or implement independent pieces in parallel.
 
