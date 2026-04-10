@@ -220,7 +220,7 @@ impl From<OpenAIServiceTier> for ServiceTier {
 impl From<OpenAIUsage> for UsageDelta {
     fn from(usage: OpenAIUsage) -> Self {
         let cache_read_input_tokens = if let Some(details) = usage.completion_tokens_details {
-            details.reasoning_tokens.map(|t| t as u64)
+            details.reasoning_tokens.map(u64::from)
         } else {
             None
         };
@@ -229,8 +229,8 @@ impl From<OpenAIUsage> for UsageDelta {
             cache_creation: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens,
-            input_tokens: Some(usage.prompt_tokens as u64),
-            output_tokens: Some(usage.completion_tokens as u64),
+            input_tokens: Some(u64::from(usage.prompt_tokens)),
+            output_tokens: Some(u64::from(usage.completion_tokens)),
             server_tool_use: None,
             service_tier: None,
         }
