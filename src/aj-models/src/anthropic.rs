@@ -1,14 +1,15 @@
 use anthropic_sdk::client::Client;
 use anthropic_sdk::messages::{
     ApiError as AnthropicApiError, CacheControl, CacheCreation as AnthropicCacheCreation,
-    Citation as AnthropicCitation, Container as AnthropicContainer,
+    Caller as AnthropicCaller, Citation as AnthropicCitation, Container as AnthropicContainer,
     ContentBlock as AnthropicContentBlock, ContentBlockParam as AnthropicContentBlockParam,
     DocumentSource as AnthropicDocumentSource, ImageSource as AnthropicImageSource,
     Message as AnthropicMessage, MessageParam as AnthropicMessageParam,
     MessageType as AnthropicMessageType, Messages, Role as AnthropicRole,
     ServerToolUsage as AnthropicServerToolUsage, ServiceTier as AnthropicServiceTier,
-    StopReason as AnthropicStopReason, Thinking as AnthropicThinking, Tool as AnthropicTool,
-    Usage as AnthropicUsage, UsageDelta as AnthropicUsageDelta,
+    StopReason as AnthropicStopReason, Thinking as AnthropicThinking,
+    ToolResultContent as AnthropicToolResultContent, ToolUnion, Usage as AnthropicUsage,
+    UsageDelta as AnthropicUsageDelta,
     WebSearchToolResultContent as AnthropicWebSearchToolResultContent,
 };
 use anthropic_sdk::streaming::StreamingEvent as AnthropicStreamingEvent;
@@ -17,9 +18,9 @@ use std::pin::Pin;
 
 use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
 use crate::messages::{
-    ApiError, CacheCreation, Citation, Container, ContentBlock, ContentBlockParam, DocumentSource,
-    ImageSource, Message, MessageParam, MessageType, Role, ServerToolUsage, ServiceTier,
-    StopReason, Usage, UsageDelta, WebSearchToolResultContent,
+    ApiError, CacheCreation, Caller, Citation, Container, ContentBlock, ContentBlockParam,
+    DocumentSource, ImageSource, Message, MessageParam, MessageType, Role, ServerToolUsage,
+    ServiceTier, StopReason, ToolResultContent, Usage, UsageDelta, WebSearchToolResultContent,
 };
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
@@ -58,7 +59,7 @@ impl Model for AnthropicModel {
             cache_control: Some(CacheControl::Ephemeral { ttl: None }),
             citations: None,
         }];
-        let tools: Vec<AnthropicTool> = tools.into_iter().map(|t| t.into()).collect();
+        let tools: Vec<ToolUnion> = tools.into_iter().map(|t| t.into()).collect();
         let thinking: Option<AnthropicThinking> = thinking.map(Into::into);
 
         let mut messages: Vec<AnthropicMessageParam> = conversation
@@ -120,6 +121,10 @@ impl Model for AnthropicModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conversation → Anthropic message conversions
+// ---------------------------------------------------------------------------
+
 impl From<&ConversationEntry> for Option<AnthropicMessageParam> {
     fn from(entry: &ConversationEntry) -> Self {
         match &entry.entry {
@@ -147,9 +152,11 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                 AnthropicContentBlockParam::TextBlock {
                     text: text.clone(),
                     cache_control: None,
-                    citations: citations
-                        .as_ref()
-                        .map(|c| c.iter().map(Into::into).collect()),
+                    citations: citations.as_ref().map(|_| {
+                        anthropic_sdk::messages::CitationsConfig {
+                            enabled: Some(true),
+                        }
+                    }),
                 }
             }
             ContentBlockParam::ImageBlock { source } => AnthropicContentBlockParam::ImageBlock {
@@ -165,7 +172,9 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                 source: source.into(),
                 citations: citations
                     .as_ref()
-                    .map(|c| c.iter().map(Into::into).collect()),
+                    .map(|_| anthropic_sdk::messages::CitationsConfig {
+                        enabled: Some(true),
+                    }),
                 context: context.clone(),
                 title: title.clone(),
                 cache_control: None,
@@ -180,44 +189,88 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
             ContentBlockParam::RedactedThinkingBlock { data } => {
                 AnthropicContentBlockParam::RedactedThinkingBlock { data: data.clone() }
             }
-            ContentBlockParam::ToolUseBlock { id, input, name } => {
-                AnthropicContentBlockParam::ToolUseBlock {
-                    id: id.clone(),
-                    input: input.clone(),
-                    name: name.clone(),
-                    cache_control: None,
-                }
-            }
+            ContentBlockParam::ToolUseBlock {
+                id,
+                input,
+                name,
+                caller,
+            } => AnthropicContentBlockParam::ToolUseBlock {
+                id: id.clone(),
+                input: input.clone(),
+                name: name.clone(),
+                cache_control: None,
+                caller: caller.as_ref().map(Into::into),
+            },
             ContentBlockParam::ToolResultBlock {
                 tool_use_id,
                 content,
                 is_error,
             } => AnthropicContentBlockParam::ToolResultBlock {
                 tool_use_id: tool_use_id.clone(),
-                content: content.clone(),
+                content: content.into(),
                 is_error: *is_error,
                 cache_control: None,
             },
-            ContentBlockParam::ServerToolUseBlock { id, input, name } => {
-                AnthropicContentBlockParam::ServerToolUseBlock {
-                    id: id.clone(),
-                    input: input.clone(),
-                    name: name.clone(),
-                    cache_control: None,
-                }
-            }
+            ContentBlockParam::ServerToolUseBlock {
+                id,
+                input,
+                name,
+                caller,
+            } => AnthropicContentBlockParam::ServerToolUseBlock {
+                id: id.clone(),
+                input: input.clone(),
+                name: name.clone(),
+                cache_control: None,
+                caller: caller.as_ref().map(Into::into),
+            },
             ContentBlockParam::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
+                caller,
             } => AnthropicContentBlockParam::WebSearchToolResultBlock {
                 content: content.iter().map(Into::into).collect(),
                 tool_use_id: tool_use_id.clone(),
                 cache_control: None,
+                caller: caller.as_ref().map(Into::into),
+            },
+            ContentBlockParam::WebFetchToolResultBlock {
+                content,
+                tool_use_id,
+                caller,
+            } => AnthropicContentBlockParam::WebFetchToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+                cache_control: None,
+                caller: caller.as_ref().map(Into::into),
             },
             ContentBlockParam::CodeExecutionToolResultBlock {
                 content,
                 tool_use_id,
             } => AnthropicContentBlockParam::CodeExecutionToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+                cache_control: None,
+            },
+            ContentBlockParam::BashCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            } => AnthropicContentBlockParam::BashCodeExecutionToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+                cache_control: None,
+            },
+            ContentBlockParam::TextEditorCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            } => AnthropicContentBlockParam::TextEditorCodeExecutionToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+                cache_control: None,
+            },
+            ContentBlockParam::ToolSearchToolResultBlock {
+                content,
+                tool_use_id,
+            } => AnthropicContentBlockParam::ToolSearchToolResultBlock {
                 content: content.clone(),
                 tool_use_id: tool_use_id.clone(),
                 cache_control: None,
@@ -263,21 +316,25 @@ impl From<&Role> for AnthropicRole {
     }
 }
 
-impl From<Tool> for AnthropicTool {
+impl From<Tool> for ToolUnion {
     fn from(tool: Tool) -> Self {
         let Tool {
             name,
             description,
             input_schema,
-            r#type,
+            r#type: _,
         } = tool;
 
-        Self {
+        ToolUnion::Custom {
             name,
             description,
             input_schema,
-            r#type,
             cache_control: None,
+            allowed_callers: Vec::new(),
+            defer_loading: None,
+            eager_input_streaming: None,
+            input_examples: Vec::new(),
+            strict: None,
         }
     }
 }
@@ -309,12 +366,19 @@ impl From<&DocumentSource> for AnthropicDocumentSource {
                 data: data.clone(),
                 media_type: media_type.clone(),
             },
+            DocumentSource::Content { content } => Self::Content {
+                content: content.clone(),
+            },
             DocumentSource::File { file_id } => Self::File {
                 file_id: file_id.clone(),
             },
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Citation conversions (aj-models ↔ anthropic-sdk)
+// ---------------------------------------------------------------------------
 
 impl From<&Citation> for AnthropicCitation {
     fn from(citation: &Citation) -> Self {
@@ -368,6 +432,21 @@ impl From<&Citation> for AnthropicCitation {
                 encrypted_index: encrypted_index.clone(),
                 title: title.clone(),
                 url: url.clone(),
+            },
+            Citation::SearchResultLocation {
+                cited_text,
+                end_block_index,
+                search_result_index,
+                source,
+                start_block_index,
+                title,
+            } => Self::SearchResultLocation {
+                cited_text: cited_text.clone(),
+                end_block_index: *end_block_index,
+                search_result_index: *search_result_index,
+                source: source.clone(),
+                start_block_index: *start_block_index,
+                title: title.clone(),
             },
         }
     }
@@ -426,6 +505,60 @@ impl From<&AnthropicCitation> for Citation {
                 title: title.clone(),
                 url: url.clone(),
             },
+            AnthropicCitation::SearchResultLocation {
+                cited_text,
+                end_block_index,
+                search_result_index,
+                source,
+                start_block_index,
+                title,
+            } => Self::SearchResultLocation {
+                cited_text: cited_text.clone(),
+                end_block_index: *end_block_index,
+                search_result_index: *search_result_index,
+                source: source.clone(),
+                start_block_index: *start_block_index,
+                title: title.clone(),
+            },
+        }
+    }
+}
+
+impl From<&ToolResultContent> for AnthropicToolResultContent {
+    fn from(content: &ToolResultContent) -> Self {
+        match content {
+            ToolResultContent::Text(s) => Self::Text(s.clone()),
+            ToolResultContent::Blocks(blocks) => {
+                Self::Blocks(blocks.iter().map(Into::into).collect())
+            }
+        }
+    }
+}
+
+impl From<&Caller> for AnthropicCaller {
+    fn from(caller: &Caller) -> Self {
+        match caller {
+            Caller::Direct => Self::Direct,
+            Caller::ServerTool { tool_name } => Self::ServerTool {
+                tool_name: tool_name.clone(),
+            },
+            Caller::ServerTool20260120 { tool_name } => Self::ServerTool20260120 {
+                tool_name: tool_name.clone(),
+            },
+        }
+    }
+}
+
+impl From<&AnthropicCaller> for Caller {
+    fn from(caller: &AnthropicCaller) -> Self {
+        match caller {
+            AnthropicCaller::Direct => Self::Direct,
+            AnthropicCaller::ServerTool { tool_name } => Self::ServerTool {
+                tool_name: tool_name.clone(),
+            },
+            AnthropicCaller::ServerTool20260120 { tool_name } => Self::ServerTool20260120 {
+                tool_name: tool_name.clone(),
+            },
         }
     }
 }
@@ -474,21 +607,32 @@ impl From<&AnthropicWebSearchToolResultContent> for WebSearchToolResultContent {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Thinking config conversion
+// ---------------------------------------------------------------------------
+
 impl From<ThinkingConfig> for AnthropicThinking {
     fn from(thinking: ThinkingConfig) -> Self {
         match thinking {
             ThinkingConfig::Low => AnthropicThinking::Enabled {
                 budget_tokens: 4_000,
+                display: None,
             },
             ThinkingConfig::Medium => AnthropicThinking::Enabled {
                 budget_tokens: 10_000,
+                display: None,
             },
             ThinkingConfig::High => AnthropicThinking::Enabled {
                 budget_tokens: 31_999,
+                display: None,
             },
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Anthropic response → aj-models conversions
+// ---------------------------------------------------------------------------
 
 impl From<AnthropicMessage> for Message {
     fn from(message: AnthropicMessage) -> Self {
@@ -500,6 +644,7 @@ impl From<AnthropicMessage> for Message {
             model,
             stop_reason,
             stop_sequence,
+            stop_details: _,
             usage,
             container,
         } = message;
@@ -578,13 +723,17 @@ impl From<AnthropicContentBlock> for ContentBlock {
                 input: input.clone(),
                 name: name.clone(),
             },
-            AnthropicContentBlock::ServerToolUseBlock { id, input, name } => {
-                Self::ServerToolUseBlock {
-                    id: id.clone(),
-                    input: input.clone(),
-                    name: name.clone(),
-                }
-            }
+            AnthropicContentBlock::ServerToolUseBlock {
+                id,
+                input,
+                name,
+                caller,
+            } => Self::ServerToolUseBlock {
+                id: id.clone(),
+                input: input.clone(),
+                name: name.clone(),
+                caller: caller.map(|c| (&c).into()),
+            },
             AnthropicContentBlock::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
@@ -592,10 +741,40 @@ impl From<AnthropicContentBlock> for ContentBlock {
                 content: content.iter().map(Into::into).collect(),
                 tool_use_id: tool_use_id.clone(),
             },
+            AnthropicContentBlock::WebFetchToolResultBlock {
+                content,
+                tool_use_id,
+                caller,
+            } => Self::WebFetchToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+                caller: caller.map(|c| (&c).into()),
+            },
             AnthropicContentBlock::CodeExecutionToolResultBlock {
                 content,
                 tool_use_id,
             } => Self::CodeExecutionToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+            },
+            AnthropicContentBlock::BashCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            } => Self::BashCodeExecutionToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+            },
+            AnthropicContentBlock::TextEditorCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            } => Self::TextEditorCodeExecutionToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+            },
+            AnthropicContentBlock::ToolSearchToolResultBlock {
+                content,
+                tool_use_id,
+            } => Self::ToolSearchToolResultBlock {
                 content: content.clone(),
                 tool_use_id: tool_use_id.clone(),
             },
@@ -626,12 +805,17 @@ impl From<AnthropicContentBlock> for ContentBlock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Usage conversions
+// ---------------------------------------------------------------------------
+
 impl From<AnthropicUsage> for Usage {
     fn from(usage: AnthropicUsage) -> Self {
         let AnthropicUsage {
             cache_creation,
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            inference_geo: _,
             input_tokens,
             output_tokens,
             server_tool_use,
@@ -656,6 +840,7 @@ impl From<AnthropicUsageDelta> for UsageDelta {
             cache_creation,
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            inference_geo: _,
             input_tokens,
             output_tokens,
             server_tool_use,
@@ -731,6 +916,10 @@ impl From<AnthropicApiError> for ApiError {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming event conversion
+// ---------------------------------------------------------------------------
 
 impl From<AnthropicStreamingEvent> for StreamingEvent {
     fn from(event: AnthropicStreamingEvent) -> Self {

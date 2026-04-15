@@ -94,11 +94,13 @@ pub enum ContentBlockParam {
         id: String,
         input: Value,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
     },
     #[serde(rename = "tool_result")]
     ToolResultBlock {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         is_error: bool,
     },
     #[serde(rename = "server_tool_use")]
@@ -106,17 +108,34 @@ pub enum ContentBlockParam {
         id: String,
         input: Value,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
     },
     #[serde(rename = "web_search_tool_result")]
     WebSearchToolResultBlock {
         content: Vec<WebSearchToolResultContent>,
         tool_use_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
+    },
+    #[serde(rename = "web_fetch_tool_result")]
+    WebFetchToolResultBlock {
+        content: Value,
+        tool_use_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
     },
     #[serde(rename = "code_execution_tool_result")]
     CodeExecutionToolResultBlock {
         content: Vec<Value>,
         tool_use_id: String,
     },
+    #[serde(rename = "bash_code_execution_tool_result")]
+    BashCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
+    #[serde(rename = "text_editor_code_execution_tool_result")]
+    TextEditorCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
+    #[serde(rename = "tool_search_tool_result")]
+    ToolSearchToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "mcp_tool_use")]
     MCPToolUseBlock {
         id: String,
@@ -143,6 +162,38 @@ impl ContentBlockParam {
     }
 }
 
+/// Content of a tool result: either a plain string or an array of content blocks.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ContentBlockParam>),
+}
+
+impl ToolResultContent {
+    /// Extract the text representation, joining block texts with newlines for
+    /// the `Blocks` variant.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlockParam::TextBlock { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+impl From<String> for ToolResultContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ImageSource {
@@ -163,7 +214,8 @@ pub enum DocumentSource {
     PdfUrl { url: String },
     #[serde(rename = "text")]
     PlainText { data: String, media_type: String },
-    // TODO: ContentBlock
+    #[serde(rename = "content")]
+    Content { content: Value },
     #[serde(rename = "file")]
     File { file_id: String },
 }
@@ -206,6 +258,16 @@ pub enum Citation {
         title: Option<String>,
         url: String,
     },
+    #[serde(rename = "search_result_location")]
+    SearchResultLocation {
+        cited_text: String,
+        end_block_index: u64,
+        search_result_index: u64,
+        source: String,
+        start_block_index: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -223,6 +285,19 @@ pub enum WebSearchToolResultContent {
     WebSearchError { error_code: String },
 }
 
+/// Identifies who invoked a server tool (the model directly, or another tool).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum Caller {
+    #[serde(rename = "direct")]
+    Direct,
+    #[serde(rename = "server_tool")]
+    ServerTool { tool_name: String },
+    #[serde(rename = "server_tool_20260120")]
+    ServerTool20260120 { tool_name: String },
+}
+
+/// MCP server connection definition (new format, `mcp-client-2025-11-20`).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MCPServer {
     pub name: String,
@@ -230,21 +305,12 @@ pub struct MCPServer {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_configuration: Option<MCPToolConfiguration>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum MCPServerType {
     #[serde(rename = "url")]
     Url,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MCPToolConfiguration {
-    allowed_tools: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -346,17 +412,32 @@ pub enum ContentBlock {
         id: String,
         input: Value,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
     },
     #[serde(rename = "web_search_tool_result")]
     WebSearchToolResultBlock {
         content: Vec<WebSearchToolResultContent>,
         tool_use_id: String,
     },
+    #[serde(rename = "web_fetch_tool_result")]
+    WebFetchToolResultBlock {
+        content: Value,
+        tool_use_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
+    },
     #[serde(rename = "code_execution_tool_result")]
     CodeExecutionToolResultBlock {
         content: Vec<Value>,
         tool_use_id: String,
     },
+    #[serde(rename = "bash_code_execution_tool_result")]
+    BashCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
+    #[serde(rename = "text_editor_code_execution_tool_result")]
+    TextEditorCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
+    #[serde(rename = "tool_search_tool_result")]
+    ToolSearchToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "mcp_tool_use")]
     MCPToolUseBlock {
         id: String,
@@ -396,23 +477,65 @@ impl ContentBlock {
                     Some(citations)
                 },
             },
-            ContentBlock::ToolUseBlock { id, input, name } => {
-                ContentBlockParam::ToolUseBlock { id, input, name }
-            }
-            ContentBlock::ServerToolUseBlock { id, input, name } => {
-                ContentBlockParam::ServerToolUseBlock { id, input, name }
-            }
+            ContentBlock::ToolUseBlock { id, input, name } => ContentBlockParam::ToolUseBlock {
+                id,
+                input,
+                name,
+                caller: None,
+            },
+            ContentBlock::ServerToolUseBlock {
+                id,
+                input,
+                name,
+                caller,
+            } => ContentBlockParam::ServerToolUseBlock {
+                id,
+                input,
+                name,
+                caller,
+            },
             ContentBlock::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
             } => ContentBlockParam::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
+                caller: None,
+            },
+            ContentBlock::WebFetchToolResultBlock {
+                content,
+                tool_use_id,
+                caller,
+            } => ContentBlockParam::WebFetchToolResultBlock {
+                content,
+                tool_use_id,
+                caller,
             },
             ContentBlock::CodeExecutionToolResultBlock {
                 content,
                 tool_use_id,
             } => ContentBlockParam::CodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            },
+            ContentBlock::BashCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            } => ContentBlockParam::BashCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            },
+            ContentBlock::TextEditorCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            } => ContentBlockParam::TextEditorCodeExecutionToolResultBlock {
+                content,
+                tool_use_id,
+            },
+            ContentBlock::ToolSearchToolResultBlock {
+                content,
+                tool_use_id,
+            } => ContentBlockParam::ToolSearchToolResultBlock {
                 content,
                 tool_use_id,
             },
@@ -487,7 +610,6 @@ pub struct Usage {
 
 impl Usage {
     pub fn add(&mut self, delta: &UsageDelta) {
-        // Accumulate cache creation tokens
         if let Some(delta_cache_creation) = delta.cache_creation.as_ref() {
             match &mut self.cache_creation {
                 Some(existing) => {
@@ -502,7 +624,6 @@ impl Usage {
             }
         }
 
-        // Accumulate optional token counters
         if let Some(delta_tokens) = delta.cache_creation_input_tokens {
             self.cache_creation_input_tokens =
                 Some(self.cache_creation_input_tokens.unwrap_or(0) + delta_tokens);
@@ -512,7 +633,6 @@ impl Usage {
                 Some(self.cache_read_input_tokens.unwrap_or(0) + delta_tokens);
         }
 
-        // Accumulate required token counters
         if let Some(input_tokens) = delta.input_tokens {
             self.input_tokens += input_tokens;
         }
@@ -520,7 +640,6 @@ impl Usage {
             self.output_tokens += output_tokens;
         }
 
-        // Accumulate server tool usage
         if let Some(delta_server_tool_use) = delta.server_tool_use.as_ref() {
             match &mut self.server_tool_use {
                 Some(existing) => {

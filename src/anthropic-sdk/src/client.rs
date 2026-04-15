@@ -17,6 +17,8 @@ pub struct Client {
     api_key: String,
     version: String,
     base_url: String,
+    /// Beta feature headers (e.g. `["mcp-client-2025-11-20"]`).
+    beta_headers: Vec<String>,
 }
 
 impl Client {
@@ -28,23 +30,52 @@ impl Client {
             api_key,
             version: "2023-06-01".to_string(),
             base_url,
+            beta_headers: Vec::new(),
         }
+    }
+
+    /// Add a beta feature header (e.g. `"mcp-client-2025-11-20"`).
+    pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
+        self.beta_headers.push(beta.into());
+        self
+    }
+
+    /// Add multiple beta feature headers.
+    pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.beta_headers.extend(betas.into_iter().map(Into::into));
+        self
+    }
+
+    /// Set beta headers, replacing any previously configured.
+    pub fn set_betas(&mut self, betas: Vec<String>) {
+        self.beta_headers = betas;
     }
 
     pub fn base_url(&self) -> String {
         self.base_url.clone()
     }
-}
 
-impl Client {
-    pub async fn messages(&self, messages: Messages) -> Result<Message, anyhow::Error> {
-        let request_builder = self
+    /// Build a request with common headers (API key, version, content-type,
+    /// and any configured beta headers).
+    fn build_request(&self) -> reqwest::RequestBuilder {
+        let mut builder = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", self.api_key.clone())
             .header("anthropic-version", self.version.clone())
-            .header("content-type", "application/json")
-            .json(&messages);
+            .header("content-type", "application/json");
+
+        if !self.beta_headers.is_empty() {
+            builder = builder.header("anthropic-beta", self.beta_headers.join(","));
+        }
+
+        builder
+    }
+}
+
+impl Client {
+    pub async fn messages(&self, messages: Messages) -> Result<Message, anyhow::Error> {
+        let request_builder = self.build_request().json(&messages);
 
         let response = request_builder
             .send()
@@ -86,14 +117,7 @@ impl Client {
     ) -> Result<Pin<Box<dyn Stream<Item = ServerSentEvent> + Send>>, ClientError> {
         messages.stream = Some(true);
 
-        let request_builder = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", self.api_key.clone())
-            .header("anthropic-version", self.version.clone())
-            // .header("anthropic-beta", "interleaved-thinking-2025-05-14")
-            .header("content-type", "application/json")
-            .json(&messages);
+        let request_builder = self.build_request().json(&messages);
 
         let response = request_builder.send().await?;
 
@@ -162,7 +186,6 @@ pub enum ClientError {
     InternalError(String),
 }
 
-// Helper function to create a high-level stream
 fn create_high_level_stream<S>(stream: S) -> Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>
 where
     S: Stream<Item = ServerSentEvent> + Send + 'static,

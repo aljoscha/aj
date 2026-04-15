@@ -154,7 +154,7 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                         } => {
                             let tool_message = ChatCompletionRequestToolMessage {
                                 content: ChatCompletionRequestToolMessageContent::Text(
-                                    content.clone(),
+                                    content.text(),
                                 ),
                                 tool_call_id: tool_use_id.clone(),
                             };
@@ -188,7 +188,9 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                             result.push(assistant_message);
                         }
                         #[allow(deprecated)]
-                        ContentBlockParam::ToolUseBlock { id, input, name } => {
+                        ContentBlockParam::ToolUseBlock {
+                            id, input, name, ..
+                        } => {
                             let tool_calls = vec![ChatCompletionMessageToolCall {
                                 id: id.clone(),
                                 r#type: ChatCompletionToolType::Function,
@@ -229,7 +231,7 @@ impl From<&MessageParam> for ChatCompletionRequestMessage {
                     .iter()
                     .filter_map(|block| match block {
                         ContentBlockParam::TextBlock { text, .. } => Some(text.clone()),
-                        ContentBlockParam::ToolResultBlock { content, .. } => Some(content.clone()),
+                        ContentBlockParam::ToolResultBlock { content, .. } => Some(content.text()),
                         // For other types, we'll need more sophisticated handling
                         _ => None,
                     })
@@ -257,16 +259,16 @@ impl From<&MessageParam> for ChatCompletionRequestMessage {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlockParam::ToolUseBlock { id, name, input } => {
-                            Some(ChatCompletionMessageToolCall {
-                                id: id.clone(),
-                                r#type: ChatCompletionToolType::Function,
-                                function: async_openai::types::FunctionCall {
-                                    name: name.clone(),
-                                    arguments: input.to_string(),
-                                },
-                            })
-                        }
+                        ContentBlockParam::ToolUseBlock {
+                            id, name, input, ..
+                        } => Some(ChatCompletionMessageToolCall {
+                            id: id.clone(),
+                            r#type: ChatCompletionToolType::Function,
+                            function: async_openai::types::FunctionCall {
+                                name: name.clone(),
+                                arguments: input.to_string(),
+                            },
+                        }),
                         _ => None,
                     })
                     .collect();

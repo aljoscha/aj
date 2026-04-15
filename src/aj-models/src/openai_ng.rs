@@ -129,7 +129,7 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                             is_error: _,
                         } => {
                             result.push(ChatCompletionRequestMessage::Tool {
-                                content: content.clone(),
+                                content: content.text(),
                                 tool_call_id: tool_use_id.clone(),
                             });
                         }
@@ -151,16 +151,16 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlockParam::ToolUseBlock { id, input, name } => {
-                            Some(OpenAIToolCall {
-                                id: id.clone(),
-                                r#type: "function".to_string(),
-                                function: FunctionCall {
-                                    name: name.clone(),
-                                    arguments: input.to_string(),
-                                },
-                            })
-                        }
+                        ContentBlockParam::ToolUseBlock {
+                            id, input, name, ..
+                        } => Some(OpenAIToolCall {
+                            id: id.clone(),
+                            r#type: "function".to_string(),
+                            function: FunctionCall {
+                                name: name.clone(),
+                                arguments: input.to_string(),
+                            },
+                        }),
                         _ => None,
                     })
                     .collect();

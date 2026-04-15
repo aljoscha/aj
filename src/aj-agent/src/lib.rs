@@ -322,7 +322,7 @@ impl<UI: AjUi> Agent<UI> {
 
                     let result_content_block = ContentBlockParam::ToolResultBlock {
                         tool_use_id: tool_id.to_owned(),
-                        content: tool_result.return_value,
+                        content: tool_result.return_value.into(),
                         is_error,
                     };
 

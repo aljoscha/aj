@@ -251,6 +251,13 @@ impl StreamProcessor {
                         current_json.push_str(&partial_json);
                         None
                     }
+                    ContentBlockDelta::CitationsDelta { citation } => {
+                        // Accumulate citations into the current text block.
+                        if let ContentBlock::TextBlock { citations, .. } = content_block {
+                            citations.push(citation);
+                        }
+                        None
+                    }
                 }
             }
 
@@ -312,7 +319,12 @@ impl StreamProcessor {
                         });
                         None
                     }
-                    ContentBlock::ServerToolUseBlock { id, name, input: _ } => {
+                    ContentBlock::ServerToolUseBlock {
+                        id,
+                        name,
+                        input: _,
+                        caller,
+                    } => {
                         let input_json = match self.current_json.take() {
                             Some(json) => json,
                             None => {
@@ -335,7 +347,12 @@ impl StreamProcessor {
                         };
                         current_message
                             .content
-                            .push(ContentBlock::ServerToolUseBlock { id, name, input });
+                            .push(ContentBlock::ServerToolUseBlock {
+                                id,
+                                name,
+                                input,
+                                caller,
+                            });
                         None
                     }
                     ContentBlock::MCPToolUseBlock {
