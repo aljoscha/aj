@@ -58,11 +58,13 @@ pub struct ModelArgs {
 pub fn create_model(model_args: ModelArgs) -> Result<Arc<dyn Model>, ModelError> {
     match model_args.api.as_str() {
         "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-                ModelError::Client(anyhow::anyhow!(
-                    "ANTHROPIC_API_KEY not found in environment variables"
-                ))
-            })?;
+            let api_key = std::env::var("ANTHROPIC_OAUTH_TOKEN")
+                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+                .map_err(|_| {
+                    ModelError::Client(anyhow::anyhow!(
+                        "Neither ANTHROPIC_OAUTH_TOKEN nor ANTHROPIC_API_KEY found in environment variables"
+                    ))
+                })?;
 
             let model = crate::anthropic::AnthropicModel::new(model_args, api_key);
 

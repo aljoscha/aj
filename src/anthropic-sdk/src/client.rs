@@ -12,9 +12,19 @@ use crate::streaming::{StreamProcessor, StreamingEvent};
 
 const BASE_URL: &str = "https://api.anthropic.com";
 
+/// Authentication mode for the Anthropic API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Standard API key authentication (`x-api-key` header).
+    ApiKey,
+    /// OAuth token authentication (`Authorization: Bearer` header).
+    OAuth,
+}
+
 pub struct Client {
     client: ReqwestClient,
     api_key: String,
+    auth_mode: AuthMode,
     version: String,
     base_url: String,
     /// Beta feature headers (e.g. `["mcp-client-2025-11-20"]`).
@@ -24,14 +34,25 @@ pub struct Client {
 impl Client {
     pub fn new(base_url: Option<String>, api_key: String) -> Self {
         let base_url = base_url.unwrap_or_else(|| BASE_URL.to_string());
+        let auth_mode = if api_key.starts_with("sk-ant-oat") {
+            AuthMode::OAuth
+        } else {
+            AuthMode::ApiKey
+        };
 
         Self {
             client: ReqwestClient::new(),
             api_key,
+            auth_mode,
             version: "2023-06-01".to_string(),
             base_url,
             beta_headers: Vec::new(),
         }
+    }
+
+    /// Returns whether this client is using OAuth authentication.
+    pub fn is_oauth(&self) -> bool {
+        self.auth_mode == AuthMode::OAuth
     }
 
     /// Add a beta feature header (e.g. `"mcp-client-2025-11-20"`).
@@ -55,18 +76,42 @@ impl Client {
         self.base_url.clone()
     }
 
-    /// Build a request with common headers (API key, version, content-type,
+    /// Build a request with common headers (auth, version, content-type,
     /// and any configured beta headers).
     fn build_request(&self) -> reqwest::RequestBuilder {
-        let mut builder = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", self.api_key.clone())
+        let mut builder = self.client.post(format!("{}/v1/messages", self.base_url));
+
+        match self.auth_mode {
+            AuthMode::ApiKey => {
+                builder = builder.header("x-api-key", self.api_key.clone());
+            }
+            AuthMode::OAuth => {
+                builder = builder
+                    .header("authorization", format!("Bearer {}", self.api_key))
+                    .header("user-agent", "claude-cli/2.1.0")
+                    .header("x-app", "cli");
+            }
+        }
+
+        builder = builder
             .header("anthropic-version", self.version.clone())
             .header("content-type", "application/json");
 
-        if !self.beta_headers.is_empty() {
-            builder = builder.header("anthropic-beta", self.beta_headers.join(","));
+        let mut betas = self.beta_headers.clone();
+        if self.auth_mode == AuthMode::OAuth {
+            for required in [
+                "claude-code-20250219",
+                "oauth-2025-04-20",
+                "fine-grained-tool-streaming-2025-05-14",
+            ] {
+                if !betas.iter().any(|b| b == required) {
+                    betas.push(required.to_string());
+                }
+            }
+        }
+
+        if !betas.is_empty() {
+            builder = builder.header("anthropic-beta", betas.join(","));
         }
 
         builder

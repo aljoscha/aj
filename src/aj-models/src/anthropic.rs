@@ -32,16 +32,22 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 pub struct AnthropicModel {
     client: Client,
     model_name: String,
+    is_oauth: bool,
 }
 
 impl AnthropicModel {
     pub fn new(model_args: ModelArgs, api_key: String) -> Self {
         let client = Client::new(model_args.url, api_key);
+        let is_oauth = client.is_oauth();
         let model_name = model_args
             .model_name
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-        Self { client, model_name }
+        Self {
+            client,
+            model_name,
+            is_oauth,
+        }
     }
 }
 
@@ -54,11 +60,22 @@ impl Model for AnthropicModel {
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
-        let system_prompt = vec![AnthropicContentBlockParam::TextBlock {
+        let mut system_prompt_blocks = Vec::new();
+
+        // OAuth mode requires the Claude Code identity system prompt.
+        if self.is_oauth {
+            system_prompt_blocks.push(AnthropicContentBlockParam::TextBlock {
+                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                cache_control: None,
+                citations: None,
+            });
+        }
+
+        system_prompt_blocks.push(AnthropicContentBlockParam::TextBlock {
             text: system_prompt,
             cache_control: Some(CacheControl::Ephemeral { ttl: None }),
             citations: None,
-        }];
+        });
         let tools: Vec<ToolUnion> = tools.into_iter().map(|t| t.into()).collect();
         let thinking: Option<AnthropicThinking> = thinking.map(Into::into);
 
@@ -94,7 +111,7 @@ impl Model for AnthropicModel {
 
         let messages_request = Messages {
             model: self.model_name.clone(),
-            system: Some(system_prompt),
+            system: Some(system_prompt_blocks),
             thinking,
             max_tokens: 32_000,
             messages,
