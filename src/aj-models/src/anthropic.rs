@@ -77,6 +77,7 @@ impl Model for AnthropicModel {
             citations: None,
         });
         let tools: Vec<ToolUnion> = tools.into_iter().map(|t| t.into()).collect();
+        let max_tokens = max_tokens_for_thinking(&thinking);
         let thinking: Option<AnthropicThinking> = thinking.map(Into::into);
 
         let mut messages: Vec<AnthropicMessageParam> = conversation
@@ -113,7 +114,7 @@ impl Model for AnthropicModel {
             model: self.model_name.clone(),
             system: Some(system_prompt_blocks),
             thinking,
-            max_tokens: 32_000,
+            max_tokens,
             messages,
             tools,
             ..Default::default()
@@ -628,6 +629,16 @@ impl From<&AnthropicWebSearchToolResultContent> for WebSearchToolResultContent {
 // Thinking config conversion
 // ---------------------------------------------------------------------------
 
+/// Returns the appropriate `max_tokens` value for the given thinking level.
+/// The Anthropic API requires `budget_tokens < max_tokens`, so XHigh needs a
+/// larger max_tokens than the default 32,000.
+fn max_tokens_for_thinking(thinking: &Option<ThinkingConfig>) -> u64 {
+    match thinking {
+        Some(ThinkingConfig::XHigh) => 128_001,
+        _ => 32_000,
+    }
+}
+
 impl From<ThinkingConfig> for AnthropicThinking {
     fn from(thinking: ThinkingConfig) -> Self {
         match thinking {
@@ -641,6 +652,10 @@ impl From<ThinkingConfig> for AnthropicThinking {
             },
             ThinkingConfig::High => AnthropicThinking::Enabled {
                 budget_tokens: 31_999,
+                display: None,
+            },
+            ThinkingConfig::XHigh => AnthropicThinking::Enabled {
+                budget_tokens: 128_000,
                 display: None,
             },
         }

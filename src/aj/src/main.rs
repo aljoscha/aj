@@ -108,6 +108,7 @@ async fn main() -> Result<()> {
         SYSTEM_PROMPT,
         get_builtin_tools(),
         model,
+        config.thinking,
     );
 
     match cli.command {

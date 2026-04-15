@@ -242,7 +242,8 @@ impl From<ThinkingConfig> for ReasoningEffort {
         match thinking {
             ThinkingConfig::Low => ReasoningEffort::Low,
             ThinkingConfig::Medium => ReasoningEffort::Medium,
-            ThinkingConfig::High => ReasoningEffort::High,
+            // OpenAI only supports low/medium/high; XHigh maps to High.
+            ThinkingConfig::High | ThinkingConfig::XHigh => ReasoningEffort::High,
         }
     }
 }

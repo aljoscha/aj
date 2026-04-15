@@ -4,7 +4,51 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use std::str::FromStr;
 use thiserror::Error;
+
+/// Thinking level that can be set in `config.toml` as a default baseline.
+///
+/// When set, this is used for every request unless a trigger word in the user
+/// message overrides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigThinkingLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+impl fmt::Display for ConfigThinkingLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigThinkingLevel::Off => write!(f, "off"),
+            ConfigThinkingLevel::Low => write!(f, "low"),
+            ConfigThinkingLevel::Medium => write!(f, "medium"),
+            ConfigThinkingLevel::High => write!(f, "high"),
+            ConfigThinkingLevel::XHigh => write!(f, "xhigh"),
+        }
+    }
+}
+
+impl FromStr for ConfigThinkingLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "off" => Ok(ConfigThinkingLevel::Off),
+            "low" => Ok(ConfigThinkingLevel::Low),
+            "medium" => Ok(ConfigThinkingLevel::Medium),
+            "high" => Ok(ConfigThinkingLevel::High),
+            "xhigh" => Ok(ConfigThinkingLevel::XHigh),
+            _ => Err(format!(
+                "invalid thinking level '{s}': expected off, low, medium, high, or xhigh"
+            )),
+        }
+    }
+}
 
 pub const AGENTS_MD_PREFIX: &str = r#"
 Here are instructions about the code base from the user. It's the contents
@@ -91,6 +135,7 @@ pub enum ConfigError {
 /// model_api = "anthropic"
 /// model_name = "claude-sonnet-4-20250514"
 /// model_url = "https://api.anthropic.com"
+/// thinking = "low"
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
@@ -100,6 +145,8 @@ pub struct Config {
     pub model_url: Option<String>,
     /// Model name override.
     pub model_name: Option<String>,
+    /// Default thinking level used when no trigger word is present.
+    pub thinking: Option<ConfigThinkingLevel>,
 }
 
 impl Config {
@@ -241,6 +288,7 @@ mod tests {
         assert!(config.model_api.is_none());
         assert!(config.model_url.is_none());
         assert!(config.model_name.is_none());
+        assert!(config.thinking.is_none());
     }
 
     #[test]
@@ -256,6 +304,58 @@ model_name = "claude-sonnet-4-20250514"
             Some("claude-sonnet-4-20250514")
         );
         assert!(config.model_url.is_none());
+        assert!(config.thinking.is_none());
+    }
+
+    #[test]
+    fn test_config_deserialize_with_thinking() {
+        let toml_str = r#"
+model_api = "anthropic"
+thinking = "medium"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::Medium));
+    }
+
+    #[test]
+    fn test_config_deserialize_thinking_levels() {
+        for (input, expected) in [
+            ("off", ConfigThinkingLevel::Off),
+            ("low", ConfigThinkingLevel::Low),
+            ("medium", ConfigThinkingLevel::Medium),
+            ("high", ConfigThinkingLevel::High),
+            ("xhigh", ConfigThinkingLevel::XHigh),
+        ] {
+            let toml_str = format!("thinking = \"{input}\"");
+            let config: Config = toml::from_str(&toml_str).unwrap();
+            assert_eq!(config.thinking, Some(expected), "failed for input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_config_thinking_level_from_str() {
+        assert_eq!(
+            "off".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::Off
+        );
+        assert_eq!(
+            "LOW".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::Low
+        );
+        assert_eq!(
+            "XHigh".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::XHigh
+        );
+        assert!("invalid".parse::<ConfigThinkingLevel>().is_err());
+    }
+
+    #[test]
+    fn test_config_thinking_level_display() {
+        assert_eq!(ConfigThinkingLevel::Off.to_string(), "off");
+        assert_eq!(ConfigThinkingLevel::Low.to_string(), "low");
+        assert_eq!(ConfigThinkingLevel::Medium.to_string(), "medium");
+        assert_eq!(ConfigThinkingLevel::High.to_string(), "high");
+        assert_eq!(ConfigThinkingLevel::XHigh.to_string(), "xhigh");
     }
 
     #[test]

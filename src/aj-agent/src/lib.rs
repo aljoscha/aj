@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::pin::{pin, Pin};
 use std::time::Duration;
 
-use aj_conf::AgentEnv;
+use aj_conf::{AgentEnv, ConfigThinkingLevel};
 use aj_models::messages::{ContentBlock, ContentBlockParam, Message, Role, Usage};
 use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
@@ -32,6 +32,7 @@ pub struct Agent<UI: AjUi> {
     tools: Vec<Tool>,
     model: Arc<dyn Model>,
     session_state: SessionState,
+    default_thinking: Option<ThinkingConfig>,
 }
 
 impl<UI: AjUi> Agent<UI> {
@@ -42,6 +43,7 @@ impl<UI: AjUi> Agent<UI> {
         system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
         model: Arc<dyn Model>,
+        default_thinking: Option<ConfigThinkingLevel>,
     ) -> Self {
         // Convert ErasedToolDefinition to Tool for Model API
         let api_tools: Vec<Tool> = tools
@@ -62,6 +64,14 @@ impl<UI: AjUi> Agent<UI> {
 
         let session_state = SessionState::new(env.working_directory.clone());
 
+        let default_thinking = default_thinking.and_then(|level| match level {
+            ConfigThinkingLevel::Off => None,
+            ConfigThinkingLevel::Low => Some(ThinkingConfig::Low),
+            ConfigThinkingLevel::Medium => Some(ThinkingConfig::Medium),
+            ConfigThinkingLevel::High => Some(ThinkingConfig::High),
+            ConfigThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
+        });
+
         Self {
             env,
             ui,
@@ -71,6 +81,7 @@ impl<UI: AjUi> Agent<UI> {
             tools: api_tools,
             model,
             session_state,
+            default_thinking,
         }
     }
 
@@ -393,16 +404,14 @@ impl<UI: AjUi> Agent<UI> {
     }
 
     /// Determine the thinking configuration based on trigger texts in the user
-    /// prompt and session state. Returns thinking configuration based on
-    /// specific trigger phrases:
+    /// prompt. Returns thinking configuration based on specific trigger phrases:
+    /// - "think maximum" -> 128,000 tokens
     /// - "think harder" -> 32,000 tokens
     /// - "think hard" -> 10,000 tokens
     /// - "think" -> 4,000 tokens
-    /// - default -> None (no thinking)
+    /// - default -> falls back to configured default thinking level
     fn determine_thinking(&self, conversation: &Conversation) -> Option<ThinkingConfig> {
         let last_user_message = conversation.last_user_message();
-
-        let mut thinking_config = None;
 
         if let Some(message) = last_user_message {
             // Extract text content from the message
@@ -421,17 +430,20 @@ impl<UI: AjUi> Agent<UI> {
 
             let text_lower = text_content.to_lowercase();
 
-            // Check for trigger phrases in order of specificity
-            if text_lower.contains("think harder") {
-                thinking_config = Some(ThinkingConfig::High);
+            // Check for trigger phrases in order of specificity.
+            if text_lower.contains("think maximum") {
+                return Some(ThinkingConfig::XHigh);
+            } else if text_lower.contains("think harder") {
+                return Some(ThinkingConfig::High);
             } else if text_lower.contains("think hard") {
-                thinking_config = Some(ThinkingConfig::Medium);
+                return Some(ThinkingConfig::Medium);
             } else if text_lower.contains("think") {
-                thinking_config = Some(ThinkingConfig::Low);
+                return Some(ThinkingConfig::Low);
             }
         }
 
-        thinking_config
+        // No trigger word found; fall back to the configured default.
+        self.default_thinking.clone()
     }
 
     /// Assemble the system prompt we pass to the model from the actual system
@@ -784,6 +796,7 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 self.system_prompt,
                 sub_agent_tools,
                 Arc::clone(&self.model),
+                None,
             );
 
             // Run the sub-agent with the task

@@ -40,6 +40,7 @@ pub enum ThinkingConfig {
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 /// Configuration arguments for model client creation.
