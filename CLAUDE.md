@@ -20,8 +20,8 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 
 ## Configuration & Runtime
 
-- Persistent data lives in `~/.config/aj/` (threads/, history.txt, .env).
-- Configuration `.env` is loaded from `~/.config/aj/.env` and project `.env`; never commit secrets.
+- Persistent data lives in `~/.aj/` (threads/, history.txt, .env).
+- Configuration `.env` is loaded from `~/.aj/.env` and project `.env`; never commit secrets.
 - Model selection via flags or env: `--model_api`, `--model_url`, `--model_name` (env: `MODEL_API`, `MODEL_URL`, `MODEL_NAME`).
 
 ## Code Style

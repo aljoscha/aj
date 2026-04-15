@@ -104,9 +104,8 @@ impl Config {
 
     fn get_config_dir() -> Result<PathBuf, ConfigError> {
         let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
-        let aj_dir = Path::new(&home_dir).join(".config").join("aj");
+        let aj_dir = Path::new(&home_dir).join(".aj");
 
-        // Create the ~/.config/aj directory if it doesn't exist
         if !aj_dir.exists() {
             fs::create_dir_all(&aj_dir)?;
         }

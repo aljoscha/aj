@@ -1181,7 +1181,7 @@ For each assistant message in the history:
 
 ### 9.1 Auth Storage
 
-Credentials are persisted in `~/.config/aj/auth.json` with file-level
+Credentials are persisted in `~/.aj/auth.json` with file-level
 locking to prevent race conditions when multiple instances refresh tokens
 simultaneously.
 
