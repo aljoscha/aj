@@ -10,18 +10,12 @@ use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
 use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
-Execute a command in the system shell (bash/sh). The command will be run in the
+Execute a command in the system shell (bash). The command will be run in the
 working directory of the agent session.
 
-Safety:
-- Commands have a configurable timeout to prevent hanging
-- No shell metacharacters (pipes, redirection, etc.) are supported
-- Output is truncated to 35000 characters to prevent excessive output
-
-Usage:
-- Provide a clear description of what the command does and why you want to run it
-- Set an appropriate timeout (default is 30 seconds)
-- The command will be parsed and executed directly, not inside a shell
+- Commands have a configurable timeout to prevent hanging (default: 30s).
+- Output is truncated to 35000 characters to prevent excessive output.
+- The command is passed to `bash -c`, so pipes, redirects, and shell features work.
 - IMPORTANT: Don't use search commands like find and grep. Instead use the grep and glob tools. Also don't use commands like cat and ls, instead use the read_file and ls tools.
 - If you absolutely must use a grep-like tool, use ripgrep (rg).
 "#;
@@ -44,56 +38,6 @@ fn default_timeout() -> u64 {
     30
 }
 
-const ALLOWED_COMMAND_PREFIXES: &[&str] = &[
-    "ls",
-    "pwd",
-    "echo",
-    "cat",
-    "head",
-    "tail",
-    "rg",
-    "find",
-    "wc",
-    "sort",
-    "uniq",
-    "which",
-    "type",
-    "file",
-    "stat",
-    "tree",
-    "cargo build",
-    "cargo check",
-    "cargo test",
-    "cargo nextest",
-    "cargo run",
-    "cargo fmt",
-    "cargo clippy",
-    "git status",
-    "git log",
-    "git show",
-    "git diff",
-    "git branch",
-    "git remote",
-    "npm test",
-    "npm run",
-    "npm build",
-    "yarn test",
-    "yarn run",
-    "yarn build",
-    "make test",
-    "make build",
-    "make check",
-    "python -m pytest",
-    "python -m unittest",
-    "python -c",
-    "node -e",
-    "node --version",
-    "npm --version",
-    "cargo --version",
-    "git --version",
-    "rustc --version",
-];
-
 impl ToolDefinition for BashTool {
     type Input = BashInput;
 
@@ -112,39 +56,15 @@ impl ToolDefinition for BashTool {
         ui: &mut dyn AjUi,
         input: Self::Input,
     ) -> Result<ToolResult, anyhow::Error> {
-        // Check if command is allowed
-        if !is_command_allowed(&input.command) {
-            let message = format!(
-                "Command not on allowlist: {}\nDescription: {}",
-                input.command, input.description
-            );
-
-            if !ui.ask_permission(&message) {
-                let error_msg = format!("Permission denied to execute command: {}", input.command);
-                return Err(anyhow::anyhow!(error_msg));
-            }
-        }
-
-        let parsed_command = parse_command(&input.command)?;
-
-        // // Resolve the executable path
-        // let executable_path = resolve_executable(&parsed_command.executable)?;
-
-        // Execute the command with timeout
         let working_dir = session_ctx.working_directory();
-        let child = Command::new(&parsed_command.executable)
-            .args(&parsed_command.args)
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(&input.command)
             .current_dir(&working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to start command '{}': {}",
-                    parsed_command.executable,
-                    e
-                )
-            })?;
+            .map_err(|e| anyhow::anyhow!("Failed to start command '{}': {}", input.command, e))?;
 
         // Set up channels for timeout handling
         let (tx, rx) = mpsc::channel();
@@ -213,81 +133,4 @@ impl ToolDefinition for BashTool {
             }
         }
     }
-}
-
-/// Represents a parsed command with executable and arguments.
-#[derive(Debug, Clone)]
-struct ParsedCommand {
-    executable: String,
-    args: Vec<String>,
-}
-
-/// Parse a command string into executable and arguments.
-/// This is a simple parser that splits on whitespace and handles basic quoting.
-fn parse_command(command: &str) -> Result<ParsedCommand, anyhow::Error> {
-    let command = command.trim();
-    if command.is_empty() {
-        return Err(anyhow::anyhow!("Empty command"));
-    }
-
-    // Check for shell metacharacters that we don't support
-    if command.contains(&['|', '>', '<', '&', ';', '`', '$', '(', ')'][..]) {
-        return Err(anyhow::anyhow!(
-            "Command contains shell metacharacters which are not supported for security reasons"
-        ));
-    }
-
-    let mut parts = Vec::new();
-    let mut current_part = String::new();
-    let mut in_quotes = false;
-    let mut quote_char = ' ';
-    let chars = command.chars();
-
-    for ch in chars {
-        match ch {
-            '"' | '\'' if !in_quotes => {
-                in_quotes = true;
-                quote_char = ch;
-            }
-            ch if in_quotes && ch == quote_char => {
-                in_quotes = false;
-                quote_char = ' ';
-            }
-            ' ' | '\t' if !in_quotes => {
-                if !current_part.is_empty() {
-                    parts.push(current_part.clone());
-                    current_part.clear();
-                }
-            }
-            _ => {
-                current_part.push(ch);
-            }
-        }
-    }
-
-    if in_quotes {
-        return Err(anyhow::anyhow!("Unterminated quote in command"));
-    }
-
-    if !current_part.is_empty() {
-        parts.push(current_part);
-    }
-
-    if parts.is_empty() {
-        return Err(anyhow::anyhow!("No executable found in command"));
-    }
-
-    let executable = parts[0].clone();
-    let args = parts[1..].to_vec();
-
-    Ok(ParsedCommand { executable, args })
-}
-
-/// Check if a command is allowed based on the allowlist.
-fn is_command_allowed(command: &str) -> bool {
-    let command = command.trim();
-
-    ALLOWED_COMMAND_PREFIXES
-        .iter()
-        .any(|prefix| command.starts_with(prefix))
 }

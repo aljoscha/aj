@@ -24,6 +24,10 @@ struct Cli {
     #[arg(long, env)]
     model_name: Option<String>,
 
+    /// Skip all permission checks on tools.
+    #[arg(long, alias = "yolo")]
+    dangerously_skip_permissions: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -77,7 +81,7 @@ async fn main() -> Result<()> {
 
     let threads_dir = Config::get_threads_dir_path()?;
 
-    let mut ui = AjCli::new(Some(history_path));
+    let mut ui = AjCli::new(Some(history_path), cli.dangerously_skip_permissions);
     let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
 

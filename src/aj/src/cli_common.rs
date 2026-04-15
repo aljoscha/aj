@@ -14,6 +14,8 @@ pub struct AjCliCommon {
     show_full_tool_output: bool,
     /// Whether to enable streaming updates.
     enable_streaming: bool,
+    /// Whether to skip all permission checks on tools.
+    skip_permissions: bool,
 }
 
 impl AjCliCommon {
@@ -21,12 +23,18 @@ impl AjCliCommon {
         prefix: Option<String>,
         show_full_tool_output: bool,
         enable_streaming: bool,
+        skip_permissions: bool,
     ) -> Self {
         Self {
             prefix,
             show_full_tool_output,
             enable_streaming,
+            skip_permissions,
         }
+    }
+
+    pub fn skip_permissions(&self) -> bool {
+        self.skip_permissions
     }
 
     fn format_with_prefix(&self, message: &str) -> String {
@@ -288,6 +296,9 @@ impl AjCliCommon {
     }
 
     pub fn ask_permission(&self, message: &str) -> bool {
+        if self.skip_permissions {
+            return true;
+        }
         ask_user_permission(self.prefix.as_deref(), message)
     }
 
