@@ -13,7 +13,7 @@ pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
 pub const AGENTS_MD_PREFIX: &str = r#"
 Here are instructions about the code base from the user. It's the contents
 of an AGENTS.md file. These instructions override default behavior and you
-MUST follow them exactly as written:
+must follow them exactly as written:
 "#;
 
 /// The working environment of the agent, includes configuration, the system
