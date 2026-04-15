@@ -14,8 +14,8 @@ use tracing_subscriber::EnvFilter;
 #[command(about = "AI-driven agent for software engineering")]
 struct Cli {
     /// Model API to use.
-    #[arg(long, env, default_value = "anthropic")]
-    model_api: String,
+    #[arg(long, env)]
+    model_api: Option<String>,
 
     /// Model endpoint URL.
     #[arg(long, env)]
@@ -61,6 +61,13 @@ async fn main() -> Result<()> {
         .with_ansi(true)
         .init();
 
+    // Load config.toml first (lowest priority).
+    let config = Config::load().unwrap_or_else(|e| {
+        tracing::warn!("failed to load config.toml: {e}");
+        Config::default()
+    });
+
+    // Load .env files (these set env vars, which are medium priority).
     if let Ok(dotenv_path) = Config::get_dotenv_file_path() {
         tracing::info!("loading .env from {:?}", dotenv_path);
         dotenv::from_path(dotenv_path).ok();
@@ -70,6 +77,7 @@ async fn main() -> Result<()> {
 
     dotenv::dotenv().ok();
 
+    // Parse CLI flags (highest priority).
     let cli = Cli::parse();
 
     let history_path = match Config::get_history_file_path() {
@@ -82,14 +90,20 @@ async fn main() -> Result<()> {
 
     let threads_dir = Config::get_threads_dir_path()?;
 
-    let mut ui = AjCli::new(Some(history_path), cli.dangerously_skip_permissions);
+    // Resolve settings with precedence: CLI flags > env vars > config.toml > defaults.
+    let skip_permissions = cli.dangerously_skip_permissions || config.dangerously_skip_permissions;
+
+    let mut ui = AjCli::new(Some(history_path), skip_permissions);
     let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
 
     let model_args = ModelArgs {
-        api: cli.model_api,
-        url: cli.model_url,
-        model_name: cli.model_name,
+        api: cli
+            .model_api
+            .or(config.model_api)
+            .unwrap_or_else(|| "anthropic".to_string()),
+        url: cli.model_url.or(config.model_url),
+        model_name: cli.model_name.or(config.model_name),
     };
     let model = create_model(model_args)?;
 

@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
 pub const AGENTS_MD_PREFIX: &str = r#"
@@ -76,36 +74,60 @@ impl fmt::Display for AgentEnv {
 pub enum ConfigError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("JSON parsing error: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("TOML parsing error: {0}")]
+    Toml(#[from] toml::de::Error),
     #[error("home directory not found")]
     HomeNotFound,
 }
 
-#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
+/// Application configuration loaded from `~/.aj/config.toml`.
+///
+/// All fields are optional. Missing fields use application defaults. The
+/// precedence order (highest to lowest) is: CLI flags > env vars > config file.
+///
+/// Example `config.toml`:
+///
+/// ```toml
+/// model_api = "anthropic"
+/// model_name = "claude-sonnet-4-20250514"
+/// model_url = "https://api.anthropic.com"
+/// dangerously_skip_permissions = false
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
-    #[serde(flatten)]
-    pub fields: HashMap<String, serde_json::Value>,
+    /// Model API backend (e.g., "anthropic", "openai").
+    pub model_api: Option<String>,
+    /// Custom model endpoint URL.
+    pub model_url: Option<String>,
+    /// Model name override.
+    pub model_name: Option<String>,
+    /// Skip all tool permission checks.
+    #[serde(default)]
+    pub dangerously_skip_permissions: bool,
 }
 
 impl Config {
+    /// Load configuration from `~/.aj/config.toml`.
+    ///
+    /// Returns a default (all-empty) config if the file does not exist.
     pub fn load() -> Result<Self, ConfigError> {
         let config_dir = Config::get_config_dir()?;
-        let config_path = config_dir.join("config.json");
+        let config_path = config_dir.join("config.toml");
 
         if !config_path.exists() {
-            tracing::debug!(config_path = %config_path.display(), "no config file found, using empty config");
-            return Ok(Config {
-                fields: HashMap::new(),
-            });
+            tracing::debug!(config_path = %config_path.display(), "no config file found, using defaults");
+            return Ok(Config::default());
         }
 
-        let content = fs::read_to_string(config_path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let content = fs::read_to_string(&config_path)?;
+        let config: Config = toml::from_str(&content)?;
+        tracing::debug!(config_path = %config_path.display(), "loaded config");
         Ok(config)
     }
 
-    fn get_config_dir() -> Result<PathBuf, ConfigError> {
+    /// Returns the path to the `~/.aj/` config directory, creating it if
+    /// necessary.
+    pub fn get_config_dir() -> Result<PathBuf, ConfigError> {
         let home_dir = env::var("HOME").map_err(|_| ConfigError::HomeNotFound)?;
         let aj_dir = Path::new(&home_dir).join(".aj");
 
@@ -134,21 +156,21 @@ impl Config {
         let aj_dir = Self::get_config_dir()?;
         let threads_base_dir = aj_dir.join("threads");
 
-        // Find the git root directory
+        // Find the git root directory.
         let working_directory = env::current_dir().map_err(ConfigError::Io)?;
         if let Some(git_root) = find_git_root(&working_directory) {
-            // Convert the git root path to a directory name
+            // Convert the git root path to a directory name.
             let project_dir_name = path_to_dir_name(&git_root);
             let project_threads_dir = threads_base_dir.join(project_dir_name);
 
-            // Create the directory if it doesn't exist
+            // Create the directory if it doesn't exist.
             if !project_threads_dir.exists() {
                 fs::create_dir_all(&project_threads_dir)?;
             }
 
             Ok(project_threads_dir)
         } else {
-            // Fallback to a default directory if no git root is found
+            // Fallback to a default directory if no git root is found.
             let default_threads_dir = threads_base_dir.join("default");
             if !default_threads_dir.exists() {
                 fs::create_dir_all(&default_threads_dir)?;
@@ -178,11 +200,11 @@ fn find_git_root(start_path: &Path) -> Option<PathBuf> {
 /// directory and joining them with dashes. For example, /Users/user/Dev/project
 /// becomes "Dev-project".
 fn path_to_dir_name(path: &Path) -> String {
-    // Get the home directory
+    // Get the home directory.
     if let Ok(home_dir) = env::var("HOME") {
         let home_path = Path::new(&home_dir);
 
-        // Try to get the relative path from home
+        // Try to get the relative path from home.
         if let Ok(relative_path) = path.strip_prefix(home_path) {
             return relative_path
                 .components()
@@ -198,7 +220,7 @@ fn path_to_dir_name(path: &Path) -> String {
         }
     }
 
-    // Fallback: use the last component of the path
+    // Fallback: use the last component of the path.
     path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("unknown")
@@ -218,7 +240,41 @@ mod tests {
     }
 
     #[test]
-    fn test_config_load_empty() {
+    fn test_config_default() {
+        let config = Config::default();
+        assert!(config.model_api.is_none());
+        assert!(config.model_url.is_none());
+        assert!(config.model_name.is_none());
+        assert!(!config.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn test_config_deserialize() {
+        let toml_str = r#"
+model_api = "anthropic"
+model_name = "claude-sonnet-4-20250514"
+dangerously_skip_permissions = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(
+            config.model_name.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+        assert!(config.model_url.is_none());
+        assert!(config.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn test_config_deserialize_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.model_api.is_none());
+        assert!(!config.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn test_config_load_missing_file() {
+        // Config::load() should succeed even when no file exists.
         let config = Config::load();
         assert!(config.is_ok());
     }
