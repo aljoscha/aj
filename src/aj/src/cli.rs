@@ -17,10 +17,10 @@ pub struct AjCli {
 }
 
 impl AjCli {
-    pub fn new(history_path: Option<PathBuf>, skip_permissions: bool) -> Self {
+    pub fn new(history_path: Option<PathBuf>) -> Self {
         Self {
             history_path,
-            common: AjCliCommon::new(None, true, true, skip_permissions),
+            common: AjCliCommon::new(None, true, true),
         }
     }
 }
@@ -150,16 +150,10 @@ impl AjUi for AjCli {
     }
 
     fn get_subagent_ui(&mut self, agent_number: usize) -> Box<dyn AjUi> {
-        Box::new(crate::cli_sub_agent::SubAgentCli::new(
-            agent_number,
-            self.common.skip_permissions(),
-        ))
+        Box::new(crate::cli_sub_agent::SubAgentCli::new(agent_number))
     }
 
     fn shallow_clone(&mut self) -> Box<dyn AjUi> {
-        Box::new(crate::cli::AjCli::new(
-            self.history_path.clone(),
-            self.common.skip_permissions(),
-        ))
+        Box::new(crate::cli::AjCli::new(self.history_path.clone()))
     }
 }

@@ -11,14 +11,13 @@ pub struct SubAgentCli {
 }
 
 impl SubAgentCli {
-    pub fn new(agent_id: usize, skip_permissions: bool) -> Self {
+    pub fn new(agent_id: usize) -> Self {
         Self {
             agent_number: agent_id,
             common: AjCliCommon::new(
                 Some(format!("(sub agent {agent_id})")),
                 false, // Don't show full tool output, only headers
                 false, // Don't enable streaming
-                skip_permissions,
             ),
         }
     }
@@ -110,16 +109,10 @@ impl AjUi for SubAgentCli {
     }
 
     fn get_subagent_ui(&mut self, agent_number: usize) -> Box<dyn AjUi> {
-        Box::new(SubAgentCli::new(
-            agent_number,
-            self.common.skip_permissions(),
-        ))
+        Box::new(SubAgentCli::new(agent_number))
     }
 
     fn shallow_clone(&mut self) -> Box<dyn AjUi> {
-        Box::new(SubAgentCli::new(
-            self.agent_number,
-            self.common.skip_permissions(),
-        ))
+        Box::new(SubAgentCli::new(self.agent_number))
     }
 }

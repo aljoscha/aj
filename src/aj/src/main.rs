@@ -25,10 +25,6 @@ struct Cli {
     #[arg(long, env)]
     model_name: Option<String>,
 
-    /// Skip all permission checks on tools.
-    #[arg(long, alias = "yolo")]
-    dangerously_skip_permissions: bool,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -91,9 +87,7 @@ async fn main() -> Result<()> {
     let threads_dir = Config::get_threads_dir_path()?;
 
     // Resolve settings with precedence: CLI flags > env vars > config.toml > defaults.
-    let skip_permissions = cli.dangerously_skip_permissions || config.dangerously_skip_permissions;
-
-    let mut ui = AjCli::new(Some(history_path), skip_permissions);
+    let mut ui = AjCli::new(Some(history_path));
     let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
 

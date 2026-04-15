@@ -91,7 +91,6 @@ pub enum ConfigError {
 /// model_api = "anthropic"
 /// model_name = "claude-sonnet-4-20250514"
 /// model_url = "https://api.anthropic.com"
-/// dangerously_skip_permissions = false
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
@@ -101,9 +100,6 @@ pub struct Config {
     pub model_url: Option<String>,
     /// Model name override.
     pub model_name: Option<String>,
-    /// Skip all tool permission checks.
-    #[serde(default)]
-    pub dangerously_skip_permissions: bool,
 }
 
 impl Config {
@@ -245,7 +241,6 @@ mod tests {
         assert!(config.model_api.is_none());
         assert!(config.model_url.is_none());
         assert!(config.model_name.is_none());
-        assert!(!config.dangerously_skip_permissions);
     }
 
     #[test]
@@ -253,7 +248,6 @@ mod tests {
         let toml_str = r#"
 model_api = "anthropic"
 model_name = "claude-sonnet-4-20250514"
-dangerously_skip_permissions = true
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.model_api.as_deref(), Some("anthropic"));
@@ -262,14 +256,12 @@ dangerously_skip_permissions = true
             Some("claude-sonnet-4-20250514")
         );
         assert!(config.model_url.is_none());
-        assert!(config.dangerously_skip_permissions);
     }
 
     #[test]
     fn test_config_deserialize_empty() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.model_api.is_none());
-        assert!(!config.dangerously_skip_permissions);
     }
 
     #[test]
