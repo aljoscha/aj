@@ -1,48 +1,37 @@
-use async_openai::config::Config;
-use async_openai::types::{
-    ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionStreamOptions, ChatCompletionTool,
-    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, FunctionCall,
-    FunctionObject, ServiceTierResponse,
-};
-use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use std::collections::{HashMap, hash_map};
 use std::pin::Pin;
 
+use openai_sdk::client::{Client as OpenAIClient, ClientError};
+use openai_sdk::types::{
+    ChatCompletionRequestMessage, ChatCompletionUserContent, CreateChatCompletionRequest,
+    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, FunctionCall,
+    FunctionDefinition, ReasoningEffort, ServiceTier as OpenAIServiceTier, StreamOptions,
+    Tool as OpenAITool, ToolCall as OpenAIToolCall, Usage as OpenAIUsage,
+};
+
 use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
 use crate::messages::{
-    ContentBlock, ContentBlockParam, Message, MessageParam, MessageType, Role, ServiceTier,
-    StopReason, Usage, UsageDelta,
+    ContentBlock, ContentBlockParam, Message, MessageType, Role, ServiceTier, StopReason, Usage,
+    UsageDelta,
 };
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
 use crate::{Model, ModelArgs, ModelError, ThinkingConfig};
 
-const DEFAULT_MODEL: &str = "gpt-4o";
+const DEFAULT_MODEL: &str = "gpt-5";
 
-/// OpenAI GPT model implementation
+/// OpenAI GPT model implementation using the in-tree openai-sdk crate.
 pub struct OpenAiModel {
-    client: OpenAIClient<OpenAIConfig>,
+    client: OpenAIClient,
     model_name: String,
 }
 
 impl OpenAiModel {
     pub fn new(model_args: ModelArgs, api_key: String) -> Self {
-        let config = OpenAIConfig::new().with_api_key(api_key);
+        let client = OpenAIClient::new(model_args.url, api_key);
 
-        let config = if let Some(base_url) = model_args.url {
-            config.with_api_base(base_url)
-        } else {
-            config
-        };
-
-        let client = OpenAIClient::with_config(config);
         let model_name = model_args
             .model_name
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
@@ -58,15 +47,12 @@ impl Model for OpenAiModel {
         conversation: &Conversation,
         system_prompt: String,
         tools: Vec<Tool>,
-        _thinking: Option<ThinkingConfig>,
+        thinking: Option<ThinkingConfig>,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
         // Convert system prompt to system message
-        let mut messages = vec![ChatCompletionRequestMessage::System(
-            ChatCompletionRequestSystemMessage {
-                content: system_prompt.into(),
-                name: None,
-            },
-        )];
+        let mut messages = vec![ChatCompletionRequestMessage::System {
+            content: system_prompt,
+        }];
 
         // Convert conversation entries to OpenAI messages
         let conv_messages: Vec<ChatCompletionRequestMessage> = conversation
@@ -80,38 +66,35 @@ impl Model for OpenAiModel {
         messages.extend(conv_messages);
 
         // Convert tools to OpenAI format
-        let openai_tools: Vec<ChatCompletionTool> = tools.into_iter().map(|t| t.into()).collect();
+        let openai_tools: Vec<OpenAITool> = tools.into_iter().map(|t| t.into()).collect();
 
         // Build the request
         let request = CreateChatCompletionRequest {
             model: self.model_name.clone(),
             messages,
-            max_tokens: Some(32_000u32),
+            max_completion_tokens: Some(32_000),
             stream: Some(true),
-            stream_options: Some(ChatCompletionStreamOptions {
-                include_usage: true,
+            tools: openai_tools,
+            parallel_tool_calls: Some(true),
+            reasoning_effort: thinking.map(Into::into),
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
             }),
-            tools: Some(openai_tools),
             ..Default::default()
         };
 
-        // tracing::debug!("open ai request: {:#?}", request);
-
-        // Note: OpenAI doesn't have a direct equivalent to Anthropic's thinking mode
-        // We ignore the thinking parameter for now
-
-        let response_stream = self
+        // Get the streaming response
+        let stream = self
             .client
-            .chat()
-            .create_stream(request)
+            .chat_completions_stream(request)
             .await
             .map_err(|e| ModelError::Client(anyhow::anyhow!(e)))?;
 
         // Use our stream processor to convert OpenAI format to internal format
         let processor = OpenAiStreamProcessor::new();
-        let stream = processor.process_stream(response_stream);
+        let processed_stream = processor.process_stream(stream);
 
-        Ok(stream.boxed())
+        Ok(processed_stream)
     }
 
     fn model_name(&self) -> String {
@@ -119,7 +102,7 @@ impl Model for OpenAiModel {
     }
 
     fn model_url(&self) -> String {
-        self.client.config().api_base().to_string()
+        self.client.base_url()
     }
 }
 
@@ -136,135 +119,44 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                 for content_block in message.content.iter() {
                     match content_block {
                         ContentBlockParam::TextBlock { text, citations: _ } => {
-                            let user_message = ChatCompletionRequestUserMessage {
-                                content: ChatCompletionRequestUserMessageContent::Text(
-                                    text.clone(),
-                                ),
-                                name: None,
-                            };
-
-                            let user_message = ChatCompletionRequestMessage::User(user_message);
-
-                            result.push(user_message);
+                            result.push(ChatCompletionRequestMessage::User {
+                                content: ChatCompletionUserContent::String(text.clone()),
+                            });
                         }
                         ContentBlockParam::ToolResultBlock {
                             tool_use_id,
                             content,
                             is_error: _,
                         } => {
-                            let tool_message = ChatCompletionRequestToolMessage {
-                                content: ChatCompletionRequestToolMessageContent::Text(
-                                    content.text(),
-                                ),
+                            result.push(ChatCompletionRequestMessage::Tool {
+                                content: content.text(),
                                 tool_call_id: tool_use_id.clone(),
-                            };
-
-                            let user_message = ChatCompletionRequestMessage::Tool(tool_message);
-
-                            result.push(user_message);
+                            });
                         }
                         other => panic!("unexpected content block for user role: {:?}", other),
                     }
                 }
             }
             Role::Assistant => {
-                for content_block in message.content.iter() {
-                    match content_block {
-                        #[allow(deprecated)]
-                        ContentBlockParam::TextBlock { text, citations: _ } => {
-                            let assistant_message = ChatCompletionRequestAssistantMessage {
-                                content: Some(ChatCompletionRequestAssistantMessageContent::Text(
-                                    text.clone(),
-                                )),
-                                refusal: None,
-                                function_call: None,
-                                tool_calls: None,
-                                name: None,
-                            };
+                let text_content: Vec<String> = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlockParam::TextBlock { text, citations: _ } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect();
 
-                            let assistant_message =
-                                ChatCompletionRequestMessage::Assistant(assistant_message);
-
-                            result.push(assistant_message);
-                        }
-                        #[allow(deprecated)]
+                let tool_calls: Vec<OpenAIToolCall> = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
                         ContentBlockParam::ToolUseBlock {
                             id, input, name, ..
-                        } => {
-                            let tool_calls = vec![ChatCompletionMessageToolCall {
-                                id: id.clone(),
-                                r#type: ChatCompletionToolType::Function,
-                                function: FunctionCall {
-                                    name: name.clone(),
-                                    arguments: input.to_string(),
-                                },
-                            }];
-                            let assistant_message = ChatCompletionRequestAssistantMessage {
-                                content: None,
-                                refusal: None,
-                                function_call: None,
-                                tool_calls: Some(tool_calls),
-                                name: None,
-                            };
-                            let assistant_message =
-                                ChatCompletionRequestMessage::Assistant(assistant_message);
-
-                            result.push(assistant_message);
-                        }
-                        other => panic!("unexpected content block for user role: {:?}", other),
-                    }
-                }
-            }
-        }
-
-        result
-    }
-}
-
-impl From<&MessageParam> for ChatCompletionRequestMessage {
-    fn from(message: &MessageParam) -> Self {
-        match message.role {
-            Role::User => {
-                // Combine all content blocks into a single string for OpenAI
-                let content = message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlockParam::TextBlock { text, .. } => Some(text.clone()),
-                        ContentBlockParam::ToolResultBlock { content, .. } => Some(content.text()),
-                        // For other types, we'll need more sophisticated handling
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: content.into(),
-                    name: None,
-                })
-            }
-            Role::Assistant => {
-                // Extract text content and tool calls
-                let content = message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlockParam::TextBlock { text, .. } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let tool_calls: Vec<ChatCompletionMessageToolCall> = message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlockParam::ToolUseBlock {
-                            id, name, input, ..
-                        } => Some(ChatCompletionMessageToolCall {
+                        } => Some(OpenAIToolCall {
                             id: id.clone(),
-                            r#type: ChatCompletionToolType::Function,
-                            function: async_openai::types::FunctionCall {
+                            r#type: "function".to_string(),
+                            function: FunctionCall {
                                 name: name.clone(),
                                 arguments: input.to_string(),
                             },
@@ -273,35 +165,28 @@ impl From<&MessageParam> for ChatCompletionRequestMessage {
                     })
                     .collect();
 
-                #[allow(deprecated)]
-                ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                    content: if content.is_empty() {
+                result.push(ChatCompletionRequestMessage::Assistant {
+                    content: if text_content.is_empty() {
                         None
                     } else {
-                        Some(content.into())
+                        Some(text_content.join("\n"))
                     },
-                    name: None,
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                    function_call: None,
-                    refusal: None,
-                })
+                    tool_calls,
+                });
             }
         }
+
+        result
     }
 }
 
-impl From<Tool> for ChatCompletionTool {
+impl From<Tool> for OpenAITool {
     fn from(tool: Tool) -> Self {
-        Self {
-            r#type: ChatCompletionToolType::Function,
-            function: FunctionObject {
+        OpenAITool::Function {
+            function: FunctionDefinition {
                 name: tool.name,
                 description: Some(tool.description),
-                parameters: Some(tool.input_schema),
+                parameters: tool.input_schema,
                 strict: None,
             },
         }
@@ -320,18 +205,20 @@ impl From<&OpenAIFinishReason> for StopReason {
     }
 }
 
-impl From<ServiceTierResponse> for ServiceTier {
-    fn from(tier: ServiceTierResponse) -> Self {
-        // TODO: This translation might not be correct...
+impl From<OpenAIServiceTier> for ServiceTier {
+    fn from(tier: OpenAIServiceTier) -> Self {
         match tier {
-            ServiceTierResponse::Scale => Self::Priority,
-            ServiceTierResponse::Default => Self::Standard,
+            OpenAIServiceTier::Auto => Self::Standard,
+            OpenAIServiceTier::Default => Self::Standard,
+            OpenAIServiceTier::Flex => Self::Standard,
+            OpenAIServiceTier::Scale => Self::Priority,
+            OpenAIServiceTier::Priority => Self::Priority,
         }
     }
 }
 
-impl From<CompletionUsage> for UsageDelta {
-    fn from(usage: CompletionUsage) -> Self {
+impl From<OpenAIUsage> for UsageDelta {
+    fn from(usage: OpenAIUsage) -> Self {
         let cache_read_input_tokens = if let Some(details) = usage.prompt_tokens_details {
             details.cached_tokens.map(u64::from)
         } else {
@@ -346,6 +233,16 @@ impl From<CompletionUsage> for UsageDelta {
             output_tokens: Some(u64::from(usage.completion_tokens)),
             server_tool_use: None,
             service_tier: None,
+        }
+    }
+}
+
+impl From<ThinkingConfig> for ReasoningEffort {
+    fn from(thinking: ThinkingConfig) -> Self {
+        match thinking {
+            ThinkingConfig::Low => ReasoningEffort::Low,
+            ThinkingConfig::Medium => ReasoningEffort::Medium,
+            ThinkingConfig::High => ReasoningEffort::High,
         }
     }
 }
@@ -375,13 +272,14 @@ impl OpenAiStreamProcessor {
         }
     }
 
-    pub fn process_stream<S>(mut self, stream: S) -> impl Stream<Item = StreamingEvent>
+    pub fn process_stream<S>(
+        mut self,
+        stream: S,
+    ) -> Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>
     where
-        S: Stream<
-            Item = Result<CreateChatCompletionStreamResponse, async_openai::error::OpenAIError>,
-        >,
+        S: Stream<Item = Result<CreateChatCompletionStreamResponse, ClientError>> + Send + 'static,
     {
-        stream! {
+        let stream = stream! {
             let mut stream = std::pin::pin!(stream);
 
             while let Some(chunk_result) = futures::StreamExt::next(&mut stream).await {
@@ -405,7 +303,9 @@ impl OpenAiStreamProcessor {
             for final_event in self.finalize() {
                 yield final_event;
             }
-        }
+        };
+
+        stream.boxed()
     }
 
     fn process_chunk(&mut self, chunk: CreateChatCompletionStreamResponse) -> Vec<StreamingEvent> {
@@ -442,6 +342,7 @@ impl OpenAiStreamProcessor {
             return events;
         }
 
+        assert!(chunk.choices.len() <= 1, "we implicitly give n=1");
         for choice in chunk.choices {
             if let Some(finish_reason) = choice.finish_reason {
                 // We don't finish. We requested a usage update, which we will
@@ -468,7 +369,7 @@ impl OpenAiStreamProcessor {
                     }
                 }
             }
-            let tool_calls = choice.delta.tool_calls.unwrap_or_default();
+            let tool_calls = choice.delta.tool_calls;
 
             for tool_call in tool_calls {
                 let partial_call =
