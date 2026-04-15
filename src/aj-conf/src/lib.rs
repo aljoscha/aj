@@ -8,8 +8,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
-
 pub const AGENTS_MD_PREFIX: &str = r#"
 Here are instructions about the code base from the user. It's the contents
 of an AGENTS.md file. These instructions override default behavior and you
