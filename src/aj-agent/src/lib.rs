@@ -432,11 +432,11 @@ impl<UI: AjUi> Agent<UI> {
     fn assemble_system_prompt(&self) -> String {
         let mut text = self.system_prompt.to_string();
 
-        if let Some(agent_md_content) = &self.env.agent_md {
+        if let Some(agents_md_content) = &self.env.agents_md {
             text.push_str(&format!(
-                "\n\n{}\n<agent-md>\n{}\n</agent-md>",
-                aj_conf::AGENT_MD_PREFIX,
-                agent_md_content
+                "\n\n{}\n<agents-md>\n{}\n</agents-md>",
+                aj_conf::AGENTS_MD_PREFIX,
+                agents_md_content
             ));
         }
 
