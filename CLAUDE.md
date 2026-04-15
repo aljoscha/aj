@@ -14,18 +14,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-AJ is an AI-driven agent for software engineering built as a Rust workspace with these core components:
+AJ is an AI-driven agent for software engineering.
 
-- **aj** (`src/aj/`): Main binary (`src/aj/src/main.rs`) that sets up the agent harness and tools. Extra bins in `src/aj/src/bin/`.
-- **aj-agent** (`src/aj-agent/`): Core agent implementation with conversation loop.
-- **aj-conf** (`src/aj-conf/`): Configuration, working directory, git root detection, and loading agent/project instructions from AGENT.md files.
-- **aj-models** (`src/aj-models/`): Abstraction layer supporting multiple LLM providers (Anthropic, OpenAI) with streaming inference and conversation management.
-- **aj-tools** (`src/aj-tools/`): Framework for builtin tools (currently includes read_file tool).
-- **aj-ui** (`src/aj-ui/`): UI abstraction trait for displaying agent output, user input, tool results, and token usage.
-- **anthropic-sdk** (`src/anthropic-sdk/`): Minimal SDK for the Anthropic API with messages and streaming support.
-- **openai-sdk** (`src/openai-sdk/`): Minimal SDK for the OpenAI chat completions API.
+The agent follows a minimal agent loop pattern, focusing on providing the right set of builtin tools rather than complex scaffolding.
 
-The agent follows a minimal agent loop pattern, focusing on providing the right set of builtin tools rather than complex scaffolding. The main entry point creates tools with JSON schemas and passes them to the Agent which manages the conversation loop.
+## Configuration & Runtime
+
+- Persistent data lives in `~/.config/aj/` (threads/, history.txt, .env).
+- Configuration `.env` is loaded from `~/.config/aj/.env` and project `.env`; never commit secrets.
+- Model selection via flags or env: `--model_api`, `--model_url`, `--model_name` (env: `MODEL_API`, `MODEL_URL`, `MODEL_NAME`).
 
 ## Code Style
 
@@ -49,29 +46,21 @@ The agent follows a minimal agent loop pattern, focusing on providing the right 
 
 - Unit tests live in the same module with `#[cfg(test)]`.
 - Integration tests go in `<crate>/tests/`.
-- If you changed code, `cargo test` must pass before committing.
 
-## Debugging & Refactoring Approach
+## Version Control
 
-- When debugging build or test failures, start by reproducing the exact failing command and reading its output. Do not run generic checks in a shotgun approach.
-- When exploring for design or debugging, start producing actionable output (plans, hypotheses, code) early. Don't spend the whole session just reading code.
-- If stuck after 3-4 investigation steps without progress, stop and summarize what you've tried and found, then ask for direction.
+We use jujutsu (jj) for version control; prefer jj over git when possible.
+The main branch/bookmark is `main`.
 
-## Approach
+- Create individual jj changes with good descriptions; one logical change per commit.
+- Prefix change description titles with the subsystem, e.g. `cli: implement CLI parsing` or `zfs: add pool operations`.
+- Verify `cargo build` passes before finalizing a change.
+- After `jj describe`, normally run `jj new` to create a fresh change for unrelated or follow-up work.
 
-- Code should be simple and clean, well-commented explaining what/how/why.
-- Before committing, verify that what you produced is high quality and works.
-- When working through a TODO or task list, pick the first unchecked task, complete one self-contained unit of work, implement, verify, check off, commit, then stop. Do not continue automatically to the next task.
-- Use agent teams when it would speed things up — for example, to explore existing code, research patterns, or implement independent pieces in parallel.
-- Never silently cut scope. When designing, specifying, or implementing a feature, deliver the full capability — do not substitute hardcoded values, stubs, or simplified approximations for functionality that should be dynamic or generated. If a reference implementation fetches data from a source, scrapes a website, or generates code programmatically, do the same rather than replacing it with a static snapshot. If reducing scope seems warranted (e.g., for a prototype), flag it explicitly, explain the trade-offs, and work with the user to find an approach that preserves the full intent.
+### jj Operations
 
-## Commit Style
-
-- Commit style: `area: short, imperative summary` (e.g., `tools: fix hidden directory filter`, `agent: add streaming support`).
-- Include a concise body for context and rationale when needed.
-
-## Configuration & Runtime
-
-- Persistent data lives in `~/.config/aj/` (threads/, history.txt, .env).
-- Configuration `.env` is loaded from `~/.config/aj/.env` and project `.env`; never commit secrets.
-- Model selection via flags or env: `--model_api`, `--model_url`, `--model_name` (env: `MODEL_API`, `MODEL_URL`, `MODEL_NAME`).
+- When fixing compilation across multiple changes after a rebase, work oldest-to-newest, one change at a time. Run `cargo build` and verify it passes before moving to the next change.
+- Prefer manual file-level reverts over `jj backout` when the change touches files modified in descendant changes.
+- When squashing, always verify the target change is correct before executing.
+- Use `jj undo` immediately when an operation creates cascading conflicts, rather than trying to fix the mess.
+- Never squash or reorder changes without asking first.
