@@ -4,3 +4,4 @@ pub mod responses;
 
 pub use chat_completions::*;
 pub use common::*;
+pub use responses::*;

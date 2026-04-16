@@ -49,9 +49,29 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
 
+    // Background execution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+
+    // Multi-turn conversation (previous_response_id and conversation are mutually exclusive)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Conversation>,
+
+    // Tool call limits
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
+
+    // Context management
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_management: Vec<ContextManagement>,
+
     // Streaming
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<ResponseStreamOptions>,
 
     // Storage and metadata
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,6 +82,10 @@ pub struct CreateResponseRequest {
     // Extra output data
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<ResponseIncludable>,
+
+    // Prompt template
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ResponsePrompt>,
 
     // Logging
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,6 +112,12 @@ impl Default for CreateResponseRequest {
             model: String::new(),
             input: ResponseInput::String(String::new()),
             instructions: None,
+            background: None,
+            previous_response_id: None,
+            conversation: None,
+            max_tool_calls: None,
+            prompt: None,
+            context_management: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
             parallel_tool_calls: None,
@@ -98,6 +128,7 @@ impl Default for CreateResponseRequest {
             text: None,
             truncation: None,
             stream: None,
+            stream_options: None,
             store: None,
             metadata: None,
             include: Vec::new(),
@@ -130,10 +161,14 @@ pub enum ResponseInputItem {
     /// A simple message with role and content.
     #[serde(rename = "message")]
     Message {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         role: InputRole,
         content: ResponseInputMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<ItemStatus>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<MessagePhase>,
     },
 
     /// A function tool call from a previous response (for multi-turn replay).
@@ -151,7 +186,7 @@ pub enum ResponseInputItem {
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
         call_id: String,
-        output: String,
+        output: FunctionCallOutputContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +256,25 @@ pub enum ResponseInputContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
     },
+    #[serde(rename = "output_text")]
+    OutputText {
+        text: String,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        annotations: Vec<ResponseAnnotation>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        logprobs: Option<Vec<ResponseLogprob>>,
+    },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+}
+
+/// The output of a function call: either a plain string or a list of content parts.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum FunctionCallOutputContent {
+    String(String),
+    Array(Vec<ResponseInputContentPart>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -246,6 +300,19 @@ pub struct Response {
     pub output: Vec<ResponseOutputItem>,
     pub parallel_tool_calls: bool,
     pub tools: Vec<ResponseTool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ResponsePrompt>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
@@ -309,6 +376,8 @@ pub enum ResponseOutputItem {
         content: Vec<ResponseOutputContent>,
         role: String, // Always "assistant"
         status: ItemStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<MessagePhase>,
     },
 
     /// A function tool call.
@@ -328,7 +397,9 @@ pub enum ResponseOutputItem {
     WebSearchCall {
         id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
+        status: Option<WebSearchCallStatus>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<Value>,
     },
 
     /// Reasoning/chain-of-thought content.
@@ -367,6 +438,19 @@ pub enum ResponseOutputContent {
     /// A refusal from the model.
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
+}
+
+// ---------------------------------------------------------------------------
+// Message phase
+// ---------------------------------------------------------------------------
+
+/// Labels an assistant message as intermediate commentary or the final answer.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum MessagePhase {
+    #[serde(rename = "commentary")]
+    Commentary,
+    #[serde(rename = "final_answer")]
+    FinalAnswer,
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +545,8 @@ pub enum ResponseTool {
         search_context_size: Option<SearchContextSize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         user_location: Option<WebSearchUserLocation>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<WebSearchFilters>,
     },
 
     /// Catch-all for tool types we don't explicitly model.
@@ -476,6 +562,24 @@ pub enum SearchContextSize {
     Medium,
     #[serde(rename = "high")]
     High,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum WebSearchCallStatus {
+    #[serde(rename = "in_progress")]
+    InProgress,
+    #[serde(rename = "searching")]
+    Searching,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "failed")]
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WebSearchFilters {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -507,6 +611,59 @@ pub enum ResponseToolChoice {
         r#type: String, // "function"
         name: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Context management types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContextManagement {
+    #[serde(rename = "type")]
+    pub r#type: String, // Currently only "compaction"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_threshold: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Stream options
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ResponseStreamOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Prompt template types
+// ---------------------------------------------------------------------------
+
+/// Reference to a stored prompt template.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ResponsePrompt {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables: Option<HashMap<String, Value>>,
+}
+
+// ---------------------------------------------------------------------------
+// Conversation types
+// ---------------------------------------------------------------------------
+
+/// A conversation reference in a request: either a conversation ID string or an object.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum Conversation {
+    Id(String),
+    Object(ConversationObject),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ConversationObject {
+    pub id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +815,12 @@ pub enum ResponseStreamEvent {
 
     #[serde(rename = "response.in_progress")]
     ResponseInProgress {
+        response: Response,
+        sequence_number: u64,
+    },
+
+    #[serde(rename = "response.queued")]
+    ResponseQueued {
         response: Response,
         sequence_number: u64,
     },
@@ -887,35 +1050,41 @@ impl ResponseInputItem {
     /// Create a user message with text content.
     pub fn user_text(text: String) -> Self {
         Self::Message {
+            id: None,
             role: InputRole::User,
             content: ResponseInputMessageContent::String(text),
             status: None,
+            phase: None,
         }
     }
 
     /// Create a system message with text content.
     pub fn system_text(text: String) -> Self {
         Self::Message {
+            id: None,
             role: InputRole::System,
             content: ResponseInputMessageContent::String(text),
             status: None,
+            phase: None,
         }
     }
 
     /// Create a developer message with text content.
     pub fn developer_text(text: String) -> Self {
         Self::Message {
+            id: None,
             role: InputRole::Developer,
             content: ResponseInputMessageContent::String(text),
             status: None,
+            phase: None,
         }
     }
 
-    /// Create a function call output.
+    /// Create a function call output with a string result.
     pub fn function_call_output(call_id: String, output: String) -> Self {
         Self::FunctionCallOutput {
             call_id,
-            output,
+            output: FunctionCallOutputContent::String(output),
             id: None,
             status: None,
         }

@@ -72,6 +72,9 @@ pub enum ContentBlockParam {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         citations: Option<Vec<Citation>>,
+        /// Opaque provider-specific signature used for replay.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     #[serde(rename = "image")]
     ImageBlock { source: ImageSource },
@@ -158,6 +161,7 @@ impl ContentBlockParam {
         Self::TextBlock {
             text,
             citations: None,
+            signature: None,
         }
     }
 }
@@ -400,6 +404,9 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         #[serde(default)]
         citations: Vec<Citation>,
+        /// Opaque provider-specific signature used for replay.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     #[serde(rename = "tool_use")]
     ToolUseBlock {
@@ -464,18 +471,24 @@ impl ContentBlock {
         Self::TextBlock {
             text,
             citations: Vec::new(),
+            signature: None,
         }
     }
 
     pub fn into_content_block_param(self) -> ContentBlockParam {
         match self {
-            Self::TextBlock { text, citations } => ContentBlockParam::TextBlock {
+            Self::TextBlock {
+                text,
+                citations,
+                signature,
+            } => ContentBlockParam::TextBlock {
                 text,
                 citations: if citations.is_empty() {
                     None
                 } else {
                     Some(citations)
                 },
+                signature,
             },
             ContentBlock::ToolUseBlock { id, input, name } => ContentBlockParam::ToolUseBlock {
                 id,

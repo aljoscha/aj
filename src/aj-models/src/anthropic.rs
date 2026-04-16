@@ -167,17 +167,17 @@ impl From<&MessageParam> for AnthropicMessageParam {
 impl From<&ContentBlockParam> for AnthropicContentBlockParam {
     fn from(content_block: &ContentBlockParam) -> Self {
         match content_block {
-            ContentBlockParam::TextBlock { text, citations } => {
-                AnthropicContentBlockParam::TextBlock {
-                    text: text.clone(),
-                    cache_control: None,
-                    citations: citations.as_ref().map(|_| {
-                        anthropic_sdk::messages::CitationsConfig {
-                            enabled: Some(true),
-                        }
+            ContentBlockParam::TextBlock {
+                text, citations, ..
+            } => AnthropicContentBlockParam::TextBlock {
+                text: text.clone(),
+                cache_control: None,
+                citations: citations
+                    .as_ref()
+                    .map(|_| anthropic_sdk::messages::CitationsConfig {
+                        enabled: Some(true),
                     }),
-                }
-            }
+            },
             ContentBlockParam::ImageBlock { source } => AnthropicContentBlockParam::ImageBlock {
                 source: source.into(),
                 cache_control: None,
@@ -729,6 +729,7 @@ impl From<AnthropicContentBlock> for ContentBlock {
             AnthropicContentBlock::TextBlock { text, citations } => Self::TextBlock {
                 text: text.clone(),
                 citations: citations.into_iter().map(|c| (&c).into()).collect(),
+                signature: None,
             },
             AnthropicContentBlock::ThinkingBlock {
                 signature,
