@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 /// information to the user or requesting input from the user.
 pub trait AjUi: Send + Sync {
     fn display_notice(&mut self, notice: &str);
+    fn display_warning(&mut self, warning: &str);
     fn display_error(&mut self, error: &str);
 
     fn get_user_input(&mut self) -> Option<String>;
@@ -149,6 +150,10 @@ impl AjUi for Box<dyn AjUi> {
 
     fn display_notice(&mut self, notice: &str) {
         self.as_mut().display_notice(notice);
+    }
+
+    fn display_warning(&mut self, warning: &str) {
+        self.as_mut().display_warning(warning);
     }
 
     fn display_error(&mut self, error: &str) {

@@ -58,6 +58,7 @@ impl AjUi for DummyPermissionHandler {
     fn agent_thinking_stop(&mut self) {}
 
     fn display_notice(&mut self, _notice: &str) {}
+    fn display_warning(&mut self, _warning: &str) {}
     fn display_error(&mut self, _error: &str) {}
 
     fn ask_permission(&mut self, _message: &str) -> bool {

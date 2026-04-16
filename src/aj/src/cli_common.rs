@@ -50,6 +50,11 @@ impl AjCliCommon {
         println!("{formatted}\n");
     }
 
+    pub fn display_warning(&self, warning: &str) {
+        let formatted = self.format_with_prefix(warning);
+        println!("{}\n", style(formatted).bold().fg(Color::Yellow));
+    }
+
     pub fn display_error(&self, error: &str) {
         if let Some(prefix) = &self.prefix {
             println!("{prefix} Error: {error}");

@@ -29,6 +29,10 @@ impl AjUi for SubAgentCli {
         self.common.display_notice(notice);
     }
 
+    fn display_warning(&mut self, warning: &str) {
+        self.common.display_warning(warning);
+    }
+
     fn display_error(&mut self, error: &str) {
         self.common.display_error(error);
     }

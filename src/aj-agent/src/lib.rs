@@ -112,6 +112,14 @@ impl<UI: AjUi> Agent<UI> {
             Conversation::new()
         };
 
+        if std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err() {
+            self.ui.display_warning(
+                "WARNING: AJ has no sandboxing or permission checks. The agent can execute \
+                 arbitrary commands on your system. Do not use AJ if you don't understand what \
+                 this means. Set AJ_DISABLE_SANDBOX_WARNING=1 to suppress this warning.",
+            );
+        }
+
         loop {
             let need_user_input = {
                 match conversation.last_message() {
@@ -833,6 +841,10 @@ impl<'a> AjUi for RecordingAjUi<'a> {
     fn display_notice(&mut self, notice: &str) {
         self.inner.display_notice(notice);
         self.record_output(UserOutput::Notice(notice.to_string()));
+    }
+
+    fn display_warning(&mut self, warning: &str) {
+        self.inner.display_warning(warning);
     }
 
     fn display_error(&mut self, error: &str) {
