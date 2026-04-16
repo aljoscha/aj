@@ -101,12 +101,18 @@ async fn main() -> Result<()> {
     };
     let model = create_model(model_args)?;
 
+    let mut tools = get_builtin_tools();
+    if !config.disabled_tools.is_empty() {
+        tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
+        tracing::info!(disabled = ?config.disabled_tools, "filtered disabled tools");
+    }
+
     let mut agent = Agent::new(
         env,
         ui.shallow_clone(),
         conversation_persistence.clone(),
         SYSTEM_PROMPT,
-        get_builtin_tools(),
+        tools,
         model,
         config.thinking,
     );

@@ -136,6 +136,7 @@ pub enum ConfigError {
 /// model_name = "claude-sonnet-4-20250514"
 /// model_url = "https://api.anthropic.com"
 /// thinking = "low"
+/// disabled_tools = ["todo_read", "todo_write"]
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
@@ -147,6 +148,10 @@ pub struct Config {
     pub model_name: Option<String>,
     /// Default thinking level used when no trigger word is present.
     pub thinking: Option<ConfigThinkingLevel>,
+    /// List of builtin tool names to disable. Tools in this list will not be
+    /// available to the agent.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 impl Config {
@@ -362,6 +367,16 @@ thinking = "medium"
     fn test_config_deserialize_empty() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.model_api.is_none());
+        assert!(config.disabled_tools.is_empty());
+    }
+
+    #[test]
+    fn test_config_deserialize_disabled_tools() {
+        let toml_str = r#"
+disabled_tools = ["todo_read", "todo_write"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.disabled_tools, vec!["todo_read", "todo_write"]);
     }
 
     #[test]
