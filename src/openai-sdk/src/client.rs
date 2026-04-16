@@ -3,7 +3,6 @@ use std::pin::Pin;
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client as ReqwestClient, StatusCode};
 use thiserror::Error;
 
@@ -41,7 +40,7 @@ impl Client {
     ) -> Result<CreateChatCompletionResponse, anyhow::Error> {
         let request_builder = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&request);
 
@@ -89,8 +88,7 @@ impl Client {
         let request_builder = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(CONTENT_TYPE, "application/json")
+            .bearer_auth(&self.api_key)
             .json(&request);
 
         let response = request_builder.send().await?;

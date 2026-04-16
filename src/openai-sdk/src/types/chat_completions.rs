@@ -76,6 +76,8 @@ pub struct CreateChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<Verbosity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prediction: Option<PredictionContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
@@ -97,6 +99,8 @@ pub struct CreateChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
 }
 
@@ -104,7 +108,7 @@ pub struct CreateChatCompletionRequest {
 #[serde(tag = "role")]
 pub enum ChatCompletionRequestMessage {
     #[serde(rename = "system")]
-    System { content: String },
+    System { content: ChatCompletionTextContent },
     #[serde(rename = "user")]
     User { content: ChatCompletionUserContent },
     #[serde(rename = "assistant")]
@@ -116,11 +120,11 @@ pub enum ChatCompletionRequestMessage {
     },
     #[serde(rename = "tool")]
     Tool {
-        content: String,
+        content: ChatCompletionTextContent,
         tool_call_id: String,
     },
     #[serde(rename = "developer")]
-    Developer { content: String },
+    Developer { content: ChatCompletionTextContent },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -128,6 +132,20 @@ pub enum ChatCompletionRequestMessage {
 pub enum ChatCompletionUserContent {
     String(String),
     Array(Vec<ChatCompletionUserContentPart>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum ChatCompletionContentPartText {
+    #[serde(rename = "text")]
+    Text { text: String },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum ChatCompletionTextContent {
+    String(String),
+    Array(Vec<ChatCompletionContentPartText>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -151,6 +169,40 @@ pub struct ImageUrl {
 pub enum Tool {
     #[serde(rename = "function")]
     Function { function: FunctionDefinition },
+    #[serde(rename = "custom")]
+    Custom { custom: CustomToolDefinition },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CustomToolDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<CustomToolFormat>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum CustomToolFormat {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "grammar")]
+    Grammar { grammar: CustomToolGrammar },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CustomToolGrammar {
+    pub definition: String,
+    pub syntax: CustomToolGrammarSyntax,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum CustomToolGrammarSyntax {
+    #[serde(rename = "lark")]
+    Lark,
+    #[serde(rename = "regex")]
+    Regex,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -179,11 +231,18 @@ pub struct FunctionChoice {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub r#type: String,
-    pub function: FunctionCall,
+#[serde(tag = "type")]
+pub enum ToolCall {
+    #[serde(rename = "function")]
+    Function { id: String, function: FunctionCall },
+    #[serde(rename = "custom")]
+    Custom { id: String, custom: CustomToolCall },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CustomToolCall {
+    pub name: String,
+    pub output: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -222,6 +281,12 @@ pub struct ChatCompletionResponseMessage {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<Annotation>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
 }
@@ -240,19 +305,29 @@ pub struct Usage {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PromptTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CompletionTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_prediction_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_prediction_tokens: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatCompletionLogprobs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ChatCompletionTokenLogprob>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Vec<ChatCompletionTokenLogprob>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -261,6 +336,23 @@ pub struct ChatCompletionTokenLogprob {
     pub logprob: f64,
     pub bytes: Option<Vec<u8>>,
     pub top_logprobs: Vec<ChatCompletionTokenLogprob>,
+}
+
+// Annotations (e.g. web search URL citations)
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum Annotation {
+    #[serde(rename = "url_citation")]
+    UrlCitation { url_citation: AnnotationUrlCitation },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AnnotationUrlCitation {
+    pub url: String,
+    pub title: String,
+    pub start_index: u32,
+    pub end_index: u32,
 }
 
 // Streaming response types
@@ -295,6 +387,8 @@ pub struct ChatCompletionStreamResponseDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallDelta>,
@@ -309,6 +403,16 @@ pub struct ToolCallDelta {
     pub r#type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<CustomToolCallDelta>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CustomToolCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -430,16 +534,24 @@ pub struct WebSearchLocationApproximate {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "minimal")]
+    Minimal,
     #[serde(rename = "low")]
     Low,
     #[serde(rename = "medium")]
     Medium,
     #[serde(rename = "high")]
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -470,6 +582,24 @@ pub enum Role {
     Function,
     #[serde(rename = "developer")]
     Developer,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum Verbosity {
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PromptCacheRetention {
+    #[serde(rename = "in-memory")]
+    InMemory,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -517,7 +647,9 @@ impl CreateChatCompletionRequest {
 
 impl ChatCompletionRequestMessage {
     pub fn system(content: String) -> Self {
-        Self::System { content }
+        Self::System {
+            content: ChatCompletionTextContent::String(content),
+        }
     }
 
     pub fn user(content: String) -> Self {
@@ -542,13 +674,15 @@ impl ChatCompletionRequestMessage {
 
     pub fn tool(content: String, tool_call_id: String) -> Self {
         Self::Tool {
-            content,
+            content: ChatCompletionTextContent::String(content),
             tool_call_id,
         }
     }
 
     pub fn developer(content: String) -> Self {
-        Self::Developer { content }
+        Self::Developer {
+            content: ChatCompletionTextContent::String(content),
+        }
     }
 }
 

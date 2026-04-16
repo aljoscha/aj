@@ -5,10 +5,11 @@ use std::pin::Pin;
 
 use openai_sdk::client::{Client as OpenAIClient, ClientError};
 use openai_sdk::types::{
-    ChatCompletionRequestMessage, ChatCompletionUserContent, CreateChatCompletionRequest,
-    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, FunctionCall,
-    FunctionDefinition, ReasoningEffort, ServiceTier as OpenAIServiceTier, StreamOptions,
-    Tool as OpenAITool, ToolCall as OpenAIToolCall, Usage as OpenAIUsage,
+    ChatCompletionRequestMessage, ChatCompletionTextContent, ChatCompletionUserContent,
+    CreateChatCompletionRequest, CreateChatCompletionStreamResponse,
+    FinishReason as OpenAIFinishReason, FunctionCall, FunctionDefinition, ReasoningEffort,
+    ServiceTier as OpenAIServiceTier, StreamOptions, Tool as OpenAITool,
+    ToolCall as OpenAIToolCall, Usage as OpenAIUsage,
 };
 
 use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
@@ -51,7 +52,7 @@ impl Model for OpenAiModel {
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
         // Convert system prompt to system message
         let mut messages = vec![ChatCompletionRequestMessage::System {
-            content: system_prompt,
+            content: ChatCompletionTextContent::String(system_prompt),
         }];
 
         // Convert conversation entries to OpenAI messages
@@ -129,7 +130,7 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                             is_error: _,
                         } => {
                             result.push(ChatCompletionRequestMessage::Tool {
-                                content: content.text(),
+                                content: ChatCompletionTextContent::String(content.text()),
                                 tool_call_id: tool_use_id.clone(),
                             });
                         }
@@ -153,9 +154,8 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                     .filter_map(|block| match block {
                         ContentBlockParam::ToolUseBlock {
                             id, input, name, ..
-                        } => Some(OpenAIToolCall {
+                        } => Some(OpenAIToolCall::Function {
                             id: id.clone(),
-                            r#type: "function".to_string(),
                             function: FunctionCall {
                                 name: name.clone(),
                                 arguments: input.to_string(),
