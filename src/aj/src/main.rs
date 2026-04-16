@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
         conversation_persistence.clone(),
         SYSTEM_PROMPT,
         tools,
+        config.disabled_tools.clone(),
         model,
         config.thinking,
     );

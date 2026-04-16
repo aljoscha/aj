@@ -30,6 +30,10 @@ pub struct Agent<UI: AjUi> {
     system_prompt: &'static str,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
+    /// Names of builtin tools to exclude when spawning subagents. Mirrors the
+    /// filter applied to the top-level agent so subagents inherit the same
+    /// tool restrictions.
+    disabled_tools: Vec<String>,
     model: Arc<dyn Model>,
     session_state: SessionState,
     default_thinking: Option<ThinkingConfig>,
@@ -42,6 +46,7 @@ impl<UI: AjUi> Agent<UI> {
         conversation_persistence: ConversationPersistence,
         system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
+        disabled_tools: Vec<String>,
         model: Arc<dyn Model>,
         default_thinking: Option<ConfigThinkingLevel>,
     ) -> Self {
@@ -79,6 +84,7 @@ impl<UI: AjUi> Agent<UI> {
             system_prompt,
             tool_definitions,
             tools: api_tools,
+            disabled_tools,
             model,
             session_state,
             default_thinking,
@@ -488,6 +494,7 @@ impl<UI: AjUi> Agent<UI> {
             env: &self.env,
             conversation_persistence: &self.conversation_persistence,
             system_prompt: self.system_prompt,
+            disabled_tools: &self.disabled_tools,
             model: Arc::clone(&self.model),
         };
 
@@ -753,6 +760,7 @@ struct SessionContextWrapper<'a, UI: AjUi> {
     ui: UI,
     conversation_persistence: &'a ConversationPersistence,
     system_prompt: &'static str,
+    disabled_tools: &'a [String],
     model: Arc<dyn Model>,
 }
 
@@ -782,10 +790,12 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             // Create a sub-agent UI wrapper with the agent number
             let sub_ui = self.ui.get_subagent_ui(agent_id);
 
-            // Get tools excluding the agent tool to prevent infinite recursion
+            // Get tools excluding the agent tool to prevent infinite recursion,
+            // and also respect any tools the user has disabled via config.
+            let disabled_tools = self.disabled_tools.to_vec();
             let sub_agent_tools = get_builtin_tools()
                 .into_iter()
-                .filter(|tool| tool.name != "agent")
+                .filter(|tool| tool.name != "agent" && !disabled_tools.contains(&tool.name))
                 .collect();
 
             // Create a new agent with the sub-agent UI
@@ -795,6 +805,7 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 self.conversation_persistence.clone(),
                 self.system_prompt,
                 sub_agent_tools,
+                disabled_tools,
                 Arc::clone(&self.model),
                 None,
             );
