@@ -773,6 +773,7 @@ pub enum ToolSearchRegexName {
 /// Geographic location hint for web search.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UserLocation {
+    pub r#type: UserLocationType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub city: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -781,6 +782,12 @@ pub struct UserLocation {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum UserLocationType {
+    #[serde(rename = "approximate")]
+    Approximate,
 }
 
 // ---------------------------------------------------------------------------
