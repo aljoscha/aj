@@ -1,0 +1,31 @@
+[package]
+name = "aj-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bitflags = "2"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = { workspace = true }
+ignore = { workspace = true }
+nucleo = "0.5"
+nucleo-matcher = "0.3"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tokio-util = { workspace = true }
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+[dev-dependencies]
+nu-ansi-term = { workspace = true }
+pretty_assertions = "1"
+regex = { workspace = true }
+serial_test = "3"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+vt100-ctt = "0.17"
+
+[lints]
+workspace = true
