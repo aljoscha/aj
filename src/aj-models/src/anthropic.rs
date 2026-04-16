@@ -5,11 +5,11 @@ use anthropic_sdk::messages::{
     ContentBlock as AnthropicContentBlock, ContentBlockParam as AnthropicContentBlockParam,
     DocumentSource as AnthropicDocumentSource, ImageSource as AnthropicImageSource,
     Message as AnthropicMessage, MessageParam as AnthropicMessageParam,
-    MessageType as AnthropicMessageType, Messages, Role as AnthropicRole,
-    ServerToolUsage as AnthropicServerToolUsage, ServiceTier as AnthropicServiceTier,
-    StopReason as AnthropicStopReason, Thinking as AnthropicThinking,
-    ToolResultContent as AnthropicToolResultContent, ToolUnion, Usage as AnthropicUsage,
-    UsageDelta as AnthropicUsageDelta,
+    MessageType as AnthropicMessageType, Messages, OutputConfig, OutputEffort,
+    Role as AnthropicRole, ServerToolUsage as AnthropicServerToolUsage,
+    ServiceTier as AnthropicServiceTier, StopReason as AnthropicStopReason,
+    Thinking as AnthropicThinking, ToolResultContent as AnthropicToolResultContent, ToolUnion,
+    Usage as AnthropicUsage, UsageDelta as AnthropicUsageDelta,
     WebSearchToolResultContent as AnthropicWebSearchToolResultContent,
 };
 use anthropic_sdk::streaming::StreamingEvent as AnthropicStreamingEvent;
@@ -77,7 +77,7 @@ impl Model for AnthropicModel {
             citations: None,
         });
         let tools: Vec<ToolUnion> = tools.into_iter().map(|t| t.into()).collect();
-        let max_tokens = max_tokens_for_thinking(&thinking);
+        let output_config = output_config_for_thinking(&thinking);
         let thinking: Option<AnthropicThinking> = thinking.map(Into::into);
 
         let mut messages: Vec<AnthropicMessageParam> = conversation
@@ -114,9 +114,10 @@ impl Model for AnthropicModel {
             model: self.model_name.clone(),
             system: Some(system_prompt_blocks),
             thinking,
-            max_tokens,
+            max_tokens: 32_000,
             messages,
             tools,
+            output_config,
             ..Default::default()
         };
 
@@ -629,36 +630,25 @@ impl From<&AnthropicWebSearchToolResultContent> for WebSearchToolResultContent {
 // Thinking config conversion
 // ---------------------------------------------------------------------------
 
-/// Returns the appropriate `max_tokens` value for the given thinking level.
-/// The Anthropic API requires `budget_tokens < max_tokens`, so XHigh needs a
-/// larger max_tokens than the default 32,000.
-fn max_tokens_for_thinking(thinking: &Option<ThinkingConfig>) -> u64 {
-    match thinking {
-        Some(ThinkingConfig::XHigh) => 128_001,
-        _ => 32_000,
-    }
+/// Returns the appropriate `OutputConfig` for the given thinking level,
+/// mapping each level to an `OutputEffort` value.
+fn output_config_for_thinking(thinking: &Option<ThinkingConfig>) -> Option<OutputConfig> {
+    let effort = match thinking {
+        Some(ThinkingConfig::Low) => OutputEffort::Low,
+        Some(ThinkingConfig::Medium) => OutputEffort::Medium,
+        Some(ThinkingConfig::High) => OutputEffort::High,
+        Some(ThinkingConfig::XHigh) => OutputEffort::Max,
+        None => return None,
+    };
+    Some(OutputConfig {
+        effort: Some(effort),
+        format: None,
+    })
 }
 
 impl From<ThinkingConfig> for AnthropicThinking {
-    fn from(thinking: ThinkingConfig) -> Self {
-        match thinking {
-            ThinkingConfig::Low => AnthropicThinking::Enabled {
-                budget_tokens: 4_000,
-                display: None,
-            },
-            ThinkingConfig::Medium => AnthropicThinking::Enabled {
-                budget_tokens: 10_000,
-                display: None,
-            },
-            ThinkingConfig::High => AnthropicThinking::Enabled {
-                budget_tokens: 31_999,
-                display: None,
-            },
-            ThinkingConfig::XHigh => AnthropicThinking::Enabled {
-                budget_tokens: 128_000,
-                display: None,
-            },
-        }
+    fn from(_thinking: ThinkingConfig) -> Self {
+        AnthropicThinking::Adaptive { display: None }
     }
 }
 
