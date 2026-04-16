@@ -53,6 +53,7 @@ impl Model for OpenAiModel {
         // Convert system prompt to system message
         let mut messages = vec![ChatCompletionRequestMessage::System {
             content: ChatCompletionTextContent::String(system_prompt),
+            name: None,
         }];
 
         // Convert conversation entries to OpenAI messages
@@ -80,6 +81,7 @@ impl Model for OpenAiModel {
             reasoning_effort: thinking.map(Into::into),
             stream_options: Some(StreamOptions {
                 include_usage: Some(true),
+                include_obfuscation: None,
             }),
             ..Default::default()
         };
@@ -122,6 +124,7 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                         ContentBlockParam::TextBlock { text, citations: _ } => {
                             result.push(ChatCompletionRequestMessage::User {
                                 content: ChatCompletionUserContent::String(text.clone()),
+                                name: None,
                             });
                         }
                         ContentBlockParam::ToolResultBlock {
@@ -171,7 +174,10 @@ impl From<&ConversationEntry> for Vec<ChatCompletionRequestMessage> {
                     } else {
                         Some(text_content.join("\n"))
                     },
+                    refusal: None,
                     tool_calls,
+                    audio: None,
+                    name: None,
                 });
             }
         }

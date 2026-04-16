@@ -80,6 +80,7 @@ pub struct CreateChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prediction: Option<PredictionContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "Use system_fingerprint monitoring instead")]
     pub seed: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
@@ -108,15 +109,29 @@ pub struct CreateChatCompletionRequest {
 #[serde(tag = "role")]
 pub enum ChatCompletionRequestMessage {
     #[serde(rename = "system")]
-    System { content: ChatCompletionTextContent },
+    System {
+        content: ChatCompletionTextContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     #[serde(rename = "user")]
-    User { content: ChatCompletionUserContent },
+    User {
+        content: ChatCompletionUserContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     #[serde(rename = "assistant")]
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refusal: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audio: Option<AssistantAudioReference>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     #[serde(rename = "tool")]
     Tool {
@@ -124,7 +139,11 @@ pub enum ChatCompletionRequestMessage {
         tool_call_id: String,
     },
     #[serde(rename = "developer")]
-    Developer { content: ChatCompletionTextContent },
+    Developer {
+        content: ChatCompletionTextContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -155,6 +174,10 @@ pub enum ChatCompletionUserContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    #[serde(rename = "file")]
+    File { file: FileInput },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -162,6 +185,24 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct InputAudio {
+    /// Base64 encoded audio data.
+    pub data: String,
+    /// The format of the encoded audio data: "wav" or "mp3".
+    pub format: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -262,6 +303,7 @@ pub struct CreateChatCompletionResponse {
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated]
     pub system_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
@@ -289,6 +331,8 @@ pub struct ChatCompletionResponseMessage {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioResponse>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -367,6 +411,7 @@ pub struct CreateChatCompletionStreamResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated]
     pub system_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
@@ -489,6 +534,8 @@ pub enum StopConfiguration {
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -496,6 +543,26 @@ pub struct StreamOptions {
 pub enum FunctionCallChoice {
     String(String), // "none", "auto"
     Object { name: String },
+}
+
+/// Reference to a previous audio response, for multi-turn audio conversations.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AssistantAudioReference {
+    /// Unique identifier for a previous audio response from the model.
+    pub id: String,
+}
+
+/// Audio response data from the model when using `modalities: ["audio"]`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AudioResponse {
+    /// Unique identifier for this audio response.
+    pub id: String,
+    /// The Unix timestamp (in seconds) for when this audio response expires.
+    pub expires_at: u64,
+    /// Base64 encoded audio bytes generated by the model.
+    pub data: String,
+    /// Transcript of the audio generated by the model.
+    pub transcript: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -649,26 +716,34 @@ impl ChatCompletionRequestMessage {
     pub fn system(content: String) -> Self {
         Self::System {
             content: ChatCompletionTextContent::String(content),
+            name: None,
         }
     }
 
     pub fn user(content: String) -> Self {
         Self::User {
             content: ChatCompletionUserContent::String(content),
+            name: None,
         }
     }
 
     pub fn assistant(content: String) -> Self {
         Self::Assistant {
             content: Some(content),
+            refusal: None,
             tool_calls: Vec::new(),
+            audio: None,
+            name: None,
         }
     }
 
     pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self::Assistant {
             content: None,
+            refusal: None,
             tool_calls,
+            audio: None,
+            name: None,
         }
     }
 
@@ -682,6 +757,7 @@ impl ChatCompletionRequestMessage {
     pub fn developer(content: String) -> Self {
         Self::Developer {
             content: ChatCompletionTextContent::String(content),
+            name: None,
         }
     }
 }
