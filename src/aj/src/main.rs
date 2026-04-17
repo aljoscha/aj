@@ -2,8 +2,9 @@ use aj::SYSTEM_PROMPT;
 use aj::cli::AjCli;
 use aj_agent::Agent;
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
+use aj_models::conversation::{ConversationLog, ConversationPersistence};
 use aj_models::messages::Speed;
-use aj_models::{ModelArgs, conversation::ConversationPersistence, create_model};
+use aj_models::{ModelArgs, create_model};
 use aj_tools::get_builtin_tools;
 use aj_ui::AjUi;
 use anyhow::Result;
@@ -132,7 +133,6 @@ async fn main() -> Result<()> {
     let mut agent = Agent::new(
         env,
         ui.shallow_clone(),
-        conversation_persistence.clone(),
         SYSTEM_PROMPT,
         tools,
         config.disabled_tools.clone(),
@@ -147,14 +147,14 @@ async fn main() -> Result<()> {
             }
             ThreadsAction::Continue { thread_id } => {
                 if let Some(thread_id) = thread_id {
-                    let conversation = conversation_persistence.load_conversation(&thread_id)?;
-                    agent.run(Some(conversation)).await?;
+                    let mut log = ConversationLog::resume(&conversation_persistence, &thread_id)?;
+                    agent.run(&mut log).await?;
                 } else {
                     let latest_thread_id = conversation_persistence.get_latest_thread_id()?;
                     if let Some(latest_thread_id) = latest_thread_id {
-                        let latest_conversation =
-                            conversation_persistence.load_conversation(&latest_thread_id)?;
-                        agent.run(Some(latest_conversation)).await?;
+                        let mut log =
+                            ConversationLog::resume(&conversation_persistence, &latest_thread_id)?;
+                        agent.run(&mut log).await?;
                     } else {
                         ui.display_notice("No latest conversation to resume");
                     }
@@ -162,8 +162,9 @@ async fn main() -> Result<()> {
             }
         },
         None => {
-            // Default behavior: run agent with new/empty conversation.
-            agent.run(None).await?;
+            // Default behavior: start a fresh log and run the agent.
+            let mut log = ConversationLog::create(&conversation_persistence)?;
+            agent.run(&mut log).await?;
         }
     }
 

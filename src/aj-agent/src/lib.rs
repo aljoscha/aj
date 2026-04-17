@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::{pin, Pin};
 use std::time::Duration;
@@ -20,12 +20,13 @@ use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 
-use aj_models::conversation::ConversationPersistence;
-use aj_models::conversation::{Conversation, ConversationEntryKind};
+use aj_models::conversation::{
+    Conversation, ConversationEntryKind, ConversationLog, ConversationView, EntryId, ThreadFilter,
+    ThreadKind,
+};
 
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
-    conversation_persistence: ConversationPersistence,
     ui: UI,
     system_prompt: &'static str,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
@@ -43,7 +44,6 @@ impl<UI: AjUi> Agent<UI> {
     pub fn new(
         env: AgentEnv,
         ui: UI,
-        conversation_persistence: ConversationPersistence,
         system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
         disabled_tools: Vec<String>,
@@ -81,7 +81,6 @@ impl<UI: AjUi> Agent<UI> {
         Self {
             env,
             ui,
-            conversation_persistence,
             system_prompt,
             tool_definitions,
             tools: api_tools,
@@ -100,35 +99,42 @@ impl<UI: AjUi> Agent<UI> {
         self.session_state.accumulated_usage()
     }
 
-    pub async fn run(&mut self, conversation: Option<Conversation>) -> Result<(), anyhow::Error> {
-        let mut conversation = if let Some(conversation) = conversation {
-            // Display existing conversation entries
+    pub async fn run(&mut self, log: &mut ConversationLog) -> Result<(), anyhow::Error> {
+        // Seed the subagent counter from the log so ids minted in this
+        // session don't collide with subagent subtrees already persisted
+        // from a prior session.
+        if let Some(max_id) = log.max_agent_id() {
+            self.session_state.seed_sub_agent_counter(max_id);
+        }
+
+        if let Some(head) = log.latest_leaf(ThreadFilter::USER) {
+            let conversation = log.linearize(&head, ThreadFilter::USER);
             self.display_conversation_history(&conversation);
+
+            // Because the log now writes to disk after every event,
+            // resuming can
+            // land us on a state where the last assistant message carries
+            // `tool_use` blocks that never got their matching
+            // `tool_result`s (process was killed between the two). Sending
+            // that to the model would fail, so synthesize "interrupted"
+            // tool_results for any dangling tool_use ids before we carry
+            // on.
+            repair_interrupted_tool_uses(log, &conversation)?;
 
             self.ui.display_notice(&format!(
                 "Resuming conversation {} (use 'ctrl-c' or 'ctrl-d' to quit)",
-                conversation.conversation_id()
+                log.thread_id()
             ));
-
-            self.ui.display_notice(&format!(
-                "Model: {}, at {}",
-                self.model.model_name(),
-                self.model.model_url()
-            ));
-
-            conversation
         } else {
             self.ui
                 .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
+        }
 
-            self.ui.display_notice(&format!(
-                "Model: {}, at {}",
-                self.model.model_name(),
-                self.model.model_url()
-            ));
-
-            Conversation::new()
-        };
+        self.ui.display_notice(&format!(
+            "Model: {}, at {}",
+            self.model.model_name(),
+            self.model.model_url()
+        ));
 
         if std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err() {
             self.ui.display_warning(
@@ -139,58 +145,77 @@ impl<UI: AjUi> Agent<UI> {
         }
 
         loop {
-            let need_user_input = {
-                match conversation.last_message() {
-                    Some(last) => {
-                        matches!(last.role, Role::Assistant)
+            let head = log.latest_leaf(ThreadFilter::USER);
+            let need_user_input = match &head {
+                Some(id) => {
+                    let conversation = log.linearize(id, ThreadFilter::USER);
+                    match conversation.last_message() {
+                        Some(last) => matches!(last.role, Role::Assistant),
+                        None => true,
                     }
-                    None => true,
                 }
+                None => true,
             };
+
             if need_user_input {
                 let user_input = self.ui.get_user_input();
                 let user_input = if let Some(user_input) = user_input {
                     user_input
                 } else {
                     self.display_usage_summary();
-                    if conversation.last_user_message().is_some() {
-                        let id = conversation.conversation_id();
+                    // Show the resume hint only if the user has actually
+                    // sent at least one message so far.
+                    if head.is_some() {
+                        let id = log.thread_id();
                         self.ui.display_notice(&format!(
                             "Thread: {id} (resume with: aj threads continue {id})"
                         ));
                     }
                     break;
                 };
-                conversation.add_user_message(vec![ContentBlockParam::new_text_block(user_input)]);
+                let mut view = ConversationView::user(log, head);
+                view.add_user_message(vec![ContentBlockParam::new_text_block(user_input)])?;
             }
 
-            self.execute_turn(&mut conversation).await?;
+            self.execute_turn(log, ThreadKind::User, None).await?;
         }
 
         Ok(())
     }
 
-    pub async fn run_single_turn(&mut self, prompt: String) -> Result<String, anyhow::Error> {
-        let mut conversation = Conversation::new();
-        conversation.add_user_message(vec![ContentBlockParam::new_text_block(prompt)]);
-
-        let mut last_assistant_text = String::new();
-
-        self.execute_turn(&mut conversation).await?;
-
-        // Extract the last assistant message text
-        if let Some(last_msg) = conversation.last_assistant_message() {
-            if matches!(last_msg.role, Role::Assistant) {
-                last_assistant_text.clear();
-                for content in &last_msg.content {
-                    if let ContentBlockParam::TextBlock { text, .. } = content {
-                        last_assistant_text.push_str(text);
-                    }
-                }
-            } else {
-                return Err(anyhow!("did not get a response from the model"));
-            }
+    pub async fn run_single_turn(
+        &mut self,
+        log: &mut ConversationLog,
+        parent_head: EntryId,
+        agent_id: usize,
+        prompt: String,
+    ) -> Result<String, anyhow::Error> {
+        {
+            let mut view = ConversationView::subagent(log, parent_head, agent_id);
+            view.add_user_message(vec![ContentBlockParam::new_text_block(prompt)])?;
         }
+
+        self.execute_turn(log, ThreadKind::Subagent, Some(agent_id))
+            .await?;
+
+        // Extract the last assistant message text from the subagent's
+        // own linearized history.
+        let head = log
+            .latest_leaf(ThreadFilter::subagent(agent_id))
+            .ok_or_else(|| anyhow!("subagent produced no entries"))?;
+        let conversation = log.linearize(&head, ThreadFilter::subagent(agent_id));
+        let last_msg = conversation
+            .last_assistant_message()
+            .ok_or_else(|| anyhow!("subagent produced no assistant text output"))?;
+
+        let last_assistant_text: String = last_msg
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlockParam::TextBlock { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
 
         Ok(last_assistant_text)
     }
@@ -198,14 +223,36 @@ impl<UI: AjUi> Agent<UI> {
     /// Executes a single "turn" of the conversation, this will potentially
     /// include mutliple back-and-forth interactions with the model, in case
     /// there are thinking blocks or tool calls.
-    async fn execute_turn(&mut self, conversation: &mut Conversation) -> Result<(), anyhow::Error> {
+    ///
+    /// The entries for this turn (assistant message, per-tool user outputs,
+    /// tool-result user message) are appended directly to `log` via
+    /// [ConversationView] handles. Each append serializes and writes one
+    /// JSONL line to disk before returning, so the on-disk state is never
+    /// more than one event behind reality.
+    async fn execute_turn(
+        &mut self,
+        log: &mut ConversationLog,
+        thread: ThreadKind,
+        agent_id: Option<usize>,
+    ) -> Result<(), anyhow::Error> {
         self.session_state.turn_counter += 1;
         let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
+
+        let filter = match thread {
+            ThreadKind::User => ThreadFilter::USER,
+            ThreadKind::Subagent => {
+                ThreadFilter::subagent(agent_id.expect("subagent thread requires agent_id"))
+            }
+        };
 
         let mut retry_strategy = None;
 
         'outer: loop {
-            let response_stream = self.run_inference_streaming(conversation).await?;
+            let head = log
+                .latest_leaf(filter)
+                .ok_or_else(|| anyhow!("execute_turn called on an empty thread"))?;
+            let conversation = log.linearize(&head, filter);
+            let response_stream = self.run_inference_streaming(&conversation).await?;
 
             let mut response: Option<Message> = None;
 
@@ -297,9 +344,15 @@ impl<UI: AjUi> Agent<UI> {
                 }
             }
 
-            // Add the assistant's message to conversation
+            // Append the assistant's message to the log. This write hits
+            // disk before we touch any tool; anchor_head is the id we'll
+            // use as the parent for subagents spawned while handling the
+            // tool_use blocks below.
             let message_param = response.into_message_param();
-            conversation.add_assistant_message(message_param.content);
+            let assistant_head = {
+                let mut view = make_view(log, head, thread, agent_id);
+                view.add_assistant_message(message_param.content)?
+            };
 
             let usage = TokenUsage {
                 accumulated_input: self.session_state.accumulated_usage.input_tokens,
@@ -329,7 +382,14 @@ impl<UI: AjUi> Agent<UI> {
 
                 for (tool_id, tool_name, tool_input) in tool_calls {
                     let tool_result = self
-                        .execute_tool(&mut turn_ctx, &tool_id, &tool_name, tool_input.clone())
+                        .execute_tool(
+                            log,
+                            assistant_head.clone(),
+                            &mut turn_ctx,
+                            &tool_id,
+                            &tool_name,
+                            tool_input.clone(),
+                        )
                         .await;
 
                     let (tool_result, is_error) = match tool_result {
@@ -356,28 +416,38 @@ impl<UI: AjUi> Agent<UI> {
 
                     tool_result_contents.push(result_content_block);
 
-                    Self::record_user_output(conversation, &tool_result.user_outputs);
+                    // Persist each user output as its own log entry, anchored
+                    // at the current leaf of this thread (which may now
+                    // include earlier subagent/tool events from this
+                    // iteration).
+                    {
+                        let current_head = log
+                            .latest_leaf(filter)
+                            .expect("we just appended an assistant message");
+                        let mut view = make_view(log, current_head, thread, agent_id);
+                        for out in tool_result.user_outputs.iter() {
+                            view.add_user_output(out.clone())?;
+                        }
+                    }
                     self.display_user_output(&tool_result.user_outputs);
                 }
 
                 if !tool_result_contents.is_empty() {
-                    conversation.add_user_message(tool_result_contents);
+                    let current_head = log
+                        .latest_leaf(filter)
+                        .expect("we just appended at least an assistant message");
+                    let mut view = make_view(log, current_head, thread, agent_id);
+                    view.add_user_message(tool_result_contents)?;
                 }
 
                 // Continue the conversation loop to get the model's response to tool results
                 continue;
             } else {
-                // We are now ready to finish this turn.
+                // We are now ready to finish this turn. Every event that
+                // belongs to this turn has already been appended
+                // individually; there is no per-turn save.
                 break;
             }
-        }
-
-        // Save the conversation after completing the turn
-        if let Err(e) = self
-            .conversation_persistence
-            .save_conversation(conversation)
-        {
-            tracing::warn!("Failed to save conversation: {e}");
         }
 
         Ok(())
@@ -481,6 +551,8 @@ impl<UI: AjUi> Agent<UI> {
 
     async fn execute_tool(
         &mut self,
+        log: &mut ConversationLog,
+        parent_head: EntryId,
         turn_ctx: &mut dyn ToolTurnContext,
         _tool_id: &str,
         tool_name: &str,
@@ -497,7 +569,8 @@ impl<UI: AjUi> Agent<UI> {
             session_ctx: &mut self.session_state,
             ui: self.ui.shallow_clone(),
             env: &self.env,
-            conversation_persistence: &self.conversation_persistence,
+            log,
+            parent_head,
             system_prompt: self.system_prompt,
             disabled_tools: &self.disabled_tools,
             model: Arc::clone(&self.model),
@@ -520,12 +593,6 @@ impl<UI: AjUi> Agent<UI> {
         let result_with_outputs = ToolResult::with_outputs(result.return_value, Vec::new());
 
         Ok(result_with_outputs)
-    }
-
-    fn record_user_output(conversation: &mut Conversation, user_outputs: &[UserOutput]) {
-        for output in user_outputs {
-            conversation.add_user_output(output.clone());
-        }
     }
 
     fn display_user_output(&mut self, user_outputs: &[UserOutput]) {
@@ -760,6 +827,14 @@ impl SessionState {
         self.sub_agent_counter
     }
 
+    /// Seed the subagent counter to `value` so subsequent
+    /// [SessionState::next_sub_agent_id] calls mint ids strictly greater
+    /// than `value`. Used on resume to avoid colliding with subagent
+    /// subtrees already persisted in the log.
+    fn seed_sub_agent_counter(&mut self, value: usize) {
+        self.sub_agent_counter = value;
+    }
+
     fn record_sub_agent_usage(&mut self, agent_id: usize, usage: Usage) {
         self.sub_agent_usage.insert(agent_id, usage);
     }
@@ -771,7 +846,14 @@ struct SessionContextWrapper<'a, UI: AjUi> {
     session_ctx: &'a mut SessionState,
     env: &'a AgentEnv,
     ui: UI,
-    conversation_persistence: &'a ConversationPersistence,
+    /// The one log owned by this session. Subagents append into it
+    /// (through their own [ConversationView]) rather than creating
+    /// sibling files.
+    log: &'a mut ConversationLog,
+    /// The entry id that subagents spawned from this tool invocation
+    /// should anchor at. Typically the assistant message that carried
+    /// the spawning `tool_use` block.
+    parent_head: EntryId,
     system_prompt: &'static str,
     disabled_tools: &'a [String],
     model: Arc<dyn Model>,
@@ -811,11 +893,12 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 .filter(|tool| tool.name != "agent" && !disabled_tools.contains(&tool.name))
                 .collect();
 
-            // Create a new agent with the sub-agent UI
+            // Create a new agent with the sub-agent UI. It shares this
+            // session's log; its entries are appended as `Subagent`
+            // entries in the same file, rooted at `self.parent_head`.
             let mut sub_agent = Agent::new(
                 self.env.clone(),
                 sub_ui,
-                self.conversation_persistence.clone(),
                 self.system_prompt,
                 sub_agent_tools,
                 disabled_tools,
@@ -823,8 +906,11 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 None,
             );
 
-            // Run the sub-agent with the task
-            let result = sub_agent.run_single_turn(task).await;
+            // Run the sub-agent with the task, anchored at the parent
+            // tool-use's assistant message.
+            let result = sub_agent
+                .run_single_turn(self.log, self.parent_head.clone(), agent_id, task)
+                .await;
 
             // Get the sub-agent's accumulated usage
             let sub_agent_usage = sub_agent.session_state.accumulated_usage.clone();
@@ -836,6 +922,93 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             result
         })
     }
+}
+
+/// Build a [ConversationView] for the given thread identity, anchored at
+/// `head`. Used by [Agent::execute_turn] to keep view construction
+/// short-lived around each append so the underlying `&mut ConversationLog`
+/// can be re-borrowed between events.
+fn make_view<'a>(
+    log: &'a mut ConversationLog,
+    head: EntryId,
+    thread: ThreadKind,
+    agent_id: Option<usize>,
+) -> ConversationView<'a> {
+    match thread {
+        ThreadKind::User => ConversationView::user(log, Some(head)),
+        ThreadKind::Subagent => {
+            let agent_id = agent_id.expect("subagent view requires an agent_id");
+            ConversationView::subagent(log, head, agent_id)
+        }
+    }
+}
+
+/// Scan the linearized user thread for `tool_use` blocks that never got a
+/// matching `tool_result`. If any are found, synthesize a single user
+/// message with one `tool_result` block per dangling id and append it to
+/// the log so the conversation is valid input for the model again.
+///
+/// Without this, a process killed between writing the assistant message
+/// and writing the tool_result user message would leave the file in a
+/// state that both Anthropic and OpenAI APIs reject on resume.
+fn repair_interrupted_tool_uses(
+    log: &mut ConversationLog,
+    conversation: &Conversation,
+) -> Result<(), anyhow::Error> {
+    // Collect all tool_use ids from assistant messages and all
+    // tool_result ids seen in subsequent user messages. Anything in the
+    // first set that isn't in the second set is dangling.
+    let mut used: HashSet<String> = HashSet::new();
+    let mut resolved: HashSet<String> = HashSet::new();
+    for entry in conversation.entries() {
+        let ConversationEntryKind::Message(msg) = &entry.entry else {
+            continue;
+        };
+        match msg.role {
+            Role::Assistant => {
+                for block in &msg.content {
+                    if let ContentBlockParam::ToolUseBlock { id, .. } = block {
+                        used.insert(id.clone());
+                    }
+                }
+            }
+            Role::User => {
+                for block in &msg.content {
+                    if let ContentBlockParam::ToolResultBlock { tool_use_id, .. } = block {
+                        resolved.insert(tool_use_id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let dangling: Vec<String> = used.difference(&resolved).cloned().collect();
+    if dangling.is_empty() {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "resuming past {} interrupted tool call(s); synthesizing error results",
+        dangling.len()
+    );
+
+    let tool_result_contents: Vec<ContentBlockParam> = dangling
+        .into_iter()
+        .map(|tool_use_id| ContentBlockParam::ToolResultBlock {
+            tool_use_id,
+            content: "Previous session was interrupted before this tool call completed."
+                .to_string()
+                .into(),
+            is_error: true,
+        })
+        .collect();
+
+    let head = log
+        .latest_leaf(ThreadFilter::USER)
+        .expect("repair called with a non-empty user thread");
+    let mut view = ConversationView::user(log, Some(head));
+    view.add_user_message(tool_result_contents)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
