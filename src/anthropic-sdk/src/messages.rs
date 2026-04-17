@@ -95,7 +95,7 @@ pub enum ContentBlockParam {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        citations: Option<CitationsConfig>,
+        citations: Option<Vec<Citation>>,
     },
     #[serde(rename = "image")]
     ImageBlock {
@@ -1072,9 +1072,7 @@ impl ContentBlock {
                 citations: if citations.is_empty() {
                     None
                 } else {
-                    Some(CitationsConfig {
-                        enabled: Some(true),
-                    })
+                    Some(citations)
                 },
                 cache_control: None,
             },
@@ -1208,10 +1206,10 @@ impl ContentBlock {
 pub enum Caller {
     #[serde(rename = "direct")]
     Direct,
-    #[serde(rename = "server_tool")]
-    ServerTool { tool_name: String },
-    #[serde(rename = "server_tool_20260120")]
-    ServerTool20260120 { tool_name: String },
+    #[serde(rename = "code_execution_20250825")]
+    CodeExecution20250825 { tool_id: String },
+    #[serde(rename = "code_execution_20260120")]
+    CodeExecution20260120 { tool_id: String },
 }
 
 // ---------------------------------------------------------------------------

@@ -174,9 +174,7 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                 cache_control: None,
                 citations: citations
                     .as_ref()
-                    .map(|_| anthropic_sdk::messages::CitationsConfig {
-                        enabled: Some(true),
-                    }),
+                    .map(|cs| cs.iter().map(Into::into).collect()),
             },
             ContentBlockParam::ImageBlock { source } => AnthropicContentBlockParam::ImageBlock {
                 source: source.into(),
@@ -572,11 +570,11 @@ impl From<&Caller> for AnthropicCaller {
     fn from(caller: &Caller) -> Self {
         match caller {
             Caller::Direct => Self::Direct,
-            Caller::ServerTool { tool_name } => Self::ServerTool {
-                tool_name: tool_name.clone(),
+            Caller::CodeExecution20250825 { tool_id } => Self::CodeExecution20250825 {
+                tool_id: tool_id.clone(),
             },
-            Caller::ServerTool20260120 { tool_name } => Self::ServerTool20260120 {
-                tool_name: tool_name.clone(),
+            Caller::CodeExecution20260120 { tool_id } => Self::CodeExecution20260120 {
+                tool_id: tool_id.clone(),
             },
         }
     }
@@ -586,11 +584,11 @@ impl From<&AnthropicCaller> for Caller {
     fn from(caller: &AnthropicCaller) -> Self {
         match caller {
             AnthropicCaller::Direct => Self::Direct,
-            AnthropicCaller::ServerTool { tool_name } => Self::ServerTool {
-                tool_name: tool_name.clone(),
+            AnthropicCaller::CodeExecution20250825 { tool_id } => Self::CodeExecution20250825 {
+                tool_id: tool_id.clone(),
             },
-            AnthropicCaller::ServerTool20260120 { tool_name } => Self::ServerTool20260120 {
-                tool_name: tool_name.clone(),
+            AnthropicCaller::CodeExecution20260120 { tool_id } => Self::CodeExecution20260120 {
+                tool_id: tool_id.clone(),
             },
         }
     }

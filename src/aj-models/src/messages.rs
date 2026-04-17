@@ -302,10 +302,10 @@ pub enum WebSearchToolResultContent {
 pub enum Caller {
     #[serde(rename = "direct")]
     Direct,
-    #[serde(rename = "server_tool")]
-    ServerTool { tool_name: String },
-    #[serde(rename = "server_tool_20260120")]
-    ServerTool20260120 { tool_name: String },
+    #[serde(rename = "code_execution_20250825")]
+    CodeExecution20250825 { tool_id: String },
+    #[serde(rename = "code_execution_20260120")]
+    CodeExecution20260120 { tool_id: String },
 }
 
 /// MCP server connection definition (new format, `mcp-client-2025-11-20`).
