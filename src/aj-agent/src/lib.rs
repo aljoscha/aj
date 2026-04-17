@@ -201,16 +201,13 @@ impl<UI: AjUi> Agent<UI> {
             let response_stream = self.run_inference_streaming(conversation).await?;
 
             let mut response: Option<Message> = None;
-            let mut turn_usage_update = Usage::default();
 
             {
                 let mut response_stream = pin!(response_stream);
                 while let Some(event) = response_stream.next().await {
                     match event {
-                        StreamingEvent::MessageStart { message } => {
-                            turn_usage_update.add(&message.usage.into_usage_delta());
-                        }
-                        StreamingEvent::UsageUpdate { usage } => turn_usage_update.add(&usage),
+                        StreamingEvent::MessageStart { .. } => {}
+                        StreamingEvent::UsageUpdate { .. } => {}
                         StreamingEvent::FinalizedMessage { message } => {
                             response = Some(message);
                         }
@@ -280,6 +277,7 @@ impl<UI: AjUi> Agent<UI> {
             }
 
             let response = response.expect("missing message");
+            let turn_usage = response.usage.clone();
 
             // Collect tool use blocks from the response
             let mut tool_calls = Vec::new();
@@ -298,27 +296,25 @@ impl<UI: AjUi> Agent<UI> {
 
             let usage = TokenUsage {
                 accumulated_input: self.session_state.accumulated_usage.input_tokens,
-                turn_input: turn_usage_update.input_tokens,
+                turn_input: turn_usage.input_tokens,
                 accumulated_output: self.session_state.accumulated_usage.output_tokens,
-                turn_output: turn_usage_update.output_tokens,
+                turn_output: turn_usage.output_tokens,
                 accumulated_cache_creation: self
                     .session_state
                     .accumulated_usage
                     .cache_creation_input_tokens
                     .unwrap_or(0),
-                turn_cache_creation: turn_usage_update.cache_creation_input_tokens.unwrap_or(0),
+                turn_cache_creation: turn_usage.cache_creation_input_tokens.unwrap_or(0),
                 accumulated_cache_read: self
                     .session_state
                     .accumulated_usage
                     .cache_read_input_tokens
                     .unwrap_or(0),
-                turn_cache_read: turn_usage_update.cache_read_input_tokens.unwrap_or(0),
+                turn_cache_read: turn_usage.cache_read_input_tokens.unwrap_or(0),
             };
             self.ui.display_token_usage(&usage);
 
-            self.session_state
-                .accumulated_usage
-                .add(&turn_usage_update.into_usage_delta());
+            self.session_state.accumulated_usage.add_usage(&turn_usage);
 
             // Execute tool calls if any
             if has_tool_use {

@@ -622,64 +622,71 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub fn add(&mut self, delta: &UsageDelta) {
-        if let Some(delta_cache_creation) = delta.cache_creation.as_ref() {
-            match &mut self.cache_creation {
-                Some(existing) => {
-                    existing.ephemeral_1h_input_tokens +=
-                        delta_cache_creation.ephemeral_1h_input_tokens;
-                    existing.ephemeral_5m_input_tokens +=
-                        delta_cache_creation.ephemeral_5m_input_tokens;
-                }
-                None => {
-                    self.cache_creation = Some(delta_cache_creation.clone());
-                }
-            }
+    /// Merge a cumulative [`UsageDelta`] (as carried by a streaming usage
+    /// update event) into this usage. Fields present in the delta REPLACE
+    /// the corresponding fields here; absent fields are preserved.
+    pub fn apply_delta(&mut self, delta: &UsageDelta) {
+        if let Some(cache_creation) = delta.cache_creation.as_ref() {
+            self.cache_creation = Some(cache_creation.clone());
         }
-
-        if let Some(delta_tokens) = delta.cache_creation_input_tokens {
-            self.cache_creation_input_tokens =
-                Some(self.cache_creation_input_tokens.unwrap_or(0) + delta_tokens);
+        if let Some(tokens) = delta.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = Some(tokens);
         }
-        if let Some(delta_tokens) = delta.cache_read_input_tokens {
-            self.cache_read_input_tokens =
-                Some(self.cache_read_input_tokens.unwrap_or(0) + delta_tokens);
+        if let Some(tokens) = delta.cache_read_input_tokens {
+            self.cache_read_input_tokens = Some(tokens);
         }
-
         if let Some(input_tokens) = delta.input_tokens {
-            self.input_tokens += input_tokens;
+            self.input_tokens = input_tokens;
         }
         if let Some(output_tokens) = delta.output_tokens {
-            self.output_tokens += output_tokens;
+            self.output_tokens = output_tokens;
         }
-
-        if let Some(delta_server_tool_use) = delta.server_tool_use.as_ref() {
-            match &mut self.server_tool_use {
-                Some(existing) => {
-                    existing.web_search_requests += delta_server_tool_use.web_search_requests;
-                }
-                None => {
-                    self.server_tool_use = Some(delta_server_tool_use.clone());
-                }
-            }
+        if let Some(server_tool_use) = delta.server_tool_use.as_ref() {
+            self.server_tool_use = Some(server_tool_use.clone());
         }
-
-        // Service tier is replaced, not accumulated (it's a configuration, not
-        // a counter)
         if let Some(service_tier) = delta.service_tier.as_ref() {
             self.service_tier = Some(service_tier.clone());
         }
     }
 
-    pub fn into_usage_delta(self) -> UsageDelta {
-        UsageDelta {
-            cache_creation: self.cache_creation,
-            cache_creation_input_tokens: self.cache_creation_input_tokens,
-            cache_read_input_tokens: self.cache_read_input_tokens,
-            input_tokens: Some(self.input_tokens),
-            output_tokens: Some(self.output_tokens),
-            server_tool_use: self.server_tool_use,
-            service_tier: self.service_tier,
+    /// Accumulate another [`Usage`] into this one, for tracking session-wide
+    /// usage across multiple turns. Counters are summed; `service_tier` is
+    /// replaced (configuration, not a counter).
+    pub fn add_usage(&mut self, other: &Usage) {
+        if let Some(other_cache_creation) = other.cache_creation.as_ref() {
+            match &mut self.cache_creation {
+                Some(existing) => {
+                    existing.ephemeral_1h_input_tokens +=
+                        other_cache_creation.ephemeral_1h_input_tokens;
+                    existing.ephemeral_5m_input_tokens +=
+                        other_cache_creation.ephemeral_5m_input_tokens;
+                }
+                None => {
+                    self.cache_creation = Some(other_cache_creation.clone());
+                }
+            }
+        }
+        if let Some(tokens) = other.cache_creation_input_tokens {
+            self.cache_creation_input_tokens =
+                Some(self.cache_creation_input_tokens.unwrap_or(0) + tokens);
+        }
+        if let Some(tokens) = other.cache_read_input_tokens {
+            self.cache_read_input_tokens = Some(self.cache_read_input_tokens.unwrap_or(0) + tokens);
+        }
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        if let Some(other_server_tool_use) = other.server_tool_use.as_ref() {
+            match &mut self.server_tool_use {
+                Some(existing) => {
+                    existing.web_search_requests += other_server_tool_use.web_search_requests;
+                }
+                None => {
+                    self.server_tool_use = Some(other_server_tool_use.clone());
+                }
+            }
+        }
+        if let Some(service_tier) = other.service_tier.as_ref() {
+            self.service_tier = Some(service_tier.clone());
         }
     }
 }

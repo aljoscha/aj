@@ -1162,67 +1162,34 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub fn add(&mut self, delta: &UsageDelta) {
-        if let Some(delta_cache_creation) = delta.cache_creation.as_ref() {
-            match &mut self.cache_creation {
-                Some(existing) => {
-                    existing.ephemeral_1h_input_tokens +=
-                        delta_cache_creation.ephemeral_1h_input_tokens;
-                    existing.ephemeral_5m_input_tokens +=
-                        delta_cache_creation.ephemeral_5m_input_tokens;
-                }
-                None => {
-                    self.cache_creation = Some(delta_cache_creation.clone());
-                }
-            }
+    /// Merge a cumulative [`UsageDelta`] (from a `message_delta` event) into
+    /// this usage. Per the API streaming docs, the token counts in a
+    /// `message_delta` event are cumulative, so fields present in the delta
+    /// REPLACE the corresponding fields here; absent fields are preserved.
+    pub fn apply_delta(&mut self, delta: &UsageDelta) {
+        if let Some(cache_creation) = delta.cache_creation.as_ref() {
+            self.cache_creation = Some(cache_creation.clone());
         }
-
-        if let Some(delta_tokens) = delta.cache_creation_input_tokens {
-            self.cache_creation_input_tokens =
-                Some(self.cache_creation_input_tokens.unwrap_or(0) + delta_tokens);
+        if let Some(tokens) = delta.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = Some(tokens);
         }
-        if let Some(delta_tokens) = delta.cache_read_input_tokens {
-            self.cache_read_input_tokens =
-                Some(self.cache_read_input_tokens.unwrap_or(0) + delta_tokens);
-        }
-
-        if let Some(input_tokens) = delta.input_tokens {
-            self.input_tokens += input_tokens;
-        }
-        if let Some(output_tokens) = delta.output_tokens {
-            self.output_tokens += output_tokens;
-        }
-
-        if let Some(delta_server_tool_use) = delta.server_tool_use.as_ref() {
-            match &mut self.server_tool_use {
-                Some(existing) => {
-                    existing.web_search_requests += delta_server_tool_use.web_search_requests;
-                }
-                None => {
-                    self.server_tool_use = Some(delta_server_tool_use.clone());
-                }
-            }
-        }
-
-        // Replace, not accumulate.
-        if let Some(service_tier) = delta.service_tier.as_ref() {
-            self.service_tier = Some(service_tier.clone());
+        if let Some(tokens) = delta.cache_read_input_tokens {
+            self.cache_read_input_tokens = Some(tokens);
         }
         if delta.inference_geo.is_some() {
             self.inference_geo.clone_from(&delta.inference_geo);
         }
-    }
-
-    pub fn into_usage_delta(self) -> UsageDelta {
-        UsageDelta {
-            cache_creation: self.cache_creation,
-            cache_creation_input_tokens: self.cache_creation_input_tokens,
-            cache_read_input_tokens: self.cache_read_input_tokens,
-            inference_geo: self.inference_geo,
-            input_tokens: Some(self.input_tokens),
-            output_tokens: Some(self.output_tokens),
-            server_tool_use: self.server_tool_use,
-            service_tier: self.service_tier,
+        if let Some(input_tokens) = delta.input_tokens {
+            self.input_tokens = input_tokens;
+        }
+        if let Some(output_tokens) = delta.output_tokens {
+            self.output_tokens = output_tokens;
+        }
+        if let Some(server_tool_use) = delta.server_tool_use.as_ref() {
+            self.server_tool_use = Some(server_tool_use.clone());
+        }
+        if let Some(service_tier) = delta.service_tier.as_ref() {
+            self.service_tier = Some(service_tier.clone());
         }
     }
 }

@@ -524,7 +524,7 @@ fn usage_from_response(
 ) -> Usage {
     let mut result = Usage::default();
     if let Some(usage) = usage {
-        result.add(&usage_delta_from_response(usage, service_tier));
+        result.apply_delta(&usage_delta_from_response(usage, service_tier));
     } else if let Some(service_tier) = service_tier {
         result.service_tier = Some(service_tier.clone().into());
     }
