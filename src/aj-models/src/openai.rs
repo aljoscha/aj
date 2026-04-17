@@ -1101,6 +1101,12 @@ mod tests {
             }),
             service_tier: Some(OpenAIServiceTier::Priority),
             tool_choice: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            safety_identifier: None,
+            top_logprobs: None,
+            #[allow(deprecated)]
+            user: None,
         };
 
         let (message, parse_events) = response_to_message(response);

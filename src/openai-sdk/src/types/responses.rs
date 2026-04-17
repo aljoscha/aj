@@ -17,7 +17,7 @@ pub struct CreateResponseRequest {
     pub input: ResponseInput,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
+    pub instructions: Option<ResponseInstructions>,
 
     // Tools
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -152,6 +152,26 @@ impl Default for CreateResponseRequest {
 pub enum ResponseInput {
     String(String),
     Items(Vec<ResponseInputItem>),
+}
+
+/// Instructions for a response: either a plain string or a list of input items.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum ResponseInstructions {
+    String(String),
+    Items(Vec<ResponseInputItem>),
+}
+
+impl From<String> for ResponseInstructions {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for ResponseInstructions {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
 }
 
 /// An input item in the response request.
@@ -319,7 +339,7 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
+    pub instructions: Option<ResponseInstructions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,6 +362,18 @@ pub struct Response {
     pub service_tier: Option<ServiceTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ResponseToolChoice>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[deprecated(note = "Use safety_identifier and prompt_cache_key instead")]
+    pub user: Option<String>,
 }
 
 impl Response {
@@ -717,10 +749,22 @@ pub enum Truncation {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ResponseIncludable {
+    #[serde(rename = "file_search_call.results")]
+    FileSearchCallResults,
+    #[serde(rename = "web_search_call.results")]
+    WebSearchCallResults,
+    #[serde(rename = "web_search_call.action.sources")]
+    WebSearchCallActionSources,
+    #[serde(rename = "message.input_image.image_url")]
+    MessageInputImageImageUrl,
+    #[serde(rename = "computer_call_output.output.image_url")]
+    ComputerCallOutputOutputImageUrl,
+    #[serde(rename = "code_interpreter_call.outputs")]
+    CodeInterpreterCallOutputs,
     #[serde(rename = "reasoning.encrypted_content")]
     ReasoningEncryptedContent,
-    #[serde(rename = "reasoning.content")]
-    ReasoningContent,
+    #[serde(rename = "message.output_text.logprobs")]
+    MessageOutputTextLogprobs,
     /// Catch-all for includable values we don't explicitly model.
     #[serde(untagged)]
     Other(String),
