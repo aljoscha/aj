@@ -139,6 +139,8 @@ pub enum ContentBlockParam {
     TextEditorCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "tool_search_tool_result")]
     ToolSearchToolResultBlock { content: Value, tool_use_id: String },
+    #[serde(rename = "advisor_tool_result")]
+    AdvisorToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "mcp_tool_use")]
     MCPToolUseBlock {
         id: String,
@@ -450,6 +452,8 @@ pub enum ContentBlock {
     TextEditorCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "tool_search_tool_result")]
     ToolSearchToolResultBlock { content: Value, tool_use_id: String },
+    #[serde(rename = "advisor_tool_result")]
+    AdvisorToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "mcp_tool_use")]
     MCPToolUseBlock {
         id: String,
@@ -556,6 +560,13 @@ impl ContentBlock {
                 content,
                 tool_use_id,
             } => ContentBlockParam::ToolSearchToolResultBlock {
+                content,
+                tool_use_id,
+            },
+            ContentBlock::AdvisorToolResultBlock {
+                content,
+                tool_use_id,
+            } => ContentBlockParam::AdvisorToolResultBlock {
                 content,
                 tool_use_id,
             },

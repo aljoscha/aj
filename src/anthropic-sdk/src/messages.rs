@@ -204,6 +204,13 @@ pub enum ContentBlockParam {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "advisor_tool_result")]
+    AdvisorToolResultBlock {
+        content: Value,
+        tool_use_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "mcp_tool_use")]
     MCPToolUseBlock {
         id: String,
@@ -275,6 +282,7 @@ impl ContentBlockParam {
             ContentBlockParam::ToolSearchToolResultBlock { cache_control, .. } => {
                 Some(cache_control)
             }
+            ContentBlockParam::AdvisorToolResultBlock { cache_control, .. } => Some(cache_control),
             ContentBlockParam::MCPToolUseBlock { cache_control, .. } => Some(cache_control),
             ContentBlockParam::MCPToolResultBlock { cache_control, .. } => Some(cache_control),
             ContentBlockParam::ContainerUploadBlock { cache_control, .. } => Some(cache_control),
@@ -629,6 +637,55 @@ pub enum ToolUnion {
         strict: Option<bool>,
     },
 
+    /// Computer use tool (Anthropic-defined, client-executed).
+    /// Requires beta header `computer-use-2025-11-24`.
+    #[serde(rename = "computer_20251124")]
+    ComputerUse {
+        name: ComputerToolName,
+        display_width_px: u64,
+        display_height_px: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_number: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        enable_zoom: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        allowed_callers: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        input_examples: Vec<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+
+    /// Advisor server tool — consults a higher-intelligence advisor model
+    /// mid-generation. Requires beta header `advisor-tool-2026-03-01`.
+    #[serde(rename = "advisor_20260301")]
+    Advisor {
+        name: AdvisorToolName,
+        /// Advisor model ID, e.g. `"claude-opus-4-7"`.
+        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u64>,
+        /// Enables prompt caching for the advisor's own transcript.
+        /// Unlike `cache_control`, this is an on/off switch, not a breakpoint.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caching: Option<CacheControl>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        allowed_callers: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+
     /// Bash tool (Anthropic-defined, client-executed).
     #[serde(rename = "bash_20250124")]
     Bash {
@@ -754,6 +811,18 @@ pub enum CodeExecutionToolName {
 pub enum BashToolName {
     #[serde(rename = "bash")]
     Bash,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ComputerToolName {
+    #[serde(rename = "computer")]
+    Computer,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum AdvisorToolName {
+    #[serde(rename = "advisor")]
+    Advisor,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -963,6 +1032,8 @@ pub enum ContentBlock {
     TextEditorCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "tool_search_tool_result")]
     ToolSearchToolResultBlock { content: Value, tool_use_id: String },
+    #[serde(rename = "advisor_tool_result")]
+    AdvisorToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "mcp_tool_use")]
     MCPToolUseBlock {
         id: String,
@@ -1073,6 +1144,14 @@ impl ContentBlock {
                 content,
                 tool_use_id,
             } => ContentBlockParam::ToolSearchToolResultBlock {
+                content,
+                tool_use_id,
+                cache_control: None,
+            },
+            ContentBlock::AdvisorToolResultBlock {
+                content,
+                tool_use_id,
+            } => ContentBlockParam::AdvisorToolResultBlock {
                 content,
                 tool_use_id,
                 cache_control: None,

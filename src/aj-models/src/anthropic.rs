@@ -294,6 +294,14 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                 tool_use_id: tool_use_id.clone(),
                 cache_control: None,
             },
+            ContentBlockParam::AdvisorToolResultBlock {
+                content,
+                tool_use_id,
+            } => AnthropicContentBlockParam::AdvisorToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+                cache_control: None,
+            },
             ContentBlockParam::MCPToolUseBlock {
                 id,
                 input,
@@ -805,6 +813,13 @@ impl From<AnthropicContentBlock> for ContentBlock {
                 content,
                 tool_use_id,
             } => Self::ToolSearchToolResultBlock {
+                content: content.clone(),
+                tool_use_id: tool_use_id.clone(),
+            },
+            AnthropicContentBlock::AdvisorToolResultBlock {
+                content,
+                tool_use_id,
+            } => Self::AdvisorToolResultBlock {
                 content: content.clone(),
                 tool_use_id: tool_use_id.clone(),
             },
