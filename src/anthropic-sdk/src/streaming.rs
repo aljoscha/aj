@@ -116,6 +116,12 @@ impl StreamProcessor {
 
                 message.stop_reason = delta.stop_reason;
                 message.stop_sequence = delta.stop_sequence;
+                if delta.container.is_some() {
+                    message.container = delta.container;
+                }
+                if delta.stop_details.is_some() {
+                    message.stop_details = delta.stop_details;
+                }
 
                 message.usage.apply_delta(&usage);
 

@@ -697,6 +697,7 @@ fn response_to_message(response: Response) -> (Message, Vec<StreamingEvent>) {
         model: response.model,
         stop_reason: Some(stop_reason),
         stop_sequence: None,
+        stop_details: None,
         usage: usage_from_response(response.usage.as_ref(), response.service_tier.as_ref()),
         container: None,
     };
@@ -915,6 +916,7 @@ impl OpenAiResponsesStreamProcessor {
                 model: response.model.clone(),
                 stop_reason: None,
                 stop_sequence: None,
+                stop_details: None,
                 usage: usage_from_response(None, response.service_tier.as_ref()),
                 container: None,
             },

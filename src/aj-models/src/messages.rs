@@ -377,9 +377,25 @@ pub struct Message {
     pub stop_reason: Option<StopReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<StopDetails>,
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<Container>,
+}
+
+/// Structured details about why the model stopped (currently only refusal).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum StopDetails {
+    #[serde(rename = "refusal")]
+    Refusal {
+        /// Policy category, e.g. `"cyber"` or `"bio"`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+    },
 }
 
 impl Message {
@@ -702,6 +718,7 @@ impl Usage {
             match &mut self.server_tool_use {
                 Some(existing) => {
                     existing.web_search_requests += other_server_tool_use.web_search_requests;
+                    existing.web_fetch_requests += other_server_tool_use.web_fetch_requests;
                 }
                 None => {
                     self.server_tool_use = Some(other_server_tool_use.clone());
@@ -726,6 +743,8 @@ pub struct CacheCreation {
 pub struct ServerToolUsage {
     #[serde(default)]
     pub web_search_requests: u64,
+    #[serde(default)]
+    pub web_fetch_requests: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -1303,6 +1303,8 @@ pub struct CacheCreation {
 pub struct ServerToolUsage {
     #[serde(default)]
     pub web_search_requests: u64,
+    #[serde(default)]
+    pub web_fetch_requests: u64,
 }
 
 /// Response-side service tier (which tier was actually used).
@@ -1422,6 +1424,10 @@ pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<StopDetails>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -7,9 +7,10 @@ use anthropic_sdk::messages::{
     Message as AnthropicMessage, MessageParam as AnthropicMessageParam,
     MessageType as AnthropicMessageType, Messages, OutputConfig, OutputEffort,
     Role as AnthropicRole, ServerToolUsage as AnthropicServerToolUsage,
-    ServiceTier as AnthropicServiceTier, StopReason as AnthropicStopReason,
-    Thinking as AnthropicThinking, ToolResultContent as AnthropicToolResultContent, ToolUnion,
-    Usage as AnthropicUsage, UsageDelta as AnthropicUsageDelta,
+    ServiceTier as AnthropicServiceTier, StopDetails as AnthropicStopDetails,
+    StopReason as AnthropicStopReason, Thinking as AnthropicThinking,
+    ToolResultContent as AnthropicToolResultContent, ToolUnion, Usage as AnthropicUsage,
+    UsageDelta as AnthropicUsageDelta,
     WebSearchToolResultContent as AnthropicWebSearchToolResultContent,
 };
 use anthropic_sdk::streaming::StreamingEvent as AnthropicStreamingEvent;
@@ -20,7 +21,8 @@ use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind
 use crate::messages::{
     ApiError, CacheCreation, Caller, Citation, Container, ContentBlock, ContentBlockParam,
     DocumentSource, ImageSource, Message, MessageParam, MessageType, Role, ServerToolUsage,
-    ServiceTier, StopReason, ToolResultContent, Usage, UsageDelta, WebSearchToolResultContent,
+    ServiceTier, StopDetails, StopReason, ToolResultContent, Usage, UsageDelta,
+    WebSearchToolResultContent,
 };
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
@@ -679,7 +681,7 @@ impl From<AnthropicMessage> for Message {
             model,
             stop_reason,
             stop_sequence,
-            stop_details: _,
+            stop_details,
             usage,
             container,
         } = message;
@@ -692,8 +694,23 @@ impl From<AnthropicMessage> for Message {
             model,
             stop_reason: stop_reason.map(Into::into),
             stop_sequence,
+            stop_details: stop_details.map(Into::into),
             usage: usage.into(),
             container: container.map(Into::into),
+        }
+    }
+}
+
+impl From<AnthropicStopDetails> for StopDetails {
+    fn from(stop_details: AnthropicStopDetails) -> Self {
+        match stop_details {
+            AnthropicStopDetails::Refusal {
+                category,
+                explanation,
+            } => Self::Refusal {
+                category,
+                explanation,
+            },
         }
     }
 }
@@ -924,10 +941,12 @@ impl From<AnthropicServerToolUsage> for ServerToolUsage {
     fn from(tool_usage: AnthropicServerToolUsage) -> Self {
         let AnthropicServerToolUsage {
             web_search_requests,
+            web_fetch_requests,
         } = tool_usage;
 
         Self {
             web_search_requests,
+            web_fetch_requests,
         }
     }
 }
