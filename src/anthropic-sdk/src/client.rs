@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use reqwest;
-use reqwest::{Client as ReqwestClient, StatusCode};
+use reqwest::Client as ReqwestClient;
 use thiserror::Error;
 
 use crate::messages::{ApiError, ApiErrorResponse, Message, Messages, ServerSentEvent};
@@ -129,30 +129,24 @@ impl Client {
 
         let response = response?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let json_text = response
-                    .text()
-                    .await
-                    .context("failed to read response text")?;
-                let response: Message = serde_json::from_str(&json_text)?;
-                Ok(response)
+        let status = response.status();
+        if status.is_success() {
+            let json_text = response
+                .text()
+                .await
+                .context("failed to read response text")?;
+            let response: Message = serde_json::from_str(&json_text)?;
+            return Ok(response);
+        }
+
+        let error_text = response.text().await?;
+        if status.is_client_error() || status.is_server_error() {
+            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+                Ok(error_response) => Err(anyhow!(error_response.error)),
+                Err(_) => Err(anyhow!("request failed ({status}): {}", error_text)),
             }
-            StatusCode::BAD_REQUEST
-            | StatusCode::UNAUTHORIZED
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_text = response.text().await?;
-                match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(anyhow!(error_response.error)),
-                    Err(_) => Err(anyhow!("request failed: {}", error_text)),
-                }
-            }
-            _ => {
-                let error_message = format!("unexpected status code: {:?}", response.text().await?);
-                Err(anyhow!(error_message))
-            }
+        } else {
+            Err(anyhow!("unexpected status code ({status}): {}", error_text))
         }
     }
 
@@ -166,55 +160,48 @@ impl Client {
 
         let response = request_builder.send().await?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let stream = response.bytes_stream().eventsource();
+        let status = response.status();
+        if status.is_success() {
+            let stream = response.bytes_stream().eventsource();
 
-                let stream = stream.filter_map(|event| async move {
-                    match event {
-                        Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
-                            Ok(json_event) => Some(json_event),
-                            Err(err) => {
-                                // The API versioning policy reserves the right
-                                // to add new event types; skip anything we
-                                // can't parse rather than crashing the stream.
-                                tracing::warn!(
-                                    "could not parse server-sent event, skipping: \
-                                     error={err}, data={}",
-                                    event.data
-                                );
-                                None
-                            }
-                        },
-                        Err(e) => {
-                            tracing::error!("event-stream error: {e}");
+            let stream = stream.filter_map(|event| async move {
+                match event {
+                    Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
+                        Ok(json_event) => Some(json_event),
+                        Err(err) => {
+                            // The API versioning policy reserves the right
+                            // to add new event types; skip anything we
+                            // can't parse rather than crashing the stream.
+                            tracing::warn!(
+                                "could not parse server-sent event, skipping: \
+                                 error={err}, data={}",
+                                event.data
+                            );
                             None
                         }
+                    },
+                    Err(e) => {
+                        tracing::error!("event-stream error: {e}");
+                        None
                     }
-                });
-                Ok(stream.boxed())
-            }
-            StatusCode::BAD_REQUEST
-            | StatusCode::UNAUTHORIZED
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_text = response.text().await?;
-                match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(error_response.error.into()),
-                    Err(_) => Err(ApiError::ApiError {
-                        message: error_text,
-                    }
-                    .into()),
                 }
+            });
+            return Ok(stream.boxed());
+        }
+
+        let error_text = response.text().await?;
+        if status.is_client_error() || status.is_server_error() {
+            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+                Ok(error_response) => Err(error_response.error.into()),
+                Err(_) => Err(ApiError::ApiError {
+                    message: format!("request failed ({status}): {error_text}"),
+                }
+                .into()),
             }
-            status_code => {
-                let error_message = format!(
-                    "unexpected status code ({status_code}), response text: {:?}",
-                    response.text().await?
-                );
-                Err(ClientError::InternalError(error_message))
-            }
+        } else {
+            Err(ClientError::InternalError(format!(
+                "unexpected status code ({status}): {error_text}"
+            )))
         }
     }
 
