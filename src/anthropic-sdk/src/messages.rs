@@ -150,6 +150,7 @@ pub enum ContentBlockParam {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
         content: ToolResultContent,
+        #[serde(default)]
         is_error: bool,
     },
     #[serde(rename = "server_tool_use")]
@@ -692,7 +693,8 @@ pub enum ToolUnion {
     #[serde(rename = "custom")]
     Custom {
         name: String,
-        description: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         input_schema: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
@@ -1222,8 +1224,6 @@ pub enum ContentBlock {
     },
     #[serde(rename = "container_upload")]
     ContainerUploadBlock { file_id: String },
-    #[serde(rename = "tool_reference")]
-    ToolReferenceBlock { tool_name: String },
     #[serde(rename = "thinking")]
     ThinkingBlock { signature: String, thinking: String },
     #[serde(rename = "redacted_thinking")]
@@ -1364,10 +1364,6 @@ impl ContentBlock {
                     cache_control: None,
                 }
             }
-            ContentBlock::ToolReferenceBlock { tool_name } => ContentBlockParam::ToolReference {
-                tool_name,
-                cache_control: None,
-            },
             ContentBlock::ThinkingBlock {
                 signature,
                 thinking,

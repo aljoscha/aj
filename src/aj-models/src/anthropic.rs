@@ -377,7 +377,7 @@ impl From<Tool> for ToolUnion {
 
         ToolUnion::Custom {
             name,
-            description,
+            description: Some(description),
             input_schema,
             cache_control: None,
             allowed_callers: Vec::new(),
@@ -911,9 +911,6 @@ impl From<AnthropicContentBlock> for ContentBlock {
             },
             AnthropicContentBlock::ContainerUploadBlock { file_id } => Self::ContainerUploadBlock {
                 file_id: file_id.clone(),
-            },
-            AnthropicContentBlock::ToolReferenceBlock { tool_name } => Self::ToolReferenceBlock {
-                tool_name: tool_name.clone(),
             },
             AnthropicContentBlock::CompactionBlock {
                 content,

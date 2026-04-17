@@ -106,6 +106,7 @@ pub enum ContentBlockParam {
     ToolResultBlock {
         tool_use_id: String,
         content: ToolResultContent,
+        #[serde(default)]
         is_error: bool,
     },
     #[serde(rename = "server_tool_use")]
@@ -499,8 +500,6 @@ pub enum ContentBlock {
     },
     #[serde(rename = "container_upload")]
     ContainerUploadBlock { file_id: String },
-    #[serde(rename = "tool_reference")]
-    ToolReferenceBlock { tool_name: String },
     #[serde(rename = "thinking")]
     ThinkingBlock { signature: String, thinking: String },
     #[serde(rename = "redacted_thinking")]
@@ -631,9 +630,6 @@ impl ContentBlock {
             },
             ContentBlock::ContainerUploadBlock { file_id } => {
                 ContentBlockParam::ContainerUploadBlock { file_id }
-            }
-            ContentBlock::ToolReferenceBlock { tool_name } => {
-                ContentBlockParam::ToolReference { tool_name }
             }
             ContentBlock::ThinkingBlock {
                 signature,
