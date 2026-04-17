@@ -227,6 +227,15 @@ pub enum ContentBlockParam {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    /// Reference to a tool discovered via tool search. Used both as content
+    /// inside a custom `tool_result` (for client-side tool search) and
+    /// nested inside a server-side `tool_search_tool_result`.
+    #[serde(rename = "tool_reference")]
+    ToolReference {
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
 }
 
 impl ContentBlockParam {
@@ -269,6 +278,7 @@ impl ContentBlockParam {
             ContentBlockParam::MCPToolUseBlock { cache_control, .. } => Some(cache_control),
             ContentBlockParam::MCPToolResultBlock { cache_control, .. } => Some(cache_control),
             ContentBlockParam::ContainerUploadBlock { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::ToolReference { cache_control, .. } => Some(cache_control),
         };
 
         if let Some(field) = field {
@@ -968,6 +978,8 @@ pub enum ContentBlock {
     },
     #[serde(rename = "container_upload")]
     ContainerUploadBlock { file_id: String },
+    #[serde(rename = "tool_reference")]
+    ToolReferenceBlock { tool_name: String },
     #[serde(rename = "thinking")]
     ThinkingBlock { signature: String, thinking: String },
     #[serde(rename = "redacted_thinking")]
@@ -1093,6 +1105,10 @@ impl ContentBlock {
                     cache_control: None,
                 }
             }
+            ContentBlock::ToolReferenceBlock { tool_name } => ContentBlockParam::ToolReference {
+                tool_name,
+                cache_control: None,
+            },
             ContentBlock::ThinkingBlock {
                 signature,
                 thinking,

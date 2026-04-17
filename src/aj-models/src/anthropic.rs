@@ -322,6 +322,12 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                     cache_control: None,
                 }
             }
+            ContentBlockParam::ToolReference { tool_name } => {
+                AnthropicContentBlockParam::ToolReference {
+                    tool_name: tool_name.clone(),
+                    cache_control: None,
+                }
+            }
         }
     }
 }
@@ -824,6 +830,9 @@ impl From<AnthropicContentBlock> for ContentBlock {
             },
             AnthropicContentBlock::ContainerUploadBlock { file_id } => Self::ContainerUploadBlock {
                 file_id: file_id.clone(),
+            },
+            AnthropicContentBlock::ToolReferenceBlock { tool_name } => Self::ToolReferenceBlock {
+                tool_name: tool_name.clone(),
             },
         }
     }

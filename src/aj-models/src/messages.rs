@@ -154,6 +154,11 @@ pub enum ContentBlockParam {
     },
     #[serde(rename = "container_upload")]
     ContainerUploadBlock { file_id: String },
+    /// Reference to a tool discovered via tool search. Used as content
+    /// inside a custom `tool_result` (for client-side tool search) or
+    /// nested inside a server-side `tool_search_tool_result`.
+    #[serde(rename = "tool_reference")]
+    ToolReference { tool_name: String },
 }
 
 impl ContentBlockParam {
@@ -460,6 +465,8 @@ pub enum ContentBlock {
     },
     #[serde(rename = "container_upload")]
     ContainerUploadBlock { file_id: String },
+    #[serde(rename = "tool_reference")]
+    ToolReferenceBlock { tool_name: String },
     #[serde(rename = "thinking")]
     ThinkingBlock { signature: String, thinking: String },
     #[serde(rename = "redacted_thinking")]
@@ -574,6 +581,9 @@ impl ContentBlock {
             },
             ContentBlock::ContainerUploadBlock { file_id } => {
                 ContentBlockParam::ContainerUploadBlock { file_id }
+            }
+            ContentBlock::ToolReferenceBlock { tool_name } => {
+                ContentBlockParam::ToolReference { tool_name }
             }
             ContentBlock::ThinkingBlock {
                 signature,
