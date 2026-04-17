@@ -75,6 +75,7 @@ impl<UI: AjUi> Agent<UI> {
             ConfigThinkingLevel::Medium => Some(ThinkingConfig::Medium),
             ConfigThinkingLevel::High => Some(ThinkingConfig::High),
             ConfigThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
+            ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
         });
 
         Self {
@@ -434,6 +435,8 @@ impl<UI: AjUi> Agent<UI> {
 
             // Check for trigger phrases in order of specificity.
             if text_lower.contains("think maximum") {
+                return Some(ThinkingConfig::Max);
+            } else if text_lower.contains("think hardest") {
                 return Some(ThinkingConfig::XHigh);
             } else if text_lower.contains("think harder") {
                 return Some(ThinkingConfig::High);

@@ -479,6 +479,8 @@ impl From<ThinkingConfig> for ReasoningEffort {
             ThinkingConfig::Medium => ReasoningEffort::Medium,
             ThinkingConfig::High => ReasoningEffort::High,
             ThinkingConfig::XHigh => ReasoningEffort::XHigh,
+            // OpenAI's effort ladder tops out at xhigh; collapse Max onto it.
+            ThinkingConfig::Max => ReasoningEffort::XHigh,
         }
     }
 }

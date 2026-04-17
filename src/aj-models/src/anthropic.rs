@@ -649,7 +649,8 @@ fn output_config_for_thinking(thinking: &Option<ThinkingConfig>) -> Option<Outpu
         Some(ThinkingConfig::Low) => OutputEffort::Low,
         Some(ThinkingConfig::Medium) => OutputEffort::Medium,
         Some(ThinkingConfig::High) => OutputEffort::High,
-        Some(ThinkingConfig::XHigh) => OutputEffort::Max,
+        Some(ThinkingConfig::XHigh) => OutputEffort::XHigh,
+        Some(ThinkingConfig::Max) => OutputEffort::Max,
         None => return None,
     };
     Some(OutputConfig {

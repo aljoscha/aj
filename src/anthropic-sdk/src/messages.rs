@@ -889,6 +889,8 @@ pub enum OutputEffort {
     Medium,
     #[serde(rename = "high")]
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
     #[serde(rename = "max")]
     Max,
 }

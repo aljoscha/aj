@@ -19,6 +19,7 @@ pub enum ConfigThinkingLevel {
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 impl fmt::Display for ConfigThinkingLevel {
@@ -29,6 +30,7 @@ impl fmt::Display for ConfigThinkingLevel {
             ConfigThinkingLevel::Medium => write!(f, "medium"),
             ConfigThinkingLevel::High => write!(f, "high"),
             ConfigThinkingLevel::XHigh => write!(f, "xhigh"),
+            ConfigThinkingLevel::Max => write!(f, "max"),
         }
     }
 }
@@ -43,8 +45,9 @@ impl FromStr for ConfigThinkingLevel {
             "medium" => Ok(ConfigThinkingLevel::Medium),
             "high" => Ok(ConfigThinkingLevel::High),
             "xhigh" => Ok(ConfigThinkingLevel::XHigh),
+            "max" => Ok(ConfigThinkingLevel::Max),
             _ => Err(format!(
-                "invalid thinking level '{s}': expected off, low, medium, high, or xhigh"
+                "invalid thinking level '{s}': expected off, low, medium, high, xhigh, or max"
             )),
         }
     }
@@ -330,6 +333,7 @@ thinking = "medium"
             ("medium", ConfigThinkingLevel::Medium),
             ("high", ConfigThinkingLevel::High),
             ("xhigh", ConfigThinkingLevel::XHigh),
+            ("max", ConfigThinkingLevel::Max),
         ] {
             let toml_str = format!("thinking = \"{input}\"");
             let config: Config = toml::from_str(&toml_str).unwrap();
@@ -361,6 +365,7 @@ thinking = "medium"
         assert_eq!(ConfigThinkingLevel::Medium.to_string(), "medium");
         assert_eq!(ConfigThinkingLevel::High.to_string(), "high");
         assert_eq!(ConfigThinkingLevel::XHigh.to_string(), "xhigh");
+        assert_eq!(ConfigThinkingLevel::Max.to_string(), "max");
     }
 
     #[test]
