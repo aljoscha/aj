@@ -711,6 +711,7 @@ impl From<AnthropicStopReason> for StopReason {
             AnthropicStopReason::ToolUse => Self::ToolUse,
             AnthropicStopReason::PauseTurn => Self::PauseTurn,
             AnthropicStopReason::Refusal => Self::Refusal,
+            AnthropicStopReason::ModelContextWindowExceeded => Self::ModelContextWindowExceeded,
         }
     }
 }

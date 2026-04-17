@@ -603,6 +603,8 @@ pub enum StopReason {
     PauseTurn,
     #[serde(rename = "refusal")]
     Refusal,
+    #[serde(rename = "model_context_window_exceeded")]
+    ModelContextWindowExceeded,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
