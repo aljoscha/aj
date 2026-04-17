@@ -514,9 +514,11 @@ fn usage_delta_from_response(
         cache_creation_input_tokens: None,
         cache_read_input_tokens: Some(cached_tokens),
         input_tokens: Some(input_tokens),
+        iterations: None,
         output_tokens: Some(u64::from(usage.output_tokens)),
         server_tool_use: None,
         service_tier: service_tier.cloned().map(Into::into),
+        speed: None,
     }
 }
 

@@ -1,7 +1,8 @@
 use aj::SYSTEM_PROMPT;
 use aj::cli::AjCli;
 use aj_agent::Agent;
-use aj_conf::{AgentEnv, Config};
+use aj_conf::{AgentEnv, Config, ConfigSpeed};
+use aj_models::messages::Speed;
 use aj_models::{ModelArgs, conversation::ConversationPersistence, create_model};
 use aj_tools::get_builtin_tools;
 use aj_ui::AjUi;
@@ -24,6 +25,12 @@ struct Cli {
     /// Model name to use.
     #[arg(long, env)]
     model_name: Option<String>,
+
+    /// Inference speed mode: `standard` (default) or `fast` (Anthropic
+    /// beta `speed` parameter; requires the `fast-inference-2025-10-02`
+    /// beta header).
+    #[arg(long, env)]
+    speed: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -91,6 +98,15 @@ async fn main() -> Result<()> {
     let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
 
+    let speed = match cli.speed {
+        Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
+        None => config.speed,
+    }
+    .map(|s| match s {
+        ConfigSpeed::Standard => Speed::Standard,
+        ConfigSpeed::Fast => Speed::Fast,
+    });
+
     let model_args = ModelArgs {
         api: cli
             .model_api
@@ -98,6 +114,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "anthropic".to_string()),
         url: cli.model_url.or(config.model_url),
         model_name: cli.model_name.or(config.model_name),
+        speed,
     };
     let model = create_model(model_args)?;
 

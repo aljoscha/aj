@@ -21,6 +21,8 @@ pub struct Messages {
     pub metadata: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -653,11 +655,15 @@ pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
     pub input_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<Vec<UsageIteration>>,
     pub output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
 }
 
 impl Usage {
@@ -677,6 +683,9 @@ impl Usage {
         if let Some(input_tokens) = delta.input_tokens {
             self.input_tokens = input_tokens;
         }
+        if let Some(iterations) = delta.iterations.as_ref() {
+            self.iterations = Some(iterations.clone());
+        }
         if let Some(output_tokens) = delta.output_tokens {
             self.output_tokens = output_tokens;
         }
@@ -685,6 +694,9 @@ impl Usage {
         }
         if let Some(service_tier) = delta.service_tier.as_ref() {
             self.service_tier = Some(service_tier.clone());
+        }
+        if let Some(speed) = delta.speed.as_ref() {
+            self.speed = Some(speed.clone());
         }
     }
 
@@ -728,6 +740,14 @@ impl Usage {
         if let Some(service_tier) = other.service_tier.as_ref() {
             self.service_tier = Some(service_tier.clone());
         }
+        if let Some(speed) = other.speed.as_ref() {
+            self.speed = Some(speed.clone());
+        }
+        if let Some(other_iterations) = other.iterations.as_ref() {
+            self.iterations
+                .get_or_insert_with(Vec::new)
+                .extend(other_iterations.iter().cloned());
+        }
     }
 }
 
@@ -747,6 +767,41 @@ pub struct ServerToolUsage {
     pub web_fetch_requests: u64,
 }
 
+/// Per-iteration token usage for a single sampling iteration within a
+/// request (e.g. server-side tool loops, autocompact, advisor calls).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum UsageIteration {
+    #[serde(rename = "message")]
+    Message {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation: Option<CacheCreation>,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    #[serde(rename = "compaction")]
+    Compaction {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation: Option<CacheCreation>,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    #[serde(rename = "advisor_message")]
+    AdvisorMessage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation: Option<CacheCreation>,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        model: String,
+    },
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServiceTier {
     #[serde(rename = "standard")]
@@ -755,6 +810,16 @@ pub enum ServiceTier {
     Priority,
     #[serde(rename = "batch")]
     Batch,
+}
+
+/// Inference speed mode (beta `speed` request parameter and the
+/// `speed` field the API reports back in Usage).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum Speed {
+    #[serde(rename = "standard")]
+    Standard,
+    #[serde(rename = "fast")]
+    Fast,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -851,9 +916,13 @@ pub struct UsageDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<Vec<UsageIteration>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
 }

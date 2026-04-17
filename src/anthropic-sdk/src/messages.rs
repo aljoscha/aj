@@ -35,6 +35,8 @@ pub struct Messages {
     pub output_config: Option<OutputConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<RequestServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -926,6 +928,16 @@ pub enum RequestServiceTier {
     StandardOnly,
 }
 
+/// Inference speed mode for the request. `Fast` enables higher
+/// output-tokens-per-second at some quality cost.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum Speed {
+    #[serde(rename = "standard")]
+    Standard,
+    #[serde(rename = "fast")]
+    Fast,
+}
+
 // ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
@@ -1251,11 +1263,15 @@ pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_geo: Option<String>,
     pub input_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<Vec<UsageIteration>>,
     pub output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
 }
 
 impl Usage {
@@ -1279,6 +1295,9 @@ impl Usage {
         if let Some(input_tokens) = delta.input_tokens {
             self.input_tokens = input_tokens;
         }
+        if let Some(iterations) = delta.iterations.as_ref() {
+            self.iterations = Some(iterations.clone());
+        }
         if let Some(output_tokens) = delta.output_tokens {
             self.output_tokens = output_tokens;
         }
@@ -1287,6 +1306,9 @@ impl Usage {
         }
         if let Some(service_tier) = delta.service_tier.as_ref() {
             self.service_tier = Some(service_tier.clone());
+        }
+        if let Some(speed) = delta.speed.as_ref() {
+            self.speed = Some(speed.clone());
         }
     }
 }
@@ -1305,6 +1327,42 @@ pub struct ServerToolUsage {
     pub web_search_requests: u64,
     #[serde(default)]
     pub web_fetch_requests: u64,
+}
+
+/// Per-iteration token usage for a single sampling iteration within the
+/// request. Reported on `Usage.iterations` when server-side tool loops or
+/// autocompact produce multiple inference passes.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum UsageIteration {
+    #[serde(rename = "message")]
+    Message {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation: Option<CacheCreation>,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    #[serde(rename = "compaction")]
+    Compaction {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation: Option<CacheCreation>,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    #[serde(rename = "advisor_message")]
+    AdvisorMessage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation: Option<CacheCreation>,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        model: String,
+    },
 }
 
 /// Response-side service tier (which tier was actually used).
@@ -1458,9 +1516,13 @@ pub struct UsageDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<Vec<UsageIteration>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
 }

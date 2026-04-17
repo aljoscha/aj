@@ -7,10 +7,11 @@ use anthropic_sdk::messages::{
     Message as AnthropicMessage, MessageParam as AnthropicMessageParam,
     MessageType as AnthropicMessageType, Messages, OutputConfig, OutputEffort,
     Role as AnthropicRole, ServerToolUsage as AnthropicServerToolUsage,
-    ServiceTier as AnthropicServiceTier, StopDetails as AnthropicStopDetails,
-    StopReason as AnthropicStopReason, Thinking as AnthropicThinking,
-    ToolResultContent as AnthropicToolResultContent, ToolUnion, Usage as AnthropicUsage,
-    UsageDelta as AnthropicUsageDelta,
+    ServiceTier as AnthropicServiceTier, Speed as AnthropicSpeed,
+    StopDetails as AnthropicStopDetails, StopReason as AnthropicStopReason,
+    Thinking as AnthropicThinking, ToolResultContent as AnthropicToolResultContent, ToolUnion,
+    Usage as AnthropicUsage, UsageDelta as AnthropicUsageDelta,
+    UsageIteration as AnthropicUsageIteration,
     WebSearchToolResultContent as AnthropicWebSearchToolResultContent,
 };
 use anthropic_sdk::streaming::StreamingEvent as AnthropicStreamingEvent;
@@ -21,8 +22,8 @@ use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind
 use crate::messages::{
     ApiError, CacheCreation, Caller, Citation, Container, ContentBlock, ContentBlockParam,
     DocumentSource, ImageSource, Message, MessageParam, MessageType, Role, ServerToolUsage,
-    ServiceTier, StopDetails, StopReason, ToolResultContent, Usage, UsageDelta,
-    WebSearchToolResultContent,
+    ServiceTier, Speed, StopDetails, StopReason, ToolResultContent, Usage, UsageDelta,
+    UsageIteration, WebSearchToolResultContent,
 };
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
@@ -35,11 +36,15 @@ pub struct AnthropicModel {
     client: Client,
     model_name: String,
     is_oauth: bool,
+    speed: Option<Speed>,
 }
 
 impl AnthropicModel {
     pub fn new(model_args: ModelArgs, api_key: String) -> Self {
-        let client = Client::new(model_args.url, api_key);
+        let mut client = Client::new(model_args.url, api_key);
+        if model_args.speed.is_some() {
+            client = client.with_beta("fast-mode-2026-02-01");
+        }
         let is_oauth = client.is_oauth();
         let model_name = model_args
             .model_name
@@ -49,6 +54,7 @@ impl AnthropicModel {
             client,
             model_name,
             is_oauth,
+            speed: model_args.speed,
         }
     }
 }
@@ -120,6 +126,7 @@ impl Model for AnthropicModel {
             messages,
             tools,
             output_config,
+            speed: self.speed.as_ref().map(Into::into),
             ..Default::default()
         };
 
@@ -881,9 +888,11 @@ impl From<AnthropicUsage> for Usage {
             cache_read_input_tokens,
             inference_geo: _,
             input_tokens,
+            iterations,
             output_tokens,
             server_tool_use,
             service_tier,
+            speed,
         } = usage;
 
         Self {
@@ -891,9 +900,11 @@ impl From<AnthropicUsage> for Usage {
             cache_creation_input_tokens,
             cache_read_input_tokens,
             input_tokens,
+            iterations: iterations.map(|its| its.into_iter().map(Into::into).collect::<Vec<_>>()),
             output_tokens,
             server_tool_use: server_tool_use.map(Into::into),
             service_tier: service_tier.map(Into::into),
+            speed: speed.map(Into::into),
         }
     }
 }
@@ -906,9 +917,11 @@ impl From<AnthropicUsageDelta> for UsageDelta {
             cache_read_input_tokens,
             inference_geo: _,
             input_tokens,
+            iterations,
             output_tokens,
             server_tool_use,
             service_tier,
+            speed,
         } = usage;
 
         Self {
@@ -916,9 +929,77 @@ impl From<AnthropicUsageDelta> for UsageDelta {
             cache_creation_input_tokens,
             cache_read_input_tokens,
             input_tokens,
+            iterations: iterations.map(|its| its.into_iter().map(Into::into).collect::<Vec<_>>()),
             output_tokens,
             server_tool_use: server_tool_use.map(Into::into),
             service_tier: service_tier.map(Into::into),
+            speed: speed.map(Into::into),
+        }
+    }
+}
+
+impl From<AnthropicSpeed> for Speed {
+    fn from(speed: AnthropicSpeed) -> Self {
+        match speed {
+            AnthropicSpeed::Standard => Self::Standard,
+            AnthropicSpeed::Fast => Self::Fast,
+        }
+    }
+}
+
+impl From<&Speed> for AnthropicSpeed {
+    fn from(speed: &Speed) -> Self {
+        match speed {
+            Speed::Standard => Self::Standard,
+            Speed::Fast => Self::Fast,
+        }
+    }
+}
+
+impl From<AnthropicUsageIteration> for UsageIteration {
+    fn from(iter: AnthropicUsageIteration) -> Self {
+        match iter {
+            AnthropicUsageIteration::Message {
+                cache_creation,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                input_tokens,
+                output_tokens,
+            } => Self::Message {
+                cache_creation: cache_creation.map(Into::into),
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                input_tokens,
+                output_tokens,
+            },
+            AnthropicUsageIteration::Compaction {
+                cache_creation,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                input_tokens,
+                output_tokens,
+            } => Self::Compaction {
+                cache_creation: cache_creation.map(Into::into),
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                input_tokens,
+                output_tokens,
+            },
+            AnthropicUsageIteration::AdvisorMessage {
+                cache_creation,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                input_tokens,
+                output_tokens,
+                model,
+            } => Self::AdvisorMessage {
+                cache_creation: cache_creation.map(Into::into),
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                input_tokens,
+                output_tokens,
+                model,
+            },
         }
     }
 }

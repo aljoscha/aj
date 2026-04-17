@@ -151,10 +151,42 @@ pub struct Config {
     pub model_name: Option<String>,
     /// Default thinking level used when no trigger word is present.
     pub thinking: Option<ConfigThinkingLevel>,
+    /// Inference speed mode (Anthropic only). `fast` enables higher
+    /// output-tokens-per-second at some quality cost.
+    pub speed: Option<ConfigSpeed>,
     /// List of builtin tool names to disable. Tools in this list will not be
     /// available to the agent.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+}
+
+/// Inference speed mode set in `config.toml` (Anthropic only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigSpeed {
+    Standard,
+    Fast,
+}
+
+impl fmt::Display for ConfigSpeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigSpeed::Standard => write!(f, "standard"),
+            ConfigSpeed::Fast => write!(f, "fast"),
+        }
+    }
+}
+
+impl FromStr for ConfigSpeed {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "standard" => Ok(ConfigSpeed::Standard),
+            "fast" => Ok(ConfigSpeed::Fast),
+            _ => Err(format!("invalid speed '{s}': expected standard or fast")),
+        }
+    }
 }
 
 impl Config {

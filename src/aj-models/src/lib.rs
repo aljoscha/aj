@@ -53,6 +53,8 @@ pub struct ModelArgs {
     pub url: Option<String>,
     /// Optional model name to use
     pub model_name: Option<String>,
+    /// Optional inference speed mode (Anthropic beta `speed` parameter).
+    pub speed: Option<crate::messages::Speed>,
 }
 
 /// Create a model instance based on the provided [ModelArgs].

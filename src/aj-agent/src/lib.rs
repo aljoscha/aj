@@ -707,15 +707,7 @@ impl SessionState {
             working_directory,
             todo_list: Vec::new(),
             turn_counter: 0,
-            accumulated_usage: Usage {
-                cache_creation: None,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                server_tool_use: None,
-                service_tier: None,
-            },
+            accumulated_usage: Usage::default(),
             sub_agent_counter: 0,
             sub_agent_usage: HashMap::new(),
         }
