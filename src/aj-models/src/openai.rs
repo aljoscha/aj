@@ -702,6 +702,7 @@ fn response_to_message(response: Response) -> (Message, Vec<StreamingEvent>) {
         stop_details: None,
         usage: usage_from_response(response.usage.as_ref(), response.service_tier.as_ref()),
         container: None,
+        context_management: None,
     };
 
     (message, events)
@@ -921,6 +922,7 @@ impl OpenAiResponsesStreamProcessor {
                 stop_details: None,
                 usage: usage_from_response(None, response.service_tier.as_ref()),
                 container: None,
+                context_management: None,
             },
         });
     }

@@ -104,7 +104,11 @@ impl StreamProcessor {
                 }
                 Some(StreamingEvent::MessageStart { message })
             }
-            ServerSentEvent::MessageDelta { delta, usage } => {
+            ServerSentEvent::MessageDelta {
+                delta,
+                usage,
+                context_management,
+            } => {
                 let message = match self.current_message.as_mut() {
                     Some(msg) => msg,
                     None => {
@@ -121,6 +125,9 @@ impl StreamProcessor {
                 }
                 if delta.stop_details.is_some() {
                     message.stop_details = delta.stop_details;
+                }
+                if context_management.is_some() {
+                    message.context_management = context_management;
                 }
 
                 message.usage.apply_delta(&usage);
@@ -261,6 +268,34 @@ impl StreamProcessor {
                         // Accumulate citations into the current text block.
                         if let ContentBlock::TextBlock { citations, .. } = content_block {
                             citations.push(citation);
+                        }
+                        None
+                    }
+                    ContentBlockDelta::CompactionDelta {
+                        content: delta_content,
+                        encrypted_content: delta_encrypted,
+                    } => {
+                        let (current_content, current_encrypted) = match content_block {
+                            ContentBlock::CompactionBlock {
+                                content,
+                                encrypted_content,
+                            } => (content, encrypted_content),
+                            _ => {
+                                return Some(StreamingEvent::ProtocolError {
+                                    error: "got compaction delta for non-compaction content block"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        if let Some(chunk) = delta_content {
+                            current_content
+                                .get_or_insert_with(String::new)
+                                .push_str(&chunk);
+                        }
+                        if let Some(chunk) = delta_encrypted {
+                            current_encrypted
+                                .get_or_insert_with(String::new)
+                                .push_str(&chunk);
                         }
                         None
                     }

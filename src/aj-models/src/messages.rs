@@ -163,6 +163,16 @@ pub enum ContentBlockParam {
     /// nested inside a server-side `tool_search_tool_result`.
     #[serde(rename = "tool_reference")]
     ToolReference { tool_name: String },
+    /// A compaction block produced by autocompact. Clients should
+    /// round-trip these (including `encrypted_content`) verbatim.
+    /// `content = None` means compaction failed; the server treats
+    /// these as no-ops.
+    #[serde(rename = "compaction")]
+    CompactionBlock {
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
 }
 
 impl ContentBlockParam {
@@ -384,6 +394,8 @@ pub struct Message {
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<Container>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagementResponse>,
 }
 
 /// Structured details about why the model stopped (currently only refusal).
@@ -493,6 +505,15 @@ pub enum ContentBlock {
     ThinkingBlock { signature: String, thinking: String },
     #[serde(rename = "redacted_thinking")]
     RedactedThinkingBlock { data: String },
+    /// A compaction block returned when autocompact fires.
+    /// `content = None` means compaction failed; the server treats these
+    /// as no-ops.
+    #[serde(rename = "compaction")]
+    CompactionBlock {
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
 }
 
 impl ContentBlock {
@@ -624,6 +645,13 @@ impl ContentBlock {
             ContentBlock::RedactedThinkingBlock { data } => {
                 ContentBlockParam::RedactedThinkingBlock { data }
             }
+            ContentBlock::CompactionBlock {
+                content,
+                encrypted_content,
+            } => ContentBlockParam::CompactionBlock {
+                content,
+                encrypted_content,
+            },
         }
     }
 }
@@ -644,6 +672,8 @@ pub enum StopReason {
     Refusal,
     #[serde(rename = "model_context_window_exceeded")]
     ModelContextWindowExceeded,
+    #[serde(rename = "compaction")]
+    Compaction,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -903,6 +933,13 @@ pub enum ContentBlockDelta {
     SignatureDelta { signature: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    #[serde(rename = "compaction_delta")]
+    CompactionDelta {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -925,4 +962,28 @@ pub struct UsageDelta {
     pub service_tier: Option<ServiceTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<Speed>,
+}
+
+/// Response-side summary of which context-management edits fired during
+/// a request.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContextManagementResponse {
+    pub applied_edits: Vec<AppliedEdit>,
+}
+
+/// A single context-management edit that fired, with counts of what it
+/// cleared.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum AppliedEdit {
+    #[serde(rename = "clear_tool_uses_20250919")]
+    ClearToolUses20250919 {
+        cleared_input_tokens: u64,
+        cleared_tool_uses: u64,
+    },
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking20251015 {
+        cleared_input_tokens: u64,
+        cleared_thinking_turns: u64,
+    },
 }

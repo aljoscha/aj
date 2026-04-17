@@ -1,8 +1,10 @@
 use anthropic_sdk::client::Client;
 use anthropic_sdk::messages::{
-    ApiError as AnthropicApiError, CacheControl, CacheCreation as AnthropicCacheCreation,
-    Caller as AnthropicCaller, Citation as AnthropicCitation, Container as AnthropicContainer,
+    ApiError as AnthropicApiError, AppliedEdit as AnthropicAppliedEdit, CacheControl,
+    CacheCreation as AnthropicCacheCreation, Caller as AnthropicCaller,
+    Citation as AnthropicCitation, Container as AnthropicContainer,
     ContentBlock as AnthropicContentBlock, ContentBlockParam as AnthropicContentBlockParam,
+    ContextManagementResponse as AnthropicContextManagementResponse,
     DocumentSource as AnthropicDocumentSource, ImageSource as AnthropicImageSource,
     Message as AnthropicMessage, MessageParam as AnthropicMessageParam,
     MessageType as AnthropicMessageType, Messages, OutputConfig, OutputEffort,
@@ -20,10 +22,10 @@ use std::pin::Pin;
 
 use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
 use crate::messages::{
-    ApiError, CacheCreation, Caller, Citation, Container, ContentBlock, ContentBlockParam,
-    DocumentSource, ImageSource, Message, MessageParam, MessageType, Role, ServerToolUsage,
-    ServiceTier, Speed, StopDetails, StopReason, ToolResultContent, Usage, UsageDelta,
-    UsageIteration, WebSearchToolResultContent,
+    ApiError, AppliedEdit, CacheCreation, Caller, Citation, Container, ContentBlock,
+    ContentBlockParam, ContextManagementResponse, DocumentSource, ImageSource, Message,
+    MessageParam, MessageType, Role, ServerToolUsage, ServiceTier, Speed, StopDetails, StopReason,
+    ToolResultContent, Usage, UsageDelta, UsageIteration, WebSearchToolResultContent,
 };
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
@@ -343,6 +345,14 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                     cache_control: None,
                 }
             }
+            ContentBlockParam::CompactionBlock {
+                content,
+                encrypted_content,
+            } => AnthropicContentBlockParam::CompactionBlock {
+                content: content.clone(),
+                encrypted_content: encrypted_content.clone(),
+                cache_control: None,
+            },
         }
     }
 }
@@ -665,6 +675,7 @@ fn output_config_for_thinking(thinking: &Option<ThinkingConfig>) -> Option<Outpu
     Some(OutputConfig {
         effort: Some(effort),
         format: None,
+        task_budget: None,
     })
 }
 
@@ -691,6 +702,7 @@ impl From<AnthropicMessage> for Message {
             stop_details,
             usage,
             container,
+            context_management,
         } = message;
 
         Self {
@@ -704,6 +716,7 @@ impl From<AnthropicMessage> for Message {
             stop_details: stop_details.map(Into::into),
             usage: usage.into(),
             container: container.map(Into::into),
+            context_management: context_management.map(Into::into),
         }
     }
 }
@@ -717,6 +730,35 @@ impl From<AnthropicStopDetails> for StopDetails {
             } => Self::Refusal {
                 category,
                 explanation,
+            },
+        }
+    }
+}
+
+impl From<AnthropicContextManagementResponse> for ContextManagementResponse {
+    fn from(resp: AnthropicContextManagementResponse) -> Self {
+        Self {
+            applied_edits: resp.applied_edits.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<AnthropicAppliedEdit> for AppliedEdit {
+    fn from(edit: AnthropicAppliedEdit) -> Self {
+        match edit {
+            AnthropicAppliedEdit::ClearToolUses20250919 {
+                cleared_input_tokens,
+                cleared_tool_uses,
+            } => Self::ClearToolUses20250919 {
+                cleared_input_tokens,
+                cleared_tool_uses,
+            },
+            AnthropicAppliedEdit::ClearThinking20251015 {
+                cleared_input_tokens,
+                cleared_thinking_turns,
+            } => Self::ClearThinking20251015 {
+                cleared_input_tokens,
+                cleared_thinking_turns,
             },
         }
     }
@@ -749,6 +791,7 @@ impl From<AnthropicStopReason> for StopReason {
             AnthropicStopReason::PauseTurn => Self::PauseTurn,
             AnthropicStopReason::Refusal => Self::Refusal,
             AnthropicStopReason::ModelContextWindowExceeded => Self::ModelContextWindowExceeded,
+            AnthropicStopReason::Compaction => Self::Compaction,
         }
     }
 }
@@ -871,6 +914,13 @@ impl From<AnthropicContentBlock> for ContentBlock {
             },
             AnthropicContentBlock::ToolReferenceBlock { tool_name } => Self::ToolReferenceBlock {
                 tool_name: tool_name.clone(),
+            },
+            AnthropicContentBlock::CompactionBlock {
+                content,
+                encrypted_content,
+            } => Self::CompactionBlock {
+                content,
+                encrypted_content,
             },
         }
     }

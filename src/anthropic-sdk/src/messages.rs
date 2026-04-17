@@ -26,6 +26,8 @@ pub struct Messages {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagementConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_geo: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<MCPServer>,
@@ -245,6 +247,18 @@ pub enum ContentBlockParam {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    /// A compaction block returned when autocompact fires. Clients should
+    /// round-trip these (including `encrypted_content`) verbatim.
+    /// `content = None` means compaction failed; the server treats these
+    /// as no-ops.
+    #[serde(rename = "compaction")]
+    CompactionBlock {
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
 }
 
 impl ContentBlockParam {
@@ -289,6 +303,7 @@ impl ContentBlockParam {
             ContentBlockParam::MCPToolResultBlock { cache_control, .. } => Some(cache_control),
             ContentBlockParam::ContainerUploadBlock { cache_control, .. } => Some(cache_control),
             ContentBlockParam::ToolReference { cache_control, .. } => Some(cache_control),
+            ContentBlockParam::CompactionBlock { cache_control, .. } => Some(cache_control),
         };
 
         if let Some(field) = field {
@@ -481,6 +496,131 @@ pub struct McpToolConfig {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defer_loading: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Context management (request + response)
+// ---------------------------------------------------------------------------
+
+/// Request-side configuration listing context-management edits to apply.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContextManagementConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<ContextManagementEdit>,
+}
+
+/// A single context-management edit. The server evaluates each edit's
+/// trigger independently and applies it when fired.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum ContextManagementEdit {
+    /// Clear older `tool_use` blocks when a trigger fires.
+    #[serde(rename = "clear_tool_uses_20250919")]
+    ClearToolUses20250919 {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clear_at_least: Option<InputTokensClearAtLeast>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clear_tool_inputs: Option<ClearToolInputs>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        exclude_tools: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keep: Option<ToolUsesKeep>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger: Option<ClearToolUsesTrigger>,
+    },
+    /// Clear older thinking blocks, keeping a window of recent ones.
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking20251015 {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keep: Option<ClearThinkingKeep>,
+    },
+    /// Automatically compact older context when the trigger fires.
+    #[serde(rename = "compact_20260112")]
+    Compact20260112 {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pause_after_compaction: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger: Option<InputTokensTrigger>,
+    },
+}
+
+/// Minimum tokens that must be cleared for a `clear_tool_uses` edit to
+/// fire.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum InputTokensClearAtLeast {
+    #[serde(rename = "input_tokens")]
+    InputTokens { value: u64 },
+}
+
+/// Whether to clear tool inputs: `true`/`false` for all, or a list of
+/// tool names to clear.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum ClearToolInputs {
+    All(bool),
+    ByName(Vec<String>),
+}
+
+/// Number of tool uses to retain when clearing.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum ToolUsesKeep {
+    #[serde(rename = "tool_uses")]
+    ToolUses { value: u64 },
+}
+
+/// Trigger condition for `clear_tool_uses_20250919`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum ClearToolUsesTrigger {
+    #[serde(rename = "input_tokens")]
+    InputTokens { value: u64 },
+    #[serde(rename = "tool_uses")]
+    ToolUses { value: u64 },
+}
+
+/// Number of thinking turns to retain when clearing.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum ClearThinkingKeep {
+    #[serde(rename = "thinking_turns")]
+    ThinkingTurns { value: u64 },
+    #[serde(rename = "all")]
+    All,
+}
+
+/// Trigger condition for `compact_20260112`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum InputTokensTrigger {
+    #[serde(rename = "input_tokens")]
+    InputTokens { value: u64 },
+}
+
+/// Response-side summary of which context-management edits fired.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContextManagementResponse {
+    pub applied_edits: Vec<AppliedEdit>,
+}
+
+/// A single edit that was applied, with counts of what it cleared.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum AppliedEdit {
+    #[serde(rename = "clear_tool_uses_20250919")]
+    ClearToolUses20250919 {
+        cleared_input_tokens: u64,
+        cleared_tool_uses: u64,
+    },
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking20251015 {
+        cleared_input_tokens: u64,
+        cleared_thinking_turns: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +1021,23 @@ pub struct OutputConfig {
     pub effort: Option<OutputEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<OutputFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_budget: Option<TokenTaskBudget>,
+}
+
+/// User-configurable total token budget across contexts. Callers update
+/// `remaining` each turn so the model can scale effort against the budget.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum TokenTaskBudget {
+    #[serde(rename = "tokens")]
+    Tokens {
+        /// Total token budget for the whole session.
+        total: u64,
+        /// Tokens still available. Defaults to `total` if not provided.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remaining: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -959,6 +1116,8 @@ pub struct Message {
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<Container>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagementResponse>,
 }
 
 impl Message {
@@ -1069,6 +1228,15 @@ pub enum ContentBlock {
     ThinkingBlock { signature: String, thinking: String },
     #[serde(rename = "redacted_thinking")]
     RedactedThinkingBlock { data: String },
+    /// A compaction block returned when autocompact fires.
+    /// `content = None` means compaction failed; the server treats these
+    /// as no-ops.
+    #[serde(rename = "compaction")]
+    CompactionBlock {
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
 }
 
 impl ContentBlock {
@@ -1210,6 +1378,14 @@ impl ContentBlock {
             ContentBlock::RedactedThinkingBlock { data } => {
                 ContentBlockParam::RedactedThinkingBlock { data }
             }
+            ContentBlock::CompactionBlock {
+                content,
+                encrypted_content,
+            } => ContentBlockParam::CompactionBlock {
+                content,
+                encrypted_content,
+                cache_control: None,
+            },
         }
     }
 }
@@ -1246,6 +1422,8 @@ pub enum StopReason {
     Refusal,
     #[serde(rename = "model_context_window_exceeded")]
     ModelContextWindowExceeded,
+    #[serde(rename = "compaction")]
+    Compaction,
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1633,8 @@ pub enum ServerSentEvent {
     MessageDelta {
         delta: MessageDelta,
         usage: UsageDelta,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_management: Option<ContextManagementResponse>,
     },
     #[serde(rename = "message_stop")]
     MessageStop,
@@ -1501,6 +1681,13 @@ pub enum ContentBlockDelta {
     InputJsonDelta { partial_json: String },
     #[serde(rename = "citations_delta")]
     CitationsDelta { citation: Citation },
+    #[serde(rename = "compaction_delta")]
+    CompactionDelta {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
