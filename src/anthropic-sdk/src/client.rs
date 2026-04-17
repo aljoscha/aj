@@ -175,7 +175,15 @@ impl Client {
                         Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
                             Ok(json_event) => Some(json_event),
                             Err(err) => {
-                                panic!("could not parse server-sent event {}: {}", event.data, err);
+                                // The API versioning policy reserves the right
+                                // to add new event types; skip anything we
+                                // can't parse rather than crashing the stream.
+                                tracing::warn!(
+                                    "could not parse server-sent event, skipping: \
+                                     error={err}, data={}",
+                                    event.data
+                                );
+                                None
                             }
                         },
                         Err(e) => {
