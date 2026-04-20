@@ -153,6 +153,12 @@ impl<UI: AjUi> Agent<UI> {
                     user_input
                 } else {
                     self.display_usage_summary();
+                    if conversation.last_user_message().is_some() {
+                        let id = conversation.conversation_id();
+                        self.ui.display_notice(&format!(
+                            "Thread: {id} (resume with: aj threads continue {id})"
+                        ));
+                    }
                     break;
                 };
                 conversation.add_user_message(vec![ContentBlockParam::new_text_block(user_input)]);
