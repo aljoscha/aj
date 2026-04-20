@@ -282,7 +282,10 @@ impl<UI: AjUi> Agent<UI> {
             let mut has_tool_use = false;
 
             for content in response.content.iter() {
-                if let ContentBlock::ToolUseBlock { id, name, input } = content {
+                if let ContentBlock::ToolUseBlock {
+                    id, name, input, ..
+                } = content
+                {
                     tool_calls.push((id.clone(), name.clone(), input.clone()));
                     has_tool_use = true;
                 }
@@ -659,8 +662,13 @@ impl<UI: AjUi> Agent<UI> {
                                 if let ContentBlockParam::ThinkingBlock { thinking, .. } = content {
                                     self.ui.agent_thinking_start(thinking);
                                     self.ui.agent_thinking_stop();
-                                } else if let ContentBlockParam::RedactedThinkingBlock { data } = content {
-                                    self.ui.agent_thinking_start(&format!("[Redacted thinking: {}]", data));
+                                } else if let ContentBlockParam::RedactedThinkingBlock { data } =
+                                    content
+                                {
+                                    self.ui.agent_thinking_start(&format!(
+                                        "[Redacted thinking: {}]",
+                                        data
+                                    ));
                                     self.ui.agent_thinking_stop();
                                 }
                             }

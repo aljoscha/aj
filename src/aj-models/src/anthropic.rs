@@ -259,7 +259,7 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                 tool_use_id,
                 caller,
             } => AnthropicContentBlockParam::WebSearchToolResultBlock {
-                content: content.iter().map(Into::into).collect(),
+                content: content.into(),
                 tool_use_id: tool_use_id.clone(),
                 cache_control: None,
                 caller: caller.as_ref().map(Into::into),
@@ -470,12 +470,14 @@ impl From<&Citation> for AnthropicCitation {
                 document_index,
                 document_title,
                 end_char_index,
+                file_id,
                 start_char_index,
             } => Self::CharLocation {
                 cited_text: cited_text.clone(),
                 document_index: *document_index,
                 document_title: document_title.clone(),
                 end_char_index: *end_char_index,
+                file_id: file_id.clone(),
                 start_char_index: *start_char_index,
             },
             Citation::PageLocation {
@@ -483,12 +485,14 @@ impl From<&Citation> for AnthropicCitation {
                 document_index,
                 document_title,
                 end_page_number,
+                file_id,
                 start_page_number,
             } => Self::PageLocation {
                 cited_text: cited_text.clone(),
                 document_index: *document_index,
                 document_title: document_title.clone(),
                 end_page_number: *end_page_number,
+                file_id: file_id.clone(),
                 start_page_number: *start_page_number,
             },
             Citation::ContentBlockLocation {
@@ -496,12 +500,14 @@ impl From<&Citation> for AnthropicCitation {
                 document_index,
                 document_title,
                 end_block_index,
+                file_id,
                 start_block_index,
             } => Self::ContentBlockLocation {
                 cited_text: cited_text.clone(),
                 document_index: *document_index,
                 document_title: document_title.clone(),
                 end_block_index: *end_block_index,
+                file_id: file_id.clone(),
                 start_block_index: *start_block_index,
             },
             Citation::WebSearchResultLocation {
@@ -542,12 +548,14 @@ impl From<&AnthropicCitation> for Citation {
                 document_index,
                 document_title,
                 end_char_index,
+                file_id,
                 start_char_index,
             } => Self::CharLocation {
                 cited_text: cited_text.clone(),
                 document_index: *document_index,
                 document_title: document_title.clone(),
                 end_char_index: *end_char_index,
+                file_id: file_id.clone(),
                 start_char_index: *start_char_index,
             },
             AnthropicCitation::PageLocation {
@@ -555,12 +563,14 @@ impl From<&AnthropicCitation> for Citation {
                 document_index,
                 document_title,
                 end_page_number,
+                file_id,
                 start_page_number,
             } => Self::PageLocation {
                 cited_text: cited_text.clone(),
                 document_index: *document_index,
                 document_title: document_title.clone(),
                 end_page_number: *end_page_number,
+                file_id: file_id.clone(),
                 start_page_number: *start_page_number,
             },
             AnthropicCitation::ContentBlockLocation {
@@ -568,12 +578,14 @@ impl From<&AnthropicCitation> for Citation {
                 document_index,
                 document_title,
                 end_block_index,
+                file_id,
                 start_block_index,
             } => Self::ContentBlockLocation {
                 cited_text: cited_text.clone(),
                 document_index: *document_index,
                 document_title: document_title.clone(),
                 end_block_index: *end_block_index,
+                file_id: file_id.clone(),
                 start_block_index: *start_block_index,
             },
             AnthropicCitation::WebSearchResultLocation {
@@ -647,44 +659,60 @@ impl From<&AnthropicCaller> for Caller {
 
 impl From<&WebSearchToolResultContent> for AnthropicWebSearchToolResultContent {
     fn from(content: &WebSearchToolResultContent) -> Self {
+        use anthropic_sdk::messages::{
+            WebSearchResultBlock as AnthropicWebSearchResultBlock,
+            WebSearchResultBlockType as AnthropicWebSearchResultBlockType,
+            WebSearchToolResultError as AnthropicWebSearchToolResultError,
+            WebSearchToolResultErrorType as AnthropicWebSearchToolResultErrorType,
+        };
         match content {
-            WebSearchToolResultContent::WebSearchResult {
-                encrypted_content,
-                title,
-                url,
-                page_age,
-            } => Self::WebSearchResult {
-                encrypted_content: encrypted_content.clone(),
-                title: title.clone(),
-                url: url.clone(),
-                page_age: page_age.clone(),
-            },
-            WebSearchToolResultContent::WebSearchError { error_code } => Self::WebSearchError {
-                error_code: error_code.clone(),
-            },
+            WebSearchToolResultContent::Error(err) => {
+                Self::Error(AnthropicWebSearchToolResultError {
+                    r#type: AnthropicWebSearchToolResultErrorType::WebSearchToolResultError,
+                    error_code: err.error_code.clone(),
+                })
+            }
+            WebSearchToolResultContent::Results(results) => Self::Results(
+                results
+                    .iter()
+                    .map(|r| AnthropicWebSearchResultBlock {
+                        r#type: AnthropicWebSearchResultBlockType::WebSearchResult,
+                        encrypted_content: r.encrypted_content.clone(),
+                        title: r.title.clone(),
+                        url: r.url.clone(),
+                        page_age: r.page_age.clone(),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
 
 impl From<&AnthropicWebSearchToolResultContent> for WebSearchToolResultContent {
     fn from(content: &AnthropicWebSearchToolResultContent) -> Self {
+        use crate::messages::{
+            WebSearchResultBlock, WebSearchResultBlockType, WebSearchToolResultError,
+            WebSearchToolResultErrorType,
+        };
         match content {
-            AnthropicWebSearchToolResultContent::WebSearchResult {
-                encrypted_content,
-                title,
-                url,
-                page_age,
-            } => Self::WebSearchResult {
-                encrypted_content: encrypted_content.clone(),
-                title: title.clone(),
-                url: url.clone(),
-                page_age: page_age.clone(),
-            },
-            AnthropicWebSearchToolResultContent::WebSearchError { error_code } => {
-                Self::WebSearchError {
-                    error_code: error_code.clone(),
-                }
+            AnthropicWebSearchToolResultContent::Error(err) => {
+                Self::Error(WebSearchToolResultError {
+                    r#type: WebSearchToolResultErrorType::WebSearchToolResultError,
+                    error_code: err.error_code.clone(),
+                })
             }
+            AnthropicWebSearchToolResultContent::Results(results) => Self::Results(
+                results
+                    .iter()
+                    .map(|r| WebSearchResultBlock {
+                        r#type: WebSearchResultBlockType::WebSearchResult,
+                        encrypted_content: r.encrypted_content.clone(),
+                        title: r.title.clone(),
+                        url: r.url.clone(),
+                        page_age: r.page_age.clone(),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -904,10 +932,16 @@ impl From<AnthropicContentBlock> for ContentBlock {
             AnthropicContentBlock::RedactedThinkingBlock { data } => {
                 Self::RedactedThinkingBlock { data: data.clone() }
             }
-            AnthropicContentBlock::ToolUseBlock { id, input, name } => Self::ToolUseBlock {
+            AnthropicContentBlock::ToolUseBlock {
+                id,
+                input,
+                name,
+                caller,
+            } => Self::ToolUseBlock {
                 id: id.clone(),
                 input: input.clone(),
                 name: name.clone(),
+                caller: caller.map(|c| (&c).into()),
             },
             AnthropicContentBlock::ServerToolUseBlock {
                 id,
@@ -925,7 +959,7 @@ impl From<AnthropicContentBlock> for ContentBlock {
                 tool_use_id,
                 caller,
             } => Self::WebSearchToolResultBlock {
-                content: content.iter().map(Into::into).collect(),
+                content: (&content).into(),
                 tool_use_id: tool_use_id.clone(),
                 caller: caller.map(|c| (&c).into()),
             },

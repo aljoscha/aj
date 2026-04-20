@@ -14,7 +14,7 @@ pub struct Messages {
     pub messages: Vec<MessageParam>,
     pub max_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub container: Option<String>,
+    pub container: Option<ContainerParam>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<MCPServer>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,7 +121,7 @@ pub enum ContentBlockParam {
     },
     #[serde(rename = "web_search_tool_result")]
     WebSearchToolResultBlock {
-        content: Vec<WebSearchToolResultContent>,
+        content: WebSearchToolResultContent,
         tool_use_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         caller: Option<Caller>,
@@ -301,6 +301,8 @@ pub enum Citation {
         #[serde(skip_serializing_if = "Option::is_none")]
         document_title: Option<String>,
         end_char_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
         start_char_index: u64,
     },
     #[serde(rename = "page_location")]
@@ -310,6 +312,8 @@ pub enum Citation {
         #[serde(skip_serializing_if = "Option::is_none")]
         document_title: Option<String>,
         end_page_number: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
         start_page_number: u64,
     },
     #[serde(rename = "content_block_location")]
@@ -319,6 +323,8 @@ pub enum Citation {
         #[serde(skip_serializing_if = "Option::is_none")]
         document_title: Option<String>,
         end_block_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
         start_block_index: u64,
     },
     #[serde(rename = "web_search_result_location")]
@@ -341,19 +347,46 @@ pub enum Citation {
     },
 }
 
+/// The `content` of a `web_search_tool_result` block: either a single bare
+/// error object or a list of result blocks. Matches the upstream shape
+/// `Union[WebSearchToolResultError, List[WebSearchResultBlock]]`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
+#[serde(untagged)]
 pub enum WebSearchToolResultContent {
-    #[serde(rename = "web_search_result")]
-    WebSearchResult {
-        encrypted_content: String,
-        title: String,
-        url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        page_age: Option<String>,
-    },
+    Error(WebSearchToolResultError),
+    Results(Vec<WebSearchResultBlock>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WebSearchToolResultError {
+    #[serde(rename = "type")]
+    pub r#type: WebSearchToolResultErrorType,
+    pub error_code: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub enum WebSearchToolResultErrorType {
+    #[default]
     #[serde(rename = "web_search_tool_result_error")]
-    WebSearchError { error_code: String },
+    WebSearchToolResultError,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WebSearchResultBlock {
+    #[serde(rename = "type")]
+    pub r#type: WebSearchResultBlockType,
+    pub encrypted_content: String,
+    pub title: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_age: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub enum WebSearchResultBlockType {
+    #[default]
+    #[serde(rename = "web_search_result")]
+    WebSearchResult,
 }
 
 /// Identifies who invoked a server tool (the model directly, or another tool).
@@ -369,9 +402,9 @@ pub enum Caller {
 }
 
 /// MCP server connection definition (new format, `mcp-client-2025-11-20`).
-/// We use the toolset-based configuration via `Tool` entries in the `tools`
-/// array; the legacy per-server `tool_configuration` field is not modeled
-/// here.
+/// Defines an MCP server connection. The toolset-based configuration via
+/// `Tool` entries in the `tools` array is preferred, but the legacy
+/// per-server `tool_configuration` is also supported.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MCPServer {
     pub name: String,
@@ -379,12 +412,53 @@ pub struct MCPServer {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_configuration: Option<MCPServerToolConfiguration>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum MCPServerType {
     #[serde(rename = "url")]
     Url,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MCPServerToolConfiguration {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Request-side `container` parameter: either a bare container ID or a
+/// config struct optionally specifying skills to load.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum ContainerParam {
+    Id(String),
+    Config(ContainerConfig),
+}
+
+impl From<String> for ContainerParam {
+    fn from(id: String) -> Self {
+        Self::Id(id)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ContainerConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillParam>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SkillParam {
+    pub skill_id: String,
+    pub r#type: SkillType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -501,6 +575,8 @@ pub enum ContentBlock {
         id: String,
         input: Value,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
     },
     #[serde(rename = "server_tool_use")]
     ServerToolUseBlock {
@@ -512,7 +588,7 @@ pub enum ContentBlock {
     },
     #[serde(rename = "web_search_tool_result")]
     WebSearchToolResultBlock {
-        content: Vec<WebSearchToolResultContent>,
+        content: WebSearchToolResultContent,
         tool_use_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         caller: Option<Caller>,
@@ -591,11 +667,16 @@ impl ContentBlock {
                 },
                 signature,
             },
-            ContentBlock::ToolUseBlock { id, input, name } => ContentBlockParam::ToolUseBlock {
+            ContentBlock::ToolUseBlock {
                 id,
                 input,
                 name,
-                caller: None,
+                caller,
+            } => ContentBlockParam::ToolUseBlock {
+                id,
+                input,
+                name,
+                caller,
             },
             ContentBlock::ServerToolUseBlock {
                 id,

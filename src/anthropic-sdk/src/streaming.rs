@@ -335,7 +335,12 @@ impl StreamProcessor {
                         current_message.content.push(thinking_block);
                         Some(StreamingEvent::ThinkingStop)
                     }
-                    ContentBlock::ToolUseBlock { id, name, input: _ } => {
+                    ContentBlock::ToolUseBlock {
+                        id,
+                        name,
+                        input: _,
+                        caller,
+                    } => {
                         let input_json = match self.current_json.take() {
                             Some(json) => json,
                             None => {
@@ -357,6 +362,7 @@ impl StreamProcessor {
                             id,
                             name,
                             input,
+                            caller,
                         });
                         None
                     }
