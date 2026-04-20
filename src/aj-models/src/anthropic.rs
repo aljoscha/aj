@@ -5,15 +5,17 @@ use anthropic_sdk::messages::{
     Citation as AnthropicCitation, Container as AnthropicContainer,
     ContentBlock as AnthropicContentBlock, ContentBlockParam as AnthropicContentBlockParam,
     ContextManagementResponse as AnthropicContextManagementResponse,
+    DocumentContentBlock as AnthropicDocumentContentBlock,
+    DocumentContentSource as AnthropicDocumentContentSource,
     DocumentSource as AnthropicDocumentSource, ImageSource as AnthropicImageSource,
-    Message as AnthropicMessage, MessageParam as AnthropicMessageParam,
-    MessageType as AnthropicMessageType, Messages, OutputConfig, OutputEffort,
-    Role as AnthropicRole, ServerToolUsage as AnthropicServerToolUsage,
-    ServiceTier as AnthropicServiceTier, Speed as AnthropicSpeed,
-    StopDetails as AnthropicStopDetails, StopReason as AnthropicStopReason,
-    Thinking as AnthropicThinking, ToolResultContent as AnthropicToolResultContent, ToolUnion,
-    Usage as AnthropicUsage, UsageDelta as AnthropicUsageDelta,
-    UsageIteration as AnthropicUsageIteration,
+    McpToolResultContent as AnthropicMcpToolResultContent, Message as AnthropicMessage,
+    MessageParam as AnthropicMessageParam, MessageType as AnthropicMessageType, Messages,
+    OutputConfig, OutputEffort, Role as AnthropicRole, ServerToolUsage as AnthropicServerToolUsage,
+    ServiceTier as AnthropicServiceTier, Skill as AnthropicSkill, SkillType as AnthropicSkillType,
+    Speed as AnthropicSpeed, StopDetails as AnthropicStopDetails,
+    StopReason as AnthropicStopReason, Thinking as AnthropicThinking,
+    ToolResultContent as AnthropicToolResultContent, ToolUnion, Usage as AnthropicUsage,
+    UsageDelta as AnthropicUsageDelta, UsageIteration as AnthropicUsageIteration,
     WebSearchToolResultContent as AnthropicWebSearchToolResultContent,
 };
 use anthropic_sdk::streaming::StreamingEvent as AnthropicStreamingEvent;
@@ -23,8 +25,9 @@ use std::pin::Pin;
 use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
 use crate::messages::{
     ApiError, AppliedEdit, CacheCreation, Caller, Citation, Container, ContentBlock,
-    ContentBlockParam, ContextManagementResponse, DocumentSource, ImageSource, Message,
-    MessageParam, MessageType, Role, ServerToolUsage, ServiceTier, Speed, StopDetails, StopReason,
+    ContentBlockParam, ContextManagementResponse, DocumentContentBlock, DocumentContentSource,
+    DocumentSource, ImageSource, McpToolResultContent, Message, MessageParam, MessageType, Role,
+    ServerToolUsage, ServiceTier, Skill, SkillType, Speed, StopDetails, StopReason,
     ToolResultContent, Usage, UsageDelta, UsageIteration, WebSearchToolResultContent,
 };
 use crate::streaming::StreamingEvent;
@@ -329,7 +332,7 @@ impl From<&ContentBlockParam> for AnthropicContentBlockParam {
                 is_error,
             } => AnthropicContentBlockParam::MCPToolResultBlock {
                 tool_use_id: tool_use_id.clone(),
-                content: content.clone(),
+                content: content.into(),
                 is_error: *is_error,
                 cache_control: None,
             },
@@ -417,10 +420,39 @@ impl From<&DocumentSource> for AnthropicDocumentSource {
                 media_type: media_type.clone(),
             },
             DocumentSource::Content { content } => Self::Content {
-                content: content.clone(),
+                content: content.into(),
             },
             DocumentSource::File { file_id } => Self::File {
                 file_id: file_id.clone(),
+            },
+        }
+    }
+}
+
+impl From<&DocumentContentSource> for AnthropicDocumentContentSource {
+    fn from(src: &DocumentContentSource) -> Self {
+        match src {
+            DocumentContentSource::Text(s) => Self::Text(s.clone()),
+            DocumentContentSource::Blocks(blocks) => {
+                Self::Blocks(blocks.iter().map(Into::into).collect())
+            }
+        }
+    }
+}
+
+impl From<&DocumentContentBlock> for AnthropicDocumentContentBlock {
+    fn from(block: &DocumentContentBlock) -> Self {
+        match block {
+            DocumentContentBlock::TextBlock { text, citations } => Self::TextBlock {
+                text: text.clone(),
+                cache_control: None,
+                citations: citations
+                    .as_ref()
+                    .map(|cs| cs.iter().map(Into::into).collect()),
+            },
+            DocumentContentBlock::ImageBlock { source } => Self::ImageBlock {
+                source: source.into(),
+                cache_control: None,
             },
         }
     }
@@ -798,9 +830,59 @@ impl From<AnthropicStopReason> for StopReason {
 
 impl From<AnthropicContainer> for Container {
     fn from(container: AnthropicContainer) -> Self {
-        let AnthropicContainer { expires_at, id } = container;
+        let AnthropicContainer {
+            expires_at,
+            id,
+            skills,
+        } = container;
 
-        Self { expires_at, id }
+        Self {
+            expires_at,
+            id,
+            skills: skills.map(|ss| ss.into_iter().map(Into::into).collect()),
+        }
+    }
+}
+
+impl From<AnthropicSkill> for Skill {
+    fn from(skill: AnthropicSkill) -> Self {
+        let AnthropicSkill {
+            skill_id,
+            r#type,
+            version,
+        } = skill;
+        Self {
+            skill_id,
+            r#type: r#type.into(),
+            version,
+        }
+    }
+}
+
+impl From<AnthropicSkillType> for SkillType {
+    fn from(ty: AnthropicSkillType) -> Self {
+        match ty {
+            AnthropicSkillType::Anthropic => Self::Anthropic,
+            AnthropicSkillType::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<&McpToolResultContent> for AnthropicMcpToolResultContent {
+    fn from(content: &McpToolResultContent) -> Self {
+        match content {
+            McpToolResultContent::Text(s) => Self::Text(s.clone()),
+            McpToolResultContent::Blocks(blocks) => Self::Blocks(blocks.clone()),
+        }
+    }
+}
+
+impl From<&AnthropicMcpToolResultContent> for McpToolResultContent {
+    fn from(content: &AnthropicMcpToolResultContent) -> Self {
+        match content {
+            AnthropicMcpToolResultContent::Text(s) => Self::Text(s.clone()),
+            AnthropicMcpToolResultContent::Blocks(blocks) => Self::Blocks(blocks.clone()),
+        }
     }
 }
 
@@ -841,9 +923,11 @@ impl From<AnthropicContentBlock> for ContentBlock {
             AnthropicContentBlock::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
+                caller,
             } => Self::WebSearchToolResultBlock {
                 content: content.iter().map(Into::into).collect(),
                 tool_use_id: tool_use_id.clone(),
+                caller: caller.map(|c| (&c).into()),
             },
             AnthropicContentBlock::WebFetchToolResultBlock {
                 content,
@@ -906,7 +990,7 @@ impl From<AnthropicContentBlock> for ContentBlock {
                 is_error,
             } => Self::MCPToolResultBlock {
                 tool_use_id: tool_use_id.clone(),
-                content: content.clone(),
+                content: (&content).into(),
                 is_error,
             },
             AnthropicContentBlock::ContainerUploadBlock { file_id } => Self::ContainerUploadBlock {
@@ -959,28 +1043,21 @@ impl From<AnthropicUsage> for Usage {
 impl From<AnthropicUsageDelta> for UsageDelta {
     fn from(usage: AnthropicUsageDelta) -> Self {
         let AnthropicUsageDelta {
-            cache_creation,
             cache_creation_input_tokens,
             cache_read_input_tokens,
-            inference_geo: _,
             input_tokens,
             iterations,
             output_tokens,
             server_tool_use,
-            service_tier,
-            speed,
         } = usage;
 
         Self {
-            cache_creation: cache_creation.map(Into::into),
             cache_creation_input_tokens,
             cache_read_input_tokens,
             input_tokens,
             iterations: iterations.map(|its| its.into_iter().map(Into::into).collect::<Vec<_>>()),
             output_tokens,
             server_tool_use: server_tool_use.map(Into::into),
-            service_tier: service_tier.map(Into::into),
-            speed: speed.map(Into::into),
         }
     }
 }

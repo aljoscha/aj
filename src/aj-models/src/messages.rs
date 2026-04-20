@@ -41,6 +41,8 @@ pub struct Messages {
     pub top_k: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_profile_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -154,7 +156,7 @@ pub enum ContentBlockParam {
     #[serde(rename = "mcp_tool_result")]
     MCPToolResultBlock {
         tool_use_id: String,
-        content: Vec<Value>,
+        content: McpToolResultContent,
         is_error: bool,
     },
     #[serde(rename = "container_upload")]
@@ -218,6 +220,21 @@ impl From<String> for ToolResultContent {
     }
 }
 
+/// Content of an MCP tool result: either a plain string or an array of
+/// text-shaped content blocks.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum McpToolResultContent {
+    Text(String),
+    Blocks(Vec<Value>),
+}
+
+impl From<String> for McpToolResultContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ImageSource {
@@ -239,9 +256,39 @@ pub enum DocumentSource {
     #[serde(rename = "text")]
     PlainText { data: String, media_type: String },
     #[serde(rename = "content")]
-    Content { content: Value },
+    Content { content: DocumentContentSource },
     #[serde(rename = "file")]
     File { file_id: String },
+}
+
+/// Content for a document whose `source.type` is `"content"`: either an
+/// inline string or an array of text/image content blocks.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum DocumentContentSource {
+    Text(String),
+    Blocks(Vec<DocumentContentBlock>),
+}
+
+impl From<String> for DocumentContentSource {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+/// A content block nested inside a `content`-shaped document source.
+/// Only text and image blocks are permitted here.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum DocumentContentBlock {
+    #[serde(rename = "text")]
+    TextBlock {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        citations: Option<Vec<Citation>>,
+    },
+    #[serde(rename = "image")]
+    ImageBlock { source: ImageSource },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -322,6 +369,9 @@ pub enum Caller {
 }
 
 /// MCP server connection definition (new format, `mcp-client-2025-11-20`).
+/// We use the toolset-based configuration via `Tool` entries in the `tools`
+/// array; the legacy per-server `tool_configuration` field is not modeled
+/// here.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MCPServer {
     pub name: String,
@@ -464,6 +514,8 @@ pub enum ContentBlock {
     WebSearchToolResultBlock {
         content: Vec<WebSearchToolResultContent>,
         tool_use_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<Caller>,
     },
     #[serde(rename = "web_fetch_tool_result")]
     WebFetchToolResultBlock {
@@ -494,7 +546,7 @@ pub enum ContentBlock {
     },
     #[serde(rename = "mcp_tool_result")]
     MCPToolResultBlock {
-        content: Vec<Value>,
+        content: McpToolResultContent,
         is_error: bool,
         tool_use_id: String,
     },
@@ -559,10 +611,11 @@ impl ContentBlock {
             ContentBlock::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
+                caller,
             } => ContentBlockParam::WebSearchToolResultBlock {
                 content,
                 tool_use_id,
-                caller: None,
+                caller,
             },
             ContentBlock::WebFetchToolResultBlock {
                 content,
@@ -697,9 +750,6 @@ impl Usage {
     /// update event) into this usage. Fields present in the delta REPLACE
     /// the corresponding fields here; absent fields are preserved.
     pub fn apply_delta(&mut self, delta: &UsageDelta) {
-        if let Some(cache_creation) = delta.cache_creation.as_ref() {
-            self.cache_creation = Some(cache_creation.clone());
-        }
         if let Some(tokens) = delta.cache_creation_input_tokens {
             self.cache_creation_input_tokens = Some(tokens);
         }
@@ -717,12 +767,6 @@ impl Usage {
         }
         if let Some(server_tool_use) = delta.server_tool_use.as_ref() {
             self.server_tool_use = Some(server_tool_use.clone());
-        }
-        if let Some(service_tier) = delta.service_tier.as_ref() {
-            self.service_tier = Some(service_tier.clone());
-        }
-        if let Some(speed) = delta.speed.as_ref() {
-            self.speed = Some(speed.clone());
         }
     }
 
@@ -852,6 +896,23 @@ pub enum Speed {
 pub struct Container {
     pub expires_at: String,
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<Skill>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Skill {
+    pub skill_id: String,
+    pub r#type: SkillType,
+    pub version: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum SkillType {
+    #[serde(rename = "anthropic")]
+    Anthropic,
+    #[serde(rename = "custom")]
+    Custom,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Error)]
@@ -938,10 +999,13 @@ pub enum ContentBlockDelta {
     },
 }
 
+/// Incremental usage update carried on a `message_delta`-style streaming
+/// event. Token counts are cumulative; only the subset of [`Usage`] fields
+/// that actually change mid-stream is modeled here. Fields like
+/// `cache_creation`, `service_tier`, and `speed` arrive once on the
+/// initial message-start event and do not update.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UsageDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_creation: Option<CacheCreation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -954,10 +1018,6 @@ pub struct UsageDelta {
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<ServiceTier>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speed: Option<Speed>,
 }
 
 /// Response-side summary of which context-management edits fired during

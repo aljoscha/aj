@@ -497,10 +497,7 @@ impl From<OpenAIServiceTier> for ServiceTier {
     }
 }
 
-fn usage_delta_from_response(
-    usage: &ResponseUsage,
-    service_tier: Option<&OpenAIServiceTier>,
-) -> UsageDelta {
+fn usage_delta_from_response(usage: &ResponseUsage) -> UsageDelta {
     let cached_tokens = usage
         .input_tokens_details
         .as_ref()
@@ -510,15 +507,12 @@ fn usage_delta_from_response(
     let input_tokens = u64::from(usage.input_tokens).saturating_sub(cached_tokens);
 
     UsageDelta {
-        cache_creation: None,
         cache_creation_input_tokens: None,
         cache_read_input_tokens: Some(cached_tokens),
         input_tokens: Some(input_tokens),
         iterations: None,
         output_tokens: Some(u64::from(usage.output_tokens)),
         server_tool_use: None,
-        service_tier: service_tier.cloned().map(Into::into),
-        speed: None,
     }
 }
 
@@ -528,8 +522,9 @@ fn usage_from_response(
 ) -> Usage {
     let mut result = Usage::default();
     if let Some(usage) = usage {
-        result.apply_delta(&usage_delta_from_response(usage, service_tier));
-    } else if let Some(service_tier) = service_tier {
+        result.apply_delta(&usage_delta_from_response(usage));
+    }
+    if let Some(service_tier) = service_tier {
         result.service_tier = Some(service_tier.clone().into());
     }
     result
@@ -864,7 +859,7 @@ impl OpenAiResponsesStreamProcessor {
 
                 if let Some(usage) = response.usage.as_ref() {
                     events.push(StreamingEvent::UsageUpdate {
-                        usage: usage_delta_from_response(usage, response.service_tier.as_ref()),
+                        usage: usage_delta_from_response(usage),
                     });
                 }
 
