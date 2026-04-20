@@ -511,7 +511,7 @@ fn usage_delta_from_response(usage: &ResponseUsage) -> UsageDelta {
         cache_read_input_tokens: Some(cached_tokens),
         input_tokens: Some(input_tokens),
         iterations: None,
-        output_tokens: Some(u64::from(usage.output_tokens)),
+        output_tokens: u64::from(usage.output_tokens),
         server_tool_use: None,
     }
 }

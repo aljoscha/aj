@@ -134,10 +134,7 @@ pub enum ContentBlockParam {
         caller: Option<Caller>,
     },
     #[serde(rename = "code_execution_tool_result")]
-    CodeExecutionToolResultBlock {
-        content: Vec<Value>,
-        tool_use_id: String,
-    },
+    CodeExecutionToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "bash_code_execution_tool_result")]
     BashCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "text_editor_code_execution_tool_result")]
@@ -601,10 +598,7 @@ pub enum ContentBlock {
         caller: Option<Caller>,
     },
     #[serde(rename = "code_execution_tool_result")]
-    CodeExecutionToolResultBlock {
-        content: Vec<Value>,
-        tool_use_id: String,
-    },
+    CodeExecutionToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "bash_code_execution_tool_result")]
     BashCodeExecutionToolResultBlock { content: Value, tool_use_id: String },
     #[serde(rename = "text_editor_code_execution_tool_result")]
@@ -843,9 +837,7 @@ impl Usage {
         if let Some(iterations) = delta.iterations.as_ref() {
             self.iterations = Some(iterations.clone());
         }
-        if let Some(output_tokens) = delta.output_tokens {
-            self.output_tokens = output_tokens;
-        }
+        self.output_tokens = delta.output_tokens;
         if let Some(server_tool_use) = delta.server_tool_use.as_ref() {
             self.server_tool_use = Some(server_tool_use.clone());
         }
@@ -1095,8 +1087,7 @@ pub struct UsageDelta {
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iterations: Option<Vec<UsageIteration>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u64>,
+    pub output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
 }
