@@ -4,7 +4,7 @@ use std::pin::{pin, Pin};
 use std::time::Duration;
 
 use aj_conf::{AgentEnv, ConfigThinkingLevel};
-use aj_models::messages::{ContentBlock, ContentBlockParam, Message, Role, Usage};
+use aj_models::messages::{ApiError, ContentBlock, ContentBlockParam, Message, Role, Usage};
 use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
 use aj_models::ModelError;
@@ -21,8 +21,8 @@ use std::sync::Arc;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 
 use aj_models::conversation::{
-    Conversation, ConversationEntryKind, ConversationLog, ConversationView, EntryId, ThreadFilter,
-    ThreadKind,
+    Conversation, ConversationEntryKind, ConversationError, ConversationLog, ConversationView,
+    EntryId, ThreadFilter, ThreadKind,
 };
 
 pub struct Agent<UI: AjUi> {
@@ -144,18 +144,21 @@ impl<UI: AjUi> Agent<UI> {
             );
         }
 
+        let mut force_user_input = false;
         loop {
             let head = log.latest_leaf(ThreadFilter::USER);
-            let need_user_input = match &head {
-                Some(id) => {
-                    let conversation = log.linearize(id, ThreadFilter::USER);
-                    match conversation.last_message() {
-                        Some(last) => matches!(last.role, Role::Assistant),
-                        None => true,
+            let need_user_input = force_user_input
+                || match &head {
+                    Some(id) => {
+                        let conversation = log.linearize(id, ThreadFilter::USER);
+                        match conversation.last_message() {
+                            Some(last) => matches!(last.role, Role::Assistant),
+                            None => true,
+                        }
                     }
-                }
-                None => true,
-            };
+                    None => true,
+                };
+            force_user_input = false;
 
             if need_user_input {
                 let user_input = self.ui.get_user_input();
@@ -177,7 +180,20 @@ impl<UI: AjUi> Agent<UI> {
                 view.add_user_message(vec![ContentBlockParam::new_text_block(user_input)])?;
             }
 
-            self.execute_turn(log, ThreadKind::User, None).await?;
+            match self.execute_turn(log, ThreadKind::User, None).await {
+                Ok(()) => {}
+                Err(TurnError::Recoverable(err)) => {
+                    self.ui.display_error(&format!("{err:#}"));
+                    // The pending user message is still on disk. Force a
+                    // prompt next iteration so we don't immediately re-send
+                    // the same broken request to the model. The user can
+                    // type a follow-up (which will be appended to the
+                    // conversation) or hit Ctrl-C/D to quit.
+                    force_user_input = true;
+                    continue;
+                }
+                Err(TurnError::Fatal(err)) => return Err(err),
+            }
         }
 
         Ok(())
@@ -234,7 +250,7 @@ impl<UI: AjUi> Agent<UI> {
         log: &mut ConversationLog,
         thread: ThreadKind,
         agent_id: Option<usize>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), TurnError> {
         self.session_state.turn_counter += 1;
         let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
 
@@ -327,7 +343,11 @@ impl<UI: AjUi> Agent<UI> {
                 }
             }
 
-            let response = response.expect("missing message");
+            let response = response.ok_or_else(|| {
+                TurnError::Recoverable(anyhow!(
+                    "model stream ended without producing a final message"
+                ))
+            })?;
             let turn_usage = response.usage.clone();
 
             // Collect tool use blocks from the response
@@ -1023,6 +1043,50 @@ impl TurnContext {
 }
 
 impl ToolTurnContext for TurnContext {}
+
+/// Error returned from [Agent::execute_turn].
+///
+/// `Recoverable` errors (model API failures, malformed streaming responses,
+/// etc.) are surfaced to the user so they can retry or rephrase, rather
+/// than aborting the program. `Fatal` errors (log persistence failures,
+/// internal invariant violations) bubble out so the user gets a clean
+/// exit instead of silently looping.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnError {
+    /// An ephemeral error encountered while talking to the model. The
+    /// conversation log is in a consistent state and the user can retry
+    /// by submitting another message.
+    #[error("{0:#}")]
+    Recoverable(anyhow::Error),
+    /// A persistent failure (e.g. failed disk write) or an internal
+    /// invariant violation. Bubble out to the top level.
+    #[error(transparent)]
+    Fatal(anyhow::Error),
+}
+
+impl From<ModelError> for TurnError {
+    fn from(e: ModelError) -> Self {
+        TurnError::Recoverable(e.into())
+    }
+}
+
+impl From<ApiError> for TurnError {
+    fn from(e: ApiError) -> Self {
+        TurnError::Recoverable(e.into())
+    }
+}
+
+impl From<ConversationError> for TurnError {
+    fn from(e: ConversationError) -> Self {
+        TurnError::Fatal(e.into())
+    }
+}
+
+impl From<anyhow::Error> for TurnError {
+    fn from(e: anyhow::Error) -> Self {
+        TurnError::Fatal(e)
+    }
+}
 
 /// A wrapper around AjUi that records all UserOutput for later retrieval
 pub struct RecordingAjUi<'a> {
