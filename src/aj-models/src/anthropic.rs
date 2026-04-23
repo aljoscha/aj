@@ -1261,6 +1261,17 @@ impl From<AnthropicStreamingEvent> for StreamingEvent {
             AnthropicStreamingEvent::ParseError { error, raw_data } => {
                 StreamingEvent::ParseError { error, raw_data }
             }
+            AnthropicStreamingEvent::ToolUseParseError {
+                id,
+                name,
+                error,
+                raw_data,
+            } => StreamingEvent::ToolUseParseError {
+                id,
+                name,
+                error,
+                raw_data,
+            },
             AnthropicStreamingEvent::ProtocolError { error } => {
                 StreamingEvent::ProtocolError { error }
             }

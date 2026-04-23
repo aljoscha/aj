@@ -631,7 +631,9 @@ fn response_output_to_content(
                     input,
                     caller: None,
                 }),
-                Err(error) => events.push(StreamingEvent::ParseError {
+                Err(error) => events.push(StreamingEvent::ToolUseParseError {
+                    id: compose_tool_use_id(&call_id, id.as_deref()),
+                    name,
                     error: format!("failed to parse tool use input json: {error}"),
                     raw_data: arguments,
                 }),

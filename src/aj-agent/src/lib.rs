@@ -271,6 +271,11 @@ impl<UI: AjUi> Agent<UI> {
             let response_stream = self.run_inference_streaming(&conversation).await?;
 
             let mut response: Option<Message> = None;
+            // Tool_use blocks whose `input` JSON failed to parse arrive
+            // as ToolUseParseError and are dropped from the assistant
+            // content. Collect (id, name, error) so we can resurrect
+            // them with a paired `is_error: true` tool_result below.
+            let mut tool_use_parse_errors: Vec<(String, String, String)> = Vec::new();
 
             {
                 let mut response_stream = pin!(response_stream);
@@ -331,6 +336,18 @@ impl<UI: AjUi> Agent<UI> {
                                 "Parse error: {error} (raw data: {raw_data})"
                             ));
                         }
+                        StreamingEvent::ToolUseParseError {
+                            id,
+                            name,
+                            error,
+                            raw_data,
+                        } => {
+                            self.ui.display_error(&format!(
+                                "Tool use parse error for '{name}' (id={id}): {error} \
+                                 (raw data: {raw_data})"
+                            ));
+                            tool_use_parse_errors.push((id, name, error));
+                        }
                         StreamingEvent::ProtocolError { error } => {
                             self.ui.display_error(&format!("Protocol error: {error}"));
                         }
@@ -343,12 +360,34 @@ impl<UI: AjUi> Agent<UI> {
                 }
             }
 
-            let response = response.ok_or_else(|| {
+            let mut response = response.ok_or_else(|| {
                 TurnError::Recoverable(anyhow!(
                     "model stream ended without producing a final message"
                 ))
             })?;
             let turn_usage = response.usage.clone();
+
+            // Resurrect tool_use blocks dropped by the streaming layer
+            // due to malformed input JSON. We add a synthetic
+            // ToolUseBlock with `null` input to keep the assistant
+            // message structurally valid; the matching `is_error: true`
+            // tool_result is produced in the execution loop below so the
+            // model can retry instead of the user being bumped to the
+            // prompt.
+            //
+            // TODO: with incremental tool-call parsing we'd have the
+            // partial `input` bytes here and could pass them through
+            // instead of `null`.
+            let mut tool_use_parse_failures: HashMap<String, String> = HashMap::new();
+            for (id, name, error) in tool_use_parse_errors.drain(..) {
+                response.content.push(ContentBlock::ToolUseBlock {
+                    id: id.clone(),
+                    name,
+                    input: serde_json::Value::Null,
+                    caller: None,
+                });
+                tool_use_parse_failures.insert(id, error);
+            }
 
             // Collect tool use blocks from the response
             let mut tool_calls = Vec::new();
@@ -401,32 +440,49 @@ impl<UI: AjUi> Agent<UI> {
                 let mut tool_result_contents = Vec::new();
 
                 for (tool_id, tool_name, tool_input) in tool_calls {
-                    let tool_result = self
-                        .execute_tool(
-                            log,
-                            assistant_head.clone(),
-                            &mut turn_ctx,
-                            &tool_id,
-                            &tool_name,
-                            tool_input.clone(),
-                        )
-                        .await;
-
-                    let (tool_result, is_error) = match tool_result {
-                        Ok(result) => (result, false),
-                        Err(err) => {
+                    // For tool_use blocks resurrected from a parse
+                    // failure, skip execution and feed the parse error
+                    // back as the tool_result.
+                    let (tool_result, is_error) =
+                        if let Some(parse_err) = tool_use_parse_failures.remove(&tool_id) {
                             let user_error_output = UserOutput::ToolError {
                                 tool_name: tool_name.clone(),
-                                input: tool_input.to_string(),
-                                error: err.to_string(),
+                                input: "<malformed json>".to_string(),
+                                error: parse_err.clone(),
                             };
                             let tool_result = ToolResult {
-                                return_value: format!("{err}"),
+                                return_value: format!("Tool input parse error: {parse_err}"),
                                 user_outputs: vec![user_error_output],
                             };
                             (tool_result, true)
-                        }
-                    };
+                        } else {
+                            let tool_result = self
+                                .execute_tool(
+                                    log,
+                                    assistant_head.clone(),
+                                    &mut turn_ctx,
+                                    &tool_id,
+                                    &tool_name,
+                                    tool_input.clone(),
+                                )
+                                .await;
+
+                            match tool_result {
+                                Ok(result) => (result, false),
+                                Err(err) => {
+                                    let user_error_output = UserOutput::ToolError {
+                                        tool_name: tool_name.clone(),
+                                        input: tool_input.to_string(),
+                                        error: err.to_string(),
+                                    };
+                                    let tool_result = ToolResult {
+                                        return_value: format!("{err}"),
+                                        user_outputs: vec![user_error_output],
+                                    };
+                                    (tool_result, true)
+                                }
+                            }
+                        };
 
                     let result_content_block = ContentBlockParam::ToolResultBlock {
                         tool_use_id: tool_id.to_owned(),

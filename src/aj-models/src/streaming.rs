@@ -44,6 +44,18 @@ pub enum StreamingEvent {
         error: String,
         raw_data: String,
     },
+    /// A `tool_use` block whose `input` JSON failed to parse. Carries
+    /// the id/name so the agent can synthesize a matching `tool_result`.
+    ///
+    /// NOTE: providers can only emit this once the block has fully
+    /// streamed. With incremental tool-call parsing the id would be
+    /// known earlier and we could include the partial `input` too.
+    ToolUseParseError {
+        id: String,
+        name: String,
+        error: String,
+        raw_data: String,
+    },
     ProtocolError {
         error: String,
     },

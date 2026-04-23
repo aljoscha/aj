@@ -50,6 +50,18 @@ pub enum StreamingEvent {
         error: String,
         raw_data: String,
     },
+    /// A `tool_use` block whose `input` JSON failed to parse. Carries
+    /// the id/name so the agent can synthesize a matching `tool_result`.
+    ///
+    /// NOTE: id/name are only known at `ContentBlockStop` time. With
+    /// incremental tool-call parsing we could emit this eagerly with the
+    /// partial `input` bytes too.
+    ToolUseParseError {
+        id: String,
+        name: String,
+        error: String,
+        raw_data: String,
+    },
     ProtocolError {
         error: String,
     },
@@ -352,7 +364,9 @@ impl StreamProcessor {
                         let input = match serde_json::from_str(&input_json) {
                             Ok(input) => input,
                             Err(e) => {
-                                return Some(StreamingEvent::ParseError {
+                                return Some(StreamingEvent::ToolUseParseError {
+                                    id,
+                                    name,
                                     error: format!("failed to parse tool use input json: {e}"),
                                     raw_data: input_json,
                                 });
