@@ -28,7 +28,19 @@ use aj_models::conversation::{
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
     ui: UI,
+    /// The base system prompt template provided by the host (compile-time
+    /// constant, ships with the binary). The full prompt sent to the
+    /// model is derived from this plus environment-dependent context
+    /// (`AgentEnv`), and then frozen on the conversation log so that
+    /// resumed threads reuse the original assembly verbatim and keep
+    /// hitting Anthropic's prompt cache.
     system_prompt: &'static str,
+    /// The fully-assembled system prompt for the current run, populated
+    /// by [Agent::resolve_system_prompt] on the first turn. Equal to the
+    /// thread's persisted [aj_models::conversation::ConversationEntryKind::SystemPrompt]
+    /// when one exists; otherwise freshly assembled (and persisted on
+    /// fresh logs).
+    assembled_system_prompt: Option<String>,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
     /// Names of builtin tools to exclude when spawning subagents. Mirrors the
@@ -82,6 +94,7 @@ impl<UI: AjUi> Agent<UI> {
             env,
             ui,
             system_prompt,
+            assembled_system_prompt: None,
             tool_definitions,
             tools: api_tools,
             disabled_tools,
@@ -100,6 +113,15 @@ impl<UI: AjUi> Agent<UI> {
     }
 
     pub async fn run(&mut self, log: &mut ConversationLog) -> Result<(), anyhow::Error> {
+        // Resolve the system prompt up front: either reuse the one
+        // persisted on the log (cache-friendly resume) or assemble a
+        // fresh one from the current environment and persist it as the
+        // log's root entry. After this returns, every subsequent
+        // append from any thread (including subagents) will anchor to
+        // the system-prompt entry, and inference reuses
+        // `self.assembled_system_prompt` verbatim.
+        self.resolve_system_prompt(log)?;
+
         // Seed the subagent counter from the log so ids minted in this
         // session don't collide with subagent subtrees already persisted
         // from a prior session.
@@ -208,6 +230,12 @@ impl<UI: AjUi> Agent<UI> {
         agent_id: usize,
         prompt: String,
     ) -> Result<String, anyhow::Error> {
+        // Resolve the system prompt before any inference. For sub-agents
+        // the parent has already populated the log's SystemPrompt entry,
+        // so this just reads it back; the assembled prompt is shared
+        // across the whole session.
+        self.resolve_system_prompt(log)?;
+
         {
             let mut view = ConversationView::subagent(log, parent_head, agent_id);
             view.add_user_message(vec![ContentBlockParam::new_text_block(prompt)])?;
@@ -260,6 +288,13 @@ impl<UI: AjUi> Agent<UI> {
             ThreadKind::User => ThreadFilter::USER,
             ThreadKind::Subagent => {
                 ThreadFilter::subagent(agent_id.expect("subagent thread requires agent_id"))
+            }
+            // `execute_turn` only runs against user/subagent threads;
+            // meta entries are structural and never the subject of a turn.
+            ThreadKind::Meta => {
+                return Err(TurnError::Fatal(anyhow!(
+                    "execute_turn called with ThreadKind::Meta"
+                )));
             }
         };
 
@@ -547,14 +582,17 @@ impl<UI: AjUi> Agent<UI> {
 
         tracing::debug!(?thinking, "thinking budget");
 
+        // `resolve_system_prompt` is called at the top of each public
+        // entry point (`run`, `run_single_turn`) before any inference,
+        // so the cache is always populated by the time we get here.
+        let system_prompt = self
+            .assembled_system_prompt
+            .clone()
+            .expect("system prompt must be resolved before inference");
+
         let response = self
             .model
-            .run_inference_streaming(
-                conversation,
-                self.assemble_system_prompt(),
-                self.tools.clone(),
-                thinking,
-            )
+            .run_inference_streaming(conversation, system_prompt, self.tools.clone(), thinking)
             .await?;
 
         Ok(response)
@@ -628,6 +666,46 @@ impl<UI: AjUi> Agent<UI> {
         ));
 
         text
+    }
+
+    /// Determine the system prompt to use for this run, populating
+    /// [Self::assembled_system_prompt]. Idempotent: subsequent calls
+    /// within the same run are no-ops.
+    ///
+    /// Resolution rules:
+    /// - If the log already carries a persisted `SystemPrompt` entry
+    ///   (resumed thread, or a thread the parent agent already
+    ///   initialized), use that verbatim. This is the cache-friendly
+    ///   path: the prompt sent to the model is byte-for-byte identical
+    ///   to the one used on the previous turn, so Anthropic's prompt
+    ///   cache stays warm across UTC date rollovers and restarts.
+    /// - Else if the log is empty, freshly assemble from the static
+    ///   prompt + current env and persist as the root entry. Future
+    ///   resumes of this thread will then take the first branch.
+    /// - Else (legacy thread file with no persisted system prompt),
+    ///   freshly assemble without persisting, falling back to the
+    ///   pre-persistence behavior. The assembly may differ from what
+    ///   the model originally saw on this thread, but legacy threads
+    ///   never had a stable cached prompt anyway.
+    fn resolve_system_prompt(
+        &mut self,
+        log: &mut ConversationLog,
+    ) -> Result<(), ConversationError> {
+        if self.assembled_system_prompt.is_some() {
+            return Ok(());
+        }
+
+        if let Some(persisted) = log.system_prompt() {
+            self.assembled_system_prompt = Some(persisted.to_string());
+            return Ok(());
+        }
+
+        let assembled = self.assemble_system_prompt();
+        if log.is_empty() {
+            log.set_system_prompt(assembled.clone())?;
+        }
+        self.assembled_system_prompt = Some(assembled);
+        Ok(())
     }
 
     async fn execute_tool(
@@ -872,6 +950,9 @@ impl<UI: AjUi> Agent<UI> {
                     // Display user output (tool results, etc.)
                     self.display_user_output(std::slice::from_ref(user_output));
                 }
+                // SystemPrompt entries are model-facing metadata, not
+                // shown in the user-visible conversation history.
+                ConversationEntryKind::SystemPrompt { .. } => {}
             }
         }
 
@@ -1041,6 +1122,10 @@ fn make_view<'a>(
             let agent_id = agent_id.expect("subagent view requires an agent_id");
             ConversationView::subagent(log, head, agent_id)
         }
+        // Meta entries are written by [ConversationLog::set_system_prompt],
+        // never via a [ConversationView]. Reaching this arm indicates a
+        // caller bug.
+        ThreadKind::Meta => panic!("make_view called with ThreadKind::Meta"),
     }
 }
 
