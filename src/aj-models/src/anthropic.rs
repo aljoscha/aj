@@ -163,6 +163,9 @@ impl From<&ConversationEntry> for Option<AnthropicMessageParam> {
         match &entry.entry {
             ConversationEntryKind::Message(message) => Some(message.into()),
             ConversationEntryKind::UserOutput(_) => None,
+            // The system prompt is passed to the model out-of-band via
+            // the dedicated `system` field, not as a conversation message.
+            ConversationEntryKind::SystemPrompt { .. } => None,
         }
     }
 }

@@ -127,6 +127,10 @@ impl From<&ConversationEntry> for Vec<ResponseInputItem> {
         match &entry.entry {
             ConversationEntryKind::Message(message) => message.into(),
             ConversationEntryKind::UserOutput(_) => Vec::new(),
+            // The system prompt is passed to the model out-of-band via
+            // the dedicated `instructions` field, not as a conversation
+            // message.
+            ConversationEntryKind::SystemPrompt { .. } => Vec::new(),
         }
     }
 }

@@ -38,6 +38,12 @@ pub enum ThreadKind {
     User,
     /// Part of a subagent exchange. Disambiguated by `agent_id`.
     Subagent,
+    /// Log-level metadata that is not part of any conversation thread
+    /// (e.g. the [ConversationEntryKind::SystemPrompt] root entry).
+    /// `Meta` entries are skipped by [ThreadFilter] walks but still
+    /// participate in the parent_id chain so subsequent thread entries
+    /// can attach to them.
+    Meta,
 }
 
 /// An entry in a conversation log. One line in the `.jsonl` file.
@@ -81,6 +87,14 @@ pub enum ConversationEntryKind {
     Message(MessageParam),
     /// Information that is displayed to the user.
     UserOutput(UserOutput),
+    /// The fully-assembled system prompt for this thread, frozen at
+    /// thread creation time. Persisted as a [ThreadKind::Meta] root
+    /// entry so resuming the thread later (potentially across UTC date
+    /// rollovers, working-directory changes, or context-file edits)
+    /// reuses the exact prompt the model already cached, instead of
+    /// re-deriving a slightly different one and busting the prompt
+    /// cache.
+    SystemPrompt { text: String },
 }
 
 /// A filter specifying which entries of a [ConversationLog] to walk over.
@@ -110,6 +124,11 @@ impl ThreadFilter {
             ThreadKind::Subagent => {
                 matches!(entry.thread, ThreadKind::Subagent) && entry.agent_id == self.agent_id
             }
+            // `Meta` is never selected by a filter: meta entries are
+            // structural (parent-chain anchors) and don't represent any
+            // user-facing thread. Constructing a `ThreadFilter` with
+            // `thread: Meta` would be a misuse.
+            ThreadKind::Meta => false,
         }
     }
 }
@@ -399,6 +418,11 @@ impl ConversationLog {
                     "subagent-thread entry must carry an agent_id".to_string(),
                 ));
             }
+            ThreadKind::Meta if agent_id.is_some() => {
+                return Err(ConversationError::InvalidAppend(
+                    "meta entry must not carry an agent_id".to_string(),
+                ));
+            }
             _ => {}
         }
         if let Some(parent) = &parent_id {
@@ -519,6 +543,52 @@ impl ConversationLog {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    /// The persisted system prompt for this thread, if one was recorded
+    /// at thread creation. Resumed threads created before system-prompt
+    /// persistence was added will return `None`.
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt_entry().map(|e| match &e.entry {
+            ConversationEntryKind::SystemPrompt { text } => text.as_str(),
+            // `system_prompt_entry` only returns SystemPrompt entries.
+            _ => unreachable!("system_prompt_entry returned non-SystemPrompt entry"),
+        })
+    }
+
+    /// The id of the persisted system-prompt entry, if any. Used as the
+    /// parent for the first conversation-thread entry so the parent
+    /// chain remains rooted.
+    pub fn system_prompt_id(&self) -> Option<&EntryId> {
+        self.system_prompt_entry().map(|e| &e.id)
+    }
+
+    /// Persist the assembled system prompt as the root [ThreadKind::Meta]
+    /// entry of this log. May only be called on an empty log; once the
+    /// thread has any other entries the system prompt is fixed for its
+    /// lifetime. Returns the id of the new entry.
+    pub fn set_system_prompt(&mut self, text: String) -> Result<EntryId, ConversationError> {
+        if !self.order.is_empty() {
+            return Err(ConversationError::InvalidAppend(
+                "system prompt can only be set on an empty log".to_string(),
+            ));
+        }
+        self.append(
+            None,
+            ThreadKind::Meta,
+            None,
+            ConversationEntryKind::SystemPrompt { text },
+        )
+    }
+
+    /// Locate the (single) system-prompt entry by scanning the log. The
+    /// system prompt is the root entry on threads that have one, so this
+    /// is effectively `O(1)` in the common case but stays correct even
+    /// if the log layout ever grows additional meta entries before it.
+    fn system_prompt_entry(&self) -> Option<&ConversationEntry> {
+        self.entries
+            .values()
+            .find(|e| matches!(e.entry, ConversationEntryKind::SystemPrompt { .. }))
+    }
 }
 
 /// A mutation handle into a [ConversationLog] that tracks where the next
@@ -606,9 +676,8 @@ impl<'a> ConversationView<'a> {
         content: Vec<ContentBlockParam>,
     ) -> Result<EntryId, ConversationError> {
         let entry = ConversationEntryKind::Message(MessageParam { role, content });
-        let id = self
-            .log
-            .append(self.head.clone(), self.thread, self.agent_id, entry)?;
+        let parent = self.parent_for_next_append();
+        let id = self.log.append(parent, self.thread, self.agent_id, entry)?;
         self.head = Some(id.clone());
         Ok(id)
     }
@@ -620,11 +689,20 @@ impl<'a> ConversationView<'a> {
         user_output: UserOutput,
     ) -> Result<EntryId, ConversationError> {
         let entry = ConversationEntryKind::UserOutput(user_output);
-        let id = self
-            .log
-            .append(self.head.clone(), self.thread, self.agent_id, entry)?;
+        let parent = self.parent_for_next_append();
+        let id = self.log.append(parent, self.thread, self.agent_id, entry)?;
         self.head = Some(id.clone());
         Ok(id)
+    }
+
+    /// Determine the `parent_id` for the next append. Normally this is
+    /// just the current `head`, but when a thread is being started for
+    /// the first time on a log that already has a system-prompt root,
+    /// we anchor to that root so the parent chain stays connected.
+    fn parent_for_next_append(&self) -> Option<EntryId> {
+        self.head
+            .clone()
+            .or_else(|| self.log.system_prompt_id().cloned())
     }
 }
 
@@ -754,4 +832,211 @@ pub struct ThreadMetadata {
     pub thread_id: String,
     pub modified: String,
     pub size_display: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messages::ContentBlockParam;
+
+    /// Allocate a unique scratch directory for one test's persistence
+    /// state. Uses the process id, the test thread id, and a nanosecond
+    /// timestamp so tests running concurrently never collide.
+    fn fresh_threads_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aj-models-conversation-test-{pid}-{tid:?}-{nanos}",
+            pid = std::process::id(),
+            tid = std::thread::current().id(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn set_system_prompt_writes_root_entry_and_is_readable() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        let id = log
+            .set_system_prompt("hello world".to_string())
+            .expect("set_system_prompt on empty log");
+
+        // Visible through the public getters.
+        assert_eq!(log.system_prompt(), Some("hello world"));
+        assert_eq!(log.system_prompt_id(), Some(&id));
+
+        // It's the only entry, and it's a `Meta` entry with no parent.
+        assert_eq!(log.len(), 1);
+        let entry = log.entries.get(&id).expect("entry exists");
+        assert!(matches!(entry.thread, ThreadKind::Meta));
+        assert!(entry.parent_id.is_none());
+        assert!(matches!(
+            entry.entry,
+            ConversationEntryKind::SystemPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn set_system_prompt_rejects_non_empty_log() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        // Seed with a regular user message so the log is no longer empty.
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("first user message");
+        }
+
+        let err = log
+            .set_system_prompt("too late".to_string())
+            .expect_err("must fail on non-empty log");
+        assert!(matches!(err, ConversationError::InvalidAppend(_)));
+    }
+
+    #[test]
+    fn first_user_message_anchors_to_system_prompt_root() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        let sp_id = log
+            .set_system_prompt("the prompt".to_string())
+            .expect("set system prompt");
+
+        let user_id = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg")
+        };
+
+        // The first user message's parent is the system-prompt entry.
+        let user_entry = log.entries.get(&user_id).expect("user entry exists");
+        assert_eq!(user_entry.parent_id.as_ref(), Some(&sp_id));
+    }
+
+    #[test]
+    fn latest_leaf_user_skips_system_prompt() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        log.set_system_prompt("p".to_string()).expect("set sp");
+
+        // No user messages yet: the only entry is Meta, so the latest
+        // user leaf is None.
+        assert!(log.latest_leaf(ThreadFilter::USER).is_none());
+
+        let user_id = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg")
+        };
+
+        assert_eq!(log.latest_leaf(ThreadFilter::USER).as_ref(), Some(&user_id));
+    }
+
+    #[test]
+    fn linearize_user_walks_past_system_prompt() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".to_string()).expect("set sp");
+
+        let user_id = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg")
+        };
+
+        let convo = log.linearize(&user_id, ThreadFilter::USER);
+        // SystemPrompt must not appear in a User-thread linearization;
+        // only the user message should be present.
+        assert_eq!(convo.entries().len(), 1);
+        assert!(matches!(
+            convo.entries()[0].entry,
+            ConversationEntryKind::Message(_)
+        ));
+        // And it doesn't sneak in via `messages()` either.
+        assert_eq!(convo.message_count(), 1);
+    }
+
+    #[test]
+    fn resume_preserves_system_prompt() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+
+        let thread_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("persisted prompt".to_string())
+                .expect("set sp");
+            {
+                let mut view = ConversationView::user(&mut log, None);
+                view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                    .expect("user msg");
+            }
+            log.thread_id().to_string()
+        };
+
+        // Resume in a fresh process-equivalent: no in-memory state
+        // carries over, only what was written to disk.
+        let resumed = ConversationLog::resume(&persistence, &thread_id).expect("resume log");
+        assert_eq!(resumed.system_prompt(), Some("persisted prompt"));
+        assert!(resumed.system_prompt_id().is_some());
+        assert!(resumed.latest_leaf(ThreadFilter::USER).is_some());
+    }
+
+    #[test]
+    fn legacy_log_without_system_prompt_returns_none() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        // Skip set_system_prompt entirely (legacy thread shape) and
+        // write a user message directly, which becomes the root.
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg");
+        }
+
+        assert!(log.system_prompt().is_none());
+        assert!(log.system_prompt_id().is_none());
+    }
+
+    #[test]
+    fn subagent_thread_attaches_to_existing_user_chain() {
+        // Sanity check that the system-prompt root doesn't disturb the
+        // existing user/subagent linearization behaviour: a subagent's
+        // first message attaches to the user-thread parent it was
+        // spawned from, and subagent linearization only collects
+        // subagent entries.
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".to_string()).expect("set sp");
+
+        let user_id = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg")
+        };
+
+        let sub_id = {
+            let mut view = ConversationView::subagent(&mut log, user_id.clone(), 1);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("subtask".into())])
+                .expect("subagent prompt")
+        };
+
+        let convo = log.linearize(&sub_id, ThreadFilter::subagent(1));
+        // Only the subagent's own message is collected; the user
+        // ancestor and the SystemPrompt are walked through but filtered.
+        assert_eq!(convo.entries().len(), 1);
+    }
 }
