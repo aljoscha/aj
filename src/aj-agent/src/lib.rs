@@ -173,7 +173,7 @@ impl<UI: AjUi> Agent<UI> {
                     if head.is_some() {
                         let id = log.thread_id();
                         self.ui.display_notice(&format!(
-                            "Thread: {id} (resume with: aj threads continue {id})"
+                            "Thread: {id} (resume with: aj continue {id})"
                         ));
                     }
                     break;

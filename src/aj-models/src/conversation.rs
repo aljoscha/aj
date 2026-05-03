@@ -371,7 +371,7 @@ impl ConversationLog {
         })
     }
 
-    /// The id under which this log is listed by `aj threads list`.
+    /// The id under which this log is listed by `aj list-threads`.
     pub fn thread_id(&self) -> &str {
         &self.thread_id
     }

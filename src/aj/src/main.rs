@@ -41,19 +41,9 @@ struct Cli {
 #[derive(Subcommand)]
 #[command(flatten_help = true)]
 enum Commands {
-    /// Manage conversation threads.
-    Threads {
-        #[command(subcommand)]
-        action: ThreadsAction,
-    },
-}
-
-#[derive(Subcommand)]
-#[command(flatten_help = true)]
-enum ThreadsAction {
     /// List existing conversation threads.
-    List,
-    /// Continue a conversation thread.
+    ListThreads,
+    /// Continue a conversation thread (latest if no id given).
     Continue {
         /// Conversation ID to continue (if not provided, continues latest
         /// thread).
@@ -141,26 +131,24 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Some(Commands::Threads { action }) => match action {
-            ThreadsAction::List => {
-                list_threads(&conversation_persistence)?;
-            }
-            ThreadsAction::Continue { thread_id } => {
-                if let Some(thread_id) = thread_id {
-                    let mut log = ConversationLog::resume(&conversation_persistence, &thread_id)?;
+        Some(Commands::ListThreads) => {
+            list_threads(&conversation_persistence)?;
+        }
+        Some(Commands::Continue { thread_id }) => {
+            if let Some(thread_id) = thread_id {
+                let mut log = ConversationLog::resume(&conversation_persistence, &thread_id)?;
+                agent.run(&mut log).await?;
+            } else {
+                let latest_thread_id = conversation_persistence.get_latest_thread_id()?;
+                if let Some(latest_thread_id) = latest_thread_id {
+                    let mut log =
+                        ConversationLog::resume(&conversation_persistence, &latest_thread_id)?;
                     agent.run(&mut log).await?;
                 } else {
-                    let latest_thread_id = conversation_persistence.get_latest_thread_id()?;
-                    if let Some(latest_thread_id) = latest_thread_id {
-                        let mut log =
-                            ConversationLog::resume(&conversation_persistence, &latest_thread_id)?;
-                        agent.run(&mut log).await?;
-                    } else {
-                        ui.display_notice("No latest conversation to resume");
-                    }
+                    ui.display_notice("No latest conversation to resume");
                 }
             }
-        },
+        }
         None => {
             // Default behavior: start a fresh log and run the agent.
             let mut log = ConversationLog::create(&conversation_persistence)?;

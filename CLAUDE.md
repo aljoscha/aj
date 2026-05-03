@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build: `cargo check` or `cargo build`
 - Run all tests: `cargo test`
 - Run specific test: `cargo test --package package_name -- test_name`
-- Run CLI: `cargo run -p aj -- [args]` (e.g., `list-threads`, `resume <id>`, `resume-latest`)
+- Run CLI: `cargo run -p aj -- [args]` (e.g., `list-threads`, `continue <id>`, `continue`)
 - Run specific bin: `cargo run -p aj --bin test_diff`
 - Format code: `cargo fmt`
 - Lint: `cargo clippy`
