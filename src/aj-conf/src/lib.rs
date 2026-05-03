@@ -179,12 +179,14 @@ impl AgentEnv {
         None
     }
 
-    /// Load project-level instructions from `AGENTS.md` (preferred) or
-    /// `agents.md` in the working directory.
+    /// Load project-level instructions from the working directory. Prefers
+    /// `AGENTS.md` (open standard), falling back to `agents.md` and then to
+    /// `CLAUDE.md` (Claude Code convention).
     fn load_project_instructions(working_directory: &Path) -> Option<ContextFile> {
         let candidates = [
             working_directory.join("AGENTS.md"),
             working_directory.join("agents.md"),
+            working_directory.join("CLAUDE.md"),
         ];
 
         for path in candidates {
@@ -599,5 +601,51 @@ disabled_tools = ["todo_read", "todo_write"]
                 None => env::remove_var("HOME"),
             }
         }
+    }
+
+    /// Build a unique temp directory for tests that need a real filesystem
+    /// scratch space without pulling in `tempfile`.
+    fn make_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("aj-conf-test-{tag}-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_load_project_instructions_prefers_agents_md() {
+        let dir = make_temp_dir("prefers-agents");
+        fs::write(dir.join("AGENTS.md"), "agents content").unwrap();
+        fs::write(dir.join("agents.md"), "lowercase content").unwrap();
+        fs::write(dir.join("CLAUDE.md"), "claude content").unwrap();
+
+        let file = AgentEnv::load_project_instructions(&dir).expect("file should load");
+        assert_eq!(file.kind, ContextFileKind::ProjectInstructions);
+        assert_eq!(file.content, "agents content");
+        assert_eq!(file.path, dir.join("AGENTS.md"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_project_instructions_falls_back_to_claude_md() {
+        let dir = make_temp_dir("falls-back-claude");
+        fs::write(dir.join("CLAUDE.md"), "claude content").unwrap();
+
+        let file = AgentEnv::load_project_instructions(&dir).expect("file should load");
+        assert_eq!(file.content, "claude content");
+        assert_eq!(file.path, dir.join("CLAUDE.md"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_project_instructions_none_when_missing() {
+        let dir = make_temp_dir("none-missing");
+        assert!(AgentEnv::load_project_instructions(&dir).is_none());
+        fs::remove_dir_all(&dir).ok();
     }
 }
