@@ -53,11 +53,69 @@ impl FromStr for ConfigThinkingLevel {
     }
 }
 
+/// Prefix for project-level AGENTS.md instructions injected into the system
+/// prompt.
 pub const AGENTS_MD_PREFIX: &str = r#"
 Here are instructions about the code base from the user. It's the contents
 of an AGENTS.md file. These instructions override default behavior and you
 must follow them exactly as written:
 "#;
+
+/// Prefix for user-level (global) instructions injected into the system
+/// prompt.
+pub const USER_AGENTS_MD_PREFIX: &str = r#"
+Here are global instructions from the user that apply across all projects.
+They are loaded from the user's home directory (e.g. ~/.agents/AGENTS.md
+or ~/.claude/CLAUDE.md). These instructions override default behavior and
+you must follow them exactly as written:
+"#;
+
+/// A file that contributes to the agent's context (system prompt). Today this
+/// covers user-level and project-level `AGENTS.md` / `CLAUDE.md`. In the
+/// future this is the place to plug in additional context (e.g. skills).
+#[derive(Debug, Clone)]
+pub struct ContextFile {
+    /// Path to the file on disk.
+    pub path: PathBuf,
+    /// What kind of context file this is. Used to pick the right framing when
+    /// stitching the file into the system prompt and to label it in the UI.
+    pub kind: ContextFileKind,
+    /// Contents of the file.
+    pub content: String,
+}
+
+/// Kind of a [ContextFile]. Determines the prefix text used when injecting the
+/// content into the system prompt and the human-readable label shown in the
+/// UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextFileKind {
+    /// Global, user-level instructions from `~/.agents/AGENTS.md` or
+    /// `~/.claude/CLAUDE.md`.
+    UserInstructions,
+    /// Project-level instructions from `AGENTS.md` / `agents.md` in the
+    /// working directory.
+    ProjectInstructions,
+}
+
+impl ContextFileKind {
+    /// Returns the prefix text injected into the system prompt before the
+    /// file's content.
+    pub fn prompt_prefix(&self) -> &'static str {
+        match self {
+            ContextFileKind::UserInstructions => USER_AGENTS_MD_PREFIX,
+            ContextFileKind::ProjectInstructions => AGENTS_MD_PREFIX,
+        }
+    }
+
+    /// Short human-readable label, used when displaying the context to the
+    /// user.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ContextFileKind::UserInstructions => "user instructions",
+            ContextFileKind::ProjectInstructions => "project instructions",
+        }
+    }
+}
 
 /// The working environment of the agent, includes configuration, the system
 /// prompt, working directories, etc.
@@ -67,8 +125,9 @@ pub struct AgentEnv {
     pub git_root_directory: Option<PathBuf>,
     pub operating_system: String,
     pub today_date: String,
-    /// Contents of AGENTS.md, if present.
-    pub agents_md: Option<String>,
+    /// Files that get stitched into the agent's system prompt. Ordered from
+    /// most general (user-level) to most specific (project-level).
+    pub context_files: Vec<ContextFile>,
 }
 
 impl AgentEnv {
@@ -77,26 +136,80 @@ impl AgentEnv {
         let git_root_directory = find_git_root(&working_directory);
         let operating_system = env::consts::OS.to_string();
         let today_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let agents_md_content = Self::load_agents_md(&working_directory);
+
+        let mut context_files = Vec::new();
+        if let Some(file) = Self::load_user_instructions() {
+            context_files.push(file);
+        }
+        if let Some(file) = Self::load_project_instructions(&working_directory) {
+            context_files.push(file);
+        }
 
         AgentEnv {
             working_directory,
             git_root_directory,
             operating_system,
             today_date,
-            agents_md: agents_md_content,
+            context_files,
         }
     }
 
-    fn load_agents_md(working_directory: &Path) -> Option<String> {
-        // Try AGENTS.md first, then agents.md.
-        let uppercase_path = working_directory.join("AGENTS.md");
-        if let Ok(content) = fs::read_to_string(&uppercase_path) {
-            return Some(content);
+    /// Load global user-level instructions. Prefers `~/.agents/AGENTS.md`
+    /// (open standard) over `~/.claude/CLAUDE.md` (Claude Code) when both
+    /// exist. Returns `None` if `HOME` isn't set or neither file exists.
+    fn load_user_instructions() -> Option<ContextFile> {
+        let home = env::var("HOME").ok()?;
+        let home = PathBuf::from(home);
+
+        // Prefer .agents over .claude.
+        let candidates = [
+            home.join(".agents").join("AGENTS.md"),
+            home.join(".claude").join("CLAUDE.md"),
+        ];
+
+        for path in candidates {
+            if let Ok(content) = fs::read_to_string(&path) {
+                return Some(ContextFile {
+                    path,
+                    kind: ContextFileKind::UserInstructions,
+                    content,
+                });
+            }
         }
-        let lowercase_path = working_directory.join("agents.md");
-        fs::read_to_string(lowercase_path).ok()
+        None
     }
+
+    /// Load project-level instructions from `AGENTS.md` (preferred) or
+    /// `agents.md` in the working directory.
+    fn load_project_instructions(working_directory: &Path) -> Option<ContextFile> {
+        let candidates = [
+            working_directory.join("AGENTS.md"),
+            working_directory.join("agents.md"),
+        ];
+
+        for path in candidates {
+            if let Ok(content) = fs::read_to_string(&path) {
+                return Some(ContextFile {
+                    path,
+                    kind: ContextFileKind::ProjectInstructions,
+                    content,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// Render `path` for display. If it lives under `$HOME`, abbreviate the home
+/// prefix to `~`.
+pub fn display_path(path: &Path) -> String {
+    if let Ok(home) = env::var("HOME") {
+        let home = PathBuf::from(home);
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
 }
 
 impl Default for AgentEnv {
@@ -431,5 +544,60 @@ disabled_tools = ["todo_read", "todo_write"]
         assert!(display_output.contains("Git root directory:"));
         assert!(display_output.contains("Operating system:"));
         assert!(display_output.contains("Today's date:"));
+    }
+
+    #[test]
+    fn test_context_file_kind_prompt_prefix() {
+        // Each kind has a non-empty prefix; smoke-test that the user-level
+        // prefix is distinct from the project-level one so the model sees
+        // them framed differently.
+        assert!(!ContextFileKind::UserInstructions.prompt_prefix().is_empty());
+        assert!(
+            !ContextFileKind::ProjectInstructions
+                .prompt_prefix()
+                .is_empty()
+        );
+        assert_ne!(
+            ContextFileKind::UserInstructions.prompt_prefix(),
+            ContextFileKind::ProjectInstructions.prompt_prefix()
+        );
+    }
+
+    #[test]
+    fn test_context_file_kind_label() {
+        assert_eq!(
+            ContextFileKind::UserInstructions.label(),
+            "user instructions"
+        );
+        assert_eq!(
+            ContextFileKind::ProjectInstructions.label(),
+            "project instructions"
+        );
+    }
+
+    #[test]
+    fn test_display_path_tildifies_home() {
+        // Pin HOME to a known value so the test is deterministic regardless
+        // of the user running it.
+        // SAFETY: tests are single-threaded per-binary by default, but env
+        // mutation is still process-wide. We restore the prior value below.
+        let prior_home = env::var("HOME").ok();
+        unsafe {
+            env::set_var("HOME", "/home/test-user");
+        }
+
+        let inside = PathBuf::from("/home/test-user/.agents/AGENTS.md");
+        assert_eq!(display_path(&inside), "~/.agents/AGENTS.md");
+
+        let outside = PathBuf::from("/etc/hosts");
+        assert_eq!(display_path(&outside), "/etc/hosts");
+
+        // Restore.
+        unsafe {
+            match prior_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
     }
 }

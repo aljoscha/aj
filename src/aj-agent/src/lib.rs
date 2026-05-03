@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::pin::{pin, Pin};
 use std::time::Duration;
 
-use aj_conf::{AgentEnv, ConfigThinkingLevel};
+use aj_conf::{display_path, AgentEnv, ConfigThinkingLevel};
 use aj_models::messages::{ApiError, ContentBlock, ContentBlockParam, Message, Role, Usage};
 use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
@@ -135,6 +135,8 @@ impl<UI: AjUi> Agent<UI> {
             self.model.model_name(),
             self.model.model_url()
         ));
+
+        self.display_context();
 
         if std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err() {
             self.ui.display_warning(
@@ -609,11 +611,14 @@ impl<UI: AjUi> Agent<UI> {
     fn assemble_system_prompt(&self) -> String {
         let mut text = self.system_prompt.to_string();
 
-        if let Some(agents_md_content) = &self.env.agents_md {
+        // Stitch in every context file, in order. Each file is wrapped in an
+        // `<agents-md>` block so the model can clearly tell where instructions
+        // start and end, with the kind-specific prefix text introducing it.
+        for file in &self.env.context_files {
             text.push_str(&format!(
                 "\n\n{}\n<agents-md>\n{}\n</agents-md>",
-                aj_conf::AGENTS_MD_PREFIX,
-                agents_md_content
+                file.kind.prompt_prefix(),
+                file.content
             ));
         }
 
@@ -711,6 +716,26 @@ impl<UI: AjUi> Agent<UI> {
                 }
             }
         }
+    }
+
+    /// Display the context (system prompt addenda) at startup so the user can
+    /// see which agent files (and, in the future, skills) are being injected
+    /// into the model's system prompt.
+    fn display_context(&mut self) {
+        if self.env.context_files.is_empty() {
+            self.ui.display_notice("Context: (none)");
+            return;
+        }
+
+        let mut lines = String::from("Context:");
+        for file in &self.env.context_files {
+            lines.push_str(&format!(
+                "\n  - {} ({})",
+                display_path(&file.path),
+                file.kind.label()
+            ));
+        }
+        self.ui.display_notice(&lines);
     }
 
     fn display_usage_summary(&mut self) {
