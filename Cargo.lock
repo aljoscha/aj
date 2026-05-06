@@ -42,6 +42,7 @@ dependencies = [
  "console",
  "dotenv",
  "rustyline",
+ "serde_json",
  "similar",
  "termimad",
  "tokio",
