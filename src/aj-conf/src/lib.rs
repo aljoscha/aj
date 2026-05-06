@@ -336,11 +336,6 @@ impl Config {
         Ok(aj_dir)
     }
 
-    pub fn get_history_file_path() -> Result<PathBuf, ConfigError> {
-        let aj_dir = Self::get_config_dir()?;
-        Ok(aj_dir.join("history.txt"))
-    }
-
     pub fn get_dotenv_file_path() -> Result<PathBuf, ConfigError> {
         let aj_dir = Self::get_config_dir()?;
         Ok(aj_dir.join(".env"))

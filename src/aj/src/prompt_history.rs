@@ -505,4 +505,26 @@ mod tests {
         let h = bootstrap_for(&dir, 100);
         assert!(h.is_empty());
     }
+
+    #[test]
+    fn arc_mutex_record_is_visible_through_shared_handles() {
+        // Lock down the contract used by `AjCli::shallow_clone`: a
+        // record made via one `Arc<Mutex<PromptHistory>>` handle is
+        // visible to all other handles that share the same Arc.
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(PromptHistory::new(100)));
+        let other = Arc::clone(&shared);
+
+        shared.lock().unwrap().record("from handle a");
+        other.lock().unwrap().record("from handle b");
+
+        let entries: Vec<String> = shared
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(entries, vec!["from handle a", "from handle b"]);
+    }
 }

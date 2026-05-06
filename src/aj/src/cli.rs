@@ -1,27 +1,43 @@
-use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use aj_ui::{AjUi, TokenUsage, UsageSummary};
 use console::{Color, style};
 use rustyline::config::Config;
 use rustyline::config::EditMode;
-use rustyline::history::FileHistory;
+use rustyline::history::MemHistory;
 use rustyline::{Cmd, Editor, KeyEvent};
 
 use crate::cli_common::AjCliCommon;
+use crate::prompt_history::PromptHistory;
 
 /// Cli-based implementation of [AjUi].
+///
+/// The prompt history is held in-memory and shared with any clones (made
+/// via [`AjUi::shallow_clone`]) so that the agent's UI and the harness's
+/// UI both see the same up-arrow stack. Bootstrap from the on-disk
+/// JSONL conversation logs happens once at startup; this struct never
+/// touches a separate history file.
 #[derive(Clone)]
 pub struct AjCli {
-    history_path: Option<PathBuf>,
+    history: Arc<Mutex<PromptHistory>>,
     common: AjCliCommon,
 }
 
 impl AjCli {
-    pub fn new(history_path: Option<PathBuf>) -> Self {
+    pub fn new(history: Arc<Mutex<PromptHistory>>) -> Self {
         Self {
-            history_path,
+            history,
             common: AjCliCommon::new(None, true, true),
         }
+    }
+
+    /// Construct an [`AjCli`] with an empty in-memory prompt history.
+    /// Useful for example/test binaries that don't actually need
+    /// persistent history.
+    pub fn with_empty_history() -> Self {
+        Self::new(Arc::new(Mutex::new(PromptHistory::new(
+            crate::prompt_history::DEFAULT_MAX_ENTRIES,
+        ))))
     }
 }
 
@@ -44,13 +60,16 @@ impl AjUi for AjCli {
     fn get_user_input(&mut self) -> Option<String> {
         let config = Config::builder().edit_mode(EditMode::Emacs).build();
 
-        let mut rl: Editor<(), FileHistory> =
-            Editor::with_history(config, FileHistory::new()).unwrap();
+        let mut rl: Editor<(), MemHistory> =
+            Editor::with_history(config, MemHistory::new()).unwrap();
 
-        if let Some(history_path) = self.history_path.as_ref() {
-            if history_path.exists() {
-                let _ = rl.load_history(history_path);
-            }
+        // Snapshot the in-memory history into the editor's MemHistory.
+        // We do this on every readline call so the user sees prompts
+        // submitted earlier in this same session as well as those
+        // bootstrapped from the JSONL logs at startup.
+        {
+            let history = self.history.lock().unwrap();
+            history.install(&mut rl);
         }
 
         rl.bind_sequence(KeyEvent::ctrl('S'), Cmd::Newline);
@@ -64,13 +83,12 @@ impl AjUi for AjCli {
                     return None;
                 }
 
-                // Add to history if not empty and not a duplicate
-                if !line.trim().is_empty() {
-                    let _ = rl.add_history_entry(&line);
-                }
-
-                if let Some(history_path) = self.history_path.as_ref() {
-                    let _ = rl.save_history(history_path);
+                // Record the freshly submitted prompt in the shared
+                // in-memory history. The next readline call (and the
+                // shallow-cloned UI inside the agent) will see it.
+                {
+                    let mut history = self.history.lock().unwrap();
+                    history.record(&line);
                 }
 
                 println!();
@@ -154,6 +172,9 @@ impl AjUi for AjCli {
     }
 
     fn shallow_clone(&mut self) -> Box<dyn AjUi> {
-        Box::new(crate::cli::AjCli::new(self.history_path.clone()))
+        // Cheap Arc clone — both the original and the shallow clone
+        // share the same underlying PromptHistory and so observe each
+        // other's submissions.
+        Box::new(crate::cli::AjCli::new(Arc::clone(&self.history)))
     }
 }

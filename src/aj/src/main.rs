@@ -1,5 +1,8 @@
+use std::sync::{Arc, Mutex};
+
 use aj::SYSTEM_PROMPT;
 use aj::cli::AjCli;
+use aj::prompt_history::{DEFAULT_MAX_ENTRIES, PromptHistory};
 use aj_agent::Agent;
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
 use aj_models::conversation::{ConversationLog, ConversationPersistence};
@@ -79,20 +82,21 @@ async fn main() -> Result<()> {
     // Parse CLI flags (highest priority).
     let cli = Cli::parse();
 
-    let history_path = match Config::get_history_file_path() {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("Could not get history file path: {e}");
-            return Err(e.into());
-        }
-    };
-
     let threads_dir = Config::get_threads_dir_path()?;
 
     // Resolve settings with precedence: CLI flags > env vars > config.toml > defaults.
-    let mut ui = AjCli::new(Some(history_path));
     let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
+
+    // Bootstrap the prompt history from the project's JSONL conversation
+    // logs. The resulting `Arc<Mutex<_>>` is shared (via shallow_clone)
+    // between the harness UI and the cloned UI handed to the agent, so
+    // submissions made during the session immediately show up in the
+    // editor's up-arrow stack.
+    let mut ui = AjCli::new(Arc::new(Mutex::new(PromptHistory::bootstrap(
+        &conversation_persistence,
+        DEFAULT_MAX_ENTRIES,
+    ))));
 
     let speed = match cli.speed {
         Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
