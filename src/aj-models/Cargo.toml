@@ -21,5 +21,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Integration tests in `tests/roundtrip/` re-use the live SDK shapes
+# directly so the round-trip fixtures stay in sync with the wire.
+anthropic-sdk = { path = "../anthropic-sdk" }
+serde_json.workspace = true
+
 [lints]
 workspace = true

@@ -1,0 +1,14 @@
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "signature": "base64-signature-bytes",
+      "thinking": "let me think about this"
+    },
+    {
+      "type": "text",
+      "text": "Sure, here's the answer."
+    }
+  ]
+}

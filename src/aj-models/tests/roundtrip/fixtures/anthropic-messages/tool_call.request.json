@@ -1,0 +1,17 @@
+{
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll read that file."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01abcDEF",
+      "input": {
+        "path": "/tmp/x"
+      },
+      "name": "read_file"
+    }
+  ]
+}

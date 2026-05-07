@@ -391,6 +391,147 @@ fn convert_assistant_message(m: &AssistantMessage) -> MessageParam {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public round-trip helpers (`docs/models-spec.md` §1.10, §12 step 11b)
+// ---------------------------------------------------------------------------
+
+/// Project an [`AssistantMessage`] onto the Anthropic Messages request item
+/// shape — the [`MessageParam`] with `role: "assistant"` that gets sent as
+/// part of `messages[]` on a follow-up turn.
+///
+/// This is the serialize side of the §1.10 round-trip invariant. It is the
+/// same projection the provider uses internally when building a request
+/// body, exposed publicly so the round-trip test suite (and any future
+/// consumer that wants to materialize a single assistant turn into its
+/// wire form without spinning up a full request) can call it directly.
+///
+/// Behaviour matches the rules in `docs/models-spec.md` §6.2:
+/// - Text blocks are forwarded verbatim.
+/// - Thinking blocks with a signature ride as `thinking` blocks.
+/// - Redacted thinking blocks ride as `redacted_thinking` with the
+///   encrypted payload pulled from `thinking_signature`.
+/// - Thinking blocks without a signature (e.g. from an aborted prior
+///   stream) are demoted to plain text so the model still sees the
+///   context.
+/// - Tool calls ride as `tool_use` blocks.
+pub fn assistant_message_to_request_item(message: &AssistantMessage) -> MessageParam {
+    convert_assistant_message(message)
+}
+
+/// Inverse of [`assistant_message_to_request_item`]: parse an Anthropic
+/// `messages[]` entry whose role is `assistant` back into a unified
+/// [`AssistantMessage`].
+///
+/// This is the parse side of the §1.10 round-trip invariant — symmetric to
+/// the SSE state machine in [`StreamState`], because Anthropic's request
+/// and response content blocks share shapes one-for-one. See
+/// `docs/models-spec.md` §6.2 for the field mapping; the spec rules
+/// preserved here are:
+///
+/// - `text` → [`AssistantContent::Text`].
+/// - `thinking` (with signature) → [`AssistantContent::Thinking`] with
+///   `redacted == false` and the signature populated.
+/// - `redacted_thinking` → [`AssistantContent::Thinking`] with
+///   `redacted == true`, empty visible text, and the encrypted payload
+///   in `thinking_signature`.
+/// - `tool_use` → [`AssistantContent::ToolCall`].
+///
+/// Server-only block kinds (server-side tool use, MCP, code execution,
+/// search results, citations, …) are not representable in the unified
+/// content set and are dropped — matching the streaming parser's
+/// `BlockState::Ignored` behaviour. The `role` is taken on faith; passing
+/// in a user-role param yields an empty assistant message.
+pub fn parse_assistant_request_item(param: &MessageParam) -> AssistantMessage {
+    let mut content = Vec::with_capacity(param.content.len());
+    for block in &param.content {
+        match block {
+            ContentBlockParam::TextBlock { text, .. } => {
+                content.push(AssistantContent::Text(TextContent {
+                    text: text.clone(),
+                    text_signature: None,
+                }));
+            }
+            ContentBlockParam::ThinkingBlock {
+                signature,
+                thinking,
+            } => {
+                content.push(AssistantContent::Thinking(ThinkingContent {
+                    thinking: thinking.clone(),
+                    thinking_signature: if signature.is_empty() {
+                        None
+                    } else {
+                        Some(signature.clone())
+                    },
+                    redacted: false,
+                }));
+            }
+            ContentBlockParam::RedactedThinkingBlock { data } => {
+                content.push(AssistantContent::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: Some(data.clone()),
+                    redacted: true,
+                }));
+            }
+            ContentBlockParam::ToolUseBlock {
+                id, input, name, ..
+            } => {
+                content.push(AssistantContent::ToolCall(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: input.clone(),
+                }));
+            }
+            // Everything else (image / document / search result on the
+            // user side, server tool use, MCP, container upload, …) is
+            // not part of the unified assistant content set and is
+            // silently dropped, matching the streaming parser.
+            _ => {}
+        }
+    }
+    let mut out = AssistantMessage::empty();
+    out.api = API_NAME.to_string();
+    out.content = content;
+    out
+}
+
+/// Replay a sequence of pre-decoded Anthropic [`ServerSentEvent`]s through
+/// the provider's streaming state machine and return the finalized
+/// [`AssistantMessage`].
+///
+/// The fixture-based round-trip tests in `tests/roundtrip/` use this to
+/// turn captured SSE wire dumps into unified messages without spinning up
+/// a real HTTP client. Provided publicly so external test suites can
+/// share the exact same parse path the live provider does.
+pub fn replay_sse_events(
+    model: &ModelInfo,
+    events: impl IntoIterator<Item = ServerSentEvent>,
+) -> AssistantMessage {
+    let mut state = StreamState::new(model);
+    let mut last_event: Option<AssistantMessageEvent> = None;
+    for ev in events {
+        let outcome = state.process(ev);
+        if let Some(last) = outcome.events.into_iter().last() {
+            last_event = Some(last);
+        }
+        if outcome.terminal {
+            // `MessageStop` produces no events itself; finalize below.
+            // `Error` already produced an `Error` event with the final
+            // message; keep that.
+            break;
+        }
+    }
+    // If the stream emitted its own terminal `Error` event, prefer that
+    // message — it carries the populated `error` and `stop_reason`.
+    if let Some(AssistantMessageEvent::Error { error, .. }) = last_event {
+        return error;
+    }
+    match state.finalize() {
+        AssistantMessageEvent::Done { message, .. }
+        | AssistantMessageEvent::Error { error: message, .. } => message,
+        other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
+    }
+}
+
 fn convert_tool_result(t: &ToolResultMessage) -> ContentBlockParam {
     // Pure-text results take the cheaper `Text(String)` shape; anything
     // else (multiple blocks, images) goes through the array form.
