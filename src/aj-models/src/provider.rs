@@ -64,8 +64,8 @@ pub trait Provider: Send + Sync {
 fn provider_for(api: &str) -> Option<Box<dyn Provider>> {
     match api {
         "anthropic-messages" => Some(Box::new(crate::anthropic::AnthropicProvider)),
-        // Filled in by §7 (openai-completions, openai-responses) as each
-        // provider lands.
+        "openai-completions" => Some(Box::new(crate::openai::OpenAiCompletionsProvider)),
+        // Filled in by §7.3 (openai-responses) once that provider lands.
         _ => None,
     }
 }
