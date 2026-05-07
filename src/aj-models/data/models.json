@@ -1,5 +1,5 @@
 {
-  "updated_at": 1778167988669,
+  "updated_at": 1778168672877,
   "source": "models.dev",
   "models": [
     {
@@ -22,8 +22,7 @@
         "cache_write": 1.0
       },
       "context_window": 200000,
-      "max_tokens": 8192,
-      "headers": null
+      "max_tokens": 8192
     },
     {
       "id": "claude-3-5-haiku-latest",
@@ -45,8 +44,7 @@
         "cache_write": 1.0
       },
       "context_window": 200000,
-      "max_tokens": 8192,
-      "headers": null
+      "max_tokens": 8192
     },
     {
       "id": "claude-3-5-sonnet-20240620",
@@ -68,8 +66,7 @@
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 8192,
-      "headers": null
+      "max_tokens": 8192
     },
     {
       "id": "claude-3-5-sonnet-20241022",
@@ -91,8 +88,7 @@
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 8192,
-      "headers": null
+      "max_tokens": 8192
     },
     {
       "id": "claude-3-7-sonnet-20250219",
@@ -114,8 +110,7 @@
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-3-haiku-20240307",
@@ -137,8 +132,7 @@
         "cache_write": 0.3
       },
       "context_window": 200000,
-      "max_tokens": 4096,
-      "headers": null
+      "max_tokens": 4096
     },
     {
       "id": "claude-3-opus-20240229",
@@ -160,8 +154,7 @@
         "cache_write": 18.75
       },
       "context_window": 200000,
-      "max_tokens": 4096,
-      "headers": null
+      "max_tokens": 4096
     },
     {
       "id": "claude-3-sonnet-20240229",
@@ -183,8 +176,7 @@
         "cache_write": 0.3
       },
       "context_window": 200000,
-      "max_tokens": 4096,
-      "headers": null
+      "max_tokens": 4096
     },
     {
       "id": "claude-haiku-4-5",
@@ -206,8 +198,7 @@
         "cache_write": 1.25
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-haiku-4-5-20251001",
@@ -229,8 +220,7 @@
         "cache_write": 1.25
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-opus-4-0",
@@ -252,8 +242,7 @@
         "cache_write": 18.75
       },
       "context_window": 200000,
-      "max_tokens": 32000,
-      "headers": null
+      "max_tokens": 32000
     },
     {
       "id": "claude-opus-4-1",
@@ -275,8 +264,7 @@
         "cache_write": 18.75
       },
       "context_window": 200000,
-      "max_tokens": 32000,
-      "headers": null
+      "max_tokens": 32000
     },
     {
       "id": "claude-opus-4-1-20250805",
@@ -298,8 +286,7 @@
         "cache_write": 18.75
       },
       "context_window": 200000,
-      "max_tokens": 32000,
-      "headers": null
+      "max_tokens": 32000
     },
     {
       "id": "claude-opus-4-20250514",
@@ -321,8 +308,7 @@
         "cache_write": 18.75
       },
       "context_window": 200000,
-      "max_tokens": 32000,
-      "headers": null
+      "max_tokens": 32000
     },
     {
       "id": "claude-opus-4-5",
@@ -344,8 +330,7 @@
         "cache_write": 6.25
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-opus-4-5-20251101",
@@ -367,8 +352,7 @@
         "cache_write": 6.25
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-opus-4-6",
@@ -377,8 +361,8 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
-      "supports_adaptive_thinking": false,
+      "supports_xhigh": true,
+      "supports_adaptive_thinking": true,
       "input": [
         "text",
         "image"
@@ -390,8 +374,7 @@
         "cache_write": 6.25
       },
       "context_window": 1000000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "claude-opus-4-7",
@@ -400,8 +383,8 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
-      "supports_adaptive_thinking": false,
+      "supports_xhigh": true,
+      "supports_adaptive_thinking": true,
       "input": [
         "text",
         "image"
@@ -413,8 +396,7 @@
         "cache_write": 6.25
       },
       "context_window": 1000000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "claude-sonnet-4-0",
@@ -436,8 +418,7 @@
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-sonnet-4-20250514",
@@ -459,8 +440,7 @@
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-sonnet-4-5",
@@ -482,8 +462,7 @@
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-sonnet-4-5-20250929",
@@ -505,8 +484,7 @@
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "claude-sonnet-4-6",
@@ -516,7 +494,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_xhigh": false,
-      "supports_adaptive_thinking": false,
+      "supports_adaptive_thinking": true,
       "input": [
         "text",
         "image"
@@ -528,8 +506,7 @@
         "cache_write": 3.75
       },
       "context_window": 1000000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     },
     {
       "id": "gpt-4",
@@ -550,8 +527,7 @@
         "cache_write": 0.0
       },
       "context_window": 8192,
-      "max_tokens": 8192,
-      "headers": null
+      "max_tokens": 8192
     },
     {
       "id": "gpt-4-turbo",
@@ -573,8 +549,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 4096,
-      "headers": null
+      "max_tokens": 4096
     },
     {
       "id": "gpt-4.1",
@@ -596,8 +571,7 @@
         "cache_write": 0.0
       },
       "context_window": 1047576,
-      "max_tokens": 32768,
-      "headers": null
+      "max_tokens": 32768
     },
     {
       "id": "gpt-4.1-mini",
@@ -619,8 +593,7 @@
         "cache_write": 0.0
       },
       "context_window": 1047576,
-      "max_tokens": 32768,
-      "headers": null
+      "max_tokens": 32768
     },
     {
       "id": "gpt-4.1-nano",
@@ -642,8 +615,7 @@
         "cache_write": 0.0
       },
       "context_window": 1047576,
-      "max_tokens": 32768,
-      "headers": null
+      "max_tokens": 32768
     },
     {
       "id": "gpt-4o",
@@ -665,8 +637,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 16384,
-      "headers": null
+      "max_tokens": 16384
     },
     {
       "id": "gpt-4o-2024-05-13",
@@ -688,8 +659,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 4096,
-      "headers": null
+      "max_tokens": 4096
     },
     {
       "id": "gpt-4o-2024-08-06",
@@ -711,8 +681,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 16384,
-      "headers": null
+      "max_tokens": 16384
     },
     {
       "id": "gpt-4o-2024-11-20",
@@ -734,8 +703,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 16384,
-      "headers": null
+      "max_tokens": 16384
     },
     {
       "id": "gpt-4o-mini",
@@ -757,8 +725,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 16384,
-      "headers": null
+      "max_tokens": 16384
     },
     {
       "id": "gpt-5",
@@ -780,8 +747,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5-codex",
@@ -803,8 +769,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5-mini",
@@ -826,8 +791,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5-nano",
@@ -849,8 +813,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5-pro",
@@ -872,8 +835,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 272000,
-      "headers": null
+      "max_tokens": 272000
     },
     {
       "id": "gpt-5.1",
@@ -895,8 +857,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.1-chat-latest",
@@ -918,8 +879,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 16384,
-      "headers": null
+      "max_tokens": 16384
     },
     {
       "id": "gpt-5.1-codex",
@@ -941,8 +901,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.1-codex-max",
@@ -964,8 +923,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.1-codex-mini",
@@ -987,8 +945,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.2",
@@ -997,7 +954,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1010,8 +967,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.2-chat-latest",
@@ -1020,7 +976,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1033,8 +989,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 16384,
-      "headers": null
+      "max_tokens": 16384
     },
     {
       "id": "gpt-5.2-codex",
@@ -1043,7 +998,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1056,8 +1011,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.2-pro",
@@ -1066,7 +1020,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1079,8 +1033,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.3-chat-latest",
@@ -1089,7 +1042,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1102,8 +1055,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 16384,
-      "headers": null
+      "max_tokens": 16384
     },
     {
       "id": "gpt-5.3-codex",
@@ -1112,7 +1064,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1125,8 +1077,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.3-codex-spark",
@@ -1135,7 +1086,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1148,8 +1099,7 @@
         "cache_write": 0.0
       },
       "context_window": 128000,
-      "max_tokens": 32000,
-      "headers": null
+      "max_tokens": 32000
     },
     {
       "id": "gpt-5.4",
@@ -1158,7 +1108,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1171,8 +1121,7 @@
         "cache_write": 0.0
       },
       "context_window": 1050000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.4-mini",
@@ -1181,7 +1130,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1194,8 +1143,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.4-nano",
@@ -1204,7 +1152,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1217,8 +1165,7 @@
         "cache_write": 0.0
       },
       "context_window": 400000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.4-pro",
@@ -1227,7 +1174,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1240,8 +1187,7 @@
         "cache_write": 0.0
       },
       "context_window": 1050000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.5",
@@ -1250,7 +1196,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1263,8 +1209,7 @@
         "cache_write": 0.0
       },
       "context_window": 1050000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "gpt-5.5-pro",
@@ -1273,7 +1218,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
+      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1286,8 +1231,7 @@
         "cache_write": 0.0
       },
       "context_window": 1050000,
-      "max_tokens": 128000,
-      "headers": null
+      "max_tokens": 128000
     },
     {
       "id": "o1",
@@ -1309,8 +1253,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     },
     {
       "id": "o1-pro",
@@ -1332,8 +1275,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     },
     {
       "id": "o3",
@@ -1355,8 +1297,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     },
     {
       "id": "o3-deep-research",
@@ -1378,8 +1319,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     },
     {
       "id": "o3-mini",
@@ -1400,8 +1340,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     },
     {
       "id": "o3-pro",
@@ -1423,8 +1362,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     },
     {
       "id": "o4-mini",
@@ -1446,8 +1384,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     },
     {
       "id": "o4-mini-deep-research",
@@ -1469,8 +1406,7 @@
         "cache_write": 0.0
       },
       "context_window": 200000,
-      "max_tokens": 100000,
-      "headers": null
+      "max_tokens": 100000
     }
   ]
 }

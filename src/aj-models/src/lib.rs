@@ -11,6 +11,7 @@ pub mod anthropic;
 pub mod conversation;
 pub mod messages;
 pub mod openai;
+pub mod refresh;
 pub mod registry;
 pub mod streaming;
 pub mod tools;

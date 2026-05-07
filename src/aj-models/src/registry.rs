@@ -214,7 +214,7 @@ impl ModelRegistry {
     /// when the active catalog is older than [`STALENESS_THRESHOLD_DAYS`].
     pub fn load() -> Self {
         let (catalog, source) = load_active_catalog();
-        let overrides = parse_overrides();
+        let overrides = bundled_overrides();
         Self::from_catalog_with_overrides(catalog, overrides, source)
     }
 
@@ -404,7 +404,7 @@ fn load_active_catalog() -> (Catalog, String) {
 /// Parse the bundled overrides. Failure here is non-fatal: we log a
 /// warning and proceed with no overrides, so a malformed file at most
 /// degrades cost/capability accuracy without bricking the registry.
-fn parse_overrides() -> OverridesFile {
+pub fn bundled_overrides() -> OverridesFile {
     serde_json::from_str(OVERRIDES_JSON).unwrap_or_else(|err| {
         tracing::warn!("failed to parse bundled overrides.json: {err}; ignoring");
         OverridesFile { overrides: vec![] }
@@ -434,7 +434,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Apply a single override entry to the model list, in place. Targets
 /// that don't match any model log at debug — overrides for unreleased
 /// or removed models are common during a transition.
-fn apply_override(models: &mut [ModelInfo], entry: &OverrideEntry) {
+pub(crate) fn apply_override(models: &mut [ModelInfo], entry: &OverrideEntry) {
     let Some(model) = models
         .iter_mut()
         .find(|m| m.provider == entry.target.provider && m.id == entry.target.id)

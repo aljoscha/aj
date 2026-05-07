@@ -52,6 +52,22 @@ enum Commands {
         /// thread).
         thread_id: Option<String>,
     },
+    /// Manage the bundled model catalog.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+#[command(flatten_help = true)]
+enum ModelsCommands {
+    /// Refresh the user model catalog at `~/.aj/models.json` from
+    /// `https://models.dev/api.json`. Filters to tool-capable Anthropic
+    /// and OpenAI models, applies the bundled overrides, and writes the
+    /// result atomically. On any fetch or parse failure the existing
+    /// cache is left untouched.
+    Update,
 }
 
 /// A harness that's setting up our logging, environment variables, etc. and
@@ -81,6 +97,14 @@ async fn main() -> Result<()> {
 
     // Parse CLI flags (highest priority).
     let cli = Cli::parse();
+
+    // `models update` is a standalone catalog-management subcommand; it
+    // doesn't need an API key, history, or agent. Short-circuit before
+    // any of that setup, both to keep startup fast and to let users run
+    // the command without configured credentials.
+    if let Some(Commands::Models { command }) = &cli.command {
+        return handle_models_command(command).await;
+    }
 
     let threads_dir = Config::get_threads_dir_path()?;
 
@@ -153,6 +177,11 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Models { .. }) => {
+            // Handled earlier in `main` before agent setup. Reaching
+            // this arm would mean we forgot to short-circuit above.
+            unreachable!("models subcommand handled before agent setup");
+        }
         None => {
             // Default behavior: start a fresh log and run the agent.
             let mut log = ConversationLog::create(&conversation_persistence)?;
@@ -179,4 +208,16 @@ fn list_threads(conversation_persistence: &ConversationPersistence) -> Result<()
     }
 
     Ok(())
+}
+
+/// Dispatch for `aj models <subcommand>`. Currently only `update`, but
+/// the layer is in place for future catalog management commands.
+async fn handle_models_command(command: &ModelsCommands) -> Result<()> {
+    match command {
+        ModelsCommands::Update => {
+            let summary = aj_models::refresh::refresh_user_cache().await?;
+            println!("{}", summary.one_line());
+            Ok(())
+        }
+    }
 }
