@@ -17,8 +17,11 @@
 //! Concrete provider flows (Anthropic in §9.3, OpenAI in §9.4) live in
 //! their own submodules and will be added in subsequent steps. The
 //! [`pkce`] submodule provides the verifier/challenge utilities both
-//! flows share.
+//! flows share, and [`page`] renders the success/error HTML each
+//! provider's local callback server returns to the browser.
 
+pub mod anthropic;
+pub mod page;
 pub mod pkce;
 
 use std::collections::HashMap;

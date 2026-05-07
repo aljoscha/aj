@@ -38,7 +38,7 @@ this file is the bridge between the spec and the git history.
 ## Phase 5: Authentication
 
 - [x] 12. OAuth infrastructure (`aj-models::oauth`) — §9.2
-- [ ] 13. Anthropic OAuth (`aj-models::oauth::anthropic`) — §9.3
+- [x] 13. Anthropic OAuth (`aj-models::oauth::anthropic`) — §9.3
 - [ ] 14. OpenAI OAuth (`aj-models::oauth::openai`) — §9.4
 - [ ] 15. Auth storage (`aj-models::auth`) — §9.1
 
