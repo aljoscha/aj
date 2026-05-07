@@ -11,6 +11,7 @@ pub mod anthropic;
 pub mod conversation;
 pub mod errors;
 pub mod messages;
+pub mod oauth;
 pub mod openai;
 pub mod partial_json;
 pub mod provider;

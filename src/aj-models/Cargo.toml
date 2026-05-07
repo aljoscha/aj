@@ -9,13 +9,16 @@ anthropic-sdk = { path = "../anthropic-sdk" }
 aj-ui = { path = "../aj-ui" }
 async-stream.workspace = true
 async-trait = "0.1"
+base64.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 futures.workspace = true
 openai-sdk = { path = "../openai-sdk" }
+rand.workspace = true
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
