@@ -24,6 +24,7 @@ use crate::registry::{ModelInfo, calculate_cost, supports_adaptive_thinking, sup
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
 };
+use crate::transform::transform_messages;
 use crate::types::{
     AssistantContent, AssistantMessage, CacheRetention, Context, Message, SimpleStreamOptions,
     StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, ToolChoice,
@@ -210,7 +211,11 @@ fn build_request(
 ) -> AMessages {
     let thinking_enabled = reasoning.is_some() && model.reasoning;
 
-    let messages = convert_messages(&context.messages);
+    // §8: rewrite the history for cross-provider replay (signature
+    // strip, tool-call ID normalization, orphan/errored handling, image
+    // downgrade) before serializing into Anthropic message params.
+    let transformed = transform_messages(&context.messages, model);
+    let messages = convert_messages(&transformed);
     let messages = apply_request_cache_control(messages, options, model);
 
     let system = build_system(context.system_prompt.as_deref(), options, model);

@@ -35,6 +35,7 @@ use crate::registry::{ModelInfo, calculate_cost, supports_xhigh};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
 };
+use crate::transform::transform_messages;
 use crate::types::{
     AssistantContent, AssistantMessage, Context, ImageContent, Message, SimpleStreamOptions,
     StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, ToolChoice,
@@ -209,7 +210,10 @@ fn build_request(
     {
         messages.push(build_system_message(model, prompt));
     }
-    convert_messages(&context.messages, &mut messages);
+    // §8: rewrite the history for cross-provider replay before
+    // serializing into Chat Completions request messages.
+    let transformed = transform_messages(&context.messages, model);
+    convert_messages(&transformed, &mut messages);
 
     let tools: Vec<ChatTool> = context.tools.iter().map(to_chat_tool).collect();
     let tool_choice = to_chat_tool_choice(options.tool_choice.as_ref(), !tools.is_empty());

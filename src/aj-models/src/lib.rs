@@ -16,6 +16,7 @@ pub mod refresh;
 pub mod registry;
 pub mod streaming;
 pub mod tools;
+pub mod transform;
 pub mod types;
 
 /// Trait for LLM model providers
