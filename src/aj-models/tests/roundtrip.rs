@@ -2,7 +2,8 @@
 //!
 //! Per `docs/models-spec.md` §12 step 11b, this suite enforces the
 //! "provider SSE → unified `AssistantMessage` → provider request item"
-//! round-trip invariant for each supported provider.
+//! round-trip invariant for each supported provider, plus the
+//! cross-provider transform rules from §8.1.
 //!
 //! Layout:
 //! - `fixtures/<api>/<scenario>.sse` — captured / hand-crafted SSE wire
@@ -13,8 +14,8 @@
 //!   `messages[]` request items, used for byte-stable serialize asserts.
 //!
 //! Each provider gets three test shapes (parse / serialize / semantic
-//! round-trip) plus, separately, one cross-provider transform test per
-//! direction.
+//! round-trip). Cross-provider directions live in `cross_provider.rs`,
+//! one end-to-end transform test per direction.
 
 // Submodules live in a sibling directory matching this file's stem.
 // Default Rust module-path resolution searches the parent of *this*
@@ -28,3 +29,6 @@ mod anthropic;
 
 #[path = "roundtrip/openai_completions.rs"]
 mod openai_completions;
+
+#[path = "roundtrip/cross_provider.rs"]
+mod cross_provider;
