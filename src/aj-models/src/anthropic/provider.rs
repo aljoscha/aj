@@ -19,6 +19,7 @@ use anthropic_sdk::messages::{
 use futures::StreamExt;
 use serde_json::Value;
 
+use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, supports_adaptive_thinking, supports_xhigh};
 use crate::streaming::{
@@ -829,11 +830,11 @@ impl StreamState {
                         });
                     }
                     BlockState::ToolCall { id, name, json } => {
-                        // Final, definitive parse: try strict JSON first,
-                        // fall back to best-effort partial parsing if the
-                        // server sent malformed bytes.
-                        let parsed: Value = serde_json::from_str(&json)
-                            .unwrap_or_else(|_| parse_streaming_json(&json));
+                        // Final, definitive parse: best-effort partial
+                        // parser already starts with strict JSON and
+                        // escalates through repair / completion before
+                        // falling back to an empty object.
+                        let parsed: Value = parse_streaming_json(&json);
                         let tool_call = ToolCall {
                             id,
                             name,
@@ -1000,95 +1001,6 @@ fn format_api_error(err: &AApiError) -> String {
         | RateLimitError { message }
         | GatewayTimeoutError { message } => message.clone(),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Partial JSON parsing (§11.1, minimal local impl pending §10)
-// ---------------------------------------------------------------------------
-
-/// Best-effort parse of partial JSON.
-///
-/// Tries [`serde_json::from_str`] first; if that fails, attempts to
-/// "complete" the JSON by closing any open strings, objects, and arrays
-/// and re-parsing. Falls back to an empty object on total failure so
-/// callers can still observe a usable `arguments` value during streaming.
-fn parse_streaming_json(input: &str) -> Value {
-    if input.trim().is_empty() {
-        return Value::Object(serde_json::Map::new());
-    }
-    if let Ok(v) = serde_json::from_str::<Value>(input) {
-        return v;
-    }
-    let completed = complete_partial_json(input);
-    serde_json::from_str(&completed).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
-}
-
-/// Append the closing characters needed to make `s` a syntactically
-/// complete JSON value. Tracks string state, escapes, and bracket
-/// nesting; trims trailing commas/whitespace. Doesn't try to be clever
-/// about partial keywords (`tru`, `fals`, `nul`) or partial numbers —
-/// those will fall through to the empty-object fallback in
-/// [`parse_streaming_json`].
-fn complete_partial_json(s: &str) -> String {
-    let mut stack: Vec<char> = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
-    let mut out = String::with_capacity(s.len() + 8);
-
-    for c in s.chars() {
-        out.push(c);
-        if escape {
-            escape = false;
-            continue;
-        }
-        if in_string {
-            match c {
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '{' => stack.push('}'),
-            '[' => stack.push(']'),
-            '}' | ']' => {
-                if let Some(top) = stack.last()
-                    && *top == c
-                {
-                    stack.pop();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if in_string {
-        out.push('"');
-    }
-
-    // Drop trailing whitespace and any dangling separator.
-    while let Some(c) = out.chars().last() {
-        if c.is_whitespace() {
-            out.pop();
-        } else {
-            break;
-        }
-    }
-    if out.ends_with(',') {
-        out.pop();
-    }
-    // If we ended on `:` (no value yet for the current key), append a
-    // null so the object remains parseable.
-    if out.ends_with(':') {
-        out.push_str(" null");
-    }
-
-    while let Some(closer) = stack.pop() {
-        out.push(closer);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1624,50 +1536,5 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-    }
-
-    // ----- Partial JSON parser -----
-
-    #[test]
-    fn partial_json_complete_object() {
-        let v = parse_streaming_json("{\"a\": 1}");
-        assert_eq!(v["a"], 1);
-    }
-
-    #[test]
-    fn partial_json_unclosed_brace() {
-        let v = parse_streaming_json("{\"a\": 1");
-        assert_eq!(v["a"], 1);
-    }
-
-    #[test]
-    fn partial_json_unclosed_string() {
-        let v = parse_streaming_json("{\"a\": \"hel");
-        assert_eq!(v["a"], "hel");
-    }
-
-    #[test]
-    fn partial_json_dangling_colon() {
-        let v = parse_streaming_json("{\"a\":");
-        assert!(v["a"].is_null());
-    }
-
-    #[test]
-    fn partial_json_trailing_comma() {
-        let v = parse_streaming_json("{\"a\": 1,");
-        assert_eq!(v["a"], 1);
-    }
-
-    #[test]
-    fn partial_json_nested_array() {
-        let v = parse_streaming_json("{\"xs\": [1, 2, 3");
-        assert_eq!(v["xs"][2], 3);
-    }
-
-    #[test]
-    fn partial_json_garbage_falls_back() {
-        let v = parse_streaming_json("not json");
-        assert!(v.is_object());
-        assert_eq!(v.as_object().unwrap().len(), 0);
     }
 }

@@ -30,6 +30,7 @@ use openai_sdk::types::chat_completions::{
 use openai_sdk::types::common::ReasoningEffort;
 use serde_json::Value;
 
+use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, supports_xhigh};
 use crate::streaming::{
@@ -880,8 +881,10 @@ impl StreamState {
         entries.sort_by_key(|(idx, _)| *idx);
         for (_, slot) in entries {
             let content_index = slot.content_index;
-            let parsed: Value = serde_json::from_str(&slot.arguments)
-                .unwrap_or_else(|_| parse_streaming_json(&slot.arguments));
+            // Final, definitive parse: the partial parser already tries
+            // strict JSON first and escalates through repair / completion
+            // before falling back to an empty object.
+            let parsed: Value = parse_streaming_json(&slot.arguments);
             let mut tool_call_snapshot = None;
             if let Some(AssistantContent::ToolCall(tc)) =
                 self.partial.content.get_mut(content_index)
@@ -1045,84 +1048,6 @@ fn finalize_usage(usage: &mut Usage, model: &ModelInfo) {
     // §7.2: trust our own arithmetic over the wire's `total_tokens`.
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
     calculate_cost(model, usage);
-}
-
-// ---------------------------------------------------------------------------
-// Partial JSON parsing
-// ---------------------------------------------------------------------------
-
-/// Best-effort parse of partial tool-call arguments JSON. Mirrors the
-/// helper in [`crate::anthropic::provider`] so streaming consumers see
-/// a usable `arguments` value before the call finalizes; replaced by a
-/// shared [`crate::messages`]-level utility once §11.1 lands.
-fn parse_streaming_json(input: &str) -> Value {
-    if input.trim().is_empty() {
-        return Value::Object(serde_json::Map::new());
-    }
-    if let Ok(v) = serde_json::from_str::<Value>(input) {
-        return v;
-    }
-    let completed = complete_partial_json(input);
-    serde_json::from_str(&completed).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
-}
-
-fn complete_partial_json(s: &str) -> String {
-    let mut stack: Vec<char> = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
-    let mut out = String::with_capacity(s.len() + 8);
-
-    for c in s.chars() {
-        out.push(c);
-        if escape {
-            escape = false;
-            continue;
-        }
-        if in_string {
-            match c {
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '{' => stack.push('}'),
-            '[' => stack.push(']'),
-            '}' | ']' => {
-                if let Some(top) = stack.last()
-                    && *top == c
-                {
-                    stack.pop();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if in_string {
-        out.push('"');
-    }
-
-    while let Some(c) = out.chars().last() {
-        if c.is_whitespace() {
-            out.pop();
-        } else {
-            break;
-        }
-    }
-    if out.ends_with(',') {
-        out.pop();
-    }
-    if out.ends_with(':') {
-        out.push_str(" null");
-    }
-
-    while let Some(closer) = stack.pop() {
-        out.push(closer);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1646,19 +1571,5 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
-    }
-
-    // ----- Partial JSON parser -----
-
-    #[test]
-    fn partial_json_unclosed_brace() {
-        let v = parse_streaming_json("{\"a\": 1");
-        assert_eq!(v["a"], 1);
-    }
-
-    #[test]
-    fn partial_json_garbage_falls_back_to_object() {
-        let v = parse_streaming_json("not json");
-        assert!(v.is_object());
     }
 }
