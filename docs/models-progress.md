@@ -29,7 +29,7 @@ this file is the bridge between the spec and the git history.
 
 - [x] 9. Message transformation (`aj-models::transform`) — §8
 - [x] 10. Partial JSON parser — §11.1
-- [ ] 11. Error classification & overflow detection (`aj-models::errors`) — §1.3, §10
+- [x] 11. Error classification & overflow detection (`aj-models::errors`) — §1.3, §10
 - [ ] 11b. Round-trip test suite (`src/aj-models/tests/roundtrip/`) — §1.10, §12
 
 ## Phase 5: Authentication

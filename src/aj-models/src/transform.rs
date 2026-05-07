@@ -152,7 +152,7 @@ fn transform_assistant(
         response_id: a.response_id.clone(),
         usage: a.usage.clone(),
         stop_reason: a.stop_reason.clone(),
-        error_message: a.error_message.clone(),
+        error: a.error.clone(),
         timestamp: a.timestamp,
     }
 }
@@ -448,7 +448,7 @@ mod tests {
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
-            error_message: None,
+            error: None,
             timestamp: 0,
         }
     }

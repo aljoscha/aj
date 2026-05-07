@@ -269,15 +269,27 @@ impl Client {
             return Ok(stream.boxed());
         }
 
+        // Capture status + Retry-After before consuming the response
+        // body — `text()` takes the response by value.
+        let http_status = status.as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let error_text = response.text().await?;
         if status.is_client_error() || status.is_server_error() {
-            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                Ok(error_response) => Err(error_response.error.into()),
-                Err(_) => Err(ApiError::ApiError {
+            let error = match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+                Ok(error_response) => error_response.error,
+                Err(_) => ApiError::ApiError {
                     message: format!("request failed ({status}): {error_text}"),
-                }
-                .into()),
-            }
+                },
+            };
+            Err(ClientError::ApiError {
+                error,
+                http_status,
+                retry_after,
+            })
         } else {
             Err(ClientError::InternalError(format!(
                 "unexpected status code ({status}): {error_text}"
@@ -296,14 +308,41 @@ impl Client {
 
 #[derive(Debug, Error)]
 pub enum ClientError {
-    #[error("{0}")]
-    ApiError(#[from] ApiError),
+    #[error("{error} (http {http_status})")]
+    ApiError {
+        #[source]
+        error: ApiError,
+        http_status: u16,
+        /// Raw `Retry-After` header value, if present. Callers parse
+        /// this with `aj-models::errors::parse_retry_after`.
+        retry_after: Option<String>,
+    },
     #[error("{0}")]
     TransportError(#[from] reqwest::Error),
     #[error("{0}")]
     ParseError(String),
     #[error("{0}")]
     InternalError(String),
+}
+
+impl ClientError {
+    /// HTTP status of the originating response, when this error came
+    /// from a server response (i.e. [`Self::ApiError`]). Returns
+    /// `None` for transport / parse / internal failures.
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::ApiError { http_status, .. } => Some(*http_status),
+            _ => None,
+        }
+    }
+
+    /// Raw `Retry-After` header value from the originating response.
+    pub fn retry_after(&self) -> Option<&str> {
+        match self {
+            Self::ApiError { retry_after, .. } => retry_after.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 fn create_high_level_stream<S>(stream: S) -> Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>

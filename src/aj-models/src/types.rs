@@ -110,9 +110,10 @@ pub struct AssistantMessage {
     pub response_id: Option<String>,
     pub usage: Usage,
     pub stop_reason: StopReason,
-    /// Error description when `stop_reason == Error`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
+    /// Failure detail when `stop_reason` is `Error` or `Aborted`.
+    /// Populated by providers per `docs/models-spec.md` §10.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AssistantError>,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
 }
@@ -153,7 +154,7 @@ pub enum Message {
 }
 
 // ---------------------------------------------------------------------------
-// §1.3 Stop Reason & Usage
+// §1.3 Stop Reason, Usage & Error
 // ---------------------------------------------------------------------------
 
 /// Why the model stopped generating.
@@ -167,7 +168,8 @@ pub enum StopReason {
     ToolUse,
     /// An error occurred during generation.
     Error,
-    /// Generation was aborted by the user or system.
+    /// Client-synthesized: the request was cancelled locally (e.g. the
+    /// stream was dropped). No provider ever returns this directly.
     Aborted,
 }
 
@@ -196,6 +198,89 @@ pub struct UsageCost {
     pub cache_read: f64,
     pub cache_write: f64,
     pub total: f64,
+}
+
+/// Carried on `AssistantMessage.error` when `stop_reason == Error`
+/// or `Aborted`.
+///
+/// Providers classify upstream failures into one of the [`ErrorCategory`]
+/// values so callers can decide retry behaviour without regex-matching
+/// the message string. Per-provider classification tables live in
+/// `docs/models-spec.md` §10.3; retry semantics in §10.4.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AssistantError {
+    pub category: ErrorCategory,
+    /// Human-readable failure message. Whatever the upstream surfaced,
+    /// cleaned up (e.g. JSON-decoded `error.message`).
+    pub message: String,
+    /// Server-requested retry delay in milliseconds, populated from
+    /// the `Retry-After` header or a body hint when present. `None`
+    /// when the provider didn't specify a delay. Only meaningful for
+    /// `RateLimit`, `Overloaded`, and `Transient` categories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// HTTP status from the originating response; `None` for
+    /// transport-level failures, stream drops, and client aborts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+/// Classification of a failure terminating an assistant turn.
+///
+/// Categories are stable and form the contract callers key retry
+/// behaviour off. See `docs/models-spec.md` §10.2 for the retryable /
+/// not-retryable split and §10.3 for per-provider mapping tables.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
+    /// 401 / 403 or OAuth refresh failure. Not retryable without
+    /// re-authenticating.
+    Auth,
+    /// 429 rate-limit response. Retryable; honour `retry_after_ms`.
+    RateLimit,
+    /// Provider-overload response (Anthropic 529, OpenAI 503 overload
+    /// body). Retryable with backoff.
+    Overloaded,
+    /// 5xx, transport error, or stream drop mid-response. Retryable,
+    /// but note that partial output may already have been emitted.
+    Transient,
+    /// 400 whose message matches the context-overflow patterns.
+    /// Not retryable without reducing context.
+    ContextOverflow,
+    /// 400 that is not a context overflow (malformed request, unknown
+    /// parameter, quota / billing, etc.). Not retryable.
+    InvalidRequest,
+    /// Safety filter refusal (Anthropic `refusal`, OpenAI
+    /// `content_filter`, Responses `response.refusal`). Not retryable.
+    ContentFilter,
+    /// Client dropped the stream / cancelled the request.
+    /// Pairs with [`StopReason::Aborted`].
+    Aborted,
+    /// Catchall when the provider can't map the failure onto one of
+    /// the above. Treat as not retryable by default.
+    Unknown,
+}
+
+impl ErrorCategory {
+    /// Whether errors in this category are safe to automatically
+    /// retry with backoff. See `docs/models-spec.md` §10.2.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::RateLimit | Self::Overloaded | Self::Transient)
+    }
+}
+
+impl AssistantError {
+    /// Convenience constructor for a category-only error with no
+    /// HTTP context. Useful for transport failures and synthesized
+    /// errors before any HTTP response is in hand.
+    pub fn new(category: ErrorCategory, message: impl Into<String>) -> Self {
+        Self {
+            category,
+            message: message.into(),
+            retry_after_ms: None,
+            http_status: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +547,7 @@ impl AssistantMessage {
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::default(),
-            error_message: None,
+            error: None,
             timestamp: 0,
         }
     }
@@ -534,7 +619,7 @@ mod tests {
                 cost: UsageCost::default(),
             },
             stop_reason: StopReason::ToolUse,
-            error_message: None,
+            error: None,
             timestamp: 1234567890,
         });
 

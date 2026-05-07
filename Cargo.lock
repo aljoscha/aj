@@ -84,6 +84,7 @@ dependencies = [
  "chrono",
  "futures",
  "openai-sdk",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

@@ -26,7 +26,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::messages::{ApiError, Citation, Message, UsageDelta};
-use crate::types::{AssistantMessage, StopReason, ToolCall};
+use crate::types::{AssistantError, AssistantMessage, ErrorCategory, StopReason, ToolCall};
 
 // ===========================================================================
 // Legacy streaming event protocol.
@@ -382,9 +382,16 @@ impl AssistantMessageEventStream {
         let mut slot = self.inner.final_message.lock().unwrap();
         if slot.is_none() {
             *slot = Some(final_message.unwrap_or_else(|| {
+                // The stream closed without emitting a terminal event:
+                // synthesize one so callers awaiting `result()` always
+                // see a typed error. Mark as transient — a stream drop
+                // is recoverable from the agent's perspective.
                 let mut msg = AssistantMessage::empty();
                 msg.stop_reason = StopReason::Error;
-                msg.error_message = Some("stream ended without a terminal event".to_string());
+                msg.error = Some(AssistantError::new(
+                    ErrorCategory::Transient,
+                    "stream ended without a terminal event",
+                ));
                 msg
             }));
         }
@@ -431,7 +438,7 @@ mod tests {
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
-            error_message: None,
+            error: None,
             timestamp: 0,
         }
     }
@@ -497,11 +504,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_event_resolves_result_with_error_message() {
+    async fn error_event_resolves_result_with_error_detail() {
         let stream = AssistantMessageEventStream::new();
         let mut err_msg = sample_partial();
         err_msg.stop_reason = StopReason::Error;
-        err_msg.error_message = Some("rate limited".into());
+        err_msg.error = Some(AssistantError::new(
+            ErrorCategory::RateLimit,
+            "rate limited",
+        ));
         stream.push(AssistantMessageEvent::Error {
             reason: ErrorReason::Error,
             error: err_msg.clone(),
@@ -509,7 +519,9 @@ mod tests {
 
         let result = stream.result().await;
         assert_eq!(result.stop_reason, StopReason::Error);
-        assert_eq!(result.error_message.as_deref(), Some("rate limited"));
+        let err = result.error.as_ref().expect("error populated");
+        assert_eq!(err.category, ErrorCategory::RateLimit);
+        assert_eq!(err.message, "rate limited");
     }
 
     #[tokio::test]
@@ -547,7 +559,7 @@ mod tests {
 
         let result = result_handle.await.unwrap();
         assert_eq!(result.stop_reason, StopReason::Error);
-        assert!(result.error_message.is_some());
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]
@@ -565,7 +577,7 @@ mod tests {
 
         let result = stream.result().await;
         assert_eq!(result.stop_reason, StopReason::Stop);
-        assert!(result.error_message.is_none());
+        assert!(result.error.is_none());
     }
 
     #[test]

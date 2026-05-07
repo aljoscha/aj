@@ -9,16 +9,18 @@
 
 use anthropic_sdk::client::{Client, ClientError};
 use anthropic_sdk::messages::{
-    ApiError as AApiError, CacheControl, ContentBlock as AContentBlock,
-    ContentBlockDelta as AContentBlockDelta, ContentBlockParam, ImageSource as AImageSource,
-    MessageParam, Messages as AMessages, Metadata, OutputConfig, OutputEffort, Role as ARole,
-    ServerSentEvent, StopDetails as AStopDetails, StopReason as AStopReason, Thinking as AThinking,
-    ToolChoice as ATC, ToolResultContent as ATRC, ToolUnion, Usage as AUsage,
-    UsageDelta as AUsageDelta,
+    CacheControl, ContentBlock as AContentBlock, ContentBlockDelta as AContentBlockDelta,
+    ContentBlockParam, ImageSource as AImageSource, MessageParam, Messages as AMessages, Metadata,
+    OutputConfig, OutputEffort, Role as ARole, ServerSentEvent, StopDetails as AStopDetails,
+    StopReason as AStopReason, Thinking as AThinking, ToolChoice as ATC, ToolResultContent as ATRC,
+    ToolUnion, Usage as AUsage, UsageDelta as AUsageDelta,
 };
 use futures::StreamExt;
 use serde_json::Value;
 
+use crate::errors::{
+    classify_anthropic_error, classify_anthropic_stop_reason, parse_retry_after, transport_error,
+};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, supports_adaptive_thinking, supports_xhigh};
@@ -27,9 +29,10 @@ use crate::streaming::{
 };
 use crate::transform::transform_messages;
 use crate::types::{
-    AssistantContent, AssistantMessage, CacheRetention, Context, Message, SimpleStreamOptions,
-    StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, ToolChoice,
-    ToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
+    AssistantContent, AssistantError, AssistantMessage, CacheRetention, Context, ErrorCategory,
+    Message, SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent,
+    ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolResultMessage, Usage, UserContent,
+    UserMessage,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
@@ -106,7 +109,7 @@ async fn run_stream(
         error.provider = model.provider.clone();
         error.model = model.id.clone();
         error.stop_reason = StopReason::Error;
-        error.error_message = Some(err);
+        error.error = Some(err);
         producer.push(AssistantMessageEvent::Error {
             reason: ErrorReason::Error,
             error,
@@ -114,21 +117,25 @@ async fn run_stream(
     }
 }
 
-/// Inner entrypoint that returns `Err(message)` on pre-stream failures
-/// (so the outer task can surface them as a uniform `Error` event) and
-/// `Ok(())` once the SSE stream has been fully consumed and a terminal
-/// event has been pushed.
+/// Inner entrypoint that returns `Err(AssistantError)` on pre-stream
+/// failures (so the outer task can surface them as a uniform `Error`
+/// event) and `Ok(())` once the SSE stream has been fully consumed
+/// and a terminal event has been pushed.
 async fn run_stream_inner(
     producer: &AssistantMessageEventStream,
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
-) -> Result<(), String> {
-    let api_key = options
-        .api_key
-        .clone()
-        .ok_or_else(|| "anthropic provider requires StreamOptions.api_key".to_string())?;
+) -> Result<(), AssistantError> {
+    let api_key = options.api_key.clone().ok_or_else(|| {
+        // Missing credentials before any HTTP call: surface as Auth so
+        // callers and the agent's retry layer see the right category.
+        AssistantError::new(
+            ErrorCategory::Auth,
+            "anthropic provider requires StreamOptions.api_key",
+        )
+    })?;
 
     let client = build_client(model, api_key, reasoning);
     let request = build_request(model, context, options, reasoning);
@@ -143,7 +150,7 @@ async fn run_stream_inner(
     let mut sse = client
         .messages_stream_raw(request)
         .await
-        .map_err(|err| format_client_error(&err))?;
+        .map_err(|err| classify_client_error(&err))?;
 
     let mut state = StreamState::new(model);
     let mut saw_terminal = false;
@@ -191,12 +198,23 @@ fn build_client(model: &ModelInfo, api_key: String, reasoning: Option<&ThinkingL
     client
 }
 
-fn format_client_error(err: &ClientError) -> String {
+/// Classify a transport-layer or SDK-surfaced error into the unified
+/// [`AssistantError`] shape per `docs/models-spec.md` §10.3.
+fn classify_client_error(err: &ClientError) -> AssistantError {
     match err {
-        ClientError::ApiError(api) => format!("{api}"),
-        ClientError::TransportError(t) => format!("transport: {t}"),
-        ClientError::ParseError(s) => format!("parse: {s}"),
-        ClientError::InternalError(s) => format!("internal: {s}"),
+        ClientError::ApiError {
+            error,
+            http_status,
+            retry_after,
+        } => classify_anthropic_error(
+            Some(error.type_tag()),
+            Some(*http_status),
+            parse_retry_after(retry_after.as_deref()),
+            error.message().to_string(),
+        ),
+        ClientError::TransportError(t) => transport_error(format!("transport: {t}")),
+        ClientError::ParseError(s) => transport_error(format!("parse: {s}")),
+        ClientError::InternalError(s) => transport_error(format!("internal: {s}")),
     }
 }
 
@@ -877,7 +895,15 @@ impl StreamState {
                 terminal = true;
             }
             ServerSentEvent::Error { error } => {
-                self.partial.error_message = Some(format_api_error(&error));
+                // Mid-stream error events from Anthropic don't carry an
+                // HTTP status — they arrive as SSE frames after the
+                // 200 OK response. Classify by the typed tag alone.
+                self.partial.error = Some(classify_anthropic_error(
+                    Some(error.type_tag()),
+                    None,
+                    None,
+                    error.message().to_string(),
+                ));
                 self.partial.stop_reason = StopReason::Error;
                 events.push(AssistantMessageEvent::Error {
                     reason: ErrorReason::Error,
@@ -925,11 +951,21 @@ impl StreamState {
         // Error-flavored terminal (e.g. refusal). Backfill an error
         // message if we don't already have one — callers should never
         // see a `StopReason::Error` without an accompanying message.
-        if self.partial.error_message.is_none() {
-            self.partial.error_message = Some(
-                self.refusal_message
-                    .unwrap_or_else(|| format!("anthropic stop reason: {:?}", self.stop_reason)),
-            );
+        // Error-flavored terminal (e.g. refusal). Backfill a structured
+        // error if we don't already have one — callers should never
+        // see a `StopReason::Error` without an accompanying detail.
+        if self.partial.error.is_none() {
+            let stop_label = match self.stop_reason {
+                Some(AStopReason::Refusal) => "refusal",
+                Some(AStopReason::ModelContextWindowExceeded) => "model_context_window_exceeded",
+                Some(AStopReason::Compaction) => "compaction",
+                _ => "unknown",
+            };
+            let message = self
+                .refusal_message
+                .clone()
+                .unwrap_or_else(|| format!("anthropic stop reason: {:?}", self.stop_reason));
+            self.partial.error = Some(classify_anthropic_stop_reason(stop_label, message));
         }
         AssistantMessageEvent::Error {
             reason: ErrorReason::Error,
@@ -982,25 +1018,6 @@ fn apply_usage_delta(usage: &mut Usage, delta: &AUsageDelta) {
 fn finalize_usage(usage: &mut Usage, model: &ModelInfo) {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
     calculate_cost(model, usage);
-}
-
-// ---------------------------------------------------------------------------
-// Error formatting
-// ---------------------------------------------------------------------------
-
-fn format_api_error(err: &AApiError) -> String {
-    use AApiError::*;
-    match err {
-        ApiError { message }
-        | AuthenticationError { message }
-        | BillingError { message }
-        | InvalidRequestError { message }
-        | NotFoundError { message }
-        | OverloadedError { message }
-        | PermissionError { message }
-        | RateLimitError { message }
-        | GatewayTimeoutError { message } => message.clone(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,7 +1108,7 @@ mod tests {
             response_id: None,
             usage: Default::default(),
             stop_reason: StopReason::Stop,
-            error_message: None,
+            error: None,
             timestamp: 0,
         };
         let p = convert_assistant_message(&assistant);
@@ -1123,7 +1140,7 @@ mod tests {
                 response_id: None,
                 usage: Default::default(),
                 stop_reason: StopReason::ToolUse,
-                error_message: None,
+                error: None,
                 timestamp: 0,
             }),
             Message::ToolResult(ToolResultMessage::text("1", "a", "ra", false)),
@@ -1454,7 +1471,9 @@ mod tests {
         match event {
             AssistantMessageEvent::Error { error, .. } => {
                 assert_eq!(error.stop_reason, StopReason::Error);
-                assert!(error.error_message.unwrap().contains("nope"));
+                let detail = error.error.as_ref().expect("error detail populated");
+                assert_eq!(detail.category, ErrorCategory::ContentFilter);
+                assert!(detail.message.contains("nope"));
             }
             other => panic!("expected Error, got {other:?}"),
         }

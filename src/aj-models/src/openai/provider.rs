@@ -30,6 +30,9 @@ use openai_sdk::types::chat_completions::{
 use openai_sdk::types::common::ReasoningEffort;
 use serde_json::Value;
 
+use crate::errors::{
+    classify_openai_error, classify_openai_finish_reason, parse_retry_after, transport_error,
+};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, supports_xhigh};
@@ -38,9 +41,10 @@ use crate::streaming::{
 };
 use crate::transform::transform_messages;
 use crate::types::{
-    AssistantContent, AssistantMessage, Context, ImageContent, Message, SimpleStreamOptions,
-    StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, ToolChoice,
-    ToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
+    AssistantContent, AssistantError, AssistantMessage, Context, ErrorCategory, ImageContent,
+    Message, SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent,
+    ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolResultMessage, Usage, UserContent,
+    UserMessage,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
@@ -117,7 +121,7 @@ async fn run_stream(
         error.provider = model.provider.clone();
         error.model = model.id.clone();
         error.stop_reason = StopReason::Error;
-        error.error_message = Some(err);
+        error.error = Some(err);
         producer.push(AssistantMessageEvent::Error {
             reason: ErrorReason::Error,
             error,
@@ -125,21 +129,23 @@ async fn run_stream(
     }
 }
 
-/// Inner entrypoint that returns `Err(message)` on pre-stream failures
-/// (so the outer task can surface them as a uniform `Error` event) and
-/// `Ok(())` once the SSE stream has been fully consumed and a terminal
-/// event has been pushed.
+/// Inner entrypoint that returns `Err(AssistantError)` on pre-stream
+/// failures (so the outer task can surface them as a uniform `Error`
+/// event) and `Ok(())` once the SSE stream has been fully consumed
+/// and a terminal event has been pushed.
 async fn run_stream_inner(
     producer: &AssistantMessageEventStream,
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
-) -> Result<(), String> {
-    let api_key = options
-        .api_key
-        .clone()
-        .ok_or_else(|| "openai-completions provider requires StreamOptions.api_key".to_string())?;
+) -> Result<(), AssistantError> {
+    let api_key = options.api_key.clone().ok_or_else(|| {
+        AssistantError::new(
+            ErrorCategory::Auth,
+            "openai-completions provider requires StreamOptions.api_key",
+        )
+    })?;
 
     let base_url = (!model.base_url.is_empty()).then(|| model.base_url.clone());
     let client = Client::new(base_url, api_key);
@@ -155,7 +161,7 @@ async fn run_stream_inner(
     let mut sse = client
         .chat_completions_stream(request)
         .await
-        .map_err(|err| format_client_error(&err))?;
+        .map_err(|err| classify_client_error(&err))?;
 
     let mut state = StreamState::new(model);
     let mut saw_terminal = false;
@@ -173,7 +179,7 @@ async fn run_stream_inner(
                 }
             }
             Err(err) => {
-                return Err(format_client_error(&err));
+                return Err(classify_client_error(&err));
             }
         }
     }
@@ -186,12 +192,24 @@ async fn run_stream_inner(
     Ok(())
 }
 
-fn format_client_error(err: &ClientError) -> String {
+/// Classify a transport-layer or SDK-surfaced error into the unified
+/// [`AssistantError`] shape per `docs/models-spec.md` §10.3.
+fn classify_client_error(err: &ClientError) -> AssistantError {
     match err {
-        ClientError::ApiError(api) => format!("{api}"),
-        ClientError::TransportError(t) => format!("transport: {t}"),
-        ClientError::ParseError(s) => format!("parse: {s}"),
-        ClientError::InternalError(s) => format!("internal: {s}"),
+        ClientError::ApiError {
+            error,
+            http_status,
+            retry_after,
+        } => classify_openai_error(
+            error.code.as_deref(),
+            error.r#type.as_deref(),
+            Some(*http_status),
+            parse_retry_after(retry_after.as_deref()),
+            error.message.clone(),
+        ),
+        ClientError::TransportError(t) => transport_error(format!("transport: {t}")),
+        ClientError::ParseError(s) => transport_error(format!("parse: {s}")),
+        ClientError::InternalError(s) => transport_error(format!("internal: {s}")),
     }
 }
 
@@ -923,7 +941,7 @@ impl StreamState {
         let cost_model = model_for_cost(&self.partial);
         finalize_usage(&mut self.partial.usage, &cost_model);
 
-        let (stop_reason, done_reason, error_message) = classify_finish(&self.finish_reason);
+        let (stop_reason, done_reason, error_detail) = classify_finish(&self.finish_reason);
 
         self.partial.stop_reason = stop_reason.clone();
 
@@ -934,11 +952,14 @@ impl StreamState {
             };
         }
 
-        if self.partial.error_message.is_none() {
-            self.partial.error_message = Some(error_message.unwrap_or_else(|| {
-                format!(
-                    "openai-completions: terminated without recognized finish_reason ({:?})",
-                    self.finish_reason
+        if self.partial.error.is_none() {
+            self.partial.error = Some(error_detail.unwrap_or_else(|| {
+                AssistantError::new(
+                    ErrorCategory::Unknown,
+                    format!(
+                        "openai-completions: terminated without recognized finish_reason ({:?})",
+                        self.finish_reason
+                    ),
                 )
             }));
         }
@@ -973,12 +994,12 @@ fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
 
 /// Map a `finish_reason` to the unified terminal triple.
 ///
-/// Returns `(stop_reason, done_reason, error_message)`. When
+/// Returns `(stop_reason, done_reason, error_detail)`. When
 /// `done_reason` is `Some`, the message terminates with `Done`;
-/// otherwise it terminates with `Error`.
+/// otherwise it terminates with `Error` and `error_detail` is set.
 fn classify_finish(
     finish: &Option<FinishReason>,
-) -> (StopReason, Option<DoneReason>, Option<String>) {
+) -> (StopReason, Option<DoneReason>, Option<AssistantError>) {
     match finish {
         Some(FinishReason::Stop) => (StopReason::Stop, Some(DoneReason::Stop), None),
         Some(FinishReason::Length) => (StopReason::Length, Some(DoneReason::Length), None),
@@ -988,17 +1009,26 @@ fn classify_finish(
         Some(FinishReason::ContentFilter) => (
             StopReason::Error,
             None,
-            Some("Provider finish_reason: content_filter".to_string()),
+            Some(classify_openai_finish_reason(
+                "content_filter",
+                "Provider finish_reason: content_filter".to_string(),
+            )),
         ),
         Some(FinishReason::NetworkError) => (
             StopReason::Error,
             None,
-            Some("Provider finish_reason: network_error".to_string()),
+            Some(classify_openai_finish_reason(
+                "network_error",
+                "Provider finish_reason: network_error".to_string(),
+            )),
         ),
         Some(FinishReason::Other(other)) => (
             StopReason::Error,
             None,
-            Some(format!("Provider finish_reason: {other}")),
+            Some(classify_openai_finish_reason(
+                other,
+                format!("Provider finish_reason: {other}"),
+            )),
         ),
         None => (StopReason::Stop, Some(DoneReason::Stop), None),
     }
@@ -1184,7 +1214,7 @@ mod tests {
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
-            error_message: None,
+            error: None,
             timestamp: 0,
         };
         let mut out = Vec::new();
@@ -1495,20 +1525,26 @@ mod tests {
             assert_eq!(done, expect_done, "for {finish:?}");
         }
 
-        let (stop, done, msg) = classify_finish(&Some(FinishReason::ContentFilter));
+        let (stop, done, err) = classify_finish(&Some(FinishReason::ContentFilter));
         assert_eq!(stop, StopReason::Error);
         assert!(done.is_none());
-        assert!(msg.unwrap().contains("content_filter"));
+        let err = err.expect("error detail set");
+        assert_eq!(err.category, ErrorCategory::ContentFilter);
+        assert!(err.message.contains("content_filter"));
 
-        let (stop, done, msg) = classify_finish(&Some(FinishReason::NetworkError));
+        let (stop, done, err) = classify_finish(&Some(FinishReason::NetworkError));
         assert_eq!(stop, StopReason::Error);
         assert!(done.is_none());
-        assert!(msg.unwrap().contains("network_error"));
+        let err = err.expect("error detail set");
+        assert_eq!(err.category, ErrorCategory::Transient);
+        assert!(err.message.contains("network_error"));
 
-        let (stop, done, msg) = classify_finish(&Some(FinishReason::Other("boom".into())));
+        let (stop, done, err) = classify_finish(&Some(FinishReason::Other("boom".into())));
         assert_eq!(stop, StopReason::Error);
         assert!(done.is_none());
-        assert!(msg.unwrap().contains("boom"));
+        let err = err.expect("error detail set");
+        assert_eq!(err.category, ErrorCategory::Unknown);
+        assert!(err.message.contains("boom"));
     }
 
     #[test]

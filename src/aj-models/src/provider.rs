@@ -17,7 +17,10 @@ use futures::StreamExt;
 
 use crate::registry::ModelInfo;
 use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream, ErrorReason};
-use crate::types::{AssistantMessage, Context, SimpleStreamOptions, StopReason, StreamOptions};
+use crate::types::{
+    AssistantError, AssistantMessage, Context, ErrorCategory, SimpleStreamOptions, StopReason,
+    StreamOptions,
+};
 
 /// A provider knows how to stream inference for a specific API type.
 ///
@@ -150,7 +153,10 @@ fn unsupported_api_stream(model: &ModelInfo) -> AssistantMessageEventStream {
     error.provider = model.provider.clone();
     error.model = model.id.clone();
     error.stop_reason = StopReason::Error;
-    error.error_message = Some(format!("no provider registered for api {:?}", model.api));
+    error.error = Some(AssistantError::new(
+        ErrorCategory::InvalidRequest,
+        format!("no provider registered for api {:?}", model.api),
+    ));
     stream.push(AssistantMessageEvent::Error {
         reason: ErrorReason::Error,
         error,
@@ -223,10 +229,12 @@ mod tests {
         let ctx = Context::new("you are a test");
         let result = complete(&model, &ctx, &StreamOptions::default()).await;
         assert_eq!(result.stop_reason, StopReason::Error);
-        let msg = result.error_message.expect("error_message present");
+        let err = result.error.expect("error populated");
+        assert_eq!(err.category, ErrorCategory::InvalidRequest);
         assert!(
-            msg.contains("definitely-not-real"),
-            "error message should mention the unknown api, got: {msg}"
+            err.message.contains("definitely-not-real"),
+            "error message should mention the unknown api, got: {}",
+            err.message
         );
         // Synthetic error inherits identity fields from the requested model.
         assert_eq!(result.api, "definitely-not-real");

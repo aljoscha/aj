@@ -1764,6 +1764,39 @@ impl ApiError {
     pub fn is_overloaded(&self) -> bool {
         matches!(self, ApiError::OverloadedError { message: _ })
     }
+
+    /// Returns the wire `type` tag (e.g. `"authentication_error"`,
+    /// `"overloaded_error"`) corresponding to this variant. Useful for
+    /// callers that want to classify errors without re-parsing the
+    /// serialized form.
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            ApiError::ApiError { .. } => "api_error",
+            ApiError::AuthenticationError { .. } => "authentication_error",
+            ApiError::BillingError { .. } => "billing_error",
+            ApiError::InvalidRequestError { .. } => "invalid_request_error",
+            ApiError::NotFoundError { .. } => "not_found_error",
+            ApiError::OverloadedError { .. } => "overloaded_error",
+            ApiError::PermissionError { .. } => "permission_error",
+            ApiError::RateLimitError { .. } => "rate_limit_error",
+            ApiError::GatewayTimeoutError { .. } => "timeout_error",
+        }
+    }
+
+    /// Borrow the underlying free-form error message.
+    pub fn message(&self) -> &str {
+        match self {
+            ApiError::ApiError { message }
+            | ApiError::AuthenticationError { message }
+            | ApiError::BillingError { message }
+            | ApiError::InvalidRequestError { message }
+            | ApiError::NotFoundError { message }
+            | ApiError::OverloadedError { message }
+            | ApiError::PermissionError { message }
+            | ApiError::RateLimitError { message }
+            | ApiError::GatewayTimeoutError { message } => message,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

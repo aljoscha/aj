@@ -9,6 +9,7 @@ use crate::tools::Tool;
 
 pub mod anthropic;
 pub mod conversation;
+pub mod errors;
 pub mod messages;
 pub mod openai;
 pub mod partial_json;
