@@ -1,3 +1,11 @@
+// New event-driven contract modules. These define the surface that
+// `aj-next` and the upcoming `aj-session` crate consume; the legacy
+// agent runtime below keeps using the older `aj-ui` / `aj-tools`
+// types until the bus migration in §2.1 of the aj-next plan.
+pub mod events;
+pub mod message;
+pub mod tool;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::{pin, Pin};

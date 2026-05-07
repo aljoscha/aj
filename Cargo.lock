@@ -58,6 +58,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-retry2",
+ "tokio-util",
  "tracing",
 ]
 
