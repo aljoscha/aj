@@ -23,9 +23,9 @@ use futures::StreamExt;
 use openai_sdk::client::{Client, ClientError};
 use openai_sdk::types::chat_completions::{
     ChatCompletionRequestMessage, ChatCompletionTextContent, ChatCompletionUserContent,
-    ChatCompletionUserContentPart, CreateChatCompletionRequest, FinishReason, FunctionChoice,
-    FunctionDefinition, ImageUrl, StreamOptions as ChatStreamOptions, Tool as ChatTool,
-    ToolCall as ChatToolCall, ToolChoice as ChatToolChoice, Usage as ChatUsage,
+    ChatCompletionUserContentPart, CreateChatCompletionRequest, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionChoice, FunctionDefinition, ImageUrl, StreamOptions as ChatStreamOptions,
+    Tool as ChatTool, ToolCall as ChatToolCall, ToolChoice as ChatToolChoice, Usage as ChatUsage,
 };
 use openai_sdk::types::common::ReasoningEffort;
 use serde_json::Value;
@@ -506,6 +506,150 @@ fn convert_tool_result(
 }
 
 // ---------------------------------------------------------------------------
+// Public round-trip helpers (`docs/models-spec.md` §1.10, §12 step 11b)
+// ---------------------------------------------------------------------------
+
+/// Project an [`AssistantMessage`] onto the Chat Completions request item
+/// shape — the [`ChatCompletionRequestMessage::Assistant`] entry that
+/// gets sent as part of `messages[]` on a follow-up turn.
+///
+/// Serialize side of the §1.10 round-trip invariant for
+/// `openai-completions`. Same projection the provider uses internally
+/// when building a request body, exposed publicly so the round-trip
+/// test suite (and any future caller that wants a single assistant turn
+/// materialized into its wire form) can reach it directly.
+///
+/// Behaviour follows §7.2:
+///
+/// - Text blocks concatenate into the single `content` string the API
+///   accepts.
+/// - Thinking blocks are dropped — the public Chat Completions endpoint
+///   does not accept `reasoning_content` on input. §1.10 explicitly
+///   lists reasoning under the deliberately-not-preserved set for this
+///   provider; see §7.2 for the rationale.
+/// - Tool calls flatten into the `tool_calls` array, with each block's
+///   JSON [`Value`] arguments serialized to a string per the wire shape.
+///
+/// Returns `None` when the assistant turn carries no text and no tool
+/// calls — empty assistant messages are rejected by the API. Callers
+/// projecting a streamed message that has at least one block can rely
+/// on `Some(...)`; the streaming parser never produces empty messages
+/// once any delta has arrived.
+pub fn assistant_message_to_request_item(
+    message: &AssistantMessage,
+) -> Option<ChatCompletionRequestMessage> {
+    convert_assistant_message(message)
+}
+
+/// Inverse of [`assistant_message_to_request_item`]: parse a Chat
+/// Completions `messages[]` entry whose role is `assistant` back into a
+/// unified [`AssistantMessage`].
+///
+/// Parse side of the §1.10 round-trip invariant for
+/// `openai-completions` — symmetric to the streaming state machine in
+/// [`StreamState`], because Chat Completions' request and response
+/// assistant content share shapes one-for-one. The mapping from
+/// `docs/models-spec.md` §7.2 preserved here:
+///
+/// - `content` (`Option<String>`) → [`AssistantContent::Text`] when
+///   non-empty.
+/// - `refusal` → another [`AssistantContent::Text`] block, matching the
+///   streaming parser's treatment of `delta.refusal` (the unified shape
+///   does not carry a separate refusal channel).
+/// - `tool_calls` → [`AssistantContent::ToolCall`], one per entry, in
+///   array order. The wire `function.arguments` string is parsed as
+///   strict JSON first, with [`parse_streaming_json`] as a fallback so
+///   a malformed prior turn still yields a structured `Value` rather
+///   than failing the parse.
+///
+/// Reasoning is intentionally not represented on the request side and
+/// therefore not recovered here — see §7.2 / §1.10.
+///
+/// Non-`Assistant` variants (`User`, `System`, `Tool`, `Developer`)
+/// produce an empty `AssistantMessage`; the role is taken on faith,
+/// matching [`crate::anthropic::provider::parse_assistant_request_item`].
+pub fn parse_assistant_request_item(item: &ChatCompletionRequestMessage) -> AssistantMessage {
+    let mut out = AssistantMessage::empty();
+    out.api = API_NAME.to_string();
+    if let ChatCompletionRequestMessage::Assistant {
+        content,
+        refusal,
+        tool_calls,
+        ..
+    } = item
+    {
+        if let Some(text) = content.as_deref()
+            && !text.is_empty()
+        {
+            out.content.push(AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            }));
+        }
+        if let Some(text) = refusal.as_deref()
+            && !text.is_empty()
+        {
+            // Refusals on the wire surface as text in the unified shape;
+            // this matches the streaming parser's handling of
+            // `delta.refusal`, which routes through `handle_text_delta`.
+            out.content.push(AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            }));
+        }
+        for tc in tool_calls {
+            match tc {
+                ChatToolCall::Function { id, function } => {
+                    let arguments: Value = if function.arguments.is_empty() {
+                        Value::Object(serde_json::Map::new())
+                    } else {
+                        serde_json::from_str(&function.arguments)
+                            .unwrap_or_else(|_| parse_streaming_json(&function.arguments))
+                    };
+                    out.content.push(AssistantContent::ToolCall(ToolCall {
+                        id: id.clone(),
+                        name: function.name.clone(),
+                        arguments,
+                    }));
+                }
+                // Custom tools are out of the agent's tool surface; drop
+                // them, matching the request-build side which only ever
+                // emits function tools.
+                ChatToolCall::Custom { .. } => {}
+            }
+        }
+    }
+    out
+}
+
+/// Replay a sequence of pre-decoded Chat Completions stream chunks
+/// through the provider's streaming state machine and return the
+/// finalized [`AssistantMessage`].
+///
+/// Mirror of [`crate::anthropic::provider::replay_sse_events`] in
+/// shape; the fixture-based round-trip suite uses this to turn captured
+/// SSE wire dumps into unified messages without spinning up a real HTTP
+/// client. Provided publicly so external test suites can share the
+/// exact same parse path the live provider does.
+pub fn replay_sse_events(
+    model: &ModelInfo,
+    events: impl IntoIterator<Item = CreateChatCompletionStreamResponse>,
+) -> AssistantMessage {
+    let mut state = StreamState::new(model);
+    for chunk in events {
+        // We deliberately discard the per-chunk events: the round-trip
+        // suite only cares about the finalized terminal message, and
+        // `state.finalize()` rebuilds it from the running snapshot.
+        let _ = state.process(chunk);
+    }
+    match state.finalize() {
+        AssistantMessageEvent::Done { message, .. }
+        | AssistantMessageEvent::Error { error: message, .. } => message,
+        other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tools / tool choice (§7.2 "Tool definition format" + "Tool choice mapping")
 // ---------------------------------------------------------------------------
 
@@ -565,8 +709,6 @@ fn map_reasoning_effort(level: Option<&ThinkingLevel>, model: &ModelInfo) -> Rea
 // ---------------------------------------------------------------------------
 // Stream state machine (§7.2 "Stream event mapping")
 // ---------------------------------------------------------------------------
-
-use openai_sdk::types::chat_completions::CreateChatCompletionStreamResponse;
 
 /// Per-content-block routing state. We thread incoming deltas to the
 /// matching slot in the running `partial.content` vector by wire role:
@@ -1090,8 +1232,8 @@ mod tests {
     use crate::registry::{InputModality, ModelCost};
     use crate::types::{AssistantContent, Message, ThinkingContent, UserContent, UserMessage};
     use openai_sdk::types::chat_completions::{
-        ChatCompletionStreamChoice, ChatCompletionStreamResponseDelta,
-        CreateChatCompletionStreamResponse, FunctionCallDelta, PromptTokensDetails, ToolCallDelta,
+        ChatCompletionStreamChoice, ChatCompletionStreamResponseDelta, FunctionCallDelta,
+        PromptTokensDetails, ToolCallDelta,
     };
 
     fn fake_model() -> ModelInfo {

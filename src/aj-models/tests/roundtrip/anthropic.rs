@@ -26,7 +26,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
 };
 
-use crate::common::{parse_sse, read_fixture, read_fixture_json};
+use crate::common::{assert_content_eq, parse_sse, read_fixture, read_fixture_json};
 
 const FIXTURE_DIR: &str = "anthropic-messages";
 
@@ -206,70 +206,6 @@ fn canonical_redacted_thinking() -> AssistantMessage {
     };
     msg.stop_reason = StopReason::Stop;
     msg
-}
-
-// ---------------------------------------------------------------------------
-// Assertion helpers
-// ---------------------------------------------------------------------------
-
-/// Compare two assistant messages on the fields the round-trip invariant
-/// requires preserving (`docs/models-spec.md` §1.10) and ignore the rest.
-///
-/// Specifically: response metadata (`api`, `provider`, `model`,
-/// `response_id`, `usage`, `timestamp`) is *not* a multi-turn-significant
-/// property — the next turn carries its own — so we don't enforce it on
-/// the re-parse leg of a semantic round-trip. We do compare `content`
-/// block-for-block, including all signatures.
-fn assert_content_eq(expected: &AssistantMessage, actual: &AssistantMessage, ctx: &str) {
-    assert_eq!(
-        actual.content.len(),
-        expected.content.len(),
-        "{ctx}: content length mismatch (expected {:?}, got {:?})",
-        expected.content,
-        actual.content
-    );
-    for (i, (exp, got)) in expected
-        .content
-        .iter()
-        .zip(actual.content.iter())
-        .enumerate()
-    {
-        match (exp, got) {
-            (AssistantContent::Text(e), AssistantContent::Text(g)) => {
-                assert_eq!(e.text, g.text, "{ctx}: content[{i}] text body mismatch");
-                assert_eq!(
-                    e.text_signature, g.text_signature,
-                    "{ctx}: content[{i}] text_signature mismatch"
-                );
-            }
-            (AssistantContent::Thinking(e), AssistantContent::Thinking(g)) => {
-                assert_eq!(
-                    e.thinking, g.thinking,
-                    "{ctx}: content[{i}] thinking body mismatch"
-                );
-                assert_eq!(
-                    e.thinking_signature, g.thinking_signature,
-                    "{ctx}: content[{i}] thinking_signature mismatch"
-                );
-                assert_eq!(
-                    e.redacted, g.redacted,
-                    "{ctx}: content[{i}] redacted flag mismatch"
-                );
-            }
-            (AssistantContent::ToolCall(e), AssistantContent::ToolCall(g)) => {
-                assert_eq!(e.id, g.id, "{ctx}: content[{i}] tool_call.id mismatch");
-                assert_eq!(
-                    e.name, g.name,
-                    "{ctx}: content[{i}] tool_call.name mismatch"
-                );
-                assert_eq!(
-                    e.arguments, g.arguments,
-                    "{ctx}: content[{i}] tool_call.arguments mismatch"
-                );
-            }
-            (e, g) => panic!("{ctx}: content[{i}] kind mismatch: expected {e:?}, got {g:?}"),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

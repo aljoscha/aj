@@ -32,7 +32,7 @@ this file is the bridge between the spec and the git history.
 - [x] 11. Error classification & overflow detection (`aj-models::errors`) — §1.3, §10
 - [ ] 11b. Round-trip test suite (`src/aj-models/tests/roundtrip/`) — §1.10, §12
    - [x] 11b.i. Scaffolding + Anthropic Messages: parse, serialize, semantic round-trip
-   - [ ] 11b.ii. OpenAI Chat Completions: parse, serialize, semantic round-trip
+   - [x] 11b.ii. OpenAI Chat Completions: parse, serialize, semantic round-trip
    - [ ] 11b.iii. Cross-provider transform tests (one per direction)
 
 ## Phase 5: Authentication

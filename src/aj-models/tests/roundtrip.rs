@@ -25,3 +25,6 @@ mod common;
 
 #[path = "roundtrip/anthropic.rs"]
 mod anthropic;
+
+#[path = "roundtrip/openai_completions.rs"]
+mod openai_completions;
