@@ -7,6 +7,9 @@ this file is the bridge between the spec and the git history.
 ## Phase 1: Unified Types (aj-models)
 
 - [x] 1. Define new type module (`aj-models::types`) — §1, §4
+- [x] 1b. Backfill `StreamOptions` per §4 and small §1 additions
+       (`ThinkingLevel::XHigh`, `ToolResultMessage.details`).
+       AssistantError / ErrorCategory deferred to step 11.
 - [x] 2. Define streaming event types (`aj-models::streaming`) — §2
 - [x] 3. Define model metadata and registry (`aj-models::registry`) — §3.1–§3.3
 - [x] 3b. Build the catalog refresh command (`aj models update`) — §3.4

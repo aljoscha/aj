@@ -7,6 +7,7 @@
 //! See `docs/models-spec.md` §1 and §4 for the full design.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -125,6 +126,13 @@ pub struct ToolResultMessage {
     pub tool_name: String,
     /// Result content — text and/or images.
     pub content: Vec<UserContent>,
+    /// Optional structured details preserved for UI/logs but never
+    /// sent to the provider. Tools attach rich metadata (diffs, file
+    /// paths, exit codes, …) here for display without forcing it
+    /// through the model. Serialized with the thread; provider
+    /// message conversion ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
     /// Whether the tool execution resulted in an error.
     #[serde(default)]
     pub is_error: bool,
@@ -221,12 +229,23 @@ pub struct Context {
 // ---------------------------------------------------------------------------
 
 /// Controls the depth of extended thinking / reasoning.
+///
+/// Serialized in lower-case form: `"minimal"`, `"low"`, `"medium"`,
+/// `"high"`, `"xhigh"`. The wire value for [`Self::XHigh`] matches
+/// OpenAI's `reasoning_effort: "xhigh"` exactly.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     Minimal,
     Low,
     Medium,
     High,
+    /// Maximum reasoning effort. Maps to Anthropic adaptive
+    /// `output_config: {effort: "max"}` (Opus 4.6 only) and OpenAI
+    /// `reasoning_effort: "xhigh"` (GPT-5.2+ only). For models that
+    /// don't support this level, providers fall back to
+    /// [`Self::High`].
+    XHigh,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +259,81 @@ pub enum CacheRetention {
     #[default]
     Short,
     Long,
+}
+
+/// Service tier override for OpenAI Responses requests. Ignored by
+/// non-Responses providers. See `docs/models-spec.md` §7.3 for cost
+/// multipliers.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTier {
+    /// 0.5× cost; best-effort latency.
+    Flex,
+    /// 2× cost; prioritized capacity.
+    Priority,
+}
+
+/// Reasoning summary verbosity for OpenAI Responses requests.
+/// Ignored by non-Responses providers. Defaults to [`Self::Auto`]
+/// when reasoning is enabled. See `docs/models-spec.md` §7.3.2.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    /// Provider chooses summary verbosity.
+    Auto,
+    /// More verbose reasoning summaries.
+    Detailed,
+    /// Shorter reasoning summaries.
+    Concise,
+}
+
+/// Controls whether the model must, may, or must not use tools.
+///
+/// When [`StreamOptions::tool_choice`] is `None`, providers apply
+/// their own default (typically [`Self::Auto`]).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool (default behavior).
+    Auto,
+    /// Model must not call any tools.
+    None,
+    /// Model must call at least one tool (any tool).
+    Required,
+    /// Model must call the specific named tool.
+    Tool { name: String },
+}
+
+/// Callback invoked with the raw outgoing request body just before
+/// it's sent. Useful for logging, recording test fixtures, or tracing
+/// provider-specific payload shape. Must not mutate the body —
+/// providers treat it as read-only.
+///
+/// Wrapped in a newtype so [`StreamOptions`] can keep its derived
+/// [`Debug`] / [`Clone`] impls and so the field can be skipped from
+/// serde without breaking the rest of the struct's wire shape.
+#[derive(Clone)]
+pub struct OnPayload(pub Arc<dyn Fn(&Value) + Send + Sync>);
+
+impl OnPayload {
+    /// Wrap a closure as an [`OnPayload`] callback.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&Value) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    /// Invoke the callback with the outgoing request body.
+    pub fn call(&self, body: &Value) {
+        (self.0)(body)
+    }
+}
+
+impl std::fmt::Debug for OnPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnPayload").finish_non_exhaustive()
+    }
 }
 
 /// Options passed to any streaming call.
@@ -262,6 +356,24 @@ pub struct StreamOptions {
     /// Metadata fields (e.g. Anthropic user_id for rate limiting).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, Value>>,
+    /// Optional debug callback invoked with the outgoing request body
+    /// just before it's sent. Skipped in serde — callbacks aren't
+    /// serializable, and persisting them would be meaningless.
+    #[serde(skip)]
+    pub on_payload: Option<OnPayload>,
+    /// Responses-only: request a non-default service tier. Ignored by
+    /// non-Responses providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+    /// Responses-only: reasoning summary verbosity. Ignored by
+    /// non-Responses providers. Defaults to [`ReasoningSummary::Auto`]
+    /// when reasoning is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<ReasoningSummary>,
+    /// Controls whether/how the model uses tools. When `None`, the
+    /// provider default applies (typically [`ToolChoice::Auto`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// Higher-level options that include reasoning control.
@@ -320,7 +432,7 @@ impl UserMessage {
 }
 
 impl ToolResultMessage {
-    /// Create a text-only tool result.
+    /// Create a text-only tool result with no structured details.
     pub fn text(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -331,6 +443,7 @@ impl ToolResultMessage {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             content: vec![UserContent::text(text)],
+            details: None,
             is_error,
             timestamp: 0,
         }
@@ -478,7 +591,8 @@ mod tests {
 
     #[test]
     fn test_simple_stream_options_flatten() {
-        // Verify that SimpleStreamOptions flattens base fields correctly.
+        // Verify that SimpleStreamOptions flattens base fields correctly
+        // and that ThinkingLevel uses the spec'd lower-case wire form.
         let opts = SimpleStreamOptions {
             base: StreamOptions {
                 temperature: Some(0.7),
@@ -489,7 +603,158 @@ mod tests {
         let json = serde_json::to_value(&opts).unwrap();
         // temperature should be at the top level due to #[serde(flatten)]
         assert_eq!(json["temperature"], 0.7);
-        assert_eq!(json["reasoning"], "High");
+        assert_eq!(json["reasoning"], "high");
+    }
+
+    #[test]
+    fn test_thinking_level_xhigh_serde() {
+        // §1.6 wire form: lower-case, single token ("xhigh", not "x-high").
+        let json = serde_json::to_value(ThinkingLevel::XHigh).unwrap();
+        assert_eq!(json, "xhigh");
+        let back: ThinkingLevel = serde_json::from_str("\"xhigh\"").unwrap();
+        assert_eq!(back, ThinkingLevel::XHigh);
+        // Spot-check the other variants too.
+        assert_eq!(
+            serde_json::to_value(ThinkingLevel::Minimal).unwrap(),
+            "minimal"
+        );
+        assert_eq!(
+            serde_json::to_value(ThinkingLevel::Medium).unwrap(),
+            "medium"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_details_roundtrip() {
+        // `details` is preserved through serialization but defaults to
+        // None and is omitted from the wire when absent.
+        let mut msg = ToolResultMessage::text("call_1", "bash", "hi", false);
+        msg.details = Some(serde_json::json!({
+            "kind": "Bash",
+            "exit_code": 0,
+        }));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"details\""));
+        let back: ToolResultMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.details.as_ref().unwrap()["exit_code"], 0);
+
+        // Default constructor leaves details None and skips the field.
+        let bare = ToolResultMessage::text("call_2", "ls", "out", false);
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("\"details\""));
+        let back: ToolResultMessage = serde_json::from_str(&bare_json).unwrap();
+        assert!(back.details.is_none());
+    }
+
+    #[test]
+    fn test_tool_choice_roundtrip() {
+        // Unit variants serialize as snake_case strings; the named
+        // `Tool` variant carries its struct payload.
+        assert_eq!(
+            serde_json::to_value(ToolChoice::Auto).unwrap(),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::None).unwrap(),
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::Required).unwrap(),
+            serde_json::json!("required")
+        );
+        let named = ToolChoice::Tool {
+            name: "read_file".into(),
+        };
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(json, serde_json::json!({"tool": {"name": "read_file"}}));
+        let back: ToolChoice = serde_json::from_value(json).unwrap();
+        assert_eq!(back, named);
+    }
+
+    #[test]
+    fn test_service_tier_and_reasoning_summary_roundtrip() {
+        assert_eq!(serde_json::to_value(ServiceTier::Flex).unwrap(), "flex");
+        assert_eq!(
+            serde_json::to_value(ServiceTier::Priority).unwrap(),
+            "priority"
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningSummary::Auto).unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningSummary::Detailed).unwrap(),
+            "detailed"
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningSummary::Concise).unwrap(),
+            "concise"
+        );
+    }
+
+    #[test]
+    fn test_stream_options_new_fields() {
+        // The new fields on StreamOptions default to None and are
+        // skipped from the wire when absent.
+        let opts = StreamOptions::default();
+        assert!(opts.service_tier.is_none());
+        assert!(opts.reasoning_summary.is_none());
+        assert!(opts.tool_choice.is_none());
+        assert!(opts.on_payload.is_none());
+        let json = serde_json::to_value(&opts).unwrap();
+        assert!(json.get("service_tier").is_none());
+        assert!(json.get("reasoning_summary").is_none());
+        assert!(json.get("tool_choice").is_none());
+        // on_payload is #[serde(skip)] — never appears regardless of value.
+        assert!(json.get("on_payload").is_none());
+
+        // When set, they round-trip through serde (modulo on_payload
+        // which is intentionally not serialized).
+        let opts = StreamOptions {
+            service_tier: Some(ServiceTier::Flex),
+            reasoning_summary: Some(ReasoningSummary::Concise),
+            tool_choice: Some(ToolChoice::Required),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: StreamOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.service_tier, Some(ServiceTier::Flex));
+        assert_eq!(back.reasoning_summary, Some(ReasoningSummary::Concise));
+        assert_eq!(back.tool_choice, Some(ToolChoice::Required));
+    }
+
+    #[test]
+    fn test_on_payload_skipped_in_serde_but_invokable() {
+        use std::sync::Mutex;
+        // The callback is invokable through the wrapper and is skipped
+        // by serde so its presence doesn't break round-trip.
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cb = Arc::clone(&captured);
+        let cb = OnPayload::new(move |body: &Value| {
+            captured_cb.lock().unwrap().push(body.clone());
+        });
+        let opts = StreamOptions {
+            on_payload: Some(cb),
+            ..Default::default()
+        };
+        // Round-trip drops the callback — that's the whole point of
+        // #[serde(skip)] — but should not error.
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: StreamOptions = serde_json::from_str(&json).unwrap();
+        assert!(back.on_payload.is_none());
+
+        // And invoking the callback through the original wrapper works.
+        opts.on_payload
+            .as_ref()
+            .unwrap()
+            .call(&serde_json::json!({"hello": "world"}));
+        let log = captured.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["hello"], "world");
+
+        // OnPayload's Debug impl doesn't try to format the closure.
+        let dbg = format!("{:?}", opts);
+        assert!(dbg.contains("OnPayload"));
     }
 
     #[test]
