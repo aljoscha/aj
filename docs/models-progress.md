@@ -17,7 +17,7 @@ this file is the bridge between the spec and the git history.
 
 ## Phase 2: Anthropic Provider
 
-- [ ] 5. Update `anthropic-sdk` — §6.1
+- [x] 5. Update `anthropic-sdk` — §6.1
 - [ ] 6. Implement Anthropic provider (`aj-models::anthropic`) — §6.2
 
 ## Phase 3: OpenAI Provider

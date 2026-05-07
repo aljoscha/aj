@@ -40,7 +40,6 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 pub struct AnthropicModel {
     client: Client,
     model_name: String,
-    is_oauth: bool,
     speed: Option<Speed>,
 }
 
@@ -50,7 +49,6 @@ impl AnthropicModel {
         if model_args.speed.is_some() {
             client = client.with_beta("fast-mode-2026-02-01");
         }
-        let is_oauth = client.is_oauth();
         let model_name = model_args
             .model_name
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
@@ -58,7 +56,6 @@ impl AnthropicModel {
         Self {
             client,
             model_name,
-            is_oauth,
             speed: model_args.speed,
         }
     }
@@ -73,22 +70,14 @@ impl Model for AnthropicModel {
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
-        let mut system_prompt_blocks = Vec::new();
-
-        // OAuth mode requires the Claude Code identity system prompt.
-        if self.is_oauth {
-            system_prompt_blocks.push(AnthropicContentBlockParam::TextBlock {
-                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-                cache_control: None,
-                citations: None,
-            });
-        }
-
-        system_prompt_blocks.push(AnthropicContentBlockParam::TextBlock {
+        // OAuth's Claude Code identity preamble and tool-name
+        // canonicalization are handled inside the SDK client; this
+        // module only assembles the caller-visible system prompt.
+        let system_prompt_blocks = vec![AnthropicContentBlockParam::TextBlock {
             text: system_prompt,
             cache_control: Some(CacheControl::Ephemeral { ttl: None }),
             citations: None,
-        });
+        }];
         let tools: Vec<ToolUnion> = tools.into_iter().map(|t| t.into()).collect();
         let output_config = output_config_for_thinking(&thinking);
         let thinking: Option<AnthropicThinking> = thinking.map(Into::into);

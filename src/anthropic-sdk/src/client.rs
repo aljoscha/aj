@@ -8,9 +8,24 @@ use reqwest::Client as ReqwestClient;
 use thiserror::Error;
 
 use crate::messages::{ApiError, ApiErrorResponse, Message, Messages, ServerSentEvent};
+use crate::stealth::{
+    CLAUDE_CODE_VERSION, apply_request_transformations, collect_caller_tool_names,
+    reverse_map_event, reverse_map_message,
+};
 use crate::streaming::{StreamProcessor, StreamingEvent};
 
 const BASE_URL: &str = "https://api.anthropic.com";
+
+/// Beta header for fine-grained tool input streaming. Always sent —
+/// the API silently ignores it on models that don't support it.
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+
+/// Beta header for interleaved thinking. Sent only when the caller
+/// opts in — adaptive-thinking models reject it.
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
+/// Beta headers required for OAuth authentication.
+const OAUTH_REQUIRED_BETAS: &[&str] = &["claude-code-20250219", "oauth-2025-04-20"];
 
 /// Authentication mode for the Anthropic API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,8 +42,16 @@ pub struct Client {
     auth_mode: AuthMode,
     version: String,
     base_url: String,
-    /// Beta feature headers (e.g. `["mcp-client-2025-11-20"]`).
+    /// Beta feature headers configured by the caller (e.g.
+    /// `["mcp-client-2025-11-20"]`). The default
+    /// `fine-grained-tool-streaming-2025-05-14` and the optional
+    /// `interleaved-thinking-2025-05-14` and OAuth-required betas are
+    /// added automatically and are not stored here.
     beta_headers: Vec<String>,
+    /// Whether to send the `interleaved-thinking-2025-05-14` beta
+    /// header. The provider sets this when reasoning is enabled and
+    /// the model is non-adaptive (adaptive models reject the header).
+    interleaved_thinking: bool,
 }
 
 impl Client {
@@ -47,6 +70,7 @@ impl Client {
             version: "2023-06-01".to_string(),
             base_url,
             beta_headers: Vec::new(),
+            interleaved_thinking: false,
         }
     }
 
@@ -72,12 +96,51 @@ impl Client {
         self.beta_headers = betas;
     }
 
+    /// Enable the `interleaved-thinking-2025-05-14` beta. The provider
+    /// should set this when the caller has reasoning enabled and the
+    /// chosen model is non-adaptive — adaptive-thinking models (Opus
+    /// 4.6+, Sonnet 4.6+) reject the header. Defaults to `false`.
+    pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+        self.interleaved_thinking = enabled;
+        self
+    }
+
+    /// Toggle the interleaved-thinking beta header on an existing
+    /// client. See [`Self::with_interleaved_thinking`].
+    pub fn set_interleaved_thinking(&mut self, enabled: bool) {
+        self.interleaved_thinking = enabled;
+    }
+
     pub fn base_url(&self) -> String {
         self.base_url.clone()
     }
 
+    /// Compute the full set of beta headers for this request, in
+    /// declaration order: caller-configured first, then the always-on
+    /// `fine-grained-tool-streaming` beta, then OAuth-required betas
+    /// when in OAuth mode, then the optional `interleaved-thinking`
+    /// beta. Duplicates are filtered.
+    fn effective_beta_headers(&self) -> Vec<String> {
+        let mut betas = self.beta_headers.clone();
+        let push_unique = |betas: &mut Vec<String>, value: &str| {
+            if !betas.iter().any(|b| b == value) {
+                betas.push(value.to_string());
+            }
+        };
+        push_unique(&mut betas, FINE_GRAINED_TOOL_STREAMING_BETA);
+        if self.auth_mode == AuthMode::OAuth {
+            for required in OAUTH_REQUIRED_BETAS {
+                push_unique(&mut betas, required);
+            }
+        }
+        if self.interleaved_thinking {
+            push_unique(&mut betas, INTERLEAVED_THINKING_BETA);
+        }
+        betas
+    }
+
     /// Build a request with common headers (auth, version, content-type,
-    /// and any configured beta headers).
+    /// and the configured + always-on beta headers).
     fn build_request(&self) -> reqwest::RequestBuilder {
         let mut builder = self.client.post(format!("{}/v1/messages", self.base_url));
 
@@ -88,7 +151,7 @@ impl Client {
             AuthMode::OAuth => {
                 builder = builder
                     .header("authorization", format!("Bearer {}", self.api_key))
-                    .header("user-agent", "claude-cli/2.1.0")
+                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
                     .header("x-app", "cli");
             }
         }
@@ -97,29 +160,32 @@ impl Client {
             .header("anthropic-version", self.version.clone())
             .header("content-type", "application/json");
 
-        let mut betas = self.beta_headers.clone();
-        if self.auth_mode == AuthMode::OAuth {
-            for required in [
-                "claude-code-20250219",
-                "oauth-2025-04-20",
-                "fine-grained-tool-streaming-2025-05-14",
-            ] {
-                if !betas.iter().any(|b| b == required) {
-                    betas.push(required.to_string());
-                }
-            }
-        }
-
+        let betas = self.effective_beta_headers();
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
 
         builder
     }
+
+    /// Apply OAuth stealth-mode transformations to the outgoing request
+    /// and return the caller's tool-name list to be used for reverse
+    /// mapping on the response. Returns an empty list when stealth
+    /// mode does not apply.
+    fn prepare_request(&self, messages: &mut Messages) -> Vec<String> {
+        if self.auth_mode != AuthMode::OAuth {
+            return Vec::new();
+        }
+        let caller_tool_names = collect_caller_tool_names(messages);
+        apply_request_transformations(messages);
+        caller_tool_names
+    }
 }
 
 impl Client {
-    pub async fn messages(&self, messages: Messages) -> Result<Message, anyhow::Error> {
+    pub async fn messages(&self, mut messages: Messages) -> Result<Message, anyhow::Error> {
+        let caller_tool_names = self.prepare_request(&mut messages);
+
         let request_builder = self.build_request().json(&messages);
 
         let response = request_builder
@@ -135,7 +201,10 @@ impl Client {
                 .text()
                 .await
                 .context("failed to read response text")?;
-            let response: Message = serde_json::from_str(&json_text)?;
+            let mut response: Message = serde_json::from_str(&json_text)?;
+            if !caller_tool_names.is_empty() {
+                reverse_map_message(&mut response, &caller_tool_names);
+            }
             return Ok(response);
         }
 
@@ -155,6 +224,7 @@ impl Client {
         mut messages: Messages,
     ) -> Result<Pin<Box<dyn Stream<Item = ServerSentEvent> + Send>>, ClientError> {
         messages.stream = Some(true);
+        let caller_tool_names = self.prepare_request(&mut messages);
 
         let request_builder = self.build_request().json(&messages);
 
@@ -164,25 +234,35 @@ impl Client {
         if status.is_success() {
             let stream = response.bytes_stream().eventsource();
 
-            let stream = stream.filter_map(|event| async move {
-                match event {
-                    Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
-                        Ok(json_event) => Some(json_event),
-                        Err(err) => {
-                            // The API versioning policy reserves the right
-                            // to add new event types; skip anything we
-                            // can't parse rather than crashing the stream.
-                            tracing::warn!(
-                                "could not parse server-sent event, skipping: \
-                                 error={err}, data={}",
-                                event.data
-                            );
+            let stream = stream.filter_map(move |event| {
+                let caller_tool_names = caller_tool_names.clone();
+                async move {
+                    match event {
+                        Ok(event) => {
+                            match serde_json::from_str::<ServerSentEvent>(&event.data) {
+                                Ok(mut json_event) => {
+                                    if !caller_tool_names.is_empty() {
+                                        reverse_map_event(&mut json_event, &caller_tool_names);
+                                    }
+                                    Some(json_event)
+                                }
+                                Err(err) => {
+                                    // The API versioning policy reserves the right
+                                    // to add new event types; skip anything we
+                                    // can't parse rather than crashing the stream.
+                                    tracing::warn!(
+                                        "could not parse server-sent event, skipping: \
+                                         error={err}, data={}",
+                                        event.data
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("event-stream error: {e}");
                             None
                         }
-                    },
-                    Err(e) => {
-                        tracing::error!("event-stream error: {e}");
-                        None
                     }
                 }
             });
@@ -232,4 +312,93 @@ where
 {
     let processor = StreamProcessor::new();
     processor.process_stream(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stealth::CLAUDE_CODE_IDENTITY_PROMPT;
+
+    #[test]
+    fn api_key_mode_includes_default_beta() {
+        let client = Client::new(None, "sk-ant-12345".to_string());
+        let betas = client.effective_beta_headers();
+        assert!(
+            betas.iter().any(|b| b == FINE_GRAINED_TOOL_STREAMING_BETA),
+            "expected fine-grained-tool-streaming beta in API key mode, got {betas:?}"
+        );
+        assert!(
+            !betas.iter().any(|b| b == INTERLEAVED_THINKING_BETA),
+            "interleaved-thinking should be off by default"
+        );
+        for required in OAUTH_REQUIRED_BETAS {
+            assert!(
+                !betas.iter().any(|b| b == required),
+                "OAuth-only beta {required} leaked into API key mode"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_mode_includes_required_and_default_betas() {
+        let client = Client::new(None, "sk-ant-oat-test".to_string());
+        assert!(client.is_oauth());
+        let betas = client.effective_beta_headers();
+        assert!(betas.iter().any(|b| b == FINE_GRAINED_TOOL_STREAMING_BETA));
+        for required in OAUTH_REQUIRED_BETAS {
+            assert!(
+                betas.iter().any(|b| b == required),
+                "missing OAuth-required beta {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn interleaved_thinking_opt_in() {
+        let client = Client::new(None, "sk-ant-12345".to_string()).with_interleaved_thinking(true);
+        let betas = client.effective_beta_headers();
+        assert!(betas.iter().any(|b| b == INTERLEAVED_THINKING_BETA));
+    }
+
+    #[test]
+    fn caller_betas_preserved_and_deduped() {
+        let client = Client::new(None, "sk-ant-12345".to_string())
+            .with_beta("custom-beta-1")
+            .with_beta(FINE_GRAINED_TOOL_STREAMING_BETA);
+        let betas = client.effective_beta_headers();
+        // No duplicate of the always-on beta.
+        let count = betas
+            .iter()
+            .filter(|b| *b == FINE_GRAINED_TOOL_STREAMING_BETA)
+            .count();
+        assert_eq!(count, 1);
+        assert!(betas.iter().any(|b| b == "custom-beta-1"));
+    }
+
+    #[test]
+    fn prepare_request_no_op_for_api_key() {
+        let client = Client::new(None, "sk-ant-12345".to_string());
+        let mut messages = Messages::default();
+        let caller_tools = client.prepare_request(&mut messages);
+        assert!(caller_tools.is_empty());
+        // System prompt untouched.
+        assert!(messages.system.is_none());
+    }
+
+    #[test]
+    fn prepare_request_applies_stealth_for_oauth() {
+        let client = Client::new(None, "sk-ant-oat-test".to_string());
+        let mut messages = Messages::default();
+        let caller_tools = client.prepare_request(&mut messages);
+        assert!(caller_tools.is_empty());
+        // System prompt now has the identity block.
+        let system = messages.system.as_ref().unwrap();
+        assert_eq!(system.len(), 1);
+        match &system[0] {
+            crate::messages::ContentBlockParam::TextBlock { text, .. } => {
+                assert_eq!(text, CLAUDE_CODE_IDENTITY_PROMPT);
+            }
+            _ => panic!("expected text block"),
+        }
+    }
 }
