@@ -8,6 +8,7 @@ use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
 
 pub mod anthropic;
+pub mod auth;
 pub mod conversation;
 pub mod errors;
 pub mod messages;
