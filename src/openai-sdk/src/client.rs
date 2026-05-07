@@ -52,30 +52,24 @@ impl Client {
             .await
             .context("failed to send request")?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let json_text = response
-                    .text()
-                    .await
-                    .context("failed to read response text")?;
-                let response: CreateChatCompletionResponse = serde_json::from_str(&json_text)?;
-                Ok(response)
+        let status = response.status();
+        if status == StatusCode::OK {
+            let json_text = response
+                .text()
+                .await
+                .context("failed to read response text")?;
+            let response: CreateChatCompletionResponse = serde_json::from_str(&json_text)?;
+            return Ok(response);
+        }
+
+        let error_text = response.text().await?;
+        if status.is_client_error() || status.is_server_error() {
+            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+                Ok(error_response) => Err(anyhow!(error_response.error)),
+                Err(_) => Err(anyhow!("request failed ({status}): {}", error_text)),
             }
-            StatusCode::BAD_REQUEST
-            | StatusCode::UNAUTHORIZED
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_text = response.text().await?;
-                match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(anyhow!(error_response.error)),
-                    Err(_) => Err(anyhow!("request failed: {}", error_text)),
-                }
-            }
-            _ => {
-                let error_message = format!("unexpected status code: {:?}", response.text().await?);
-                Err(anyhow!(error_message))
-            }
+        } else {
+            Err(anyhow!("unexpected status code ({status}): {}", error_text))
         }
     }
 
@@ -96,58 +90,51 @@ impl Client {
 
         let response = request_builder.send().await?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let stream = response.bytes_stream().eventsource();
+        let status = response.status();
+        if status == StatusCode::OK {
+            let stream = response.bytes_stream().eventsource();
 
-                let stream = stream.filter_map(|event| async move {
-                    match event {
-                        Ok(event) => {
-                            if event.data == "[DONE]" {
-                                return None;
-                            }
-                            match serde_json::from_str::<CreateChatCompletionStreamResponse>(
-                                &event.data,
-                            ) {
-                                Ok(json_event) => Some(Ok(json_event)),
-                                Err(err) => {
-                                    let err = format!(
-                                        "could not parse server-sent event {}: {}",
-                                        event.data, err
-                                    );
-                                    Some(Err(ClientError::ParseError(err)))
-                                }
+            let stream = stream.filter_map(|event| async move {
+                match event {
+                    Ok(event) => {
+                        if event.data == "[DONE]" {
+                            return None;
+                        }
+                        match serde_json::from_str::<CreateChatCompletionStreamResponse>(
+                            &event.data,
+                        ) {
+                            Ok(json_event) => Some(Ok(json_event)),
+                            Err(err) => {
+                                let err = format!(
+                                    "could not parse server-sent event {}: {}",
+                                    event.data, err
+                                );
+                                Some(Err(ClientError::ParseError(err)))
                             }
                         }
-                        Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
                     }
-                });
-                Ok(stream.boxed())
-            }
-            StatusCode::BAD_REQUEST
-            | StatusCode::UNAUTHORIZED
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_text = response.text().await?;
-                match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(error_response.error.into()),
-                    Err(_) => Err(ApiError {
-                        message: error_text,
-                        r#type: None,
-                        param: None,
-                        code: None,
-                    }
-                    .into()),
+                    Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
                 }
+            });
+            return Ok(stream.boxed());
+        }
+
+        let error_text = response.text().await?;
+        if status.is_client_error() || status.is_server_error() {
+            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+                Ok(error_response) => Err(error_response.error.into()),
+                Err(_) => Err(ApiError {
+                    message: format!("request failed ({status}): {error_text}"),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                }
+                .into()),
             }
-            status_code => {
-                let error_message = format!(
-                    "unexpected status code ({status_code}), response text: {:?}",
-                    response.text().await?
-                );
-                Err(ClientError::InternalError(error_message))
-            }
+        } else {
+            Err(ClientError::InternalError(format!(
+                "unexpected status code ({status}): {error_text}"
+            )))
         }
     }
 
@@ -166,30 +153,24 @@ impl Client {
             .await
             .context("failed to send request")?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let json_text = response
-                    .text()
-                    .await
-                    .context("failed to read response text")?;
-                let response: ResponsesResponse = serde_json::from_str(&json_text)?;
-                Ok(response)
+        let status = response.status();
+        if status == StatusCode::OK {
+            let json_text = response
+                .text()
+                .await
+                .context("failed to read response text")?;
+            let response: ResponsesResponse = serde_json::from_str(&json_text)?;
+            return Ok(response);
+        }
+
+        let error_text = response.text().await?;
+        if status.is_client_error() || status.is_server_error() {
+            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+                Ok(error_response) => Err(anyhow!(error_response.error)),
+                Err(_) => Err(anyhow!("request failed ({status}): {}", error_text)),
             }
-            StatusCode::BAD_REQUEST
-            | StatusCode::UNAUTHORIZED
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_text = response.text().await?;
-                match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(anyhow!(error_response.error)),
-                    Err(_) => Err(anyhow!("request failed: {}", error_text)),
-                }
-            }
-            _ => {
-                let error_message = format!("unexpected status code: {:?}", response.text().await?);
-                Err(anyhow!(error_message))
-            }
+        } else {
+            Err(anyhow!("unexpected status code ({status}): {}", error_text))
         }
     }
 
@@ -210,56 +191,49 @@ impl Client {
 
         let response = request_builder.send().await?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let stream = response.bytes_stream().eventsource();
+        let status = response.status();
+        if status == StatusCode::OK {
+            let stream = response.bytes_stream().eventsource();
 
-                let stream = stream.filter_map(|event| async move {
-                    match event {
-                        Ok(event) => {
-                            if event.data == "[DONE]" {
-                                return None;
-                            }
-                            match serde_json::from_str::<ResponseStreamEvent>(&event.data) {
-                                Ok(json_event) => Some(Ok(json_event)),
-                                Err(err) => {
-                                    let err = format!(
-                                        "could not parse server-sent event {}: {}",
-                                        event.data, err
-                                    );
-                                    Some(Err(ClientError::ParseError(err)))
-                                }
+            let stream = stream.filter_map(|event| async move {
+                match event {
+                    Ok(event) => {
+                        if event.data == "[DONE]" {
+                            return None;
+                        }
+                        match serde_json::from_str::<ResponseStreamEvent>(&event.data) {
+                            Ok(json_event) => Some(Ok(json_event)),
+                            Err(err) => {
+                                let err = format!(
+                                    "could not parse server-sent event {}: {}",
+                                    event.data, err
+                                );
+                                Some(Err(ClientError::ParseError(err)))
                             }
                         }
-                        Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
                     }
-                });
-                Ok(stream.boxed())
-            }
-            StatusCode::BAD_REQUEST
-            | StatusCode::UNAUTHORIZED
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_text = response.text().await?;
-                match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                    Ok(error_response) => Err(error_response.error.into()),
-                    Err(_) => Err(ApiError {
-                        message: error_text,
-                        r#type: None,
-                        param: None,
-                        code: None,
-                    }
-                    .into()),
+                    Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
                 }
+            });
+            return Ok(stream.boxed());
+        }
+
+        let error_text = response.text().await?;
+        if status.is_client_error() || status.is_server_error() {
+            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+                Ok(error_response) => Err(error_response.error.into()),
+                Err(_) => Err(ApiError {
+                    message: format!("request failed ({status}): {error_text}"),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                }
+                .into()),
             }
-            status_code => {
-                let error_message = format!(
-                    "unexpected status code ({status_code}), response text: {:?}",
-                    response.text().await?
-                );
-                Err(ClientError::InternalError(error_message))
-            }
+        } else {
+            Err(ClientError::InternalError(format!(
+                "unexpected status code ({status}): {error_text}"
+            )))
         }
     }
 }

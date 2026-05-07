@@ -326,6 +326,20 @@ pub struct ChatCompletionResponseMessage {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// Reasoning text on responses from endpoints that surface chain-of-
+    /// thought via the OpenRouter/llama.cpp/-style `reasoning_content`
+    /// field on the assistant message. Native OpenAI Chat Completions
+    /// does not return reasoning on this endpoint (see Responses API
+    /// instead), so this field stays `None` there. We accept the
+    /// alternate names `reasoning` and `reasoning_text` as well, since
+    /// different OpenAI-compatible providers spell it differently.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reasoning",
+        alias = "reasoning_text"
+    )]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<Annotation>,
@@ -353,6 +367,14 @@ pub struct PromptTokensDetails {
     pub audio_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u32>,
+    /// Number of input tokens that were *written* to the prompt cache on
+    /// this request. Not part of the standard OpenAI schema; some
+    /// OpenAI-compatible providers (notably ones that proxy Anthropic-
+    /// shaped pricing) report it here. When present, callers should
+    /// subtract it from `cached_tokens` before treating the remainder as
+    /// pure cache reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -435,6 +457,18 @@ pub struct ChatCompletionStreamResponseDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// Streaming reasoning chunks from endpoints that surface chain-of-
+    /// thought on Chat Completions. Same compatibility notes as
+    /// [`ChatCompletionResponseMessage::reasoning_content`]: native
+    /// OpenAI does not emit it, but several compatible providers do,
+    /// under one of three field names that we coalesce here.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reasoning",
+        alias = "reasoning_text"
+    )]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallDelta>,
@@ -573,18 +607,71 @@ pub struct WebSearchLocationApproximate {
     pub timezone: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// `finish_reason` reported by Chat Completions and OpenAI-compatible
+/// providers. We enumerate the values that AJ classifies explicitly
+/// (per §10.3 of the models spec) and keep an `Other(String)` catch-
+/// all so that a new or vendor-specific value never breaks the parser.
+/// The catch-all preserves the raw wire string so callers can include
+/// it in error messages or fold it into `Unknown` categorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FinishReason {
-    #[serde(rename = "stop")]
     Stop,
-    #[serde(rename = "length")]
     Length,
-    #[serde(rename = "tool_calls")]
     ToolCalls,
-    #[serde(rename = "content_filter")]
     ContentFilter,
-    #[serde(rename = "function_call")]
     FunctionCall,
+    /// Some OpenAI-compatible endpoints terminate a stream with
+    /// `finish_reason: "network_error"` to signal a recoverable
+    /// upstream failure mid-response.
+    NetworkError,
+    /// Any other `finish_reason` value the upstream emits. The wrapped
+    /// string is the verbatim value from the wire.
+    Other(String),
+}
+
+impl FinishReason {
+    /// Wire value as it appears in JSON (`finish_reason: "stop"`,
+    /// `"length"`, ...). Inverse of [`FinishReason::from_wire`].
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
+            Self::ContentFilter => "content_filter",
+            Self::FunctionCall => "function_call",
+            Self::NetworkError => "network_error",
+            Self::Other(s) => s.as_str(),
+        }
+    }
+
+    /// Parse a `finish_reason` wire value into the enum. Unrecognised
+    /// values are preserved via [`FinishReason::Other`] rather than
+    /// rejected, so a future server-side addition can't break the
+    /// stream parser.
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "stop" | "end" => Self::Stop,
+            "length" => Self::Length,
+            "tool_calls" => Self::ToolCalls,
+            "content_filter" => Self::ContentFilter,
+            "function_call" => Self::FunctionCall,
+            "network_error" => Self::NetworkError,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for FinishReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for FinishReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&raw))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -699,5 +786,90 @@ impl ChatCompletionUserContent {
                 },
             },
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_reason_round_trips_known_values() {
+        for (json, expected) in [
+            ("\"stop\"", FinishReason::Stop),
+            ("\"length\"", FinishReason::Length),
+            ("\"tool_calls\"", FinishReason::ToolCalls),
+            ("\"content_filter\"", FinishReason::ContentFilter),
+            ("\"function_call\"", FinishReason::FunctionCall),
+            ("\"network_error\"", FinishReason::NetworkError),
+        ] {
+            let parsed: FinishReason = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed, expected, "decode {json}");
+            let encoded = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(encoded, json, "round-trip {json}");
+        }
+    }
+
+    #[test]
+    fn finish_reason_normalises_end_alias_to_stop() {
+        // Some OpenAI-compatible endpoints emit "end" rather than "stop".
+        // §7.2 of the models spec maps both to the same `Stop`.
+        let parsed: FinishReason = serde_json::from_str("\"end\"").unwrap();
+        assert_eq!(parsed, FinishReason::Stop);
+    }
+
+    #[test]
+    fn finish_reason_falls_back_to_other_for_unknown() {
+        let parsed: FinishReason = serde_json::from_str("\"some_new_reason\"").unwrap();
+        assert_eq!(parsed, FinishReason::Other("some_new_reason".to_string()));
+        // Round-trips back to the same wire string.
+        let encoded = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(encoded, "\"some_new_reason\"");
+    }
+
+    #[test]
+    fn stream_delta_parses_reasoning_content_field() {
+        let json = r#"{"role":"assistant","reasoning_content":"thinking..."}"#;
+        let delta: ChatCompletionStreamResponseDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
+    fn stream_delta_accepts_reasoning_alias() {
+        // Some OpenAI-compatible providers expose chain-of-thought via
+        // `reasoning` rather than `reasoning_content`.
+        let json = r#"{"reasoning":"alt name"}"#;
+        let delta: ChatCompletionStreamResponseDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("alt name"));
+    }
+
+    #[test]
+    fn response_message_parses_reasoning_content_field() {
+        let json = r#"{"role":"assistant","content":"hi","reasoning_text":"thinking"}"#;
+        let msg: ChatCompletionResponseMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content.as_deref(), Some("hi"));
+        assert_eq!(msg.reasoning_content.as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn prompt_tokens_details_parses_cache_write_tokens() {
+        let json = r#"{"cached_tokens":120,"cache_write_tokens":30}"#;
+        let details: PromptTokensDetails = serde_json::from_str(json).unwrap();
+        assert_eq!(details.cached_tokens, Some(120));
+        assert_eq!(details.cache_write_tokens, Some(30));
+    }
+
+    #[test]
+    fn prompt_tokens_details_omits_cache_write_when_absent() {
+        let details = PromptTokensDetails {
+            audio_tokens: None,
+            cached_tokens: Some(50),
+            cache_write_tokens: None,
+        };
+        let encoded = serde_json::to_string(&details).unwrap();
+        assert!(
+            !encoded.contains("cache_write_tokens"),
+            "cache_write_tokens should be skipped when None: {encoded}"
+        );
     }
 }

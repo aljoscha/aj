@@ -22,7 +22,7 @@ this file is the bridge between the spec and the git history.
 
 ## Phase 3: OpenAI Provider
 
-- [ ] 7. Update `openai-sdk` — §7.1
+- [x] 7. Update `openai-sdk` — §7.1
 - [ ] 8. Implement OpenAI Chat Completions provider (`aj-models::openai`) — §7.2
 
 ## Phase 4: Cross-Provider & Utilities
