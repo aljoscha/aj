@@ -1,0 +1,214 @@
+{
+  "overrides": [
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-5"
+      },
+      "patch": {
+        "cost": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        }
+      },
+      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25"
+    },
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-5-20251101"
+      },
+      "patch": {
+        "cost": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        }
+      },
+      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25"
+    },
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-6"
+      },
+      "patch": {
+        "supports_adaptive_thinking": true
+      },
+      "reason": "uses top-level adaptive thinking + output_config.effort; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-7"
+      },
+      "patch": {
+        "supports_adaptive_thinking": true
+      },
+      "reason": "uses top-level adaptive thinking + output_config.effort; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-6"
+      },
+      "patch": {
+        "supports_adaptive_thinking": true
+      },
+      "reason": "uses top-level adaptive thinking + output_config.effort; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-6"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports XHigh reasoning tier (output_config.effort=max/xhigh); not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-7"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports XHigh reasoning tier (output_config.effort=max/xhigh); not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.2"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.2-codex"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.2-pro"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.2-chat-latest"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.3-codex"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.3-codex-spark"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.3-chat-latest"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.4"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.4-mini"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.4-nano"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.4-pro"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.5"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.5-pro"
+      },
+      "patch": {
+        "supports_xhigh": true
+      },
+      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+    }
+  ]
+}
