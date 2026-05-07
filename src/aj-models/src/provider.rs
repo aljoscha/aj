@@ -63,8 +63,9 @@ pub trait Provider: Send + Sync {
 /// callers always observe a uniform stream shape.
 fn provider_for(api: &str) -> Option<Box<dyn Provider>> {
     match api {
-        // Filled in by §6 (anthropic-messages) and §7 (openai-completions,
-        // openai-responses) as each provider lands.
+        "anthropic-messages" => Some(Box::new(crate::anthropic::AnthropicProvider)),
+        // Filled in by §7 (openai-completions, openai-responses) as each
+        // provider lands.
         _ => None,
     }
 }
