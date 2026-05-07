@@ -15,12 +15,13 @@
 //!   a registry of providers and look them up by id.
 //!
 //! Concrete provider flows (Anthropic in §9.3, OpenAI in §9.4) live in
-//! their own submodules and will be added in subsequent steps. The
-//! [`pkce`] submodule provides the verifier/challenge utilities both
-//! flows share, and [`page`] renders the success/error HTML each
-//! provider's local callback server returns to the browser.
+//! their own submodules. The [`pkce`] submodule provides the
+//! verifier/challenge utilities both flows share, and [`page`] renders
+//! the success/error HTML each provider's local callback server
+//! returns to the browser.
 
 pub mod anthropic;
+pub mod openai;
 pub mod page;
 pub mod pkce;
 
