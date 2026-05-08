@@ -24,16 +24,42 @@ this file is the bridge between the spec and the git history.
 
 - [x] 7. Update `openai-sdk` — §7.1
 - [x] 8. Implement OpenAI Chat Completions provider (`aj-models::openai`) — §7.2
+- [ ] 8b. Implement OpenAI Responses provider (`aj-models::openai`) — §7.3.
+      The §12 plan didn't list this as a discrete step, but §3.4.3
+      mandates `api: "openai-responses"` for native OpenAI models, and
+      the bundled catalog reflects that — all 41 native OpenAI catalog
+      entries are `openai-responses`. Today `provider_for("openai-responses")`
+      returns `None`, so the new `Provider` trait can't drive any native
+      OpenAI model; only `openai-completions` (third-party-shape, no
+      catalog entries today) is wired. Implement against §7.3 — message
+      conversion (input array of typed items, system/developer prompt,
+      reasoning items round-tripped via `thinking_signature`, text
+      signatures via `TextSignatureV1`, composite tool-call IDs
+      `{call_id}|{item_id}`), request parameters (`reasoning.effort`,
+      `include: ["reasoning.encrypted_content"]`, `prompt_cache_key`,
+      `prompt_cache_retention`, `service_tier`, `store: false`),
+      session-correlation headers (§7.3 preface), the SSE event
+      mapping table (§7.3.6), usage parsing (§7.3.7), and the
+      `response.status` → `StopReason` mapping (§7.3.8). The legacy
+      `crate::openai::legacy::OpenAiModel` is already Responses-based
+      and can serve as a wire-mapping reference; round-trip §7.3.3
+      (encrypted reasoning), §7.3.4 (text signatures), §7.3.5
+      (composite IDs) need fresh implementation since they're
+      multi-turn-replay invariants the legacy code didn't have to care
+      about. Ship 11b.iv round-trip fixtures alongside (Responses
+      parse/serialize/semantic round-trip).
 
 ## Phase 4: Cross-Provider & Utilities
 
 - [x] 9. Message transformation (`aj-models::transform`) — §8
 - [x] 10. Partial JSON parser — §11.1
 - [x] 11. Error classification & overflow detection (`aj-models::errors`) — §1.3, §10
-- [x] 11b. Round-trip test suite (`src/aj-models/tests/roundtrip/`) — §1.10, §12
+- [ ] 11b. Round-trip test suite (`src/aj-models/tests/roundtrip/`) — §1.10, §12
    - [x] 11b.i. Scaffolding + Anthropic Messages: parse, serialize, semantic round-trip
    - [x] 11b.ii. OpenAI Chat Completions: parse, serialize, semantic round-trip
    - [x] 11b.iii. Cross-provider transform tests (one per direction)
+   - [ ] 11b.iv. OpenAI Responses: parse, serialize, semantic round-trip
+         (lands with step 8b)
 
 ## Phase 5: Authentication
 
@@ -62,5 +88,19 @@ this file is the bridge between the spec and the git history.
       (executed via aj-next §2.0–§2.5; see `aj-next-progress.md`)
 - [ ] 17. Update `aj` CLI — add provider flag, model registry
       (executed via aj-next §2.5; see `aj-next-progress.md`)
-- [ ] 18. Remove old code — old messages, Model trait, StreamingEvent, etc.
+- [ ] 18. Remove old code — replaced by the models-spec rewrite.
+      Mandatory: the legacy `Model` trait, `create_model`, the legacy
+      `StreamingEvent` enum, the `messages` module (replaced by
+      `types`), the `aj-models::anthropic::legacy` and
+      `aj-models::openai::legacy` modules (replaced by the new
+      `Provider` impls — `legacy.rs` is unconditional dead code once
+      `aj-agent` migrates off the `Model` trait), the `async-openai`
+      dependency if it's still pulled in, and the `openai_ng` module
+      if it survived earlier cleanups. Audit: grep for `Model::` /
+      `StreamingEvent` / `crate::messages::` / `legacy::` / `aj_models::Model`
+      after the §2.5 binary swap and remove every remaining reference.
+      Constraint: this step lands only after step 8b *and* aj-next
+      §2.4–§2.5 — both the new Provider trait must cover every model
+      surface the catalog points at, and the binary must have moved
+      off the legacy `Model` trait, before legacy.rs can be deleted.
       (executed via aj-next §2.6; see `aj-next-progress.md`)
