@@ -1,5 +1,5 @@
-use aj_tools::ToolDefinition;
-use aj_tools::testing::{DummyPermissionHandler, DummySessionContext, DummyTurnContext};
+use aj_agent::tool::ToolDefinition;
+use aj_tools::testing::DummyToolContext;
 use aj_tools::tools::glob::{GlobInput, GlobTool};
 use std::env;
 
@@ -19,24 +19,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let input = GlobInput { path, pattern };
     let tool = GlobTool;
-    let mut session_ctx = DummySessionContext;
-    let mut turn_ctx = DummyTurnContext;
-    let mut permission_handler = DummyPermissionHandler;
-
-    match tool
-        .execute(
-            &mut session_ctx,
-            &mut turn_ctx,
-            &mut permission_handler,
-            input,
-        )
-        .await
-    {
-        Ok(result) => println!("{}", result.return_value),
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
+    let mut ctx = DummyToolContext::default();
+    let outcome = tool.execute(&mut ctx, input).await?;
+    if outcome.is_error {
+        match &outcome.details {
+            aj_agent::tool::ToolDetails::Text { body, .. } => {
+                eprintln!("Error: {body}");
+            }
+            other => eprintln!("Error: {other:?}"),
         }
+        std::process::exit(1);
+    }
+
+    match outcome.details {
+        aj_agent::tool::ToolDetails::Text { body, .. } => println!("{body}"),
+        other => println!("{other:?}"),
     }
 
     Ok(())

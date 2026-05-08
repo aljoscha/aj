@@ -115,7 +115,23 @@ and the git history.
         `DummyToolContext`. Seven unit tests cover the happy paths
         (non-recursive, recursive, ignore patterns) and recoverable
         errors (relative path, missing path, file path, invalid glob).
-  - [ ] `glob` (Text)
+  - [x] `glob` (Text). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Text {
+        summary, body }, is_error }` and no longer touches `AjUi`.
+        `summary` is the search-root path made relative to the working
+        directory (matching `read_file` / `ls` conventions) followed
+        by a ` pattern=<glob>` marker so a collapsed view captures
+        both the target and the search pattern. `body` is the
+        formatted listing of matched entries (or a "no entries"
+        notice). Recoverable errors (path-not-absolute, missing path,
+        not-a-directory, invalid glob pattern, walker IO failures,
+        relative-path computation failures, metadata failures) come
+        back as `is_error: true` outcomes instead of bubbled `Err`s.
+        Wired into `get_builtin_tools()` via `bridge::legacy_adapt(GlobTool)`.
+        `bin/glob.rs` updated to drive the new shape via
+        `DummyToolContext`. Seven unit tests cover the happy paths
+        (extension match, recursive `**/`, no matches) and recoverable
+        errors (relative path, missing path, file path, invalid glob).
   - [ ] `grep` (Text)
   - [ ] `agent` (Text / SubAgentReport)
   - [ ] `todo_read` (Todos + Text)
