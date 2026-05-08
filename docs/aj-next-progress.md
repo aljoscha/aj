@@ -769,7 +769,81 @@ adopts independently.
 
 ## Phase 1 — `aj-next` (§4)
 
-- [ ] Crate scaffold (`src/aj-next/`).
+- [x] Crate scaffold (`src/aj-next/`). Adds the `aj-next` package
+      to the workspace with the §4 dependency set (`aj-agent`,
+      `aj-conf`, `aj-models`, `aj-session`, `aj-tools`, `aj-tui`)
+      plus the basic glue deps (`anyhow`, `clap`, `dotenv`,
+      `serde_json`, `tokio`, `tracing`, `tracing-subscriber`).
+      Lays out the directory tree exactly as `docs/aj-next-plan.md`
+      §4 prescribes:
+
+      ```
+      src/aj-next/
+        Cargo.toml
+        src/
+          main.rs            — env + arg parsing + mode dispatch
+          lib.rs             — module declarations, SYSTEM_PROMPT
+          cli.rs             — module declarations
+          cli/
+            args.rs          — clap-derived `Args` (mirrors legacy
+                               `aj` flags + `--print` / `--format`),
+                               `Command` (list-threads/continue/
+                               models), `ModelsCommand`
+            file_args.rs     — passthrough stub for `@file` expansion
+          config.rs          — module declarations
+          config/
+            keybindings.rs   — empty stub
+            theme.rs         — empty stub
+            slash_commands.rs — empty stub
+          persistence.rs     — empty stub
+          modes.rs           — module declarations
+          modes/
+            print.rs         — `run(args)` stub returning a clear
+                               "not yet implemented" error
+            interactive.rs   — `InteractiveMode { from_args, run }`
+                               stub with `bail!`
+            interactive/
+              layout.rs      — empty stub
+              event_pump.rs  — empty stub
+              footer_data.rs — empty stub
+              keys.rs        — empty stub
+              editor_ext.rs  — empty stub
+              components.rs  — module declarations
+              components/
+                assistant_message.rs, user_message.rs,
+                tool_execution.rs, bash_execution.rs, diff.rs,
+                loader_status.rs, footer.rs, header.rs,
+                model_selector.rs, thinking_selector.rs,
+                session_selector.rs — empty stubs
+      ```
+
+      `main.rs` parses CLI args via [`clap::Parser`], loads
+      `~/.aj/.env` (then a project `.env`) via the same precedence
+      the legacy binary uses, and dispatches to the appropriate
+      mode: `--print` selects `modes::print::run`, otherwise
+      `InteractiveMode::from_args` + `run`. `list-threads`,
+      `continue`, and `models update` route through their own
+      stub handlers in `main.rs` so the dispatch surface is
+      stable for the next steps to plug into.
+
+      `SYSTEM_PROMPT` is shared with the legacy binary via
+      `include_str!("../../aj/SYSTEM_PROMPT.md")` so both
+      binaries embed the exact same bytes during the transition.
+      The file moves into this crate at the §5 cutover.
+
+      Per the workspace lint policy (`mod_module_files = "warn"`)
+      every directory uses the sibling `foo.rs` + `foo/` layout
+      rather than `foo/mod.rs`. The three `async fn` stubs that
+      will actually `await` once filled in (`modes::print::run`,
+      `InteractiveMode::run`, `handle_models_command`) carry a
+      narrow `#[allow(clippy::unused_async)]` with a comment
+      naming the await they'll grow.
+
+      `cargo build -p aj-next`, `cargo test -p aj-next`, and
+      `cargo clippy -p aj-next --all-targets` all pass clean (the
+      only remaining warnings are pre-existing in `aj-agent`).
+      `cargo run -p aj-next -- --help` prints the full clap help
+      tree end-to-end.
 - [ ] Print mode (text, JSONL).
 - [ ] Interactive TUI: layout slots, event pump, components.
 - [ ] Selectors (model/thinking/session) and theming.

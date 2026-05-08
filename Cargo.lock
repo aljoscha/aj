@@ -98,6 +98,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aj-next"
+version = "0.1.0"
+dependencies = [
+ "aj-agent",
+ "aj-conf",
+ "aj-models",
+ "aj-session",
+ "aj-tools",
+ "aj-tui",
+ "anyhow",
+ "clap",
+ "dotenv",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aj-session"
 version = "0.1.0"
 dependencies = [

@@ -4,6 +4,7 @@ members = [
     "src/aj-agent",
     "src/aj-conf",
     "src/aj-models",
+    "src/aj-next",
     "src/aj-session",
     "src/aj-tools",
     "src/anthropic-sdk",
