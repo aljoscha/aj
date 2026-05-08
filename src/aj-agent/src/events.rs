@@ -18,6 +18,7 @@ use std::time::Duration;
 use aj_models::messages::ContentBlockParam;
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantMessage, ToolResultMessage};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::message::AgentMessage;
@@ -30,7 +31,13 @@ use crate::types::{TokenUsage, UserOutput};
 /// sub-agent spawned through the `agent` tool. Sub-agent indices are
 /// assigned by the parent's session state and are stable for the
 /// lifetime of the parent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// JSON shape (used by `aj-next --format json` and any other listener
+/// that serializes events): `"main"` for [`AgentId::Main`] and
+/// `{"sub": N}` for [`AgentId::Sub`]. Variant names are lowercased to
+/// match the rest of the event protocol's serde convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentId {
     /// The top-level agent.
     Main,
@@ -50,7 +57,8 @@ pub enum AgentId {
 /// projects each persisted user-role text message as a Start/Stop
 /// pair on the user channel so the renderer can repaint the prior
 /// turns through the same path it uses for live streaming.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamChannel {
     /// Visible assistant text.
     Text,
@@ -69,7 +77,8 @@ pub enum StreamChannel {
 /// without translation. Once the agent migrates to unified streaming
 /// (`AssistantMessageEvent`) in §2.4, this enum and the
 /// [`AgentEvent::StreamChunk`] variant fold into [`AgentEvent::MessageUpdate`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamAction {
     /// First fragment of a new block. `snapshot` is the initial chunk
     /// the renderer should display.
@@ -93,7 +102,8 @@ pub enum StreamAction {
 /// turn structure — it just appends what it's told). Folds into
 /// the per-message [`AgentEvent::MessageEnd`] payload in §2.4 when
 /// the on-disk format switches to typed messages.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PersistedMessageKind {
     /// Append a user-role message carrying typed user input — the
     /// readline loop's prompt for the top-level agent, or a
@@ -124,7 +134,21 @@ pub enum PersistedMessageKind {
 /// Every variant carries an `agent_id` so a single listener (e.g. the
 /// persistence writer or the TUI's event pump) can serve both the
 /// main agent and any nested sub-agents.
-#[derive(Clone, Debug)]
+///
+/// Serialization shape (used by `aj-next --format json` and any other
+/// listener that ships events out-of-process): an internally tagged
+/// JSON object with the variant discriminator under `"type"` and the
+/// payload fields lifted to the top level. The three message-
+/// lifecycle variants ([`AgentEvent::MessageStart`],
+/// [`AgentEvent::MessageUpdate`], [`AgentEvent::MessageEnd`]) are
+/// `#[serde(skip)]`-marked: they carry an [`AssistantMessageEvent`]
+/// payload that doesn't yet derive [`Serialize`], and the agent does
+/// not emit them today (they fold into the unified streaming
+/// protocol in §2.4 of `docs/aj-next-plan.md`, at which point the
+/// skip drops). Attempting to serialize one will fail loudly rather
+/// than ship malformed JSONL.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     // --- Lifecycle ---------------------------------------------------------
     /// Emitted once when [`Agent::prompt`](crate::Agent) starts a run.
@@ -148,6 +172,7 @@ pub enum AgentEvent {
     // --- Message lifecycle -------------------------------------------------
     /// A message has been added to the transcript. Fired for user,
     /// assistant, and tool-result messages alike.
+    #[serde(skip)]
     MessageStart {
         agent_id: AgentId,
         message: AgentMessage,
@@ -157,12 +182,14 @@ pub enum AgentEvent {
     /// can drive incremental rendering, plus the partial
     /// [`AgentMessage`] snapshot for callers that just want the
     /// running text/thinking/tool-call state.
+    #[serde(skip)]
     MessageUpdate {
         agent_id: AgentId,
         message: AgentMessage,
         event: AssistantMessageEvent,
     },
     /// A message has been finalized.
+    #[serde(skip)]
     MessageEnd {
         agent_id: AgentId,
         message: AgentMessage,
@@ -352,5 +379,59 @@ mod tests {
             text: "hello".into(),
         };
         assert_eq!(sub_evt.agent_id(), AgentId::Sub(3));
+    }
+
+    /// Pin the JSON-on-the-wire shape used by `aj-next --format json`.
+    ///
+    /// Listeners that ship events out-of-process (today the print-mode
+    /// JSONL writer; tomorrow any RPC bridge) rely on this contract,
+    /// so we lock the discriminator key (`"type"`), the `snake_case`
+    /// renaming of variant names, and the in-tagged shape of nested
+    /// enums (`AgentId`, `StreamChannel`, `StreamAction`,
+    /// `PersistedMessageKind`). Adding a new event or renaming a field
+    /// shows up here as a test breakage instead of silently changing
+    /// the consumer-facing shape.
+    #[test]
+    fn agent_event_serializes_with_internally_tagged_snake_case_shape() {
+        let evt = AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: "hi".into(),
+        };
+        let json = serde_json::to_value(&evt).expect("notice serializes");
+        assert_eq!(json["type"], "notice");
+        assert_eq!(json["agent_id"], "main");
+        assert_eq!(json["text"], "hi");
+
+        let sub = AgentEvent::Notice {
+            agent_id: AgentId::Sub(7),
+            text: "from child".into(),
+        };
+        let json = serde_json::to_value(&sub).expect("sub-tagged notice serializes");
+        // Tuple variants of `AgentId` serialize as `{"sub": N}` so a
+        // listener can pattern-match on the discriminator key cheaply.
+        assert_eq!(json["agent_id"]["sub"], 7);
+
+        let chunk = AgentEvent::StreamChunk {
+            agent_id: AgentId::Main,
+            channel: StreamChannel::Text,
+            action: StreamAction::Update {
+                delta: "abc".into(),
+            },
+        };
+        let json = serde_json::to_value(&chunk).expect("stream chunk serializes");
+        assert_eq!(json["type"], "stream_chunk");
+        assert_eq!(json["channel"], "text");
+        // The action is a `tag = "kind"` enum: discriminator + payload.
+        assert_eq!(json["action"]["kind"], "update");
+        assert_eq!(json["action"]["delta"], "abc");
+
+        let persisted = AgentEvent::MessagePersisted {
+            agent_id: AgentId::Main,
+            kind: PersistedMessageKind::User { content: vec![] },
+        };
+        let json = serde_json::to_value(&persisted).expect("persisted serializes");
+        assert_eq!(json["type"], "message_persisted");
+        assert_eq!(json["kind"]["kind"], "user");
+        assert!(json["kind"]["content"].is_array());
     }
 }

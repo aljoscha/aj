@@ -844,7 +844,48 @@ adopts independently.
       only remaining warnings are pre-existing in `aj-agent`).
       `cargo run -p aj-next -- --help` prints the full clap help
       tree end-to-end.
-- [ ] Print mode (text, JSONL).
+- [x] Print mode (text, JSONL).
+      Implemented in `src/aj-next/src/modes/print.rs`. The `print::run`
+      flow mirrors the legacy `aj` binary's session setup (load
+      `config.toml`, resolve model args with CLI > env > config
+      precedence, build the agent + filtered tool list, open a fresh
+      [`ConversationLog`]) but skips the readline loop: a single
+      [`Agent::prompt`] runs the supplied prompt to completion, then
+      either the JSONL listener has already streamed every event or
+      the text-mode finalizer walks back through `agent.messages()`
+      to print the last assistant message's visible text blocks.
+
+      Per `docs/aj-next-plan.md` §4.2 the same agent core drives both
+      output formats; the only difference is which subscriber sees
+      the bus. JSON mode registers `json_event_listener`
+      ([`listener_from_sync`]-wrapped, awaited inline by the bus) so
+      events appear on stdout in emit order with one JSONL line per
+      event; text mode registers no extra listener and relies on the
+      transcript walk after `prompt` returns. Persistence runs
+      alongside both via [`aj_session::persistence_listener`] so
+      `aj-next --print "do X"` leaves a resumable thread on disk.
+
+      JSON shape: the print-mode contract piggybacks on the new
+      [`Serialize`] derive on [`AgentEvent`] (and supporting types
+      [`AgentId`], [`StreamChannel`], [`StreamAction`],
+      [`PersistedMessageKind`]). The discriminator is `"type"` for
+      event variants and `"kind"` for nested enums, all
+      `snake_case` per the existing serde convention. The deferred
+      `MessageStart` / `MessageUpdate` / `MessageEnd` variants are
+      `#[serde(skip)]`-marked because they carry an
+      [`AssistantMessageEvent`] payload that doesn't yet derive
+      `Serialize` and the agent doesn't emit them today; the JSONL
+      listener catches the (unreachable-in-practice) serialize error,
+      logs a one-liner to stderr, and continues. The shape is locked
+      by `agent_event_serializes_with_internally_tagged_snake_case_shape`
+      in `aj-agent::events::tests`.
+
+      Validation: `aj-next --print` without a prompt errors with
+      "requires a prompt argument"; `aj-next --print continue ...`
+      bails with a clear "not yet supported" message (resume + print
+      lands alongside the interactive resume work). `cargo build`,
+      `cargo fmt`, `cargo test`, and `cargo clippy -p aj-next
+      --all-targets` all pass clean.
 - [ ] Interactive TUI: layout slots, event pump, components.
 - [ ] Selectors (model/thinking/session) and theming.
 
