@@ -287,22 +287,56 @@ impl Agent {
         &self.env
     }
 
-    /// Run a single turn for the top-level agent.
+    /// Append `message` as a user-role text input to the transcript
+    /// and run one assistant turn against it.
     ///
-    /// If `prompt` is `Some`, append it as a user message to the
-    /// transcript and emit [`AgentEvent::MessagePersisted::User`]
-    /// before driving the assistant turn loop. If `prompt` is
-    /// `None`, the agent assumes the transcript already ends in a
-    /// user-role message (typically a synthesized tool_result, on
-    /// the recovery path after a recoverable turn error) and
-    /// continues from there.
-    ///
-    /// The turn loop runs one inference, processes any tool calls
-    /// the assistant emits (each with its own
-    /// [`AgentEvent::ToolExecutionStart`] /
+    /// Emits [`AgentEvent::MessagePersisted::User`] before driving
+    /// the assistant turn loop so the persistence listener writes
+    /// the user's input to disk. The turn loop runs one inference,
+    /// processes any tool calls the assistant emits (each with its
+    /// own [`AgentEvent::ToolExecutionStart`] /
     /// [`AgentEvent::ToolExecutionEnd`] bracket), and loops until
     /// the assistant produces a non-tool turn.
-    pub async fn run_turn(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
+    ///
+    /// The whole call is bracketed by [`AgentEvent::AgentStart`] /
+    /// [`AgentEvent::AgentEnd`] events tagged with this agent's id
+    /// so listeners can scope nested transcripts.
+    pub async fn prompt(&mut self, message: String) -> Result<(), TurnError> {
+        self.run_top_level_turn(Some(message)).await
+    }
+
+    /// Run one assistant turn against the existing transcript
+    /// without appending a new user message.
+    ///
+    /// Used after a recoverable turn error, when the user's input
+    /// (or the synthesized tool_result message that closed the
+    /// previous tool batch) is already in the transcript and we
+    /// want to retry inference without re-injecting a prompt. The
+    /// transcript must end in a user-role message; calling this
+    /// against an assistant-role last message would send the model
+    /// an invalid request and is treated as a fatal misuse here.
+    ///
+    /// Like [`Agent::prompt`], the call is bracketed by
+    /// [`AgentEvent::AgentStart`] / [`AgentEvent::AgentEnd`] events.
+    pub async fn continue_run(&mut self) -> Result<(), TurnError> {
+        match self.transcript.last() {
+            Some(msg) if matches!(msg.role, Role::User) => {}
+            _ => {
+                return Err(TurnError::Fatal(anyhow!(
+                    "continue_run requires the transcript to end in a user-role message"
+                )));
+            }
+        }
+        self.run_top_level_turn(None).await
+    }
+
+    /// Shared driver for [`Agent::prompt`] / [`Agent::continue_run`].
+    ///
+    /// `prompt` is `Some` for [`Agent::prompt`] (a fresh user
+    /// message is appended before inference) and `None` for
+    /// [`Agent::continue_run`] (the existing transcript is fed back
+    /// to the model unchanged).
+    async fn run_top_level_turn(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
         // bus. `AgentEnd.messages` will eventually carry a snapshot
         // of the agent's transcript per `docs/aj-next-plan.md` §1.4;
@@ -317,7 +351,7 @@ impl Agent {
             .await
             .map_err(TurnError::Fatal)?;
 
-        let outcome = self.run_turn_inner(prompt).await;
+        let outcome = self.run_top_level_turn_inner(prompt).await;
 
         self.bus
             .emit(AgentEvent::AgentEnd {
@@ -330,7 +364,7 @@ impl Agent {
         outcome
     }
 
-    async fn run_turn_inner(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
+    async fn run_top_level_turn_inner(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
         if let Some(text) = prompt {
             // Append the user message to the in-memory transcript
             // and emit a `MessagePersisted::User` event for the
@@ -1311,7 +1345,8 @@ fn scan_dangling_tool_uses(transcript: &[MessageParam]) -> std::collections::Has
     used.difference(&resolved).cloned().collect()
 }
 
-/// Error returned from [`Agent::run_turn`] / [`Agent::run_single_turn`].
+/// Error returned from [`Agent::prompt`] / [`Agent::continue_run`] /
+/// [`Agent::run_single_turn`].
 ///
 /// `Recoverable` errors (model API failures, malformed streaming
 /// responses, etc.) are surfaced to the user so they can retry or
@@ -1811,7 +1846,7 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
-    async fn run_turn_emits_user_message_persisted_event() {
+    async fn prompt_emits_user_message_persisted_event() {
         // The top-level entry point appends the user prompt to the
         // transcript and emits a `MessagePersisted::User` event
         // before the assistant turn loop begins. This is the
@@ -1830,9 +1865,9 @@ mod event_protocol_tests {
         }));
 
         agent
-            .run_turn(Some("hello agent".to_string()))
+            .prompt("hello agent".to_string())
             .await
-            .expect("run_turn");
+            .expect("prompt");
 
         let events = recorded.lock().unwrap().clone();
         assert_eq!(
@@ -1857,6 +1892,109 @@ mod event_protocol_tests {
         // The transcript reflects both the user prompt and the
         // assistant reply.
         assert_eq!(agent.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn continue_run_drives_existing_transcript_without_appending() {
+        // `continue_run` is the recovery / continuation entry point:
+        // the binary uses it after a recoverable error to retry
+        // inference against the user message that's already on the
+        // transcript, without re-emitting a `MessagePersisted::User`
+        // (the prior `prompt` call already wrote it). Here we seed
+        // a transcript ending in a user-role message and verify
+        // `continue_run` drives one assistant turn without firing
+        // any extra User persistence event.
+        use aj_models::messages::ContentBlockParam;
+
+        let scripts = vec![vec![StreamingEvent::FinalizedMessage {
+            message: finalize_text("retried"),
+        }]];
+
+        let mut agent = build_agent(scripts, Vec::new());
+        // Seed a user-role last message — typically the prompt the
+        // user already submitted before the previous turn errored
+        // out.
+        agent.seed_messages(vec![aj_models::messages::MessageParam::new_user_message(
+            vec![ContentBlockParam::new_text_block("retry me".into())],
+        )]);
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        agent.continue_run().await.expect("continue_run");
+
+        let events = recorded.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                EventLabel::AgentStart(AgentId::Main),
+                // No `MessagePersisted::User` here — that's the
+                // distinguishing feature of `continue_run` vs `prompt`.
+                EventLabel::TurnStart(AgentId::Main),
+                EventLabel::MessagePersisted {
+                    agent_id: AgentId::Main,
+                    kind: "Assistant",
+                },
+                EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::AgentEnd(AgentId::Main),
+            ],
+            "unexpected event sequence: {events:#?}"
+        );
+
+        // The seeded user prompt + the assistant reply are both
+        // visible in the transcript.
+        assert_eq!(agent.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn continue_run_rejects_assistant_role_last_message() {
+        // The wire layer requires the transcript to end in a
+        // user-role message before inference. `continue_run`
+        // enforces that precondition with a fatal error rather
+        // than letting the model API surface an obscure 4xx.
+        use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+
+        // No scripts queued: if the precondition check is missing
+        // and the agent runs an inference, the `ScriptedModel`
+        // panics ("ScriptedModel exhausted"). That'd produce a
+        // different failure than the `Fatal` we're checking for —
+        // so a successful test here implies the check fired
+        // *before* any inference attempt.
+        let mut agent = build_agent(Vec::new(), Vec::new());
+        // Seed an assistant-role last message.
+        agent.seed_messages(vec![MessageParam {
+            role: Role::Assistant,
+            content: vec![ContentBlockParam::new_text_block("hi".into())],
+        }]);
+
+        let err = agent
+            .continue_run()
+            .await
+            .expect_err("continue_run must reject assistant-role last message");
+        assert!(
+            matches!(err, crate::TurnError::Fatal(_)),
+            "expected Fatal error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_run_rejects_empty_transcript() {
+        // Empty transcript is the other shape that's invalid: the
+        // model needs *something* user-side to respond to. Same
+        // fatal-error contract as the assistant-last case.
+        let mut agent = build_agent(Vec::new(), Vec::new());
+
+        let err = agent
+            .continue_run()
+            .await
+            .expect_err("continue_run must reject empty transcript");
+        assert!(
+            matches!(err, crate::TurnError::Fatal(_)),
+            "expected Fatal error, got: {err:?}"
+        );
     }
 
     #[test]

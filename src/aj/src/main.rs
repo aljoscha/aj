@@ -307,12 +307,12 @@ async fn run_session(
     let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
 
     // Main turn loop. The binary owns this loop; the agent's
-    // `run_turn` runs one assistant cycle and returns. We decide
-    // whether to ask for user input by inspecting the last message
-    // in the agent's transcript: if the assistant just spoke, we
-    // need new input; if the last message is from the user (e.g.
-    // a synthesized tool_result on the recovery path), we
-    // continue without prompting.
+    // `prompt` / `continue_run` runs one assistant cycle and
+    // returns. We decide whether to ask for user input by
+    // inspecting the last message in the agent's transcript: if the
+    // assistant just spoke, we need new input; if the last message
+    // is from the user (e.g. a synthesized tool_result on the
+    // recovery path), we continue without prompting.
     let mut force_user_input = false;
     let mut sent_any_input = resumed_thread_id.is_some();
     loop {
@@ -323,11 +323,16 @@ async fn run_session(
             };
         force_user_input = false;
 
-        let prompt: Option<String> = if need_user_input {
+        // Two distinct entry points: a fresh user prompt drives
+        // [`Agent::prompt`]; resuming from a recoverable error or a
+        // synthesized tool_result drives [`Agent::continue_run`].
+        // The latter never appends a new user message — the prior
+        // turn already wrote one to the transcript and to disk.
+        let result = if need_user_input {
             match ui.get_user_input() {
                 Some(text) => {
                     sent_any_input = true;
-                    Some(text)
+                    agent.prompt(text).await
                 }
                 None => {
                     // Ctrl-C / Ctrl-D / empty: print the closing
@@ -341,10 +346,10 @@ async fn run_session(
                 }
             }
         } else {
-            None
+            agent.continue_run().await
         };
 
-        match agent.run_turn(prompt).await {
+        match result {
             Ok(()) => {}
             Err(TurnError::Recoverable(err)) => {
                 ui.display_error(&format!("{err:#}"));

@@ -574,9 +574,76 @@ materializes the "agent is bus-only" end state.
 
 ### §2.5 Split agent loop from input loop
 
-- [ ] `Agent::prompt` / `Agent::continue_run` API; binary owns
-      readline loop, `ConversationLog`, persistence + renderer
-      listeners, and replay.
+Spec calls for one atomic commit. Splitting in two: §2.5a does the
+public API rename (this commit window); §2.5b flips
+[`aj_session::replay`] to emit
+[`aj_agent::events::AgentEvent`]s so the binary's resume-time
+history rendering can route through the same event-bridge listener
+that drives live runs. The split is safe — the API rename has no
+on-the-wire or persistence implications, and the replay flip is a
+self-contained additive change to `aj-session` that the binary
+adopts independently.
+
+- [x] §2.5a: `Agent::prompt(message)` / `Agent::continue_run()`
+      API. The legacy `Agent::run_turn(prompt: Option<String>)`
+      entry point split into two clearly-named entry points:
+      [`Agent::prompt`] (append a fresh user-role text message,
+      then run one assistant turn) and [`Agent::continue_run`]
+      (run one assistant turn against the existing transcript
+      without appending anything). The shared bracket-the-run-with-
+      `AgentStart`/`AgentEnd` body lives in private
+      `run_top_level_turn` / `run_top_level_turn_inner`.
+
+      [`Agent::continue_run`] enforces the wire-layer precondition
+      that the transcript must end in a user-role message
+      (otherwise the model API errors with an obscure 4xx); a
+      mismatched last role or an empty transcript surfaces as
+      [`TurnError::Fatal`] without firing any inference. The binary
+      already inspects `agent.messages().last()` to decide which
+      entry point to call (per `docs/aj-next-plan.md` §2.5
+      bullet 3 — "resumes from transcript when the last message is
+      user/tool-result"), so the precondition acts as a
+      defense-in-depth check rather than a runtime gate.
+
+      `aj/src/main.rs`'s turn loop swapped its
+      `Option<String>`-shaped branch for the typed split: a fresh
+      readline result drives `agent.prompt(text).await`; the
+      "continue without prompting after a user/tool-result last
+      message" arm drives `agent.continue_run().await`. Same
+      observable behaviour, clearer call sites. The recoverable-
+      error retry path keeps the existing `force_user_input` flag
+      so a turn that errored never silently re-fires inference
+      against the same broken request.
+
+      `aj_agent::event_protocol_tests` picked up three new
+      [`Agent::continue_run`] tests on top of the renamed
+      [`Agent::prompt`] coverage: the success path (drives one
+      assistant turn from a seeded user-role last message and
+      emits no `MessagePersisted::User`), the assistant-last
+      rejection path, and the empty-transcript rejection path. The
+      `ScriptedModel` deliberately runs out of canned scripts in
+      the rejection tests, so a regression that skips the
+      precondition check would panic with "ScriptedModel
+      exhausted" instead of returning the expected
+      [`TurnError::Fatal`].
+
+- [ ] §2.5b: Flip [`aj_session::replay`] to
+      `Iterator<Item = AgentEvent>`. The cycle that blocked this
+      in §2.0(a) (`aj-agent` depending on `aj-session`) was
+      removed in §2.4b — `aj-session` now depends on `aj-agent`
+      and the replay module can construct `AgentEvent`s directly.
+      Each persisted [`ConversationEntryKind`] maps to one or
+      more events: assistant messages emit `StreamChunk` Start
+      and Stop pairs (so the renderer paints text and thinking
+      content the same way it does for live turns) plus
+      synthesized `ToolExecutionEnd` events for any tool_use
+      blocks; user-role messages with text emit a "user input
+      replayed" event the renderer can route to the user-text
+      pane; tool_result messages and `UserOutput::ToolError`
+      entries emit synthesized `ToolExecutionEnd` events keyed by
+      `tool_use_id`. The binary's [`display_conversation_history`]
+      retires in favour of consuming the same event-bridge
+      listener that drives live runs.
 
 ### §2.6 Cleanup
 
