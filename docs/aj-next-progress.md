@@ -213,7 +213,30 @@ and the git history.
         the empty / populated read paths, list replacement, the
         empty-list write, and the multi-in-progress validation
         rejection.
-  - [ ] `write_file` (Diff)
+  - [x] `write_file` (Diff). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Diff {
+        path, before, after }, is_error }` and no longer touches `AjUi`.
+        On success the wire `content` is the legacy
+        `"Successfully {created|overwrote} file '{path}'"` summary so
+        the model still sees a deterministic confirmation; the
+        structured `Diff` carries the prior bytes as `before` (empty
+        string for fresh files, which the renderer surfaces as an
+        all-`+` creation diff) and the freshly-written bytes as
+        `after`. Recoverable errors (path-not-absolute, IO write
+        failure) come back as `is_error: true` outcomes with
+        `details::Text { summary, body }` — same shape as
+        `read_file`/`ls`/`glob`/`grep`/`todo_write` validation
+        failures — instead of bubbling an `Err`. `execution_mode()`
+        is overridden to `ExecutionMode::Sequential` per
+        `docs/aj-next-plan.md` §1.3 so a batch containing it
+        serializes around any other in-flight tool calls. Wired into
+        `get_builtin_tools()` via `bridge::legacy_adapt(WriteFileTool)`;
+        the bridge's existing `ToolDetails::Diff` arm renders through
+        `display_tool_result_diff`, which handles the empty-`before`
+        creation case naturally. Five unit tests cover the create /
+        overwrite happy paths, the relative-path and write-failure
+        recoverable errors, and lock in the `Sequential` execution
+        mode.
   - [ ] `edit_file` (Diff)
   - [ ] `edit_file_multi` (Diff)
   - [ ] `bash` (Bash)
