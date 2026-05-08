@@ -100,7 +100,21 @@ and the git history.
         file-not-found) come back as `is_error: true` outcomes instead
         of bubbled `Err`s. `DummyToolContext` added to
         `aj-tools::testing` for unit-testing migrated tools.
-  - [ ] `ls` (Text)
+  - [x] `ls` (Text). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Text {
+        summary, body }, is_error }` and no longer touches `AjUi`.
+        `summary` is the directory path made relative to the working
+        directory (matching `read_file`'s convention) with optional
+        ` (recursive)` and ` ignore=[...]` markers describing the
+        request mode; `body` is the formatted listing. Recoverable
+        errors (path-not-absolute, missing path, not-a-directory,
+        invalid glob pattern, walker IO failure) come back as
+        `is_error: true` outcomes instead of bubbled `Err`s. Wired
+        into `get_builtin_tools()` via `bridge::legacy_adapt(LsTool)`.
+        `bin/ls.rs` updated to drive the new shape via
+        `DummyToolContext`. Seven unit tests cover the happy paths
+        (non-recursive, recursive, ignore patterns) and recoverable
+        errors (relative path, missing path, file path, invalid glob).
   - [ ] `glob` (Text)
   - [ ] `grep` (Text)
   - [ ] `agent` (Text / SubAgentReport)

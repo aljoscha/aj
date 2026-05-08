@@ -43,14 +43,15 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
         AgentTool.into(),
         BashTool.into(),
-        // `read_file` is migrated to the new tool shape; the bridge
-        // adapter presents it to the agent through the legacy contract
-        // alongside the un-migrated tools below.
+        // Tools migrated to the new `aj_agent::tool::ToolDefinition`
+        // shape are wrapped via the bridge so they appear identical to
+        // legacy tools at the catalog level. Un-migrated tools below
+        // still go through the legacy `.into()` path.
         bridge::legacy_adapt(ReadFileTool),
         WriteFileTool.into(),
         EditFileTool.into(),
         EditFileMultiTool.into(),
-        LsTool.into(),
+        bridge::legacy_adapt(LsTool),
         GlobTool.into(),
         GrepTool.into(),
         TodoReadTool.into(),
