@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantMessage, ToolResultMessage};
+use aj_ui::TokenUsage;
 use serde_json::Value;
 
 use crate::message::AgentMessage;
@@ -34,6 +35,41 @@ pub enum AgentId {
     Main,
     /// A sub-agent identified by its assignment index.
     Sub(usize),
+}
+
+/// Channel for streaming assistant content. Routed by listeners onto
+/// distinct UI components — visible text vs. extended thinking — so
+/// renderers can style them differently and persistence can decide
+/// whether either is worth keeping (today: only the finalized message
+/// is persisted; streaming is transient).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamChannel {
+    /// Visible assistant text.
+    Text,
+    /// Extended thinking ("reasoning") content.
+    Thinking,
+}
+
+/// Streaming progress action for an in-flight assistant content block.
+///
+/// `Start`, `Update`, `Stop` mirror the legacy `agent_text_*` /
+/// `agent_thinking_*` callback shape so the bridge listener in the
+/// `aj` binary can drive the existing `AjCli` rendering helpers
+/// without translation. Once the agent migrates to unified streaming
+/// (`AssistantMessageEvent`) in §2.4, this enum and the
+/// [`AgentEvent::StreamChunk`] variant fold into [`AgentEvent::MessageUpdate`].
+#[derive(Clone, Debug)]
+pub enum StreamAction {
+    /// First fragment of a new block. `snapshot` is the initial chunk
+    /// the renderer should display.
+    Start { snapshot: String },
+    /// Incremental delta. `delta` is the bytes appended since the last
+    /// event on this channel.
+    Update { delta: String },
+    /// Block finalized. `snapshot` is the final, complete content of
+    /// the block; renderers that drop intermediate `Update`s can fall
+    /// back on this for the full text.
+    Stop { snapshot: String },
 }
 
 /// Bus event emitted by the agent runtime.
@@ -149,6 +185,32 @@ pub enum AgentEvent {
         error: String,
     },
 
+    // --- Streaming bridge (§2.3 → §2.4) -----------------------------------
+    /// Streaming progress for an in-flight assistant content block.
+    ///
+    /// Bridging shape used while the agent still drives inference
+    /// through the legacy `Model::run_inference_streaming` /
+    /// `StreamingEvent` pipeline. In §2.4 this folds into
+    /// [`AgentEvent::MessageUpdate`] carrying an
+    /// [`AssistantMessageEvent`]; until then, [`StreamChannel`] +
+    /// [`StreamAction`] cover what the legacy CLI renderer needs.
+    StreamChunk {
+        agent_id: AgentId,
+        channel: StreamChannel,
+        action: StreamAction,
+    },
+
+    /// Per-turn token usage snapshot. Bridging variant emitted at the
+    /// end of each assistant turn so renderers can show a one-line
+    /// usage indicator without having to re-aggregate from
+    /// [`AgentEvent::MessageEnd`] payloads. Folds into the
+    /// `AssistantMessage.usage` ride-along on
+    /// [`AgentEvent::MessageEnd`] in §2.4.
+    TurnUsage {
+        agent_id: AgentId,
+        usage: TokenUsage,
+    },
+
     // --- Queue snapshots ---------------------------------------------------
     /// Full snapshot of both pending-message queues. Fired whenever
     /// either queue changes so listeners can render a single state
@@ -182,6 +244,8 @@ impl AgentEvent {
             | Self::Warning { agent_id, .. }
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
+            | Self::StreamChunk { agent_id, .. }
+            | Self::TurnUsage { agent_id, .. }
             | Self::QueueUpdate { agent_id, .. } => *agent_id,
             Self::SubAgentStart { parent, .. } | Self::SubAgentEnd { parent, .. } => *parent,
         }

@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use aj::SYSTEM_PROMPT;
 use aj::cli::AjCli;
+use aj::event_bridge::EventBridgeListener;
 use aj::prompt_history::{DEFAULT_MAX_ENTRIES, PromptHistory};
 use aj_agent::Agent;
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
@@ -157,6 +158,18 @@ async fn main() -> Result<()> {
         model,
         config.thinking,
     );
+
+    // Register the bus -> AjCli rendering bridge before any turns
+    // run, so every event the agent emits during inference flows
+    // back into the existing renderer. The listener owns its own
+    // shallow-cloned `AjCli` (sharing the prompt-history `Arc`) plus
+    // lazily-created `SubAgentCli`s for any sub-agent the session
+    // spawns; per `docs/aj-next-plan.md` §1.6 sub-agents share the
+    // parent's bus, so all of their events flow through this same
+    // listener too. The handle stays alive for the rest of the
+    // process: we hold it on the stack until `main` returns.
+    let _bridge_handle =
+        agent.subscribe(EventBridgeListener::new(ui.shallow_clone()).into_listener());
 
     match cli.command {
         Some(Commands::ListThreads) => {

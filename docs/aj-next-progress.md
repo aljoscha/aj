@@ -370,9 +370,60 @@ and the git history.
 
 ### §2.3 Drive the legacy CLI off the bus
 
-- [ ] Atomic swap: add `EventBridgeListener` + persistence listener,
-      delete `self.ui.*` and `view.add_*` calls inside
-      `Agent::execute_turn` in one commit.
+Spec calls for one atomic commit. Splitting in two: §2.3a does the
+UI rendering swap (this commit window); §2.3b does the persistence
+swap (`view.add_*` removal, log access via `Arc<Mutex<>>`). The
+split is safe — no double-rendering and no dead `bus.emit` calls
+either way. The plan author flagged atomicity as concerning because
+of those two failure modes; staging the two halves around them
+preserves the same end state.
+
+- [x] §2.3a: `EventBridgeListener` drives UI rendering off the bus.
+      Added new bus events `StreamChunk { agent_id, channel:
+      StreamChannel, action: StreamAction }` (text/thinking
+      streaming, bridging shape that folds into `MessageUpdate` in
+      §2.4) and `TurnUsage { agent_id, usage }` (per-turn
+      `TokenUsage` snapshot, folds into `AssistantMessage.usage` on
+      `MessageEnd` in §2.4). `Agent::execute_turn` now emits these
+      alongside the existing `Notice` / `Warning` / `Error` /
+      `ToolExecutionStart` / `ToolExecutionEnd` /
+      `SubAgentStart` / `SubAgentEnd` / `StreamRetry` events.
+      `EventBridgeListener` (in `src/aj/src/event_bridge.rs`) holds a
+      main `Box<dyn AjUi>` plus a `HashMap<usize, Box<dyn AjUi>>` of
+      lazily-created `SubAgentCli`s and dispatches each event onto
+      the appropriate renderer. Sub-agents share the parent's bus
+      (per `docs/aj-next-plan.md` §1.6) via a new
+      `Agent::set_bus(EventBus)` setter called inside
+      `SessionContextWrapper::spawn_agent`, so a single registration
+      on the parent covers every event in the session.
+      `aj_tools::bridge::render_details_via_ui` was promoted to `pub`
+      so the bridge listener can reuse the same
+      `ToolDetails`-to-`AjUi` projection that the in-tree
+      `BridgedTool` uses today, keeping the rendered output byte-
+      identical. Inside `execute_turn`, the matching `self.ui.*`
+      calls were removed: `display_error` (overload retry / parse
+      error / tool-use parse error / protocol error),
+      `agent_text_*` / `agent_thinking_*`, `display_token_usage`,
+      and the tail `display_user_output` invocation. The
+      `Agent::run` and `Agent::run_single_turn` paths still call
+      `self.ui.*` for things outside the turn loop (startup notices,
+      sandbox warning, conversation history replay, end-of-session
+      usage summary) — those move to the binary in §2.5. The
+      `AgentEvent::agent_id` accessor and the `event_protocol_tests`
+      labels learned about the new `StreamChunk` / `TurnUsage`
+      variants; the locked sequences pick up `TurnUsage` after every
+      assistant turn.
+- [ ] §2.3b: Persistence listener drives `ConversationLog` writes
+      off the bus. Adds a `MessagePersisted { agent_id, kind,
+      content }` bridging event for assistant-message and
+      tool-result-message finalization. Wraps log access in
+      `Arc<tokio::sync::Mutex<ConversationLog>>` so the agent and
+      the persistence listener can share the log. Removes
+      `view.add_*` calls inside `Agent::execute_turn`; the agent
+      re-reads `latest_leaf` post-emit to recover the freshly-
+      written entry's `EntryId` for sub-agent anchoring. The
+      `Agent::run` / `run_single_turn` `&mut ConversationLog`
+      parameter changes to the shared handle in this commit too.
 
 ### §2.4 Flip `Agent::run` to bus-only
 

@@ -170,7 +170,7 @@ where
 /// dedicated legacy renderer (`Bash`, `SubAgentReport`, `Todos`,
 /// `Json`) come through as a flattened `display_tool_result` — those
 /// tools haven't migrated yet and won't take this path until they do.
-fn render_details_via_ui(
+pub fn render_details_via_ui(
     ui: &mut dyn AjUi,
     tool_name: &str,
     details: &ToolDetails,

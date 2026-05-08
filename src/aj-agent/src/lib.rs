@@ -27,7 +27,7 @@ use aj_session::{
 use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
-use crate::events::{AgentEvent, AgentId};
+use crate::events::{AgentEvent, AgentId, StreamAction, StreamChannel};
 use crate::legacy_tool::{
     ErasedToolDefinition, SessionContext, ToolResult, TurnContext as ToolTurnContext,
 };
@@ -139,6 +139,20 @@ impl<UI: AjUi> Agent<UI> {
     /// keep the default [AgentId::Main] and never call this.
     pub fn set_agent_id(&mut self, id: AgentId) {
         self.agent_id = id;
+    }
+
+    /// Replace this agent's event bus.
+    ///
+    /// Used by [SessionContextWrapper::spawn_agent] to make a
+    /// sub-agent share the parent's bus per `docs/aj-next-plan.md`
+    /// §1.6: every event the child emits then reaches every listener
+    /// the binary registered on the parent (rendering, persistence,
+    /// future TUI components), tagged by the child's
+    /// [AgentId::Sub]. Must be called before any turn runs;
+    /// subscriptions registered on the bus that's about to be
+    /// replaced are silently dropped.
+    pub fn set_bus(&mut self, bus: EventBus) {
+        self.bus = bus;
     }
 
     /// Subscribe an async listener to the agent's internal event bus.
@@ -476,7 +490,6 @@ impl<UI: AjUi> Agent<UI> {
                             if let Some(retry_sleep) = retry_sleep {
                                 let message =
                                     format!("{}, retrying in {}s...", error, retry_sleep.as_secs());
-                                self.ui.display_error(&message);
                                 self.bus
                                     .emit(AgentEvent::Error {
                                         agent_id: self.agent_id,
@@ -506,26 +519,86 @@ impl<UI: AjUi> Agent<UI> {
                             return Err(error.into());
                         }
                         StreamingEvent::TextStart { text, citations: _ } => {
-                            self.ui.agent_text_start(&text);
+                            self.bus
+                                .emit(AgentEvent::StreamChunk {
+                                    agent_id: self.agent_id,
+                                    channel: StreamChannel::Text,
+                                    action: StreamAction::Start {
+                                        snapshot: text.clone(),
+                                    },
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                         StreamingEvent::TextUpdate { diff, snapshot: _ } => {
-                            self.ui.agent_text_update(&diff);
+                            self.bus
+                                .emit(AgentEvent::StreamChunk {
+                                    agent_id: self.agent_id,
+                                    channel: StreamChannel::Text,
+                                    action: StreamAction::Update {
+                                        delta: diff.clone(),
+                                    },
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                         StreamingEvent::TextStop { text } => {
-                            self.ui.agent_text_stop(&text);
+                            self.bus
+                                .emit(AgentEvent::StreamChunk {
+                                    agent_id: self.agent_id,
+                                    channel: StreamChannel::Text,
+                                    action: StreamAction::Stop {
+                                        snapshot: text.clone(),
+                                    },
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                         StreamingEvent::ThinkingStart { thinking } => {
-                            self.ui.agent_thinking_start(&thinking);
+                            self.bus
+                                .emit(AgentEvent::StreamChunk {
+                                    agent_id: self.agent_id,
+                                    channel: StreamChannel::Thinking,
+                                    action: StreamAction::Start {
+                                        snapshot: thinking.clone(),
+                                    },
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                         StreamingEvent::ThinkingUpdate { diff, snapshot: _ } => {
-                            self.ui.agent_thinking_update(&diff);
+                            self.bus
+                                .emit(AgentEvent::StreamChunk {
+                                    agent_id: self.agent_id,
+                                    channel: StreamChannel::Thinking,
+                                    action: StreamAction::Update {
+                                        delta: diff.clone(),
+                                    },
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                         StreamingEvent::ThinkingStop => {
-                            self.ui.agent_thinking_stop();
+                            // Thinking streaming has no terminal text
+                            // (the streaming layer doesn't accumulate
+                            // a final snapshot for thinking blocks),
+                            // so the renderer-bridge listener treats
+                            // this as a "thinking finished, flush
+                            // newline" signal regardless of snapshot
+                            // contents.
+                            self.bus
+                                .emit(AgentEvent::StreamChunk {
+                                    agent_id: self.agent_id,
+                                    channel: StreamChannel::Thinking,
+                                    action: StreamAction::Stop {
+                                        snapshot: String::new(),
+                                    },
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                         StreamingEvent::ParseError { error, raw_data } => {
                             let message = format!("Parse error: {error} (raw data: {raw_data})");
-                            self.ui.display_error(&message);
                             self.bus
                                 .emit(AgentEvent::Error {
                                     agent_id: self.agent_id,
@@ -544,7 +617,6 @@ impl<UI: AjUi> Agent<UI> {
                                 "Tool use parse error for '{name}' (id={id}): {error} \
                                  (raw data: {raw_data})"
                             );
-                            self.ui.display_error(&message);
                             self.bus
                                 .emit(AgentEvent::Error {
                                     agent_id: self.agent_id,
@@ -556,7 +628,6 @@ impl<UI: AjUi> Agent<UI> {
                         }
                         StreamingEvent::ProtocolError { error } => {
                             let message = format!("Protocol error: {error}");
-                            self.ui.display_error(&message);
                             self.bus
                                 .emit(AgentEvent::Error {
                                     agent_id: self.agent_id,
@@ -646,7 +717,13 @@ impl<UI: AjUi> Agent<UI> {
                     .unwrap_or(0),
                 turn_cache_read: turn_usage.cache_read_input_tokens.unwrap_or(0),
             };
-            self.ui.display_token_usage(&usage);
+            self.bus
+                .emit(AgentEvent::TurnUsage {
+                    agent_id: self.agent_id,
+                    usage,
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
 
             self.session_state.accumulated_usage.add_usage(&turn_usage);
 
@@ -744,7 +821,16 @@ impl<UI: AjUi> Agent<UI> {
                             view.add_user_output(out.clone())?;
                         }
                     }
-                    self.display_user_output(&tool_result.user_outputs);
+                    // [Agent::display_user_output] would dispatch the
+                    // user_outputs to the UI here. Today the recorder
+                    // is disabled (every migrated tool returns
+                    // `user_outputs: Vec::new()`), so the call would
+                    // be a no-op; once §2.3b lands a persistence
+                    // listener it will project the structured
+                    // [ToolDetails] from `tool_result.details` (which
+                    // already rides on the [AgentEvent::ToolExecutionEnd]
+                    // event below) onto rendered output, replacing
+                    // this code path entirely.
 
                     // Mirror the tool result on the bus. Migrated
                     // tools surface their own [ToolDetails] through
@@ -1420,6 +1506,13 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 None,
             );
             sub_agent.set_agent_id(child_id);
+            // Share the parent's bus per `docs/aj-next-plan.md` §1.6:
+            // every event the sub-agent emits during its run reaches
+            // the listeners the binary registered on the parent
+            // (rendering, persistence), tagged with `Sub(n)`. Without
+            // this the sub-agent runs on its own bus and the binary's
+            // bridge listener never sees its activity.
+            sub_agent.set_bus(self.parent_bus.clone());
 
             // Run the sub-agent with the task, anchored at the parent
             // tool-use's assistant message.
@@ -2009,6 +2102,12 @@ mod event_protocol_tests {
             child: AgentId,
         },
         StreamRetry(AgentId, u32),
+        StreamChunk {
+            agent_id: AgentId,
+            channel: &'static str,
+            action: &'static str,
+        },
+        TurnUsage(AgentId),
         Other(&'static str),
     }
 
@@ -2066,6 +2165,27 @@ mod event_protocol_tests {
             AgentEvent::StreamRetry {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),
+            AgentEvent::StreamChunk {
+                agent_id,
+                channel,
+                action,
+            } => {
+                let channel = match channel {
+                    crate::events::StreamChannel::Text => "text",
+                    crate::events::StreamChannel::Thinking => "thinking",
+                };
+                let action = match action {
+                    crate::events::StreamAction::Start { .. } => "start",
+                    crate::events::StreamAction::Update { .. } => "update",
+                    crate::events::StreamAction::Stop { .. } => "stop",
+                };
+                EventLabel::StreamChunk {
+                    agent_id: *agent_id,
+                    channel,
+                    action,
+                }
+            }
+            AgentEvent::TurnUsage { agent_id, .. } => EventLabel::TurnUsage(*agent_id),
             AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
             AgentEvent::MessageStart { .. } => EventLabel::Other("MessageStart"),
             AgentEvent::MessageUpdate { .. } => EventLabel::Other("MessageUpdate"),
@@ -2149,6 +2269,12 @@ mod event_protocol_tests {
         let expected = vec![
             EventLabel::AgentStart(AgentId::Main),
             EventLabel::TurnStart(AgentId::Main),
+            // First inference: the model returned a tool_use, so a
+            // TurnUsage event fires after the assistant message
+            // finalizes (carrying the per-turn token counts) and the
+            // tool-execution lifecycle runs against the synthesized
+            // `ping` tool.
+            EventLabel::TurnUsage(AgentId::Main),
             EventLabel::ToolExecutionStart {
                 agent_id: AgentId::Main,
                 call_id: "tu-1".to_string(),
@@ -2162,6 +2288,10 @@ mod event_protocol_tests {
                 body: "pong".to_string(),
                 is_error: false,
             },
+            // Second inference: the model returned plain text, so
+            // `TurnUsage` fires once and the loop exits without
+            // another tool batch.
+            EventLabel::TurnUsage(AgentId::Main),
             EventLabel::AgentEnd(AgentId::Main),
         ];
         assert_eq!(events, expected, "unexpected event sequence: {events:#?}");
@@ -2212,14 +2342,16 @@ mod event_protocol_tests {
             .expect("run_single_turn");
 
         let events = recorded.lock().unwrap().clone();
-        // The exact subset we lock: lifecycle markers and the turn
-        // boundary. Everything else (no tool calls, no errors) means
-        // there are no other events this run.
+        // The exact subset we lock: lifecycle markers, the turn
+        // boundary, and the per-turn token-usage event. Everything
+        // else (no tool calls, no errors) means there are no other
+        // events this run.
         assert_eq!(
             events,
             vec![
                 EventLabel::AgentStart(AgentId::Sub(7)),
                 EventLabel::TurnStart(AgentId::Sub(7)),
+                EventLabel::TurnUsage(AgentId::Sub(7)),
                 EventLabel::AgentEnd(AgentId::Sub(7)),
             ],
             "unexpected event sequence: {events:#?}"
