@@ -413,17 +413,48 @@ preserves the same end state.
       labels learned about the new `StreamChunk` / `TurnUsage`
       variants; the locked sequences pick up `TurnUsage` after every
       assistant turn.
-- [ ] §2.3b: Persistence listener drives `ConversationLog` writes
-      off the bus. Adds a `MessagePersisted { agent_id, kind,
-      content }` bridging event for assistant-message and
-      tool-result-message finalization. Wraps log access in
+- [x] §2.3b: Persistence listener drives `ConversationLog` writes
+      off the bus. Adds a `MessagePersisted { agent_id, kind }`
+      bridging event (in `aj_agent::events`) carrying a
+      `PersistedMessageKind { Assistant | ToolResult | UserOutput }`
+      payload — one variant per `view.add_*` call the agent used to
+      make inline. The agent emits one event per write; the listener
+      writes one JSONL line per emit. Wraps log access in
       `Arc<tokio::sync::Mutex<ConversationLog>>` so the agent and
-      the persistence listener can share the log. Removes
-      `view.add_*` calls inside `Agent::execute_turn`; the agent
-      re-reads `latest_leaf` post-emit to recover the freshly-
-      written entry's `EntryId` for sub-agent anchoring. The
-      `Agent::run` / `run_single_turn` `&mut ConversationLog`
-      parameter changes to the shared handle in this commit too.
+      the persistence listener can share it; the agent only locks
+      it briefly (linearization for inference, `latest_leaf` after
+      `MessagePersisted::Assistant` to recover the freshly-appended
+      `EntryId` for sub-agent anchoring) and never holds the lock
+      across a `bus.emit` so it can't deadlock against the
+      listener's own `lock().await`. The listener factory lives in
+      `aj_agent::persistence::persistence_listener(log)` so the
+      `aj` binary, the future `aj-next` binary, and tests can all
+      share the same projection logic without the binary needing to
+      reach into `aj-session` directly. `Agent::run`,
+      `Agent::run_single_turn`, `Agent::execute_turn`, and
+      `Agent::execute_tool` swap their `&mut ConversationLog`
+      parameter for the shared handle; `SessionContextWrapper` does
+      the same so sub-agent spawns thread the handle through to
+      `sub_agent.run_single_turn`. `Agent::execute_turn` no longer
+      calls `view.add_*` at all — assistant messages, the
+      synthesized tool-result user message, and the legacy
+      `UserOutput::ToolError` records (today the only freestanding
+      user_output the agent writes) all flow out as
+      `MessagePersisted` events. The legacy `make_view` helper goes
+      away with them. `aj/src/main.rs` registers the listener
+      alongside the existing `EventBridgeListener` (rendering)
+      before any turn runs; the persistence listener returning
+      `Err` aborts the run with `TurnError::Fatal`, preserving
+      today's "log never more than one event behind reality"
+      durability guarantee. The `event_protocol_tests` module
+      registers the persistence listener in tandem with the
+      recording listener and locks in the new event sequence;
+      `EventLabel` grew a `MessagePersisted { agent_id, kind }`
+      arm tracking only the kind discriminator so test assertions
+      stay legible. Four new tests in `aj_agent::persistence::tests`
+      cover the happy paths (assistant / tool-result / user-output
+      writes), the empty-thread error path, and the no-op behaviour
+      for non-persistence events.
 
 ### §2.4 Flip `Agent::run` to bus-only
 

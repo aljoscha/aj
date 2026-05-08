@@ -222,6 +222,12 @@ impl EventBridgeInner {
             | AgentEvent::MessageStart { .. }
             | AgentEvent::MessageUpdate { .. }
             | AgentEvent::MessageEnd { .. }
+            // The persistence listener owns `MessagePersisted`; the
+            // legacy CLI bridge has nothing to do with it (the
+            // textual rendering of tool results already flows through
+            // `ToolExecutionEnd`, and the assistant message is
+            // already rendered live via `StreamChunk`).
+            | AgentEvent::MessagePersisted { .. }
             | AgentEvent::QueueUpdate { .. } => {}
         }
     }

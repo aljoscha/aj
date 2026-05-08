@@ -5,6 +5,7 @@ use aj::cli::AjCli;
 use aj::event_bridge::EventBridgeListener;
 use aj::prompt_history::{DEFAULT_MAX_ENTRIES, PromptHistory};
 use aj_agent::Agent;
+use aj_agent::persistence::persistence_listener;
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
 use aj_models::messages::Speed;
 use aj_models::{ModelArgs, create_model};
@@ -13,6 +14,7 @@ use aj_tools::get_builtin_tools;
 use aj_ui::AjUi;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tokio::sync::Mutex as TokioMutex;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -177,14 +179,28 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Continue { thread_id }) => {
             if let Some(thread_id) = thread_id {
-                let mut log = ConversationLog::resume(&conversation_persistence, &thread_id)?;
-                agent.run(&mut log).await?;
+                let log = Arc::new(TokioMutex::new(ConversationLog::resume(
+                    &conversation_persistence,
+                    &thread_id,
+                )?));
+                // Register the persistence listener AFTER the bridge
+                // so a disk-write failure (which the listener
+                // surfaces as `Err`) aborts the run before the
+                // bridge gets to render anything stale. Sub-agents
+                // share the parent's bus per §1.6, so this single
+                // registration covers nested runs too.
+                let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
+                agent.run(Arc::clone(&log)).await?;
             } else {
                 let latest_thread_id = conversation_persistence.get_latest_thread_id()?;
                 if let Some(latest_thread_id) = latest_thread_id {
-                    let mut log =
-                        ConversationLog::resume(&conversation_persistence, &latest_thread_id)?;
-                    agent.run(&mut log).await?;
+                    let log = Arc::new(TokioMutex::new(ConversationLog::resume(
+                        &conversation_persistence,
+                        &latest_thread_id,
+                    )?));
+                    let _persistence_handle =
+                        agent.subscribe(persistence_listener(Arc::clone(&log)));
+                    agent.run(Arc::clone(&log)).await?;
                 } else {
                     ui.display_notice("No latest conversation to resume");
                 }
@@ -197,8 +213,11 @@ async fn main() -> Result<()> {
         }
         None => {
             // Default behavior: start a fresh log and run the agent.
-            let mut log = ConversationLog::create(&conversation_persistence)?;
-            agent.run(&mut log).await?;
+            let log = Arc::new(TokioMutex::new(ConversationLog::create(
+                &conversation_persistence,
+            )?));
+            let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
+            agent.run(Arc::clone(&log)).await?;
         }
     }
 

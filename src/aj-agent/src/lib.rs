@@ -7,6 +7,7 @@ pub mod bus;
 pub mod events;
 pub mod legacy_tool;
 pub mod message;
+pub mod persistence;
 pub mod tool;
 
 use std::collections::{HashMap, HashSet};
@@ -27,7 +28,7 @@ use aj_session::{
 use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
-use crate::events::{AgentEvent, AgentId, StreamAction, StreamChannel};
+use crate::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
 use crate::legacy_tool::{
     ErasedToolDefinition, SessionContext, ToolResult, TurnContext as ToolTurnContext,
 };
@@ -35,6 +36,7 @@ use crate::tool::{SpawnedAgent, TodoItem, ToolDetails};
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 
 pub struct Agent<UI: AjUi> {
@@ -186,7 +188,10 @@ impl<UI: AjUi> Agent<UI> {
         self.session_state.accumulated_usage()
     }
 
-    pub async fn run(&mut self, log: &mut ConversationLog) -> Result<(), anyhow::Error> {
+    pub async fn run(
+        &mut self,
+        log: Arc<TokioMutex<ConversationLog>>,
+    ) -> Result<(), anyhow::Error> {
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
         // bus. `AgentEnd.messages` will eventually carry a snapshot
         // of the agent's transcript per `docs/aj-next-plan.md` §1.4;
@@ -215,40 +220,61 @@ impl<UI: AjUi> Agent<UI> {
     /// Body of [Agent::run], split out so [Agent::run] itself can
     /// emit `AgentStart` / `AgentEnd` events around the run regardless
     /// of which exit path the loop takes.
-    async fn run_inner(&mut self, log: &mut ConversationLog) -> Result<(), anyhow::Error> {
-        // Resolve the system prompt up front: either reuse the one
-        // persisted on the log (cache-friendly resume) or assemble a
-        // fresh one from the current environment and persist it as the
-        // log's root entry. After this returns, every subsequent
-        // append from any thread (including subagents) will anchor to
-        // the system-prompt entry, and inference reuses
-        // `self.assembled_system_prompt` verbatim.
-        self.resolve_system_prompt(log)?;
+    async fn run_inner(
+        &mut self,
+        log: Arc<TokioMutex<ConversationLog>>,
+    ) -> Result<(), anyhow::Error> {
+        // Setup phase. We hold the log lock for the duration of this
+        // block so resolve / repair / linearize see a consistent
+        // snapshot, but we never call `bus.emit` inside it — the
+        // persistence listener also needs the lock and would deadlock.
+        let resume_info: Option<(String, Conversation)> = {
+            let mut log_guard = log.lock().await;
+            // Resolve the system prompt up front: either reuse the
+            // one persisted on the log (cache-friendly resume) or
+            // assemble a fresh one from the current environment and
+            // persist it as the log's root entry. After this returns,
+            // every subsequent append from any thread (including
+            // subagents) anchors to the system-prompt entry, and
+            // inference reuses `self.assembled_system_prompt`
+            // verbatim.
+            self.resolve_system_prompt(&mut log_guard)?;
 
-        // Seed the subagent counter from the log so ids minted in this
-        // session don't collide with subagent subtrees already persisted
-        // from a prior session.
-        if let Some(max_id) = log.max_agent_id() {
-            self.session_state.seed_sub_agent_counter(max_id);
+            // Seed the subagent counter from the log so ids minted
+            // in this session don't collide with subagent subtrees
+            // already persisted from a prior session.
+            if let Some(max_id) = log_guard.max_agent_id() {
+                self.session_state.seed_sub_agent_counter(max_id);
+            }
+
+            if let Some(head) = log_guard.latest_leaf(ThreadFilter::USER) {
+                let conversation = log_guard.linearize(&head, ThreadFilter::USER);
+                // Because the log writes to disk after every event,
+                // resuming can land us on a state where the last
+                // assistant message carries `tool_use` blocks that
+                // never got their matching `tool_result`s (process
+                // was killed between the two). Sending that to the
+                // model would fail, so synthesize "interrupted"
+                // tool_results for any dangling tool_use ids before
+                // we carry on.
+                repair_interrupted_tool_uses(&mut log_guard, &conversation)?;
+                Some((log_guard.thread_id().to_string(), conversation))
+            } else {
+                None
+            }
+        };
+
+        // Render conversation history through the legacy UI before
+        // any bus emit fires so the user sees it interleaved
+        // correctly with the resume notice below. `display_*` is
+        // synchronous and doesn't touch the log.
+        if let Some((_, conversation)) = &resume_info {
+            self.display_conversation_history(conversation);
         }
 
-        if let Some(head) = log.latest_leaf(ThreadFilter::USER) {
-            let conversation = log.linearize(&head, ThreadFilter::USER);
-            self.display_conversation_history(&conversation);
-
-            // Because the log now writes to disk after every event,
-            // resuming can
-            // land us on a state where the last assistant message carries
-            // `tool_use` blocks that never got their matching
-            // `tool_result`s (process was killed between the two). Sending
-            // that to the model would fail, so synthesize "interrupted"
-            // tool_results for any dangling tool_use ids before we carry
-            // on.
-            repair_interrupted_tool_uses(log, &conversation)?;
-
+        if let Some((thread_id, _)) = &resume_info {
             self.notice(format!(
-                "Resuming conversation {} (use 'ctrl-c' or 'ctrl-d' to quit)",
-                log.thread_id()
+                "Resuming conversation {thread_id} (use 'ctrl-c' or 'ctrl-d' to quit)"
             ))
             .await?;
         } else {
@@ -276,18 +302,25 @@ impl<UI: AjUi> Agent<UI> {
 
         let mut force_user_input = false;
         loop {
-            let head = log.latest_leaf(ThreadFilter::USER);
-            let need_user_input = force_user_input
-                || match &head {
-                    Some(id) => {
-                        let conversation = log.linearize(id, ThreadFilter::USER);
-                        match conversation.last_message() {
-                            Some(last) => matches!(last.role, Role::Assistant),
-                            None => true,
+            // Decide whether the next iteration needs user input.
+            // Lock briefly to peek at the user thread; drop before
+            // we touch the UI.
+            let (need_user_input, has_history) = {
+                let log_guard = log.lock().await;
+                let head = log_guard.latest_leaf(ThreadFilter::USER);
+                let need = force_user_input
+                    || match &head {
+                        Some(id) => {
+                            let conversation = log_guard.linearize(id, ThreadFilter::USER);
+                            match conversation.last_message() {
+                                Some(last) => matches!(last.role, Role::Assistant),
+                                None => true,
+                            }
                         }
-                    }
-                    None => true,
-                };
+                        None => true,
+                    };
+                (need, head.is_some())
+            };
             force_user_input = false;
 
             if need_user_input {
@@ -296,28 +329,38 @@ impl<UI: AjUi> Agent<UI> {
                     user_input
                 } else {
                     self.display_usage_summary();
-                    // Show the resume hint only if the user has actually
-                    // sent at least one message so far.
-                    if head.is_some() {
-                        let id = log.thread_id();
+                    // Show the resume hint only if the user has
+                    // actually sent at least one message so far.
+                    if has_history {
+                        let id = log.lock().await.thread_id().to_string();
                         self.notice(format!("Thread: {id} (resume with: aj continue {id})"))
                             .await?;
                     }
                     break;
                 };
-                let mut view = ConversationView::user(log, head);
+                // Persist the user message directly (the binary will
+                // own this write in §2.5; until then, the agent
+                // still drives the readline loop and writes its own
+                // input). No bus emit yet — we need the lock.
+                let mut log_guard = log.lock().await;
+                let head = log_guard.latest_leaf(ThreadFilter::USER);
+                let mut view = ConversationView::user(&mut log_guard, head);
                 view.add_user_message(vec![ContentBlockParam::new_text_block(user_input)])?;
             }
 
-            match self.execute_turn(log, ThreadKind::User, None).await {
+            match self
+                .execute_turn(Arc::clone(&log), ThreadKind::User, None)
+                .await
+            {
                 Ok(()) => {}
                 Err(TurnError::Recoverable(err)) => {
                     self.error(format!("{err:#}")).await?;
-                    // The pending user message is still on disk. Force a
-                    // prompt next iteration so we don't immediately re-send
-                    // the same broken request to the model. The user can
-                    // type a follow-up (which will be appended to the
-                    // conversation) or hit Ctrl-C/D to quit.
+                    // The pending user message is still on disk.
+                    // Force a prompt next iteration so we don't
+                    // immediately re-send the same broken request to
+                    // the model. The user can type a follow-up
+                    // (which will be appended to the conversation)
+                    // or hit Ctrl-C/D to quit.
                     force_user_input = true;
                     continue;
                 }
@@ -330,7 +373,7 @@ impl<UI: AjUi> Agent<UI> {
 
     pub async fn run_single_turn(
         &mut self,
-        log: &mut ConversationLog,
+        log: Arc<TokioMutex<ConversationLog>>,
         parent_head: EntryId,
         agent_id: usize,
         prompt: String,
@@ -361,31 +404,40 @@ impl<UI: AjUi> Agent<UI> {
 
     async fn run_single_turn_inner(
         &mut self,
-        log: &mut ConversationLog,
+        log: Arc<TokioMutex<ConversationLog>>,
         parent_head: EntryId,
         agent_id: usize,
         prompt: String,
     ) -> Result<String, anyhow::Error> {
-        // Resolve the system prompt before any inference. For sub-agents
-        // the parent has already populated the log's SystemPrompt entry,
-        // so this just reads it back; the assembled prompt is shared
-        // across the whole session.
-        self.resolve_system_prompt(log)?;
-
+        // Resolve the system prompt before any inference. For
+        // sub-agents the parent has already populated the log's
+        // `SystemPrompt` entry, so this just reads it back; the
+        // assembled prompt is shared across the whole session.
         {
-            let mut view = ConversationView::subagent(log, parent_head, agent_id);
+            let mut log_guard = log.lock().await;
+            self.resolve_system_prompt(&mut log_guard)?;
+        }
+
+        // Append the prompt as the sub-agent's first user message
+        // anchored at `parent_head` (the spawning assistant message
+        // on the parent thread). Direct write — no bus emit so we
+        // hold the lock through it.
+        {
+            let mut log_guard = log.lock().await;
+            let mut view = ConversationView::subagent(&mut log_guard, parent_head, agent_id);
             view.add_user_message(vec![ContentBlockParam::new_text_block(prompt)])?;
         }
 
-        self.execute_turn(log, ThreadKind::Subagent, Some(agent_id))
+        self.execute_turn(Arc::clone(&log), ThreadKind::Subagent, Some(agent_id))
             .await?;
 
-        // Extract the last assistant message text from the subagent's
-        // own linearized history.
-        let head = log
+        // Extract the last assistant message text from the
+        // subagent's own linearized history.
+        let log_guard = log.lock().await;
+        let head = log_guard
             .latest_leaf(ThreadFilter::subagent(agent_id))
             .ok_or_else(|| anyhow!("subagent produced no entries"))?;
-        let conversation = log.linearize(&head, ThreadFilter::subagent(agent_id));
+        let conversation = log_guard.linearize(&head, ThreadFilter::subagent(agent_id));
         let last_msg = conversation
             .last_assistant_message()
             .ok_or_else(|| anyhow!("subagent produced no assistant text output"))?;
@@ -406,14 +458,16 @@ impl<UI: AjUi> Agent<UI> {
     /// include mutliple back-and-forth interactions with the model, in case
     /// there are thinking blocks or tool calls.
     ///
-    /// The entries for this turn (assistant message, per-tool user outputs,
-    /// tool-result user message) are appended directly to `log` via
-    /// [ConversationView] handles. Each append serializes and writes one
-    /// JSONL line to disk before returning, so the on-disk state is never
-    /// more than one event behind reality.
+    /// The turn's writes (assistant message, per-tool user outputs,
+    /// tool-result user message) flow out as
+    /// [`AgentEvent::MessagePersisted`] events. The persistence
+    /// listener subscribed on the bus translates them into
+    /// [`ConversationView`] appends, one JSONL line per event, so
+    /// the on-disk state stays at-most one event behind reality
+    /// (see `docs/aj-next-plan.md` §2.3b).
     async fn execute_turn(
         &mut self,
-        log: &mut ConversationLog,
+        log: Arc<TokioMutex<ConversationLog>>,
         thread: ThreadKind,
         agent_id: Option<usize>,
     ) -> Result<(), TurnError> {
@@ -455,10 +509,16 @@ impl<UI: AjUi> Agent<UI> {
         let mut retry_strategy = None;
 
         'outer: loop {
-            let head = log
-                .latest_leaf(filter)
-                .ok_or_else(|| anyhow!("execute_turn called on an empty thread"))?;
-            let conversation = log.linearize(&head, filter);
+            // Lock briefly to snapshot the conversation for inference.
+            // The lock is dropped before the inference call so the
+            // persistence listener (or anything else) can take it.
+            let conversation = {
+                let log_guard = log.lock().await;
+                let head = log_guard
+                    .latest_leaf(filter)
+                    .ok_or_else(|| anyhow!("execute_turn called on an empty thread"))?;
+                log_guard.linearize(&head, filter)
+            };
             let response_stream = self.run_inference_streaming(&conversation).await?;
 
             let mut response: Option<Message> = None;
@@ -689,14 +749,30 @@ impl<UI: AjUi> Agent<UI> {
                 }
             }
 
-            // Append the assistant's message to the log. This write hits
-            // disk before we touch any tool; anchor_head is the id we'll
-            // use as the parent for subagents spawned while handling the
-            // tool_use blocks below.
+            // Persist the assistant's message via the bus. The
+            // persistence listener writes it to disk before this
+            // `emit` resolves (listeners are awaited inline), so
+            // when we re-read `latest_leaf` immediately after we
+            // see the freshly-appended entry. `assistant_head` is
+            // the id sub-agents spawned while handling tool_use
+            // blocks below anchor at.
             let message_param = response.into_message_param();
+            self.bus
+                .emit(AgentEvent::MessagePersisted {
+                    agent_id: self.agent_id,
+                    kind: PersistedMessageKind::Assistant {
+                        content: message_param.content,
+                    },
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
             let assistant_head = {
-                let mut view = make_view(log, head, thread, agent_id);
-                view.add_assistant_message(message_param.content)?
+                let log_guard = log.lock().await;
+                log_guard.latest_leaf(filter).ok_or_else(|| {
+                    TurnError::Fatal(anyhow!(
+                        "persistence listener failed to append assistant message"
+                    ))
+                })?
             };
 
             let usage = TokenUsage {
@@ -769,7 +845,7 @@ impl<UI: AjUi> Agent<UI> {
                         } else {
                             let tool_result = self
                                 .execute_tool(
-                                    log,
+                                    Arc::clone(&log),
                                     assistant_head.clone(),
                                     &mut turn_ctx,
                                     &tool_id,
@@ -808,29 +884,23 @@ impl<UI: AjUi> Agent<UI> {
 
                     tool_result_contents.push(result_content_block);
 
-                    // Persist each user output as its own log entry, anchored
-                    // at the current leaf of this thread (which may now
-                    // include earlier subagent/tool events from this
-                    // iteration).
-                    {
-                        let current_head = log
-                            .latest_leaf(filter)
-                            .expect("we just appended an assistant message");
-                        let mut view = make_view(log, current_head, thread, agent_id);
-                        for out in tool_result.user_outputs.iter() {
-                            view.add_user_output(out.clone())?;
-                        }
+                    // Persist each user_output the agent synthesized
+                    // (today only `UserOutput::ToolError` from
+                    // tool-call parse failures and tool-execution
+                    // errors — see the §2.0 reconnaissance findings
+                    // in `docs/aj-next-progress.md`). The persistence
+                    // listener writes one log line per emit.
+                    for out in tool_result.user_outputs.iter() {
+                        self.bus
+                            .emit(AgentEvent::MessagePersisted {
+                                agent_id: self.agent_id,
+                                kind: PersistedMessageKind::UserOutput {
+                                    output: out.clone(),
+                                },
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
                     }
-                    // [Agent::display_user_output] would dispatch the
-                    // user_outputs to the UI here. Today the recorder
-                    // is disabled (every migrated tool returns
-                    // `user_outputs: Vec::new()`), so the call would
-                    // be a no-op; once §2.3b lands a persistence
-                    // listener it will project the structured
-                    // [ToolDetails] from `tool_result.details` (which
-                    // already rides on the [AgentEvent::ToolExecutionEnd]
-                    // event below) onto rendered output, replacing
-                    // this code path entirely.
 
                     // Mirror the tool result on the bus. Migrated
                     // tools surface their own [ToolDetails] through
@@ -856,11 +926,15 @@ impl<UI: AjUi> Agent<UI> {
                 }
 
                 if !tool_result_contents.is_empty() {
-                    let current_head = log
-                        .latest_leaf(filter)
-                        .expect("we just appended at least an assistant message");
-                    let mut view = make_view(log, current_head, thread, agent_id);
-                    view.add_user_message(tool_result_contents)?;
+                    self.bus
+                        .emit(AgentEvent::MessagePersisted {
+                            agent_id: self.agent_id,
+                            kind: PersistedMessageKind::ToolResult {
+                                content: tool_result_contents,
+                            },
+                        })
+                        .await
+                        .map_err(TurnError::Fatal)?;
                 }
 
                 // Continue the conversation loop to get the model's response to tool results
@@ -1028,7 +1102,7 @@ impl<UI: AjUi> Agent<UI> {
 
     async fn execute_tool(
         &mut self,
-        log: &mut ConversationLog,
+        log: Arc<TokioMutex<ConversationLog>>,
         parent_head: EntryId,
         turn_ctx: &mut dyn ToolTurnContext,
         _tool_id: &str,
@@ -1411,8 +1485,11 @@ struct SessionContextWrapper<'a, UI: AjUi> {
     ui: UI,
     /// The one log owned by this session. Subagents append into it
     /// (through their own [ConversationView]) rather than creating
-    /// sibling files.
-    log: &'a mut ConversationLog,
+    /// sibling files. Held behind an `Arc<tokio::sync::Mutex<_>>`
+    /// per `docs/aj-next-plan.md` §2.3b so the agent and the
+    /// persistence listener can both reach it; the wrapper only
+    /// passes it through to the spawned sub-agent.
+    log: Arc<TokioMutex<ConversationLog>>,
     /// The entry id that subagents spawned from this tool invocation
     /// should anchor at. Typically the assistant message that carried
     /// the spawning `tool_use` block.
@@ -1517,7 +1594,12 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             // Run the sub-agent with the task, anchored at the parent
             // tool-use's assistant message.
             let result = sub_agent
-                .run_single_turn(self.log, self.parent_head.clone(), agent_id, task)
+                .run_single_turn(
+                    Arc::clone(&self.log),
+                    self.parent_head.clone(),
+                    agent_id,
+                    task,
+                )
                 .await;
 
             // Get the sub-agent's accumulated usage
@@ -1550,29 +1632,6 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             // tool-error result for failed spawns.
             result.map(|report| SpawnedAgent { agent_id, report })
         })
-    }
-}
-
-/// Build a [ConversationView] for the given thread identity, anchored at
-/// `head`. Used by [Agent::execute_turn] to keep view construction
-/// short-lived around each append so the underlying `&mut ConversationLog`
-/// can be re-borrowed between events.
-fn make_view<'a>(
-    log: &'a mut ConversationLog,
-    head: EntryId,
-    thread: ThreadKind,
-    agent_id: Option<usize>,
-) -> ConversationView<'a> {
-    match thread {
-        ThreadKind::User => ConversationView::user(log, Some(head)),
-        ThreadKind::Subagent => {
-            let agent_id = agent_id.expect("subagent view requires an agent_id");
-            ConversationView::subagent(log, head, agent_id)
-        }
-        // Meta entries are written by [ConversationLog::set_system_prompt],
-        // never via a [ConversationView]. Reaching this arm indicates a
-        // caller bug.
-        ThreadKind::Meta => panic!("make_view called with ThreadKind::Meta"),
     }
 }
 
@@ -1888,14 +1947,17 @@ mod event_protocol_tests {
     use aj_ui::{AjUi, TokenUsage, UsageSummary};
     use async_trait::async_trait;
     use futures::stream;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::Mutex as TokioMutex;
 
     use crate::bus::listener_from_sync;
-    use crate::events::{AgentEvent, AgentId};
+    use crate::events::{AgentEvent, AgentId, PersistedMessageKind};
     use crate::legacy_tool::{
         ErasedToolDefinition, SessionContext, ToolDefinition as LegacyToolDefinition, ToolResult,
         TurnContext as LegacyTurnContext,
     };
+    use crate::persistence::persistence_listener;
     use crate::tool::ToolDetails;
     use crate::Agent;
 
@@ -2108,6 +2170,14 @@ mod event_protocol_tests {
             action: &'static str,
         },
         TurnUsage(AgentId),
+        /// Persistence write request. The label captures only the
+        /// kind discriminator (Assistant / ToolResult / UserOutput)
+        /// so test assertions don't have to care about the exact
+        /// content blocks the event carries.
+        MessagePersisted {
+            agent_id: AgentId,
+            kind: &'static str,
+        },
         Other(&'static str),
     }
 
@@ -2186,6 +2256,17 @@ mod event_protocol_tests {
                 }
             }
             AgentEvent::TurnUsage { agent_id, .. } => EventLabel::TurnUsage(*agent_id),
+            AgentEvent::MessagePersisted { agent_id, kind } => {
+                let kind = match kind {
+                    PersistedMessageKind::Assistant { .. } => "Assistant",
+                    PersistedMessageKind::ToolResult { .. } => "ToolResult",
+                    PersistedMessageKind::UserOutput { .. } => "UserOutput",
+                };
+                EventLabel::MessagePersisted {
+                    agent_id: *agent_id,
+                    kind,
+                }
+            }
             AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
             AgentEvent::MessageStart { .. } => EventLabel::Other("MessageStart"),
             AgentEvent::MessageUpdate { .. } => EventLabel::Other("MessageUpdate"),
@@ -2196,14 +2277,16 @@ mod event_protocol_tests {
     }
 
     /// Set up a temp directory with an empty conversation log carrying
-    /// a fixed system prompt.
-    fn fresh_log() -> (TempDir, ConversationLog) {
+    /// a fixed system prompt. Returns the log behind the same shared
+    /// handle the agent expects so each test can register its own
+    /// persistence listener and pass the handle into `run_single_turn`.
+    fn fresh_log() -> (TempDir, Arc<TokioMutex<ConversationLog>>) {
         let dir = TempDir::new().expect("temp dir");
         let persistence = ConversationPersistence::new(dir.path().join("threads"));
         let mut log = ConversationLog::create(&persistence).expect("ConversationLog::create");
         log.set_system_prompt("test system prompt".to_string())
             .expect("set_system_prompt on fresh log");
-        (dir, log)
+        (dir, Arc::new(TokioMutex::new(log)))
     }
 
     /// Build an [AgentEnv] that doesn't pull instructions from the
@@ -2222,8 +2305,10 @@ mod event_protocol_tests {
 
     #[tokio::test]
     async fn run_single_turn_with_tool_call_emits_locked_protocol() {
-        let (_dir, mut log) = fresh_log();
+        let (_dir, log) = fresh_log();
         let parent_head = log
+            .lock()
+            .await
             .system_prompt_id()
             .expect("set_system_prompt populates the root entry")
             .clone();
@@ -2239,7 +2324,7 @@ mod event_protocol_tests {
                 message: finalize_text("done"),
             }],
         ];
-        let model = std::sync::Arc::new(ScriptedModel::new(scripts));
+        let model = Arc::new(ScriptedModel::new(scripts));
 
         let env = empty_env(std::env::temp_dir());
         let ping: ErasedToolDefinition = PingTool.into();
@@ -2252,47 +2337,76 @@ mod event_protocol_tests {
             model,
             None,
         );
+        // Mirror what `SessionContextWrapper::spawn_agent` does in
+        // production: tagging the agent with its sub-agent id keeps
+        // bus events and persistence writes aligned to the
+        // [`ThreadKind::Subagent`] entries `run_single_turn` will
+        // append below.
+        agent.set_agent_id(AgentId::Sub(1));
 
-        let recorded: std::sync::Arc<Mutex<Vec<EventLabel>>> =
-            std::sync::Arc::new(Mutex::new(Vec::new()));
+        // Register the persistence listener so `MessagePersisted`
+        // events actually reach disk; without this the agent can't
+        // recover the assistant message's id via `latest_leaf` after
+        // the emit and the run aborts with a Fatal error.
+        let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             recorded_clone.lock().unwrap().push(label(event));
         }));
 
         agent
-            .run_single_turn(&mut log, parent_head, 1, "run ping".to_string())
+            .run_single_turn(Arc::clone(&log), parent_head, 1, "run ping".to_string())
             .await
             .expect("run_single_turn");
 
         let events = recorded.lock().unwrap().clone();
         let expected = vec![
-            EventLabel::AgentStart(AgentId::Main),
-            EventLabel::TurnStart(AgentId::Main),
+            EventLabel::AgentStart(AgentId::Sub(1)),
+            EventLabel::TurnStart(AgentId::Sub(1)),
             // First inference: the model returned a tool_use, so a
-            // TurnUsage event fires after the assistant message
-            // finalizes (carrying the per-turn token counts) and the
-            // tool-execution lifecycle runs against the synthesized
-            // `ping` tool.
-            EventLabel::TurnUsage(AgentId::Main),
+            // `MessagePersisted::Assistant` event fires (the
+            // listener writes the assistant message to disk before
+            // the emit resolves), `TurnUsage` reports the per-turn
+            // token counts, and the tool-execution lifecycle runs
+            // against the synthesized `ping` tool.
+            EventLabel::MessagePersisted {
+                agent_id: AgentId::Sub(1),
+                kind: "Assistant",
+            },
+            EventLabel::TurnUsage(AgentId::Sub(1)),
             EventLabel::ToolExecutionStart {
-                agent_id: AgentId::Main,
+                agent_id: AgentId::Sub(1),
                 call_id: "tu-1".to_string(),
                 tool: "ping".to_string(),
             },
             EventLabel::ToolExecutionEnd {
-                agent_id: AgentId::Main,
+                agent_id: AgentId::Sub(1),
                 call_id: "tu-1".to_string(),
                 tool: "ping".to_string(),
                 summary: "ping".to_string(),
                 body: "pong".to_string(),
                 is_error: false,
             },
+            // After the tool batch finishes, the agent emits one
+            // `MessagePersisted::ToolResult` event so the listener
+            // appends the synthesized user-role tool_result message
+            // (which the next inference will see).
+            EventLabel::MessagePersisted {
+                agent_id: AgentId::Sub(1),
+                kind: "ToolResult",
+            },
             // Second inference: the model returned plain text, so
-            // `TurnUsage` fires once and the loop exits without
-            // another tool batch.
-            EventLabel::TurnUsage(AgentId::Main),
-            EventLabel::AgentEnd(AgentId::Main),
+            // we get one more `MessagePersisted::Assistant` (the
+            // text response itself), `TurnUsage` fires, and the
+            // loop exits without another tool batch.
+            EventLabel::MessagePersisted {
+                agent_id: AgentId::Sub(1),
+                kind: "Assistant",
+            },
+            EventLabel::TurnUsage(AgentId::Sub(1)),
+            EventLabel::AgentEnd(AgentId::Sub(1)),
         ];
         assert_eq!(events, expected, "unexpected event sequence: {events:#?}");
     }
@@ -2302,12 +2416,14 @@ mod event_protocol_tests {
         // Drives `run_single_turn` (the public sub-agent entry point)
         // and verifies the bus brackets every run with an
         // `AgentStart` / `AgentEnd` pair tagged with the agent's id.
-        let (_dir, mut log) = fresh_log();
+        let (_dir, log) = fresh_log();
 
         // run_single_turn anchors on a parent_head from the log; the
         // system_prompt entry (root) is reachable and works as the
         // parent for the sub-agent thread.
         let parent_head = log
+            .lock()
+            .await
             .system_prompt_id()
             .expect("set_system_prompt populates the root entry")
             .clone();
@@ -2315,7 +2431,7 @@ mod event_protocol_tests {
         let scripts = vec![vec![StreamingEvent::FinalizedMessage {
             message: finalize_text("ok"),
         }]];
-        let model = std::sync::Arc::new(ScriptedModel::new(scripts));
+        let model = Arc::new(ScriptedModel::new(scripts));
 
         let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::new(
@@ -2329,28 +2445,33 @@ mod event_protocol_tests {
         );
         agent.set_agent_id(AgentId::Sub(7));
 
-        let recorded: std::sync::Arc<Mutex<Vec<EventLabel>>> =
-            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             recorded_clone.lock().unwrap().push(label(event));
         }));
 
         agent
-            .run_single_turn(&mut log, parent_head, 7, "test prompt".to_string())
+            .run_single_turn(Arc::clone(&log), parent_head, 7, "test prompt".to_string())
             .await
             .expect("run_single_turn");
 
         let events = recorded.lock().unwrap().clone();
         // The exact subset we lock: lifecycle markers, the turn
-        // boundary, and the per-turn token-usage event. Everything
-        // else (no tool calls, no errors) means there are no other
-        // events this run.
+        // boundary, the assistant-message persistence event, and
+        // the per-turn token-usage event. Everything else (no tool
+        // calls, no errors) means there are no other events this run.
         assert_eq!(
             events,
             vec![
                 EventLabel::AgentStart(AgentId::Sub(7)),
                 EventLabel::TurnStart(AgentId::Sub(7)),
+                EventLabel::MessagePersisted {
+                    agent_id: AgentId::Sub(7),
+                    kind: "Assistant",
+                },
                 EventLabel::TurnUsage(AgentId::Sub(7)),
                 EventLabel::AgentEnd(AgentId::Sub(7)),
             ],

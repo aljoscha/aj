@@ -15,9 +15,10 @@
 
 use std::time::Duration;
 
+use aj_models::messages::ContentBlockParam;
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantMessage, ToolResultMessage};
-use aj_ui::TokenUsage;
+use aj_ui::{TokenUsage, UserOutput};
 use serde_json::Value;
 
 use crate::message::AgentMessage;
@@ -70,6 +71,37 @@ pub enum StreamAction {
     /// the block; renderers that drop intermediate `Update`s can fall
     /// back on this for the full text.
     Stop { snapshot: String },
+}
+
+/// What the persistence listener should append to the log when it
+/// observes an [`AgentEvent::MessagePersisted`].
+///
+/// Each variant maps directly onto the legacy
+/// [`aj_session::ConversationView`] write the agent used to make
+/// inline; carrying the payload on the event keeps the listener
+/// stateless (the listener doesn't need to know anything about turn
+/// structure — it just appends what it's told). Folds into the
+/// per-message [`AgentEvent::MessageEnd`] payload in §2.4 when the
+/// on-disk format switches to typed messages.
+#[derive(Clone, Debug)]
+pub enum PersistedMessageKind {
+    /// Append an assistant message with the given content blocks.
+    /// Maps onto [`aj_session::ConversationView::add_assistant_message`].
+    Assistant { content: Vec<ContentBlockParam> },
+    /// Append a user-role message carrying one or more
+    /// `tool_result` content blocks. Synthesized by the agent at
+    /// the end of every tool batch so the next inference sees the
+    /// model's tool calls answered. Maps onto
+    /// [`aj_session::ConversationView::add_user_message`].
+    ToolResult { content: Vec<ContentBlockParam> },
+    /// Append a freestanding [`UserOutput`] entry. Today only
+    /// emitted for the synthesized [`UserOutput::ToolError`]
+    /// records the agent writes when a tool-call's `input` JSON
+    /// fails to parse or the tool's `execute` itself returns an
+    /// `Err`. Folds into the structured [`ToolDetails`] entry shape
+    /// in §2.4 (see `docs/aj-next-plan.md` §3 — log-format
+    /// migration).
+    UserOutput { output: UserOutput },
 }
 
 /// Bus event emitted by the agent runtime.
@@ -211,6 +243,32 @@ pub enum AgentEvent {
         usage: TokenUsage,
     },
 
+    /// Persistence write request for a finalized turn entry.
+    ///
+    /// Emitted by the agent every time an in-flight turn produces a
+    /// payload that must hit disk: the assistant message itself, the
+    /// synthesized user message carrying tool-result content blocks,
+    /// or one of the freestanding [`UserOutput`] entries written for
+    /// tool-call parse failures and tool-execution errors. The
+    /// persistence listener responds by appending one
+    /// [`aj_session::ConversationEntry`] to the log; the bus's
+    /// awaited-inline listener semantics give us the same "log is
+    /// never more than one event behind reality" durability
+    /// guarantee the previous direct `view.add_*_message` calls had,
+    /// and a listener that returns `Err` (e.g. on a disk-write
+    /// failure) aborts the run via [`crate::TurnError::Fatal`].
+    ///
+    /// Bridging shape used while the agent still drives inference
+    /// through the legacy [`MessageParam`](aj_models::messages::MessageParam)
+    /// flow. Folds into [`AgentEvent::MessageEnd`] in §2.4 once
+    /// `aj-agent` migrates to the unified
+    /// [`aj_models::types::Message`] types and the on-disk format
+    /// switches to typed message entries.
+    MessagePersisted {
+        agent_id: AgentId,
+        kind: PersistedMessageKind,
+    },
+
     // --- Queue snapshots ---------------------------------------------------
     /// Full snapshot of both pending-message queues. Fired whenever
     /// either queue changes so listeners can render a single state
@@ -246,6 +304,7 @@ impl AgentEvent {
             | Self::StreamRetry { agent_id, .. }
             | Self::StreamChunk { agent_id, .. }
             | Self::TurnUsage { agent_id, .. }
+            | Self::MessagePersisted { agent_id, .. }
             | Self::QueueUpdate { agent_id, .. } => *agent_id,
             Self::SubAgentStart { parent, .. } | Self::SubAgentEnd { parent, .. } => *parent,
         }
