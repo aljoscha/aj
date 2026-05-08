@@ -3,13 +3,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::conversation::Conversation;
+use crate::messages::MessageParam;
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
 
 pub mod anthropic;
 pub mod auth;
-pub mod conversation;
 pub mod errors;
 pub mod messages;
 pub mod oauth;
@@ -23,13 +22,21 @@ pub mod tools;
 pub mod transform;
 pub mod types;
 
-/// Trait for LLM model providers
+/// Trait for LLM model providers.
+///
+/// The legacy `Model` trait operates over a flat slice of
+/// [`MessageParam`]s — the wire layer's view of the conversation.
+/// On-disk persistence (entry framing, sub-agent threads, system
+/// prompts) is the responsibility of `aj-session`; that crate
+/// linearizes a [`crate::messages::MessageParam`] sequence and hands
+/// it to the model. Keeping the trait persistence-free lets
+/// `aj-models` stay purely wire (per `docs/aj-next-plan.md` §1).
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {
-    /// Run streaming inference with the given messages
+    /// Run streaming inference with the given messages.
     async fn run_inference_streaming(
         &self,
-        conversation: &Conversation,
+        messages: &[MessageParam],
         system_prompt: String,
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,

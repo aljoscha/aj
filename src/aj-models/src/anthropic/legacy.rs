@@ -22,7 +22,6 @@ use anthropic_sdk::streaming::StreamingEvent as AnthropicStreamingEvent;
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 
-use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
 use crate::messages::{
     ApiError, AppliedEdit, CacheCreation, Caller, Citation, Container, ContentBlock,
     ContentBlockParam, ContextManagementResponse, DocumentContentBlock, DocumentContentSource,
@@ -65,7 +64,7 @@ impl AnthropicModel {
 impl Model for AnthropicModel {
     async fn run_inference_streaming(
         &self,
-        conversation: &Conversation,
+        messages: &[MessageParam],
         system_prompt: String,
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
@@ -82,11 +81,7 @@ impl Model for AnthropicModel {
         let output_config = output_config_for_thinking(&thinking);
         let thinking: Option<AnthropicThinking> = thinking.map(Into::into);
 
-        let mut messages: Vec<AnthropicMessageParam> = conversation
-            .entries()
-            .iter()
-            .filter_map(Into::<Option<AnthropicMessageParam>>::into)
-            .collect();
+        let mut messages: Vec<AnthropicMessageParam> = messages.iter().map(Into::into).collect();
 
         let last_user_message = messages
             .iter_mut()
@@ -144,20 +139,8 @@ impl Model for AnthropicModel {
 }
 
 // ---------------------------------------------------------------------------
-// Conversation → Anthropic message conversions
+// Wire `MessageParam` → Anthropic message conversions
 // ---------------------------------------------------------------------------
-
-impl From<&ConversationEntry> for Option<AnthropicMessageParam> {
-    fn from(entry: &ConversationEntry) -> Self {
-        match &entry.entry {
-            ConversationEntryKind::Message(message) => Some(message.into()),
-            ConversationEntryKind::UserOutput(_) => None,
-            // The system prompt is passed to the model out-of-band via
-            // the dedicated `system` field, not as a conversation message.
-            ConversationEntryKind::SystemPrompt { .. } => None,
-        }
-    }
-}
 
 impl From<&MessageParam> for AnthropicMessageParam {
     fn from(message: &MessageParam) -> Self {

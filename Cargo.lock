@@ -24,6 +24,7 @@ dependencies = [
  "aj-agent",
  "aj-conf",
  "aj-models",
+ "aj-session",
  "aj-tools",
  "aj-ui",
  "anthropic-sdk",
@@ -47,6 +48,7 @@ version = "0.1.0"
 dependencies = [
  "aj-conf",
  "aj-models",
+ "aj-session",
  "aj-ui",
  "anyhow",
  "chrono",
@@ -76,7 +78,6 @@ dependencies = [
 name = "aj-models"
 version = "0.1.0"
 dependencies = [
- "aj-ui",
  "anthropic-sdk",
  "anyhow",
  "async-stream",
@@ -94,6 +95,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aj-session"
+version = "0.1.0"
+dependencies = [
+ "aj-models",
+ "aj-ui",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tracing",
 ]
 

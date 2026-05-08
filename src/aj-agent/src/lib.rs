@@ -19,6 +19,10 @@ use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
 use aj_models::ModelError;
 use aj_models::{Model, ThinkingConfig};
+use aj_session::{
+    Conversation, ConversationEntryKind, ConversationError, ConversationLog, ConversationView,
+    EntryId, ThreadFilter, ThreadKind,
+};
 use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 
 use crate::legacy_tool::{
@@ -29,11 +33,6 @@ use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
-
-use aj_models::conversation::{
-    Conversation, ConversationEntryKind, ConversationError, ConversationLog, ConversationView,
-    EntryId, ThreadFilter, ThreadKind,
-};
 
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
@@ -47,7 +46,7 @@ pub struct Agent<UI: AjUi> {
     system_prompt: &'static str,
     /// The fully-assembled system prompt for the current run, populated
     /// by [Agent::resolve_system_prompt] on the first turn. Equal to the
-    /// thread's persisted [aj_models::conversation::ConversationEntryKind::SystemPrompt]
+    /// thread's persisted [aj_session::ConversationEntryKind::SystemPrompt]
     /// when one exists; otherwise freshly assembled (and persisted on
     /// fresh logs).
     assembled_system_prompt: Option<String>,
@@ -600,9 +599,17 @@ impl<UI: AjUi> Agent<UI> {
             .clone()
             .expect("system prompt must be resolved before inference");
 
+        // The legacy `Model` trait operates on a flat slice of
+        // `MessageParam`s — the wire view of the conversation. Project
+        // the linearized log down to that shape here; non-message
+        // entries (system prompts, tool-output stand-ins) are
+        // structural metadata and never reach the wire.
+        let messages: Vec<aj_models::messages::MessageParam> =
+            conversation.messages().into_iter().cloned().collect();
+
         let response = self
             .model
-            .run_inference_streaming(conversation, system_prompt, self.tools.clone(), thinking)
+            .run_inference_streaming(&messages, system_prompt, self.tools.clone(), thinking)
             .await?;
 
         Ok(response)

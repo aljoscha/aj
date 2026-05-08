@@ -1,3 +1,25 @@
+//! Append-only conversation log + read-only inference view.
+//!
+//! Each thread is one `.jsonl` file under the project's threads
+//! directory. `ConversationLog` holds the in-memory image and writes
+//! every append to disk before mutating the in-memory maps, so a
+//! crashed process never leaves the two diverging beyond the last
+//! line (which [`ConversationLog::resume`] tolerates with a warning).
+//!
+//! [`ConversationView`] is a short-lived mutation handle that tracks
+//! a head pointer and routes appends to a specific thread (the
+//! user's main conversation, or one sub-agent subtree). It writes
+//! one JSONL line per call, so every individual event is durable as
+//! soon as the call returns.
+//!
+//! [`Conversation`] is the read-only linearized projection consumed
+//! by the wire layer. It carries the materialized [`MessageParam`]s
+//! (filtered through a [`ThreadFilter`]) plus a small set of helpers
+//! (`last_message`, `last_user_message`, `last_assistant_message`)
+//! that today's agent uses to decide thinking budgets and resume
+//! state.
+
+use aj_models::messages::{ContentBlockParam, MessageParam, Role};
 use aj_ui::UserOutput;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -8,8 +30,6 @@ use std::{
     path::PathBuf,
 };
 use thiserror::Error;
-
-use crate::messages::{ContentBlockParam, MessageParam, Role};
 
 #[derive(Debug, Error)]
 pub enum ConversationError {
@@ -136,6 +156,12 @@ impl ThreadFilter {
 /// A linearized, read-only view of (a slice of) a conversation log. Produced
 /// by [ConversationLog::linearize] / [ConversationView::as_conversation] and
 /// passed to the model for inference.
+///
+/// The view carries both the underlying [`ConversationEntry`] sequence
+/// (for callers that need entry-level provenance, e.g. resume-time
+/// repair walks and history rendering) and a pre-extracted
+/// [`MessageParam`] projection for the wire layer, which only cares
+/// about messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     conversation_id: String,
@@ -178,6 +204,21 @@ impl Conversation {
             .iter()
             .filter(|entry| matches!(entry.entry, ConversationEntryKind::Message(_)))
             .count()
+    }
+
+    /// Borrow every [`MessageParam`] in this view, in chronological
+    /// order. Non-message entries (system prompt, user outputs) are
+    /// skipped — the wire layer only cares about turn-by-turn
+    /// conversation, and out-of-band metadata travels through other
+    /// channels.
+    pub fn messages(&self) -> Vec<&MessageParam> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message(msg) => Some(msg),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Get the last message in the view, if any.
@@ -276,7 +317,9 @@ impl ConversationLog {
     /// yet. The file is created lazily on the first [ConversationLog::append]
     /// so a session the user abandons before typing anything leaves no
     /// 0-byte file behind.
-    pub fn create(persistence: &ConversationPersistence) -> Result<Self, ConversationError> {
+    pub fn create(
+        persistence: &crate::persistence::ConversationPersistence,
+    ) -> Result<Self, ConversationError> {
         let threads_dir = persistence.threads_dir();
         if !threads_dir.exists() {
             fs::create_dir_all(threads_dir)?;
@@ -329,7 +372,7 @@ impl ConversationLog {
     /// it is dropped with a warning. A parse failure on any non-final
     /// line is a real corruption and surfaces as an error.
     pub fn resume(
-        persistence: &ConversationPersistence,
+        persistence: &crate::persistence::ConversationPersistence,
         thread_id: &str,
     ) -> Result<Self, ConversationError> {
         let path = persistence.thread_path(thread_id);
@@ -544,6 +587,16 @@ impl ConversationLog {
         &self.path
     }
 
+    /// All entries in the order they were appended. Used by
+    /// [`crate::replay`] to walk a freshly-resumed log without having
+    /// to re-derive the head/parent chain.
+    pub fn entries_in_order(&self) -> Vec<&ConversationEntry> {
+        self.order
+            .iter()
+            .filter_map(|id| self.entries.get(id))
+            .collect()
+    }
+
     /// The persisted system prompt for this thread, if one was recorded
     /// at thread creation. Resumed threads created before system-prompt
     /// persistence was added will return `None`.
@@ -706,138 +759,11 @@ impl<'a> ConversationView<'a> {
     }
 }
 
-/// Handles persistence operations for conversations, including listing
-/// existing thread files and resolving their paths.
-#[derive(Clone)]
-pub struct ConversationPersistence {
-    threads_dir: PathBuf,
-}
-
-impl ConversationPersistence {
-    /// Create a new [ConversationPersistence] instance with the given
-    /// threads directory.
-    pub fn new(threads_dir: PathBuf) -> Self {
-        Self { threads_dir }
-    }
-
-    pub fn threads_dir(&self) -> &std::path::Path {
-        &self.threads_dir
-    }
-
-    fn thread_path(&self, thread_id: &str) -> PathBuf {
-        self.threads_dir.join(format!("{thread_id}.jsonl"))
-    }
-
-    /// Get metadata about all conversation threads, sorted by creation
-    /// time (latest first).
-    ///
-    /// Files whose first line does not parse as the new
-    /// [ConversationEntry] shape (e.g. pre-refactor threads) are skipped
-    /// with a `tracing::info!` note.
-    pub fn list_threads(&self) -> Result<Vec<ThreadMetadata>, ConversationError> {
-        if !self.threads_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let entries = fs::read_dir(&self.threads_dir)?;
-        let mut thread_files = Vec::new();
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    thread_files.push(file_stem.to_string());
-                }
-            }
-        }
-
-        // Sort by filename (a timestamp), latest first.
-        thread_files.sort_by(|a, b| b.cmp(a));
-
-        let mut threads = Vec::new();
-
-        for thread_id in thread_files {
-            let path = self.thread_path(&thread_id);
-
-            if !Self::looks_like_new_format(&path) {
-                tracing::info!(
-                    "skipping pre-refactor thread file {} (old on-disk format)",
-                    path.display()
-                );
-                continue;
-            }
-
-            let metadata = fs::metadata(&path)?;
-            let modified = metadata.modified()?;
-            let modified_str = DateTime::<Utc>::from(modified)
-                .format("%Y-%m-%d %H:%M:%S UTC")
-                .to_string();
-
-            // Use file size as proxy for conversation length.
-            let file_size = metadata.len();
-            let size_display = if file_size < 1024 {
-                format!("{file_size}B")
-            } else if file_size < 1024 * 1024 {
-                format!("{}KB", file_size / 1024)
-            } else {
-                format!("{}MB", file_size / (1024 * 1024))
-            };
-
-            threads.push(ThreadMetadata {
-                thread_id,
-                modified: modified_str,
-                size_display,
-            });
-        }
-
-        Ok(threads)
-    }
-
-    /// Empty files are considered new-format (they were just created and
-    /// nothing has been written yet). Otherwise the first non-empty line
-    /// must parse as a [ConversationEntry].
-    fn looks_like_new_format(path: &std::path::Path) -> bool {
-        let Ok(file) = File::open(path) else {
-            return false;
-        };
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => return true, // empty file is fine
-                Ok(_) => {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    return serde_json::from_str::<ConversationEntry>(line.trim_end()).is_ok();
-                }
-                Err(_) => return false,
-            }
-        }
-    }
-
-    /// Get the latest conversation thread ID, if any exist.
-    pub fn get_latest_thread_id(&self) -> Result<Option<String>, ConversationError> {
-        let threads = self.list_threads()?;
-        Ok(threads.first().map(|t| t.thread_id.clone()))
-    }
-}
-
-/// Metadata about a conversation thread.
-#[derive(Debug, Clone)]
-pub struct ThreadMetadata {
-    pub thread_id: String,
-    pub modified: String,
-    pub size_display: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::ContentBlockParam;
+    use crate::persistence::ConversationPersistence;
+    use aj_models::messages::ContentBlockParam;
 
     /// Allocate a unique scratch directory for one test's persistence
     /// state. Uses the process id, the test thread id, and a nanosecond
@@ -848,7 +774,7 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "aj-models-conversation-test-{pid}-{tid:?}-{nanos}",
+            "aj-session-log-test-{pid}-{tid:?}-{nanos}",
             pid = std::process::id(),
             tid = std::thread::current().id(),
         ));
@@ -965,6 +891,7 @@ mod tests {
         ));
         // And it doesn't sneak in via `messages()` either.
         assert_eq!(convo.message_count(), 1);
+        assert_eq!(convo.messages().len(), 1);
     }
 
     #[test]

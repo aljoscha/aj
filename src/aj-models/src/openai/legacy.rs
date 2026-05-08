@@ -15,10 +15,9 @@ use openai_sdk::types::responses::{
     ResponseUsage,
 };
 
-use crate::conversation::{Conversation, ConversationEntry, ConversationEntryKind};
 use crate::messages::{
-    ApiError, ContentBlock, ContentBlockParam, DocumentSource, ImageSource, Message, MessageType,
-    Role, ServiceTier, StopReason, ToolResultContent, Usage, UsageDelta,
+    ApiError, ContentBlock, ContentBlockParam, DocumentSource, ImageSource, Message, MessageParam,
+    MessageType, Role, ServiceTier, StopReason, ToolResultContent, Usage, UsageDelta,
 };
 use crate::streaming::StreamingEvent;
 use crate::tools::Tool;
@@ -49,15 +48,14 @@ impl OpenAiModel {
 impl Model for OpenAiModel {
     async fn run_inference_streaming(
         &self,
-        conversation: &Conversation,
+        messages: &[MessageParam],
         system_prompt: String,
         tools: Vec<Tool>,
         thinking: Option<ThinkingConfig>,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
         let mut input = vec![system_prompt_item(&self.model_name, system_prompt)];
 
-        let conversation_items: Vec<ResponseInputItem> = conversation
-            .entries()
+        let conversation_items: Vec<ResponseInputItem> = messages
             .iter()
             .flat_map(Into::<Vec<ResponseInputItem>>::into)
             .collect();
@@ -119,19 +117,6 @@ fn reasoning_config(thinking: Option<ThinkingConfig>) -> Reasoning {
             effort: Some(ReasoningEffort::None),
             summary: None,
         },
-    }
-}
-
-impl From<&ConversationEntry> for Vec<ResponseInputItem> {
-    fn from(entry: &ConversationEntry) -> Self {
-        match &entry.entry {
-            ConversationEntryKind::Message(message) => message.into(),
-            ConversationEntryKind::UserOutput(_) => Vec::new(),
-            // The system prompt is passed to the model out-of-band via
-            // the dedicated `instructions` field, not as a conversation
-            // message.
-            ConversationEntryKind::SystemPrompt { .. } => Vec::new(),
-        }
     }
 }
 

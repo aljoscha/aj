@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = { workspace = true }
 aj-conf = { path = "../aj-conf" }
 aj-models = { path = "../aj-models" }
+aj-session = { path = "../aj-session" }
 aj-ui = { path = "../aj-ui" }
 chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }

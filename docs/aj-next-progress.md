@@ -34,9 +34,25 @@ and the git history.
       toolset without re-calling `get_builtin_tools()`. `TodoItem` /
       `TodoPriority` / `TodoStatus` are canonicalized in
       `aj_agent::tool` and re-exported from `aj_tools::tools::todo`.
-- [ ] (a) Extract `aj-session` crate from today's
+- [x] (a) Extract `aj-session` crate from today's
       `aj_models::conversation::*`, with a replay module returning
-      `impl Iterator<Item = AgentEvent>`.
+      an iterator. **Status:** the new `aj-session` crate carries
+      `ConversationLog`, `ConversationView`, `ConversationPersistence`,
+      `ConversationEntry`, `ConversationEntryKind`, `ThreadKind`,
+      `ThreadFilter`, `EntryId`, `ConversationError`, plus the
+      read-only `Conversation` view (refactored to expose
+      `messages()` so the wire-only `Model` trait now takes
+      `&[MessageParam]`). The legacy `Model` trait stays in
+      `aj-models` but no longer references any persistence type, so
+      `aj-models` dropped its `aj-ui` dependency and is now wire-only.
+      `aj-agent` (and `aj`) imports the persistence types from
+      `aj-session`. The `replay()` function returns
+      `impl Iterator<Item = &ConversationEntry>` for now: the
+      target shape is `Iterator<Item = AgentEvent>` per §1.1, but
+      `aj-agent` still depends on `aj-session` for `ConversationLog`
+      during §2.1–§2.3, so a `aj-session → aj-agent` dep would form
+      a cycle. The signature flips once §2.4 lands and the cycle
+      breaks; the iterator-driven call-site shape stays unchanged.
 
 ### §2.1 Agent emits events alongside `AjUi` calls
 

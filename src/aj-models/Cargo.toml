@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 anthropic-sdk = { path = "../anthropic-sdk" }
-aj-ui = { path = "../aj-ui" }
 async-stream.workspace = true
 async-trait = "0.1"
 base64.workspace = true
