@@ -192,6 +192,22 @@ pub struct ToolOutcome {
     pub is_error: bool,
 }
 
+/// Result of [`ToolContext::spawn_agent`].
+///
+/// Carries enough information for callers (currently the `agent`
+/// builtin) to construct a [`ToolDetails::SubAgentReport`] without
+/// looking up the freshly-allocated sub-agent id elsewhere. The
+/// `agent_id` matches the `Sub(_)` index surfaced on the bus through
+/// [`crate::events::AgentEvent::SubAgentStart`] /
+/// [`crate::events::AgentEvent::SubAgentEnd`].
+#[derive(Clone, Debug)]
+pub struct SpawnedAgent {
+    /// The sub-agent's id within the current session.
+    pub agent_id: usize,
+    /// Final assistant text returned by the sub-agent.
+    pub report: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tool trait + erased shape
 // ---------------------------------------------------------------------------
@@ -309,15 +325,16 @@ pub trait ToolContext: Send {
 
     /// Spawn a sub-agent on the current bus.
     ///
-    /// Resolves to the child's final assistant text. The child shares
-    /// the parent's event bus tagged with a fresh
+    /// Resolves to a [`SpawnedAgent`] carrying the freshly-allocated
+    /// sub-agent id and the child's final assistant text. The child
+    /// shares the parent's event bus tagged with a fresh
     /// [`crate::events::AgentId::Sub`] and inherits a child
     /// cancellation token derived from the parent's
     /// [`Self::cancellation`].
     fn spawn_agent<'a>(
         &'a mut self,
         task: String,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'a>>;
 
     /// Emit a partial [`ToolDetails`] snapshot through the bus as a
     /// [`crate::events::AgentEvent::ToolExecutionUpdate`]. Tools that

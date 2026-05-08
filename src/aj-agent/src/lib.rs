@@ -31,7 +31,7 @@ use crate::events::{AgentEvent, AgentId};
 use crate::legacy_tool::{
     ErasedToolDefinition, SessionContext, ToolResult, TurnContext as ToolTurnContext,
 };
-use crate::tool::{TodoItem, ToolDetails};
+use crate::tool::{SpawnedAgent, TodoItem, ToolDetails};
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
@@ -1371,7 +1371,7 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
         &mut self,
         task: String,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<SpawnedAgent, anyhow::Error>> + Send + '_>,
     > {
         Box::pin(async move {
             // Get the next agent ID
@@ -1447,11 +1447,15 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 .emit(AgentEvent::SubAgentEnd {
                     parent: self.parent_agent_id,
                     child: child_id,
-                    report,
+                    report: report.clone(),
                 })
                 .await?;
 
-            result
+            // Surface the freshly-allocated sub-agent id alongside the
+            // child's final assistant text. Errors still propagate via
+            // `?` so the agent runtime keeps synthesizing a generic
+            // tool-error result for failed spawns.
+            result.map(|report| SpawnedAgent { agent_id, report })
         })
     }
 }

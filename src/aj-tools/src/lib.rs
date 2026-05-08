@@ -41,12 +41,12 @@ pub use tools::write_file::WriteFileTool;
 /// function is called exactly once per process.
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
-        AgentTool.into(),
-        BashTool.into(),
         // Tools migrated to the new `aj_agent::tool::ToolDefinition`
         // shape are wrapped via the bridge so they appear identical to
         // legacy tools at the catalog level. Un-migrated tools below
         // still go through the legacy `.into()` path.
+        bridge::legacy_adapt(AgentTool),
+        BashTool.into(),
         bridge::legacy_adapt(ReadFileTool),
         WriteFileTool.into(),
         EditFileTool.into(),

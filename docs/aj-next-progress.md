@@ -153,7 +153,31 @@ and the git history.
         (regex match, include filter, no matches) and recoverable
         errors (relative path, missing path, file path, invalid regex,
         invalid include glob).
-  - [ ] `agent` (Text / SubAgentReport)
+  - [x] `agent` (Text / SubAgentReport). Migrated to
+        `aj_agent::tool::ToolDefinition`; returns
+        `ToolOutcome { content, details: ToolDetails::SubAgentReport
+        { agent_id, task, report }, is_error }` and no longer touches
+        `AjUi`. The wire `content` carries the sub-agent's final
+        assistant text verbatim so the parent model still reads the
+        report on the wire; `details` carries the structured
+        `(agent_id, task, report)` triple the renderer / persistence
+        listener uses to group nested transcripts under this tool
+        call. `agent_id` comes from the new
+        `aj_agent::tool::SpawnedAgent` struct returned by
+        `ToolContext::spawn_agent` (and the legacy
+        `SessionContext::spawn_agent`); the in-tree implementation in
+        `SessionContextWrapper` constructs it from the freshly-allocated
+        `next_sub_agent_id()` value. Spawn failures still propagate as
+        `Err` so the agent runtime keeps synthesizing a generic error
+        tool_result on bubble-up, matching the legacy contract.
+        `LegacyContextBridge::spawn_agent` and the dummy session /
+        tool contexts in `aj-tools::testing` were updated to thread
+        the new return type through. Wired into `get_builtin_tools()`
+        via `bridge::legacy_adapt(AgentTool)`. Three unit tests cover
+        the success path (round-trips wire content + structured
+        `SubAgentReport`), the optional `description` input (kept for
+        schema compat, doesn't affect the outcome), and the
+        spawn-failure bubble-up path.
   - [ ] `todo_read` (Todos + Text)
   - [ ] `todo_write` (Todos + Text)
   - [ ] `write_file` (Diff)

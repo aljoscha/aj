@@ -33,7 +33,9 @@ use aj_agent::legacy_tool::{
     AjUi, ErasedToolDefinition, SessionContext, ToolDefinition as LegacyToolDefinition,
     ToolResult as LegacyToolResult, TurnContext as LegacyTurnContext,
 };
-use aj_agent::tool::{TodoItem, ToolContext, ToolDefinition as NewToolDefinition, ToolDetails};
+use aj_agent::tool::{
+    SpawnedAgent, TodoItem, ToolContext, ToolDefinition as NewToolDefinition, ToolDetails,
+};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -79,7 +81,7 @@ impl<'a> ToolContext for LegacyContextBridge<'a> {
     fn spawn_agent<'b>(
         &'b mut self,
         task: String,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'b>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'b>> {
         self.session_ctx.spawn_agent(task)
     }
 

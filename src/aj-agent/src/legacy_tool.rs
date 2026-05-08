@@ -28,7 +28,7 @@ use serde_json::Value;
 // without needing a direct `aj-ui` dependency.
 pub use aj_ui::{AjUi, TokenUsage, UsageSummary, UserOutput};
 
-use crate::tool::{derive_schema, TodoItem, ToolDetails, ToolOutcome};
+use crate::tool::{derive_schema, SpawnedAgent, TodoItem, ToolDetails, ToolOutcome};
 
 use aj_models::types::UserContent;
 
@@ -217,13 +217,14 @@ pub trait SessionContext: Send {
 
     /// Spawn a sub-agent.
     ///
-    /// Resolves to the child's final assistant text. The
+    /// Resolves to a [`SpawnedAgent`] carrying the freshly-allocated
+    /// sub-agent id and the child's final assistant text. The
     /// implementation handles bus / cancellation propagation; tools
-    /// only see the resulting string.
+    /// only see the resulting struct.
     fn spawn_agent(
         &mut self,
         task: String,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>>;
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<SpawnedAgent, anyhow::Error>> + Send + '_>>;
 }
 
 /// Access to state scoped to a single turn through the agent loop.

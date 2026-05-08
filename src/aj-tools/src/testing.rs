@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use crate::{AjUi, SessionContext, TokenUsage, TurnContext, UsageSummary};
-use aj_agent::tool::{TodoItem, ToolContext, ToolDetails};
+use aj_agent::tool::{SpawnedAgent, TodoItem, ToolContext, ToolDetails};
 use tokio_util::sync::CancellationToken;
 
 /// A dummy implementation of SessionContext for testing and CLI tools.
@@ -34,7 +34,7 @@ impl SessionContext for DummySessionContext {
         &mut self,
         _task: String,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, anyhow::Error>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<SpawnedAgent, anyhow::Error>> + Send + '_>,
     > {
         Box::pin(async move {
             Err(anyhow::anyhow!(
@@ -144,8 +144,9 @@ impl ToolContext for DummyToolContext {
     fn spawn_agent<'a>(
         &'a mut self,
         _task: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'a>,
+    > {
         Box::pin(async move {
             Err(anyhow::anyhow!(
                 "spawn_agent not supported in DummyToolContext"
