@@ -132,7 +132,27 @@ and the git history.
         `DummyToolContext`. Seven unit tests cover the happy paths
         (extension match, recursive `**/`, no matches) and recoverable
         errors (relative path, missing path, file path, invalid glob).
-  - [ ] `grep` (Text)
+  - [x] `grep` (Text). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Text {
+        summary, body }, is_error }` and no longer touches `AjUi`.
+        `summary` is the search-root path made relative to the working
+        directory (matching `read_file` / `ls` / `glob` conventions)
+        followed by a ` pattern=<regex>` marker, plus an optional
+        ` include=<glob>` marker when the call narrows the file set,
+        so a collapsed view captures both the target and the search
+        parameters. `body` is the formatted listing of matching files
+        (or a "no matches" notice). Recoverable errors (path-not-absolute,
+        missing path, not-a-directory, invalid regex, invalid include
+        glob, walker IO failures, metadata failures) come back as
+        `is_error: true` outcomes instead of bubbled `Err`s; files the
+        searcher can't read (binary, permission errors) are silently
+        skipped to match historical behavior. Wired into
+        `get_builtin_tools()` via `bridge::legacy_adapt(GrepTool)`.
+        `bin/grep.rs` updated to drive the new shape via
+        `DummyToolContext`. Eight unit tests cover the happy paths
+        (regex match, include filter, no matches) and recoverable
+        errors (relative path, missing path, file path, invalid regex,
+        invalid include glob).
   - [ ] `agent` (Text / SubAgentReport)
   - [ ] `todo_read` (Todos + Text)
   - [ ] `todo_write` (Todos + Text)

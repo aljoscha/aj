@@ -53,7 +53,7 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
         EditFileMultiTool.into(),
         bridge::legacy_adapt(LsTool),
         bridge::legacy_adapt(GlobTool),
-        GrepTool.into(),
+        bridge::legacy_adapt(GrepTool),
         TodoReadTool.into(),
         TodoWriteTool.into(),
     ]
