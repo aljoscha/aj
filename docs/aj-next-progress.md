@@ -81,7 +81,7 @@ and the git history.
 
 ### §2.2 Refactor tools to `ToolContext` + `ToolOutcome`
 
-- [ ] Per-tool migration off `&mut dyn AjUi` onto `&mut dyn ToolContext`.
+- [x] Per-tool migration off `&mut dyn AjUi` onto `&mut dyn ToolContext`.
   - [x] `read_file` (Text). Migrated to `aj_agent::tool::ToolDefinition`;
         returns `ToolOutcome { content, details: ToolDetails::Text { summary,
         body }, is_error }` and no longer touches `AjUi`. Plumbed through
@@ -298,7 +298,75 @@ and the git history.
         ambiguous-match recoverable errors, the mid-batch validation
         failure (which must leave the file untouched), and lock in
         the `Sequential` execution mode.
-  - [ ] `bash` (Bash)
+  - [x] `bash` (Bash). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Bash {
+        command, stdout, stderr, exit_code, truncated, full_output_path },
+        is_error }` and no longer touches `AjUi`. The wire `content`
+        keeps the legacy text shape (stdout, then `STDERR:` block, then
+        a `Command failed with exit code: N` / `Command terminated by
+        signal` / `Command cancelled` / `Command timed out after N
+        seconds` trailer, plus an `[Output truncated; full output at
+        <path>]` marker when truncation occurred) so existing prompts
+        keep behaving the same way; the structured `Bash` payload
+        carries the same data plus a separate stdout/stderr split for
+        the renderer.
+
+        Per `docs/aj-next-plan.md` §1.2: each stream is capped in
+        memory at a 16 KiB rolling tail (`STREAM_CAP_BYTES`) using a
+        `Vec<u8>` that evicts from the front once full. Both reader
+        tasks tee every byte into a `tempfile::NamedTempFile`
+        (prefix `aj-bash-`, suffix `.log`) so the spill always holds
+        the full uncaptured output. At completion we either `keep()`
+        the spill (`truncated == true`) and surface its path through
+        `full_output_path`, or drop the `NamedTempFile` so its `Drop`
+        unlinks the file. The wire content is additionally hard-capped
+        at the legacy 35 000-char ceiling (`WIRE_CAP_BYTES`) as
+        belt-and-braces — in practice the per-stream caps keep us well
+        under it.
+
+        Per §1.3 / §1.8: the child is spawned with `process_group(0)`
+        so it leads its own group, and on cancel / timeout we shell
+        out to `kill -9 -- -<pgid>` to SIGKILL the entire descendant
+        tree (a plain `Child::kill` would leak grandchildren the shell
+        forked). `stdin: null` keeps any command that reads from stdin
+        from hanging on the agent's terminal. The implementation
+        races `child.wait`, `cancellation.cancelled()`, a
+        `sleep_until(timeout_at)` arm, and a periodic `sleep(100ms)`
+        wakeup in a `tokio::select!` with `biased` ordering so
+        cancellation always wins. Cancellation and timeout produce
+        `is_error: true` outcomes with `exit_code: None`; non-zero
+        natural exits stay `is_error: false` to match legacy behavior
+        (the wire content already conveys the failure to the model).
+
+        Per §1.3 / §6 ("tool-update streaming"): while the child runs
+        the loop calls `ctx.emit_update(snapshot)` on a 100 ms leading-
+        edge debounce (~10 events/s). Each snapshot is a
+        `ToolDetails::Bash` partial with the in-flight stdout/stderr
+        tails and the `truncated` flag set as eviction occurs;
+        `exit_code` and `full_output_path` are left `None` until the
+        final outcome.
+
+        `execution_mode()` is overridden to `ExecutionMode::Sequential`
+        because bash runs arbitrary commands. Wired into
+        `get_builtin_tools()` via `bridge::legacy_adapt(BashTool)`; the
+        bridge's existing `ToolDetails::Bash` arm renders through
+        `display_tool_result` / `display_tool_error` so the legacy CLI
+        keeps printing tool output until §2.3.
+
+        Reader tasks share a `RecordingCtx` test helper that records
+        every `emit_update` snapshot for assertion; the legacy
+        `DummyToolContext` is reused for the simpler paths. Ten unit
+        tests cover the happy paths (echo to stdout, stderr capture
+        under its own header, working-directory plumbing), the failure
+        paths (non-zero exit code stays `is_error: false`,
+        missing-binary surfacing as exit 127), the truncation /
+        spill-file path, cancellation and timeout (both must kill the
+        process and return `is_error: true` with `exit_code: None`),
+        the leading-edge `emit_update` debounce firing at least once
+        during execution, and lock in the `Sequential` execution mode.
+
+        `aj-tools` gained a runtime `tempfile` dependency (it was a
+        dev-dep before) for the `NamedTempFile` spill helper.
 
 ### §2.3 Drive the legacy CLI off the bus
 

@@ -46,7 +46,7 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
         // legacy tools at the catalog level. Un-migrated tools below
         // still go through the legacy `.into()` path.
         bridge::legacy_adapt(AgentTool),
-        BashTool.into(),
+        bridge::legacy_adapt(BashTool),
         bridge::legacy_adapt(ReadFileTool),
         bridge::legacy_adapt(WriteFileTool),
         bridge::legacy_adapt(EditFileTool),
