@@ -5,6 +5,11 @@
 //! `AjUi` re-export live in `aj_agent::legacy_tool`. This crate now
 //! contains only the concrete tool implementations and the
 //! [`get_builtin_tools`] catalog. See `docs/aj-next-plan.md` §2.0(c).
+//!
+//! Tools migrated to the new [`aj_agent::tool::ToolDefinition`] shape
+//! (per `docs/aj-next-plan.md` §2.2) are wrapped via [`bridge::legacy_adapt`]
+//! so they appear identical to legacy tools at the catalog level until
+//! the agent runtime stops driving the legacy contract in §2.4.
 
 // Re-export the legacy contract so existing in-crate `use crate::{...}`
 // paths keep working without changes.
@@ -13,6 +18,7 @@ pub use aj_agent::legacy_tool::{
     TurnContext, UsageSummary, UserOutput,
 };
 
+pub mod bridge;
 pub mod testing;
 pub mod tools;
 
@@ -37,7 +43,10 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
         AgentTool.into(),
         BashTool.into(),
-        ReadFileTool.into(),
+        // `read_file` is migrated to the new tool shape; the bridge
+        // adapter presents it to the agent through the legacy contract
+        // alongside the un-migrated tools below.
+        bridge::legacy_adapt(ReadFileTool),
         WriteFileTool.into(),
         EditFileTool.into(),
         EditFileMultiTool.into(),

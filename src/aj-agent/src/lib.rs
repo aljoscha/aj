@@ -685,6 +685,8 @@ impl<UI: AjUi> Agent<UI> {
                             let tool_result = ToolResult {
                                 return_value: format!("Tool input parse error: {parse_err}"),
                                 user_outputs: vec![user_error_output],
+                                details: None,
+                                is_error: true,
                             };
                             (tool_result, true)
                         } else {
@@ -700,7 +702,10 @@ impl<UI: AjUi> Agent<UI> {
                                 .await;
 
                             match tool_result {
-                                Ok(result) => (result, false),
+                                Ok(result) => {
+                                    let is_error = result.is_error;
+                                    (result, is_error)
+                                }
                                 Err(err) => {
                                     let user_error_output = UserOutput::ToolError {
                                         tool_name: tool_name.clone(),
@@ -710,6 +715,8 @@ impl<UI: AjUi> Agent<UI> {
                                     let tool_result = ToolResult {
                                         return_value: format!("{err}"),
                                         user_outputs: vec![user_error_output],
+                                        details: None,
+                                        is_error: true,
                                     };
                                     (tool_result, true)
                                 }
@@ -739,23 +746,23 @@ impl<UI: AjUi> Agent<UI> {
                     }
                     self.display_user_output(&tool_result.user_outputs);
 
-                    // Mirror the tool result on the bus. Today we
-                    // surface the textual return value through
-                    // `ToolDetails::Text`; once the per-tool migration
-                    // in §2.2 of `docs/aj-next-plan.md` lands, each
-                    // tool will pick its own `ToolDetails` variant
-                    // (e.g. `Diff` for editors, `Bash` for shell) and
-                    // we'll plumb that variant through here verbatim.
+                    // Mirror the tool result on the bus. Migrated
+                    // tools surface their own [ToolDetails] through
+                    // [ToolResult::details]; legacy tools fall back to
+                    // the [tool_details_for_legacy] projection of the
+                    // textual `return_value`. Once §2.2 of
+                    // `docs/aj-next-plan.md` finishes per-tool
+                    // migration, the fallback (and `tool_details_for_legacy`)
+                    // can go away.
+                    let bus_details = tool_result.details.clone().unwrap_or_else(|| {
+                        tool_details_for_legacy(&tool_name, &tool_result.return_value, is_error)
+                    });
                     self.bus
                         .emit(AgentEvent::ToolExecutionEnd {
                             agent_id: self.agent_id,
                             call_id: tool_id.clone(),
                             tool: tool_name.clone(),
-                            result: tool_details_for_legacy(
-                                &tool_name,
-                                &tool_result.return_value,
-                                is_error,
-                            ),
+                            result: bus_details,
                             is_error,
                         })
                         .await
@@ -985,7 +992,16 @@ impl<UI: AjUi> Agent<UI> {
         // Extract recorded outputs and add them to the result
         // let recorded_outputs = recording_ui.take_recorded_outputs();
         // let result_with_outputs = ToolResult::with_outputs(result.return_value, recorded_outputs);
-        let result_with_outputs = ToolResult::with_outputs(result.return_value, Vec::new());
+        // We rebuild the [ToolResult] with empty `user_outputs` (the
+        // recorder is currently disabled) but preserve `details` and
+        // `is_error` from migrated tools so the bus event in
+        // [Agent::execute_turn] gets the rich payload.
+        let result_with_outputs = ToolResult {
+            return_value: result.return_value,
+            user_outputs: Vec::new(),
+            details: result.details,
+            is_error: result.is_error,
+        };
 
         Ok(result_with_outputs)
     }

@@ -82,7 +82,24 @@ and the git history.
 ### §2.2 Refactor tools to `ToolContext` + `ToolOutcome`
 
 - [ ] Per-tool migration off `&mut dyn AjUi` onto `&mut dyn ToolContext`.
-  - [ ] `read_file` (Text)
+  - [x] `read_file` (Text). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Text { summary,
+        body }, is_error }` and no longer touches `AjUi`. Plumbed through
+        `aj-tools::bridge::legacy_adapt` so the agent's legacy
+        `ErasedToolDefinition` collection can drive it during the
+        migration window. Bridge pieces: `LegacyContextBridge` adapts
+        `&mut dyn legacy::SessionContext` to `&mut dyn ToolContext` (no-op
+        `emit_update`, never-fired `cancellation`); `BridgedTool<T>`
+        renders `ToolDetails` via the legacy `AjUi` so the CLI keeps
+        printing tool results until §2.3 wires the bus to rendering.
+        Legacy `ToolResult` grew `details: Option<ToolDetails>` and
+        `is_error: bool` so migrated tools surface their structured
+        payload through the existing agent runtime; `Agent::execute_turn`
+        now reads both fields when emitting `ToolExecutionEnd` and
+        computing the wire `is_error`. Errors (path-not-absolute,
+        file-not-found) come back as `is_error: true` outcomes instead
+        of bubbled `Err`s. `DummyToolContext` added to
+        `aj-tools::testing` for unit-testing migrated tools.
   - [ ] `ls` (Text)
   - [ ] `glob` (Text)
   - [ ] `grep` (Text)

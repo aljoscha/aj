@@ -118,6 +118,7 @@ name = "aj-tools"
 version = "0.1.0"
 dependencies = [
  "aj-agent",
+ "aj-models",
  "anthropic-sdk",
  "anyhow",
  "chrono",
@@ -128,8 +129,10 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "termimad",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

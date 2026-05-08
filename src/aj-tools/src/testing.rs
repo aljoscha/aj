@@ -3,11 +3,16 @@
 //! Provides no-op implementations of [`SessionContext`], [`TurnContext`],
 //! and [`AjUi`] so individual tools can be exercised from CLI bins
 //! and integration tests without standing up a full agent runtime.
+//!
+//! Also includes [`DummyToolContext`], the new-shape [`ToolContext`]
+//! analogue, for testing tools that have migrated to
+//! [`aj_agent::tool::ToolDefinition`].
 
 use std::path::PathBuf;
 
 use crate::{AjUi, SessionContext, TokenUsage, TurnContext, UsageSummary};
-use aj_agent::tool::TodoItem;
+use aj_agent::tool::{TodoItem, ToolContext, ToolDetails};
+use tokio_util::sync::CancellationToken;
 
 /// A dummy implementation of SessionContext for testing and CLI tools.
 pub struct DummySessionContext;
@@ -93,5 +98,66 @@ impl AjUi for DummyPermissionHandler {
 
     fn get_user_input(&mut self) -> Option<String> {
         None
+    }
+}
+
+/// No-op [`ToolContext`] for exercising new-shape
+/// [`aj_agent::tool::ToolDefinition`] implementations from unit tests.
+///
+/// `working_directory` defaults to the process's `cwd`; override the
+/// public field if a test needs a fixed directory. Todos are stored
+/// in-memory; `spawn_agent` returns an error; `emit_update` discards
+/// snapshots; `cancellation` returns a fresh token that never fires.
+pub struct DummyToolContext {
+    /// Working directory returned by [`ToolContext::working_directory`].
+    pub working_directory: PathBuf,
+    /// Backing storage for [`ToolContext::get_todo_list`] /
+    /// [`ToolContext::set_todo_list`].
+    pub todos: Vec<TodoItem>,
+    /// Cancellation token surfaced by [`ToolContext::cancellation`].
+    pub cancellation: CancellationToken,
+}
+
+impl Default for DummyToolContext {
+    fn default() -> Self {
+        Self {
+            working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            todos: Vec::new(),
+            cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+impl ToolContext for DummyToolContext {
+    fn working_directory(&self) -> PathBuf {
+        self.working_directory.clone()
+    }
+
+    fn get_todo_list(&self) -> Vec<TodoItem> {
+        self.todos.clone()
+    }
+
+    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
+        self.todos = todos;
+    }
+
+    fn spawn_agent<'a>(
+        &'a mut self,
+        _task: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "spawn_agent not supported in DummyToolContext"
+            ))
+        })
+    }
+
+    fn emit_update(&mut self, _partial: ToolDetails) {
+        // No-op: no production listener consumes ToolExecutionUpdate yet.
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 }

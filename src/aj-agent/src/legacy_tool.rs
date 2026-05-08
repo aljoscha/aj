@@ -28,7 +28,9 @@ use serde_json::Value;
 // without needing a direct `aj-ui` dependency.
 pub use aj_ui::{AjUi, TokenUsage, UsageSummary, UserOutput};
 
-use crate::tool::{derive_schema, TodoItem};
+use crate::tool::{derive_schema, TodoItem, ToolDetails, ToolOutcome};
+
+use aj_models::types::UserContent;
 
 /// Result of executing a legacy tool.
 ///
@@ -36,12 +38,30 @@ use crate::tool::{derive_schema, TodoItem};
 /// `tool_result` message, plus an optional list of `UserOutput`s that
 /// the persistence and rendering layers consume. New code should
 /// prefer [`crate::tool::ToolOutcome`].
+///
+/// During the §2.2 per-tool migration window, tools that have moved to
+/// the new [`crate::tool::ToolDefinition`] shape go through the
+/// `aj-tools::bridge` adapter, which surfaces the new tool's structured
+/// payload through the [`ToolResult::details`] and [`ToolResult::is_error`]
+/// fields below. Tools still on the legacy trait leave them at their
+/// defaults and the agent falls back to the same handling as before.
 pub struct ToolResult {
     /// Textual return value that flows back to the model as the tool
     /// result content.
     pub return_value: String,
     /// User-facing outputs accumulated during execution.
     pub user_outputs: Vec<aj_ui::UserOutput>,
+    /// Structured rendering payload produced by tools migrated to the
+    /// new [`crate::tool::ToolDefinition`] trait. The agent forwards
+    /// it verbatim onto the bus as the
+    /// [`crate::events::AgentEvent::ToolExecutionEnd`] result. Legacy
+    /// tools leave this at `None` and the agent synthesizes a
+    /// [`crate::tool::ToolDetails::Text`] from `return_value`.
+    pub details: Option<ToolDetails>,
+    /// Whether the migrated tool reported an error outcome. Legacy
+    /// tools leave this at `false`; their failures still arrive as a
+    /// returned `Err` from [`ToolDefinition::execute`].
+    pub is_error: bool,
 }
 
 impl ToolResult {
@@ -51,6 +71,8 @@ impl ToolResult {
         Self {
             return_value,
             user_outputs: Vec::new(),
+            details: None,
+            is_error: false,
         }
     }
 
@@ -60,6 +82,34 @@ impl ToolResult {
         Self {
             return_value,
             user_outputs,
+            details: None,
+            is_error: false,
+        }
+    }
+
+    /// Build a legacy [`ToolResult`] from a new-shape [`ToolOutcome`].
+    ///
+    /// `return_value` is the concatenation of the outcome's text
+    /// `UserContent` blocks (image content is dropped because the
+    /// legacy wire path doesn't carry it). The structured details and
+    /// error flag pass through verbatim. The bridge in `aj-tools` is
+    /// the only intended caller; once the agent is fully bus-driven
+    /// (§2.4) this and the surrounding type disappear.
+    pub fn from_outcome(outcome: ToolOutcome) -> Self {
+        let return_value = outcome
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::Text(t) => Some(t.text.as_str()),
+                UserContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        Self {
+            return_value,
+            user_outputs: Vec::new(),
+            details: Some(outcome.details),
+            is_error: outcome.is_error,
         }
     }
 }
