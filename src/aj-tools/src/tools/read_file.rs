@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+use crate::AjUi;
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Read the contents of a file from the local file system. If a file does not exist

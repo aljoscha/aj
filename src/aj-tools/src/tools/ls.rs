@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::AjUi;
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 List entries (files and directories) in a given directory path.

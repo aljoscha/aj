@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::SystemTime;
 
+use crate::AjUi;
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Recursively find files and directories matching a glob pattern.

@@ -47,7 +47,6 @@ version = "0.1.0"
 dependencies = [
  "aj-conf",
  "aj-models",
- "aj-tools",
  "aj-ui",
  "anyhow",
  "chrono",
@@ -102,7 +101,7 @@ dependencies = [
 name = "aj-tools"
 version = "0.1.0"
 dependencies = [
- "aj-ui",
+ "aj-agent",
  "anthropic-sdk",
  "anyhow",
  "chrono",

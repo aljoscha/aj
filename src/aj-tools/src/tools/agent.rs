@@ -2,8 +2,8 @@ use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::AjUi;
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Spawn a sub-agent to perform a specific task like research, analysis, or implementation.

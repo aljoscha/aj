@@ -25,8 +25,15 @@ and the git history.
       findings" below.
 - [x] (b) Move contract types into `aj-agent`: new `events`, `tool`,
       and `message` modules. Types are defined but not yet wired.
-- [ ] (c) Flip `aj-tools`'s dependency to `aj-agent` instead of
+- [x] (c) Flip `aj-tools`'s dependency to `aj-agent` instead of
       `aj-ui`. Tool implementations + `get_builtin_tools()` only.
+      Legacy contract types (`ToolDefinition`, `ToolResult`,
+      `ErasedToolDefinition`, `SessionContext`, `TurnContext`) moved
+      to `aj_agent::legacy_tool`; `ErasedToolDefinition` is now
+      `Clone` (Arc-shared closure) so sub-agents inherit the parent
+      toolset without re-calling `get_builtin_tools()`. `TodoItem` /
+      `TodoPriority` / `TodoStatus` are canonicalized in
+      `aj_agent::tool` and re-exported from `aj_tools::tools::todo`.
 - [ ] (a) Extract `aj-session` crate from today's
       `aj_models::conversation::*`, with a replay module returning
       `impl Iterator<Item = AgentEvent>`.

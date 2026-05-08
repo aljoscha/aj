@@ -1,8 +1,10 @@
 // New event-driven contract modules. These define the surface that
 // `aj-next` and the upcoming `aj-session` crate consume; the legacy
-// agent runtime below keeps using the older `aj-ui` / `aj-tools`
-// types until the bus migration in §2.1 of the aj-next plan.
+// agent runtime below keeps using the older `aj-ui` types and the
+// legacy tool trait (now re-homed in `crate::legacy_tool`) until the
+// bus migration in §2.1 of the aj-next plan.
 pub mod events;
+pub mod legacy_tool;
 pub mod message;
 pub mod tool;
 
@@ -17,12 +19,12 @@ use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
 use aj_models::ModelError;
 use aj_models::{Model, ThinkingConfig};
-use aj_tools::tools::todo::TodoItem;
-use aj_tools::{
-    get_builtin_tools, ErasedToolDefinition, SessionContext, ToolResult,
-    TurnContext as ToolTurnContext,
-};
 use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
+
+use crate::legacy_tool::{
+    ErasedToolDefinition, SessionContext, ToolResult, TurnContext as ToolTurnContext,
+};
+use crate::tool::TodoItem;
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
@@ -731,6 +733,14 @@ impl<UI: AjUi> Agent<UI> {
             return Err(anyhow!("tool not found!"));
         };
 
+        // Build the sub-agent tool template now (cheap clone: every
+        // `ErasedToolDefinition` field is `Clone`, with the closure
+        // sitting behind an `Arc`). Doing this before borrowing
+        // `self` mutably for the wrapper avoids field-aliasing
+        // borrows.
+        let sub_agent_tools: Vec<ErasedToolDefinition> =
+            self.tool_definitions.values().cloned().collect();
+
         // Create a wrapper that provides UI access to the session state
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_ctx: &mut self.session_state,
@@ -741,6 +751,7 @@ impl<UI: AjUi> Agent<UI> {
             system_prompt: self.system_prompt,
             disabled_tools: &self.disabled_tools,
             model: Arc::clone(&self.model),
+            sub_agent_tools,
         };
 
         // Create recording wrapper to capture UI output
@@ -1047,6 +1058,11 @@ struct SessionContextWrapper<'a, UI: AjUi> {
     system_prompt: &'static str,
     disabled_tools: &'a [String],
     model: Arc<dyn Model>,
+    /// Snapshot of the parent's tool list. Sub-agents inherit this
+    /// minus the `agent` tool. Cloning per-spawn is cheap because
+    /// every `ErasedToolDefinition` field is `Clone` and the closure
+    /// is `Arc`-shared.
+    sub_agent_tools: Vec<ErasedToolDefinition>,
 }
 
 impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
@@ -1075,12 +1091,18 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             // Create a sub-agent UI wrapper with the agent number
             let sub_ui = self.ui.get_subagent_ui(agent_id);
 
-            // Get tools excluding the agent tool to prevent infinite recursion,
-            // and also respect any tools the user has disabled via config.
+            // Build the sub-agent's tool list by cloning the parent's
+            // (the toolset is filtered upstream when the binary calls
+            // `Agent::new`), then dropping the `agent` tool itself to
+            // prevent infinite recursion. We clone rather than re-call
+            // `get_builtin_tools` so `aj-agent` doesn't depend on
+            // `aj-tools`.
             let disabled_tools = self.disabled_tools.to_vec();
-            let sub_agent_tools = get_builtin_tools()
-                .into_iter()
-                .filter(|tool| tool.name != "agent" && !disabled_tools.contains(&tool.name))
+            let sub_agent_tools: Vec<ErasedToolDefinition> = self
+                .sub_agent_tools
+                .iter()
+                .filter(|tool| tool.name != "agent")
+                .cloned()
                 .collect();
 
             // Create a new agent with the sub-agent UI. It shares this

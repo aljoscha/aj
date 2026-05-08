@@ -6,8 +6,8 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::AjUi;
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Execute a command in the system shell (bash). The command will be run in the

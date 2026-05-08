@@ -1,10 +1,13 @@
 //! Testing utilities for aj-tools.
+//!
+//! Provides no-op implementations of [`SessionContext`], [`TurnContext`],
+//! and [`AjUi`] so individual tools can be exercised from CLI bins
+//! and integration tests without standing up a full agent runtime.
 
 use std::path::PathBuf;
 
-use crate::tools::todo::TodoItem;
-use crate::{SessionContext, TurnContext};
-use aj_ui::{AjUi, TokenUsage, UsageSummary};
+use crate::{AjUi, SessionContext, TokenUsage, TurnContext, UsageSummary};
+use aj_agent::tool::TodoItem;
 
 /// A dummy implementation of SessionContext for testing and CLI tools.
 pub struct DummySessionContext;

@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+use crate::AjUi;
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::AjUi;
 
 const DESCRIPTION: &str = r#"
 Write a file to the local file system.

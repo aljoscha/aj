@@ -17,7 +17,7 @@ path = "src/bin/ls.rs"
 
 [dependencies]
 anthropic-sdk = { path = "../anthropic-sdk/" }
-aj-ui = { path = "../aj-ui/" }
+aj-agent = { path = "../aj-agent/" }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }

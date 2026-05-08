@@ -2,8 +2,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use termimad::crossterm::style::{Attribute, Stylize};
 
+use crate::AjUi;
 use crate::{SessionContext, ToolDefinition, ToolResult, TurnContext};
-use aj_ui::AjUi;
+
+// Re-export the canonical todo types from `aj-agent` so external
+// callers (and the new `aj_agent::tool::ToolDetails::Todos` shape)
+// share one definition. The legacy on-disk and wire-schema rendering
+// is identical: `TodoStatus` uses `kebab-case`, `TodoPriority` uses
+// `lowercase`.
+pub use aj_agent::tool::{TodoItem, TodoPriority, TodoStatus};
 
 /// Formats a list of todo items for display
 fn format_todo_list(todos: &[TodoItem]) -> String {
@@ -161,32 +168,4 @@ impl ToolDefinition for TodoWriteTool {
 
         Ok(ToolResult::new(result))
     }
-}
-
-#[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
-pub struct TodoItem {
-    pub id: String,
-    pub content: String,
-    pub priority: TodoPriority,
-    pub status: TodoStatus,
-}
-
-#[derive(JsonSchema, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum TodoPriority {
-    #[serde(rename = "low")]
-    Low,
-    #[serde(rename = "medium")]
-    Medium,
-    #[serde(rename = "high")]
-    High,
-}
-
-#[derive(JsonSchema, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum TodoStatus {
-    #[serde(rename = "todo")]
-    Todo,
-    #[serde(rename = "in-progress")]
-    InProgress,
-    #[serde(rename = "completed")]
-    Completed,
 }
