@@ -8,8 +8,10 @@
 
 pub mod legacy;
 pub mod provider;
+pub mod responses;
 
 // Re-exported so existing call sites that reference
 // `crate::openai::OpenAiModel` keep working without churn.
 pub use legacy::OpenAiModel;
 pub use provider::OpenAiCompletionsProvider;
+pub use responses::OpenAiResponsesProvider;

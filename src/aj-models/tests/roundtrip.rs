@@ -30,5 +30,8 @@ mod anthropic;
 #[path = "roundtrip/openai_completions.rs"]
 mod openai_completions;
 
+#[path = "roundtrip/openai_responses.rs"]
+mod openai_responses;
+
 #[path = "roundtrip/cross_provider.rs"]
 mod cross_provider;

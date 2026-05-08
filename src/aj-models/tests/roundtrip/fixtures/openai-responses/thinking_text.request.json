@@ -1,0 +1,20 @@
+[
+  {
+    "type": "reasoning",
+    "id": "rs_1",
+    "summary": [
+      {"text": "Considering the user request.", "type": "summary_text"}
+    ],
+    "encrypted_content": "opaque-blob",
+    "status": "completed"
+  },
+  {
+    "type": "message",
+    "id": "msg_2",
+    "role": "assistant",
+    "content": [
+      {"type": "output_text", "text": "The answer is 42."}
+    ],
+    "status": "completed"
+  }
+]

@@ -40,6 +40,10 @@ pub struct Client {
     client: ReqwestClient,
     api_key: String,
     base_url: String,
+    /// Extra request headers merged into every outgoing call.
+    /// Used by the Responses provider for session-correlation
+    /// headers (`session_id`, `x-client-request-id`).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl Client {
@@ -50,7 +54,21 @@ impl Client {
             client: ReqwestClient::new(),
             api_key,
             base_url,
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// Add a header to be sent with every request.
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    fn apply_extra_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in &self.extra_headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder
     }
 
     pub fn base_url(&self) -> String {
@@ -63,11 +81,12 @@ impl Client {
     ) -> Result<CreateChatCompletionResponse, anyhow::Error> {
         let url = format!("{}/chat/completions", self.base_url);
         debug_log_request(&url, &request);
-        let request_builder = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&request);
+        let request_builder = self.apply_extra_headers(
+            self.client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&request),
+        );
 
         let response = request_builder
             .send()
@@ -106,11 +125,12 @@ impl Client {
 
         let url = format!("{}/chat/completions", self.base_url);
         debug_log_request(&url, &request);
-        let request_builder = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&request);
+        let request_builder = self.apply_extra_headers(
+            self.client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&request),
+        );
 
         let response = request_builder.send().await?;
 
@@ -178,11 +198,12 @@ impl Client {
     ) -> Result<ResponsesResponse, anyhow::Error> {
         let url = format!("{}/responses", self.base_url);
         debug_log_request(&url, &request);
-        let request_builder = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&request);
+        let request_builder = self.apply_extra_headers(
+            self.client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&request),
+        );
 
         let response = request_builder
             .send()
@@ -221,11 +242,12 @@ impl Client {
 
         let url = format!("{}/responses", self.base_url);
         debug_log_request(&url, &request);
-        let request_builder = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&request);
+        let request_builder = self.apply_extra_headers(
+            self.client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&request),
+        );
 
         let response = request_builder.send().await?;
 

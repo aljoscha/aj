@@ -24,30 +24,26 @@ this file is the bridge between the spec and the git history.
 
 - [x] 7. Update `openai-sdk` — §7.1
 - [x] 8. Implement OpenAI Chat Completions provider (`aj-models::openai`) — §7.2
-- [ ] 8b. Implement OpenAI Responses provider (`aj-models::openai`) — §7.3.
-      The §12 plan didn't list this as a discrete step, but §3.4.3
-      mandates `api: "openai-responses"` for native OpenAI models, and
-      the bundled catalog reflects that — all 41 native OpenAI catalog
-      entries are `openai-responses`. Today `provider_for("openai-responses")`
-      returns `None`, so the new `Provider` trait can't drive any native
-      OpenAI model; only `openai-completions` (third-party-shape, no
-      catalog entries today) is wired. Implement against §7.3 — message
-      conversion (input array of typed items, system/developer prompt,
-      reasoning items round-tripped via `thinking_signature`, text
-      signatures via `TextSignatureV1`, composite tool-call IDs
-      `{call_id}|{item_id}`), request parameters (`reasoning.effort`,
-      `include: ["reasoning.encrypted_content"]`, `prompt_cache_key`,
-      `prompt_cache_retention`, `service_tier`, `store: false`),
-      session-correlation headers (§7.3 preface), the SSE event
-      mapping table (§7.3.6), usage parsing (§7.3.7), and the
-      `response.status` → `StopReason` mapping (§7.3.8). The legacy
-      `crate::openai::legacy::OpenAiModel` is already Responses-based
-      and can serve as a wire-mapping reference; round-trip §7.3.3
-      (encrypted reasoning), §7.3.4 (text signatures), §7.3.5
-      (composite IDs) need fresh implementation since they're
-      multi-turn-replay invariants the legacy code didn't have to care
-      about. Ship 11b.iv round-trip fixtures alongside (Responses
-      parse/serialize/semantic round-trip).
+- [x] 8b. Implement OpenAI Responses provider (`aj-models::openai`) — §7.3.
+      Lives in `src/aj-models/src/openai/responses.rs` and is wired
+      into `provider_for("openai-responses")`. Implements §7.3.1
+      message conversion (typed input array, system/developer
+      prompt, reasoning items round-tripped via
+      `thinking_signature`, text signatures via `TextSignatureV1`,
+      composite tool-call IDs `{call_id}|{item_id}`), §7.3.2
+      request parameters (`reasoning.effort`, `include`,
+      `prompt_cache_key`, `prompt_cache_retention`, `service_tier`,
+      `store: false`), the §7.3 session-correlation headers
+      (`session_id`, `x-client-request-id` on `api.openai.com`
+      only), the §7.3.6 SSE event mapping, §7.3.7 usage parsing
+      with service-tier cost multiplier, and §7.3.8
+      `response.status` → `StopReason` mapping. Public round-trip
+      helpers (`assistant_message_to_input_items`,
+      `parse_assistant_input_items`, `replay_sse_events`) plus
+      `TextSignatureV1` are exposed for the round-trip suite.
+      `openai-sdk::Client` got `with_extra_header` to plumb the
+      session-correlation headers without forking the streaming
+      path.
 
 ## Phase 4: Cross-Provider & Utilities
 
@@ -58,8 +54,7 @@ this file is the bridge between the spec and the git history.
    - [x] 11b.i. Scaffolding + Anthropic Messages: parse, serialize, semantic round-trip
    - [x] 11b.ii. OpenAI Chat Completions: parse, serialize, semantic round-trip
    - [x] 11b.iii. Cross-provider transform tests (one per direction)
-   - [ ] 11b.iv. OpenAI Responses: parse, serialize, semantic round-trip
-         (lands with step 8b)
+   - [x] 11b.iv. OpenAI Responses: parse, serialize, semantic round-trip
 
 ## Phase 5: Authentication
 

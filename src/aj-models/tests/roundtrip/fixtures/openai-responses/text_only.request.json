@@ -1,0 +1,11 @@
+[
+  {
+    "type": "message",
+    "id": "msg_text_1",
+    "role": "assistant",
+    "content": [
+      {"type": "output_text", "text": "Hello, world!"}
+    ],
+    "status": "completed"
+  }
+]
