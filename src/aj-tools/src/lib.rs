@@ -49,7 +49,7 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
         BashTool.into(),
         bridge::legacy_adapt(ReadFileTool),
         bridge::legacy_adapt(WriteFileTool),
-        EditFileTool.into(),
+        bridge::legacy_adapt(EditFileTool),
         EditFileMultiTool.into(),
         bridge::legacy_adapt(LsTool),
         bridge::legacy_adapt(GlobTool),

@@ -237,7 +237,31 @@ and the git history.
         overwrite happy paths, the relative-path and write-failure
         recoverable errors, and lock in the `Sequential` execution
         mode.
-  - [ ] `edit_file` (Diff)
+  - [x] `edit_file` (Diff). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Diff {
+        path, before, after }, is_error }` and no longer touches `AjUi`.
+        On success the wire `content` is the legacy `"Successfully
+        replaced '<old>' with '<new>' in file '<path>'"` summary so the
+        model still sees a deterministic confirmation; the structured
+        `Diff` carries the file's prior bytes as `before` and the post-
+        replacement bytes as `after`. Recoverable errors (path-not-
+        absolute, file-not-found, read-failure, zero matches, multiple
+        matches without `replace_all`, write-failure) come back as
+        `is_error: true` outcomes with `details::Text { summary, body }`
+        — same shape as `read_file`/`ls`/`glob`/`grep`/`todo_write`/
+        `write_file` validation failures — instead of bubbling an `Err`,
+        and the file is left untouched on every recoverable error path
+        (the disk write only runs once validation has fully passed).
+        `execution_mode()` is overridden to `ExecutionMode::Sequential`
+        per `docs/aj-next-plan.md` §1.3 so a batch containing it
+        serializes around any other in-flight tool calls. Wired into
+        `get_builtin_tools()` via `bridge::legacy_adapt(EditFileTool)`;
+        the bridge's existing `ToolDetails::Diff` arm renders through
+        `display_tool_result_diff`. Seven unit tests cover the single-
+        occurrence happy path, `replace_all` over multiple occurrences,
+        the relative-path / missing-file / no-match / multi-match-without-
+        `replace_all` recoverable errors, and lock in the `Sequential`
+        execution mode.
   - [ ] `edit_file_multi` (Diff)
   - [ ] `bash` (Bash)
 
