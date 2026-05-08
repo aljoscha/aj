@@ -5,6 +5,15 @@ in §2 (Phase 0), §4 (Phase 1), or §5 (Phase 2). Use `git log` for
 the authoritative state; this file is the bridge between the plan
 and the git history.
 
+> **Relationship to `models-progress.md`.** This file is the
+> commit-by-commit decomposition of `models-progress.md` Phase 6
+> (steps 16–18). The aj-next §2 rollout ends with `aj-agent`
+> migrated to the unified types and streaming protocol, which is
+> exactly what models-spec step 16 requires. Once §2.4–§2.6 land,
+> tick 16/17/18 in `models-progress.md`. Until then, **this is
+> the active tracking file**; pick the next unchecked item from
+> here.
+
 ## Phase 0 — refactor the core (§2)
 
 ### §2.0 Preparation

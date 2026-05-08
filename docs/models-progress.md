@@ -44,6 +44,23 @@ this file is the bridge between the spec and the git history.
 
 ## Phase 6: Integration
 
+> **Note for future sessions:** steps 16–18 are being executed as the
+> concrete commit-by-commit rollout in `docs/aj-next-plan.md` §2
+> (Phase 0 — refactor the core), tracked in
+> `docs/aj-next-progress.md`. The aj-next plan decomposes step 16
+> (`Update aj-agent`) into ~6 atomic commits — contract types →
+> tool migrations → bus → flip → split loop → cleanup — each of
+> which keeps the `aj` binary byte-identical along the way.
+> Models-spec step 16 itself acknowledges this dependency: "if [the
+> aj-session extraction] lands first, `aj-agent` no longer touches
+> `ConversationLog` directly and this step has nothing to update on
+> the persistence path." Pick the next item from
+> `aj-next-progress.md`; check 16/17/18 off here once §2.4–§2.6 of
+> the aj-next plan land.
+
 - [ ] 16. Update `aj-agent` — migrate to new types and streaming
+      (executed via aj-next §2.0–§2.5; see `aj-next-progress.md`)
 - [ ] 17. Update `aj` CLI — add provider flag, model registry
+      (executed via aj-next §2.5; see `aj-next-progress.md`)
 - [ ] 18. Remove old code — old messages, Model trait, StreamingEvent, etc.
+      (executed via aj-next §2.6; see `aj-next-progress.md`)
