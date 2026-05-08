@@ -15,6 +15,7 @@
 use std::any::Any;
 
 use aj_agent::tool::ToolDetails;
+use aj_tui::ansi::wrap_text_with_ansi;
 use aj_tui::component::Component;
 use aj_tui::keys::InputEvent;
 use aj_tui::style;
@@ -113,17 +114,51 @@ impl ToolExecutionComponent {
 impl Component for ToolExecutionComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<String> {
         let mut out = Vec::with_capacity(self.body.len() + 2);
         // Empty leading line so each tool call has visual breathing
         // room from the previous chat entry; matches the
         // user/assistant message padding rhythm.
         out.push(String::new());
-        out.push(self.header_line());
+
+        let header = self.header_line();
+        if width == 0 {
+            // Headless or zero-width edge case (the frame validator
+            // skips this terminal too). Emit lines verbatim and let
+            // the caller deal with downstream sizing.
+            out.push(header);
+            for line in &self.body {
+                out.push(format!("  {line}"));
+            }
+            return out;
+        }
+
+        // Wrap the header so a verbose argument summary (long
+        // `command="…"`, multi-field calls) doesn't overflow the
+        // terminal edge. Continuation lines fall back to column 0;
+        // that's fine since args are already truncated per-field
+        // and overflow stays the rare case.
+        out.extend(wrap_text_with_ansi(&header, width));
+
+        if width <= 2 {
+            // Too narrow to spare two columns for the body indent.
+            // Drop the indent rather than overflow the strict
+            // line-width check.
+            for line in &self.body {
+                out.extend(wrap_text_with_ansi(line, width));
+            }
+            return out;
+        }
+
+        // Wrap each body line to the indent-aware width so long
+        // tool output (e.g. clippy's `help: try: …` suggestions,
+        // wide file lines) doesn't blow past the terminal edge
+        // and trip the strict line-width check in `Tui::render`.
+        let body_width = width - 2;
         for line in &self.body {
-            // Indent body lines by two columns so they're clearly
-            // attached to the header.
-            out.push(format!("  {line}"));
+            for wrapped in wrap_text_with_ansi(line, body_width) {
+                out.push(format!("  {wrapped}"));
+            }
         }
         out
     }
@@ -334,5 +369,63 @@ mod tests {
         assert!(s.starts_with('"'));
         assert!(s.contains('…'));
         assert!(s.len() < long.len());
+    }
+
+    #[test]
+    fn body_lines_wider_than_width_get_wrapped_to_fit() {
+        // Regression: clippy / build output regularly contains
+        // single lines wider than the terminal (e.g. `help: try:
+        // ...` suggestions naming a fully-qualified type). The
+        // component must wrap them so the strict line-width check
+        // in `Tui::render` doesn't panic on the next frame.
+        let mut c = ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}));
+        let long_line = "x".repeat(300);
+        c.update_result(
+            &ToolDetails::Text {
+                summary: String::new(),
+                body: long_line.clone(),
+            },
+            false,
+        );
+        let width = 80;
+        let lines = c.render(width);
+        for (i, line) in lines.iter().enumerate() {
+            let w = aj_tui::ansi::visible_width(line);
+            assert!(
+                w <= width,
+                "line {i} exceeds width: {w} > {width}: {line:?}",
+            );
+        }
+        // Wrapped body lines stay indented by the component's
+        // two-column body indent so they still read as attached
+        // to the header.
+        assert!(
+            lines
+                .iter()
+                .map(|l| strip_ansi(l))
+                .filter(|l| l.contains('x'))
+                .all(|l| l.starts_with("  ")),
+        );
+    }
+
+    #[test]
+    fn header_wider_than_width_gets_wrapped_to_fit() {
+        // A long `description=` field can push the header past the
+        // terminal edge on its own. Make sure the wrap path covers
+        // the header line too.
+        let args = serde_json::json!({
+            "command": "echo hi",
+            "description": "x".repeat(200),
+        });
+        let mut c = ToolExecutionComponent::new("bash".to_string(), &args);
+        let width = 60;
+        let lines = c.render(width);
+        for (i, line) in lines.iter().enumerate() {
+            let w = aj_tui::ansi::visible_width(line);
+            assert!(
+                w <= width,
+                "line {i} exceeds width: {w} > {width}: {line:?}",
+            );
+        }
     }
 }
