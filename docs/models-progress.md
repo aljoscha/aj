@@ -44,6 +44,18 @@ this file is the bridge between the spec and the git history.
       `openai-sdk::Client` got `with_extra_header` to plumb the
       session-correlation headers without forking the streaming
       path.
+- [ ] 8c. Implement OpenAI Codex Responses provider
+      (`aj-models::openai::codex`) — §7.4. Lands as a new module
+      sharing helpers with `aj-models::openai::responses`; wires
+      `api: "openai-codex-responses"` into `provider_for`; renames
+      the OpenAI OAuth provider id from `"openai"` to
+      `"openai-codex"` (with `auth.json` migration); adds
+      `OPENAI_CODEX_OAUTH_TOKEN` env var to §9.5 mapping; seeds the
+      `provider: "openai-codex"` model catalog by hand and teaches
+      `aj models update` to preserve those entries (§3.4.7); adds
+      Codex parse / serialize / semantic round-trip fixtures.
+      WebSocket transport is explicitly out of scope (§7.4.8) — SSE
+      only.
 
 ## Phase 4: Cross-Provider & Utilities
 

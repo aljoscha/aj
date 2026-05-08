@@ -8,14 +8,18 @@ model registry, authentication (including OAuth), and cost tracking.
 
 - **Anthropic Messages API** (direct API key and OAuth/Claude Pro)
 - **OpenAI Responses API** — primary OpenAI surface. Used for all
-  native OpenAI models (direct API key and OAuth/ChatGPT Plus).
-  Preserves encrypted reasoning across turns.
+  native OpenAI models (direct API key). Preserves encrypted
+  reasoning across turns.
+- **OpenAI Codex Responses API** — ChatGPT Plus/Pro subscription
+  surface, addressed via OAuth JWT against `chatgpt.com/backend-api`.
+  Same Responses event shape as the public API; see §7.4.
 - **OpenAI Chat Completions API** — legacy surface. Kept for
   OpenAI-compatible third-party providers (Cerebras, Groq,
   OpenRouter, etc.) that only speak the Chat Completions shape.
   Reasoning is one-way here (see §7.2).
 - Provider-agnostic types that enable cross-provider conversation replay
-- OAuth flows for both Anthropic and OpenAI
+- OAuth flows for both Anthropic and OpenAI (the latter is
+  Codex-only — see §9.4)
 
 ---
 
@@ -777,12 +781,20 @@ For each provider, fixed values:
 |---|---|---|
 | `anthropic` | `"anthropic-messages"` | `"https://api.anthropic.com"` |
 | `openai` | `"openai-responses"` | `"https://api.openai.com/v1"` |
+| `openai-codex` | `"openai-codex-responses"` | `"https://chatgpt.com/backend-api"` |
 
 **One api per `(provider, id)`, no duplication.** The catalog
 contains exactly one `api` string per `(provider, id)` pair. Users
 do not pick between Chat Completions and Responses for a native
 OpenAI model; the provider's preferred API is hard-coded in the
 catalog. Native `openai` models use `"openai-responses"`.
+
+The `openai-codex` provider is a parallel entry in the catalog,
+not an override of `openai`: the same model id (e.g. `gpt-5.1`) may
+appear under both providers, distinguished by `(provider, id)`.
+They serve different credential pools (`OPENAI_API_KEY` versus the
+ChatGPT OAuth JWT) and different base URLs, so users pick a
+provider, not a model.
 
 If future third-party OpenAI-compatible providers (Cerebras, Groq,
 OpenRouter, etc.) are added, those get `"openai-completions"`
@@ -847,6 +859,18 @@ A catalog entry is included only if:
 Filtering runs during fetch (§3.4.2); the seed and user cache
 already contain only filtered entries, so the load path does not
 re-filter.
+
+**Codex models are seeded by hand, not from models.dev.** The
+`openai-codex` provider's model list (`gpt-5.1`, `gpt-5.1-codex-max`,
+`gpt-5.1-codex-mini`, `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.3-codex`,
+`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, plus any free preview models
+like `gpt-5.3-codex-spark`) is not exposed by models.dev. The
+refresh CLI (§3.4.5) preserves the existing Codex entries on every
+run: it filters them out of the upstream diff and re-emits them
+from a small seed list maintained alongside the overrides file.
+`context_window` is set to `272000` (the observed server cap, not
+the marketing number) and `max_tokens` to `128000`; pricing is
+hand-curated in the seed.
 
 ---
 
@@ -1542,6 +1566,208 @@ All other concerns (auth, cost calculation, context-overflow detection,
 partial-JSON parsing, tool call ID normalization) reuse the mechanisms
 in §3, §8, §10, and §11.
 
+### 7.4 Provider Implementation (OpenAI Codex Responses)
+
+**API identifier:** `openai-codex-responses` (known `api` string for `ModelInfo`).
+**Provider identifier:** `openai-codex` (distinct from `openai`; see §7.4.1).
+**Base URL:** `https://chatgpt.com/backend-api`. **Endpoint:** `POST /codex/responses`.
+
+The Codex backend is a separate deployment of the Responses API,
+gated to ChatGPT Plus/Pro subscribers and addressed via the OAuth
+JWT (not an API key). The wire format is mostly the public Responses
+shape from §7.3, with the differences enumerated below; everything
+not called out here behaves identically to §7.3 and reuses the same
+implementation paths (`convert_responses_messages`, the SSE event
+mapper, the reasoning round-trip helpers, the partial-JSON parser,
+the §10 error classifier, etc.).
+
+#### 7.4.1 Authentication & Identity
+
+The credential for this provider is the OAuth access token from the
+flow in §9.4 — a JWT, not an `sk-…` API key. Two consequences:
+
+1. **Provider id split.** OAuth credentials live under provider id
+   `"openai-codex"` in `auth.json`; plain `OPENAI_API_KEY` lives
+   under `"openai"`. The OAuth JWT is only valid against
+   `chatgpt.com/backend-api`, and a regular OpenAI API key is not
+   accepted there, so the two credential pools never overlap.
+   `OAuthProvider::id()` for the Codex flow therefore returns
+   `"openai-codex"` (this differs from the literal name of the
+   underlying authorize endpoint, but matches the model registry
+   provider).
+2. **Account id is read from the access token.** The JWT payload's
+   `claims["https://api.openai.com/auth"].chatgpt_account_id` claim
+   is decoded at request time and sent as the `chatgpt-account-id`
+   header. The same value is also persisted in
+   `OAuthCredentials.extra["accountId"]` (see §9.1) for diagnostics
+   and CLI display, but the request-time path re-decodes the JWT to
+   stay correct after token refresh.
+
+**Required request headers:**
+
+| Header | Value |
+|---|---|
+| `Authorization` | `Bearer <jwt access token>` |
+| `chatgpt-account-id` | `<account id decoded from JWT>` |
+| `originator` | `aj` (caller-chosen identifier; same value used by §9.4's authorize URL) |
+| `User-Agent` | `aj/<version> (<os> <release>; <arch>)` |
+| `OpenAI-Beta` | `responses=experimental` |
+| `Accept` | `text/event-stream` |
+| `Content-Type` | `application/json` |
+| `session_id`, `x-client-request-id` | `<StreamOptions.session_id>` when present (mirrors §7.3) |
+
+#### 7.4.2 Message Conversion
+
+Same shape as §7.3.1 (typed `input` array, reasoning items
+round-tripped via `thinking_signature`, composite tool-call IDs,
+images via `input_image`), with one difference: **the system prompt
+is sent as the top-level `instructions` request field, not as a
+`developer`/`system` input item.** The conversion helper used by the
+Responses provider must be invoked with an `include_system_prompt:
+false` flag (or equivalent) so the system prompt is omitted from the
+`input` array and surfaced in the request body instead (see §7.4.3).
+
+#### 7.4.3 Request Parameters
+
+```
+POST /codex/responses
+{
+  model: <model_id>,
+  instructions: <system_prompt or "You are a helpful assistant.">,
+  input: <converted messages, no system item>,
+  stream: true,
+  store: false,                     // mandatory; server rejects store: true
+  prompt_cache_key: <session_id or omit>,
+  service_tier: <"flex" | "priority" or omit>,
+  temperature: <if set>,
+  tools: [{type: "function", name, description, parameters}],
+  tool_choice: "auto",
+  parallel_tool_calls: true,
+  reasoning: {effort: <level>, summary: <reasoning_summary or "auto">},  // reasoning models only
+  include: ["reasoning.encrypted_content"],                              // when reasoning is enabled
+}
+```
+
+Differences from §7.3.2:
+
+- **`store` is hardcoded `false` and the server enforces it.** Passing
+  `true` returns HTTP 400 "Store must be set to false". The Codex
+  endpoint does not currently support server-side conversation
+  storage of any flavour, even though §7.3.2 keeps `store: false` as
+  a forward-compatible default.
+- **`prompt_cache_retention` is not sent.** The Codex backend does not
+  expose retention tuning; cache routing is driven entirely by
+  `prompt_cache_key`.
+- **`tools[*].strict` is omitted.** The Codex endpoint rejects
+  requests carrying `strict` on tool definitions, so we drop the
+  field for this provider only (§7.3.2 sends `strict: false`).
+- **`tool_choice` is always `"auto"`.** The Codex endpoint does not
+  currently honour tool-choice overrides; we send `"auto"` to keep
+  the wire format valid and rely on prompting/loop control to gate
+  tool use. Caller-supplied tool-choice values from `StreamOptions`
+  are ignored on this provider (this is a documented capability gap,
+  surfaced via §8.2 capability downgrade if/when it matters).
+- **`parallel_tool_calls: true` is sent unconditionally.**
+- **`text.verbosity` is omitted.** This leaves the OpenAI server
+  default in effect (mid-range) so answers aren't truncated. We
+  deliberately do *not* mirror the upstream client's `"low"` default
+  here; verbosity may later be exposed as an explicit
+  `StreamOptions` knob if a caller needs it.
+- **`max_output_tokens` is omitted.** The Codex endpoint does not
+  honour the field; the model is bounded by the per-model
+  `max_tokens` registry value and the server's own caps.
+
+All other Responses-shape behaviour (reasoning effort mapping,
+`include` requirement for reasoning round-trip, `prompt_cache_key`
+sourcing) carries over from §7.3.2 unchanged.
+
+#### 7.4.4 Service Tier Pricing
+
+Same `service_tier` knob as §7.3 with the same effective-tier
+resolution rule (response value wins; requested value falls back
+when the response reports `"default"`). The cost multipliers differ
+slightly because the Codex endpoint's pricing curve is not identical
+to the public Responses API:
+
+| Tier | Wire value | Cost multiplier (default) | Cost multiplier (`gpt-5.5`) |
+|---|---|---|---|
+| Flex | `"flex"` | 0.5× | 0.5× |
+| Priority | `"priority"` | 2× | 2.5× |
+| Standard | omit | 1× | 1× |
+
+The `gpt-5.5` exception is hard-coded in the provider's multiplier
+helper; all other Codex models use the default column.
+
+#### 7.4.5 Stream Event Mapping
+
+Reuses §7.3.6 with one normalization layer applied before the events
+reach the unified mapper:
+
+- `response.done` and `response.incomplete` are rewritten to
+  `response.completed` (the Codex backend emits the older event names
+  in places). The `response.status` field is normalized to one of
+  `{completed, incomplete, failed, cancelled, queued, in_progress}`
+  — anything else is treated as missing.
+- Top-level `error` events and `response.failed` events are surfaced
+  as terminal errors, not transport failures: extract
+  `{code, message}` (or `response.error.{code, message}`) and feed
+  them into the §10 classifier.
+- Everything else (`response.created`, `response.output_item.*`,
+  `response.output_text.delta`, `response.reasoning_summary_*`,
+  `response.function_call_arguments.*`, `response.completed`) flows
+  through §7.3.6 unchanged.
+
+#### 7.4.6 Error Mapping
+
+HTTP error responses follow the §10.3 OpenAI Chat Completions table
+(`401 → Auth`, `429 → RateLimit`, etc.) with one Codex-specific
+elaboration on 429:
+
+| `error.code` (or `error.type`) on 429 | Friendly message |
+|---|---|
+| `usage_limit_reached`, `usage_not_included`, `rate_limit_exceeded` | `You have hit your ChatGPT usage limit[ (<plan_type> plan)][. Try again in ~<N> min.]` |
+
+The friendly message is built from optional `error.plan_type` and
+`error.resets_at` fields when present (`resets_at` is a unix
+timestamp in seconds; minutes-until-reset is computed against
+current time). The category remains `RateLimit` (retryable) for
+`rate_limit_exceeded` and `Auth`/`InvalidRequest` for the usage-cap
+codes per the §10.3 mapping — only the `message` text is enriched.
+
+#### 7.4.7 Reused Behaviour
+
+The following behaviours are identical to §7.3 and require no
+Codex-specific code path:
+
+- §7.3.3 reasoning round-trip (encrypted content via `include`,
+  `thinking_signature` carries the full `ResponseReasoningItem`)
+- §7.3.4 text signatures (`TextSignatureV1`)
+- §7.3.5 composite tool-call IDs (`{call_id}|{item_id}`, `fc_` prefix
+  on `item_id`)
+- §7.3.7 usage parsing (`input_tokens` minus
+  `input_tokens_details.cached_tokens`, `cache_write` always 0)
+- §7.3.8 stop reason mapping
+- §10.5 context overflow detection
+- §11.1 partial JSON parsing for tool-call argument streams
+
+The implementation in `aj-models::openai::codex` should reuse the
+shared helpers from `aj-models::openai::responses` for all of the
+above; the Codex-specific module owns only the request shape, the
+header set, the auth path, the event normalization layer, the
+service-tier multiplier exception, and the friendly 429 message.
+
+#### 7.4.8 Out of Scope
+
+**WebSocket transport.** The Codex backend also exposes a WebSocket
+streaming surface (`OpenAI-Beta: responses_websockets=...`) with
+per-session connection caching and `previous_response_id`-based
+input-delta optimization. This is explicitly out of scope for the
+initial implementation: SSE-only. The provider does not negotiate,
+fall back to, or even acknowledge the WebSocket transport. If/when
+that changes, it'll land as its own spec section with its own
+progress tracking; until then, callers get straight POST + SSE on
+every turn.
+
 ---
 
 ## 8. Cross-Provider Message Transformation
@@ -1766,7 +1992,16 @@ trait OAuthCallbacks: Send + Sync {
 
 ### 9.4 OpenAI OAuth Flow (ChatGPT/Codex)
 
-**Protocol:** OAuth 2.0 Authorization Code + PKCE
+**Protocol:** OAuth 2.0 Authorization Code + PKCE.
+
+**Provider id:** the `OAuthProvider` for this flow returns
+`"openai-codex"` from `id()` and stores its credentials under that
+key in `auth.json`. The JWT it issues is only valid against
+`chatgpt.com/backend-api`; the regular `api.openai.com` endpoint
+does not accept it. There is therefore no OAuth flow under the
+`"openai"` provider id — that slot is reserved for the plain
+`OPENAI_API_KEY` credential. See §7.4.1 for how the credential is
+used at request time.
 
 1. Generate PKCE verifier + challenge
 2. Start local HTTP callback server on `127.0.0.1:1455` (this port is
@@ -1785,7 +2020,8 @@ trait OAuthCallbacks: Send + Sync {
 5. The returned **access token** is itself a JWT. Base64-decode the payload
    segment and read `claims["https://api.openai.com/auth"].chatgpt_account_id`
    to obtain the account ID.
-6. Store `{refresh, access, expires, accountId}` in auth.json
+6. Store `{refresh, access, expires, accountId}` in auth.json under
+   provider id `"openai-codex"`.
 
 **Token refresh:** POST form-urlencoded with `grant_type=refresh_token`.
 
@@ -1795,9 +2031,17 @@ trait OAuthCallbacks: Send + Sync {
 |----------|---------------------|
 | anthropic | `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY` |
 | openai | `OPENAI_API_KEY` |
+| openai-codex | `OPENAI_CODEX_OAUTH_TOKEN` |
 
 Per §9.1, any of these env vars overrides credentials stored in
 `auth.json`.
+
+`OPENAI_CODEX_OAUTH_TOKEN` is the JWT access token from the §9.4
+flow. It expires (typically within an hour) and cannot be
+refreshed without the refresh token, so the env-var path is
+primarily useful for tests and short-lived dev sessions; persistent
+use should rely on a stored credential refreshed on demand by the
+auth layer.
 
 ---
 
@@ -2082,6 +2326,47 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
    - Usage parsing with cached token subtraction
    - Stop reason mapping
 
+8c. **Implement OpenAI Codex Responses provider**
+    (`aj-models::openai::codex`): new module implementing the
+    `Provider` trait for `api: "openai-codex-responses"` per §7.4.
+    Reuses `aj-models::openai::responses` shared helpers
+    (`convert_responses_messages` invoked with `include_system_prompt
+    = false`, the SSE event mapper, the reasoning round-trip
+    helpers, partial JSON parsing) and only owns the Codex-specific
+    pieces:
+
+    - Request shape: `instructions` field, `store: false`,
+      `tool_choice: "auto"`, `parallel_tool_calls: true`, omit
+      `tools[*].strict`, omit `text.verbosity`, omit
+      `max_output_tokens`.
+    - Auth path: read the OAuth credential from `AuthStorage` under
+      provider id `"openai-codex"`, decode the JWT to lift
+      `chatgpt_account_id`, send `Authorization: Bearer …`,
+      `chatgpt-account-id`, `originator: aj`,
+      `User-Agent: aj/<version> (<os> <release>; <arch>)`,
+      `OpenAI-Beta: responses=experimental`.
+    - Event normalization layer that rewrites
+      `response.done` / `response.incomplete` to `response.completed`
+      and lifts `response.failed` / top-level `error` events into
+      classifier-ready terminal errors.
+    - Service-tier multiplier helper with the `gpt-5.5` priority-tier
+      exception (2.5×).
+    - Friendly 429 message for `usage_limit_reached` /
+      `usage_not_included` / `rate_limit_exceeded`, sourcing
+      `plan_type` and `resets_at` from the error body.
+    - Wire the new `api` string into `provider_for` (in
+      `aj-models::provider`) and add a Codex round-trip fixture
+      directory under `tests/roundtrip/fixtures/openai-codex/`
+      (parse / serialize / semantic round-trip mirroring step 11b).
+    - WebSocket transport is explicitly out of scope (§7.4.8); SSE only.
+
+    Catalog seeding: extend the `aj models update` refresh to
+    preserve Codex entries (§3.4.7) — bundle a hand-curated seed
+    list for `provider: "openai-codex"` covering the §7.4 model set,
+    re-emitted on every refresh so models.dev churn never deletes
+    them. `context_window: 272000`, `max_tokens: 128000`, pricing
+    per the seed.
+
 ### Phase 4: Cross-Provider & Utilities
 
 9. **Message transformation** (`aj-models::transform`): Implement
@@ -2142,7 +2427,13 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
 14. **OpenAI OAuth** (`aj-models::oauth::openai`): Implement the OpenAI
     Codex OAuth flow from §9.4 — local callback server, authorization
     URL construction, token exchange with form-urlencoded body, JWT
-    parsing for account ID, token refresh.
+    parsing for account ID, token refresh. The provider's `id()`
+    returns `"openai-codex"` (not `"openai"`) per §9.4 / §7.4.1, so
+    credentials are keyed under that string in `auth.json` and the
+    JWT is paired with the `openai-codex` inference provider. (If
+    this step has already shipped under id `"openai"`, step 8c
+    must include the rename and a one-time migration of any
+    pre-existing `auth.json` entries.)
 
 15. **Auth storage** (`aj-models::auth`): Implement `AuthStorage` from
     §9.1 — JSON file persistence with file locking, credential CRUD,
