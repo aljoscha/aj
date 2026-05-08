@@ -178,8 +178,41 @@ and the git history.
         `SubAgentReport`), the optional `description` input (kept for
         schema compat, doesn't affect the outcome), and the
         spawn-failure bubble-up path.
-  - [ ] `todo_read` (Todos + Text)
-  - [ ] `todo_write` (Todos + Text)
+  - [x] `todo_read` (Todos). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Todos {
+        items }, is_error }` and no longer touches `AjUi`. The wire
+        `content` carries the canonical text rendering of the list
+        (status symbols `-`/`›`/`✓`, priority suffix, and the
+        `"TODO list is empty."` marker for empty sessions) so the LLM
+        reads the full snapshot without needing to know about the
+        structured variant. `details::Todos { items }` carries the
+        same snapshot in structured form for the renderer /
+        persistence listener. Wired into `get_builtin_tools()` via
+        `bridge::legacy_adapt(TodoReadTool)`. The bridge's
+        `ToolDetails::Todos` arm now reuses the public
+        `format_todo_list` helper from `tools::todo` so the legacy
+        CLI display matches what the pre-migration code produced.
+        `format_todo_list` was promoted from a module-private helper
+        to a `pub` function so the bridge can share the rendering
+        without coupling to internal todo state.
+  - [x] `todo_write` (Todos / Text). Migrated to
+        `aj_agent::tool::ToolDefinition`; returns `ToolOutcome { content,
+        details: ToolDetails::Todos { items }, is_error }` and no
+        longer touches `AjUi`. The wire `content` carries
+        `"Updated todo list with N items.\n<formatted list>"` so the
+        model still sees both the confirmation and the post-update
+        rendering; `details::Todos { items }` carries the structured
+        snapshot for the UI / persistence layer. The "more than one
+        in-progress" validation now comes back as an `is_error: true`
+        outcome with `details::Text { summary, body }` — same
+        recoverable-error shape as `read_file`/`ls`/`glob`/`grep`
+        validation failures — instead of bubbling an `Err`. The
+        session's todo list is left untouched on validation failure.
+        Wired into `get_builtin_tools()` via
+        `bridge::legacy_adapt(TodoWriteTool)`. Five unit tests cover
+        the empty / populated read paths, list replacement, the
+        empty-list write, and the multi-in-progress validation
+        rejection.
   - [ ] `write_file` (Diff)
   - [ ] `edit_file` (Diff)
   - [ ] `edit_file_multi` (Diff)

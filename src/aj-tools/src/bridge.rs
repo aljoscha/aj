@@ -237,15 +237,14 @@ fn render_details_via_ui(
             }
         }
         ToolDetails::Todos { items } => {
-            let body = items
-                .iter()
-                .map(|item| format!("- [{:?}] {}", item.status, item.content))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // Reuse the canonical text rendering from the `todo` tool
+            // module so the legacy CLI display matches what the
+            // pre-migration code produced.
+            let body = crate::tools::todo::format_todo_list(items);
             if is_error {
-                ui.display_tool_error(tool_name, "todos", &body);
+                ui.display_tool_error(tool_name, "", &body);
             } else {
-                ui.display_tool_result(tool_name, "todos", &body);
+                ui.display_tool_result(tool_name, "", &body);
             }
         }
         ToolDetails::Json(value) => {

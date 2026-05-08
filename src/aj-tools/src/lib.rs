@@ -54,7 +54,7 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
         bridge::legacy_adapt(LsTool),
         bridge::legacy_adapt(GlobTool),
         bridge::legacy_adapt(GrepTool),
-        TodoReadTool.into(),
-        TodoWriteTool.into(),
+        bridge::legacy_adapt(TodoReadTool),
+        bridge::legacy_adapt(TodoWriteTool),
     ]
 }
