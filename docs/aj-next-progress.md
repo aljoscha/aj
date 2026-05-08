@@ -262,7 +262,42 @@ and the git history.
         the relative-path / missing-file / no-match / multi-match-without-
         `replace_all` recoverable errors, and lock in the `Sequential`
         execution mode.
-  - [ ] `edit_file_multi` (Diff)
+  - [x] `edit_file_multi` (Diff). Migrated to `aj_agent::tool::ToolDefinition`;
+        returns `ToolOutcome { content, details: ToolDetails::Diff {
+        path, before, after }, is_error }` and no longer touches `AjUi`.
+        On success the wire `content` is the legacy `"Successfully
+        applied N edits to file '<path>':\n<per-edit summaries>"` so the
+        model still sees a deterministic confirmation listing each
+        edit's `old_string` → `new_string` mapping; the structured
+        `Diff` carries the file's prior bytes as `before` and the
+        post-batch bytes (after every edit applied) as `after`. Edits
+        are still applied sequentially against the in-memory copy of
+        the file — each edit's `old_string` is matched against the
+        result of all prior edits, preserving the documented
+        "subsequent edits work on the state of the file after the
+        previous edit" contract. Recoverable errors (path-not-absolute,
+        file-not-found, read-failure, zero matches at any step,
+        multiple matches without `replace_all` at any step,
+        write-failure) come back as `is_error: true` outcomes with
+        `details::Text { summary, body }` — same shape as `read_file`/
+        `ls`/`glob`/`grep`/`todo_write`/`write_file`/`edit_file`
+        validation failures — instead of bubbling an `Err`, and the
+        file is left untouched on every recoverable error path
+        (the disk write only runs once every edit has fully validated,
+        upholding the documented "all edits applied atomically"
+        guarantee). `execution_mode()` is overridden to
+        `ExecutionMode::Sequential` per `docs/aj-next-plan.md` §1.3 so
+        a batch containing it serializes around any other in-flight
+        tool calls. Wired into `get_builtin_tools()` via
+        `bridge::legacy_adapt(EditFileMultiTool)`; the bridge's
+        existing `ToolDetails::Diff` arm renders through
+        `display_tool_result_diff`. Eight unit tests cover multiple
+        independent edits in source order, edits whose `old_string`
+        depends on a prior edit's `new_string` output, single
+        `replace_all` happy path, the relative-path / missing-file /
+        ambiguous-match recoverable errors, the mid-batch validation
+        failure (which must leave the file untouched), and lock in
+        the `Sequential` execution mode.
   - [ ] `bash` (Bash)
 
 ### §2.3 Drive the legacy CLI off the bus

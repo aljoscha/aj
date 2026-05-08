@@ -50,7 +50,7 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
         bridge::legacy_adapt(ReadFileTool),
         bridge::legacy_adapt(WriteFileTool),
         bridge::legacy_adapt(EditFileTool),
-        EditFileMultiTool.into(),
+        bridge::legacy_adapt(EditFileMultiTool),
         bridge::legacy_adapt(LsTool),
         bridge::legacy_adapt(GlobTool),
         bridge::legacy_adapt(GrepTool),
