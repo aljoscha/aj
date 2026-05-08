@@ -458,9 +458,69 @@ preserves the same end state.
 
 ### §2.4 Flip `Agent::run` to bus-only
 
-- [ ] Remove `self.ui` and `&mut ConversationLog` parameter from
-      `Agent`. The bus is the only output; `aj-session` is no longer
-      reached from `aj-agent`.
+Spec calls for one atomic commit. Splitting in two: §2.4a switches
+the agent's tool driving to the new `tool::ToolDefinition` /
+`tool::ToolContext` path so tool execution stops touching `AjUi`;
+§2.4b strips `self.ui` and the `Arc<TokioMutex<ConversationLog>>`
+parameter from the agent's outer surface and moves the readline
+loop, history display, and log management to the binary. The split
+mirrors §2.3a/§2.3b — §2.4a is a focused, well-tested refactor of
+the tool execution path; §2.4b is the larger ownership move that
+materializes the "agent is bus-only" end state.
+
+- [x] §2.4a: Switch the agent off the legacy tool trait. The
+      `tool_definitions` collection becomes
+      `HashMap<String, aj_agent::tool::ErasedToolDefinition>`;
+      `Agent::execute_tool` drives tools via the new trait,
+      returning `ToolOutcome { content, details, is_error }`.
+      `SessionContextWrapper` implements `tool::ToolContext`
+      (working dir, todos, sub-agent spawn, cancellation token,
+      `emit_update` no-op for now). `RecordingAjUi`, `BridgedTool`,
+      `LegacyContextBridge`, the `tool_details_for_legacy` helper,
+      the legacy `TurnContext` / `ToolTurnContext` impls, and the
+      entire `legacy_tool` module went away.
+      `aj-tools::get_builtin_tools()` returns the new
+      `ErasedToolDefinition` directly via blanket `Into` impls.
+      `aj-tools::testing` collapsed to just `DummyToolContext`
+      (legacy `DummySessionContext` / `DummyTurnContext` /
+      `DummyPermissionHandler` were dead after the migration).
+
+      `tool::ErasedToolDefinition` gained `Clone` (the closure
+      moved from `Box<...>` to `Arc<...>`) so the agent can clone
+      the parent's tool list per-spawn for sub-agents without
+      re-running `get_builtin_tools()`. The agent's tool execution
+      loop now constructs a `ToolOutcome` for both the success
+      path and the synthesized error paths (parse failure /
+      bubbled-up `Err`); the wire `tool_result` block carries the
+      text-flattened `outcome.content`, the bus's
+      `ToolExecutionEnd` event carries `outcome.details`
+      verbatim, and `MessagePersisted::UserOutput::ToolError`
+      still rides alongside synthesized errors so the on-disk
+      shape (37/37 freestanding `user_output` entries on disk are
+      `ToolError` per the §2.0 reconnaissance) keeps matching.
+
+      `Agent` gained a `cancellation: CancellationToken` field
+      surfaced through `ToolContext::cancellation`; sub-agents
+      receive a `child_token()` derived from the parent's per
+      `docs/aj-next-plan.md` §1.6 so a future `Agent::cancel()`
+      reaches the whole hierarchy. The `aj` binary's
+      `EventBridgeListener` keeps using
+      `aj_tools::bridge::render_details_via_ui` to project
+      `ToolDetails` onto the legacy `AjUi`. Self-tests update
+      `event_protocol_tests::PingTool` to the new trait shape and
+      lock the same end-to-end event sequence the §2.3 commits
+      already verified.
+
+      The agent retains `self.ui` for run-level orchestration
+      (notices, history display, readline loop, usage summary)
+      and still takes `Arc<TokioMutex<ConversationLog>>` as a
+      parameter — those both move out in §2.4b.
+- [ ] §2.4b: Remove `self.ui` and the `ConversationLog` parameter
+      from `Agent`. Move the readline loop, history display, and
+      log management to the binary; the agent uses an in-memory
+      transcript and emits `MessagePersisted::User` events for
+      user input. `aj-session` is no longer reached from
+      `aj-agent`.
 
 ### §2.5 Split agent loop from input loop
 

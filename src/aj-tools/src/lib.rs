@@ -1,26 +1,22 @@
 //! Built-in tool implementations for AJ.
 //!
-//! The trait surface (`ToolDefinition`, `ToolResult`,
-//! `ErasedToolDefinition`, `SessionContext`, `TurnContext`) and the
-//! `AjUi` re-export live in `aj_agent::legacy_tool`. This crate now
-//! contains only the concrete tool implementations and the
-//! [`get_builtin_tools`] catalog. See `docs/aj-next-plan.md` §2.0(c).
+//! Tools implement [`aj_agent::tool::ToolDefinition`] (per
+//! `docs/aj-next-plan.md` §1.2 / §1.3) and convert into the
+//! type-erased [`aj_agent::tool::ErasedToolDefinition`] for storage
+//! in the agent's heterogeneous tool collection. The agent drives
+//! them directly — there is no longer a legacy bridge layer in
+//! between.
 //!
-//! Tools migrated to the new [`aj_agent::tool::ToolDefinition`] shape
-//! (per `docs/aj-next-plan.md` §2.2) are wrapped via [`bridge::legacy_adapt`]
-//! so they appear identical to legacy tools at the catalog level until
-//! the agent runtime stops driving the legacy contract in §2.4.
-
-// Re-export the legacy contract so existing in-crate `use crate::{...}`
-// paths keep working without changes.
-pub use aj_agent::legacy_tool::{
-    AjUi, ErasedToolDefinition, SessionContext, TokenUsage, ToolDefinition, ToolResult,
-    TurnContext, UsageSummary, UserOutput,
-};
+//! [`bridge::render_details_via_ui`] survives as a tactical
+//! [`aj_agent::tool::ToolDetails`] → [`aj_ui::AjUi`] projection used
+//! by the binary's bus-listener while the legacy CLI sticks around;
+//! it disappears in §2.6 along with the rest of `aj-ui`.
 
 pub mod bridge;
 pub mod testing;
 pub mod tools;
+
+use aj_agent::tool::ErasedToolDefinition;
 
 pub use tools::agent::AgentTool;
 pub use tools::bash::BashTool;
@@ -41,20 +37,16 @@ pub use tools::write_file::WriteFileTool;
 /// function is called exactly once per process.
 pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
     vec![
-        // Tools migrated to the new `aj_agent::tool::ToolDefinition`
-        // shape are wrapped via the bridge so they appear identical to
-        // legacy tools at the catalog level. Un-migrated tools below
-        // still go through the legacy `.into()` path.
-        bridge::legacy_adapt(AgentTool),
-        bridge::legacy_adapt(BashTool),
-        bridge::legacy_adapt(ReadFileTool),
-        bridge::legacy_adapt(WriteFileTool),
-        bridge::legacy_adapt(EditFileTool),
-        bridge::legacy_adapt(EditFileMultiTool),
-        bridge::legacy_adapt(LsTool),
-        bridge::legacy_adapt(GlobTool),
-        bridge::legacy_adapt(GrepTool),
-        bridge::legacy_adapt(TodoReadTool),
-        bridge::legacy_adapt(TodoWriteTool),
+        AgentTool.into(),
+        BashTool.into(),
+        ReadFileTool.into(),
+        WriteFileTool.into(),
+        EditFileTool.into(),
+        EditFileMultiTool.into(),
+        LsTool.into(),
+        GlobTool.into(),
+        GrepTool.into(),
+        TodoReadTool.into(),
+        TodoWriteTool.into(),
     ]
 }

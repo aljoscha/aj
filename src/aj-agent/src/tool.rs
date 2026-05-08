@@ -11,6 +11,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use aj_models::types::UserContent;
 use schemars::generate::SchemaSettings;
@@ -255,7 +256,12 @@ pub trait ToolDefinition: Send + Sync {
 }
 
 /// Boxed-future signature used by [`ErasedToolDefinition::func`].
-pub type ErasedToolFn = Box<
+///
+/// Held behind an `Arc` so [`ErasedToolDefinition`] is cheaply
+/// cloneable: the agent clones the parent's tool list for each
+/// sub-agent it spawns (filtered to drop the `agent` tool itself),
+/// and bumping a refcount per tool keeps that path allocation-free.
+pub type ErasedToolFn = Arc<
     dyn for<'a> Fn(
             &'a mut dyn ToolContext,
             Value,
@@ -270,6 +276,7 @@ pub type ErasedToolFn = Box<
 ///
 /// Convert from a [`ToolDefinition`] via the blanket
 /// `From<T> for ErasedToolDefinition` impl.
+#[derive(Clone)]
 pub struct ErasedToolDefinition {
     pub name: String,
     pub description: String,
@@ -292,7 +299,7 @@ where
             description,
             input_schema,
             execution_mode,
-            func: Box::new(move |ctx, raw_input| {
+            func: Arc::new(move |ctx, raw_input| {
                 let parsed: Result<T::Input, _> = serde_json::from_value(raw_input);
                 let tool = tool.clone();
                 Box::pin(async move {

@@ -18,10 +18,10 @@
 //!   their events flow here too.
 //! - Reuses [`aj_tools::bridge::render_details_via_ui`] for
 //!   [`AgentEvent::ToolExecutionEnd`] so the rendered output is
-//!   byte-identical to what the in-tree
-//!   [`aj_tools::bridge::BridgedTool`] currently produces (today's
-//!   tools call into `AjUi` via that path; once §2.3a lands, the
-//!   bridged tool stops calling `AjUi` and the listener takes over).
+//!   byte-identical to what the legacy CLI produced before the bus
+//!   drove rendering — the same `display_tool_*` calls, just keyed
+//!   off the structured [`aj_agent::tool::ToolDetails`] payload the
+//!   tool returned.
 //! - Synchronously calls every render method, then resolves the
 //!   `Future` immediately. The bus awaits each listener inline, so
 //!   rendering is sequenced: the agent never moves on to the next

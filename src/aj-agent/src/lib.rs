@@ -1,11 +1,13 @@
-// New event-driven contract modules. These define the surface that
-// `aj-next` and the upcoming `aj-session` crate consume; the legacy
-// agent runtime below keeps using the older `aj-ui` types and the
-// legacy tool trait (now re-homed in `crate::legacy_tool`) until the
-// bus migration in §2.1 of the aj-next plan.
+// Event-driven contract modules consumed by `aj-next`, the
+// upcoming `aj-session` crate, and the in-tree `aj` binary. The
+// agent runtime in this file drives tools through the new
+// [`tool::ToolDefinition`] / [`tool::ToolContext`] surface; the
+// legacy `&mut dyn AjUi`-bound tool trait was retired in §2.4a of
+// the aj-next plan. `aj_ui::AjUi` itself stays alive for run-level
+// orchestration (notices, history display, readline loop, usage
+// summary) until §2.4b moves that responsibility to the binary.
 pub mod bus;
 pub mod events;
-pub mod legacy_tool;
 pub mod message;
 pub mod persistence;
 pub mod tool;
@@ -19,6 +21,7 @@ use aj_conf::{display_path, AgentEnv, ConfigThinkingLevel};
 use aj_models::messages::{ApiError, ContentBlock, ContentBlockParam, Message, Role, Usage};
 use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
+use aj_models::types::UserContent;
 use aj_models::ModelError;
 use aj_models::{Model, ThinkingConfig};
 use aj_session::{
@@ -29,15 +32,15 @@ use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
 use crate::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
-use crate::legacy_tool::{
-    ErasedToolDefinition, SessionContext, ToolResult, TurnContext as ToolTurnContext,
+use crate::tool::{
+    ErasedToolDefinition, SpawnedAgent, TodoItem, ToolContext, ToolDetails, ToolOutcome,
 };
-use crate::tool::{SpawnedAgent, TodoItem, ToolDetails};
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
+use tokio_util::sync::CancellationToken;
 
 pub struct Agent<UI: AjUi> {
     env: AgentEnv,
@@ -77,6 +80,15 @@ pub struct Agent<UI: AjUi> {
     /// shape, and §2.3 of `docs/aj-next-plan.md` swaps in production
     /// listeners for rendering and persistence.
     bus: EventBus,
+    /// Cancellation token surfaced to tools through
+    /// [`ToolContext::cancellation`]. Today the agent never fires
+    /// it: cancellation propagation lands in §1.8 of the aj-next
+    /// plan, but the field is wired through now so tools observing
+    /// `select!` against `ctx.cancellation()` compile cleanly.
+    /// Sub-agents inherit a child token derived from their parent's
+    /// (`docs/aj-next-plan.md` §1.6) so a single eventual `cancel()`
+    /// call reaches the whole hierarchy.
+    cancellation: CancellationToken,
 }
 
 impl<UI: AjUi> Agent<UI> {
@@ -130,6 +142,7 @@ impl<UI: AjUi> Agent<UI> {
             default_thinking,
             agent_id: AgentId::Main,
             bus: EventBus::new(),
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -472,7 +485,6 @@ impl<UI: AjUi> Agent<UI> {
         agent_id: Option<usize>,
     ) -> Result<(), TurnError> {
         self.session_state.turn_counter += 1;
-        let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
 
         // `TurnStart` mirrors entry to the assistant-message cycle.
         // The matching `TurnEnd` event (which carries the finalized
@@ -825,101 +837,124 @@ impl<UI: AjUi> Agent<UI> {
                         .await
                         .map_err(TurnError::Fatal)?;
 
-                    // For tool_use blocks resurrected from a parse
-                    // failure, skip execution and feed the parse error
-                    // back as the tool_result.
-                    let (tool_result, is_error) =
-                        if let Some(parse_err) = tool_use_parse_failures.remove(&tool_id) {
-                            let user_error_output = UserOutput::ToolError {
-                                tool_name: tool_name.clone(),
-                                input: "<malformed json>".to_string(),
-                                error: parse_err.clone(),
-                            };
-                            let tool_result = ToolResult {
-                                return_value: format!("Tool input parse error: {parse_err}"),
-                                user_outputs: vec![user_error_output],
-                                details: None,
-                                is_error: true,
-                            };
-                            (tool_result, true)
-                        } else {
-                            let tool_result = self
-                                .execute_tool(
-                                    Arc::clone(&log),
-                                    assistant_head.clone(),
-                                    &mut turn_ctx,
-                                    &tool_id,
-                                    &tool_name,
-                                    tool_input.clone(),
-                                )
-                                .await;
-
-                            match tool_result {
-                                Ok(result) => {
-                                    let is_error = result.is_error;
-                                    (result, is_error)
-                                }
-                                Err(err) => {
-                                    let user_error_output = UserOutput::ToolError {
-                                        tool_name: tool_name.clone(),
-                                        input: tool_input.to_string(),
-                                        error: err.to_string(),
-                                    };
-                                    let tool_result = ToolResult {
-                                        return_value: format!("{err}"),
-                                        user_outputs: vec![user_error_output],
-                                        details: None,
-                                        is_error: true,
-                                    };
-                                    (tool_result, true)
-                                }
-                            }
-                        };
-
-                    let result_content_block = ContentBlockParam::ToolResultBlock {
-                        tool_use_id: tool_id.to_owned(),
-                        content: tool_result.return_value.clone().into(),
-                        is_error,
-                    };
-
-                    tool_result_contents.push(result_content_block);
-
-                    // Persist each user_output the agent synthesized
-                    // (today only `UserOutput::ToolError` from
-                    // tool-call parse failures and tool-execution
-                    // errors — see the §2.0 reconnaissance findings
-                    // in `docs/aj-next-progress.md`). The persistence
-                    // listener writes one log line per emit.
-                    for out in tool_result.user_outputs.iter() {
+                    // Run the tool (or synthesize an error outcome for
+                    // tool_use blocks the streaming layer rejected
+                    // with a parse error). The agent now drives the
+                    // new [`tool::ToolDefinition`] surface end-to-end:
+                    // success and recoverable error both come back as
+                    // a [`ToolOutcome`] the rest of the loop projects
+                    // onto the wire `tool_result` block (text-flattened
+                    // `content`) and the bus
+                    // [`AgentEvent::ToolExecutionEnd`] event
+                    // (structured `details` + `is_error`).
+                    let outcome = if let Some(parse_err) = tool_use_parse_failures.remove(&tool_id)
+                    {
+                        // Persist a freestanding [`UserOutput::ToolError`]
+                        // for the legacy on-disk shape (per the §2.0
+                        // reconnaissance: every freestanding user_output
+                        // entry on disk is a `ToolError`). The §3
+                        // migration walker rewrites these into
+                        // structured `ToolDetails` entries.
                         self.bus
                             .emit(AgentEvent::MessagePersisted {
                                 agent_id: self.agent_id,
                                 kind: PersistedMessageKind::UserOutput {
-                                    output: out.clone(),
+                                    output: UserOutput::ToolError {
+                                        tool_name: tool_name.clone(),
+                                        input: "<malformed json>".to_string(),
+                                        error: parse_err.clone(),
+                                    },
                                 },
                             })
                             .await
                             .map_err(TurnError::Fatal)?;
-                    }
 
-                    // Mirror the tool result on the bus. Migrated
-                    // tools surface their own [ToolDetails] through
-                    // [ToolResult::details]; legacy tools fall back to
-                    // the [tool_details_for_legacy] projection of the
-                    // textual `return_value`. Once §2.2 of
-                    // `docs/aj-next-plan.md` finishes per-tool
-                    // migration, the fallback (and `tool_details_for_legacy`)
-                    // can go away.
-                    let bus_details = tool_result.details.clone().unwrap_or_else(|| {
-                        tool_details_for_legacy(&tool_name, &tool_result.return_value, is_error)
-                    });
+                        let body = format!("Tool input parse error: {parse_err}");
+                        ToolOutcome {
+                            content: vec![UserContent::text(body.clone())],
+                            details: ToolDetails::Text {
+                                summary: format!("{tool_name}: error"),
+                                body,
+                            },
+                            is_error: true,
+                        }
+                    } else {
+                        let result = self
+                            .execute_tool(
+                                Arc::clone(&log),
+                                assistant_head.clone(),
+                                &tool_id,
+                                &tool_name,
+                                tool_input.clone(),
+                            )
+                            .await;
+
+                        match result {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                // Same legacy persistence as the parse-failure path.
+                                self.bus
+                                    .emit(AgentEvent::MessagePersisted {
+                                        agent_id: self.agent_id,
+                                        kind: PersistedMessageKind::UserOutput {
+                                            output: UserOutput::ToolError {
+                                                tool_name: tool_name.clone(),
+                                                input: tool_input.to_string(),
+                                                error: err.to_string(),
+                                            },
+                                        },
+                                    })
+                                    .await
+                                    .map_err(TurnError::Fatal)?;
+
+                                let body = err.to_string();
+                                ToolOutcome {
+                                    content: vec![UserContent::text(format!("{err}"))],
+                                    details: ToolDetails::Text {
+                                        summary: format!("{tool_name}: error"),
+                                        body,
+                                    },
+                                    is_error: true,
+                                }
+                            }
+                        }
+                    };
+
+                    // Project the structured `content` onto the
+                    // legacy text-only `ToolResultContent::Text` shape
+                    // for the wire. The `details` ride directly on
+                    // the bus event below; persistence captures both
+                    // pieces (the wire content goes into the
+                    // synthesized user-role `ToolResult` message; the
+                    // structured details land via a future
+                    // `MessagePersisted::ToolDetails` once the on-disk
+                    // format catches up — see `docs/aj-next-plan.md`
+                    // §3 / §1.2).
+                    let return_value: String = outcome
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.as_str()),
+                            UserContent::Image(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    let result_content_block = ContentBlockParam::ToolResultBlock {
+                        tool_use_id: tool_id.to_owned(),
+                        content: return_value.into(),
+                        is_error: outcome.is_error,
+                    };
+
+                    tool_result_contents.push(result_content_block);
+
                     self.bus
                         .emit(AgentEvent::ToolExecutionEnd {
                             agent_id: self.agent_id,
                             call_id: tool_id.clone(),
                             tool: tool_name.clone(),
-                            result: bus_details,
-                            is_error,
+                            result: outcome.details,
+                            is_error: outcome.is_error,
                         })
                         .await
                         .map_err(TurnError::Fatal)?;
@@ -1104,11 +1139,10 @@ impl<UI: AjUi> Agent<UI> {
         &mut self,
         log: Arc<TokioMutex<ConversationLog>>,
         parent_head: EntryId,
-        turn_ctx: &mut dyn ToolTurnContext,
-        _tool_id: &str,
+        _call_id: &str,
         tool_name: &str,
         tool_input: serde_json::Value,
-    ) -> Result<ToolResult, anyhow::Error> {
+    ) -> Result<ToolOutcome, anyhow::Error> {
         let tool_def = if let Some(tool_def) = self.tool_definitions.get(tool_name) {
             tool_def
         } else {
@@ -1123,7 +1157,14 @@ impl<UI: AjUi> Agent<UI> {
         let sub_agent_tools: Vec<ErasedToolDefinition> =
             self.tool_definitions.values().cloned().collect();
 
-        // Create a wrapper that provides UI access to the session state
+        // Build the [`ToolContext`] the tool sees: working directory,
+        // todos, sub-agent spawn, cancellation token, no-op
+        // `emit_update`. The wrapper holds the still-required pieces
+        // for sub-agent spawning (parent log handle, parent head id,
+        // model, disabled tools, parent bus, parent agent id, sub-
+        // agent tool list, and a clone of the parent's UI for the
+        // sub-agent's `AjUi` while §2.4a leaves run-level
+        // orchestration on `self.ui`).
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_ctx: &mut self.session_state,
             ui: self.ui.shallow_clone(),
@@ -1136,34 +1177,11 @@ impl<UI: AjUi> Agent<UI> {
             sub_agent_tools,
             parent_bus: self.bus.clone(),
             parent_agent_id: self.agent_id,
+            cancellation: self.cancellation.child_token(),
         };
 
-        // Create recording wrapper to capture UI output
-        let mut recording_ui = RecordingAjUi::new(&mut self.ui);
-
-        let result = (tool_def.func)(
-            &mut session_ctx_wrapper,
-            turn_ctx,
-            &mut recording_ui,
-            tool_input,
-        )
-        .await?;
-
-        // Extract recorded outputs and add them to the result
-        // let recorded_outputs = recording_ui.take_recorded_outputs();
-        // let result_with_outputs = ToolResult::with_outputs(result.return_value, recorded_outputs);
-        // We rebuild the [ToolResult] with empty `user_outputs` (the
-        // recorder is currently disabled) but preserve `details` and
-        // `is_error` from migrated tools so the bus event in
-        // [Agent::execute_turn] gets the rich payload.
-        let result_with_outputs = ToolResult {
-            return_value: result.return_value,
-            user_outputs: Vec::new(),
-            details: result.details,
-            is_error: result.is_error,
-        };
-
-        Ok(result_with_outputs)
+        let outcome = (tool_def.func)(&mut session_ctx_wrapper, tool_input).await?;
+        Ok(outcome)
     }
 
     fn display_user_output(&mut self, user_outputs: &[UserOutput]) {
@@ -1505,19 +1523,23 @@ struct SessionContextWrapper<'a, UI: AjUi> {
     /// Clone of the parent agent's event bus. Used to emit
     /// [AgentEvent::SubAgentStart] / [AgentEvent::SubAgentEnd]
     /// correlation events on the parent's bus when this wrapper's
-    /// [SessionContext::spawn_agent] runs. The sub-agent itself owns
-    /// a separate bus today; per `docs/aj-next-plan.md` §1.6 those
-    /// will eventually unify, but the correlation events on the
-    /// parent's bus are sufficient for listeners to know a sub-agent
-    /// ran.
+    /// [ToolContext::spawn_agent] runs. Sub-agents share this bus
+    /// per `docs/aj-next-plan.md` §1.6 so every event a child emits
+    /// reaches the listeners the binary registered on the parent,
+    /// tagged with [`AgentId::Sub`].
     parent_bus: EventBus,
     /// Identifier of the parent agent that owns this wrapper. The
     /// `parent` field of [AgentEvent::SubAgentStart] /
     /// [AgentEvent::SubAgentEnd].
     parent_agent_id: AgentId,
+    /// Cancellation token surfaced through [`ToolContext::cancellation`].
+    /// Derived from the parent agent's token via
+    /// [`CancellationToken::child_token`] so a future `Agent::cancel`
+    /// reaches in-flight tools and any sub-agents they spawn.
+    cancellation: CancellationToken,
 }
 
-impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
+impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
     fn working_directory(&self) -> PathBuf {
         self.session_ctx.working_directory()
     }
@@ -1530,11 +1552,11 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
         self.session_ctx.set_todo_list(todos);
     }
 
-    fn spawn_agent(
-        &mut self,
+    fn spawn_agent<'b>(
+        &'b mut self,
         task: String,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<SpawnedAgent, anyhow::Error>> + Send + '_>,
+        Box<dyn std::future::Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'b>,
     > {
         Box::pin(async move {
             // Get the next agent ID
@@ -1633,26 +1655,23 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             result.map(|report| SpawnedAgent { agent_id, report })
         })
     }
-}
 
-/// Project a legacy [ToolResult] return value onto a [ToolDetails::Text]
-/// for [AgentEvent::ToolExecutionEnd] emission.
-///
-/// Today every tool returns a `String` `return_value`; we wrap that in
-/// the default rendering shape so listeners have a consistent payload
-/// to render. Once §2.2 of `docs/aj-next-plan.md` migrates each tool
-/// to [crate::tool::ToolOutcome], the per-tool implementation will
-/// pick a richer variant (`Diff`, `Bash`, `Todos`, …) and this helper
-/// disappears.
-fn tool_details_for_legacy(tool_name: &str, return_value: &str, is_error: bool) -> ToolDetails {
-    let summary = if is_error {
-        format!("{tool_name}: error")
-    } else {
-        tool_name.to_string()
-    };
-    ToolDetails::Text {
-        summary,
-        body: return_value.to_string(),
+    fn emit_update(&mut self, _partial: ToolDetails) {
+        // No-op for §2.4a. The trait's `emit_update` is synchronous
+        // but the bus's `emit` is async, so we cannot drive
+        // [`AgentEvent::ToolExecutionUpdate`] inline from a sync
+        // context without breaking the bus's "listeners are awaited
+        // inline" guarantee (firing the listener from a spawned task
+        // would let `Update` events arrive after `End`). Today only
+        // `bash` calls `emit_update`, the legacy CLI doesn't render
+        // it, and dropping the snapshot is functionally equivalent
+        // to the pre-§2.4a behavior. A bus-side `try_emit_sync` (or
+        // an async `emit_update` on the trait) lands when the TUI
+        // needs progress streaming.
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 }
 
@@ -1724,19 +1743,6 @@ fn repair_interrupted_tool_uses(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub struct TurnContext {
-    pub turn_id: usize,
-}
-
-impl TurnContext {
-    pub fn new(turn_id: usize) -> Self {
-        Self { turn_id }
-    }
-}
-
-impl ToolTurnContext for TurnContext {}
-
 /// Error returned from [Agent::execute_turn].
 ///
 /// `Recoverable` errors (model API failures, malformed streaming responses,
@@ -1781,148 +1787,6 @@ impl From<anyhow::Error> for TurnError {
     }
 }
 
-/// A wrapper around AjUi that records all UserOutput for later retrieval
-pub struct RecordingAjUi<'a> {
-    inner: &'a mut dyn AjUi,
-    recorded_outputs: Vec<UserOutput>,
-}
-
-impl<'a> RecordingAjUi<'a> {
-    pub fn new(inner: &'a mut dyn AjUi) -> Self {
-        Self {
-            inner,
-            recorded_outputs: Vec::new(),
-        }
-    }
-
-    pub fn take_recorded_outputs(&mut self) -> Vec<UserOutput> {
-        std::mem::take(&mut self.recorded_outputs)
-    }
-
-    fn record_output(&mut self, output: UserOutput) {
-        self.recorded_outputs.push(output);
-    }
-}
-
-impl<'a> AjUi for RecordingAjUi<'a> {
-    fn display_notice(&mut self, notice: &str) {
-        self.inner.display_notice(notice);
-        self.record_output(UserOutput::Notice(notice.to_string()));
-    }
-
-    fn display_warning(&mut self, warning: &str) {
-        self.inner.display_warning(warning);
-    }
-
-    fn display_error(&mut self, error: &str) {
-        self.inner.display_error(error);
-        self.record_output(UserOutput::Error(error.to_string()));
-    }
-
-    fn get_user_input(&mut self) -> Option<String> {
-        self.inner.get_user_input()
-    }
-
-    fn agent_text_start(&mut self, text: &str) {
-        self.inner.agent_text_start(text);
-    }
-
-    fn agent_text_update(&mut self, diff: &str) {
-        self.inner.agent_text_update(diff);
-    }
-
-    fn agent_text_stop(&mut self, text: &str) {
-        self.inner.agent_text_stop(text);
-    }
-
-    fn user_text_start(&mut self, text: &str) {
-        self.inner.user_text_start(text);
-    }
-
-    fn user_text_update(&mut self, diff: &str) {
-        self.inner.user_text_update(diff);
-    }
-
-    fn user_text_stop(&mut self, text: &str) {
-        self.inner.user_text_stop(text);
-    }
-
-    fn agent_thinking_start(&mut self, thinking: &str) {
-        self.inner.agent_thinking_start(thinking);
-    }
-
-    fn agent_thinking_update(&mut self, diff: &str) {
-        self.inner.agent_thinking_update(diff);
-    }
-
-    fn agent_thinking_stop(&mut self) {
-        self.inner.agent_thinking_stop();
-    }
-
-    fn display_tool_result(&mut self, tool_name: &str, input: &str, output: &str) {
-        self.inner.display_tool_result(tool_name, input, output);
-        self.record_output(UserOutput::ToolResult {
-            tool_name: tool_name.to_string(),
-            input: input.to_string(),
-            output: output.to_string(),
-        });
-    }
-
-    fn display_tool_result_diff(
-        &mut self,
-        tool_name: &str,
-        input: &str,
-        before: &str,
-        after: &str,
-    ) {
-        self.inner
-            .display_tool_result_diff(tool_name, input, before, after);
-        self.record_output(UserOutput::ToolResultDiff {
-            tool_name: tool_name.to_string(),
-            input: input.to_string(),
-            before: before.to_string(),
-            after: after.to_string(),
-        });
-    }
-
-    fn display_tool_error(&mut self, tool_name: &str, input: &str, error: &str) {
-        self.inner.display_tool_error(tool_name, input, error);
-        self.record_output(UserOutput::ToolError {
-            tool_name: tool_name.to_string(),
-            input: input.to_string(),
-            error: error.to_string(),
-        });
-    }
-
-    fn ask_permission(&mut self, message: &str) -> bool {
-        self.inner.ask_permission(message)
-    }
-
-    fn display_token_usage(&mut self, usage: &TokenUsage) {
-        self.inner.display_token_usage(usage);
-        self.record_output(UserOutput::TokenUsage(usage.clone()));
-    }
-
-    fn display_token_usage_summary(&mut self, summary: &UsageSummary) {
-        self.inner.display_token_usage_summary(summary);
-        self.record_output(UserOutput::TokenUsageSummary(summary.clone()));
-    }
-
-    fn get_subagent_ui(&mut self, _agent_number: usize) -> Box<dyn AjUi> {
-        // We could solve these by splitting them into it's own interface and
-        // only giving what is allowed to tools. But we have larger seafood to
-        // cook...
-        panic!("tools are not allowed to spawn subagent ui");
-    }
-
-    fn shallow_clone(&mut self) -> Box<dyn AjUi> {
-        // We could solve these by splitting them into it's own interface and
-        // only giving what is allowed to tools. But we have larger seafood to
-        // cook...
-        panic!("tools are not allowed to clone ui");
-    }
-}
-
 #[cfg(test)]
 mod event_protocol_tests {
     //! Snapshot the event protocol the agent emits on its bus.
@@ -1953,12 +1817,10 @@ mod event_protocol_tests {
 
     use crate::bus::listener_from_sync;
     use crate::events::{AgentEvent, AgentId, PersistedMessageKind};
-    use crate::legacy_tool::{
-        ErasedToolDefinition, SessionContext, ToolDefinition as LegacyToolDefinition, ToolResult,
-        TurnContext as LegacyTurnContext,
-    };
     use crate::persistence::persistence_listener;
-    use crate::tool::ToolDetails;
+    use crate::tool::{
+        ErasedToolDefinition, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+    };
     use crate::Agent;
 
     /// Stub AjUi that swallows every interaction. We assert against
@@ -2054,16 +1916,16 @@ mod event_protocol_tests {
         }
     }
 
-    /// Trivial tool that returns a fixed string. Mirrors the legacy
-    /// `ToolDefinition` trait so it can be passed through `Agent::new`
-    /// alongside the existing builtins.
+    /// Trivial tool that returns a fixed string. Implements the
+    /// new-shape [`ToolDefinition`] so the test exercises the same
+    /// driving path the production builtins go through.
     #[derive(Clone)]
     struct PingTool;
 
     #[derive(serde::Deserialize, schemars::JsonSchema)]
     struct PingInput {}
 
-    impl LegacyToolDefinition for PingTool {
+    impl ToolDefinition for PingTool {
         type Input = PingInput;
 
         fn name(&self) -> &'static str {
@@ -2074,14 +1936,19 @@ mod event_protocol_tests {
             "Test tool"
         }
 
-        fn execute(
+        async fn execute(
             &self,
-            _session_ctx: &mut dyn SessionContext,
-            _turn_ctx: &mut dyn LegacyTurnContext,
-            _ui: &mut dyn AjUi,
+            _ctx: &mut dyn ToolContext,
             _input: PingInput,
-        ) -> impl std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send {
-            async move { Ok(ToolResult::new("pong".to_string())) }
+        ) -> anyhow::Result<ToolOutcome> {
+            Ok(ToolOutcome {
+                content: vec![aj_models::types::UserContent::text("pong".to_string())],
+                details: ToolDetails::Text {
+                    summary: "ping".to_string(),
+                    body: "pong".to_string(),
+                },
+                is_error: false,
+            })
         }
     }
 
