@@ -967,6 +967,106 @@ adopts independently.
       in `aj-agent`).
 - [ ] Selectors (model/thinking/session) and theming.
 
+  Splitting along the same lines as §2.3a/b / §2.4a/b / §2.5a/b: each
+  selector is a self-contained unit with its own commit window, and
+  the theming refactor is an independent concern. Sub-bullets:
+
+  - [x] Phase 1.4a: Slash-command infrastructure + selector overlay
+        framework + thinking selector. Adds the slash-command
+        catalog, dispatcher, autocomplete provider, and the first
+        end-to-end selector flow.
+
+        **`aj-models`:** [`ThinkingConfig`] gained `PartialEq + Eq`
+        so the slash dispatcher's `SlashAction` enum can derive
+        equality (the test suite asserts on dispatched actions
+        directly).
+
+        **`aj-agent`:** new [`Agent::default_thinking`] getter and
+        [`Agent::set_default_thinking`] setter so the selector can
+        read the current level on open and apply the chosen level
+        on confirm. The setter takes effect on the next inference;
+        in-flight turns continue with whatever they were already
+        configured for.
+
+        **`aj-next/config/slash_commands.rs`:** new module owning
+        the slash-command catalog ([`BUILTIN_COMMANDS`]) and the
+        submit-time dispatcher ([`dispatch`]). `BUILTIN_COMMANDS`
+        carries six entries today (`/thinking`, `/model`,
+        `/session`, `/clear`, `/help`, `/quit`); each has a
+        description and optional argument hint surfaced in the
+        editor's autocomplete pop-up. [`build_autocomplete_provider`]
+        constructs a [`CombinedAutocompleteProvider`] from the
+        catalog so typing `/` opens the suggestion list and
+        `/thinking m` proposes `medium` and `max` via the inline
+        argument completer. [`dispatch`] returns a [`SlashAction`]
+        — `OpenThinkingSelector`, `SetThinking(level)`,
+        `NotYetImplemented { command, message }`, `Quit`,
+        `Unknown { input }`, `InvalidArgument { command, message }`
+        — that the host applies. The thinking-level catalog
+        ([`THINKING_LEVELS`]) is shared with the selector
+        component so descriptions stay in sync.
+
+        **`aj-next/.../components/thinking_selector.rs`:** new
+        [`ThinkingSelectorComponent`] wrapping
+        [`aj_tui::components::select_list::SelectList`]. The
+        component pre-selects the active level on open (marked
+        `(current)` so a no-op confirm is obvious), routes
+        Enter/Esc through the SelectList's `on_select` / `on_cancel`
+        callbacks into a shared `Arc<Mutex<Option<Outcome>>>` slot,
+        and exposes [`outcome_handle()`] so the host can poll the
+        outcome after each input event. Five unit tests cover
+        the highlight-current-on-open, Enter-confirms, Esc-cancels,
+        arrow-key-navigation, and off-is-selectable paths.
+
+        **`aj-next/modes/interactive.rs`:** wires the slash
+        catalogue into the editor on startup
+        ([`Editor::set_autocomplete_provider`]) and intercepts
+        `/...`-prefixed editor submissions in the main loop,
+        before the normal `agent.prompt(...)` branch. A
+        `OpenSelector` enum tracks the active overlay and the
+        host polls its outcome handle after every TUI input
+        event; on confirm the host hides the overlay via
+        [`Tui::hide_overlay`] (which restores focus to the
+        editor) and applies the result, on cancel it just hides
+        and stays put. `/quit` breaks the main loop;
+        `NotYetImplemented` and `Unknown` flow through
+        [`AgentEvent::Notice`] so the existing event pump
+        renders a dim status row in the chat scrollback. Slash
+        dispatch runs even mid-turn so `/quit` always works;
+        [`Agent::set_default_thinking`] takes a brief
+        `TokioMutex` lock alongside the agent's
+        prompt-running task without blocking the bus.
+
+        Seven new unit tests in `slash_commands::tests` cover
+        the dispatcher (quit, unknown, no-arg-opens-selector,
+        valid levels round-trip, invalid arguments, deferred
+        commands, level catalog round-trip, prefix completer).
+        `cargo build`, `cargo test -p aj-next`, `cargo fmt`,
+        and `cargo clippy -p aj-next --all-targets` all pass
+        clean.
+
+  - [ ] Phase 1.4b: Model selector. Drives off
+        [`aj_models::registry::ModelRegistry`] with an inline
+        fuzzy filter (matches `id`, `provider`, and
+        `provider/id`), respects `disabled_tools` style filtering
+        (none today; reserved for future auth-storage gating),
+        and applies the chosen model via a new
+        [`Agent::set_model`] setter.
+
+  - [ ] Phase 1.4c: Session selector. Loads threads via
+        [`aj_session::ConversationPersistence::list_threads`] with
+        a streaming progress indicator for the `list-all` case.
+        On select, the host swaps the active log + agent over to
+        the chosen thread (mirroring `aj-next continue <id>` but
+        without restarting the binary).
+
+  - [ ] Phase 1.4d: Configurable theme palette. Replace the
+        hard-coded closures in `config/theme.rs` with a
+        JSON-loaded palette (`vars` + `colors` semantic tokens),
+        wire fs-watcher hot-reload, and surface the active level
+        through the editor's border colour so `thinking` and
+        `bash` modes are visually distinct.
+
 ## Phase 2 — Cutover (§5)
 
 - [ ] Behavioral parity verification for daily flows.

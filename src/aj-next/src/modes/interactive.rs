@@ -36,16 +36,22 @@ use aj_session::{
 use aj_tools::get_builtin_tools;
 use aj_tui::components::editor::Editor;
 use aj_tui::terminal::ProcessTerminal;
-use aj_tui::tui::{Tui, TuiEvent};
+use aj_tui::tui::{OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, Tui, TuiEvent};
 use anyhow::{Context, Result};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command};
-use crate::config::theme::markdown_theme;
+use crate::config::slash_commands::{
+    SlashAction, build_autocomplete_provider, dispatch as slash_dispatch, thinking_level_name,
+};
+use crate::config::theme::{markdown_theme, select_list_theme};
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
+use crate::modes::interactive::components::thinking_selector::{
+    OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
+};
 use crate::modes::interactive::event_pump::{
     EventPump, set_editor_submit_enabled, take_submitted_prompt,
 };
@@ -192,6 +198,16 @@ impl InteractiveMode {
             .map_err(|e| anyhow::anyhow!("failed to start terminal: {e}"))?;
         build_layout(&mut tui);
 
+        // Install the slash-command autocomplete provider on the
+        // editor. Every recognised command (/thinking, /model, …)
+        // pops up as a suggestion when the user types `/` at the
+        // start of the prompt; argument completion (e.g. `/thinking
+        // m` → medium) flows through the same provider.
+        if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+            let provider = build_autocomplete_provider(agent.env().working_directory.clone());
+            editor.set_autocomplete_provider(Arc::new(provider));
+        }
+
         // Header: thread id + resume/start banner. Footer: model +
         // working directory (initial snapshot; richer state lands
         // alongside `footer_data` in a follow-up).
@@ -238,6 +254,13 @@ impl InteractiveMode {
         // queue up before steering/follow-up land.
         let mut running_task: Option<tokio::task::JoinHandle<Result<(), TurnError>>> = None;
         let mut run_result: Result<()> = Ok(());
+
+        // Slash commands like `/thinking` open an overlay selector.
+        // While an overlay is up the editor is not focused, but
+        // `tui.show_overlay` already routes input to the overlay,
+        // so the main loop's job is just to poll the outcome slot
+        // after every input event and close the overlay on result.
+        let mut open_selector: Option<OpenSelector> = None;
 
         loop {
             // Build a future that resolves when the agent task
@@ -314,6 +337,29 @@ impl InteractiveMode {
                             }
                             tui.handle_input(&input);
 
+                            // If a selector overlay is open, the
+                            // input was just routed to it. Poll
+                            // the overlay's outcome slot; on a
+                            // confirm/cancel, close it and apply
+                            // the result.
+                            if let Some(sel) = open_selector.take() {
+                                match handle_selector_outcome(
+                                    &mut tui,
+                                    sel,
+                                    Arc::clone(&agent),
+                                ).await {
+                                    SelectorPollOutcome::StillOpen(reopened) => {
+                                        open_selector = Some(reopened);
+                                    }
+                                    SelectorPollOutcome::Closed { notice } => {
+                                        if let Some(text) = notice {
+                                            pump.handle(&mut tui, &notice_event(&text));
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
                             // The editor swallows printable
                             // input and re-emits a `Submit` when
                             // the user presses Enter. Drain it
@@ -323,6 +369,34 @@ impl InteractiveMode {
                                 if trimmed.is_empty() {
                                     continue;
                                 }
+
+                                // Slash-command branch — dispatch
+                                // before checking `running_task`
+                                // so `/quit` works even mid-turn.
+                                if trimmed.starts_with('/') {
+                                    if let Some(editor) = tui.get_mut_as::<Editor>(
+                                        SlotIndex::Editor.idx()
+                                    ) {
+                                        editor.set_text("");
+                                    }
+                                    match handle_slash_command(
+                                        &mut tui,
+                                        Arc::clone(&agent),
+                                        &trimmed,
+                                    ).await {
+                                        SlashHandled::Continue { selector, notice } => {
+                                            if let Some(text) = notice {
+                                                pump.handle(&mut tui, &notice_event(&text));
+                                            }
+                                            if let Some(sel) = selector {
+                                                open_selector = Some(sel);
+                                            }
+                                        }
+                                        SlashHandled::Quit => break,
+                                    }
+                                    continue;
+                                }
+
                                 if running_task.is_some() {
                                     // Already running a turn;
                                     // ignore the second submit.
@@ -378,4 +452,136 @@ impl InteractiveMode {
 /// that as a transient blip and keeps the TUI alive.
 async fn recv_event(rx: &mut UnboundedReceiver<AgentEvent>) -> Option<AgentEvent> {
     rx.recv().await
+}
+
+/// State for an active selector overlay.
+///
+/// Each variant pairs the overlay's [`OverlayHandle`] (so the host
+/// can hide it on completion) with a typed outcome handle that the
+/// component populates when the user confirms or cancels.
+enum OpenSelector {
+    Thinking {
+        handle: OverlayHandle,
+        outcome: ThinkingOutcomeHandle,
+    },
+}
+
+/// Result of dispatching a `/...`-prefixed editor submission.
+enum SlashHandled {
+    /// Stay in the main loop. Optionally present a transient notice
+    /// to the chat scrollback and/or open a selector overlay.
+    Continue {
+        selector: Option<OpenSelector>,
+        notice: Option<String>,
+    },
+    /// User asked to quit; the host breaks out of the loop.
+    Quit,
+}
+
+/// Result of polling an open selector after a TUI input event.
+enum SelectorPollOutcome {
+    /// The selector is still waiting for input.
+    StillOpen(OpenSelector),
+    /// The selector closed (confirmed or cancelled). The optional
+    /// notice describes what happened so the host can render a
+    /// status line in the chat scrollback.
+    Closed { notice: Option<String> },
+}
+
+/// Wrap a notice string in the [`AgentEvent::Notice`] shape so we
+/// can route it through the existing event pump for rendering. The
+/// pump's `Notice` arm appends a dim text row to the chat slot,
+/// which is exactly the look we want for slash-command status
+/// feedback.
+fn notice_event(text: &str) -> AgentEvent {
+    AgentEvent::Notice {
+        agent_id: aj_agent::events::AgentId::Main,
+        text: text.to_string(),
+    }
+}
+
+/// Dispatch a freshly-submitted slash-prefixed line.
+async fn handle_slash_command(
+    tui: &mut Tui,
+    agent: Arc<TokioMutex<Agent>>,
+    text: &str,
+) -> SlashHandled {
+    match slash_dispatch(text) {
+        SlashAction::OpenThinkingSelector => {
+            let current = {
+                let a = agent.lock().await;
+                a.default_thinking()
+            };
+            let component = ThinkingSelectorComponent::new(select_list_theme(), current);
+            let outcome = component.outcome_handle();
+            let options = OverlayOptions {
+                anchor: OverlayAnchor::Center,
+                width: Some(SizeValue::Absolute(60)),
+                ..OverlayOptions::default()
+            };
+            let handle = tui.show_overlay(Box::new(component), options);
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::Thinking { handle, outcome }),
+                notice: None,
+            }
+        }
+        SlashAction::SetThinking(level) => {
+            let mut a = agent.lock().await;
+            let name = thinking_level_name(&level);
+            a.set_default_thinking(level);
+            SlashHandled::Continue {
+                selector: None,
+                notice: Some(format!("Thinking level set to {name}.")),
+            }
+        }
+        SlashAction::NotYetImplemented { message, .. } => SlashHandled::Continue {
+            selector: None,
+            notice: Some(message.to_string()),
+        },
+        SlashAction::Quit => SlashHandled::Quit,
+        SlashAction::Unknown { input } => SlashHandled::Continue {
+            selector: None,
+            notice: Some(format!(
+                "Unknown command: {input}. Try /help for available commands."
+            )),
+        },
+        SlashAction::InvalidArgument { message, .. } => SlashHandled::Continue {
+            selector: None,
+            notice: Some(message),
+        },
+    }
+}
+
+/// Poll an open selector for its outcome and apply the result.
+///
+/// Returns [`SelectorPollOutcome::StillOpen`] if the user hasn't
+/// pressed Enter or Esc yet; [`SelectorPollOutcome::Closed`] if the
+/// overlay completed, with an optional notice describing what
+/// happened.
+async fn handle_selector_outcome(
+    tui: &mut Tui,
+    selector: OpenSelector,
+    agent: Arc<TokioMutex<Agent>>,
+) -> SelectorPollOutcome {
+    match selector {
+        OpenSelector::Thinking { handle, outcome } => {
+            let outcome_value = outcome.lock().expect("thinking outcome poisoned").take();
+            match outcome_value {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Thinking { handle, outcome }),
+                Some(ThinkingSelectorOutcome::Confirmed(level)) => {
+                    tui.hide_overlay(&handle);
+                    let mut a = agent.lock().await;
+                    let name = thinking_level_name(&level);
+                    a.set_default_thinking(level);
+                    SelectorPollOutcome::Closed {
+                        notice: Some(format!("Thinking level set to {name}.")),
+                    }
+                }
+                Some(ThinkingSelectorOutcome::Cancelled) => {
+                    tui.hide_overlay(&handle);
+                    SelectorPollOutcome::Closed { notice: None }
+                }
+            }
+        }
+    }
 }

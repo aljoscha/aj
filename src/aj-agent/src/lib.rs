@@ -322,6 +322,28 @@ impl Agent {
         &self.env
     }
 
+    /// Borrow the agent's current default thinking configuration.
+    ///
+    /// `None` means "no extended thinking unless a trigger word in
+    /// the user's message escalates it". The selector overlays in
+    /// the new TUI read this to highlight the active level when
+    /// opening; the binary passes it into the footer for the
+    /// startup banner.
+    pub fn default_thinking(&self) -> Option<ThinkingConfig> {
+        self.default_thinking.clone()
+    }
+
+    /// Replace the agent's default thinking configuration mid-
+    /// session.
+    ///
+    /// Used by the interactive `/thinking` selector to retune the
+    /// reasoning budget without restarting the session. Takes
+    /// effect on the next inference; in-flight turns continue with
+    /// whatever they were already configured for.
+    pub fn set_default_thinking(&mut self, level: Option<ThinkingConfig>) {
+        self.default_thinking = level;
+    }
+
     /// Append `message` as a user-role text input to the transcript
     /// and run one assistant turn against it.
     ///

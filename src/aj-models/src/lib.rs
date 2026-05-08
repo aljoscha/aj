@@ -50,7 +50,7 @@ pub trait Model: Send + Sync {
 }
 
 /// Thinking configuration for models that support it
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingConfig {
     Low,
     Medium,
