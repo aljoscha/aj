@@ -19,8 +19,8 @@
 //! that today's agent uses to decide thinking budgets and resume
 //! state.
 
+use aj_agent::types::UserOutput;
 use aj_models::messages::{ContentBlockParam, MessageParam, Role};
-use aj_ui::UserOutput;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

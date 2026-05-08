@@ -52,8 +52,8 @@ use std::collections::HashMap;
 
 use aj_agent::events::{AgentEvent, AgentId, StreamAction, StreamChannel};
 use aj_agent::tool::ToolDetails;
+use aj_agent::types::UserOutput;
 use aj_models::messages::{ContentBlockParam, Role};
-use aj_ui::UserOutput;
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationLog, ThreadKind};
 
@@ -349,8 +349,8 @@ mod tests {
     use super::*;
     use crate::log::{ConversationLog, ConversationView};
     use crate::persistence::ConversationPersistence;
+    use aj_agent::types::UserOutput;
     use aj_models::messages::{ContentBlockParam, ToolResultContent};
-    use aj_ui::UserOutput;
     use serde_json::json;
     use std::path::PathBuf;
 

@@ -1,8 +1,7 @@
 use aj::cli::AjCli;
-use aj_ui::AjUi;
 
 fn main() {
-    let mut ui = AjCli::with_empty_history();
+    let ui = AjCli::with_empty_history();
 
     let markdown_text = r#"# Example Markdown Output
 

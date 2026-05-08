@@ -1,4 +1,4 @@
-use aj_ui::{SubAgentUsage, TokenUsage, UsageSummary};
+use aj_agent::types::{SubAgentUsage, TokenUsage, UsageSummary};
 use console::{Color, style};
 use similar::{ChangeTag, TextDiff};
 use termimad::{Alignment, MadSkin};

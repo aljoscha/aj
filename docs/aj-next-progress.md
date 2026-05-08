@@ -714,9 +714,58 @@ adopts independently.
 
 ### §2.6 Cleanup
 
-- [ ] Delete `RecordingAjUi`.
-- [ ] Delete `aj-ui` crate; absorb types into `aj-agent`.
-- [ ] Replace `AjCli` trait impl with a plain `Renderer` struct.
+- [x] Delete `RecordingAjUi`. Already gone in §2.4a (alongside the
+      `BridgedTool` / `LegacyContextBridge` removal); recorded here
+      for tracking-doc completeness.
+- [x] Delete `aj-ui` crate; absorb types into `aj-agent`. The `AjUi`
+      trait, `AjUiAskPermission` blanket impl, and `Box<dyn AjUi>`
+      forwarding impl are gone with the crate. The data shapes that
+      were riding on the trait's signatures moved into a new
+      `aj_agent::types` module: `TokenUsage` (carried on
+      `AgentEvent::TurnUsage`), `UserOutput` (carried on
+      `PersistedMessageKind::UserOutput` and on the on-disk
+      `ConversationEntryKind::UserOutput` until the §3 walker rewrites
+      them), and the structured-totals pair `SubAgentUsage` /
+      `UsageSummary` (used by the binary's end-of-session summary).
+      `aj-session`, `aj-tools`, and `aj` all dropped their `aj-ui`
+      dependency; the workspace `Cargo.toml` no longer lists it.
+
+      The `aj_tools::bridge::render_details_via_ui` rendering helper
+      moved out of `aj-tools` (which is now wire-only — tool
+      implementations + `get_builtin_tools()`) into the binary's
+      `event_bridge.rs`. It now takes a concrete `&AjCliCommon`
+      instead of `&mut dyn AjUi`; the binary calls
+      `aj_tools::tools::todo::format_todo_list` directly for the
+      `Todos` arm.
+- [x] Replace `AjCli` trait impl with a plain `Renderer` struct.
+      `AjCli` keeps its `{ history, common }` shape but the entire
+      `impl AjUi for AjCli` block is gone — the struct exposes
+      inherent methods directly (`display_notice`, `display_warning`,
+      `display_error`, `display_token_usage_summary`,
+      `agent_text_stop`, `display_tool_result_diff`,
+      `get_user_input`). A new `AjCli::renderer()` returns a clone
+      of the inner `AjCliCommon` for listeners that need to render
+      without pulling in the readline loop.
+
+      `SubAgentCli` (the per-sub-agent trait wrapper) is deleted
+      outright: the bus listener now holds an `AjCliCommon` directly
+      for the main agent and a `HashMap<usize, AjCliCommon>` of
+      lazily-constructed renderers for each `Sub(n)`. The sub-agent
+      flavour reuses `AjCliCommon::new(Some(format!("(sub agent
+      {n})")), false, false)` — the same prefix and compact output
+      profile the deleted wrapper produced — so rendered output for
+      nested transcripts is byte-identical.
+
+      `EventBridgeListener::new` now takes an `AjCliCommon` (cheaper
+      than the prior `Box<dyn AjUi>`); `main.rs` builds it via
+      `EventBridgeListener::new(ui.renderer())`. The two test
+      binaries (`bin/test_diff.rs`, `bin/test_markdown.rs`) drive
+      `AjCli`'s inherent methods directly without the trait import.
+      The existing `cli_common::AjCliCommon` keeps its
+      `ask_permission` helper as a concrete CLI utility (the trait
+      `AjUiAskPermission` is gone but the inherent permission
+      prompt stays available for future interactive needs — see §1.7
+      "Permissions: dropped").
 
 ## Phase 1 — `aj-next` (§4)
 

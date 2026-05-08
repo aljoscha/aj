@@ -173,8 +173,8 @@ mod tests {
 
     use aj_agent::bus::EventBus;
     use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind};
+    use aj_agent::types::UserOutput;
     use aj_models::messages::{ContentBlockParam, Role};
-    use aj_ui::UserOutput;
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 

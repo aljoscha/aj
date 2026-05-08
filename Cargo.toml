@@ -8,7 +8,6 @@ members = [
     "src/aj-tools",
     "src/anthropic-sdk",
     "src/openai-sdk",
-    "src/aj-ui",
     "src/aj-tui",
 ]
 resolver = "2"

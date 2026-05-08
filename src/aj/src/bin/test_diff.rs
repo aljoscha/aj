@@ -1,8 +1,7 @@
 use aj::cli::AjCli;
-use aj_ui::AjUi;
 
 fn main() {
-    let mut ui = AjCli::with_empty_history();
+    let ui = AjCli::with_empty_history();
 
     let tool_name = "edit_file";
     let input = r#"{"path": "/path/to/file.rs", "old_string": "fn old_function()", "new_string": "fn new_function()"}"#;

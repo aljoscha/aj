@@ -5,6 +5,7 @@ use aj::cli::AjCli;
 use aj::event_bridge::EventBridgeListener;
 use aj::prompt_history::{DEFAULT_MAX_ENTRIES, PromptHistory};
 use aj_agent::bus::Listener;
+use aj_agent::types::{SubAgentUsage, UsageSummary};
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
 use aj_models::messages::{Role, Speed};
@@ -14,7 +15,6 @@ use aj_session::{
     repair_interrupted_tool_uses, replay,
 };
 use aj_tools::get_builtin_tools;
-use aj_ui::{AjUi, SubAgentUsage, UsageSummary};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio::sync::Mutex as TokioMutex;
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
     // between the harness UI and the cloned UI handed to the bridge
     // listener, so submissions made during the session immediately show
     // up in the editor's up-arrow stack.
-    let mut ui = AjCli::new(Arc::new(Mutex::new(PromptHistory::bootstrap(
+    let ui = AjCli::new(Arc::new(Mutex::new(PromptHistory::bootstrap(
         &conversation_persistence,
         DEFAULT_MAX_ENTRIES,
     ))));
@@ -164,22 +164,23 @@ async fn main() -> Result<()> {
         config.thinking,
     );
 
-    // Register the bus -> AjCli rendering bridge before any turns
-    // run, so every event the agent emits during inference flows
-    // back into the existing renderer. The listener owns its own
-    // shallow-cloned `AjCli` (sharing the prompt-history `Arc`) plus
-    // lazily-created `SubAgentCli`s for any sub-agent the session
-    // spawns; per `docs/aj-next-plan.md` §1.6 sub-agents share the
-    // parent's bus, so all of their events flow through this same
-    // listener too. The handle stays alive for the rest of the
-    // process: we hold it on the stack until `main` returns.
+    // Register the bus -> AjCliCommon rendering bridge before any
+    // turns run, so every event the agent emits during inference
+    // flows back into the existing renderer. The listener owns a
+    // clone of the binary's `AjCliCommon` (the rendering subset of
+    // [`AjCli`]) plus lazily-created `AjCliCommon`s for any
+    // sub-agent the session spawns; per `docs/aj-next-plan.md` §1.6
+    // sub-agents share the parent's bus, so all of their events
+    // flow through this same listener too. The handle stays alive
+    // for the rest of the process: we hold it on the stack until
+    // `main` returns.
     //
     // Keep a clone of the listener around so the resume path can
     // drain `aj_session::replay` events through the same closure
     // without going via the bus (which would also fire the
     // persistence listener and re-write the events we're reading
     // straight off disk).
-    let bridge_listener: Listener = EventBridgeListener::new(ui.shallow_clone()).into_listener();
+    let bridge_listener: Listener = EventBridgeListener::new(ui.renderer()).into_listener();
     let _bridge_handle = agent.subscribe(Arc::clone(&bridge_listener));
 
     match cli.command {
@@ -197,7 +198,7 @@ async fn main() -> Result<()> {
             };
             run_session(
                 &mut agent,
-                &mut ui,
+                &ui,
                 log,
                 /* resuming = */ true,
                 Arc::clone(&bridge_listener),
@@ -214,7 +215,7 @@ async fn main() -> Result<()> {
             let log = ConversationLog::create(&conversation_persistence)?;
             run_session(
                 &mut agent,
-                &mut ui,
+                &ui,
                 log,
                 /* resuming = */ false,
                 Arc::clone(&bridge_listener),
@@ -243,7 +244,7 @@ async fn main() -> Result<()> {
 /// during replay — those events are *already* on disk.
 async fn run_session(
     agent: &mut Agent,
-    ui: &mut AjCli,
+    ui: &AjCli,
     mut log: ConversationLog,
     resuming: bool,
     bridge_listener: Listener,
@@ -410,7 +411,7 @@ async fn run_session(
 /// file injected into the agent's system prompt. Mirrors the
 /// pre-§2.4b behavior of `Agent::display_context` so the user
 /// continues to see which context files are in play.
-fn display_context(ui: &mut AjCli, env: &AgentEnv) {
+fn display_context(ui: &AjCli, env: &AgentEnv) {
     let text = if env.context_files.is_empty() {
         "Context: (none)".to_string()
     } else {
@@ -430,7 +431,7 @@ fn display_context(ui: &mut AjCli, env: &AgentEnv) {
 /// Render the end-of-session token-usage summary by reading the
 /// agent's accumulated counts and per-sub-agent breakdown. Mirrors
 /// the pre-§2.4b `Agent::display_usage_summary`.
-fn display_usage_summary(ui: &mut AjCli, agent: &Agent) {
+fn display_usage_summary(ui: &AjCli, agent: &Agent) {
     let main = agent.accumulated_usage();
     let main_agent_usage = SubAgentUsage {
         agent_id: None,

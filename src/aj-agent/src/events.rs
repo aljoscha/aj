@@ -18,11 +18,11 @@ use std::time::Duration;
 use aj_models::messages::ContentBlockParam;
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantMessage, ToolResultMessage};
-use aj_ui::{TokenUsage, UserOutput};
 use serde_json::Value;
 
 use crate::message::AgentMessage;
 use crate::tool::ToolDetails;
+use crate::types::{TokenUsage, UserOutput};
 
 /// Identifier for the agent emitting an event.
 ///

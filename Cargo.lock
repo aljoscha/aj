@@ -26,7 +26,6 @@ dependencies = [
  "aj-models",
  "aj-session",
  "aj-tools",
- "aj-ui",
  "anthropic-sdk",
  "anyhow",
  "chrono",
@@ -48,7 +47,6 @@ version = "0.1.0"
 dependencies = [
  "aj-conf",
  "aj-models",
- "aj-ui",
  "anyhow",
  "async-trait",
  "chrono",
@@ -105,7 +103,6 @@ version = "0.1.0"
 dependencies = [
  "aj-agent",
  "aj-models",
- "aj-ui",
  "anyhow",
  "chrono",
  "serde",
@@ -122,7 +119,6 @@ version = "0.1.0"
 dependencies = [
  "aj-agent",
  "aj-models",
- "aj-ui",
  "anthropic-sdk",
  "anyhow",
  "chrono",
@@ -163,13 +159,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.0",
  "vt100-ctt",
-]
-
-[[package]]
-name = "aj-ui"
-version = "0.1.0"
-dependencies = [
- "serde",
 ]
 
 [[package]]

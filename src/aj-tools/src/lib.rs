@@ -7,12 +7,11 @@
 //! them directly — there is no longer a legacy bridge layer in
 //! between.
 //!
-//! [`bridge::render_details_via_ui`] survives as a tactical
-//! [`aj_agent::tool::ToolDetails`] → [`aj_ui::AjUi`] projection used
-//! by the binary's bus-listener while the legacy CLI sticks around;
-//! it disappears in §2.6 along with the rest of `aj-ui`.
+//! Rendering of [`aj_agent::tool::ToolDetails`] payloads onto a
+//! terminal lives in the binary that subscribes to the agent's bus
+//! ([`AgentEvent::ToolExecutionEnd`](aj_agent::events::AgentEvent::ToolExecutionEnd)
+//! carries the structured result); `aj-tools` is wire-only.
 
-pub mod bridge;
 pub mod testing;
 pub mod tools;
 

@@ -10,6 +10,7 @@ pub mod bus;
 pub mod events;
 pub mod message;
 pub mod tool;
+pub mod types;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,13 +26,13 @@ use aj_models::tools::Tool;
 use aj_models::types::UserContent;
 use aj_models::ModelError;
 use aj_models::{Model, ThinkingConfig};
-use aj_ui::{TokenUsage, UserOutput};
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
 use crate::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
 use crate::tool::{
     ErasedToolDefinition, SpawnedAgent, TodoItem, ToolContext, ToolDetails, ToolOutcome,
 };
+use crate::types::{TokenUsage, UserOutput};
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
