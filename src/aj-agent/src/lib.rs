@@ -184,6 +184,40 @@ impl Agent {
         self.bus.subscribe(listener)
     }
 
+    /// Subscribe a channel-style sink for the agent's event bus.
+    ///
+    /// Registers a non-blocking forwarding listener that pushes
+    /// each [`AgentEvent`] into a `tokio::sync::mpsc::UnboundedSender`
+    /// and returns the matching receiver alongside the
+    /// [`SubscriptionHandle`] that owns the subscription's
+    /// lifetime. The listener returns `Ok(())` even if the
+    /// receiver has been dropped, so a renderer that hangs up
+    /// mid-run does not fail the agent's turn.
+    ///
+    /// This is the channel sugar from `docs/aj-next-plan.md` §1.4:
+    /// the TUI's event pump uses it to decouple itself from the
+    /// agent's emit timing. The agent never blocks on a slow
+    /// renderer because the forwarder's `send` is non-blocking;
+    /// renderers see events at their own pace by polling the
+    /// receiver from a `tokio::select!`.
+    pub fn subscribe_channel(
+        &self,
+    ) -> (
+        SubscriptionHandle,
+        tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = crate::bus::listener_from_sync(move |event: &AgentEvent| {
+            // `send` only fails when the receiver has been dropped;
+            // we treat that as the consumer no longer being
+            // interested, not as an agent-level error. Dropping the
+            // event keeps the agent's turn making progress.
+            let _ = tx.send(event.clone());
+        });
+        let handle = self.bus.subscribe(listener);
+        (handle, rx)
+    }
+
     /// Borrow the agent's internal event bus.
     pub fn bus(&self) -> &EventBus {
         &self.bus

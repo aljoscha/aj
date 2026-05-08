@@ -111,6 +111,7 @@ dependencies = [
  "clap",
  "dotenv",
  "serde_json",
+ "similar",
  "tokio",
  "tracing",
  "tracing-subscriber",

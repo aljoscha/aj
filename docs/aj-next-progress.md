@@ -886,7 +886,85 @@ adopts independently.
       lands alongside the interactive resume work). `cargo build`,
       `cargo fmt`, `cargo test`, and `cargo clippy -p aj-next
       --all-targets` all pass clean.
-- [ ] Interactive TUI: layout slots, event pump, components.
+- [x] Interactive TUI: layout slots, event pump, components.
+      **Status:** functional MVP landed. The interactive mode wires
+      end-to-end: `aj-next` (no flags) opens a [`Tui`] with a five-slot
+      layout (Header / Chat / Status / Editor / Footer), subscribes a
+      persistence listener and a channel-style event listener on the
+      agent's bus, replays any persisted thread through the same event
+      pump that handles live events, and enters a `tokio::select!` loop
+      over `tui.next_event()` and the bus channel. Editor submits spawn
+      `agent.prompt(text)` on a tokio task; the editor's
+      `disable_submit` flag gates a second submission until the run
+      ends.
+
+      **`aj-agent`:** new [`Agent::subscribe_channel`] returns
+      `(SubscriptionHandle, UnboundedReceiver<AgentEvent>)`. The
+      forwarder is built on top of [`Agent::subscribe`] +
+      [`listener_from_sync`] and never blocks on a slow renderer
+      (the `send` returns immediately, and dropping the receiver is
+      treated as a benign hangup, not a fatal listener error).
+
+      **Theme:** `aj-next/src/config/theme.rs` builds the shared
+      [`MarkdownTheme`], [`EditorTheme`], and [`SelectListTheme`]
+      from `aj_tui::style` closures so every component renders
+      against the same palette. `Selectors and theming` will swap
+      these for a configurable palette layer.
+
+      **Layout:** `aj-next/src/modes/interactive/layout.rs` exports
+      a [`SlotIndex`] enum and a [`build_layout`] helper that
+      attaches the five layout slots in canonical order and focuses
+      the editor.
+
+      **Components** (in `aj-next/src/modes/interactive/components/`):
+
+      - `assistant_message.rs` — wraps two
+        [`Markdown`](aj_tui::components::markdown::Markdown) widgets
+        (text + dim/italic thinking) with append-delta and replace-
+        snapshot setters so streaming `StreamChunk` events update
+        in place.
+      - `user_message.rs` — `> `-prefixed italic markdown widget for
+        typed prompts and replayed user-thread entries.
+      - `tool_execution.rs` — generic per-tool component with a
+        status glyph (`…` running, `✓` ok, `✗` error), a `name(args)`
+        header, and a body switched on the [`ToolDetails`] variant.
+        Diff/Bash/Todos/SubAgentReport/Json all flow through this
+        component.
+      - `bash_execution.rs` — body-line builder for the
+        [`ToolDetails::Bash`] variant (stdout + dim "STDERR:"
+        header + colored exit-code row + truncation/spillover
+        marker). Used by `tool_execution.rs`.
+      - `diff.rs` — unified-diff renderer with a 3-line context
+        window, dim equal lines, red/green +/-, and a dim "…" hunk
+        separator. Used by `tool_execution.rs`.
+      - `loader_status.rs` — wraps [`aj_tui::components::loader::Loader`]
+        with active/idle gating so the status slot collapses to
+        zero rows between turns.
+      - `header.rs` / `footer.rs` — minimal stub dim text rows
+        (thread id + notice; model + cwd) populated from
+        [`Agent::env`] / [`Agent::model`] on startup. Richer
+        per-turn refresh lands alongside `footer_data.rs` in a
+        follow-up.
+
+      **Event pump** (`aj-next/src/modes/interactive/event_pump.rs`):
+      [`EventPump::handle`] receives one [`AgentEvent`] and
+      mutates the layout. Lifecycle (`AgentStart`/`AgentEnd`)
+      toggles the loader; streaming `StreamChunk` events update
+      the in-flight assistant component; `ToolExecutionStart`/
+      `ToolExecutionUpdate`/`ToolExecutionEnd` route by `call_id`
+      to the matching `ToolExecutionComponent`; persisted user
+      messages add `UserMessageComponent`s to the chat slot;
+      notices/warnings/errors append styled `Text` rows.
+      Sub-agent grouping, `TurnEnd` / `TurnUsage` / `QueueUpdate`
+      consumption, and the unified `MessageStart`/`MessageUpdate`/
+      `MessageEnd` variants land in follow-up steps; the variant
+      arms are present so the exhaustiveness check stays alive.
+
+      Twenty-three new unit tests cover the components and the
+      layout helper. `cargo build`, `cargo test -p aj-next`,
+      `cargo fmt`, and `cargo clippy -p aj-next --all-targets`
+      all pass clean (the only remaining warnings are pre-existing
+      in `aj-agent`).
 - [ ] Selectors (model/thinking/session) and theming.
 
 ## Phase 2 — Cutover (§5)
