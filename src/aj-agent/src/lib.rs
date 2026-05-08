@@ -3,6 +3,7 @@
 // agent runtime below keeps using the older `aj-ui` types and the
 // legacy tool trait (now re-homed in `crate::legacy_tool`) until the
 // bus migration in §2.1 of the aj-next plan.
+pub mod bus;
 pub mod events;
 pub mod legacy_tool;
 pub mod message;
@@ -25,10 +26,12 @@ use aj_session::{
 };
 use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
 
+use crate::bus::{EventBus, Listener, SubscriptionHandle};
+use crate::events::{AgentEvent, AgentId};
 use crate::legacy_tool::{
     ErasedToolDefinition, SessionContext, ToolResult, TurnContext as ToolTurnContext,
 };
-use crate::tool::TodoItem;
+use crate::tool::{TodoItem, ToolDetails};
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
@@ -59,6 +62,19 @@ pub struct Agent<UI: AjUi> {
     model: Arc<dyn Model>,
     session_state: SessionState,
     default_thinking: Option<ThinkingConfig>,
+    /// Identifier used on every event emitted by this agent. The
+    /// top-level instance constructed by the binary keeps the default
+    /// [AgentId::Main]; sub-agents created via
+    /// [SessionContextWrapper::spawn_agent] override this so listeners
+    /// can route nested transcripts.
+    agent_id: AgentId,
+    /// Internal event bus. Every state transition the agent goes
+    /// through is mirrored here as an [AgentEvent]; today nothing
+    /// production-side subscribes (the CLI still drives off the
+    /// `self.ui.*` calls), but tests subscribe to lock the protocol
+    /// shape, and §2.3 of `docs/aj-next-plan.md` swaps in production
+    /// listeners for rendering and persistence.
+    bus: EventBus,
 }
 
 impl<UI: AjUi> Agent<UI> {
@@ -110,7 +126,42 @@ impl<UI: AjUi> Agent<UI> {
             model,
             session_state,
             default_thinking,
+            agent_id: AgentId::Main,
+            bus: EventBus::new(),
         }
+    }
+
+    /// Override this agent's [AgentId] before driving any turns.
+    ///
+    /// Used by [SessionContextWrapper::spawn_agent] when constructing
+    /// a sub-agent so the events it emits carry the correct
+    /// [AgentId::Sub] tag. Top-level instances built by the binary
+    /// keep the default [AgentId::Main] and never call this.
+    pub fn set_agent_id(&mut self, id: AgentId) {
+        self.agent_id = id;
+    }
+
+    /// Subscribe an async listener to the agent's internal event bus.
+    ///
+    /// Returns a [SubscriptionHandle] whose drop removes the listener.
+    /// Listeners are awaited inline in registration order; a listener
+    /// returning `Err` aborts the in-flight operation with a fatal
+    /// error. See [EventBus::subscribe] for the full protocol.
+    pub fn subscribe(&self, listener: Listener) -> SubscriptionHandle {
+        self.bus.subscribe(listener)
+    }
+
+    /// Borrow the agent's internal event bus.
+    ///
+    /// Sub-systems (currently only [SessionContextWrapper::spawn_agent])
+    /// clone this so events emitted on a sub-agent's bus can later be
+    /// forwarded to the parent's listeners — the eventual
+    /// "sub-agents share the parent's bus" arrangement from
+    /// `docs/aj-next-plan.md` §1.6 lands once the per-tool migration
+    /// in §2.2 finishes; for now sub-agents own their own bus and
+    /// the parent emits only correlation events.
+    pub fn bus(&self) -> &EventBus {
+        &self.bus
     }
 
     pub fn current_turn(&self) -> usize {
@@ -122,6 +173,35 @@ impl<UI: AjUi> Agent<UI> {
     }
 
     pub async fn run(&mut self, log: &mut ConversationLog) -> Result<(), anyhow::Error> {
+        // Mirror the run as `AgentStart` / `AgentEnd` events on the
+        // bus. `AgentEnd.messages` will eventually carry a snapshot
+        // of the agent's transcript per `docs/aj-next-plan.md` §1.4;
+        // until §2.4 migrates the agent to the unified message types,
+        // we ship an empty snapshot so the protocol shape (event
+        // ordering, agent_id routing) is exercised without forcing a
+        // premature legacy→unified bridge.
+        self.bus
+            .emit(AgentEvent::AgentStart {
+                agent_id: self.agent_id,
+            })
+            .await?;
+
+        let outcome = self.run_inner(log).await;
+
+        self.bus
+            .emit(AgentEvent::AgentEnd {
+                agent_id: self.agent_id,
+                messages: Vec::new(),
+            })
+            .await?;
+
+        outcome
+    }
+
+    /// Body of [Agent::run], split out so [Agent::run] itself can
+    /// emit `AgentStart` / `AgentEnd` events around the run regardless
+    /// of which exit path the loop takes.
+    async fn run_inner(&mut self, log: &mut ConversationLog) -> Result<(), anyhow::Error> {
         // Resolve the system prompt up front: either reuse the one
         // persisted on the log (cache-friendly resume) or assemble a
         // fresh one from the current environment and persist it as the
@@ -152,29 +232,32 @@ impl<UI: AjUi> Agent<UI> {
             // on.
             repair_interrupted_tool_uses(log, &conversation)?;
 
-            self.ui.display_notice(&format!(
+            self.notice(format!(
                 "Resuming conversation {} (use 'ctrl-c' or 'ctrl-d' to quit)",
                 log.thread_id()
-            ));
+            ))
+            .await?;
         } else {
-            self.ui
-                .display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
+            self.notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)")
+                .await?;
         }
 
-        self.ui.display_notice(&format!(
+        self.notice(format!(
             "Model: {}, at {}",
             self.model.model_name(),
             self.model.model_url()
-        ));
+        ))
+        .await?;
 
-        self.display_context();
+        self.display_context().await?;
 
         if std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err() {
-            self.ui.display_warning(
+            self.warning(
                 "WARNING: AJ has no sandboxing or permission checks. The agent can execute \
                  arbitrary commands on your system. Do not use AJ if you don't understand what \
                  this means. Set AJ_DISABLE_SANDBOX_WARNING=1 to suppress this warning.",
-            );
+            )
+            .await?;
         }
 
         let mut force_user_input = false;
@@ -203,9 +286,8 @@ impl<UI: AjUi> Agent<UI> {
                     // sent at least one message so far.
                     if head.is_some() {
                         let id = log.thread_id();
-                        self.ui.display_notice(&format!(
-                            "Thread: {id} (resume with: aj continue {id})"
-                        ));
+                        self.notice(format!("Thread: {id} (resume with: aj continue {id})"))
+                            .await?;
                     }
                     break;
                 };
@@ -216,7 +298,7 @@ impl<UI: AjUi> Agent<UI> {
             match self.execute_turn(log, ThreadKind::User, None).await {
                 Ok(()) => {}
                 Err(TurnError::Recoverable(err)) => {
-                    self.ui.display_error(&format!("{err:#}"));
+                    self.error(format!("{err:#}")).await?;
                     // The pending user message is still on disk. Force a
                     // prompt next iteration so we don't immediately re-send
                     // the same broken request to the model. The user can
@@ -233,6 +315,37 @@ impl<UI: AjUi> Agent<UI> {
     }
 
     pub async fn run_single_turn(
+        &mut self,
+        log: &mut ConversationLog,
+        parent_head: EntryId,
+        agent_id: usize,
+        prompt: String,
+    ) -> Result<String, anyhow::Error> {
+        // Sub-agent runs share the same lifecycle framing as the
+        // top-level agent — `AgentStart` / `AgentEnd` events bracket
+        // the entire run so listeners that group by `agent_id` see a
+        // self-contained nested transcript.
+        self.bus
+            .emit(AgentEvent::AgentStart {
+                agent_id: self.agent_id,
+            })
+            .await?;
+
+        let outcome = self
+            .run_single_turn_inner(log, parent_head, agent_id, prompt)
+            .await;
+
+        self.bus
+            .emit(AgentEvent::AgentEnd {
+                agent_id: self.agent_id,
+                messages: Vec::new(),
+            })
+            .await?;
+
+        outcome
+    }
+
+    async fn run_single_turn_inner(
         &mut self,
         log: &mut ConversationLog,
         parent_head: EntryId,
@@ -293,6 +406,20 @@ impl<UI: AjUi> Agent<UI> {
         self.session_state.turn_counter += 1;
         let mut turn_ctx = TurnContext::new(self.session_state.turn_counter);
 
+        // `TurnStart` mirrors entry to the assistant-message cycle.
+        // The matching `TurnEnd` event (which carries the finalized
+        // assistant message and tool-result list per `docs/aj-next-plan.md`
+        // §1.1) lands in §2.4 once `aj-agent` migrates to the unified
+        // message types; today we have only the legacy `MessageParam`
+        // shape, and bridging it through a throwaway converter would
+        // be code we'd delete in the same week.
+        self.bus
+            .emit(AgentEvent::TurnStart {
+                agent_id: self.agent_id,
+            })
+            .await
+            .map_err(TurnError::Fatal)?;
+
         let filter = match thread {
             ThreadKind::User => ThreadFilter::USER,
             ThreadKind::Subagent => {
@@ -307,6 +434,10 @@ impl<UI: AjUi> Agent<UI> {
             }
         };
 
+        // Number of streaming retries observed for the current
+        // inference. Reported on `StreamRetry` events so listeners
+        // can render "retrying… (attempt N)" indicators.
+        let mut retry_attempt: u32 = 0;
         let mut retry_strategy = None;
 
         'outer: loop {
@@ -343,11 +474,26 @@ impl<UI: AjUi> Agent<UI> {
                                 retry_strategy.as_mut().expect("known to be some").next();
 
                             if let Some(retry_sleep) = retry_sleep {
-                                self.ui.display_error(&format!(
-                                    "{}, retrying in {}s...",
-                                    error,
-                                    retry_sleep.as_secs()
-                                ));
+                                let message =
+                                    format!("{}, retrying in {}s...", error, retry_sleep.as_secs());
+                                self.ui.display_error(&message);
+                                self.bus
+                                    .emit(AgentEvent::Error {
+                                        agent_id: self.agent_id,
+                                        text: message,
+                                    })
+                                    .await
+                                    .map_err(TurnError::Fatal)?;
+                                retry_attempt = retry_attempt.saturating_add(1);
+                                self.bus
+                                    .emit(AgentEvent::StreamRetry {
+                                        agent_id: self.agent_id,
+                                        attempt: retry_attempt,
+                                        delay: retry_sleep,
+                                        error: error.to_string(),
+                                    })
+                                    .await
+                                    .map_err(TurnError::Fatal)?;
 
                                 tokio::time::sleep(retry_sleep).await;
 
@@ -378,9 +524,15 @@ impl<UI: AjUi> Agent<UI> {
                             self.ui.agent_thinking_stop();
                         }
                         StreamingEvent::ParseError { error, raw_data } => {
-                            self.ui.display_error(&format!(
-                                "Parse error: {error} (raw data: {raw_data})"
-                            ));
+                            let message = format!("Parse error: {error} (raw data: {raw_data})");
+                            self.ui.display_error(&message);
+                            self.bus
+                                .emit(AgentEvent::Error {
+                                    agent_id: self.agent_id,
+                                    text: message,
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                         StreamingEvent::ToolUseParseError {
                             id,
@@ -388,21 +540,38 @@ impl<UI: AjUi> Agent<UI> {
                             error,
                             raw_data,
                         } => {
-                            self.ui.display_error(&format!(
+                            let message = format!(
                                 "Tool use parse error for '{name}' (id={id}): {error} \
                                  (raw data: {raw_data})"
-                            ));
+                            );
+                            self.ui.display_error(&message);
+                            self.bus
+                                .emit(AgentEvent::Error {
+                                    agent_id: self.agent_id,
+                                    text: message,
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                             tool_use_parse_errors.push((id, name, error));
                         }
                         StreamingEvent::ProtocolError { error } => {
-                            self.ui.display_error(&format!("Protocol error: {error}"));
+                            let message = format!("Protocol error: {error}");
+                            self.ui.display_error(&message);
+                            self.bus
+                                .emit(AgentEvent::Error {
+                                    agent_id: self.agent_id,
+                                    text: message,
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
                         }
                     }
 
                     // We've successfully received an event, reset the retry
                     // strategy. That way, when we get an Overloaded error again
                     // we'll initialize with a fresh retry_strategy.
-                    retry_strategy = None
+                    retry_strategy = None;
+                    retry_attempt = 0;
                 }
             }
 
@@ -486,6 +655,23 @@ impl<UI: AjUi> Agent<UI> {
                 let mut tool_result_contents = Vec::new();
 
                 for (tool_id, tool_name, tool_input) in tool_calls {
+                    // Mirror the start of every tool invocation on the
+                    // bus before we do any work — listeners that render
+                    // a "running…" placeholder rely on seeing this
+                    // event before any update or end. The matching
+                    // `ToolExecutionEnd` is emitted below regardless of
+                    // whether the call succeeded, errored, or was a
+                    // parse-failure that bypassed execution.
+                    self.bus
+                        .emit(AgentEvent::ToolExecutionStart {
+                            agent_id: self.agent_id,
+                            call_id: tool_id.clone(),
+                            tool: tool_name.clone(),
+                            args: tool_input.clone(),
+                        })
+                        .await
+                        .map_err(TurnError::Fatal)?;
+
                     // For tool_use blocks resurrected from a parse
                     // failure, skip execution and feed the parse error
                     // back as the tool_result.
@@ -532,7 +718,7 @@ impl<UI: AjUi> Agent<UI> {
 
                     let result_content_block = ContentBlockParam::ToolResultBlock {
                         tool_use_id: tool_id.to_owned(),
-                        content: tool_result.return_value.into(),
+                        content: tool_result.return_value.clone().into(),
                         is_error,
                     };
 
@@ -552,6 +738,28 @@ impl<UI: AjUi> Agent<UI> {
                         }
                     }
                     self.display_user_output(&tool_result.user_outputs);
+
+                    // Mirror the tool result on the bus. Today we
+                    // surface the textual return value through
+                    // `ToolDetails::Text`; once the per-tool migration
+                    // in §2.2 of `docs/aj-next-plan.md` lands, each
+                    // tool will pick its own `ToolDetails` variant
+                    // (e.g. `Diff` for editors, `Bash` for shell) and
+                    // we'll plumb that variant through here verbatim.
+                    self.bus
+                        .emit(AgentEvent::ToolExecutionEnd {
+                            agent_id: self.agent_id,
+                            call_id: tool_id.clone(),
+                            tool: tool_name.clone(),
+                            result: tool_details_for_legacy(
+                                &tool_name,
+                                &tool_result.return_value,
+                                is_error,
+                            ),
+                            is_error,
+                        })
+                        .await
+                        .map_err(TurnError::Fatal)?;
                 }
 
                 if !tool_result_contents.is_empty() {
@@ -759,6 +967,8 @@ impl<UI: AjUi> Agent<UI> {
             disabled_tools: &self.disabled_tools,
             model: Arc::clone(&self.model),
             sub_agent_tools,
+            parent_bus: self.bus.clone(),
+            parent_agent_id: self.agent_id,
         };
 
         // Create recording wrapper to capture UI output
@@ -825,21 +1035,64 @@ impl<UI: AjUi> Agent<UI> {
     /// Display the context (system prompt addenda) at startup so the user can
     /// see which agent files (and, in the future, skills) are being injected
     /// into the model's system prompt.
-    fn display_context(&mut self) {
-        if self.env.context_files.is_empty() {
-            self.ui.display_notice("Context: (none)");
-            return;
-        }
+    async fn display_context(&mut self) -> Result<(), anyhow::Error> {
+        let text = if self.env.context_files.is_empty() {
+            "Context: (none)".to_string()
+        } else {
+            let mut lines = String::from("Context:");
+            for file in &self.env.context_files {
+                lines.push_str(&format!(
+                    "\n  - {} ({})",
+                    display_path(&file.path),
+                    file.kind.label()
+                ));
+            }
+            lines
+        };
+        self.notice(text).await
+    }
 
-        let mut lines = String::from("Context:");
-        for file in &self.env.context_files {
-            lines.push_str(&format!(
-                "\n  - {} ({})",
-                display_path(&file.path),
-                file.kind.label()
-            ));
-        }
-        self.ui.display_notice(&lines);
+    /// Display a notice both through the UI and on the bus.
+    ///
+    /// The bus emit is awaited inline so a listener that returns
+    /// `Err` (e.g. a future persistence listener that observes a
+    /// disk-write failure) propagates the failure back to the
+    /// caller. Today no production subscribers exist; the helper
+    /// pairs the legacy UI call with a `Notice` event so tests can
+    /// snapshot the protocol shape without touching the binary.
+    async fn notice(&mut self, text: impl Into<String>) -> Result<(), anyhow::Error> {
+        let text = text.into();
+        self.ui.display_notice(&text);
+        self.bus
+            .emit(AgentEvent::Notice {
+                agent_id: self.agent_id,
+                text,
+            })
+            .await
+    }
+
+    /// Sibling of [Self::notice] for warnings.
+    async fn warning(&mut self, text: impl Into<String>) -> Result<(), anyhow::Error> {
+        let text = text.into();
+        self.ui.display_warning(&text);
+        self.bus
+            .emit(AgentEvent::Warning {
+                agent_id: self.agent_id,
+                text,
+            })
+            .await
+    }
+
+    /// Sibling of [Self::notice] for errors.
+    async fn error(&mut self, text: impl Into<String>) -> Result<(), anyhow::Error> {
+        let text = text.into();
+        self.ui.display_error(&text);
+        self.bus
+            .emit(AgentEvent::Error {
+                agent_id: self.agent_id,
+                text,
+            })
+            .await
     }
 
     fn display_usage_summary(&mut self) {
@@ -1070,6 +1323,19 @@ struct SessionContextWrapper<'a, UI: AjUi> {
     /// every `ErasedToolDefinition` field is `Clone` and the closure
     /// is `Arc`-shared.
     sub_agent_tools: Vec<ErasedToolDefinition>,
+    /// Clone of the parent agent's event bus. Used to emit
+    /// [AgentEvent::SubAgentStart] / [AgentEvent::SubAgentEnd]
+    /// correlation events on the parent's bus when this wrapper's
+    /// [SessionContext::spawn_agent] runs. The sub-agent itself owns
+    /// a separate bus today; per `docs/aj-next-plan.md` §1.6 those
+    /// will eventually unify, but the correlation events on the
+    /// parent's bus are sufficient for listeners to know a sub-agent
+    /// ran.
+    parent_bus: EventBus,
+    /// Identifier of the parent agent that owns this wrapper. The
+    /// `parent` field of [AgentEvent::SubAgentStart] /
+    /// [AgentEvent::SubAgentEnd].
+    parent_agent_id: AgentId,
 }
 
 impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
@@ -1094,6 +1360,19 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
         Box::pin(async move {
             // Get the next agent ID
             let agent_id = self.session_ctx.next_sub_agent_id();
+            let child_id = AgentId::Sub(agent_id);
+
+            // Mirror sub-agent lifecycle on the parent's bus so a
+            // single listener (e.g. the future TUI's event pump) can
+            // group nested transcripts under the parent's
+            // tool-execution component.
+            self.parent_bus
+                .emit(AgentEvent::SubAgentStart {
+                    parent: self.parent_agent_id,
+                    child: child_id,
+                    task: task.clone(),
+                })
+                .await?;
 
             // Create a sub-agent UI wrapper with the agent number
             let sub_ui = self.ui.get_subagent_ui(agent_id);
@@ -1124,6 +1403,7 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
                 Arc::clone(&self.model),
                 None,
             );
+            sub_agent.set_agent_id(child_id);
 
             // Run the sub-agent with the task, anchored at the parent
             // tool-use's assistant message.
@@ -1137,6 +1417,23 @@ impl<'a, UI: AjUi> SessionContext for SessionContextWrapper<'a, UI> {
             // Record the usage in the main session state
             self.session_ctx
                 .record_sub_agent_usage(agent_id, sub_agent_usage);
+
+            // Emit `SubAgentEnd` regardless of success — listeners
+            // need to clean up nested-transcript framing on errors
+            // too. The report carries the child's final assistant
+            // text (or the error string) so the parent's listener
+            // sees a single complete summary.
+            let report = match &result {
+                Ok(text) => text.clone(),
+                Err(err) => format!("sub-agent failed: {err:#}"),
+            };
+            self.parent_bus
+                .emit(AgentEvent::SubAgentEnd {
+                    parent: self.parent_agent_id,
+                    child: child_id,
+                    report,
+                })
+                .await?;
 
             result
         })
@@ -1163,6 +1460,27 @@ fn make_view<'a>(
         // never via a [ConversationView]. Reaching this arm indicates a
         // caller bug.
         ThreadKind::Meta => panic!("make_view called with ThreadKind::Meta"),
+    }
+}
+
+/// Project a legacy [ToolResult] return value onto a [ToolDetails::Text]
+/// for [AgentEvent::ToolExecutionEnd] emission.
+///
+/// Today every tool returns a `String` `return_value`; we wrap that in
+/// the default rendering shape so listeners have a consistent payload
+/// to render. Once §2.2 of `docs/aj-next-plan.md` migrates each tool
+/// to [crate::tool::ToolOutcome], the per-tool implementation will
+/// pick a richer variant (`Diff`, `Bash`, `Todos`, …) and this helper
+/// disappears.
+fn tool_details_for_legacy(tool_name: &str, return_value: &str, is_error: bool) -> ToolDetails {
+    let summary = if is_error {
+        format!("{tool_name}: error")
+    } else {
+        tool_name.to_string()
+    };
+    ToolDetails::Text {
+        summary,
+        body: return_value.to_string(),
     }
 }
 
@@ -1430,5 +1748,461 @@ impl<'a> AjUi for RecordingAjUi<'a> {
         // only giving what is allowed to tools. But we have larger seafood to
         // cook...
         panic!("tools are not allowed to clone ui");
+    }
+}
+
+#[cfg(test)]
+mod event_protocol_tests {
+    //! Snapshot the event protocol the agent emits on its bus.
+    //!
+    //! Per `docs/aj-next-plan.md` §2.1, the bus runs alongside the
+    //! legacy `AjUi` calls during Phase 0; this module locks the
+    //! event sequence for known-shape turns so subsequent commits
+    //! (per-tool migration, atomic CLI swap, type unification)
+    //! cannot silently regress the protocol.
+
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use aj_conf::AgentEnv;
+    use aj_models::messages::{
+        ContentBlock, Message as LegacyMessage, MessageType, Role, StopReason, Usage,
+    };
+    use aj_models::streaming::StreamingEvent;
+    use aj_models::tools::Tool;
+    use aj_models::{Model, ModelError, ThinkingConfig};
+    use aj_session::{ConversationLog, ConversationPersistence};
+    use aj_ui::{AjUi, TokenUsage, UsageSummary};
+    use async_trait::async_trait;
+    use futures::stream;
+    use tempfile::TempDir;
+
+    use crate::bus::listener_from_sync;
+    use crate::events::{AgentEvent, AgentId};
+    use crate::legacy_tool::{
+        ErasedToolDefinition, SessionContext, ToolDefinition as LegacyToolDefinition, ToolResult,
+        TurnContext as LegacyTurnContext,
+    };
+    use crate::tool::ToolDetails;
+    use crate::Agent;
+
+    /// Stub AjUi that swallows every interaction. We assert against
+    /// the bus, not against the legacy UI; the agent still routes
+    /// every notice/warning/error through both during §2.1.
+    #[derive(Clone)]
+    struct NoopUi;
+
+    impl AjUi for NoopUi {
+        fn display_notice(&mut self, _notice: &str) {}
+        fn display_warning(&mut self, _warning: &str) {}
+        fn display_error(&mut self, _error: &str) {}
+        fn get_user_input(&mut self) -> Option<String> {
+            None
+        }
+        fn agent_text_start(&mut self, _text: &str) {}
+        fn agent_text_update(&mut self, _diff: &str) {}
+        fn agent_text_stop(&mut self, _text: &str) {}
+        fn user_text_start(&mut self, _text: &str) {}
+        fn user_text_update(&mut self, _diff: &str) {}
+        fn user_text_stop(&mut self, _text: &str) {}
+        fn agent_thinking_start(&mut self, _thinking: &str) {}
+        fn agent_thinking_update(&mut self, _diff: &str) {}
+        fn agent_thinking_stop(&mut self) {}
+        fn display_tool_result(&mut self, _tool_name: &str, _input: &str, _output: &str) {}
+        fn display_tool_result_diff(
+            &mut self,
+            _tool_name: &str,
+            _input: &str,
+            _before: &str,
+            _after: &str,
+        ) {
+        }
+        fn display_tool_error(&mut self, _tool_name: &str, _input: &str, _error: &str) {}
+        fn ask_permission(&mut self, _message: &str) -> bool {
+            false
+        }
+        fn display_token_usage(&mut self, _usage: &TokenUsage) {}
+        fn display_token_usage_summary(&mut self, _summary: &UsageSummary) {}
+        fn get_subagent_ui(&mut self, _agent_number: usize) -> Box<dyn AjUi> {
+            Box::new(NoopUi)
+        }
+        fn shallow_clone(&mut self) -> Box<dyn AjUi> {
+            Box::new(NoopUi)
+        }
+    }
+
+    /// Fake [Model] that hands back canned [StreamingEvent] streams.
+    ///
+    /// The agent loops over inferences when the model returns a
+    /// `tool_use`, so the test feeds in one stream per inference.
+    /// Each `Vec<StreamingEvent>` is consumed in source order; the
+    /// test panics if the agent runs more inferences than were
+    /// queued, which would indicate a regression that adds an
+    /// unexpected loop iteration.
+    struct ScriptedModel {
+        scripts: Mutex<std::vec::IntoIter<Vec<StreamingEvent>>>,
+    }
+
+    impl ScriptedModel {
+        fn new(scripts: Vec<Vec<StreamingEvent>>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts.into_iter()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Model for ScriptedModel {
+        async fn run_inference_streaming(
+            &self,
+            _messages: &[aj_models::messages::MessageParam],
+            _system_prompt: String,
+            _tools: Vec<Tool>,
+            _thinking: Option<ThinkingConfig>,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = StreamingEvent> + Send>>, ModelError>
+        {
+            let next = self
+                .scripts
+                .lock()
+                .unwrap()
+                .next()
+                .expect("ScriptedModel exhausted: agent ran more inferences than scripted");
+            Ok(Box::pin(stream::iter(next)))
+        }
+
+        fn model_name(&self) -> String {
+            "scripted".to_string()
+        }
+
+        fn model_url(&self) -> String {
+            "fake://test".to_string()
+        }
+    }
+
+    /// Trivial tool that returns a fixed string. Mirrors the legacy
+    /// `ToolDefinition` trait so it can be passed through `Agent::new`
+    /// alongside the existing builtins.
+    #[derive(Clone)]
+    struct PingTool;
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct PingInput {}
+
+    impl LegacyToolDefinition for PingTool {
+        type Input = PingInput;
+
+        fn name(&self) -> &'static str {
+            "ping"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool"
+        }
+
+        fn execute(
+            &self,
+            _session_ctx: &mut dyn SessionContext,
+            _turn_ctx: &mut dyn LegacyTurnContext,
+            _ui: &mut dyn AjUi,
+            _input: PingInput,
+        ) -> impl std::future::Future<Output = Result<ToolResult, anyhow::Error>> + Send {
+            async move { Ok(ToolResult::new("pong".to_string())) }
+        }
+    }
+
+    /// Build a finalized [LegacyMessage] with a single tool_use block.
+    fn finalize_tool_use(tool_use_id: &str, tool_name: &str) -> LegacyMessage {
+        LegacyMessage {
+            id: "test-msg-1".to_string(),
+            r#type: MessageType::Message,
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUseBlock {
+                id: tool_use_id.to_string(),
+                name: tool_name.to_string(),
+                input: serde_json::json!({}),
+                caller: None,
+            }],
+            model: "scripted".to_string(),
+            stop_reason: Some(StopReason::ToolUse),
+            stop_sequence: None,
+            stop_details: None,
+            usage: Usage::default(),
+            container: None,
+            context_management: None,
+        }
+    }
+
+    /// Build a finalized [LegacyMessage] with a single text block.
+    fn finalize_text(text: &str) -> LegacyMessage {
+        LegacyMessage {
+            id: "test-msg-2".to_string(),
+            r#type: MessageType::Message,
+            role: Role::Assistant,
+            content: vec![ContentBlock::TextBlock {
+                text: text.to_string(),
+                citations: Vec::new(),
+                signature: None,
+            }],
+            model: "scripted".to_string(),
+            stop_reason: Some(StopReason::EndTurn),
+            stop_sequence: None,
+            stop_details: None,
+            usage: Usage::default(),
+            container: None,
+            context_management: None,
+        }
+    }
+
+    /// Compact, comparable representation of an [AgentEvent] for
+    /// snapshot assertions. We don't `derive(PartialEq)` on the real
+    /// enum because some payloads (e.g. the legacy `AssistantMessage`
+    /// once it arrives in §2.4) don't implement `PartialEq` cleanly,
+    /// and a label per variant keeps test failures readable.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum EventLabel {
+        AgentStart(AgentId),
+        AgentEnd(AgentId),
+        TurnStart(AgentId),
+        Notice(AgentId, String),
+        Warning(AgentId, String),
+        Error(AgentId, String),
+        ToolExecutionStart {
+            agent_id: AgentId,
+            call_id: String,
+            tool: String,
+        },
+        ToolExecutionEnd {
+            agent_id: AgentId,
+            call_id: String,
+            tool: String,
+            summary: String,
+            body: String,
+            is_error: bool,
+        },
+        SubAgentStart {
+            parent: AgentId,
+            child: AgentId,
+            task: String,
+        },
+        SubAgentEnd {
+            parent: AgentId,
+            child: AgentId,
+        },
+        StreamRetry(AgentId, u32),
+        Other(&'static str),
+    }
+
+    fn label(event: &AgentEvent) -> EventLabel {
+        match event {
+            AgentEvent::AgentStart { agent_id } => EventLabel::AgentStart(*agent_id),
+            AgentEvent::AgentEnd { agent_id, .. } => EventLabel::AgentEnd(*agent_id),
+            AgentEvent::TurnStart { agent_id } => EventLabel::TurnStart(*agent_id),
+            AgentEvent::Notice { agent_id, text } => EventLabel::Notice(*agent_id, text.clone()),
+            AgentEvent::Warning { agent_id, text } => EventLabel::Warning(*agent_id, text.clone()),
+            AgentEvent::Error { agent_id, text } => EventLabel::Error(*agent_id, text.clone()),
+            AgentEvent::ToolExecutionStart {
+                agent_id,
+                call_id,
+                tool,
+                ..
+            } => EventLabel::ToolExecutionStart {
+                agent_id: *agent_id,
+                call_id: call_id.clone(),
+                tool: tool.clone(),
+            },
+            AgentEvent::ToolExecutionEnd {
+                agent_id,
+                call_id,
+                tool,
+                result,
+                is_error,
+            } => {
+                let (summary, body) = match result {
+                    ToolDetails::Text { summary, body } => (summary.clone(), body.clone()),
+                    other => (format!("{other:?}"), "<non-text variant>".to_string()),
+                };
+                EventLabel::ToolExecutionEnd {
+                    agent_id: *agent_id,
+                    call_id: call_id.clone(),
+                    tool: tool.clone(),
+                    summary,
+                    body,
+                    is_error: *is_error,
+                }
+            }
+            AgentEvent::SubAgentStart {
+                parent,
+                child,
+                task,
+            } => EventLabel::SubAgentStart {
+                parent: *parent,
+                child: *child,
+                task: task.clone(),
+            },
+            AgentEvent::SubAgentEnd { parent, child, .. } => EventLabel::SubAgentEnd {
+                parent: *parent,
+                child: *child,
+            },
+            AgentEvent::StreamRetry {
+                agent_id, attempt, ..
+            } => EventLabel::StreamRetry(*agent_id, *attempt),
+            AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
+            AgentEvent::MessageStart { .. } => EventLabel::Other("MessageStart"),
+            AgentEvent::MessageUpdate { .. } => EventLabel::Other("MessageUpdate"),
+            AgentEvent::MessageEnd { .. } => EventLabel::Other("MessageEnd"),
+            AgentEvent::ToolExecutionUpdate { .. } => EventLabel::Other("ToolExecutionUpdate"),
+            AgentEvent::QueueUpdate { .. } => EventLabel::Other("QueueUpdate"),
+        }
+    }
+
+    /// Set up a temp directory with an empty conversation log carrying
+    /// a fixed system prompt.
+    fn fresh_log() -> (TempDir, ConversationLog) {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("threads"));
+        let mut log = ConversationLog::create(&persistence).expect("ConversationLog::create");
+        log.set_system_prompt("test system prompt".to_string())
+            .expect("set_system_prompt on fresh log");
+        (dir, log)
+    }
+
+    /// Build an [AgentEnv] that doesn't pull instructions from the
+    /// host — context loading is environment-dependent, and we want
+    /// a deterministic event sequence regardless of where the test
+    /// runs.
+    fn empty_env(working_directory: PathBuf) -> AgentEnv {
+        AgentEnv {
+            working_directory,
+            git_root_directory: None,
+            operating_system: "test".to_string(),
+            today_date: "2024-01-01".to_string(),
+            context_files: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_single_turn_with_tool_call_emits_locked_protocol() {
+        let (_dir, mut log) = fresh_log();
+        let parent_head = log
+            .system_prompt_id()
+            .expect("set_system_prompt populates the root entry")
+            .clone();
+
+        // Two scripted inferences:
+        //   1. Tool call (id="tu-1", name="ping").
+        //   2. Final text response after the tool result is fed back.
+        let scripts = vec![
+            vec![StreamingEvent::FinalizedMessage {
+                message: finalize_tool_use("tu-1", "ping"),
+            }],
+            vec![StreamingEvent::FinalizedMessage {
+                message: finalize_text("done"),
+            }],
+        ];
+        let model = std::sync::Arc::new(ScriptedModel::new(scripts));
+
+        let env = empty_env(std::env::temp_dir());
+        let ping: ErasedToolDefinition = PingTool.into();
+        let mut agent = Agent::new(
+            env,
+            NoopUi,
+            "irrelevant — log already has a frozen system prompt",
+            vec![ping],
+            Vec::new(),
+            model,
+            None,
+        );
+
+        let recorded: std::sync::Arc<Mutex<Vec<EventLabel>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        agent
+            .run_single_turn(&mut log, parent_head, 1, "run ping".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let events = recorded.lock().unwrap().clone();
+        let expected = vec![
+            EventLabel::AgentStart(AgentId::Main),
+            EventLabel::TurnStart(AgentId::Main),
+            EventLabel::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: "tu-1".to_string(),
+                tool: "ping".to_string(),
+            },
+            EventLabel::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "tu-1".to_string(),
+                tool: "ping".to_string(),
+                summary: "ping".to_string(),
+                body: "pong".to_string(),
+                is_error: false,
+            },
+            EventLabel::AgentEnd(AgentId::Main),
+        ];
+        assert_eq!(events, expected, "unexpected event sequence: {events:#?}");
+    }
+
+    #[tokio::test]
+    async fn run_single_turn_brackets_with_agent_lifecycle() {
+        // Drives `run_single_turn` (the public sub-agent entry point)
+        // and verifies the bus brackets every run with an
+        // `AgentStart` / `AgentEnd` pair tagged with the agent's id.
+        let (_dir, mut log) = fresh_log();
+
+        // run_single_turn anchors on a parent_head from the log; the
+        // system_prompt entry (root) is reachable and works as the
+        // parent for the sub-agent thread.
+        let parent_head = log
+            .system_prompt_id()
+            .expect("set_system_prompt populates the root entry")
+            .clone();
+
+        let scripts = vec![vec![StreamingEvent::FinalizedMessage {
+            message: finalize_text("ok"),
+        }]];
+        let model = std::sync::Arc::new(ScriptedModel::new(scripts));
+
+        let env = empty_env(std::env::temp_dir());
+        let mut agent = Agent::new(
+            env,
+            NoopUi,
+            "irrelevant",
+            Vec::new(),
+            Vec::new(),
+            model,
+            None,
+        );
+        agent.set_agent_id(AgentId::Sub(7));
+
+        let recorded: std::sync::Arc<Mutex<Vec<EventLabel>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        agent
+            .run_single_turn(&mut log, parent_head, 7, "test prompt".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let events = recorded.lock().unwrap().clone();
+        // The exact subset we lock: lifecycle markers and the turn
+        // boundary. Everything else (no tool calls, no errors) means
+        // there are no other events this run.
+        assert_eq!(
+            events,
+            vec![
+                EventLabel::AgentStart(AgentId::Sub(7)),
+                EventLabel::TurnStart(AgentId::Sub(7)),
+                EventLabel::AgentEnd(AgentId::Sub(7)),
+            ],
+            "unexpected event sequence: {events:#?}"
+        );
     }
 }

@@ -56,9 +56,28 @@ and the git history.
 
 ### §2.1 Agent emits events alongside `AjUi` calls
 
-- [ ] Agent gains a private bus and emits `AgentEvent` parallel to
+- [x] Agent gains a private bus and emits `AgentEvent` parallel to
       every `self.ui.foo(...)`. Tests subscribe; no production
       subscribers yet.
+      Implemented in `aj-agent::bus` (`EventBus`, `Listener`,
+      `SubscriptionHandle`, `listener_from_sync`). `Agent` exposes
+      `subscribe(...)` and tags every event with an `AgentId`;
+      sub-agents get an `AgentId::Sub(n)` via `set_agent_id`. Bus
+      emits land alongside the existing UI calls for: lifecycle
+      (`AgentStart`, `AgentEnd`, `TurnStart`); diagnostics (`Notice`,
+      `Warning`, `Error`); streaming retries (`StreamRetry`); tool
+      execution (`ToolExecutionStart`, `ToolExecutionEnd` with
+      `ToolDetails::Text` for now); and sub-agent correlation
+      (`SubAgentStart`, `SubAgentEnd`).
+      `MessageStart`/`MessageUpdate`/`MessageEnd`, the full
+      `TurnEnd` payload, `ToolExecutionUpdate`, and `QueueUpdate`
+      events are deferred to §2.2/§2.4 once the unified message
+      types and per-tool `ToolOutcome` migrations land — the variant
+      shapes already require `AssistantMessage` /
+      `AssistantMessageEvent` from `aj-models::types`/`streaming`,
+      and bridging them through the legacy `MessageParam` flow
+      would be throwaway work. Two `event_protocol_tests` lock the
+      sequence we *do* emit today.
 
 ### §2.2 Refactor tools to `ToolContext` + `ToolOutcome`
 
