@@ -16,6 +16,26 @@ use crate::types::{
 
 const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Log an outgoing request URL and JSON body at `DEBUG` level. Gated
+/// on `tracing::enabled!` so callers don't pay the serialization cost
+/// when debug logging is disabled.
+fn debug_log_request<T: serde::Serialize>(url: &str, body: &T) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    match serde_json::to_string(body) {
+        Ok(json) => tracing::debug!(
+            url = %url,
+            body = %json,
+            "openai-sdk: outgoing request",
+        ),
+        Err(err) => tracing::debug!(
+            url = %url,
+            "openai-sdk: outgoing request (body serialization failed: {err})",
+        ),
+    }
+}
+
 pub struct Client {
     client: ReqwestClient,
     api_key: String,
@@ -41,9 +61,11 @@ impl Client {
         &self,
         request: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, anyhow::Error> {
+        let url = format!("{}/chat/completions", self.base_url);
+        debug_log_request(&url, &request);
         let request_builder = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(&url)
             .bearer_auth(&self.api_key)
             .json(&request);
 
@@ -82,9 +104,11 @@ impl Client {
     > {
         request.stream = Some(true);
 
+        let url = format!("{}/chat/completions", self.base_url);
+        debug_log_request(&url, &request);
         let request_builder = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(&url)
             .bearer_auth(&self.api_key)
             .json(&request);
 
@@ -152,9 +176,11 @@ impl Client {
         &self,
         request: CreateResponseRequest,
     ) -> Result<ResponsesResponse, anyhow::Error> {
+        let url = format!("{}/responses", self.base_url);
+        debug_log_request(&url, &request);
         let request_builder = self
             .client
-            .post(format!("{}/responses", self.base_url))
+            .post(&url)
             .bearer_auth(&self.api_key)
             .json(&request);
 
@@ -193,9 +219,11 @@ impl Client {
     > {
         request.stream = Some(true);
 
+        let url = format!("{}/responses", self.base_url);
+        debug_log_request(&url, &request);
         let request_builder = self
             .client
-            .post(format!("{}/responses", self.base_url))
+            .post(&url)
             .bearer_auth(&self.api_key)
             .json(&request);
 

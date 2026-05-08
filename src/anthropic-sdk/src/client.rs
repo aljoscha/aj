@@ -168,6 +168,27 @@ impl Client {
         builder
     }
 
+    /// Log the outgoing request URL and JSON body at `DEBUG` level.
+    /// Gated on `tracing::enabled!` so callers don't pay the
+    /// serialization cost when debug logging is disabled.
+    fn debug_log_request(&self, body: &Messages) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let url = format!("{}/v1/messages", self.base_url);
+        match serde_json::to_string(body) {
+            Ok(json) => tracing::debug!(
+                url = %url,
+                body = %json,
+                "anthropic-sdk: outgoing request",
+            ),
+            Err(err) => tracing::debug!(
+                url = %url,
+                "anthropic-sdk: outgoing request (body serialization failed: {err})",
+            ),
+        }
+    }
+
     /// Apply OAuth stealth-mode transformations to the outgoing request
     /// and return the caller's tool-name list to be used for reverse
     /// mapping on the response. Returns an empty list when stealth
@@ -186,6 +207,7 @@ impl Client {
     pub async fn messages(&self, mut messages: Messages) -> Result<Message, anyhow::Error> {
         let caller_tool_names = self.prepare_request(&mut messages);
 
+        self.debug_log_request(&messages);
         let request_builder = self.build_request().json(&messages);
 
         let response = request_builder
@@ -226,6 +248,7 @@ impl Client {
         messages.stream = Some(true);
         let caller_tool_names = self.prepare_request(&mut messages);
 
+        self.debug_log_request(&messages);
         let request_builder = self.build_request().json(&messages);
 
         let response = request_builder.send().await?;
