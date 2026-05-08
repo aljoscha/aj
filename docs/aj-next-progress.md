@@ -18,9 +18,11 @@ and the git history.
 
 ### §2.0 Preparation
 
-- [ ] Reconnaissance: inspect on-disk thread files in `~/.aj/threads/`
+- [x] Reconnaissance: inspect on-disk thread files in `~/.aj/threads/`
       to choose between serde rename and rewriting walker for
-      `UserOutput` → `ToolDetails` migration.
+      `UserOutput` → `ToolDetails` migration. **Decision: rewriting
+      walker, no `schema_version` header.** See "Reconnaissance
+      findings" below.
 - [x] (b) Move contract types into `aj-agent`: new `events`, `tool`,
       and `message` modules. Types are defined but not yet wired.
 - [ ] (c) Flip `aj-tools`'s dependency to `aj-agent` instead of
@@ -88,3 +90,85 @@ and the git history.
 - [ ] Drop `rustyline`, `termimad`, `console`.
 - [ ] Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`.
 - [ ] Update `README.md` and `AGENTS.md`.
+
+---
+
+## Reconnaissance findings — `UserOutput` → `ToolDetails` migration
+
+Empirical sample taken from `~/.aj/threads/aj/` and
+`~/.aj/threads/aj-2/` (240 thread files, ~12k entries):
+
+| Entry `type` | Count |
+|---|---|
+| `message` | 11,779 |
+| `system_prompt` | 120 |
+| `user_output` | 37 |
+
+Subagent framing exists in real data (thread `subagent`, 381
+entries spread across `agent_id` ∈ {1,2,3}); 120 thread files have
+the `meta` `system_prompt` root.
+
+`message` content blocks observed: `text`, `thinking`, `tool_use`,
+`tool_result`. Roles: `user`, `assistant`.
+
+**Of the 37 `user_output` entries, all 37 are `ToolError`.** Zero
+`Notice`, `Error`, `ToolResult`, `ToolResultDiff`, `TokenUsage`, or
+`TokenUsageSummary` entries appear on disk. This is a code
+consequence, not coincidence: `Agent::execute_tool`'s
+`recording_ui.take_recorded_outputs()` call is commented out
+(`src/aj-agent/src/lib.rs:758-760`), so every successful tool path
+returns `user_outputs: Vec::new()`. Only the agent-side error
+construction (`UserOutput::ToolError` at `lib.rs:493` and `:518`)
+ever reaches the log.
+
+On-disk shape quirk: the outer entry tag is snake_case
+(`"type": "user_output"`, from `#[serde(tag = "type",
+rename_all = "snake_case")]` on `ConversationEntryKind`), but the
+inner `UserOutput` variant uses serde defaults, so the variant
+discriminator is PascalCase (`"ToolError": {...}`).
+
+### Why a rewriting walker (not a serde rename)
+
+1. `ToolError {tool_name, input, error}` → `ToolDetails::Text
+   {summary, body}` with `is_error: true` is a **field-name
+   rewrite**, not a tag rename. `#[serde(rename = "...")]` on
+   variants and fields can't bridge `tool_name`/`input`/`error` to
+   `summary`/`body`.
+2. The §3 "discard `Notice`/`Error`/`TokenUsage*`" rules are no-ops
+   for actual data — none exist on disk. The walker stays trivial
+   for the `UserOutput` portion: 37 `ToolError` entries to rewrite,
+   nothing to discard.
+3. The `aj-models` rewrite already needs a one-shot
+   `MessageParam` → unified `Message` walker (per
+   `models-spec.md`). Adding the `UserOutput` rewrite to the same
+   pass costs nothing.
+4. After the walker runs we own a single, clean on-disk format
+   with no lingering serde compat shims in the Rust types.
+
+### Why no `schema_version` header
+
+- Every existing entry is identifiable by structural pattern
+  (`type` discriminator + variant body) without a version field.
+- The migration is one-shot and one-way (per §3); a header would
+  only matter if we expected multiple format generations
+  coexisting, which is explicitly out of scope.
+- `.bak` siblings cover the rollback story.
+
+### Walker shape (for §2.0(a) when it lands)
+
+The walker lives in `aj-session::migrate::walk_threads_dir(path)`
+and runs once on first launch of the new binary against
+`~/.aj/threads/<project>/*.jsonl`:
+
+- For each `ConversationEntry` with `entry: UserOutput(ToolError {
+  tool_name, input, error })`: emit `entry: ToolDetails(Text {
+  summary: format!("{tool_name}: error"), body: Some(error) })`
+  with `is_error: true`. Anchor on the same `parent_id`; preserve
+  `id`, `timestamp`, `thread`, `agent_id`. The preceding `tool_use`
+  block is reachable via `parent_id` if a future format wants the
+  `call_id` correlation.
+- `MessageParam` content blocks → unified `Message` (handled by
+  the same pass once `aj-models` lands its rewrite; out of scope
+  for §2.0(a)).
+- Each migrated file gets a `.bak` sibling. Skip files that
+  already have a `.bak` sibling (idempotent rerun).
