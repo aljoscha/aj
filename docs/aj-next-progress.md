@@ -627,23 +627,90 @@ adopts independently.
       exhausted" instead of returning the expected
       [`TurnError::Fatal`].
 
-- [ ] §2.5b: Flip [`aj_session::replay`] to
+- [x] §2.5b: Flip [`aj_session::replay`] to
       `Iterator<Item = AgentEvent>`. The cycle that blocked this
       in §2.0(a) (`aj-agent` depending on `aj-session`) was
       removed in §2.4b — `aj-session` now depends on `aj-agent`
-      and the replay module can construct `AgentEvent`s directly.
-      Each persisted [`ConversationEntryKind`] maps to one or
-      more events: assistant messages emit `StreamChunk` Start
-      and Stop pairs (so the renderer paints text and thinking
-      content the same way it does for live turns) plus
-      synthesized `ToolExecutionEnd` events for any tool_use
-      blocks; user-role messages with text emit a "user input
-      replayed" event the renderer can route to the user-text
-      pane; tool_result messages and `UserOutput::ToolError`
-      entries emit synthesized `ToolExecutionEnd` events keyed by
-      `tool_use_id`. The binary's [`display_conversation_history`]
-      retires in favour of consuming the same event-bridge
-      listener that drives live runs.
+      and the replay module constructs `AgentEvent`s directly.
+      The mapping (in `src/aj-session/src/replay.rs`):
+
+      - [`ConversationEntryKind::SystemPrompt`]: model-facing
+        metadata, no event.
+      - Assistant-role [`Message`]: one
+        [`AgentEvent::StreamChunk`] `Start`/`Stop` pair on
+        [`StreamChannel::Thinking`] for each `ThinkingBlock` /
+        `RedactedThinkingBlock` (latter rendered as
+        `[Redacted thinking: ...]`), then one pair on
+        [`StreamChannel::Text`] for the joined visible text. Each
+        `ToolUseBlock` updates an internal `tool_use_id ↦
+        tool_name` map used to label the matching
+        `ToolResultBlock` in the next user message.
+      - User-role [`Message`]: one [`AgentEvent::ToolExecutionEnd`]
+        for each `ToolResultBlock` keyed by `tool_use_id`
+        (carrying the looked-up tool name; falls back to
+        `"tool"` for orphaned legacy entries) plus, if the
+        message also carried free text, a
+        [`StreamChannel::User`] `Start`/`Stop` pair so the
+        renderer paints the user-input pane.
+      - [`UserOutput`]: each variant maps onto the closest live
+        equivalent — [`AgentEvent::Notice`] / [`AgentEvent::Error`]
+        for textual notices, [`AgentEvent::ToolExecutionEnd`] (with
+        the matching [`ToolDetails`] variant) for tool-flavoured
+        outputs, [`AgentEvent::TurnUsage`] for `TokenUsage`
+        snapshots. [`UserOutput::TokenUsageSummary`] is
+        end-of-session presentational state the binary renders
+        separately on shutdown, so it has no replay event.
+
+      A new [`StreamChannel::User`] variant was added to
+      [`aj_agent::events`] for the replayed user-input pair (live
+      user prompts arrive through the readline loop and never
+      flow through the bus, so the channel exists exclusively for
+      replay). [`event_bridge::EventBridgeListener`] in the `aj`
+      binary picks up the new channel and routes its actions
+      through `user_text_start` / `user_text_update` /
+      `user_text_stop`, mirroring the existing Text/Thinking
+      handling. The agent's `event_protocol_tests` `EventLabel`
+      mapping learned the new channel name (`"user"`) so future
+      regressions show up in the locked sequence labels.
+
+      `Agent::events::AgentId` derivation in `replay()`: User
+      threads emit as [`AgentId::Main`]; Subagent threads emit
+      tagged with their `agent_id` as [`AgentId::Sub(n)`] so the
+      bridge listener's per-agent renderer cache routes
+      sub-agent activity to a fresh [`SubAgentCli`] just like a
+      live run does. Meta entries (the system-prompt root) emit
+      no events — they're structural framing the binary projects
+      elsewhere (it freezes the prompt and hands it to the
+      agent).
+
+      The binary's [`display_conversation_history`] retired in
+      favour of the new pipeline:
+      `aj/src/main.rs::run_session` now keeps a clone of the
+      [`Listener`] subscribed to the agent's bus and drives
+      [`replay`] events through the same closure directly (not
+      through the bus, which would re-fire the persistence
+      listener and double-write every entry). The
+      `"--- End of conversation history ---"` notice still
+      bookends the replay so the user has a clear visual
+      separation between historical and live output. Replay now
+      runs *after* `repair_interrupted_tool_uses`, so the
+      synthesized `tool_result` message a recovery walk inserts
+      shows up in the user's resume display alongside everything
+      else (previously the synthesis happened after rendering
+      and the user never saw it).
+
+      Tests: `replay_projects_assistant_thinking_text_and_tool_results`
+      pins the seven-event sequence for a turn with
+      thinking/text/tool_use/tool_result;
+      `replay_skips_system_prompt_and_handles_empty_log` covers
+      the meta-only case; `replay_projects_user_output_tool_error_with_is_error_flag`
+      pins the legacy `UserOutput::ToolError` projection (the
+      predominant on-disk shape per §2.0 reconnaissance);
+      `replay_routes_subagent_entries_to_sub_agent_id` covers
+      sub-agent-tagged events;
+      `replay_falls_back_when_tool_use_id_is_not_tracked` covers
+      the truncated-log case where a tool_result block has no
+      preceding tool_use entry.
 
 ### §2.6 Cleanup
 

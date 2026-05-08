@@ -182,6 +182,15 @@ impl EventBridgeInner {
                         // a newline.
                         renderer.agent_thinking_stop();
                     }
+                    (StreamChannel::User, StreamAction::Start { snapshot }) => {
+                        renderer.user_text_start(snapshot);
+                    }
+                    (StreamChannel::User, StreamAction::Update { delta }) => {
+                        renderer.user_text_update(delta);
+                    }
+                    (StreamChannel::User, StreamAction::Stop { snapshot }) => {
+                        renderer.user_text_stop(snapshot);
+                    }
                 }
             }
             AgentEvent::TurnUsage { agent_id, usage } => {

@@ -4,13 +4,14 @@ use aj::SYSTEM_PROMPT;
 use aj::cli::AjCli;
 use aj::event_bridge::EventBridgeListener;
 use aj::prompt_history::{DEFAULT_MAX_ENTRIES, PromptHistory};
+use aj_agent::bus::Listener;
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
-use aj_models::messages::{ContentBlockParam, Role, Speed};
+use aj_models::messages::{Role, Speed};
 use aj_models::{ModelArgs, create_model};
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
-    repair_interrupted_tool_uses,
+    repair_interrupted_tool_uses, replay,
 };
 use aj_tools::get_builtin_tools;
 use aj_ui::{AjUi, SubAgentUsage, UsageSummary};
@@ -172,8 +173,14 @@ async fn main() -> Result<()> {
     // parent's bus, so all of their events flow through this same
     // listener too. The handle stays alive for the rest of the
     // process: we hold it on the stack until `main` returns.
-    let _bridge_handle =
-        agent.subscribe(EventBridgeListener::new(ui.shallow_clone()).into_listener());
+    //
+    // Keep a clone of the listener around so the resume path can
+    // drain `aj_session::replay` events through the same closure
+    // without going via the bus (which would also fire the
+    // persistence listener and re-write the events we're reading
+    // straight off disk).
+    let bridge_listener: Listener = EventBridgeListener::new(ui.shallow_clone()).into_listener();
+    let _bridge_handle = agent.subscribe(Arc::clone(&bridge_listener));
 
     match cli.command {
         Some(Commands::ListThreads) => {
@@ -188,7 +195,14 @@ async fn main() -> Result<()> {
                 ui.display_notice("No latest conversation to resume");
                 return Ok(());
             };
-            run_session(&mut agent, &mut ui, log, /* resuming = */ true).await?;
+            run_session(
+                &mut agent,
+                &mut ui,
+                log,
+                /* resuming = */ true,
+                Arc::clone(&bridge_listener),
+            )
+            .await?;
         }
         Some(Commands::Models { .. }) => {
             // Handled earlier in `main` before agent setup. Reaching
@@ -198,7 +212,14 @@ async fn main() -> Result<()> {
         None => {
             // Default behavior: start a fresh log and run the agent.
             let log = ConversationLog::create(&conversation_persistence)?;
-            run_session(&mut agent, &mut ui, log, /* resuming = */ false).await?;
+            run_session(
+                &mut agent,
+                &mut ui,
+                log,
+                /* resuming = */ false,
+                Arc::clone(&bridge_listener),
+            )
+            .await?;
         }
     }
 
@@ -213,11 +234,19 @@ async fn main() -> Result<()> {
 /// conversation log at all; the binary linearizes the user thread,
 /// repairs any interrupted tool calls, seeds the agent's transcript
 /// once, and otherwise watches the bus for updates.
+///
+/// `bridge_listener` is the [`Listener`] already subscribed to the
+/// agent's bus for live rendering; this function calls it directly
+/// for each event produced by [`replay`] when resuming, so the
+/// rendered history goes through the same code path as live events
+/// (§2.5b). The persistence listener is intentionally not driven
+/// during replay — those events are *already* on disk.
 async fn run_session(
     agent: &mut Agent,
     ui: &mut AjCli,
     mut log: ConversationLog,
     resuming: bool,
+    bridge_listener: Listener,
 ) -> Result<()> {
     // Resolve the system prompt: reuse a persisted one (cache-warm
     // resume) or assemble fresh from the env. On a fresh log we
@@ -246,13 +275,22 @@ async fn run_session(
     // thread, then run `repair_interrupted_tool_uses` to write
     // synthesized tool_results for any dangling `tool_use` ids
     // (process-killed-mid-batch recovery), then re-linearize so the
-    // seed sees the post-repair view.
+    // seed sees the post-repair view. The renderer drains the same
+    // [`AgentEvent`] stream a live run produces so live and resumed
+    // sessions go through identical UI code paths (§2.5b).
     let resumed_thread_id = if let Some(head) = log.latest_leaf(ThreadFilter::USER) {
         let conversation = log.linearize(&head, ThreadFilter::USER);
-        if resuming {
-            display_conversation_history(ui, &conversation);
-        }
         repair_interrupted_tool_uses(&mut log, &conversation)?;
+        if resuming {
+            // Drive replay events directly through the bridge
+            // listener (not the bus) so they don't also trip the
+            // persistence listener — replay is reading from disk,
+            // re-writing would duplicate every entry.
+            for event in replay(&log) {
+                bridge_listener(&event).await?;
+            }
+            ui.display_notice("--- End of conversation history ---");
+        }
         // Re-linearize after repair to capture any synthesized
         // tool_result message.
         let head = log
@@ -366,91 +404,6 @@ async fn run_session(
     }
 
     Ok(())
-}
-
-/// Render replayed conversation history through the legacy CLI
-/// helpers. The agent emits live events through the bus; resumed
-/// sessions need to display the prior turns to give the user a
-/// visual anchor before the next prompt.
-fn display_conversation_history(ui: &mut AjCli, conversation: &aj_session::Conversation) {
-    if conversation.is_empty() {
-        return;
-    }
-
-    for entry in conversation.entries() {
-        match &entry.entry {
-            aj_session::ConversationEntryKind::Message(msg) => match msg.role {
-                Role::User => {
-                    let text_content = msg
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            ContentBlockParam::TextBlock { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !text_content.is_empty() {
-                        ui.user_text_start("");
-                        ui.user_text_stop(&text_content);
-                    }
-                }
-                Role::Assistant => {
-                    for content in &msg.content {
-                        if let ContentBlockParam::ThinkingBlock { thinking, .. } = content {
-                            ui.agent_thinking_start(thinking);
-                            ui.agent_thinking_stop();
-                        } else if let ContentBlockParam::RedactedThinkingBlock { data } = content {
-                            ui.agent_thinking_start(&format!("[Redacted thinking: {data}]"));
-                            ui.agent_thinking_stop();
-                        }
-                    }
-                    let text_content = msg
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            ContentBlockParam::TextBlock { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !text_content.is_empty() {
-                        ui.agent_text_start("");
-                        ui.agent_text_stop(&text_content);
-                    }
-                }
-            },
-            aj_session::ConversationEntryKind::UserOutput(out) => match out {
-                aj_ui::UserOutput::Notice(msg) => ui.display_notice(msg),
-                aj_ui::UserOutput::Error(msg) => ui.display_error(msg),
-                aj_ui::UserOutput::ToolResult {
-                    tool_name,
-                    input,
-                    output,
-                } => ui.display_tool_result(tool_name, input, output),
-                aj_ui::UserOutput::ToolResultDiff {
-                    tool_name,
-                    input,
-                    before,
-                    after,
-                } => ui.display_tool_result_diff(tool_name, input, before, after),
-                aj_ui::UserOutput::ToolError {
-                    tool_name,
-                    input,
-                    error,
-                } => ui.display_tool_error(tool_name, input, error),
-                aj_ui::UserOutput::TokenUsage(usage) => ui.display_token_usage(usage),
-                aj_ui::UserOutput::TokenUsageSummary(summary) => {
-                    ui.display_token_usage_summary(summary)
-                }
-            },
-            aj_session::ConversationEntryKind::SystemPrompt { .. } => {
-                // Model-facing metadata; not shown to the user.
-            }
-        }
-    }
-
-    ui.display_notice("--- End of conversation history ---");
 }
 
 /// Render the startup `Context:` notice listing every agents.md

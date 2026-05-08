@@ -38,17 +38,27 @@ pub enum AgentId {
     Sub(usize),
 }
 
-/// Channel for streaming assistant content. Routed by listeners onto
-/// distinct UI components — visible text vs. extended thinking — so
-/// renderers can style them differently and persistence can decide
-/// whether either is worth keeping (today: only the finalized message
-/// is persisted; streaming is transient).
+/// Channel for streaming content. Routed by listeners onto distinct
+/// UI components — visible text vs. extended thinking vs. replayed
+/// user input — so renderers can style them differently and
+/// persistence can decide whether each is worth keeping (today: only
+/// the finalized message is persisted; streaming is transient).
+///
+/// [`StreamChannel::User`] is used exclusively by replay (see
+/// [`aj_session::replay`]): live user input arrives via the readline
+/// loop and never flows through the bus, but resuming a thread
+/// projects each persisted user-role text message as a Start/Stop
+/// pair on the user channel so the renderer can repaint the prior
+/// turns through the same path it uses for live streaming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamChannel {
     /// Visible assistant text.
     Text,
     /// Extended thinking ("reasoning") content.
     Thinking,
+    /// Replayed user input. Only emitted during conversation replay;
+    /// live user prompts are echoed by the terminal directly.
+    User,
 }
 
 /// Streaming progress action for an in-flight assistant content block.

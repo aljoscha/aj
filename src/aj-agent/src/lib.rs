@@ -1662,6 +1662,7 @@ mod event_protocol_tests {
                 let channel = match channel {
                     crate::events::StreamChannel::Text => "text",
                     crate::events::StreamChannel::Thinking => "thinking",
+                    crate::events::StreamChannel::User => "user",
                 };
                 let action = match action {
                     crate::events::StreamAction::Start { .. } => "start",
