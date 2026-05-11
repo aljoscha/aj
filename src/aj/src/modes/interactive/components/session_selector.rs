@@ -29,18 +29,23 @@ use aj_tui::keys::InputEvent;
 use aj_tui::style;
 use chrono::{DateTime, Utc};
 
-/// Maximum visible rows in the result list. Matches the model
-/// selector's eight-row window so the two overlays feel
-/// consistent; taller terminals see a scrolled view through
-/// [`SelectList`]'s own scroll model.
-const MAX_VISIBLE_ROWS: usize = 8;
+/// Maximum visible rows in the result list. The session picker
+/// carries more per-row metadata than the thinking or model
+/// pickers (preview prefix + creation date + last-message age),
+/// so it benefits from showing more candidates at once than the
+/// shared eight-row baseline. Thinking and model selectors stay
+/// at eight — their catalogs are small and have far lower
+/// information density per row, so the extra height there would
+/// be wasted screen real-estate.
+const MAX_VISIBLE_ROWS: usize = 16;
 
 /// Cap on how much of the first user message is rendered in the
 /// primary column. Keeps long pastes (a stack trace, a chunk of
-/// code) from blowing past the overlay width — the description
-/// column carries the thread id and date so the user can still
-/// disambiguate.
-const PREVIEW_MAX_CHARS: usize = 80;
+/// code) from blowing past the overlay width while leaving room
+/// for the broader `<count> msgs · created … · last …`
+/// description triplet — the description column needs more width
+/// than the previous design left it.
+const PREVIEW_MAX_CHARS: usize = 60;
 
 /// Outcome of a single overlay session.
 ///
@@ -280,14 +285,23 @@ fn format_primary(preview: &ThreadPreview, is_current: bool) -> String {
 }
 
 /// Build the secondary (right / description) column for one row.
-/// Carries thread metadata: human age and the message count. The
-/// thread id itself is omitted — it's already the row's unique
-/// value and would dominate the column width without adding much.
+/// Carries thread metadata as a triplet: message count, creation
+/// date (adaptive absolute), and time since the last message
+/// (coarse buckets relative to `now`). The thread id itself is
+/// omitted — it's already the row's unique value and would
+/// dominate the column width without adding much.
+///
+/// Example: `42 msgs · created May 8 · last 5m`.
+///
+/// If a too-narrow terminal can't fit the full triplet,
+/// [`SelectList`]'s existing description-end truncation kicks in
+/// — we don't build a custom collapse strategy.
 fn format_secondary(preview: &ThreadPreview, now: DateTime<Utc>) -> String {
-    let age = format_age(now, preview.modified);
     let count = preview.message_count;
     let msg_word = if count == 1 { "msg" } else { "msgs" };
-    format!("{count} {msg_word} · {age}")
+    let created = format_created(now, preview.created_at);
+    let last = format_age(now, preview.last_message_at);
+    format!("{count} {msg_word} · created {created} · last {last}")
 }
 
 /// Render `then` as a coarse age relative to `now`.
@@ -320,6 +334,37 @@ fn format_age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
         format!("{months}mo")
     } else {
         format!("{years}y")
+    }
+}
+
+/// Render `created` as an adaptive absolute date relative to `now`.
+///
+/// - **Same calendar day** as `now`: clock-only (`14:22`). The
+///   surrounding `last <age>` field already captures recency
+///   coarsely, so the absolute clock time is the value-add for
+///   threads created earlier today.
+/// - **Same calendar year** as `now`: month + day (`May 8`). Year
+///   is implied; trimming it keeps the description tight.
+/// - **Older**: month + day + year (`May 8 2024`). The year
+///   matters once we cross the calendar boundary.
+///
+/// Both arguments are UTC `DateTime`s; the comparison is therefore
+/// UTC-local rather than wall-clock-local. That's a deliberate
+/// trade-off: the rest of the selector renders ages in UTC too
+/// (the `thread_id` mint format is `%Y-%m-%d-%H-%M-%S-%3f` UTC),
+/// and switching one cell to wall-clock would make the row
+/// internally inconsistent. A future per-user locale toggle could
+/// flip everything together.
+fn format_created(now: DateTime<Utc>, created: DateTime<Utc>) -> String {
+    use chrono::Datelike;
+    let same_day = now.date_naive() == created.date_naive();
+    let same_year = now.year() == created.year();
+    if same_day {
+        created.format("%H:%M").to_string()
+    } else if same_year {
+        created.format("%b %-d").to_string()
+    } else {
+        created.format("%b %-d %Y").to_string()
     }
 }
 
@@ -430,9 +475,18 @@ mod tests {
         message_count: usize,
         age: Duration,
     ) -> ThreadPreview {
+        let now = Utc::now();
+        // Default test policy: `last_message_at` mirrors `age` (the
+        // recency we care about), `created_at` is treated as roughly
+        // the same instant — most tests don't care about the
+        // distinction and the few that do override both fields
+        // directly after constructing the preview.
+        let last = now - age;
         ThreadPreview {
             thread_id: thread_id.to_string(),
-            modified: Utc::now() - age,
+            modified: last,
+            created_at: last,
+            last_message_at: last,
             size_bytes: 1024,
             message_count,
             first_user_message: first_user.map(|s| s.to_string()),
@@ -624,5 +678,170 @@ mod tests {
         assert_eq!(format_age(now, now - Duration::days(14)), "2w");
         assert_eq!(format_age(now, now - Duration::days(60)), "2mo");
         assert_eq!(format_age(now, now - Duration::days(800)), "2y");
+    }
+
+    #[test]
+    fn format_created_uses_clock_for_same_day() {
+        // A timestamp earlier the same calendar day should render
+        // as `HH:MM` only.
+        let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_opt(20, 0, 0)
+            .unwrap()
+            .and_utc();
+        let earlier = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_opt(14, 22, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(format_created(now, earlier), "14:22");
+    }
+
+    #[test]
+    fn format_created_uses_month_day_for_same_year() {
+        // Different calendar day, same year → `Mon D`.
+        let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_opt(20, 0, 0)
+            .unwrap()
+            .and_utc();
+        let earlier = chrono::NaiveDate::from_ymd_opt(2025, 5, 8)
+            .unwrap()
+            .and_hms_opt(14, 22, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(format_created(now, earlier), "May 8");
+    }
+
+    #[test]
+    fn format_created_uses_year_for_older_threads() {
+        // Different calendar year → `Mon D YYYY`.
+        let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_opt(20, 0, 0)
+            .unwrap()
+            .and_utc();
+        let earlier = chrono::NaiveDate::from_ymd_opt(2024, 5, 8)
+            .unwrap()
+            .and_hms_opt(14, 22, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(format_created(now, earlier), "May 8 2024");
+    }
+
+    #[test]
+    fn description_carries_msg_count_created_and_last() {
+        // The description should encode all three fields in the
+        // documented order: `<count> msgs · created <D> · last <age>`.
+        let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_opt(20, 0, 0)
+            .unwrap()
+            .and_utc();
+        let p = ThreadPreview {
+            thread_id: "2025-05-11-13-22-00-000".to_string(),
+            // `last_message_at` and `created_at` separated by hours
+            // so the rendered fields are visually distinct.
+            modified: now - Duration::hours(2),
+            created_at: chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+                .unwrap()
+                .and_hms_opt(13, 22, 0)
+                .unwrap()
+                .and_utc(),
+            last_message_at: now - Duration::hours(2),
+            size_bytes: 0,
+            message_count: 42,
+            first_user_message: Some("refactor".into()),
+        };
+        let secondary = format_secondary(&p, now);
+        assert_eq!(secondary, "42 msgs · created 13:22 · last 2h");
+    }
+
+    #[test]
+    fn description_singular_msg_word_for_one_message() {
+        // The singular grammar (`1 msg`) is preserved.
+        let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_opt(20, 0, 0)
+            .unwrap()
+            .and_utc();
+        let p = ThreadPreview {
+            thread_id: "2025-05-11-13-22-00-000".into(),
+            modified: now,
+            created_at: chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+                .unwrap()
+                .and_hms_opt(13, 22, 0)
+                .unwrap()
+                .and_utc(),
+            last_message_at: now,
+            size_bytes: 0,
+            message_count: 1,
+            first_user_message: None,
+        };
+        let s = format_secondary(&p, now);
+        assert!(s.starts_with("1 msg ·"), "got: {s:?}");
+    }
+
+    #[test]
+    fn description_uses_last_message_at_not_modified_for_age() {
+        // A preview whose file mtime is recent but whose final
+        // message timestamp is hours older should still render
+        // `last 3h` rather than `last now`.
+        let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_opt(20, 0, 0)
+            .unwrap()
+            .and_utc();
+        let p = ThreadPreview {
+            thread_id: "2025-05-11-13-22-00-000".into(),
+            // File was touched seconds ago (e.g. a vacuum / rename
+            // / fsync), but the last actual message landed 3h ago.
+            modified: now - Duration::seconds(5),
+            created_at: chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+                .unwrap()
+                .and_hms_opt(13, 22, 0)
+                .unwrap()
+                .and_utc(),
+            last_message_at: now - Duration::hours(3),
+            size_bytes: 0,
+            message_count: 10,
+            first_user_message: None,
+        };
+        let s = format_secondary(&p, now);
+        // The `last <age>` cell drives off `last_message_at`, so we
+        // get `last 3h` even though the file was touched moments
+        // ago.
+        assert!(s.ends_with("· last 3h"), "got: {s:?}");
+    }
+
+    #[test]
+    fn pre_selected_current_thread_stays_visible_at_max_visible_rows_bump() {
+        // With the row cap bumped to 16, a catalog of 12 threads
+        // and the current thread in the middle of the list should
+        // produce a render that still includes the `(current)`
+        // marker — i.e. no off-screen scrolling required.
+        let mut catalog = Vec::new();
+        for i in 0i64..12 {
+            catalog.push(make_preview(
+                &format!("2025-05-{:02}", 11 - i),
+                Some(&format!("thread {i}")),
+                // Test-only count: small numeric, so a lossless
+                // cast through a typed temporary keeps the strict
+                // `clippy::as-conversions` lint satisfied.
+                usize::try_from(i).expect("non-negative i fits in usize"),
+                Duration::minutes(i * 5 + 1),
+            ));
+        }
+        // Pick the middle row as current. The pre-selection should
+        // land in the visible window without any scroll.
+        let current = catalog[6].thread_id.clone();
+        let mut sel =
+            SessionSelectorComponent::new(identity_theme(), catalog, Some(current.clone()), None);
+        // Render wide so column truncation can't strip "(current)".
+        let body = sel.render(200).join("\n");
+        assert!(
+            body.contains("thread 6 (current)"),
+            "expected the current row to be visible: {body}"
+        );
     }
 }

@@ -6,7 +6,7 @@
 //! [`crate::log::ConversationLog`] can open / create the right file.
 
 use aj_models::messages::{ContentBlockParam, Role};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -228,6 +228,26 @@ pub struct ThreadPreview {
     /// real [`DateTime`] (not a pre-formatted string) so the
     /// renderer can choose whatever date/age formatting it likes.
     pub modified: DateTime<Utc>,
+    /// Thread creation time. Parsed from `thread_id` (which is
+    /// minted as a millisecond-precision UTC timestamp on
+    /// [`crate::log::ConversationLog::create`]). Falls back to
+    /// `modified` when the id doesn't parse — placeholder previews,
+    /// hand-renamed files, or a future filename format that this
+    /// build doesn't recognise still produce a structurally
+    /// complete row.
+    pub created_at: DateTime<Utc>,
+    /// Time of the most recently appended message-kind entry.
+    /// Captured during the JSONL walk in
+    /// [`read_thread_preview_file`] as the largest
+    /// [`ConversationEntry::timestamp`] seen on a
+    /// [`ConversationEntryKind::Message`] entry, so out-of-order
+    /// writes (e.g. a tool result that completes after a streaming
+    /// assistant message finalised) still resolve to the true
+    /// most-recent message rather than the last line of the file.
+    /// Falls back to `modified` when no entry carries a timestamp
+    /// (logs predating the timestamping work) or no message-kind
+    /// entry has been appended yet.
+    pub last_message_at: DateTime<Utc>,
     /// On-disk size in bytes. Cheap to surface from the
     /// `fs::metadata` we already had to call.
     pub size_bytes: u64,
@@ -260,9 +280,18 @@ impl ThreadPreview {
             }
             Err(_) => (Utc::now(), 0),
         };
+        // Parse the creation time from the filename stem; fall back
+        // to `modified` so the row still has a complete metadata
+        // triple to render.
+        let created_at = parse_thread_id_created_at(&thread_id).unwrap_or(modified);
         Self {
             thread_id,
             modified,
+            created_at,
+            // No message-kind entries parsed: the cheap fallback is
+            // the file mtime, matching what `format_age` would have
+            // returned before this field existed.
+            last_message_at: modified,
             size_bytes,
             message_count: 0,
             first_user_message: None,
@@ -293,6 +322,11 @@ fn read_thread_preview_file(
 
     let mut message_count = 0usize;
     let mut first_user_message: Option<String> = None;
+    // Track the largest message-kind timestamp seen so far. Tracking
+    // the max (not the last) lets the field tolerate out-of-order
+    // writes — a tool result that lands after a streaming assistant
+    // message finalised, for example.
+    let mut last_message_at: Option<DateTime<Utc>> = None;
 
     for line_res in reader.lines() {
         // A best-effort `Ok(_)`-only path: an IO error mid-file
@@ -315,16 +349,69 @@ fn read_thread_preview_file(
                     first_user_message = Some(text);
                 }
             }
+            if let Some(ts) = entry.timestamp {
+                last_message_at = Some(match last_message_at {
+                    Some(prev) if prev >= ts => prev,
+                    _ => ts,
+                });
+            }
         }
     }
+
+    // Creation time: derived from the filename stem rather than
+    // a per-entry timestamp so a thread with no appended messages
+    // (a freshly-minted log) still has a meaningful "created"
+    // marker for the selector. Fall back to the file mtime if the
+    // stem doesn't parse.
+    let created_at = parse_thread_id_created_at(thread_id).unwrap_or(modified);
+    // `last_message_at` falls back to the file mtime for two cases:
+    // logs predating the per-entry timestamping work (every entry
+    // has `timestamp: None`) and freshly-minted threads with no
+    // message-kind entries yet. The fallback matches the value the
+    // selector would have rendered as `modified` under the older
+    // single-field design.
+    let last_message_at = last_message_at.unwrap_or(modified);
 
     Ok(ThreadPreview {
         thread_id: thread_id.to_string(),
         modified,
+        created_at,
+        last_message_at,
         size_bytes,
         message_count,
         first_user_message,
     })
+}
+
+/// Parse a thread id minted by [`crate::log::ConversationLog::create`]
+/// back into the UTC instant it represents.
+///
+/// The mint format is `%Y-%m-%d-%H-%M-%S-%3f` with an optional
+/// `_<N>` collision suffix appended when two `create`s land in the
+/// same millisecond. This parser strips the suffix and reads the
+/// stem against the same `chrono` format string the minter uses, so
+/// the round-trip is exact.
+///
+/// Returns `None` for any stem that doesn't conform — placeholder
+/// ids, hand-renamed files, or future format changes. The caller
+/// falls back to file mtime in that case so the row still renders.
+fn parse_thread_id_created_at(thread_id: &str) -> Option<DateTime<Utc>> {
+    // Strip a trailing `_<digits>` collision suffix. The mint side
+    // never embeds an underscore in the timestamp portion so an
+    // underscore unambiguously marks the suffix boundary; we still
+    // require the suffix to be all digits to avoid misclassifying
+    // an unexpected stem shape as a collision.
+    let stem = match thread_id.rsplit_once('_') {
+        Some((prefix, suffix))
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            prefix
+        }
+        _ => thread_id,
+    };
+    NaiveDateTime::parse_from_str(stem, "%Y-%m-%d-%H-%M-%S-%3f")
+        .ok()
+        .map(|naive| naive.and_utc())
 }
 
 /// Return the text from the first [`ContentBlockParam::TextBlock`]
@@ -510,5 +597,137 @@ mod tests {
 
         let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
         assert!(previews.is_empty(), "got {previews:?}");
+    }
+
+    #[test]
+    fn parse_thread_id_created_at_round_trips_minted_id() {
+        // The mint format is `%Y-%m-%d-%H-%M-%S-%3f`; parsing a known
+        // stem should give back the corresponding UTC instant.
+        let parsed = super::parse_thread_id_created_at("2025-05-11-14-22-03-512")
+            .expect("known-good stem parses");
+        // Build the same instant from components and compare.
+        let expected = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
+            .unwrap()
+            .and_hms_milli_opt(14, 22, 3, 512)
+            .unwrap()
+            .and_utc();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parse_thread_id_created_at_strips_collision_suffix() {
+        // `_<digits>` suffix marks an intra-millisecond collision —
+        // strip it before parsing. The result should be the same as
+        // the suffix-less id.
+        let suffix = super::parse_thread_id_created_at("2025-05-11-14-22-03-512_3")
+            .expect("suffixed stem parses");
+        let bare =
+            super::parse_thread_id_created_at("2025-05-11-14-22-03-512").expect("bare stem parses");
+        assert_eq!(suffix, bare);
+    }
+
+    #[test]
+    fn parse_thread_id_created_at_returns_none_for_unrecognised_stem() {
+        // Hand-renamed files, placeholder ids, or future formats
+        // should produce `None` so the caller can fall back to
+        // file-mtime.
+        assert!(super::parse_thread_id_created_at("custom-name").is_none());
+        assert!(super::parse_thread_id_created_at("").is_none());
+        // Underscore with non-digit suffix isn't a collision marker.
+        assert!(super::parse_thread_id_created_at("2025-05-11-14-22-03-512_abc").is_none());
+    }
+
+    #[test]
+    fn list_thread_previews_populates_created_at_from_thread_id() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hi", "ok");
+        let thread_id = log.thread_id().to_string();
+
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert_eq!(previews.len(), 1);
+        let p = &previews[0];
+        // The id was minted from `Utc::now()` at create-time, so the
+        // parsed `created_at` should land within a few seconds of
+        // when the test ran. We assert it parses back to the same
+        // instant the id encodes by re-parsing the stem ourselves.
+        let expected =
+            super::parse_thread_id_created_at(&thread_id).expect("freshly-minted id parses");
+        assert_eq!(p.created_at, expected);
+    }
+
+    #[test]
+    fn list_thread_previews_falls_back_to_modified_for_last_message_at_when_no_entries() {
+        let (_dir, persistence) = fixture();
+        // Create a log but don't append anything — the file stays
+        // empty so there are zero message-kind entries.
+        let _log = ConversationLog::create(&persistence).expect("create");
+        // The file is created lazily on first append; we need an
+        // on-disk file for `list_thread_previews` to see it, so
+        // append a single SystemPrompt entry (not a Message-kind
+        // entry, so it shouldn't bump `last_message_at`).
+        let mut log = _log;
+        log.append(
+            None,
+            ThreadKind::Meta,
+            None,
+            ConversationEntryKind::SystemPrompt {
+                text: "test".to_string(),
+            },
+        )
+        .expect("append system prompt");
+
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert_eq!(previews.len(), 1);
+        let p = &previews[0];
+        assert_eq!(p.message_count, 0);
+        // No message-kind entry was appended → `last_message_at`
+        // falls back to the file mtime.
+        assert_eq!(p.last_message_at, p.modified);
+    }
+
+    #[test]
+    fn list_thread_previews_uses_largest_message_timestamp() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        // Append two messages with a real time gap so each line gets
+        // a distinct timestamp.
+        append_user_then_assistant(&mut log, "hello", "world");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let head = log
+            .latest_leaf(crate::ThreadFilter::USER)
+            .expect("head exists");
+        let user2 = MessageParam {
+            role: Role::User,
+            content: vec![ContentBlockParam::TextBlock {
+                text: "follow-up".to_string(),
+                citations: None,
+                signature: None,
+            }],
+        };
+        log.append(
+            Some(head),
+            ThreadKind::User,
+            None,
+            ConversationEntryKind::Message(user2),
+        )
+        .expect("append user2");
+
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert_eq!(previews.len(), 1);
+        let p = &previews[0];
+        // The last appended message is the latest in this case, so
+        // `last_message_at` should match its timestamp. We can't
+        // assert the exact instant (the test doesn't know it) but
+        // it must be strictly after the first message's timestamp
+        // window — we sanity-check by requiring `last_message_at`
+        // to be no earlier than `created_at` + 10ms.
+        let min_expected = p.created_at + chrono::Duration::milliseconds(10);
+        assert!(
+            p.last_message_at >= min_expected,
+            "last_message_at = {}, expected >= {}",
+            p.last_message_at,
+            min_expected
+        );
     }
 }

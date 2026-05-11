@@ -901,12 +901,23 @@ async fn handle_slash_command(
                 initial_query,
             );
             let outcome = component.outcome_handle();
-            // Session picker needs as much room as the model picker
-            // — thread previews can carry meaningful prefixes worth
-            // showing without truncation.
+            // Session picker carries the richest per-row metadata
+            // (preview prefix + msg count + creation date + last-
+            // message age), so it gets the most room. 80% of the
+            // terminal width on wide terminals lets the description
+            // triplet breathe; an 80-column floor keeps the
+            // overlay readable on narrower terminals, and the
+            // 80%-of-height cap keeps the picker from spilling
+            // beyond the visible region on short terminals.
+            // `resolve_overlay_layout` clamps the resolved width
+            // to the terminal's actual width after the floor is
+            // applied, so the picker degrades gracefully when the
+            // floor exceeds the terminal width.
             let options = OverlayOptions {
                 anchor: OverlayAnchor::Center,
-                width: Some(SizeValue::Absolute(80)),
+                width: Some(SizeValue::Percent(80.0)),
+                min_width: Some(80),
+                max_height: Some(SizeValue::Percent(80.0)),
                 ..OverlayOptions::default()
             };
             let handle = tui.show_overlay(Box::new(component), options);
