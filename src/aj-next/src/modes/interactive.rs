@@ -49,7 +49,9 @@ use crate::config::slash_commands::{
     SlashAction, build_autocomplete_provider, dispatch as slash_dispatch, load_model_catalog,
     thinking_level_name,
 };
-use crate::config::theme::{Theme, markdown_theme, select_list_theme};
+use crate::config::theme::{
+    Theme, ThemeHandle, markdown_theme, select_list_theme, watch_user_theme,
+};
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::model_selector::{
@@ -220,9 +222,23 @@ impl InteractiveMode {
         // ---- Theme ----------------------------------------------------
         // Loaded once at startup from `config.theme` (default `dark`).
         // The handle is reused everywhere a component needs theme
-        // colors: layout, event pump, selector overlays. Hot-reload
-        // and the runtime theme-swap path land in a follow-up.
-        let theme = Theme::load(config.theme.as_deref().unwrap_or("dark"));
+        // colors: layout, event pump, selector overlays. A runtime
+        // swap re-points the inner [`Theme`] without rebuilding any
+        // component — every theme closure resolves through the
+        // shared [`RwLock`] on each call.
+        let configured_theme = config.theme.as_deref().unwrap_or("dark").to_string();
+        let theme = ThemeHandle::new(Theme::load(&configured_theme));
+
+        // ---- Theme file watcher (hot-reload) -------------------------
+        // Only user-supplied themes get a watcher; bundled `dark` /
+        // `light` palettes live inside the binary and have no on-disk
+        // source to edit. `watch_user_theme` short-circuits on missing
+        // file / unset `$HOME` and silently degrades to "no
+        // hot-reload" when the notify backend can't start.
+        let (theme_watcher_guard, mut theme_rx) = match watch_user_theme(&configured_theme) {
+            Some((guard, rx)) => (Some(guard), Some(rx)),
+            None => (None, None),
+        };
 
         // ---- Build the TUI --------------------------------------------
         let mut tui = Tui::new(Box::new(ProcessTerminal::new()));
@@ -482,6 +498,31 @@ impl InteractiveMode {
                     let Some(event) = maybe_evt else { continue };
                     pump.handle(&mut tui, &event);
                 }
+
+                // --- Theme reload (fs-watcher) ---
+                // Coalesced re-parses of `~/.aj/themes/<name>.json`
+                // flow through here. `theme_rx` is `None` when no
+                // watcher is active (bundled theme name with no
+                // override, missing `$HOME`, or the notify backend
+                // declined to start); the helper folds that into a
+                // pending-forever future so the select arm is
+                // harmless in those cases.
+                maybe_new_theme = recv_theme(theme_rx.as_mut()) => {
+                    let Some(new_theme) = maybe_new_theme else { continue };
+                    let name = new_theme.name().to_string();
+                    theme.replace(new_theme);
+                    // `Tui::invalidate` walks the root + every overlay
+                    // and clears each component's cached render
+                    // output. The closures still in flight resolve
+                    // through the shared lock so the next render
+                    // paints with the new palette automatically.
+                    tui.invalidate();
+                    tui.request_render();
+                    pump.handle(
+                        &mut tui,
+                        &notice_event(&format!("Theme '{name}' reloaded.")),
+                    );
+                }
             }
         }
 
@@ -492,6 +533,13 @@ impl InteractiveMode {
             handle.abort();
             let _ = handle.await;
         }
+
+        // Drop the watcher guard explicitly so its `Drop`
+        // tears down the notify watcher before the runtime exits.
+        // Without this the variable would still be live across the
+        // `tui.stop()` call below and trigger a clippy warning
+        // about meaningless drops if we later wanted to be explicit.
+        drop(theme_watcher_guard);
 
         tui.stop();
         run_result
@@ -504,6 +552,20 @@ impl InteractiveMode {
 /// that as a transient blip and keeps the TUI alive.
 async fn recv_event(rx: &mut UnboundedReceiver<AgentEvent>) -> Option<AgentEvent> {
     rx.recv().await
+}
+
+/// Pull one [`Theme`] off the theme-watcher channel. Mirrors the
+/// shape of [`recv_event`] but accepts an `Option<&mut
+/// UnboundedReceiver<Theme>>` so the `tokio::select!` arm in
+/// [`InteractiveMode::run`] stays clean whether or not the
+/// fs-watcher started successfully. When the receiver is absent
+/// (no watcher / `None`), the future pends forever — the arm
+/// effectively becomes a no-op in the `select!`.
+async fn recv_theme(rx: Option<&mut UnboundedReceiver<Theme>>) -> Option<Theme> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// State for an active selector overlay.
@@ -569,7 +631,7 @@ async fn handle_slash_command(
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
     log: Arc<TokioMutex<ConversationLog>>,
     conversation_persistence: ConversationPersistence,
-    theme: &Theme,
+    theme: &ThemeHandle,
     text: &str,
 ) -> SlashHandled {
     match slash_dispatch(text) {
@@ -724,7 +786,7 @@ async fn handle_selector_outcome(
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
     conversation_persistence: &ConversationPersistence,
-    theme: &Theme,
+    theme: &ThemeHandle,
 ) -> SelectorPollOutcome {
     match selector {
         OpenSelector::Thinking { handle, outcome } => {
@@ -900,7 +962,7 @@ async fn perform_thread_swap(
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
     conversation_persistence: &ConversationPersistence,
-    theme: &Theme,
+    theme: &ThemeHandle,
     thread_id: &str,
 ) -> Result<()> {
     // 1. Resume the new log from disk.

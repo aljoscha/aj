@@ -52,15 +52,18 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use aj_tui::components::editor::EditorTheme;
 use aj_tui::components::markdown::MarkdownTheme;
 use aj_tui::components::select_list::SelectListTheme;
 use aj_tui::style;
+use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// Bundled "dark" palette. The default; loads when `theme` is unset
 /// in `config.toml` or when an explicitly-named theme fails to
@@ -833,13 +836,273 @@ fn user_themes_dir() -> Option<PathBuf> {
 }
 
 // ============================================================================
+// ThemeHandle: shared, hot-swappable theme reference
+// ============================================================================
+
+/// Shared, hot-swappable handle to a [`Theme`]. The interactive
+/// mode threads a single [`ThemeHandle`] through every theme
+/// builder so a runtime palette swap (fs-watcher fires; a future
+/// `/theme` selector picks a new theme) is visible to every
+/// component without rebuilding any of them.
+///
+/// The closures returned by [`Self::fg_closure`] /
+/// [`Self::bg_closure`] dereference through the inner [`RwLock`]
+/// on each call, so an in-place [`Self::replace`] is enough to
+/// re-skin everything that's still alive. Callers should follow
+/// up with `tui.invalidate()` + `tui.request_render()` to push
+/// the change to screen.
+#[derive(Clone)]
+pub struct ThemeHandle {
+    inner: Arc<RwLock<Theme>>,
+}
+
+impl ThemeHandle {
+    /// Wrap a freshly-loaded [`Theme`] in a sharable handle.
+    pub fn new(theme: Theme) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(theme)),
+        }
+    }
+
+    /// Replace the inner theme. The next render call from any
+    /// component painted through the closures handed out by
+    /// [`Self::fg_closure`] / [`Self::bg_closure`] picks up the
+    /// new palette automatically; the host is responsible for
+    /// invalidating cached render output (`tui.invalidate()`) and
+    /// requesting a fresh frame (`tui.request_render()`).
+    pub fn replace(&self, theme: Theme) {
+        match self.inner.write() {
+            Ok(mut guard) => *guard = theme,
+            Err(poisoned) => {
+                // Reader thread panicked while holding a read
+                // lock — vanishingly unlikely (we never panic
+                // inside [`Theme::fg`] / [`Theme::bg`]) but if it
+                // happened we'd rather keep the binary alive with
+                // the fresh palette than propagate the panic.
+                let mut guard = poisoned.into_inner();
+                *guard = theme;
+            }
+        }
+    }
+
+    /// Snapshot the active theme's name (e.g. `"dark"`,
+    /// `"light"`, or the user-supplied `"<name>"`). Cheap clone of
+    /// a `String`.
+    pub fn name(&self) -> String {
+        self.read().name().to_string()
+    }
+
+    /// Snapshot the active theme's [`ColorMode`].
+    pub fn color_mode(&self) -> ColorMode {
+        self.read().color_mode()
+    }
+
+    /// Build a foreground-painting closure. The closure resolves
+    /// through the shared lock on each call so a [`Self::replace`]
+    /// reskins it without reconstructing the widget that holds it.
+    pub fn fg_closure(&self, token: ThemeColor) -> Arc<dyn Fn(&str) -> String> {
+        let handle = Arc::clone(&self.inner);
+        // The `aj-tui` theme structs hold `Arc<dyn Fn(&str) -> String>`
+        // without `Send + Sync` bounds (the TUI thread is the only
+        // consumer). `Arc<RwLock<Theme>>` is `Send + Sync`, but the
+        // closure itself only needs to satisfy the trait object's
+        // bounds, so this is fine.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let closure: Arc<dyn Fn(&str) -> String> =
+            Arc::new(move |s: &str| handle.read().expect("theme rwlock poisoned").fg(token, s));
+        closure
+    }
+
+    /// Build a background-painting closure. Same hot-rebind
+    /// semantics as [`Self::fg_closure`].
+    pub fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String> {
+        let handle = Arc::clone(&self.inner);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let closure: Arc<dyn Fn(&str) -> String> =
+            Arc::new(move |s: &str| handle.read().expect("theme rwlock poisoned").bg(token, s));
+        closure
+    }
+
+    /// Read access to the underlying [`Theme`]. Used by callers
+    /// that need to read a token directly without going through a
+    /// closure (currently nothing in `aj-next` does this — exposed
+    /// for completeness and tests).
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Theme> {
+        self.inner.read().expect("theme rwlock poisoned")
+    }
+}
+
+// ============================================================================
+// Theme file watcher
+// ============================================================================
+
+/// Debounce window for fs notifications. Editors writing through
+/// tempfile+rename produce a burst of events; coalescing them
+/// avoids re-parsing the same file 3-4 times in a row.
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Guard returned by [`watch_user_theme`]. Dropping it tears down
+/// the notify watcher and the spawned debouncer task.
+pub struct ThemeWatcherGuard {
+    // The notify watcher stops as soon as it's dropped. We hold
+    // it inside the guard so the caller can decide its lifetime.
+    _watcher: notify::RecommendedWatcher,
+}
+
+/// Start watching `~/.aj/themes/<name>.json` for changes.
+///
+/// Returns `None` when:
+/// - `name` refers to a bundled theme (`dark` / `light`) — built-
+///   ins live inside the binary and can't be edited at runtime.
+/// - `$HOME` is unset (no user themes directory).
+/// - The user themes directory doesn't exist (nothing to watch).
+/// - The notify backend fails to initialise (rare; usually a
+///   resource-exhaustion scenario, e.g. `inotify` instances cap).
+///
+/// On a successful return, a debounced re-parse task emits a fresh
+/// [`Theme`] through the returned receiver every time the file
+/// settles after a write burst. Parse errors are swallowed
+/// silently so a mid-save invalid-JSON snapshot doesn't blow away
+/// the running palette.
+///
+/// The watcher targets the **directory** rather than the file
+/// itself: editors that write through tempfile+rename invalidate
+/// a file-level watch on the first event. Watching the directory
+/// survives those rebinds; we filter the event paths to the
+/// matching filename so unrelated files in the same directory are
+/// ignored.
+pub fn watch_user_theme(name: &str) -> Option<(ThemeWatcherGuard, UnboundedReceiver<Theme>)> {
+    let dir = user_themes_dir()?;
+    watch_user_theme_in_dir(&dir, name)
+}
+
+/// Same as [`watch_user_theme`] but with an explicit themes
+/// directory. Exposed for the unit tests so they can drive the
+/// watcher against a tempdir without touching `$HOME`.
+pub(crate) fn watch_user_theme_in_dir(
+    dir: &Path,
+    name: &str,
+) -> Option<(ThemeWatcherGuard, UnboundedReceiver<Theme>)> {
+    // Skip bundled names — there's no on-disk file to watch (the
+    // user can still place a `dark.json` in the user dir to
+    // override the bundled palette, in which case we'd watch
+    // that). Honour the override by checking for the file
+    // existence rather than the name alone.
+    let path = dir.join(format!("{name}.json"));
+    if !path.exists() {
+        return None;
+    }
+    let filename = path.file_name()?.to_owned();
+
+    // Channel feeding from notify's callback to our debouncer
+    // task. We don't care about the event payload; one zero-sized
+    // ping is enough to schedule a reload.
+    let (notify_tx, mut notify_rx) = unbounded_channel::<()>();
+    // The notify callback may fire on a non-tokio thread (e.g.
+    // the inotify reader thread); we filter event paths there to
+    // keep the ping channel low-volume.
+    let filename_for_cb = filename.clone();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let event = match res {
+            Ok(event) => event,
+            Err(err) => {
+                tracing::debug!("theme watcher reported error: {err}");
+                return;
+            }
+        };
+        // Only react to data-changing events. Access-time
+        // updates and metadata-only flips don't change the
+        // file contents.
+        if !matches!(
+            event.kind,
+            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+        ) {
+            return;
+        }
+        // Filter to events that touch our specific theme
+        // file. Some platforms emit events without paths;
+        // when that happens we still ping so the debouncer
+        // can decide based on the file's current state.
+        let mentions_us = event.paths.is_empty()
+            || event
+                .paths
+                .iter()
+                .any(|p| p.file_name() == Some(filename_for_cb.as_os_str()));
+        if !mentions_us {
+            return;
+        }
+        let _ = notify_tx.send(());
+    })
+    .ok()?;
+    watcher
+        .watch(dir, RecursiveMode::NonRecursive)
+        .map_err(|e| {
+            tracing::warn!("theme watcher failed to start: {e}");
+            e
+        })
+        .ok()?;
+
+    let (theme_tx, theme_rx) = unbounded_channel::<Theme>();
+    let path_for_task = path.clone();
+    let mode = ColorMode::detect();
+    tokio::spawn(async move {
+        loop {
+            // Block until the first event arrives.
+            if notify_rx.recv().await.is_none() {
+                // Watcher dropped; the caller is winding down.
+                break;
+            }
+            // Coalesce: sleep the debounce window, then drain
+            // anything that arrived during it. This collapses
+            // editor write bursts into one re-parse.
+            tokio::time::sleep(WATCHER_DEBOUNCE).await;
+            while notify_rx.try_recv().is_ok() {}
+
+            // Quiet period elapsed; attempt the reload. We
+            // tolerate transient ENOENT (editors momentarily
+            // unlink before atomic-rename) and parse failures
+            // (the user is mid-edit) by skipping this iteration
+            // and waiting for the next event.
+            let content = match fs::read_to_string(&path_for_task) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::debug!(
+                        "theme watcher: read failed for {}: {err}",
+                        path_for_task.display()
+                    );
+                    continue;
+                }
+            };
+            let label = path_for_task.display().to_string();
+            match Theme::from_json_with_mode(&label, &content, mode) {
+                Ok(theme) => {
+                    if theme_tx.send(theme).is_err() {
+                        // Receiver dropped; the interactive mode
+                        // has shut down.
+                        break;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "theme watcher: parse failed for {}: {err}",
+                        path_for_task.display()
+                    );
+                }
+            }
+        }
+    });
+
+    Some((ThemeWatcherGuard { _watcher: watcher }, theme_rx))
+}
+
+// ============================================================================
 // aj-tui theme builders
 // ============================================================================
 
 /// Build the [`SelectListTheme`] used by the autocomplete pop-up
 /// and the selector overlays. Routes the five rendering closures
 /// through the matching semantic tokens.
-pub fn select_list_theme(theme: &Theme) -> SelectListTheme {
+pub fn select_list_theme(theme: &ThemeHandle) -> SelectListTheme {
     let accent = theme.fg_closure(ThemeColor::Accent);
     let accent_for_bold = Arc::clone(&accent);
     // The `aj-tui` theme structs hold `Arc<dyn Fn(&str) -> String>`
@@ -864,7 +1127,7 @@ pub fn select_list_theme(theme: &Theme) -> SelectListTheme {
 /// default; the host can override per-frame via
 /// [`aj_tui::editor_component::EditorComponent::set_border_color`]
 /// to surface thinking-level / bash-mode tints.
-pub fn editor_theme(theme: &Theme) -> EditorTheme {
+pub fn editor_theme(theme: &ThemeHandle) -> EditorTheme {
     EditorTheme {
         border_color: theme.fg_closure(ThemeColor::BorderMuted),
         select_list: select_list_theme(theme),
@@ -875,7 +1138,7 @@ pub fn editor_theme(theme: &Theme) -> EditorTheme {
 /// user-message renderers. Code-block bodies stay identity because
 /// the bundled syntect highlighter colors per token inside the
 /// block — wrapping it would interfere with its SGR resets.
-pub fn markdown_theme(theme: &Theme) -> MarkdownTheme {
+pub fn markdown_theme(theme: &ThemeHandle) -> MarkdownTheme {
     MarkdownTheme {
         heading: theme.fg_closure(ThemeColor::MdHeading),
         bold: Arc::new(style::bold),
@@ -1076,8 +1339,8 @@ mod tests {
 
     #[test]
     fn builders_produce_themed_closures() {
-        let theme = Theme::bundled_dark();
-        let ml_theme = markdown_theme(&theme);
+        let handle = ThemeHandle::new(Theme::bundled_dark());
+        let ml_theme = markdown_theme(&handle);
         // The heading closure should wrap text in the heading
         // foreground escape — `#f0c674` resolved via the dark
         // palette. Either as a 24-bit triple or a 256-color
@@ -1119,5 +1382,209 @@ mod tests {
             (232..=255).contains(&idx),
             "expected grayscale index, got {idx}"
         );
+    }
+
+    // ------------------------------------------------------------
+    // ThemeHandle: hot-swap semantics
+    // ------------------------------------------------------------
+
+    #[test]
+    fn theme_handle_closure_reflects_replaced_palette() {
+        // The cornerstone hot-reload invariant: a closure obtained
+        // before `replace` must paint with the new theme's escape
+        // after `replace`.
+        let handle = ThemeHandle::new(
+            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
+                .expect("dark.json must parse"),
+        );
+        let paint = handle.fg_closure(ThemeColor::Accent);
+
+        let before = paint("X");
+        // Dark's accent is `#8abeb7` — truecolor encoding.
+        assert!(
+            before.contains("\x1b[38;2;138;190;183m"),
+            "expected dark accent escape before swap, got {before:?}"
+        );
+
+        // Swap to the light palette in-place.
+        handle.replace(
+            Theme::from_json_with_mode("light", LIGHT_THEME_JSON, ColorMode::Truecolor)
+                .expect("light.json must parse"),
+        );
+        let after = paint("X");
+        // Light's accent resolves through `teal` → `#5a8080`.
+        assert!(
+            after.contains("\x1b[38;2;90;128;128m"),
+            "expected light accent escape after swap, got {after:?}"
+        );
+        // The dark prefix must be gone — otherwise we'd just be
+        // concatenating both.
+        assert!(
+            !after.contains("\x1b[38;2;138;190;183m"),
+            "stale dark escape leaked into post-swap output: {after:?}"
+        );
+    }
+
+    #[test]
+    fn theme_handle_name_tracks_replacement() {
+        let handle = ThemeHandle::new(Theme::bundled_dark());
+        assert_eq!(handle.name(), "dark");
+        handle.replace(Theme::bundled_light());
+        assert_eq!(handle.name(), "light");
+    }
+
+    // ------------------------------------------------------------
+    // Theme file watcher
+    // ------------------------------------------------------------
+
+    /// Build a minimal JSON theme document with a specified
+    /// `accent` color. Useful for watcher tests that need to
+    /// produce a parseable file with a distinguishing field
+    /// without spelling out the full 51-key schema each time.
+    fn minimal_theme_json(name: &str, accent_hex: &str) -> String {
+        format!(
+            r#"{{
+                "name": "{name}",
+                "vars": {{}},
+                "colors": {{
+                    "accent": "{accent_hex}",
+                    "border": "", "borderAccent": "", "borderMuted": "",
+                    "success": "", "error": "", "warning": "", "muted": "",
+                    "dim": "", "text": "", "thinkingText": "",
+                    "selectedBg": "", "userMessageBg": "", "userMessageText": "",
+                    "customMessageBg": "", "customMessageText": "",
+                    "customMessageLabel": "", "toolPendingBg": "",
+                    "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",
+                    "toolOutput": "",
+                    "mdHeading": "", "mdLink": "", "mdLinkUrl": "", "mdCode": "",
+                    "mdCodeBlock": "", "mdCodeBlockBorder": "", "mdQuote": "",
+                    "mdQuoteBorder": "", "mdHr": "", "mdListBullet": "",
+                    "toolDiffAdded": "", "toolDiffRemoved": "", "toolDiffContext": "",
+                    "syntaxComment": "", "syntaxKeyword": "", "syntaxFunction": "",
+                    "syntaxVariable": "", "syntaxString": "", "syntaxNumber": "",
+                    "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
+                    "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
+                    "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
+                    "bashMode": ""
+                }}
+            }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn watch_user_theme_returns_none_for_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        // Even though "nothing" sounds like a bundled name (it
+        // isn't), the watcher only fires when the file actually
+        // exists on disk — bundled names need a user override to
+        // be watchable.
+        let result = watch_user_theme_in_dir(dir.path(), "nothing-here");
+        assert!(
+            result.is_none(),
+            "watcher must not start when the theme file is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_user_theme_delivers_reparsed_theme_on_file_edit() {
+        // End-to-end test: write a theme file, start the watcher,
+        // modify the file, assert that a freshly-parsed `Theme`
+        // arrives on the channel within a reasonable timeout.
+        // Filesystem watch delivery is asynchronous so we give the
+        // pipeline a generous 5-second budget; in practice it
+        // resolves in <500ms on every backend we've tried.
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let path = dir.path().join("custom.json");
+        std::fs::write(&path, minimal_theme_json("custom", "#000000")).expect("write seed");
+
+        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "custom")
+            .expect("watcher should start when the file exists");
+
+        // Trigger a modification. We use `fs::write` (which
+        // truncates and writes) rather than tempfile+rename to
+        // avoid relying on platform-specific atomic-rename
+        // semantics in the test; the production watcher handles
+        // both shapes because it watches the directory.
+        std::fs::write(&path, minimal_theme_json("custom", "#ff0000")).expect("rewrite");
+
+        let new_theme = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("watcher delivered a theme within 5s")
+            .expect("channel was open");
+        assert_eq!(new_theme.name(), "custom");
+        // The new accent should be `#ff0000`; encoded as truecolor
+        // when the host detects it, otherwise as a 256-color
+        // approximation. Accept either since the test runs in
+        // arbitrary terminals.
+        let painted = new_theme.fg(ThemeColor::Accent, "X");
+        let has_truecolor = painted.contains("\x1b[38;2;255;0;0m");
+        let has_256 = painted.contains("\x1b[38;5;");
+        assert!(
+            has_truecolor || has_256,
+            "expected red accent escape post-edit, got {painted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_user_theme_ignores_unrelated_files_in_same_dir() {
+        // The watcher targets the directory, so unrelated files in
+        // it (themes the user is editing for a *different*
+        // session, log files, etc.) shouldn't trigger reloads.
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let our_path = dir.path().join("ours.json");
+        let other_path = dir.path().join("other.json");
+        std::fs::write(&our_path, minimal_theme_json("ours", "#112233")).expect("write ours");
+
+        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "ours")
+            .expect("watcher should start when the file exists");
+
+        // Write a *different* file. The watcher's filename filter
+        // should drop this event.
+        std::fs::write(&other_path, minimal_theme_json("other", "#445566")).expect("write other");
+
+        // Wait through the debounce window plus a generous margin
+        // for fs-event delivery, then assert no theme arrived. A
+        // false positive here (a stray event) would surface as a
+        // received message — which is exactly what we want to
+        // catch.
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "watcher fired for an unrelated filename: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_user_theme_swallows_parse_errors_silently() {
+        // A mid-edit save can momentarily produce invalid JSON.
+        // The watcher should *not* propagate the error; it should
+        // wait for the next write that produces a parseable
+        // document.
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let path = dir.path().join("partial.json");
+        std::fs::write(&path, minimal_theme_json("partial", "#000000")).expect("write seed");
+
+        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "partial")
+            .expect("watcher should start when the file exists");
+
+        // First write: invalid JSON. The watcher should re-read,
+        // fail to parse, and discard silently.
+        std::fs::write(&path, "{ this is not valid json").expect("write invalid");
+        // Give the debouncer time to fire and drop the bad event.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Channel must still be empty.
+        assert!(
+            rx.try_recv().is_err(),
+            "watcher must not surface a parse error as a Theme"
+        );
+
+        // Second write: valid again. Now we expect a delivery.
+        std::fs::write(&path, minimal_theme_json("partial", "#abcdef")).expect("write valid");
+        let recovered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("watcher recovered within 5s")
+            .expect("channel was open");
+        assert_eq!(recovered.name(), "partial");
     }
 }

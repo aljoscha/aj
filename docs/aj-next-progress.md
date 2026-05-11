@@ -1309,11 +1309,74 @@ adopts independently.
           test -p aj-next`, `cargo fmt`, and `cargo clippy -p
           aj-next --all-targets` all pass clean.
 
-    - [ ] Phase 1.4d.ii: fs-watcher hot-reload of the active
-          theme file. Watch `~/.aj/themes/<name>.json` for
-          changes; on a successful re-parse, rebuild the
-          `aj-tui` theme structs on the live components without
-          needing a binary restart.
+    - [x] Phase 1.4d.ii: fs-watcher hot-reload of the active theme
+          file. The interactive mode now holds a single
+          [`ThemeHandle`] (an `Arc<RwLock<Theme>>`) and threads it
+          through every theme builder; a runtime swap re-points the
+          inner [`Theme`] without rebuilding any component — every
+          closure handed out by [`ThemeHandle::fg_closure`] /
+          [`bg_closure`] resolves through the shared lock on each
+          call, so changes are visible on the next render. The
+          previous `&Theme`-shaped builder API is gone (all
+          `markdown_theme` / `editor_theme` / `select_list_theme`
+          call sites take `&ThemeHandle` now).
+
+          **Watcher** (`config/theme.rs`): [`watch_user_theme`]
+          (and the testable
+          [`watch_user_theme_in_dir`](crate::config::theme::watch_user_theme_in_dir))
+          spawns a `notify`-backed directory watcher over
+          `~/.aj/themes/`, filters events to the requested filename,
+          debounces 100 ms (matches a typical editor's
+          tempfile+rename burst), re-reads the file, and emits a
+          freshly-parsed [`Theme`] through an
+          [`UnboundedReceiver<Theme>`]. Parse errors during mid-save
+          invalid-JSON snapshots are swallowed silently and logged
+          at `debug` — the running palette stays put until the next
+          quiescent valid save. The directory watch (rather than a
+          file-level watch) survives tempfile+rename saves which
+          would otherwise drop the file-level watch's inode.
+
+          Returns `None` for: bundled theme names with no user
+          override (the file doesn't exist), missing `$HOME` (no
+          themes dir), or notify-backend failures (resource
+          exhaustion). The interactive mode tolerates `None` by
+          folding the `recv_theme` future into `std::future::pending`,
+          so the `tokio::select!` arm becomes a no-op rather than
+          spinning.
+
+          **Integration** (`modes/interactive.rs`):
+          [`InteractiveMode::run`] now wraps the loaded `Theme` in a
+          `ThemeHandle` at startup, kicks off the watcher (storing
+          its [`ThemeWatcherGuard`] until shutdown), and adds a
+          fourth `tokio::select!` arm: on each delivered theme it
+          calls [`ThemeHandle::replace`] to swap the palette,
+          [`Tui::invalidate`] to drop every component's cached
+          render output, [`Tui::request_render`] to schedule the
+          next frame, and emits an [`AgentEvent::Notice`] confirming
+          the swap through the existing event pump so the user gets
+          a chat-line confirmation. The new
+          [`Component::invalidate`] plumbing in `aj-tui` walks the
+          root + every overlay; on the next render the closures
+          resolve through the new palette automatically.
+
+          **Workspace deps:** `notify = "8.2"` added to the
+          workspace and pulled into `aj-next` (runtime dep).
+          `tempfile` added as a dev-dep of `aj-next` for the
+          watcher integration tests.
+
+          Six new unit tests in `config::theme::tests` cover:
+          `ThemeHandle::fg_closure` paints with the new palette
+          after `replace`; `ThemeHandle::name` tracks replacement;
+          `watch_user_theme_in_dir` returns `None` for missing
+          files; an end-to-end "write seed → start watcher → edit
+          → assert delivered theme" test with a 5-second budget;
+          unrelated filenames in the same directory are filtered
+          out; mid-save invalid-JSON snapshots are swallowed and a
+          subsequent valid save recovers. Total `aj-next` unit
+          tests: 81 (up from 75). `cargo build`, `cargo test
+          --workspace`, `cargo fmt`, and `cargo clippy -p aj-next
+          --all-targets` all pass clean (the only remaining
+          warnings are pre-existing in `aj-agent`).
 
     - [ ] Phase 1.4d.iii: Surface the active thinking level and
           bash mode through the editor's border color. Hook the
