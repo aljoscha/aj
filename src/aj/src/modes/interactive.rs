@@ -235,7 +235,7 @@ impl InteractiveMode {
         // swap re-points the inner [`Theme`] without rebuilding any
         // component — every theme closure resolves through the
         // shared [`RwLock`] on each call.
-        let configured_theme = config.theme.as_deref().unwrap_or("dark").to_string();
+        let configured_theme = config.theme.as_deref().unwrap_or("light").to_string();
         let theme = ThemeHandle::new(Theme::load(&configured_theme));
 
         // ---- Theme file watcher (hot-reload) -------------------------
