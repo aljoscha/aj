@@ -95,14 +95,24 @@ fn handle_list_threads() -> Result<()> {
     Ok(())
 }
 
-/// `aj-next models <subcommand>`. Stub for the scaffold; wired
-/// up alongside print mode. The real body awaits the catalog
-/// refresh's HTTP fetch, so the signature stays `async`.
-#[allow(clippy::unused_async)]
+/// `aj-next models <subcommand>`: catalog-management utilities.
+///
+/// Today only `update` is wired, which refreshes the on-disk model
+/// catalog at `~/.aj/models.json` from `models.dev`. The
+/// `/model` selector overlay reads that catalog at startup, so
+/// running this command is how users surface freshly-released
+/// models to the picker without restarting from a different
+/// catalog source.
+///
+/// The output is a stable one-line summary (added / removed /
+/// price-changes counts plus total + destination path) so
+/// scripts watching for it keep working.
 async fn handle_models_command(command: ModelsCommand) -> Result<()> {
     match command {
         ModelsCommand::Update => {
-            anyhow::bail!("aj-next models update is not yet implemented");
+            let summary = aj_models::refresh::refresh_user_cache().await?;
+            println!("{}", summary.one_line());
+            Ok(())
         }
     }
 }

@@ -1483,12 +1483,19 @@ adopts independently.
         same string the legacy binary uses. `cargo build`,
         `cargo test -p aj-next`, `cargo fmt`, and `cargo clippy
         -p aj-next --all-targets` all pass clean.
-  - [ ] Phase 2.1b: Wire `aj-next models update` — replace the
-        stub in `main.rs::handle_models_command` with a port of
-        the legacy `aj`'s implementation. Drives off
-        [`aj_models::refresh::refresh_user_cache`] and prints the
-        returned `summary.one_line()`. Required for `/model`
+  - [x] Phase 2.1b: Wire `aj-next models update` — replaces the
+        stub in `main.rs::handle_models_command` with a body that
+        calls [`aj_models::refresh::refresh_user_cache`] and
+        prints `summary.one_line()`. Required for `/model`
         selector freshness — the catalog never updates today.
+        Live `cargo run -p aj-next -- models update` against an
+        empty `~/.aj/models.json` populated 64 models from
+        `https://models.dev/api.json` and printed the stable
+        `added N models, removed M, price changes on K (total:
+        T, written to <path>)` summary line, so any scripts
+        watching for that line keep working. `cargo build`,
+        `cargo test -p aj-next`, `cargo fmt`, and `cargo clippy
+        -p aj-next --all-targets` all pass clean.
   - [ ] Phase 2.1c: Startup `Context:` notice + sandbox warning.
         Port the legacy `display_context` + sandbox-warning notice
         (gated on `AJ_DISABLE_SANDBOX_WARNING`) so users see
