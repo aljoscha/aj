@@ -23,7 +23,7 @@ use aj_tui::components::editor::Editor;
 use aj_tui::container::Container;
 use aj_tui::tui::Tui;
 
-use crate::config::theme::editor_theme;
+use crate::config::theme::{Theme, editor_theme};
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::loader_status::LoaderStatus;
@@ -73,7 +73,7 @@ impl SlotIndex {
 /// `tui.start()` is *not* called here — the caller drives the TUI
 /// lifecycle, and tests using a virtual terminal want full control
 /// over when the terminal is initialised.
-pub fn build_layout(tui: &mut Tui) {
+pub fn build_layout(tui: &mut Tui, theme: &Theme) {
     // Header slot.
     tui.add_child(Box::new(Header::new()));
 
@@ -94,7 +94,7 @@ pub fn build_layout(tui: &mut Tui) {
 
     // Editor. Themed via the shared `editor_theme`; the event
     // pump installs an autocomplete provider once selectors land.
-    let editor = Editor::new(tui.handle(), editor_theme());
+    let editor = Editor::new(tui.handle(), editor_theme(theme));
     tui.add_child(Box::new(editor));
 
     // Footer slot.
@@ -118,7 +118,8 @@ mod tests {
         // container surface, not the running terminal. This keeps
         // the test from touching real stdin/stdout.
         let mut tui = Tui::new(Box::new(ProcessTerminal::new()));
-        build_layout(&mut tui);
+        let theme = Theme::bundled_dark();
+        build_layout(&mut tui, &theme);
         assert_eq!(tui.len(), 5, "expected the five layout slots");
     }
 }

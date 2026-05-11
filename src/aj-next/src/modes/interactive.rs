@@ -49,7 +49,7 @@ use crate::config::slash_commands::{
     SlashAction, build_autocomplete_provider, dispatch as slash_dispatch, load_model_catalog,
     thinking_level_name,
 };
-use crate::config::theme::{markdown_theme, select_list_theme};
+use crate::config::theme::{Theme, markdown_theme, select_list_theme};
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::model_selector::{
@@ -217,11 +217,18 @@ impl InteractiveMode {
             agent.seed_messages(messages);
         }
 
+        // ---- Theme ----------------------------------------------------
+        // Loaded once at startup from `config.theme` (default `dark`).
+        // The handle is reused everywhere a component needs theme
+        // colors: layout, event pump, selector overlays. Hot-reload
+        // and the runtime theme-swap path land in a follow-up.
+        let theme = Theme::load(config.theme.as_deref().unwrap_or("dark"));
+
         // ---- Build the TUI --------------------------------------------
         let mut tui = Tui::new(Box::new(ProcessTerminal::new()));
         tui.start()
             .map_err(|e| anyhow::anyhow!("failed to start terminal: {e}"))?;
-        build_layout(&mut tui);
+        build_layout(&mut tui, &theme);
 
         // Install the slash-command autocomplete provider on the
         // editor. Every recognised command (/thinking, /model, …)
@@ -259,7 +266,7 @@ impl InteractiveMode {
         // Drive replay events through the pump (post-layout so the
         // chat container has a slot to receive them). Replay never
         // hits the bus, so persistence isn't double-written.
-        let mut pump = EventPump::new(markdown_theme());
+        let mut pump = EventPump::new(markdown_theme(&theme));
         for event in replay(&log) {
             pump.handle(&mut tui, &event);
         }
@@ -386,6 +393,7 @@ impl InteractiveMode {
                                     &mut persistence_handle,
                                     &mut pump,
                                     &conversation_persistence,
+                                    &theme,
                                 ).await {
                                     SelectorPollOutcome::StillOpen(reopened) => {
                                         open_selector = Some(reopened);
@@ -425,6 +433,7 @@ impl InteractiveMode {
                                         Arc::clone(&current_model_key),
                                         Arc::clone(&log),
                                         conversation_persistence.clone(),
+                                        &theme,
                                         &trimmed,
                                     ).await {
                                         SlashHandled::Continue { selector, notice } => {
@@ -552,6 +561,7 @@ fn notice_event(text: &str) -> AgentEvent {
 }
 
 /// Dispatch a freshly-submitted slash-prefixed line.
+#[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
     tui: &mut Tui,
     agent: Arc<TokioMutex<Agent>>,
@@ -559,6 +569,7 @@ async fn handle_slash_command(
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
     log: Arc<TokioMutex<ConversationLog>>,
     conversation_persistence: ConversationPersistence,
+    theme: &Theme,
     text: &str,
 ) -> SlashHandled {
     match slash_dispatch(text) {
@@ -567,7 +578,7 @@ async fn handle_slash_command(
                 let a = agent.lock().await;
                 a.default_thinking()
             };
-            let component = ThinkingSelectorComponent::new(select_list_theme(), current);
+            let component = ThinkingSelectorComponent::new(select_list_theme(theme), current);
             let outcome = component.outcome_handle();
             let options = OverlayOptions {
                 anchor: OverlayAnchor::Center,
@@ -607,7 +618,7 @@ async fn handle_slash_command(
             // owns it for the lifetime of the overlay so we don't
             // pay an extra Arc indirection on every rebuild.
             let component = ModelSelectorComponent::new(
-                select_list_theme(),
+                select_list_theme(theme),
                 (*model_catalog).clone(),
                 Some(&identity),
                 initial_query,
@@ -659,7 +670,7 @@ async fn handle_slash_command(
             }
 
             let component = SessionSelectorComponent::new(
-                select_list_theme(),
+                select_list_theme(theme),
                 previews,
                 Some(current_thread_id),
                 initial_query,
@@ -713,6 +724,7 @@ async fn handle_selector_outcome(
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
     conversation_persistence: &ConversationPersistence,
+    theme: &Theme,
 ) -> SelectorPollOutcome {
     match selector {
         OpenSelector::Thinking { handle, outcome } => {
@@ -822,6 +834,7 @@ async fn handle_selector_outcome(
                         persistence_handle,
                         pump,
                         conversation_persistence,
+                        theme,
                         &preview.thread_id,
                     )
                     .await
@@ -887,6 +900,7 @@ async fn perform_thread_swap(
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
     conversation_persistence: &ConversationPersistence,
+    theme: &Theme,
     thread_id: &str,
 ) -> Result<()> {
     // 1. Resume the new log from disk.
@@ -968,7 +982,7 @@ async fn perform_thread_swap(
     if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
         chat.clear();
     }
-    *pump = EventPump::new(markdown_theme());
+    *pump = EventPump::new(markdown_theme(theme));
     {
         let l = log.lock().await;
         for event in replay(&l) {

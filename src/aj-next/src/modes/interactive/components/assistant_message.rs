@@ -213,17 +213,17 @@ impl AsRef<dyn Any> for AssistantMessageComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::theme::markdown_theme;
+    use crate::config::theme::{Theme, markdown_theme};
 
     #[test]
     fn fresh_component_is_empty() {
-        let c = AssistantMessageComponent::new(markdown_theme());
+        let c = AssistantMessageComponent::new(markdown_theme(&Theme::bundled_dark()));
         assert!(c.is_empty());
     }
 
     #[test]
     fn streaming_text_creates_a_widget_lazily_and_appends() {
-        let mut c = AssistantMessageComponent::new(markdown_theme());
+        let mut c = AssistantMessageComponent::new(markdown_theme(&Theme::bundled_dark()));
         c.set_text_snapshot("hello".to_string());
         assert!(!c.is_empty());
         assert!(c.text.is_some());
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_drops_the_inner_widget() {
-        let mut c = AssistantMessageComponent::new(markdown_theme());
+        let mut c = AssistantMessageComponent::new(markdown_theme(&Theme::bundled_dark()));
         c.set_text_snapshot("hello".to_string());
         assert!(c.text.is_some());
         // A `Stop` carrying an empty snapshot should clear out the

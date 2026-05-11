@@ -254,6 +254,7 @@ pub enum ConfigError {
 /// model_name = "claude-sonnet-4-20250514"
 /// model_url = "https://api.anthropic.com"
 /// thinking = "low"
+/// theme = "dark"
 /// disabled_tools = ["todo_read", "todo_write"]
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -269,6 +270,10 @@ pub struct Config {
     /// Inference speed mode (Anthropic only). `fast` enables higher
     /// output-tokens-per-second at some quality cost.
     pub speed: Option<ConfigSpeed>,
+    /// Interactive TUI theme name. Resolved against the bundled
+    /// catalog (`dark`, `light`) plus any `*.json` files in
+    /// `~/.aj/themes/`. Defaults to `dark` when unset.
+    pub theme: Option<String>,
     /// List of builtin tool names to disable. Tools in this list will not be
     /// available to the agent.
     #[serde(default)]

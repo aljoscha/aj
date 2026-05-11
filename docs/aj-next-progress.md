@@ -1229,6 +1229,99 @@ adopts independently.
         through the editor's border colour so `thinking` and
         `bash` modes are visually distinct.
 
+        Splitting along the lines we've used for prior multi-part
+        Phase 1 steps: this is large enough to benefit from a
+        commit per axis. Sub-bullets:
+
+    - [x] Phase 1.4d.i: JSON-loaded palette + named themes. The
+          `config/theme.rs` builders now consume a [`Theme`]
+          struct holding precomputed ANSI escapes per semantic
+          token; the previous hard-coded closures are gone.
+
+          **Schema:** a `vars`
+          map of reusable hex / 256-color values plus a `colors`
+          map keyed by 45 foreground and 6 background semantic
+          tokens. Values are either explicit (`#rrggbb` hex,
+          integer 0–255 for the 256-color palette, or `""` for
+          terminal default) or var-references resolved
+          transitively (`mdHeading: "yellow"` → `vars.yellow:
+          "#9a7326"`). Cyclic refs are detected and surfaced as
+          [`ThemeError::VarCycle`]; missing required tokens
+          surface as [`ThemeError::MissingColor`].
+
+          **Bundled themes:** `dark.json` and `light.json` ship
+          embedded via [`include_str!`] under
+          `src/aj-next/src/config/theme/`. [`Theme::bundled_dark`]
+          / [`Theme::bundled_light`] return them directly with no
+          fs hit; [`Theme::load(name)`] consults
+          `~/.aj/themes/<name>.json` first (so a user file can
+          override a bundled name), falls back to the bundled
+          catalog, then falls back to dark on any parse error so
+          the binary always comes up with a working palette.
+          [`Theme::available`] lists bundled names plus every
+          `*.json` under the user themes dir for future
+          `/theme`-selector discovery.
+
+          **Color modes:** [`ColorMode::detect`] looks at
+          `$COLORTERM`, `$WT_SESSION`, `$TERM`, and
+          `$TERM_PROGRAM` to pick truecolor vs 256-color. Hex
+          values are downsampled to the xterm 6x6x6 cube or
+          24-step grayscale ramp on 256-color terminals using
+          BT.601 luma weighting;
+          colors with low channel spread fall through to the
+          grayscale ramp only when it's empirically closer than
+          the cube pick, so a deliberate cyan / red tint isn't
+          flattened to gray on limited terminals. All distance
+          math is integer-only (no `as` casts) so the workspace's
+          `clippy::as_conversions` lint stays satisfied.
+
+          **Builders:** [`markdown_theme`], [`editor_theme`], and
+          [`select_list_theme`] take `&Theme` and produce the
+          `MarkdownTheme` / `EditorTheme` / `SelectListTheme`
+          structs from `aj-tui`. The mapping uses the
+          semantic tokens defined in the palette schema
+          (`accent`, `muted`, `mdHeading`, `mdLink`, …). The
+          editor's `border_color` uses
+          [`ThemeColor::BorderMuted`] as the resting tint;
+          [`aj_tui::editor_component::EditorComponent::set_border_color`]
+          can swap it per-frame once the thinking-level wiring
+          lands in 1.4d.iii.
+
+          **Config integration:** [`aj_conf::Config`] grew a
+          `theme: Option<String>` field consulted by
+          `InteractiveMode::run` on startup; absent or unset
+          defaults to `"dark"`. The interactive mode builds the
+          [`Theme`] once and threads `&Theme` through
+          [`build_layout`], [`EventPump::new`],
+          [`handle_slash_command`], [`handle_selector_outcome`],
+          and [`perform_thread_swap`].
+
+          **Workspace deps:** `aj-next` picked up workspace deps
+          on `serde` (for the `Deserialize` derives) and
+          `thiserror` (for [`ThemeError`]).
+
+          13 unit tests cover dark / light parsing, the
+          truecolor and 256-color encoding paths, integer color
+          values, var-ref resolution + cycle detection, missing-
+          token reporting, the fall-back-to-dark path, the
+          builder-produced theme closures, and the `rgb_to_256`
+          neutral-vs-saturated dispatch. `cargo build`, `cargo
+          test -p aj-next`, `cargo fmt`, and `cargo clippy -p
+          aj-next --all-targets` all pass clean.
+
+    - [ ] Phase 1.4d.ii: fs-watcher hot-reload of the active
+          theme file. Watch `~/.aj/themes/<name>.json` for
+          changes; on a successful re-parse, rebuild the
+          `aj-tui` theme structs on the live components without
+          needing a binary restart.
+
+    - [ ] Phase 1.4d.iii: Surface the active thinking level and
+          bash mode through the editor's border color. Hook the
+          editor's [`set_border_color`] off the agent's
+          `default_thinking` setter and any future bash-mode
+          toggle so `thinking` / `bash` modes are visually
+          distinct.
+
 ## Phase 2 — Cutover (§5)
 
 - [ ] Behavioral parity verification for daily flows.
