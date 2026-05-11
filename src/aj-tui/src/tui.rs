@@ -1402,18 +1402,33 @@ impl Tui {
 
     /// Render immediately. Call this in your event loop after processing events.
     pub fn render(&mut self) {
-        let width = usize::from(self.terminal.columns());
-        let height = usize::from(self.terminal.rows());
+        // Snapshot the terminal dimensions exactly once for the whole
+        // render pass. `terminal.columns()` / `.rows()` poll the OS on
+        // every call, so re-reading them later in this function would
+        // race against a SIGWINCH that lands mid-render: components
+        // would have laid their lines out at the *old* width, but a
+        // downstream consumer (the line-width validator, the strategy
+        // decision, the deletion-cleanup math) would compare them
+        // against the *new* width and either panic on the validator or
+        // corrupt the diff engine's row tracking. Sampling here and
+        // threading the snapshot through every later use keeps the
+        // single render pass internally consistent; the resize event
+        // itself already schedules a follow-up render (see
+        // [`Tui::handle_input_after_listeners`]) that will pick up the
+        // new dimensions and full-redraw via the `width_changed`
+        // strategy branch.
+        let term_cols = self.terminal.columns();
+        let term_rows = self.terminal.rows();
+        let width = usize::from(term_cols);
+        let height = usize::from(term_rows);
 
         // Republish dimensions to every outstanding [`RenderHandle`]
         // so consumers (e.g. the editor's auto-sized scroll window)
         // observe the latest size on every frame, including resizes.
         // Done before the early-return so a 0-sized terminal still
         // updates handles (handle consumers handle 0 explicitly).
-        self.term_rows
-            .store(self.terminal.rows(), Ordering::Relaxed);
-        self.term_cols
-            .store(self.terminal.columns(), Ordering::Relaxed);
+        self.term_rows.store(term_rows, Ordering::Relaxed);
+        self.term_cols.store(term_cols, Ordering::Relaxed);
 
         if width == 0 || height == 0 {
             return;
@@ -1479,11 +1494,27 @@ impl Tui {
         // duplicated rows or a hard hang on the next keystroke. We'd
         // rather halt cleanly with a diagnostic than keep painting over
         // a corrupted frame.
-        self.validate_line_widths(&lines);
+        //
+        // The validator measures against the snapshotted `width` from
+        // the top of this function, not against a fresh
+        // `terminal.columns()` read: components laid the frame out at
+        // that width, and if a resize landed mid-render we want the
+        // *next* render to handle the new size cleanly, not this one
+        // to panic on lines that were valid for the width they were
+        // rendered at.
+        self.validate_line_widths(&lines, width);
 
         // Phase 5: Determine rendering strategy and emit output.
-        let current_width = self.terminal.columns();
-        let current_height = self.terminal.rows();
+        //
+        // Use the snapshotted `term_cols` / `term_rows` from the top of
+        // this function, not a fresh `terminal.columns()` /
+        // `.rows()` read. Otherwise a SIGWINCH that lands here would
+        // make `width_changed` reflect the *current* terminal vs. the
+        // previous render's terminal, while `previous_lines` was laid
+        // out for the snapshotted width — and the diff engine would
+        // try to splice rows of one width on top of rows of another.
+        let current_width = term_cols;
+        let current_height = term_rows;
         let width_changed = current_width != self.previous_width;
         let height_changed = current_height != self.previous_height;
         let first_render = self.previous_lines.is_empty() && self.max_lines_rendered == 0;
@@ -1591,7 +1622,7 @@ impl Tui {
                 // viewport, the cleanup move would land in scrollback.
                 let target_row = lines.len().saturating_sub(1);
                 let extra_lines = self.previous_lines.len().saturating_sub(lines.len());
-                let term_height = usize::from(self.terminal.rows());
+                let term_height = height;
                 target_row < effective_viewport_top
                     || (term_height > 0 && extra_lines > term_height)
             })
@@ -2559,19 +2590,27 @@ impl Tui {
 
     // -- Private rendering methods --
 
-    /// Panic cleanly if any rendered line would overflow the current
-    /// terminal width. See the phase-4.5 block in [`Tui::render`] for
-    /// the motivation. The panic hook installed by
-    /// [`ProcessTerminal::start`] restores raw-mode/paste/keyboard
-    /// state before the message surfaces, and a crash log with every
-    /// rendered line (annotated with its visible width) is written to
-    /// `~/.aj/aj-tui-crash.log` (override with `AJ_TUI_CRASH_LOG`) so
-    /// the offending component is easy to pinpoint after the fact.
-    fn validate_line_widths(&mut self, lines: &[String]) {
+    /// Panic cleanly if any rendered line would overflow the
+    /// terminal width that the frame was *laid out for*. See the
+    /// phase-4.5 block in [`Tui::render`] for the motivation. The
+    /// panic hook installed by [`ProcessTerminal::start`] restores
+    /// raw-mode/paste/keyboard state before the message surfaces, and
+    /// a crash log with every rendered line (annotated with its
+    /// visible width) is written to `~/.aj/aj-tui-crash.log`
+    /// (override with `AJ_TUI_CRASH_LOG`) so the offending component
+    /// is easy to pinpoint after the fact.
+    ///
+    /// `width` is the snapshot taken at the top of [`Tui::render`]
+    /// and threaded through every component's `render(width)` call.
+    /// Re-reading `self.terminal.columns()` here would race against a
+    /// SIGWINCH that lands mid-render: components rendered to the old
+    /// width would be measured against the new (smaller) width and
+    /// trip a spurious panic on a frame whose lines were valid for
+    /// the width they were actually rendered at.
+    fn validate_line_widths(&mut self, lines: &[String], width: usize) {
         if !self.strict_line_widths {
             return;
         }
-        let width = usize::from(self.terminal.columns());
         if width == 0 {
             // The terminal reports no width (headless/test edge case).
             // Nothing to validate against.
