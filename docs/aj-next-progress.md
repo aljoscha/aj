@@ -1745,9 +1745,57 @@ adopts independently.
         `cargo clippy -p aj-next --all-targets` all pass clean
         (the only remaining warnings are pre-existing in
         `aj-agent`).
-  - [ ] Phase 2.1f: Per-turn `TurnUsage` rendering. Fill the
-        placeholder arm in `event_pump.rs` with a dim status line
-        matching the legacy `display_token_usage`.
+  - [x] Phase 2.1f: Per-turn `TurnUsage` rendering. Fills the
+        placeholder arm in `event_pump.rs` with a dim
+        `Token Usage - …` chat row that matches the legacy
+        `display_token_usage` line byte-for-byte (modulo ANSI dim
+        wrapping). The new private helper
+        [`format_turn_usage_line(agent_id, usage)`] in
+        `event_pump.rs` ports the `format_tokens(acc, turn)`
+        closure from `aj/src/cli_common.rs::format_token_usage`
+        verbatim: render `acc+turn` when the turn delta is
+        nonzero, plain `acc` when it's zero (so cache hits don't
+        spam `+0` columns). The main-agent row is unprefixed; a
+        `(sub agent N)` tag is prepended for `AgentId::Sub(n)` to
+        match the legacy `AjCliCommon::prefix` convention so the
+        scrollback stays readable when sub-agents share the
+        parent's bus.
+
+        Wiring: the placeholder `TurnUsage` arm under "events
+        whose UI work isn't yet wired" in `EventPump::handle`
+        moved out into its own arm calling a new
+        [`EventPump::append_turn_usage`] helper. The helper
+        constructs the line, wraps it in
+        [`aj_tui::style::dim`], and pushes it onto the chat
+        container via the existing
+        [`EventPump::push_chat_child`] path so the row sits in
+        the same scrollback as assistant text, tool execution
+        blocks, and notices — exactly where the legacy renderer
+        printed it.
+
+        Four new unit tests in `event_pump::tests`:
+
+        - `format_turn_usage_line_emits_acc_plus_turn_for_main_agent`
+          pins the first-turn shape where `accumulated == turn`,
+          asserting every column gets the `acc+turn` rendering.
+        - `format_turn_usage_line_drops_turn_part_when_turn_is_zero`
+          locks the cache-hit case: a turn that contributes zero
+          new tokens must render bare `acc` columns, never
+          `acc+0`.
+        - `format_turn_usage_line_prefixes_sub_agent_id` covers
+          the `(sub agent N)` prefix for sub-agents.
+        - `turn_usage_event_appends_one_chat_row` is the
+          end-to-end check: dispatch a `TurnUsage` event through
+          a real [`EventPump`] against a freshly-built layout,
+          assert the chat container grew by exactly one row, and
+          verify the row's rendered output carries the formatted
+          line wrapped in the ANSI dim escape sequence.
+
+        Total `aj-next` unit tests: 111 (up from 107).
+        `cargo build`, `cargo test -p aj-next`, `cargo fmt`, and
+        `cargo clippy -p aj-next --all-targets` all pass clean
+        (the only remaining warnings are pre-existing in
+        `aj-agent`).
   - [ ] Phase 2.1g (nice-to-have): `aj-next continue --print`.
         Replace the explicit bail in `print::run` with a resume
         flow that replays history through the JSONL sink and

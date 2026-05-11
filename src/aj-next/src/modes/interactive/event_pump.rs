@@ -17,7 +17,8 @@
 
 use std::collections::HashMap;
 
-use aj_agent::events::{AgentEvent, PersistedMessageKind, StreamAction, StreamChannel};
+use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
+use aj_agent::types::TokenUsage;
 use aj_models::messages::ContentBlockParam;
 use aj_tui::components::editor::Editor;
 use aj_tui::components::markdown::MarkdownTheme;
@@ -164,21 +165,25 @@ impl EventPump {
                 self.append_styled_notice(tui, &msg, aj_tui::style::yellow);
             }
 
+            // ---- Per-turn token usage. ----
+            AgentEvent::TurnUsage { agent_id, usage } => {
+                self.append_turn_usage(tui, *agent_id, usage);
+            }
+
             // ---- Placeholders: events whose UI work isn't yet wired. ----
             AgentEvent::SubAgentStart { .. }
             | AgentEvent::SubAgentEnd { .. }
             | AgentEvent::TurnEnd { .. }
-            | AgentEvent::TurnUsage { .. }
             | AgentEvent::QueueUpdate { .. }
             | AgentEvent::MessageStart { .. }
             | AgentEvent::MessageUpdate { .. }
             | AgentEvent::MessageEnd { .. } => {
-                // Sub-agent grouping, per-turn usage display, queue
-                // indicators, and the unified message-event variants
-                // (which the agent doesn't emit yet) all land in
-                // follow-up commits. Holding the arms here keeps the
-                // exhaustiveness check active so a newly-emitted
-                // event variant shows up as a compile error.
+                // Sub-agent grouping, queue indicators, and the
+                // unified message-event variants (which the agent
+                // doesn't emit yet) all land in follow-up commits.
+                // Holding the arms here keeps the exhaustiveness
+                // check active so a newly-emitted event variant
+                // shows up as a compile error.
             }
         }
 
@@ -369,6 +374,20 @@ impl EventPump {
         self.push_chat_child(tui, Box::new(Text::new(&styled, 1, 0)));
     }
 
+    /// Append a dim `Token Usage - ...` row for a freshly-completed
+    /// turn. Sub-agents get a leading `(sub agent N)` tag so their
+    /// per-turn counts stay distinguishable when they share the
+    /// parent's scrollback (per `docs/aj-next-plan.md` §1.6
+    /// sub-agents share the parent's bus). The format matches the
+    /// legacy `display_token_usage` line byte-for-byte (modulo the
+    /// ANSI dim escape sequence) so users with eyes trained on the
+    /// old format don't have to re-learn the layout.
+    fn append_turn_usage(&self, tui: &mut Tui, agent_id: AgentId, usage: &TokenUsage) {
+        let line = format_turn_usage_line(agent_id, usage);
+        let styled = aj_tui::style::dim(&line);
+        self.push_chat_child(tui, Box::new(Text::new(&styled, 1, 0)));
+    }
+
     /// Append `child` to the chat container slot and return its
     /// index. Centralises the slot lookup so callers don't have to
     /// know about [`SlotIndex::Chat`].
@@ -389,6 +408,36 @@ impl EventPump {
     }
 }
 
+/// Render the `Token Usage - ...` line for a single `TurnUsage`
+/// event. Sub-agents are tagged with their `(sub agent N)` prefix
+/// so their per-turn counts stand apart from the main agent's in
+/// the shared scrollback. Visible for testing.
+fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
+    // `format_tokens` keeps the legacy convention: render the
+    // accumulated total bare when the turn contributed nothing
+    // (e.g. a cached read of an existing tool result), or
+    // `acc+turn` so the per-turn delta is visible at a glance.
+    let format_tokens = |acc: u64, turn: u64| -> String {
+        if turn == 0 {
+            format!("{acc}")
+        } else {
+            format!("{acc}+{turn}")
+        }
+    };
+    let input_str = format_tokens(usage.accumulated_input, usage.turn_input);
+    let output_str = format_tokens(usage.accumulated_output, usage.turn_output);
+    let cache_creation_str =
+        format_tokens(usage.accumulated_cache_creation, usage.turn_cache_creation);
+    let cache_read_str = format_tokens(usage.accumulated_cache_read, usage.turn_cache_read);
+    let body = format!(
+        "Token Usage - Input: {input_str} | Output: {output_str} | Cache Creation: {cache_creation_str} | Cache Read: {cache_read_str}",
+    );
+    match agent_id {
+        AgentId::Main => body,
+        AgentId::Sub(n) => format!("(sub agent {n}) {body}"),
+    }
+}
+
 /// Pull and clear the editor's submitted text. Returns `Some` at
 /// most once per editor submission; the host's main loop calls
 /// this after every input event so a freshly-submitted prompt
@@ -404,5 +453,135 @@ pub fn take_submitted_prompt(tui: &mut Tui) -> Option<String> {
 pub fn set_editor_submit_enabled(tui: &mut Tui, enabled: bool) {
     if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
         editor.disable_submit = !enabled;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use aj_tui::component::Component;
+    use aj_tui::components::markdown::MarkdownTheme;
+    use aj_tui::terminal::ProcessTerminal;
+
+    use crate::config::theme::{ThemeHandle, markdown_theme};
+    use crate::modes::interactive::layout::build_layout;
+
+    /// Build a TokenUsage with the supplied turn deltas and the
+    /// accumulated totals set to `turn + already`, so the resulting
+    /// snapshot looks like an agent that ran one prior turn worth
+    /// `already` plus this turn's contribution.
+    fn token_usage(turn: [u64; 4], already: [u64; 4]) -> TokenUsage {
+        TokenUsage {
+            accumulated_input: already[0] + turn[0],
+            turn_input: turn[0],
+            accumulated_output: already[1] + turn[1],
+            turn_output: turn[1],
+            accumulated_cache_creation: already[2] + turn[2],
+            turn_cache_creation: turn[2],
+            accumulated_cache_read: already[3] + turn[3],
+            turn_cache_read: turn[3],
+        }
+    }
+
+    #[test]
+    fn format_turn_usage_line_emits_acc_plus_turn_for_main_agent() {
+        // First turn: accumulated == turn. Each `acc+turn` field
+        // should print `acc+turn` since the turn delta is nonzero.
+        let usage = token_usage([100, 50, 30, 5], [0, 0, 0, 0]);
+        let line = format_turn_usage_line(AgentId::Main, &usage);
+        assert_eq!(
+            line,
+            "Token Usage - Input: 100+100 | Output: 50+50 | Cache Creation: 30+30 | Cache Read: 5+5",
+        );
+    }
+
+    #[test]
+    fn format_turn_usage_line_drops_turn_part_when_turn_is_zero() {
+        // The legacy renderer hides the `+turn` suffix when the
+        // turn contributed nothing — a cached read of an existing
+        // tool result, for example. Pin that behaviour so we don't
+        // start showing `+0` rows for routine cache hits.
+        let usage = token_usage([0, 0, 0, 0], [200, 80, 0, 14]);
+        let line = format_turn_usage_line(AgentId::Main, &usage);
+        assert_eq!(
+            line,
+            "Token Usage - Input: 200 | Output: 80 | Cache Creation: 0 | Cache Read: 14",
+        );
+    }
+
+    #[test]
+    fn format_turn_usage_line_prefixes_sub_agent_id() {
+        // Sub-agents share the parent's bus, so their per-turn
+        // usage line is tagged with `(sub agent N)` to keep the
+        // rows distinguishable in the shared scrollback.
+        let usage = token_usage([10, 5, 1, 0], [0, 0, 0, 0]);
+        let line = format_turn_usage_line(AgentId::Sub(2), &usage);
+        assert_eq!(
+            line,
+            "(sub agent 2) Token Usage - Input: 10+10 | Output: 5+5 | Cache Creation: 1+1 | Cache Read: 0",
+        );
+    }
+
+    /// Build a fresh `Tui` + layout pair for event-pump tests.
+    /// Returns the populated `Tui` and a paired `EventPump` so the
+    /// caller can dispatch events and inspect the chat container's
+    /// contents afterwards.
+    fn fresh_tui_with_layout() -> (aj_tui::tui::Tui, EventPump, MarkdownTheme) {
+        let mut tui = aj_tui::tui::Tui::new(Box::new(ProcessTerminal::new()));
+        let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
+        build_layout(&mut tui, &theme);
+        let md = markdown_theme(&theme);
+        let pump = EventPump::new(md.clone());
+        (tui, pump, md)
+    }
+
+    #[test]
+    fn turn_usage_event_appends_one_chat_row() {
+        // End-to-end: dispatch a `TurnUsage` event and verify a
+        // new child landed in the chat container with the
+        // formatted line inside it (the dim escape wraps the
+        // visible body verbatim, so `.contains` is enough).
+        let (mut tui, mut pump, _md) = fresh_tui_with_layout();
+        let chat_len_before = {
+            let chat = tui
+                .get_mut_as::<aj_tui::container::Container>(SlotIndex::Chat.idx())
+                .expect("chat slot");
+            chat.len()
+        };
+        let usage = token_usage([42, 17, 0, 3], [0, 0, 0, 0]);
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Main,
+                usage,
+            },
+        );
+        let chat = tui
+            .get_mut_as::<aj_tui::container::Container>(SlotIndex::Chat.idx())
+            .expect("chat slot");
+        assert_eq!(
+            chat.len(),
+            chat_len_before + 1,
+            "TurnUsage should append exactly one chat row",
+        );
+        let row = chat
+            .get_mut_as::<aj_tui::components::text::Text>(chat_len_before)
+            .expect("the appended row should be a Text component");
+        // `render` walks the styled string; the dim escape sequence
+        // brackets the body, so a `contains` check on the visible
+        // payload is robust to trailing/leading ANSI bytes.
+        let lines = row.render(120);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(
+                "Token Usage - Input: 42+42 | Output: 17+17 | Cache Creation: 0 | Cache Read: 3+3"
+            ),
+            "row should carry the formatted usage line, got: {joined:?}",
+        );
+        assert!(
+            joined.contains("\x1b[2m"),
+            "row should be wrapped in the dim ANSI escape",
+        );
     }
 }
