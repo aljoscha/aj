@@ -57,6 +57,33 @@ this file is the bridge between the spec and the git history.
       WebSocket transport is explicitly out of scope (§7.4.8) — SSE
       only.
 
+      Sub-progress:
+   - [x] 8c.i. Provider-id split + env-var mapping. Renamed
+         `OpenAIOAuth::id()` from `"openai"` to `"openai-codex"` per
+         spec §7.4.1; added `"openai-codex" => ["OPENAI_CODEX_OAUTH_TOKEN"]`
+         to `find_env_keys` per §9.5 (deliberately *not* falling back
+         to `OPENAI_API_KEY` — the two credential pools target
+         different endpoints and crossing them surfaces as a 401
+         mid-request). `read_auth_file` gained a silent, idempotent
+         in-memory migration that moves OAuth-typed entries from
+         `auth.json["openai"]` to `auth.json["openai-codex"]`; the
+         migration only fires if the destination slot is empty and
+         leaves plain `api_key` entries under `openai` untouched
+         (those are legitimate `OPENAI_API_KEY` paste-ins for the
+         public API). The migrated shape persists to disk the next
+         time any mutating operation (`set` / `remove` /
+         `refresh_oauth_with_lock`) round-trips through
+         `write_auth_file`. Five new unit tests cover the migration:
+         basic rewrite, `api_key` preservation, no-clobber when both
+         ids are populated, persist-to-disk round-trip, and the
+         §9.5 env-var split. Existing tests (`default_registry_has_*`,
+         `openai_oauth_implements_provider_metadata`) updated to
+         match the renamed id.
+   - [ ] 8c.ii. Catalog seed + refresh preservation.
+   - [ ] 8c.iii. SDK + provider implementation.
+   - [ ] 8c.iv. Wire `"openai-codex-responses"` into `provider_for`.
+   - [ ] 8c.v. Round-trip parse / serialize / semantic fixtures.
+
 ## Phase 4: Cross-Provider & Utilities
 
 - [x] 9. Message transformation (`aj-models::transform`) — §8

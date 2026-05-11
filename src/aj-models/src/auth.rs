@@ -398,7 +398,12 @@ impl AuthStorage {
 // ---------------------------------------------------------------------------
 
 /// OAuth providers shipped out of the box, matching the auth section
-/// of the spec (Anthropic Claude Pro/Max in §9.3, OpenAI ChatGPT in §9.4).
+/// of the spec (Anthropic Claude Pro/Max in §9.3 → provider id
+/// `"anthropic"`, OpenAI ChatGPT/Codex in §9.4 → provider id
+/// `"openai-codex"`). Per §7.4.1 the Codex flow uses a distinct
+/// provider id from plain `OPENAI_API_KEY` credentials so the
+/// `chatgpt.com/backend-api` JWT pool never collides with the
+/// `api.openai.com` API-key pool.
 fn default_oauth_providers() -> HashMap<String, Arc<dyn OAuthProvider>> {
     let mut map: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
     let anthropic: Arc<dyn OAuthProvider> = Arc::new(AnthropicOAuth::new());
@@ -421,14 +426,20 @@ fn default_path() -> Result<PathBuf, AuthError> {
 /// Environment variables that can supply an API key for `provider_id`,
 /// in order of preference.
 ///
-/// Per §9.5 the only providers we cover today are `"anthropic"`
-/// (`ANTHROPIC_OAUTH_TOKEN` then `ANTHROPIC_API_KEY`) and `"openai"`
-/// (`OPENAI_API_KEY`). Unknown providers return an empty slice so
-/// callers can treat absence as "no env mapping configured".
+/// Per §9.5 we cover three providers today: `"anthropic"`
+/// (`ANTHROPIC_OAUTH_TOKEN` then `ANTHROPIC_API_KEY`), `"openai"`
+/// (`OPENAI_API_KEY`), and `"openai-codex"`
+/// (`OPENAI_CODEX_OAUTH_TOKEN`). The codex var carries a short-lived
+/// JWT minted by the §9.4 OAuth flow; on its own it cannot be
+/// refreshed, so persistent use should rely on a stored OAuth
+/// credential rather than this env var. Unknown providers return an
+/// empty slice so callers can treat absence as "no env mapping
+/// configured".
 pub fn find_env_keys(provider_id: &str) -> &'static [&'static str] {
     match provider_id {
         "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openai" => &["OPENAI_API_KEY"],
+        "openai-codex" => &["OPENAI_CODEX_OAUTH_TOKEN"],
         _ => &[],
     }
 }
@@ -448,17 +459,60 @@ pub fn get_env_api_key(provider_id: &str) -> Option<String> {
 /// Read and parse `auth.json`. Treats a missing or empty file as an
 /// empty map so first-run flows don't have to special-case file
 /// creation themselves.
+///
+/// Applies the §7.4.1 legacy-id migration in-memory before returning:
+/// any OAuth-type entry stored under provider id `"openai"` is moved
+/// to `"openai-codex"`, matching the renamed [`OpenAIOAuth`] provider
+/// id. The migration is silent and idempotent — if the destination
+/// id already holds an entry we leave both alone rather than clobber
+/// a user's hand-edited file. Plain `api_key` entries under
+/// `"openai"` are never touched: those are real `OPENAI_API_KEY`
+/// credentials for the public API and don't belong to the Codex
+/// credential pool.
+///
+/// The on-disk file is not rewritten here — that happens the next
+/// time any mutating operation re-reads + writes via [`write_auth_file`],
+/// at which point the migrated shape is persisted. Until then, both
+/// shapes coexist on disk, which is harmless: callers always observe
+/// the migrated in-memory view.
 fn read_auth_file(path: &Path) -> Result<AuthData, AuthError> {
-    match std::fs::read_to_string(path) {
+    let mut data: AuthData = match std::fs::read_to_string(path) {
         Ok(content) => {
             if content.trim().is_empty() {
                 return Ok(HashMap::new());
             }
-            serde_json::from_str(&content).map_err(AuthError::Parse)
+            serde_json::from_str(&content).map_err(AuthError::Parse)?
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
-        Err(e) => Err(AuthError::Io(e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(AuthError::Io(e)),
+    };
+    migrate_legacy_openai_oauth(&mut data);
+    Ok(data)
+}
+
+/// In-place rewrite of any legacy OAuth-typed `"openai"` entry to
+/// `"openai-codex"`. Idempotent; leaves the data alone if the
+/// destination id is already populated or if the source isn't an
+/// OAuth entry.
+fn migrate_legacy_openai_oauth(data: &mut AuthData) {
+    const LEGACY_ID: &str = "openai";
+    const NEW_ID: &str = "openai-codex";
+
+    // Only OAuth credentials migrate. The legacy `openai` slot also
+    // legitimately stored hand-written `api_key` entries (plain
+    // `OPENAI_API_KEY` paste-ins), and those stay where they are.
+    if !matches!(data.get(LEGACY_ID), Some(AuthCredential::OAuth(_))) {
+        return;
     }
+    // Don't clobber a user-authored entry under the new id.
+    if data.contains_key(NEW_ID) {
+        return;
+    }
+    let cred = data.remove(LEGACY_ID).expect("matched OAuth variant above");
+    data.insert(NEW_ID.to_string(), cred);
+    tracing::info!(
+        "migrated legacy OAuth credentials from `openai` to `openai-codex` in auth.json"
+    );
 }
 
 /// Write `data` to `auth.json`, creating the parent directory if
@@ -921,6 +975,23 @@ mod tests {
         assert_eq!(find_env_keys("openai"), &["OPENAI_API_KEY"]);
     }
 
+    /// The OAuth-only `openai-codex` pool resolves to its own env var
+    /// (per spec §9.5). It deliberately does *not* fall back to
+    /// `OPENAI_API_KEY` — a regular OpenAI API key is not accepted
+    /// against `chatgpt.com/backend-api`, and a Codex JWT is not
+    /// accepted against `api.openai.com`, so leaking either across
+    /// the boundary would surface as a confusing 401 mid-request.
+    #[test]
+    fn find_env_keys_openai_codex_is_distinct_from_openai() {
+        assert_eq!(find_env_keys("openai-codex"), &["OPENAI_CODEX_OAUTH_TOKEN"]);
+        // Sanity-check the inverse: `openai` does not pick up the
+        // Codex env var.
+        assert!(
+            !find_env_keys("openai").contains(&"OPENAI_CODEX_OAUTH_TOKEN"),
+            "`openai` provider id must not consume the Codex JWT env var"
+        );
+    }
+
     /// Unknown providers report an empty mapping rather than an
     /// error so callers can treat absence uniformly.
     #[test]
@@ -957,11 +1028,14 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
-    /// Default registry includes Anthropic + OpenAI so out-of-the-box
+    /// Default registry includes Anthropic + OpenAI Codex so out-of-the-box
     /// CLI usage can refresh both. Constructed via `AuthStorage::new`
-    /// to exercise the same path embedders use.
+    /// to exercise the same path embedders use. The OpenAI entry lives
+    /// under `openai-codex` per spec §7.4.1 — the regular `openai`
+    /// provider id is reserved for plain `OPENAI_API_KEY` credentials,
+    /// which don't need a refresh flow.
     #[tokio::test]
-    async fn default_registry_has_anthropic_and_openai() {
+    async fn default_registry_has_anthropic_and_openai_codex() {
         let path = scratch_path("registry");
         let storage = AuthStorage::new(path.clone());
 
@@ -974,7 +1048,150 @@ mod tests {
         let providers = storage.state.lock().await.oauth_providers.clone();
         let mut ids: Vec<&str> = providers.values().map(|p| p.id()).collect();
         ids.sort();
-        assert_eq!(ids, vec!["anthropic", "openai"]);
+        assert_eq!(ids, vec!["anthropic", "openai-codex"]);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A legacy `openai` OAuth entry in `auth.json` is invisibly
+    /// migrated to `openai-codex` on read, so a user who logged in
+    /// before the §7.4.1 rename keeps their stored refresh token.
+    /// `get` against the old id returns `None`; `get` against the
+    /// new id returns the migrated credential.
+    #[tokio::test]
+    async fn read_migrates_legacy_openai_oauth_to_openai_codex() {
+        let path = scratch_path("migrate");
+        // Hand-write a pre-migration `auth.json` containing an OAuth
+        // entry under the legacy `openai` key. This is exactly the
+        // shape a previous-version `aj` would have produced.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "openai": {
+                "type": "oauth",
+                "refresh": "legacy-refresh",
+                "access": "legacy-access",
+                "expires": i64::MAX,
+                "accountId": "acc-legacy"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+        // Old id no longer surfaces the entry…
+        assert!(storage.get("openai").await.unwrap().is_none());
+
+        // …and the new id holds the migrated OAuth credential.
+        match storage.get("openai-codex").await.unwrap() {
+            Some(AuthCredential::OAuth(c)) => {
+                assert_eq!(c.refresh, "legacy-refresh");
+                assert_eq!(c.access, "legacy-access");
+                assert_eq!(c.extra.get("accountId").unwrap(), "acc-legacy");
+            }
+            other => panic!("expected migrated OAuth entry under openai-codex, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// An `api_key` entry under `openai` is *not* migrated — that's a
+    /// real `OPENAI_API_KEY` for the public API, distinct from the
+    /// Codex OAuth pool. Migrating it would silently break the
+    /// regular OpenAI provider's auth lookup.
+    #[tokio::test]
+    async fn read_preserves_openai_api_key_entries() {
+        let path = scratch_path("preserve");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "openai": {"type": "api_key", "key": "sk-keep-me"}
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+        match storage.get("openai").await.unwrap() {
+            Some(AuthCredential::ApiKey { key }) => assert_eq!(key, "sk-keep-me"),
+            other => panic!("expected untouched ApiKey under openai, got {other:?}"),
+        }
+        assert!(storage.get("openai-codex").await.unwrap().is_none());
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// If the user already has an `openai-codex` entry — e.g. they
+    /// hand-edited the file or already migrated in a prior run — the
+    /// legacy `openai` slot is left untouched. We never clobber an
+    /// existing destination.
+    #[tokio::test]
+    async fn read_skips_migration_when_target_already_present() {
+        let path = scratch_path("collision");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mixed = serde_json::json!({
+            "openai": {
+                "type": "oauth",
+                "refresh": "legacy-r",
+                "access": "legacy-a",
+                "expires": 0
+            },
+            "openai-codex": {
+                "type": "oauth",
+                "refresh": "new-r",
+                "access": "new-a",
+                "expires": 1
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&mixed).unwrap()).unwrap();
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+        // Both entries remain.
+        match storage.get("openai").await.unwrap() {
+            Some(AuthCredential::OAuth(c)) => assert_eq!(c.refresh, "legacy-r"),
+            other => panic!("expected legacy entry preserved, got {other:?}"),
+        }
+        match storage.get("openai-codex").await.unwrap() {
+            Some(AuthCredential::OAuth(c)) => assert_eq!(c.refresh, "new-r"),
+            other => panic!("expected new entry preserved, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// After the in-memory migration, the next mutating write
+    /// (`set` / `remove`) persists the migrated shape to disk, so the
+    /// legacy `openai` OAuth key disappears from `auth.json` once any
+    /// real auth operation runs.
+    #[tokio::test]
+    async fn migration_persists_to_disk_on_next_write() {
+        let path = scratch_path("persist");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "openai": {
+                "type": "oauth",
+                "refresh": "legacy-refresh",
+                "access": "legacy-access",
+                "expires": i64::MAX
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+        // A write to *any* provider causes the read-modify-write
+        // cycle inside `set` to round-trip the migrated map.
+        storage
+            .set("anthropic", AuthCredential::ApiKey { key: "sk-x".into() })
+            .await
+            .unwrap();
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            on_disk.get("openai").is_none(),
+            "legacy openai key should be gone from disk, got: {on_disk}"
+        );
+        assert_eq!(on_disk["openai-codex"]["refresh"], "legacy-refresh");
+        assert_eq!(on_disk["anthropic"]["type"], "api_key");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

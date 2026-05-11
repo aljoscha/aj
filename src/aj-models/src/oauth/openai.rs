@@ -175,7 +175,12 @@ impl OpenAIOAuth {
 #[async_trait]
 impl OAuthProvider for OpenAIOAuth {
     fn id(&self) -> &str {
-        "openai"
+        // Per spec §7.4.1, OAuth credentials live under the `openai-codex`
+        // provider id, separate from the `openai` provider id used for
+        // plain `OPENAI_API_KEY` credentials. The JWT issued by this flow
+        // is only valid against `chatgpt.com/backend-api`, so the two
+        // credential pools deliberately do not overlap.
+        "openai-codex"
     }
 
     fn name(&self) -> &str {
@@ -1175,10 +1180,13 @@ mod tests {
     /// `OAuthProvider` trait wiring smoke-test: build an
     /// `OpenAIOAuth`, ask for its id/name/flags and use it as a
     /// trait object (the same shape the auth-storage layer needs).
+    /// The id is the spec §7.4.1 split — OAuth credentials live under
+    /// `openai-codex`, not `openai` — so the storage layer never
+    /// mistakes a JWT for a plain `OPENAI_API_KEY`.
     #[test]
     fn openai_oauth_implements_provider_metadata() {
         let provider = OpenAIOAuth::new();
-        assert_eq!(provider.id(), "openai");
+        assert_eq!(provider.id(), "openai-codex");
         assert!(provider.name().contains("ChatGPT"));
         assert!(provider.uses_callback_server());
         // Default `get_api_key` returns the access token verbatim.
