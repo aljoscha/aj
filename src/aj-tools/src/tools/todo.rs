@@ -18,7 +18,6 @@ use aj_agent::tool::{ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use termimad::crossterm::style::{Attribute, Stylize};
 
 // Re-export the canonical todo types from `aj-agent` so external
 // callers (and the new `aj_agent::tool::ToolDetails::Todos` shape)
@@ -55,8 +54,12 @@ pub fn format_todo_list(todos: &[TodoItem]) -> String {
             TodoPriority::Low => " (low)",
         };
 
+        // Strike through completed items via the SGR strikethrough
+        // attribute (`ESC[9m` on, `ESC[29m` off). Renderers that
+        // strip ANSI fall back to the plain text content; renderers
+        // that honor it dim the entry visually.
         let content = if todo.status == TodoStatus::Completed {
-            format!("{}", todo.content.clone().attribute(Attribute::CrossedOut))
+            format!("\x1b[9m{}\x1b[29m", todo.content)
         } else {
             todo.content.clone()
         };

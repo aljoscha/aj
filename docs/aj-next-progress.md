@@ -2039,7 +2039,21 @@ adopts independently.
       run -p aj -- list-threads` lists threads exactly like the
       legacy binary did. Total `aj` unit tests: 116 (renamed
       from the prior `aj-next` count).
-- [ ] Drop `rustyline`, `termimad`, `console`.
+- [x] Drop `rustyline`, `termimad`, `console`. `rustyline` was
+      already dropped alongside the legacy `aj` crate rename. The
+      remaining two go in this commit: `termimad = "0.33.0"` came
+      off `src/aj-tools/Cargo.toml` (its lone usage was
+      `format_todo_list`'s strike-through styling, replaced with an
+      inline `\x1b[9m{content}\x1b[29m` SGR pair matching the
+      `aj_tui::style::strikethrough` convention — turns off only the
+      strikethrough attribute instead of resetting all colors), and
+      `console = "0.15"` came off the workspace `Cargo.toml` (no
+      Rust source referenced it; it was a stranded leftover from the
+      legacy CLI). `cargo build` and `cargo test --workspace` pass
+      clean; `cargo clippy --workspace --all-targets` produces only
+      the pre-existing `clone_on_ref_ptr` warnings in `aj-agent` /
+      `aj-models` / `aj-tools`. Neither crate appears in `Cargo.lock`
+      anymore (no transitive consumers).
 - [ ] Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`.
 - [ ] Update `README.md` and `AGENTS.md`.
 

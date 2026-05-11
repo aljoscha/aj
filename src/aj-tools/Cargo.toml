@@ -30,7 +30,6 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-termimad = "0.33.0"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
