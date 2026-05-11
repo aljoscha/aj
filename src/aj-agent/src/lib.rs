@@ -315,6 +315,19 @@ impl Agent {
         Arc::clone(&self.model)
     }
 
+    /// Replace the model handle mid-session.
+    ///
+    /// Used by the interactive `/model` selector to switch the
+    /// active model without restarting the session. Takes effect
+    /// on the next inference; an in-flight turn keeps running
+    /// against whatever handle it was already using. Sub-agents
+    /// spawned after this call inherit the new handle; sub-agents
+    /// that were already constructed retain the old one (they
+    /// were cloned from `self.model` at spawn time).
+    pub fn set_model(&mut self, model: Arc<dyn Model>) {
+        self.model = model;
+    }
+
     /// Borrow the agent's environment. The binary uses this to
     /// render the startup `Context:` notice listing every
     /// agents.md file injected into the system prompt.

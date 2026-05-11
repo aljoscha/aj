@@ -44,11 +44,16 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command};
 use crate::config::slash_commands::{
-    SlashAction, build_autocomplete_provider, dispatch as slash_dispatch, thinking_level_name,
+    SlashAction, build_autocomplete_provider, dispatch as slash_dispatch, load_model_catalog,
+    thinking_level_name,
 };
 use crate::config::theme::{markdown_theme, select_list_theme};
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
+use crate::modes::interactive::components::model_selector::{
+    ModelIdentityRef, ModelSelectorComponent, ModelSelectorOutcome,
+    OutcomeHandle as ModelOutcomeHandle,
+};
 use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
 };
@@ -110,7 +115,22 @@ impl InteractiveMode {
                 .or_else(|| config.model_name.clone()),
             speed,
         };
+        // Capture the (provider, id) pair separately from the
+        // constructed handle so the `/model` selector can pre-select
+        // the active row and update it on a successful swap. We
+        // resolve the id post-construction so the captured value
+        // reflects whatever default `create_model` applied when
+        // `model_name` was unset on the CLI / config.
+        let current_provider = model_args.api.clone();
         let model = create_model(model_args).context("failed to construct model handle")?;
+        let current_id = model.model_name();
+        let current_model_key = Arc::new(std::sync::Mutex::new((current_provider, current_id)));
+
+        // Snapshot the model catalog up-front so the `/model`
+        // selector overlay and the editor's argument completer
+        // share a single load (registry::load reads JSON twice
+        // otherwise — once per consumer).
+        let model_catalog = load_model_catalog();
 
         // ---- Tools -----------------------------------------------------
         let mut tools = get_builtin_tools();
@@ -204,7 +224,10 @@ impl InteractiveMode {
         // start of the prompt; argument completion (e.g. `/thinking
         // m` → medium) flows through the same provider.
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
-            let provider = build_autocomplete_provider(agent.env().working_directory.clone());
+            let provider = build_autocomplete_provider(
+                agent.env().working_directory.clone(),
+                Arc::clone(&model_catalog),
+            );
             editor.set_autocomplete_provider(Arc::new(provider));
         }
 
@@ -347,6 +370,7 @@ impl InteractiveMode {
                                     &mut tui,
                                     sel,
                                     Arc::clone(&agent),
+                                    Arc::clone(&current_model_key),
                                 ).await {
                                     SelectorPollOutcome::StillOpen(reopened) => {
                                         open_selector = Some(reopened);
@@ -382,6 +406,8 @@ impl InteractiveMode {
                                     match handle_slash_command(
                                         &mut tui,
                                         Arc::clone(&agent),
+                                        Arc::clone(&model_catalog),
+                                        Arc::clone(&current_model_key),
                                         &trimmed,
                                     ).await {
                                         SlashHandled::Continue { selector, notice } => {
@@ -464,6 +490,10 @@ enum OpenSelector {
         handle: OverlayHandle,
         outcome: ThinkingOutcomeHandle,
     },
+    Model {
+        handle: OverlayHandle,
+        outcome: ModelOutcomeHandle,
+    },
 }
 
 /// Result of dispatching a `/...`-prefixed editor submission.
@@ -504,6 +534,8 @@ fn notice_event(text: &str) -> AgentEvent {
 async fn handle_slash_command(
     tui: &mut Tui,
     agent: Arc<TokioMutex<Agent>>,
+    model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
+    current_model_key: Arc<std::sync::Mutex<(String, String)>>,
     text: &str,
 ) -> SlashHandled {
     match slash_dispatch(text) {
@@ -534,6 +566,44 @@ async fn handle_slash_command(
                 notice: Some(format!("Thinking level set to {name}.")),
             }
         }
+        SlashAction::OpenModelSelector { initial_query } => {
+            // Snapshot the current (provider, id) pair so the
+            // overlay can pre-select the active row. The mutex lock
+            // is brief — we only need it to read the pair.
+            let (provider, id) = {
+                let key = current_model_key
+                    .lock()
+                    .expect("current_model_key mutex poisoned");
+                (key.0.clone(), key.1.clone())
+            };
+            let identity = ModelIdentityRef {
+                provider: &provider,
+                id: &id,
+            };
+            // Clone the catalog into the component — the component
+            // owns it for the lifetime of the overlay so we don't
+            // pay an extra Arc indirection on every rebuild.
+            let component = ModelSelectorComponent::new(
+                select_list_theme(),
+                (*model_catalog).clone(),
+                Some(&identity),
+                initial_query,
+            );
+            let outcome = component.outcome_handle();
+            // Model picker needs more width than the thinking
+            // overlay — long ids like `claude-sonnet-4-20250514`
+            // benefit from a roomier primary column.
+            let options = OverlayOptions {
+                anchor: OverlayAnchor::Center,
+                width: Some(SizeValue::Absolute(80)),
+                ..OverlayOptions::default()
+            };
+            let handle = tui.show_overlay(Box::new(component), options);
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::Model { handle, outcome }),
+                notice: None,
+            }
+        }
         SlashAction::NotYetImplemented { message, .. } => SlashHandled::Continue {
             selector: None,
             notice: Some(message.to_string()),
@@ -562,6 +632,7 @@ async fn handle_selector_outcome(
     tui: &mut Tui,
     selector: OpenSelector,
     agent: Arc<TokioMutex<Agent>>,
+    current_model_key: Arc<std::sync::Mutex<(String, String)>>,
 ) -> SelectorPollOutcome {
     match selector {
         OpenSelector::Thinking { handle, outcome } => {
@@ -578,6 +649,68 @@ async fn handle_selector_outcome(
                     }
                 }
                 Some(ThinkingSelectorOutcome::Cancelled) => {
+                    tui.hide_overlay(&handle);
+                    SelectorPollOutcome::Closed { notice: None }
+                }
+            }
+        }
+        OpenSelector::Model { handle, outcome } => {
+            let outcome_value = outcome.lock().expect("model outcome poisoned").take();
+            match outcome_value {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Model { handle, outcome }),
+                Some(ModelSelectorOutcome::Confirmed(info)) => {
+                    tui.hide_overlay(&handle);
+                    // Construct a fresh handle from the picked
+                    // catalog entry. Speed is intentionally left
+                    // unset on selector-driven swaps; users who want
+                    // the Anthropic fast-inference beta pass
+                    // `--speed fast` at startup (it survives the
+                    // swap if they re-pick a model that supports
+                    // it; otherwise it silently degrades).
+                    let model_args = ModelArgs {
+                        api: info.provider.clone(),
+                        url: Some(info.base_url.clone()),
+                        model_name: Some(info.id.clone()),
+                        speed: None,
+                    };
+                    match create_model(model_args) {
+                        Ok(model) => {
+                            let new_name = model.model_name();
+                            let new_url = model.model_url();
+                            {
+                                let mut a = agent.lock().await;
+                                a.set_model(Arc::clone(&model));
+                            }
+                            // Track the new key so a re-open of the
+                            // selector pre-selects the freshly-
+                            // active row.
+                            {
+                                let mut key = current_model_key
+                                    .lock()
+                                    .expect("current_model_key mutex poisoned");
+                                *key = (info.provider.clone(), info.id.clone());
+                            }
+                            // Refresh the footer's model line so
+                            // the user has visual confirmation of
+                            // the swap without waiting for the next
+                            // turn boundary.
+                            if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx())
+                            {
+                                footer.set_model(Some(format!("{} @ {}", new_name, new_url)));
+                            }
+                            SelectorPollOutcome::Closed {
+                                notice: Some(format!(
+                                    "Model set to {} ({}/{}).",
+                                    info.name, info.provider, info.id
+                                )),
+                            }
+                        }
+                        Err(err) => SelectorPollOutcome::Closed {
+                            notice: Some(format!("Failed to switch to {}: {err}", info.name)),
+                        },
+                    }
+                }
+                Some(ModelSelectorOutcome::Cancelled) => {
                     tui.hide_overlay(&handle);
                     SelectorPollOutcome::Closed { notice: None }
                 }

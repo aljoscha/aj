@@ -22,11 +22,14 @@
 //! pairing stays honest.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aj_models::ThinkingConfig;
+use aj_models::registry::{ModelInfo, ModelRegistry};
 use aj_tui::autocomplete::{
     AutocompleteItem, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
 };
+use aj_tui::fuzzy::FuzzyMatcher;
 
 /// One entry in the static catalog. A static `&str` keeps the list
 /// declarable as a `const` and avoids per-startup allocation.
@@ -51,7 +54,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "model",
-        description: "Switch the active model.",
+        description: "Switch the active model (Enter to commit; type to filter).",
         argument_hint: Some("[search]"),
     },
     BuiltinCommand {
@@ -81,13 +84,23 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
 /// `working_directory` feeds the `@`-fuzzy and direct-path branches
 /// of the underlying [`CombinedAutocompleteProvider`]; the slash
 /// catalog is shared regardless of the current working directory.
+/// `models` is the catalog used by the `/model` argument completer
+/// (passed in rather than loaded here so the caller controls when
+/// the registry-load cost is paid and can share the catalog with
+/// the selector overlay).
 ///
 /// `/thinking` carries an inline argument completer that fuzzy-
 /// matches against the level names so typing `/thinking m` proposes
-/// `medium` and `max` without the user opening the overlay. Other
-/// commands have no argument completer (yet) — the catalog's
-/// `argument_hint` is the only UX hint there.
-pub fn build_autocomplete_provider(working_directory: PathBuf) -> CombinedAutocompleteProvider {
+/// `medium` and `max` without the user opening the overlay. `/model`
+/// carries a fuzzy completer over the supplied model catalog so
+/// typing `/model sonn` proposes every model whose provider/id/name
+/// includes "sonn" as a subsequence. Other commands have no
+/// argument completer (yet) — the catalog's `argument_hint` is the
+/// only UX hint there.
+pub fn build_autocomplete_provider(
+    working_directory: PathBuf,
+    models: Arc<Vec<ModelInfo>>,
+) -> CombinedAutocompleteProvider {
     let entries: Vec<CommandEntry> = BUILTIN_COMMANDS
         .iter()
         .map(|cmd| {
@@ -98,10 +111,74 @@ pub fn build_autocomplete_provider(working_directory: PathBuf) -> CombinedAutoco
             if cmd.name == "thinking" {
                 sc = sc.with_argument_completions(thinking_argument_completions);
             }
+            if cmd.name == "model" {
+                let models_for_completer = Arc::clone(&models);
+                sc = sc.with_argument_completions(move |partial| {
+                    model_argument_completions(&models_for_completer, partial)
+                });
+            }
             CommandEntry::Command(sc)
         })
         .collect();
     CombinedAutocompleteProvider::new(entries, working_directory)
+}
+
+/// Snapshot the model catalog into a flat vector for sharing across
+/// the autocomplete provider and the [`SlashAction::OpenModelSelector`]
+/// overlay. Loads from [`ModelRegistry::load`] (bundled seed plus
+/// optional user cache, plus overrides) and flattens by provider in
+/// catalog order so the resulting list preserves the registry's
+/// intentional ordering.
+pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
+    let registry = ModelRegistry::load();
+    let mut models = Vec::new();
+    for provider in registry.providers() {
+        for info in registry.models(provider) {
+            models.push(info.clone());
+        }
+    }
+    Arc::new(models)
+}
+
+/// Argument completer for `/model`. Returns models whose searchable
+/// blob (`provider id name`) fuzzy-matches `partial`. Empty input
+/// returns the full catalog so the user can browse.
+///
+/// Items use `provider/id` as the autocomplete value (the same key
+/// the selector commits) so typing `/model an` → accepting the
+/// `anthropic/claude-...` suggestion produces an unambiguous
+/// dispatch target.
+fn model_argument_completions(models: &[ModelInfo], partial: &str) -> Vec<AutocompleteItem> {
+    if models.is_empty() {
+        return Vec::new();
+    }
+    let mut matcher = FuzzyMatcher::new();
+    let query = partial.trim();
+    let mut scored: Vec<(usize, u32)> = Vec::new();
+    if query.is_empty() {
+        scored.extend((0..models.len()).map(|i| (i, 0u32)));
+    } else {
+        for (idx, info) in models.iter().enumerate() {
+            let haystack = format!("{} {} {}", info.provider, info.id, info.name);
+            if let Some(score) = matcher.score(query, &haystack) {
+                scored.push((idx, u32::from(score)));
+            }
+        }
+        // Highest score first; tiebreak by catalog order so equally
+        // strong matches stay in the registry's intentional sequence.
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
+    scored
+        .into_iter()
+        .map(|(idx, _)| {
+            let info = &models[idx];
+            AutocompleteItem::new(
+                &format!("{}/{}", info.provider, info.id),
+                &format!("{}/{}", info.provider, info.id),
+            )
+            .with_description(&info.name)
+        })
+        .collect()
 }
 
 /// Argument completer for `/thinking`. Returns the levels whose
@@ -132,6 +209,11 @@ pub enum SlashAction {
     /// Apply the supplied thinking level inline (no overlay) and
     /// surface a status notice. Used for `/thinking <level>`.
     SetThinking(Option<ThinkingConfig>),
+    /// Open the model selector overlay. The current model is
+    /// pre-selected; `Esc` cancels, `Enter` applies. `initial_query`
+    /// pre-fills the search box so `/model sonn` opens the overlay
+    /// already filtered.
+    OpenModelSelector { initial_query: Option<String> },
     /// User typed a recognised command whose UI lives in a
     /// follow-up commit. The host renders the embedded message as
     /// a notice and clears the editor.
@@ -181,9 +263,12 @@ pub fn dispatch(input: &str) -> SlashAction {
                 ),
             },
         },
-        "model" => SlashAction::NotYetImplemented {
-            command: "model",
-            message: "/model: selector not yet implemented; restart with --model-name to switch.",
+        "model" => SlashAction::OpenModelSelector {
+            initial_query: if rest.is_empty() {
+                None
+            } else {
+                Some(rest.to_string())
+            },
         },
         "session" => SlashAction::NotYetImplemented {
             command: "session",
@@ -350,7 +435,6 @@ mod tests {
     #[test]
     fn dispatch_deferred_commands_return_not_yet_implemented() {
         for (input, expected_command) in [
-            ("/model", "model"),
             ("/session", "session"),
             ("/clear", "clear"),
             ("/help", "help"),
@@ -362,6 +446,40 @@ mod tests {
                 other => panic!("expected NotYetImplemented for {input}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn dispatch_model_no_arg_opens_selector() {
+        assert_eq!(
+            dispatch("/model"),
+            SlashAction::OpenModelSelector {
+                initial_query: None
+            }
+        );
+        assert_eq!(
+            dispatch("  /model  "),
+            SlashAction::OpenModelSelector {
+                initial_query: None
+            }
+        );
+    }
+
+    #[test]
+    fn dispatch_model_with_query_pre_fills_search() {
+        assert_eq!(
+            dispatch("/model sonnet"),
+            SlashAction::OpenModelSelector {
+                initial_query: Some("sonnet".to_string())
+            }
+        );
+        // Multi-word queries pass through verbatim so the search
+        // box receives the same string the user typed.
+        assert_eq!(
+            dispatch("/model claude opus 4"),
+            SlashAction::OpenModelSelector {
+                initial_query: Some("claude opus 4".to_string())
+            }
+        );
     }
 
     #[test]
@@ -408,7 +526,8 @@ mod tests {
         // command list directly, but constructing one is a safe
         // smoke test that every entry produces a valid
         // `SlashCommand`.
-        let _provider = build_autocomplete_provider(PathBuf::from("/tmp"));
+        let models = Arc::new(Vec::new());
+        let _provider = build_autocomplete_provider(PathBuf::from("/tmp"), models);
         // Sanity-check the catalog itself: every command name is
         // unique and non-empty.
         let mut seen = std::collections::HashSet::new();
@@ -416,5 +535,67 @@ mod tests {
             assert!(!cmd.name.is_empty(), "command name is empty");
             assert!(seen.insert(cmd.name), "duplicate command name {}", cmd.name);
         }
+    }
+
+    #[test]
+    fn model_argument_completions_fuzzy_matches_across_provider_id_name() {
+        let models = vec![
+            ModelInfo {
+                id: "claude-sonnet-4-20250514".into(),
+                name: "Claude Sonnet 4".into(),
+                api: "anthropic-messages".into(),
+                provider: "anthropic".into(),
+                base_url: "https://api.anthropic.com".into(),
+                reasoning: true,
+                supports_xhigh: false,
+                supports_adaptive_thinking: false,
+                input: vec![],
+                cost: aj_models::registry::ModelCost::default(),
+                context_window: 200000,
+                max_tokens: 8192,
+                headers: None,
+            },
+            ModelInfo {
+                id: "gpt-5".into(),
+                name: "GPT-5".into(),
+                api: "openai-responses".into(),
+                provider: "openai".into(),
+                base_url: "https://api.openai.com".into(),
+                reasoning: false,
+                supports_xhigh: false,
+                supports_adaptive_thinking: false,
+                input: vec![],
+                cost: aj_models::registry::ModelCost::default(),
+                context_window: 200000,
+                max_tokens: 8192,
+                headers: None,
+            },
+        ];
+
+        // Substring on the name matches.
+        let by_name = model_argument_completions(&models, "sonnet");
+        assert!(
+            by_name
+                .iter()
+                .any(|i| i.value == "anthropic/claude-sonnet-4-20250514"),
+            "got {by_name:?}"
+        );
+
+        // Provider name matches.
+        let by_provider = model_argument_completions(&models, "openai");
+        assert!(
+            by_provider.iter().any(|i| i.value == "openai/gpt-5"),
+            "got {by_provider:?}"
+        );
+
+        // Empty query returns the full catalog in order.
+        let all = model_argument_completions(&models, "");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].value, "anthropic/claude-sonnet-4-20250514");
+        assert_eq!(all[1].value, "openai/gpt-5");
+
+        // Nonsense query returns nothing.
+        let none = model_argument_completions(&models, "xyzzy");
+        assert!(none.is_empty(), "got {none:?}");
     }
 }

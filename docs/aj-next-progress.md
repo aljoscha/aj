@@ -1045,13 +1045,86 @@ adopts independently.
         and `cargo clippy -p aj-next --all-targets` all pass
         clean.
 
-  - [ ] Phase 1.4b: Model selector. Drives off
-        [`aj_models::registry::ModelRegistry`] with an inline
-        fuzzy filter (matches `id`, `provider`, and
-        `provider/id`), respects `disabled_tools` style filtering
-        (none today; reserved for future auth-storage gating),
-        and applies the chosen model via a new
-        [`Agent::set_model`] setter.
+  - [x] Phase 1.4b: Model selector. Drives off
+        [`aj_models::registry::ModelRegistry`] with an inline fuzzy
+        filter (matches `id`, `provider`, and `name`), preserves the
+        registry's catalog order on ties, and applies the chosen
+        model via a new [`Agent::set_model`] setter.
+
+        **`aj-agent`:** new [`Agent::set_model`] setter mirroring
+        [`Agent::set_default_thinking`]. Takes effect on the next
+        inference; an in-flight turn keeps running against whatever
+        handle it was already using.
+
+        **`aj-next/config/slash_commands.rs`:** `/model` no longer
+        returns [`SlashAction::NotYetImplemented`]; instead it
+        returns [`SlashAction::OpenModelSelector { initial_query }`]
+        with no args (`initial_query == None`) or with a fuzzy
+        pre-fill (`Some("sonnet")` for `/model sonnet`). The argument
+        completer on the editor pop-up uses
+        [`aj_tui::fuzzy::FuzzyMatcher`] against a `"provider id name"`
+        haystack so typing `/model sonn` proposes every model whose
+        searchable blob fuzzy-matches the query. A new
+        [`load_model_catalog`] helper snapshots
+        [`ModelRegistry::load`] once at startup so the autocomplete
+        provider and the selector overlay share a single load
+        rather than reading the JSON catalog twice.
+
+        **`aj-next/.../components/model_selector.rs`:** new
+        [`ModelSelectorComponent`] wrapping an
+        [`aj_tui::components::text_input::TextInput`] (live search
+        box) above an [`aj_tui::components::select_list::SelectList`]
+        (results). The component owns the catalog and rebuilds the
+        inner list on every text change via a reusable
+        [`FuzzyMatcher`] (empty query → catalog order; non-empty →
+        highest-score-first with catalog-order tiebreak). The
+        currently-active model is pre-selected on open and marked
+        `(current)` so a no-op confirm is visually obvious;
+        Enter/Esc are intercepted at the component level so they
+        route to the outcome slot without relying on either
+        sub-component's callbacks. Navigation keys
+        (Up/Down/PgUp/PgDn) flow to the [`SelectList`]; everything
+        else flows to the [`TextInput`]. A small
+        [`ModelIdentity`] / [`ModelIdentityRef`] trait pair keeps
+        the component decoupled from the wire-level [`Model`]
+        trait. Eight unit tests cover open-pre-selects-current,
+        Enter-confirms-highlighted, Esc-cancels, down-then-Enter,
+        live-filtering-on-typing, initial-query-pre-fills,
+        empty-catalog-shows-no-match, and unknown-current-falls-back-
+        to-first-row.
+
+        **`aj-next/modes/interactive.rs`:** captures
+        `current_model_key: Arc<Mutex<(String, String)>>` at startup
+        from `ModelArgs.api` and the resolved
+        `model.model_name()`, and threads it (alongside the
+        snapshotted `model_catalog: Arc<Vec<ModelInfo>>`) through
+        [`handle_slash_command`] and [`handle_selector_outcome`].
+        [`OpenSelector`] grew a [`Model { handle, outcome }`]
+        variant. On [`SlashAction::OpenModelSelector`] the host
+        clones the catalog into a fresh
+        [`ModelSelectorComponent`], shows it as an 80-column
+        centred overlay (wider than the thinking overlay because
+        ids like `claude-sonnet-4-20250514` need room), and polls
+        the outcome handle after every input event. On a confirmed
+        outcome the host rebuilds an [`aj_models::create_model`]
+        handle from the picked [`ModelInfo`] (provider → `api`,
+        base_url → `url`, id → `model_name`, speed left unset on
+        selector-driven swaps), calls [`Agent::set_model`] under
+        the existing [`TokioMutex<Agent>`] lock, updates
+        `current_model_key` so a re-open pre-selects the new row,
+        and refreshes the footer's model line with the freshly-
+        active `model_name @ model_url` pair so the user has
+        immediate visual confirmation of the swap.
+
+        Speed (`Anthropic fast-inference-2025-10-02` beta) is
+        intentionally not preserved across selector-driven swaps —
+        users who want it pass `--speed fast` at startup. A
+        follow-up could surface it as part of the selector if
+        that turns out to matter in practice.
+
+        `cargo build`, `cargo test -p aj-next`, `cargo fmt`, and
+        `cargo clippy -p aj-next --all-targets` all pass clean (the
+        only remaining warnings are pre-existing in `aj-agent`).
 
   - [ ] Phase 1.4c: Session selector. Loads threads via
         [`aj_session::ConversationPersistence::list_threads`] with
