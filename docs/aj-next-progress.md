@@ -1468,6 +1468,133 @@ adopts independently.
           aj-next --all-targets` all pass clean (the only
           remaining warnings are pre-existing in `aj-agent`).
 
+  - [ ] Phase 1.4e: Bigger session picker + richer per-thread
+        metadata. Adds creation time and last-message time to the
+        row metadata, widens the overlay so the extra fields have
+        room, and bumps the visible-row count so more threads fit
+        on screen at once. The session selector keeps its current
+        single-line row model — multi-line rows would force a
+        generic [`aj_tui::components::select_list::SelectList`]
+        scroll-model refactor that ripples into the thinking and
+        model selectors as well, and is deliberately deferred.
+
+        **`aj-session`:** [`ThreadPreview`] grows two
+        `DateTime<Utc>` fields:
+
+        - `created_at` — parsed from `thread_id` once at preview
+          build time. The thread id is minted in
+          [`ConversationLog::create`] as `%Y-%m-%d-%H-%M-%S-%3f`,
+          optionally suffixed `_<N>` for intra-millisecond
+          collisions; the parser strips a trailing `_<digits>`
+          suffix before parsing the stem. Falls back to `modified`
+          if the result doesn't parse (placeholder previews,
+          hand-renamed files, future format changes).
+        - `last_message_at` — captured during the JSONL walk in
+          [`read_thread_preview_file`] as the largest
+          `ConversationEntry.timestamp` seen on a `Message`-kind
+          entry. Falls back to `modified` if no entry carries a
+          timestamp (the field is `Option<DateTime<Utc>>` so logs
+          predating the timestamping work can have `None` on
+          every line).
+
+        [`ThreadPreview::placeholder`] populates both new fields
+        from the same fallback logic so a corrupt thread file
+        still produces a structurally complete row. `modified`
+        stays as-is — it remains the cheap fallback and is still
+        what [`ThreadMetadata`] / the `list-threads` CLI surface.
+
+        New unit tests in `persistence::tests`:
+
+        - A synthetic file with known per-entry timestamps
+          round-trips its `last_message_at` (largest, not last,
+          to guard against out-of-order writes).
+        - A preview built from `2025-05-11-14-22-03-512` has
+          `created_at` equal to that instant; the `_3` collision
+          suffix is stripped cleanly before parse.
+        - An unparseable id sets `created_at == modified` (the
+          fallback path).
+
+        **`aj-next/.../components/session_selector.rs`:** four
+        layout / rendering changes.
+
+        - **Overlay sizing.** The [`OverlayOptions`] in the
+          [`SlashAction::OpenSessionSelector`] arm of
+          [`handle_slash_command`] gains
+          `width: Some(SizeValue::Percent(80))` with
+          `min_width: Some(80)` and
+          `max_height: Some(SizeValue::Percent(80))`. Wide
+          terminals get a wide picker; narrow terminals degrade
+          gracefully because [`resolve_overlay_layout`] clamps
+          width to the available terminal width after the
+          `min_width` floor is applied, and `max_height` keeps
+          the picker from overflowing on short terminals.
+        - **More visible rows.** `MAX_VISIBLE_ROWS: 8 → 16`. With
+          a richer per-row description the user wants more rows
+          on screen at once. Thinking and model selectors stay at
+          8 — their catalogs are small and they don't carry the
+          same information density.
+        - **Description triplet.** `format_secondary` now
+          produces `<count> msgs · created <D> · last <age>`:
+
+          - `<count> msgs` keeps today's singular / plural
+            grammar (`1 msg`, `42 msgs`).
+          - `created <D>` is an adaptive absolute format off
+            `created_at` (new helper `format_created`):
+            clock-only (`14:22`) for threads created on the same
+            calendar day as the selector's `now` snapshot; month
+            + day (`May 8`) for same calendar year; month + day
+            + year (`May 8 2024`) for older threads.
+          - `last <age>` reuses the existing `format_age` coarse
+            buckets (`now / 5m / 3h / 2d / 4w / 6mo / 2y`), but
+            driven off `last_message_at` instead of `modified`.
+
+          Example row description:
+          `42 msgs · created May 8 · last 5m`. If a too-narrow
+          terminal can't fit the full triplet, `SelectList`'s
+          existing description-end truncation kicks in — we
+          don't build a custom collapse strategy.
+        - **Primary column.** `PREVIEW_MAX_CHARS: 80 → 60` (and
+          the matching `max_primary_column_width` adjustment in
+          [`primary_column_layout`]) so the broader description
+          has room without forcing `SelectList`'s per-row
+          truncator to collapse it. Long previews continue to
+          receive a trailing `…` from [`truncate_for_display`],
+          and the `(current)` suffix continues to fit because
+          the layout cap already reserved space for it.
+
+        Search and sort policy are unchanged: the haystack stays
+        `"<first_user_message> <thread_id>"` (the thread id
+        encodes the creation date, so date-prefix searches still
+        work), and [`ConversationPersistence::list_thread_previews`]
+        keeps returning latest-first by filename stem. Per-row
+        load-progress indication and sort / group toggles in the
+        overlay remain out of scope; the `on_progress` callback
+        is already plumbed for the former when it becomes
+        warranted.
+
+        New / updated unit tests in `session_selector::tests`:
+
+        - Description string includes `created` and `last` in
+          the expected order, with `created` rendered in clock
+          format for today's threads and date format for older
+          threads.
+        - `format_created` boundary cases: same day (clock),
+          same year (month + day), prior year (month + day +
+          year).
+        - `last_message_at` drives the `last <age>` cell —
+          a preview whose file mtime is recent but whose final
+          message timestamp is hours old still renders `last 3h`
+          rather than `last now`.
+        - `MAX_VISIBLE_ROWS` bump doesn't regress
+          highlight-current-on-open: with 12 threads in the
+          catalog and the current pre-selection in the middle,
+          the row is visible without scrolling.
+
+        No callers of [`ThreadPreview`] outside the selector
+        inspect the new fields, so the data-model change lands
+        as an additive extension without touching the
+        `list-threads` CLI's [`ThreadMetadata`] path.
+
 ## Phase 2 — Cutover (§5)
 
 - [ ] Behavioral parity verification for daily flows. Decomposed
