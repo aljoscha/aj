@@ -965,7 +965,7 @@ adopts independently.
       `cargo fmt`, and `cargo clippy -p aj-next --all-targets`
       all pass clean (the only remaining warnings are pre-existing
       in `aj-agent`).
-- [ ] Selectors (model/thinking/session) and theming.
+- [x] Selectors (model/thinking/session) and theming.
 
   Splitting along the same lines as §2.3a/b / §2.4a/b / §2.5a/b: each
   selector is a self-contained unit with its own commit window, and
@@ -1222,7 +1222,7 @@ adopts independently.
         events mid-turn), so the swap path doesn't need to cancel
         an in-flight `agent.prompt(...)` task.
 
-  - [ ] Phase 1.4d: Configurable theme palette. Replace the
+  - [x] Phase 1.4d: Configurable theme palette. Replace the
         hard-coded closures in `config/theme.rs` with a
         JSON-loaded palette (`vars` + `colors` semantic tokens),
         wire fs-watcher hot-reload, and surface the active level
@@ -1615,7 +1615,7 @@ adopts independently.
 
 ## Phase 2 — Cutover (§5)
 
-- [ ] Behavioral parity verification for daily flows. Decomposed
+- [x] Behavioral parity verification for daily flows. Decomposed
       into focused sub-bullets, each landing as its own commit:
   - [x] Phase 2.1a: Wire `aj-next list-threads` — replace the stub
         in `main.rs::handle_list_threads` with a port of the
@@ -2093,7 +2093,38 @@ adopts independently.
       most recent entries. No code changes. `cargo build`, `cargo
       test -p aj -p aj-agent`, and `cargo fmt` pass clean (139 tests
       across the two crates).
-- [ ] Update `README.md` and `AGENTS.md`.
+- [x] Update `README.md` and `AGENTS.md`. `README.md` was
+      expanded from the legacy three-line install blurb to cover
+      the daily flows: interactive vs `--print` mode, the
+      non-conversational subcommands (`list-threads`, `continue`,
+      `models update`), the slash-command catalog
+      (`/model`, `/thinking`, `/session`, `/clear`, `/help`,
+      `/quit`), the `~/.aj/` layout (`.env`, `config.toml`,
+      `models.json`, `themes/`, `threads/`), the model-selection
+      precedence (CLI flags → env vars → `config.toml` → defaults
+      with the correct kebab-case `--model-api` / `--model-url`
+      / `--model-name` flag names), and the post-Phase-0 crate
+      graph (`aj-models` ← `aj-agent` ← `aj-tools` ← `aj-session`
+      ← `aj`, plus `aj-tui` / `aj-conf` / the two provider SDKs).
+
+      `CLAUDE.md` (which `AGENTS.md` symlinks to) was updated to
+      match: the stale `cargo run -p aj --bin test_diff` line
+      came out (the `test_diff` / `test_markdown` helper binaries
+      were deleted with the legacy `aj` crate rename), the model
+      flags were corrected from snake_case to kebab-case, the
+      lint command was changed from `cargo clippy` to
+      `cargo clippy --workspace --all-targets` (matches the
+      command the progress doc cites under every recent commit),
+      and a new Architecture section documents the crate graph,
+      the per-crate responsibilities, and the `AgentEvent` bus
+      subscription model (`Agent::prompt` doesn't take a
+      `&ConversationLog`; the binary registers a persistence
+      listener). The Configuration & Runtime section now lists
+      every file under `~/.aj/` and spells out the model-selection
+      precedence chain.
+
+      No code changes. `cargo build`, `cargo fmt`, and `cargo
+      test --workspace` all pass clean (no source touched).
 
 ---
 

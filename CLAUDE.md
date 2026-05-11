@@ -7,22 +7,61 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build: `cargo check` or `cargo build`
 - Run all tests: `cargo test`
 - Run specific test: `cargo test --package package_name -- test_name`
-- Run CLI: `cargo run -p aj -- [args]` (e.g., `list-threads`, `continue <id>`, `continue`)
-- Run specific bin: `cargo run -p aj --bin test_diff`
+- Run CLI: `cargo run -p aj -- [args]` (e.g. `list-threads`, `continue <id>`, `continue`)
 - Format code: `cargo fmt`
-- Lint: `cargo clippy`
+- Lint: `cargo clippy --workspace --all-targets`
 
 ## Architecture
 
-AJ is an AI-driven agent for software engineering.
+AJ is an AI-driven agent for software engineering. The agent follows a
+minimal loop pattern, focusing on providing the right set of builtin tools
+rather than complex scaffolding.
 
-The agent follows a minimal agent loop pattern, focusing on providing the right set of builtin tools rather than complex scaffolding.
+The workspace is split along the dependency graph from
+`docs/aj-next-plan.md`:
+
+```
+aj-models  ←  aj-agent  ←  aj-tools
+                ↑              ↑
+                └─  aj-session  ─┘
+                        ↑
+                        aj
+```
+
+- `aj-models` — wire layer: provider SDKs, unified `Message` /
+  `AssistantMessage` / streaming types, model registry.
+- `aj-agent` — the `Agent` runtime, the typed `AgentEvent` bus, the
+  tool trait, and `ToolDetails` for structured tool rendering.
+- `aj-session` — on-disk thread format, `ConversationLog`, replay.
+- `aj-tools` — the builtin tool implementations.
+- `aj-tui` — in-process text-UI framework (layout, components, theming).
+- `aj-conf` — `~/.aj/config.toml` loader and path helpers.
+- `aj` — the binary: CLI parsing, print mode, interactive TUI, slash
+  commands, selectors.
+- `anthropic-sdk` / `openai-sdk` — thin async clients used by
+  `aj-models`'s provider adapters.
+
+Frontends (TUI, print mode, tests) subscribe to the agent's `AgentEvent`
+bus via `Agent::subscribe(...)`. Persistence is just another subscriber.
+`Agent::prompt` does not take a `&ConversationLog`; the binary owns the
+log and registers a persistence listener.
 
 ## Configuration & Runtime
 
-- Persistent data lives in `~/.aj/` (threads/, .env).
-- Configuration `.env` is loaded from `~/.aj/.env` and project `.env`; never commit secrets.
-- Model selection via flags or env: `--model_api`, `--model_url`, `--model_name` (env: `MODEL_API`, `MODEL_URL`, `MODEL_NAME`).
+Persistent state lives under `~/.aj/`:
+
+- `.env` — secrets (API keys); loaded before the project-local `.env`.
+- `config.toml` — defaults (model, thinking level, speed, theme,
+  disabled tools).
+- `models.json` — model catalog; refresh with `aj models update`.
+- `themes/<name>.json` — optional user themes layered on top of the
+  bundled `dark` / `light` palettes. Hot-reloads on file changes.
+- `threads/<project>/` — JSONL conversation logs, one file per thread.
+
+Model selection precedence (highest to lowest): CLI flags
+(`--model-api`, `--model-url`, `--model-name`) → env vars (`MODEL_API`,
+`MODEL_URL`, `MODEL_NAME`) → `config.toml` → built-in defaults. Never
+commit secrets.
 
 ## Code Style
 
