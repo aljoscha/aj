@@ -21,6 +21,7 @@ pub mod event_pump;
 pub mod footer_data;
 pub mod keys;
 pub mod layout;
+pub mod shutdown;
 
 use std::sync::Arc;
 
@@ -70,6 +71,9 @@ use crate::modes::interactive::event_pump::{
     EventPump, set_editor_submit_enabled, take_submitted_prompt,
 };
 use crate::modes::interactive::layout::{SlotIndex, build_layout};
+use crate::modes::interactive::shutdown::{
+    build_usage_summary, print_resume_hint, print_usage_summary,
+};
 
 /// Driver for a single interactive session. Owns the
 /// [`aj_tui::tui::Tui`], the registered listeners on the agent's
@@ -564,6 +568,47 @@ impl InteractiveMode {
         drop(theme_watcher_guard);
 
         tui.stop();
+
+        // End-of-session banner: token-usage breakdown plus a
+        // resume hint pointing at the active thread id. Printed
+        // *after* [`Tui::stop`] so the bytes land in the user's
+        // regular shell scrollback rather than the alternate-screen
+        // TUI buffer that gets cleared on exit. Mirrors the legacy
+        // `aj` binary's shutdown output (see
+        // `aj/src/main.rs::display_usage_summary` + the
+        // `Thread:` notice it emits right after).
+        //
+        // Reading the agent + log behind their `TokioMutex` is
+        // safe here: the running task was aborted above, the
+        // event-channel forwarder lives on its own task that
+        // doesn't touch these mutexes, and the persistence
+        // listener is no-op-and-quick when no events are firing.
+        let summary = {
+            let a = agent.lock().await;
+            build_usage_summary(&a)
+        };
+        print_usage_summary(&summary);
+
+        // Resume hint is gated on "the thread is worth resuming",
+        // i.e. it has at least one persisted user-thread leaf.
+        // Fresh threads where the user quit without typing
+        // anything don't get a hint — there's nothing meaningful
+        // to come back to. The check covers both the "user
+        // submitted at least one prompt this session" and "we
+        // resumed a thread that already had content" paths in one
+        // shot since the persistence listener writes user
+        // messages inline before the run returns.
+        let (resume_eligible, thread_id) = {
+            let l = log.lock().await;
+            (
+                l.latest_leaf(ThreadFilter::USER).is_some(),
+                l.thread_id().to_string(),
+            )
+        };
+        if resume_eligible {
+            print_resume_hint(&thread_id);
+        }
+
         run_result
     }
 }

@@ -1566,10 +1566,103 @@ adopts independently.
         `cargo clippy -p aj-next --all-targets` all pass clean
         (the only remaining warnings are pre-existing in
         `aj-agent`). Total `aj-next` unit tests: 91 (up from 86).
-  - [ ] Phase 2.1d: End-of-session usage summary + resume hint.
-        Port `display_usage_summary` + the `Thread: <id>
-        (resume with: aj-next continue <id>)` line so users can
-        track cost and find their thread id on exit.
+  - [x] Phase 2.1d: End-of-session usage summary + resume hint.
+        Ports `display_usage_summary` + the `Thread: <id> (resume
+        with: aj-next continue <id>)` line from the legacy `aj`
+        binary so users can track cost and find their thread id
+        on exit.
+
+        **`aj-next/.../interactive/shutdown.rs`:** new module
+        owning the end-of-session banner. Three public surfaces:
+
+        - [`build_usage_summary(agent)`] — read the agent's
+          [`Agent::accumulated_usage`] and [`Agent::sub_agent_usage`]
+          and project them onto a structured [`UsageSummary`] (a
+          [`SubAgentUsage`] row per agent, sub-agents sorted by
+          `agent_id` for determinism, plus a `total_usage` row
+          summing them). Cache-creation / cache-read counts on the
+          wire [`Usage`] are `Option<u64>`; absent values flatten
+          to `0` in the summary's `u64` fields. The thin
+          [`build_usage_summary`] wrapper reads the parts off the
+          agent; the heavy lifter
+          [`build_usage_summary_from_parts`] takes a `&Usage` plus
+          a `&HashMap<usize, Usage>` so unit tests can exercise
+          the projection without spinning up a live `Agent`.
+        - [`format_usage_summary(summary)`] — render a
+          [`UsageSummary`] into the canonical multi-line block
+          (`Main Agent - …` row, `Sub-agent <n> - …` rows in id
+          order, trailing `TOTAL - …` row). The row shape `Input:
+          A | Output: B | Cache Creation: C | Cache Read: D`
+          mirrors `aj/src/cli_common.rs::format_usage_summary`
+          byte-for-byte so users scripting against either binary
+          see the same numbers in the same positions. No trailing
+          newline — the caller (the print helper) adds one.
+        - [`print_usage_summary`] / [`print_resume_hint`] —
+          stdout-bound display helpers wrapping the formatters in
+          [`aj_tui::style::dim`] (ANSI dim attribute) to match the
+          legacy `console::style(…).dim()` presentation. Each adds
+          one trailing newline so the usage block, the resume
+          hint, and the user's shell prompt sit on visually
+          separate rows.
+
+        **`aj-next/modes/interactive.rs`:** the end of
+        [`InteractiveMode::run`] now does, after
+        [`Tui::stop`]:
+
+        1. Lock the agent, call [`build_usage_summary`], call
+           [`print_usage_summary`].
+        2. Lock the log, snapshot
+           `latest_leaf(ThreadFilter::USER).is_some()` plus the
+           `thread_id`. If the leaf exists,
+           [`print_resume_hint`] the id.
+
+        Reading the agent + log behind their `TokioMutex`es on
+        the shutdown path is deadlock-free: the in-flight
+        `agent.prompt(...)` task has been aborted by then, the
+        event-channel forwarder lives on its own task and
+        doesn't touch these mutexes, and the persistence
+        listener is no-op-and-quick when the bus is quiet.
+
+        The "is there a leaf?" check covers both the "user
+        submitted at least one prompt this session" and "we
+        resumed a thread that already had content" paths in one
+        shot since the persistence listener writes user
+        messages inline before each `prompt` returns — the
+        legacy binary's `sent_any_input` boolean would have
+        ended up tracking the same state, but reading the log's
+        leaf is simpler and survives `/session` swaps without
+        extra bookkeeping. A fresh thread where the user quits
+        before typing anything still has no leaf, so they get
+        the usage banner (which will be all zeros) but no
+        resume hint pointing at an effectively-empty thread.
+
+        The shutdown banner is printed *after* [`Tui::stop`] so
+        the bytes land in the user's regular shell scrollback
+        rather than the alternate-screen TUI buffer that gets
+        cleared on exit — same end-of-session behaviour the
+        legacy binary produces.
+
+        Print mode (`--print`) does not get this banner: a
+        one-shot `aj-next --print "do X"` prints the assistant's
+        answer to stdout and exits, leaving the user free to
+        compose them. Adding a usage line under the answer would
+        contaminate scripted output where the caller's already
+        piped stdout into another process. The interactive
+        binary is the only one that surfaces this — same call
+        the legacy binary makes.
+
+        Five new unit tests in `shutdown::tests` cover:
+        the main-only happy path (no sub-agents → total equals
+        main), the multi-sub-agent path with out-of-order
+        `HashMap` inserts (asserts on sorted `agent_id` output
+        and on the summed totals), the format renders the
+        main-only block byte-for-byte against the legacy shape,
+        the format renders sub-agent rows in order, and the
+        resume-hint formatter round-trips its thread id.
+        `cargo build`, `cargo test -p aj-next`, `cargo fmt`,
+        and `cargo clippy -p aj-next --all-targets` all pass
+        clean (the only remaining warnings are pre-existing in
+        `aj-agent`). Total `aj-next` unit tests: 96 (up from 91).
   - [ ] Phase 2.1e: Prompt history bootstrap from project JSONL
         thread logs. Port the prompt-history extractor so the
         editor's up-arrow surfaces cross-session history.
