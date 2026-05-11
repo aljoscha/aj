@@ -38,7 +38,6 @@ struct State {
     /// Receiver side of the input channel. Moved out exactly once, by
     /// the first [`Terminal::take_input_stream`] call.
     input_rx: Option<mpsc::UnboundedReceiver<InputEvent>>,
-    cursor_visible: bool,
     title: String,
     progress_active: bool,
     kitty_protocol_active: bool,
@@ -65,7 +64,6 @@ impl State {
             rows,
             input_tx,
             input_rx: Some(input_rx),
-            cursor_visible: true,
             title: String::new(),
             progress_active: false,
             // Default to true so tests that don't care about protocol
@@ -211,9 +209,17 @@ impl VirtualTerminal {
         self.state.borrow().parser.screen().cursor_position()
     }
 
-    /// Whether the cursor was last hidden via [`Terminal::hide_cursor`].
+    /// Whether the cursor is currently visible, as last observed by the
+    /// internal VT100 parser.
+    ///
+    /// This is derived from whatever DECSET/DECRST `25` sequences have
+    /// been processed via [`Terminal::write`] (regardless of whether
+    /// they arrived through the [`Terminal::hide_cursor`] /
+    /// [`Terminal::show_cursor`] trait methods or as inline bytes in a
+    /// larger frame buffer). Defaults to `true` — the parser's natural
+    /// initial state — to match how a real terminal boots.
     pub fn is_cursor_visible(&self) -> bool {
-        self.state.borrow().cursor_visible
+        !self.state.borrow().parser.screen().hide_cursor()
     }
 
     /// Current terminal title, as last set via [`Terminal::set_title`].
@@ -282,7 +288,6 @@ impl VirtualTerminal {
     pub fn reset(&self) {
         let mut state = self.state.borrow_mut();
         state.parser = Parser::new(state.rows, state.columns, DEFAULT_SCROLLBACK);
-        state.cursor_visible = true;
         state.title.clear();
         state.progress_active = false;
         state.writes.clear();
@@ -379,12 +384,10 @@ impl Terminal for VirtualTerminal {
     }
 
     fn hide_cursor(&mut self) {
-        self.state.borrow_mut().cursor_visible = false;
         self.write("\x1b[?25l");
     }
 
     fn show_cursor(&mut self) {
-        self.state.borrow_mut().cursor_visible = true;
         self.write("\x1b[?25h");
     }
 

@@ -58,6 +58,11 @@ const SYNC_BEGIN: &str = "\x1b[?2026h";
 /// Synchronized output: end (terminal flushes atomically).
 const SYNC_END: &str = "\x1b[?2026l";
 
+/// DECSET 25 set: show the hardware cursor.
+const CURSOR_SHOW: &str = "\x1b[?25h";
+/// DECSET 25 reset: hide the hardware cursor.
+const CURSOR_HIDE: &str = "\x1b[?25l";
+
 /// Events yielded by [`Tui::next_event`]. Exactly one kind of thing
 /// happens per loop iteration: the application routes it into the
 /// `Tui` accordingly.
@@ -1635,6 +1640,21 @@ impl Tui {
         // empty, but only the former wants the clear sequence; see the
         // field doc for the rationale.
         let recover_full_clear = self.pending_full_clear;
+
+        // Assemble the entire frame — clear/paint, cursor positioning,
+        // and cursor visibility toggle — into a single buffer, then
+        // wrap it in [`SYNC_BEGIN`] / [`SYNC_END`] and commit with a
+        // single `terminal.write` + `flush`. On terminals that honor
+        // DEC mode 2026 (Begin/End Synchronized Update) the whole
+        // frame, *including* the final cursor placement and visibility,
+        // appears atomically — eliminating the brief cursor flicker
+        // that used to land between the paint flush and a separate
+        // cursor-positioning flush. On terminals that don't honor 2026
+        // the bytes still arrive in the right order, so the visible
+        // end state is unchanged.
+        let mut frame = String::new();
+        frame.push_str(SYNC_BEGIN);
+
         if first_render
             || width_changed
             || height_forces_full_redraw
@@ -1665,7 +1685,7 @@ impl Tui {
             // `first_render` is true, because the caller has explicitly
             // asked for a wipe.
             let clear = !first_render || recover_full_clear;
-            self.full_render(&lines, clear);
+            self.full_render(&mut frame, &lines, clear);
             self.full_redraws += 1;
             self.pending_full_clear = false;
         } else {
@@ -1675,7 +1695,7 @@ impl Tui {
             // height + 1)`, so starting from the stale value would
             // bias the tracker upward when the height shrinks.
             self.previous_viewport_top = effective_viewport_top;
-            diff_range = self.differential_render(&lines);
+            diff_range = self.differential_render(&mut frame, &lines);
             strategy = if diff_range.is_some() {
                 "diff"
             } else {
@@ -1683,19 +1703,25 @@ impl Tui {
             };
         }
 
-        // Phase 6: Position hardware cursor.
+        // Phase 6: Position hardware cursor. Cursor moves AND the
+        // `\x1b[?25h` / `\x1b[?25l` visibility toggle are appended
+        // into the same `frame` buffer, inside the sync envelope.
         if let Some(pos) = &cursor_pos {
-            self.position_hardware_cursor(pos.row, pos.col, &lines);
+            self.position_hardware_cursor(&mut frame, pos.row, pos.col, &lines);
         } else if self.hardware_cursor_currently_shown {
-            // Only emit `\x1b[?25l` when transitioning from shown to
+            // Only append `\x1b[?25l` when transitioning from shown to
             // hidden. Re-emitting hide on every frame while already
             // hidden is a no-op at the protocol level, but some
             // terminals react to the sequence with a brief cursor
             // repaint — perceptible as flicker when the popup stays
             // open across many keystrokes.
-            self.terminal.hide_cursor();
+            frame.push_str(CURSOR_HIDE);
             self.hardware_cursor_currently_shown = false;
         }
+
+        frame.push_str(SYNC_END);
+        self.terminal.write(&frame);
+        self.terminal.flush();
 
         // Update state.
         self.previous_lines = lines;
@@ -2644,10 +2670,11 @@ impl Tui {
         }
     }
 
-    fn full_render(&mut self, lines: &[String], clear: bool) {
-        let mut buf = String::new();
-        buf.push_str(SYNC_BEGIN);
-
+    /// Append a full repaint of `lines` to `buf`. The caller is responsible
+    /// for wrapping the buffer in [`SYNC_BEGIN`] / [`SYNC_END`] and issuing
+    /// the actual `terminal.write` + `flush`; this method does not touch
+    /// the terminal directly. See [`Self::render`] for the assembly path.
+    fn full_render(&mut self, buf: &mut String, lines: &[String], clear: bool) {
         if clear {
             match self.full_clear_mode {
                 FullClearMode::WholeScreen => {
@@ -2686,10 +2713,6 @@ impl Tui {
             }
             buf.push_str(line);
         }
-
-        buf.push_str(SYNC_END);
-        self.terminal.write(&buf);
-        self.terminal.flush();
 
         self.hardware_cursor_row = lines.len().saturating_sub(1);
         // When we emitted the clear-from-cursor escape the rendered area
@@ -2744,7 +2767,17 @@ impl Tui {
         first_changed.zip(last_changed)
     }
 
-    fn differential_render(&mut self, lines: &[String]) -> Option<(usize, usize)> {
+    /// Append a differential repaint to `buf`. Returns the
+    /// `(first_changed, last_changed)` row range that was repainted,
+    /// or `None` if the new frame is byte-identical to the previous.
+    /// As with [`Self::full_render`], this method does not write to or
+    /// flush the terminal — the caller assembles the full sync-wrapped
+    /// frame buffer and issues a single `write` + `flush`.
+    fn differential_render(
+        &mut self,
+        buf: &mut String,
+        lines: &[String],
+    ) -> Option<(usize, usize)> {
         let (first, last) = Self::compute_diff_range(&self.previous_lines, lines)?;
 
         // Pure-deletion branch: every changed row is past the end of
@@ -2756,7 +2789,7 @@ impl Tui {
         // we can assume the cleanup sequence fits inside the visible
         // area.
         if first >= lines.len() {
-            self.differential_render_deletion_only(lines);
+            self.differential_render_deletion_only(buf, lines);
             return Some((first, last));
         }
 
@@ -2771,9 +2804,6 @@ impl Tui {
         // cascade into deleted-row territory would push existing rows
         // into scrollback as a side effect of clearing them.
         let render_end = last.min(lines.len().saturating_sub(1));
-
-        let mut buf = String::new();
-        buf.push_str(SYNC_BEGIN);
 
         // Move cursor to the first changed line, column 0. Going up
         // is a plain `\x1b[nA` (CUU stays within the visible region
@@ -2893,10 +2923,6 @@ impl Tui {
             buf.push_str(&format!("\x1b[{}A", extra_lines));
         }
 
-        buf.push_str(SYNC_END);
-        self.terminal.write(&buf);
-        self.terminal.flush();
-
         self.hardware_cursor_row = cursor_row;
         self.max_lines_rendered = self.max_lines_rendered.max(lines.len());
         // Track viewport advance caused by the `\r\n`s we just
@@ -2914,18 +2940,22 @@ impl Tui {
         Some((first, last))
     }
 
-    /// Emit the cleanup sequence for a frame whose only changes are
-    /// trailing-row deletions. Called by [`Self::differential_render`]
-    /// when `first >= lines.len()`; the render-strategy selector has
-    /// already routed unreachable cases (target row above the
-    /// viewport, extra-line count exceeding the terminal height) to
-    /// a full redraw.
+    /// Append the cleanup sequence for a frame whose only changes are
+    /// trailing-row deletions to `buf`. Called by
+    /// [`Self::differential_render`] when `first >= lines.len()`; the
+    /// render-strategy selector has already routed unreachable cases
+    /// (target row above the viewport, extra-line count exceeding the
+    /// terminal height) to a full redraw.
     ///
     /// The move pattern is CUU/CUD + `\x1b[1B`/`\r\x1b[2K` pairs — all
     /// clamp-style cursor moves, none that can scroll. Uses `\r\n`
     /// nowhere on this path, so reaching the viewport bottom doesn't
     /// push any existing rows into scrollback.
-    fn differential_render_deletion_only(&mut self, lines: &[String]) {
+    ///
+    /// As with [`Self::full_render`] and [`Self::differential_render`],
+    /// this method appends to `buf` and updates internal state but does
+    /// not touch the terminal directly.
+    fn differential_render_deletion_only(&mut self, buf: &mut String, lines: &[String]) {
         let prev_len = self.previous_lines.len();
         let new_len = lines.len();
         debug_assert!(prev_len > new_len, "deletion-only path requires shrink");
@@ -2936,9 +2966,6 @@ impl Tui {
         let target_row = new_len.saturating_sub(1);
         let extra_lines = prev_len - new_len;
         let cursor_at = self.hardware_cursor_row;
-
-        let mut buf = String::new();
-        buf.push_str(SYNC_BEGIN);
 
         // Move the cursor onto `target_row` at column 0. Use CUD (not
         // `\r\n`) because we're deliberately avoiding any scroll on
@@ -2967,10 +2994,6 @@ impl Tui {
         // Return to end of new content.
         buf.push_str(&format!("\x1b[{}A", extra_lines));
 
-        buf.push_str(SYNC_END);
-        self.terminal.write(&buf);
-        self.terminal.flush();
-
         self.hardware_cursor_row = target_row;
         // `max_lines_rendered` stays put: we haven't cleared the
         // screen, so any previously-higher high-water mark is still a
@@ -2978,7 +3001,30 @@ impl Tui {
         // frames. Viewport top also stays put — we didn't scroll.
     }
 
-    fn position_hardware_cursor(&mut self, row: usize, col: usize, lines: &[String]) {
+    /// Append cursor positioning to `buf` and bring the hardware cursor
+    /// visibility in line with [`Self::hardware_cursor_enabled`].
+    ///
+    /// All output (cursor moves AND the `\x1b[?25h` / `\x1b[?25l`
+    /// visibility toggle) is appended to `buf` rather than written
+    /// directly to the terminal. Combined with the
+    /// [`SYNC_BEGIN`] / [`SYNC_END`] wrapping that [`Self::render`]
+    /// puts around the whole frame buffer, this is what makes the
+    /// cursor-move-and-show pair commit atomically with the paint on
+    /// terminals that honor DEC mode 2026 — no flash at the
+    /// pre-paint position, no flicker from the show/hide sequence.
+    ///
+    /// The visibility toggle is still guarded by
+    /// [`Self::hardware_cursor_currently_shown`]: if the state matches
+    /// the desired visibility, no toggle bytes are appended at all
+    /// (some terminals briefly repaint the cursor when `?25h`/`?25l`
+    /// arrives even when it's a no-op at the protocol level).
+    fn position_hardware_cursor(
+        &mut self,
+        buf: &mut String,
+        row: usize,
+        col: usize,
+        lines: &[String],
+    ) {
         // Defensive clamp on row. The caller (typically `render` after
         // `extract_cursor_position` returned a position) has already
         // walked `lines` to find the marker, so `row < lines.len()` is
@@ -2999,7 +3045,6 @@ impl Tui {
         };
 
         let current = self.hardware_cursor_row;
-        let mut buf = String::new();
 
         // See the matching comment in `differential_render`: `\x1b[nB`
         // clamps at the last visible row, so when a prior render has
@@ -3026,18 +3071,23 @@ impl Tui {
         // (some IMEs anchor their candidate window on the reported
         // cursor position even when the cursor is hidden), but emit
         // `\x1b[?25l` if we happen to currently be showing it.
+        //
+        // The toggle is appended *after* the cursor move so the order
+        // inside the sync envelope is: move-to-new-position, then
+        // show. Terminals that honor DEC mode 2026 never see the
+        // cursor at a stale row even briefly; terminals that don't
+        // honor it process the bytes in order and still hit the
+        // intended end state.
         if self.hardware_cursor_enabled {
             if !self.hardware_cursor_currently_shown {
-                self.terminal.show_cursor();
+                buf.push_str(CURSOR_SHOW);
                 self.hardware_cursor_currently_shown = true;
             }
         } else if self.hardware_cursor_currently_shown {
-            self.terminal.hide_cursor();
+            buf.push_str(CURSOR_HIDE);
             self.hardware_cursor_currently_shown = false;
         }
 
-        self.terminal.write(&buf);
-        self.terminal.flush();
         self.hardware_cursor_row = row;
     }
 
