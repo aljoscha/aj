@@ -2642,7 +2642,39 @@ impl Tui {
             // Nothing to validate against.
             return;
         }
+        // Skip re-validating rows that are byte-identical to the
+        // previous frame at the same layout width. `visible_width` is
+        // a pure function of `line`'s bytes, and the previous render
+        // could only have reached `previous_lines = lines` by passing
+        // this same check at `previous_width = width` — otherwise it
+        // would have panicked. Re-walking those rows every frame is
+        // pure waste: with a long conversation and a 12.5 fps spinner
+        // tick, this validator dominated render CPU because it scanned
+        // every byte of the entire frame on every tick. Restricting
+        // the walk to changed rows mirrors the diff engine downstream,
+        // which only repaints rows that differ.
+        //
+        // Safety conditions:
+        //
+        // - `previous_width as usize == width`: a width change means
+        //   lines that previously fit may no longer fit, so we have
+        //   to validate everything.
+        // - `i < previous_lines.len()`: rows beyond the previous
+        //   frame's length are brand new and must be checked.
+        // - `previous_lines[i] == *line`: any byte difference might
+        //   change the visible width (e.g. a CJK glyph swapped in
+        //   for an ASCII one, an ANSI sequence dropped so previously
+        //   zero-width bytes start counting).
+        //
+        // `force_full_render` clears `previous_lines` and resets
+        // `previous_width` to 0, which falls through to the full walk
+        // on the next render — exactly what callers asking for a
+        // forced repaint expect.
+        let skip_unchanged = usize::from(self.previous_width) == width;
         for (i, line) in lines.iter().enumerate() {
+            if skip_unchanged && self.previous_lines.get(i).is_some_and(|prev| prev == line) {
+                continue;
+            }
             let w = visible_width(line);
             if w > width {
                 let header = format!(
