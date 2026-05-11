@@ -20,10 +20,22 @@ use aj_tui::component::Component;
 use aj_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use aj_tui::keys::InputEvent;
 
-/// Per-message vertical padding shared with the user message
-/// component (one blank line above + below).
-const PADDING_Y: usize = 1;
-/// Per-message horizontal padding (one column on each side).
+/// Per-message vertical padding. Set to `0` so the component
+/// itself doesn't emit blank rows around its content; the
+/// surrounding chat container's auto-spacer (see
+/// [`crate::modes::interactive::event_pump::EventPump::push_chat_child`])
+/// drops a plain blank line between every two non-first chat
+/// children, which is the only vertical breathing room the
+/// assistant message needs. Bubble-style components (user
+/// messages, tool executions) keep their internal `padding_y = 1`
+/// so the bg paint extends to a one-row frame above and below
+/// their content — the assistant message has no bg, so there's
+/// nothing to paint and any extra blank rows would just double
+/// the gap.
+const PADDING_Y: usize = 0;
+/// Per-message horizontal padding. One column on each side so the
+/// rendered text aligns with the inset content inside bubble
+/// components.
 const PADDING_X: usize = 1;
 
 /// On-screen representation of an assistant chat entry.
@@ -179,12 +191,18 @@ impl Component for AssistantMessageComponent {
     fn render(&mut self, width: usize) -> Vec<String> {
         // Thinking renders first so the visible answer follows
         // it (matching the natural reading order: "let me think
-        // …" then the answer).
+        // …" then the answer). With `padding_y = 0` on both
+        // widgets the two would butt directly against each
+        // other; a single explicit blank row between them keeps
+        // the two channels visually distinct.
         let mut lines = Vec::new();
         if let Some(thinking) = self.thinking.as_mut() {
             lines.extend(thinking.render(width));
         }
         if let Some(text) = self.text.as_mut() {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
             lines.extend(text.render(width));
         }
         lines

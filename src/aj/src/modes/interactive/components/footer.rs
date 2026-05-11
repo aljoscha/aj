@@ -82,7 +82,10 @@ impl Component for Footer {
         if parts.is_empty() {
             return Vec::new();
         }
-        vec![style::dim(&parts.join("  ·  "))]
+        // One-column left indent matches the header and the chat
+        // scrollback's `padding_x = 1`, so the persistent status
+        // bars share a left edge with the messages between them.
+        vec![format!(" {}", style::dim(&parts.join("  ·  ")))]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {

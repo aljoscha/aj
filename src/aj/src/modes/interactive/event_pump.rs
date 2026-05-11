@@ -21,11 +21,12 @@ use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, 
 use aj_agent::types::TokenUsage;
 use aj_models::messages::ContentBlockParam;
 use aj_tui::components::editor::Editor;
-use aj_tui::components::markdown::MarkdownTheme;
+use aj_tui::components::spacer::Spacer;
 use aj_tui::components::text::Text;
 use aj_tui::container::Container;
 use aj_tui::tui::Tui;
 
+use crate::config::theme::ChatTheme;
 use crate::modes::interactive::components::assistant_message::AssistantMessageComponent;
 use crate::modes::interactive::components::loader_status::LoaderStatus;
 use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
@@ -41,7 +42,7 @@ use crate::modes::interactive::layout::SlotIndex;
 /// component (so `StreamChunk` updates land on the right widget)
 /// and the index map for tool-call ids → chat-container index.
 pub struct EventPump {
-    theme: MarkdownTheme,
+    theme: ChatTheme,
     /// Index, inside the chat container, of the current
     /// in-flight assistant message component. `None` between
     /// turns; set when the first assistant chunk arrives, cleared
@@ -55,10 +56,10 @@ pub struct EventPump {
 }
 
 impl EventPump {
-    /// Build a fresh pump bound to the supplied markdown theme
+    /// Build a fresh pump bound to the supplied [`ChatTheme`]
     /// (used when constructing assistant / user message
     /// components on the fly).
-    pub fn new(theme: MarkdownTheme) -> Self {
+    pub fn new(theme: ChatTheme) -> Self {
         Self {
             theme,
             current_assistant: None,
@@ -222,7 +223,7 @@ impl EventPump {
         if text.is_empty() {
             return;
         }
-        let component = UserMessageComponent::new(&text, self.theme.clone());
+        let component = UserMessageComponent::new(&text, &self.theme);
         self.push_chat_child(tui, Box::new(component));
     }
 
@@ -268,7 +269,7 @@ impl EventPump {
                 // snapshot; intermediate updates would just be partial
                 // copies of the same text.
                 if let StreamAction::Stop { snapshot } = action {
-                    let component = UserMessageComponent::new(snapshot, self.theme.clone());
+                    let component = UserMessageComponent::new(snapshot, &self.theme);
                     self.push_chat_child(tui, Box::new(component));
                 }
             }
@@ -283,7 +284,7 @@ impl EventPump {
         if let Some(idx) = self.current_assistant {
             return idx;
         }
-        let component = AssistantMessageComponent::new(self.theme.clone());
+        let component = AssistantMessageComponent::new(self.theme.markdown.clone());
         let idx = self.push_chat_child(tui, Box::new(component));
         self.current_assistant = Some(idx);
         idx
@@ -300,7 +301,7 @@ impl EventPump {
         tool: &str,
         args: &serde_json::Value,
     ) {
-        let component = ToolExecutionComponent::new(tool.to_string(), args);
+        let component = ToolExecutionComponent::new(tool.to_string(), args, &self.theme);
         let idx = self.push_chat_child(tui, Box::new(component));
         self.tool_index.insert(call_id.to_string(), idx);
         // A tool call that arrives mid-turn means the assistant
@@ -345,8 +346,11 @@ impl EventPump {
         let idx = match self.tool_index.get(call_id) {
             Some(idx) => *idx,
             None => {
-                let component =
-                    ToolExecutionComponent::new(tool.to_string(), &serde_json::json!({}));
+                let component = ToolExecutionComponent::new(
+                    tool.to_string(),
+                    &serde_json::json!({}),
+                    &self.theme,
+                );
                 let idx = self.push_chat_child(tui, Box::new(component));
                 self.tool_index.insert(call_id.to_string(), idx);
                 idx
@@ -361,14 +365,19 @@ impl EventPump {
         c.update_result(result, is_error);
     }
 
-    /// Append a plain dim-styled notice line.
+    /// Append a plain dim-styled notice line. The auto-spacer
+    /// inserted by [`Self::push_chat_child`] handles separation
+    /// from neighbouring chat elements, so the text component
+    /// itself uses `padding_y = 0` to keep the row compact.
     fn append_notice(&self, tui: &mut Tui, text: &str) {
         let styled = aj_tui::style::dim(text);
         self.push_chat_child(tui, Box::new(Text::new(&styled, 1, 0)));
     }
 
     /// Append a styled notice using the supplied colour function
-    /// (yellow for warnings, red for errors).
+    /// (yellow for warnings, red for errors). Mirrors
+    /// [`Self::append_notice`]'s zero internal padding; the
+    /// surrounding auto-spacer provides the visible gap.
     fn append_styled_notice(&self, tui: &mut Tui, text: &str, style: fn(&str) -> String) {
         let styled = style(text);
         self.push_chat_child(tui, Box::new(Text::new(&styled, 1, 0)));
@@ -391,6 +400,20 @@ impl EventPump {
     /// Append `child` to the chat container slot and return its
     /// index. Centralises the slot lookup so callers don't have to
     /// know about [`SlotIndex::Chat`].
+    ///
+    /// When the chat container already has at least one child this
+    /// helper inserts a [`Spacer`] of one blank row immediately
+    /// before `child`. Each chat-scrollback component (user
+    /// messages, assistant messages, tool executions, notices)
+    /// can therefore stay focused on its own internal layout — the
+    /// vertical breathing room between siblings is owned by the
+    /// container side.
+    ///
+    /// The returned index is the *child's* slot in the container,
+    /// not the spacer's. Callers that key follow-up lookups by
+    /// this index ([`Self::ensure_assistant_message`],
+    /// [`Self::append_tool_execution`]) continue to find the right
+    /// component after the spacer is inserted.
     fn push_chat_child(
         &self,
         tui: &mut Tui,
@@ -402,6 +425,9 @@ impl EventPump {
             // nothing useful to do but drop the child.
             return 0;
         };
+        if !chat.is_empty() {
+            chat.add_child(Box::new(Spacer::new(1)));
+        }
         let idx = chat.len();
         chat.add_child(child);
         idx
@@ -461,10 +487,9 @@ mod tests {
     use super::*;
 
     use aj_tui::component::Component;
-    use aj_tui::components::markdown::MarkdownTheme;
     use aj_tui::terminal::ProcessTerminal;
 
-    use crate::config::theme::{ThemeHandle, markdown_theme};
+    use crate::config::theme::{ChatTheme, ThemeHandle, chat_theme};
     use crate::modes::interactive::layout::build_layout;
 
     /// Build a TokenUsage with the supplied turn deltas and the
@@ -527,13 +552,13 @@ mod tests {
     /// Returns the populated `Tui` and a paired `EventPump` so the
     /// caller can dispatch events and inspect the chat container's
     /// contents afterwards.
-    fn fresh_tui_with_layout() -> (aj_tui::tui::Tui, EventPump, MarkdownTheme) {
+    fn fresh_tui_with_layout() -> (aj_tui::tui::Tui, EventPump, ChatTheme) {
         let mut tui = aj_tui::tui::Tui::new(Box::new(ProcessTerminal::new()));
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
         build_layout(&mut tui, &theme);
-        let md = markdown_theme(&theme);
-        let pump = EventPump::new(md.clone());
-        (tui, pump, md)
+        let chat = chat_theme(&theme);
+        let pump = EventPump::new(chat.clone());
+        (tui, pump, chat)
     }
 
     #[test]
@@ -542,7 +567,7 @@ mod tests {
         // new child landed in the chat container with the
         // formatted line inside it (the dim escape wraps the
         // visible body verbatim, so `.contains` is enough).
-        let (mut tui, mut pump, _md) = fresh_tui_with_layout();
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         let chat_len_before = {
             let chat = tui
                 .get_mut_as::<aj_tui::container::Container>(SlotIndex::Chat.idx())

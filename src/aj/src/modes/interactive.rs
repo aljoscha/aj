@@ -52,7 +52,7 @@ use crate::config::slash_commands::{
     thinking_level_name,
 };
 use crate::config::theme::{
-    Theme, ThemeHandle, editor_border_color_for_thinking, markdown_theme, select_list_theme,
+    Theme, ThemeHandle, chat_theme, editor_border_color_for_thinking, select_list_theme,
     watch_user_theme,
 };
 use crate::modes::interactive::components::footer::Footer;
@@ -315,7 +315,7 @@ impl InteractiveMode {
         // Drive replay events through the pump (post-layout so the
         // chat container has a slot to receive them). Replay never
         // hits the bus, so persistence isn't double-written.
-        let mut pump = EventPump::new(markdown_theme(&theme));
+        let mut pump = EventPump::new(chat_theme(&theme));
         for event in replay(&log) {
             pump.handle(&mut tui, &event);
         }
@@ -1224,7 +1224,7 @@ async fn perform_thread_swap(
     if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
         chat.clear();
     }
-    *pump = EventPump::new(markdown_theme(theme));
+    *pump = EventPump::new(chat_theme(theme));
     {
         let l = log.lock().await;
         for event in replay(&l) {

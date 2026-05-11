@@ -75,7 +75,18 @@ impl Component for Header {
         if parts.is_empty() {
             return Vec::new();
         }
-        vec![style::dim(&parts.join("  ·  "))]
+        // One-column left indent matches the chat scrollback's
+        // `padding_x = 1` so the header text aligns with the
+        // notices, user messages, and tool outputs below it. The
+        // trailing blank row separates the persistent header from
+        // the first chat child — the chat container's auto-spacer
+        // only fires *between* children, not before the first one,
+        // so without this blank the `Context:` notice would butt
+        // directly against the banner.
+        vec![
+            format!(" {}", style::dim(&parts.join("  ·  "))),
+            String::new(),
+        ]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {
@@ -100,12 +111,17 @@ mod tests {
     }
 
     #[test]
-    fn populated_header_renders_one_line_with_separator() {
+    fn populated_header_renders_banner_row_with_separator_and_a_trailing_blank() {
         let mut h = Header::new();
         h.set_thread_id(Some("abc-123".into()));
         h.set_notice(Some("Resuming conversation".into()));
         let lines = h.render(80);
-        assert_eq!(lines.len(), 1);
+        // Banner row + trailing blank separator before the chat.
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[1].is_empty(),
+            "second row should be a blank: {lines:?}"
+        );
         // Strip ANSI for the assertion — the `dim` wrapper adds
         // SGR codes around the visible text.
         let visible = lines[0].replace("\x1b[2m", "").replace("\x1b[22m", "");

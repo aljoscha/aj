@@ -1135,6 +1135,61 @@ pub fn editor_theme(theme: &ThemeHandle) -> EditorTheme {
     }
 }
 
+/// Bundle of styling primitives shared by every chat-scrollback
+/// component (user messages, assistant messages, tool executions,
+/// notices, …). Carries the [`MarkdownTheme`] used for rich-text
+/// rendering plus the precomputed background-paint closures that
+/// individual components need to tint their bubbles.
+///
+/// Built once per session via [`chat_theme`] and threaded through
+/// the [`crate::modes::interactive::event_pump::EventPump`]. Cheap
+/// to [`Clone`] — every field is either a [`Clone`] struct of
+/// `Arc<dyn Fn>` closures or an `Arc` itself.
+#[derive(Clone)]
+pub struct ChatTheme {
+    /// Foreground / styling theme passed to every [`aj_tui::components::markdown::Markdown`]
+    /// widget the chat renders.
+    pub markdown: MarkdownTheme,
+    /// Background-paint closure for the user-message bubble. Wraps
+    /// each rendered row through [`Theme::bg`] with the
+    /// [`ThemeBg::UserMessageBg`] palette token so the bubble's
+    /// inset rectangle reads as a single tinted block.
+    pub user_message_bg: Arc<dyn Fn(&str) -> String>,
+    /// Tool-execution bubble tint while the call is in-flight.
+    /// Drives the rectangle the [`super::super::modes::interactive::components::tool_execution::ToolExecutionComponent`]
+    /// paints between the `ToolExecutionStart` and `ToolExecutionEnd`
+    /// events. Picks up the neutral [`ThemeBg::ToolPendingBg`]
+    /// palette token.
+    pub tool_pending_bg: Arc<dyn Fn(&str) -> String>,
+    /// Tool-execution bubble tint applied once the call finishes
+    /// without flagging an error (`ToolExecutionEnd { is_error: false }`).
+    /// Picks up the success-leaning [`ThemeBg::ToolSuccessBg`]
+    /// token (a faintly green-tinted background in the bundled
+    /// themes).
+    pub tool_success_bg: Arc<dyn Fn(&str) -> String>,
+    /// Tool-execution bubble tint applied once the call finishes
+    /// with `is_error: true`. Picks up the
+    /// [`ThemeBg::ToolErrorBg`] token (a faintly red-tinted
+    /// background in the bundled themes) so the eye finds failed
+    /// calls without having to read the per-row colouring.
+    pub tool_error_bg: Arc<dyn Fn(&str) -> String>,
+}
+
+/// Build the [`ChatTheme`] bundle the chat-scrollback components
+/// share. New per-bubble background tokens land here so the
+/// downstream wiring (event pump → component constructor) only
+/// needs to consume `ChatTheme` rather than collecting individual
+/// closures.
+pub fn chat_theme(theme: &ThemeHandle) -> ChatTheme {
+    ChatTheme {
+        markdown: markdown_theme(theme),
+        user_message_bg: theme.bg_closure(ThemeBg::UserMessageBg),
+        tool_pending_bg: theme.bg_closure(ThemeBg::ToolPendingBg),
+        tool_success_bg: theme.bg_closure(ThemeBg::ToolSuccessBg),
+        tool_error_bg: theme.bg_closure(ThemeBg::ToolErrorBg),
+    }
+}
+
 /// Build the [`MarkdownTheme`] used by the assistant-message and
 /// user-message renderers. Code-block bodies stay identity because
 /// the bundled syntect highlighter colors per token inside the

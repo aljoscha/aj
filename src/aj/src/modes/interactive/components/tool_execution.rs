@@ -9,44 +9,99 @@
 //! `Bash` and `Diff` live in [`super::bash_execution`] and
 //! [`super::diff`] respectively.
 //!
+//! Visually the component renders as a bubble: a coloured
+//! rectangle painted with one of three background tints depending
+//! on the current [`Status`] (pending → neutral, succeeded →
+//! greenish, failed → reddish). The header and body lines sit
+//! inside the bubble at `padding_x = 1`, framed by one bg-painted
+//! blank row above and below (`padding_y = 1`). Separation from
+//! the surrounding chat elements comes from the auto-spacer the
+//! [`crate::modes::interactive::event_pump::EventPump`] inserts
+//! between sibling chat-container children.
+//!
+//! ## Render-cost shape
+//!
+//! The bubble's frame, padding and background paint live in an
+//! owned [`aj_tui::components::text_box::TextBox`]; the header and
+//! body each live in their own [`aj_tui::components::text::Text`]
+//! child inside that box. Both kinds of widget cache their
+//! rendered output keyed on inputs that change rarely
+//! (`(text, width)` for `Text`; `(width, child-lines, bg-sample)`
+//! for `TextBox`), so a finalised tool with kilobytes of body
+//! costs one wrap pass at construction and then string-equality
+//! checks on every subsequent frame. The hot render path in a
+//! long chat with many finished tools is dominated by clones of
+//! the cached `Vec<String>`, not by re-wrapping.
+//!
+//! Mutating callers (`update_partial`, `update_result`) tear the
+//! `Text` children down and rebuild them so the next render
+//! repopulates the caches with the new content. State that
+//! doesn't affect visible output (status flip to `Succeeded` /
+//! `Failed`) still rebuilds because the header glyph changes; the
+//! body is dropped and re-installed in that path too, which is
+//! fine because state changes are rare compared to renders.
+//!
 //! See `docs/aj-next-plan.md` §1.2 (`ToolDetails`) and §4
 //! (`components/tool_execution.rs`).
 
 use std::any::Any;
+use std::sync::Arc;
 
 use aj_agent::tool::ToolDetails;
 use aj_tui::ansi::wrap_text_with_ansi;
 use aj_tui::component::Component;
+use aj_tui::components::text::Text;
+use aj_tui::components::text_box::TextBox;
 use aj_tui::keys::InputEvent;
 use aj_tui::style;
 use serde_json::Value;
 
+use crate::config::theme::ChatTheme;
 use crate::modes::interactive::components::bash_execution::render_bash_body;
 use crate::modes::interactive::components::diff::render_unified_diff;
 
+/// Horizontal padding inside the bubble (one column on each side
+/// so the tinted rectangle reads as an inset block rather than
+/// edge-to-edge text).
+const PADDING_X: usize = 1;
+/// Vertical padding inside the bubble. One bg-painted blank row
+/// above and below the content matches the user-message bubble's
+/// rhythm so the two kinds of bubbles compose cleanly when the
+/// auto-spacer drops a plain blank line between them.
+const PADDING_Y: usize = 1;
+
+/// Minimum total render width at which the bubble framing kicks
+/// in. Below this we fall back to a plain header+body listing so
+/// the bg-padding pipeline (which assumes at least two cells of
+/// horizontal padding plus one cell of content) doesn't try to
+/// paint a degenerate row. The threshold also covers the headless
+/// `width = 0` case used by some tests.
+const MIN_BUBBLE_WIDTH: usize = 3;
+
 /// Lifecycle states a tool execution moves through. Drives the
-/// rendered status indicator in the header line so users can
-/// distinguish a not-yet-started call from a finished one at a
-/// glance.
+/// rendered status indicator in the header line and the bubble's
+/// background tint so users can distinguish a not-yet-started call
+/// from a finished one at a glance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
     /// Tool args have been received but the tool body hasn't run
     /// yet (we observed `ToolExecutionStart`). Header shows a
-    /// dim spinner glyph.
+    /// dim spinner glyph; the bubble paints with the neutral
+    /// pending tint.
     Started,
     /// The tool finished without flagging an error (we observed
     /// `ToolExecutionEnd { is_error: false }`). Header shows a
-    /// green check.
+    /// green check; the bubble paints with the success tint.
     Succeeded,
     /// The tool finished with `is_error: true`. Header shows a red
-    /// cross and the body renders with red emphasis.
+    /// cross and the bubble paints with the error tint.
     Failed,
 }
 
 /// On-screen representation of a single tool call.
 ///
 /// One component per `tool_use_id`. The event pump keys these by
-/// id in a `HashMap<String, *mut ToolExecutionComponent>` so each
+/// id in a `HashMap<String, usize>` so each
 /// `ToolExecutionStart` / `ToolExecutionUpdate` / `ToolExecutionEnd`
 /// event reaches the right component. The component is a `Box<dyn
 /// Component>` from the chat container's perspective; the event
@@ -57,26 +112,59 @@ pub struct ToolExecutionComponent {
     /// JSON-encoded arguments, rendered inside the parens after
     /// the name. Stored as a string so we can re-render cheaply.
     args_pretty: String,
-    /// Current execution status. Drives the header glyph.
+    /// Current execution status. Drives the header glyph and the
+    /// bubble background tint.
     status: Status,
     /// Body lines rendered under the header. Populated from the
     /// `ToolDetails` variant on every `ToolExecutionUpdate` and
     /// finalized on `ToolExecutionEnd`.
     body: Vec<String>,
+    /// Bg-paint closure for the in-flight state. Stored once at
+    /// construction so the render path never has to rebuild the
+    /// closure.
+    bg_pending: Arc<dyn Fn(&str) -> String>,
+    /// Bg-paint closure for the `Succeeded` state.
+    bg_success: Arc<dyn Fn(&str) -> String>,
+    /// Bg-paint closure for the `Failed` state.
+    bg_error: Arc<dyn Fn(&str) -> String>,
+    /// Cached child tree.
+    ///
+    /// The bubble owns a `TextBox` whose padding becomes the
+    /// bubble's frame (1 cell horizontally, 1 row vertically) and
+    /// whose `bg_fn` reflects the current [`Status`]. Inside it
+    /// sit two zero-padding `Text` children: a header text and an
+    /// optional body text. Both `Text` and `TextBox` carry their
+    /// own caches, so steady-state renders return cached vectors
+    /// without re-running the wrap pass.
+    ///
+    /// `rebuild_children` is the single mutating path: it tears
+    /// down the existing children and reinstalls fresh ones, so
+    /// `Text`'s `(text, width)` cache and `TextBox`'s
+    /// `(child-lines, width, bg-sample)` cache both re-populate on
+    /// the next render.
+    bubble: TextBox,
 }
 
 impl ToolExecutionComponent {
     /// Build a new component for a tool call with the given name
-    /// and arguments. The component starts in [`Status::Started`];
-    /// the header alone renders until [`Self::update_partial`] or
-    /// [`Self::update_result`] is called.
-    pub fn new(tool_name: String, args: &Value) -> Self {
-        Self {
+    /// and arguments. The component starts in [`Status::Started`]
+    /// and paints with the `tool_pending_bg` tint until the agent
+    /// emits a result; [`Self::update_partial`] / [`Self::update_result`]
+    /// flip the status and the matching bg.
+    pub fn new(tool_name: String, args: &Value, theme: &ChatTheme) -> Self {
+        let mut me = Self {
             tool_name,
             args_pretty: format_args(args),
             status: Status::Started,
             body: Vec::new(),
-        }
+            bg_pending: Arc::clone(&theme.tool_pending_bg),
+            bg_success: Arc::clone(&theme.tool_success_bg),
+            bg_error: Arc::clone(&theme.tool_error_bg),
+            bubble: TextBox::new(PADDING_X, PADDING_Y),
+        };
+        me.bubble.set_bg_fn(me.make_bg_box());
+        me.rebuild_children();
+        me
     }
 
     /// Replace the rendered body with the partial snapshot in
@@ -85,6 +173,7 @@ impl ToolExecutionComponent {
     /// only `bash` emits these).
     pub fn update_partial(&mut self, details: &ToolDetails) {
         self.body = render_details_body(details);
+        self.rebuild_children();
     }
 
     /// Finalize the component with the tool's result. Called from
@@ -96,6 +185,14 @@ impl ToolExecutionComponent {
         } else {
             Status::Succeeded
         };
+        // The status flip pulls a different bg closure into the
+        // box. `set_bg_fn` doesn't invalidate the cache itself;
+        // `TextBox::render` compares a sampled application of the
+        // new closure against the cached sample, so a real bg
+        // change reaches the screen on the next render even though
+        // the children are unchanged.
+        self.bubble.set_bg_fn(self.make_bg_box());
+        self.rebuild_children();
     }
 
     /// Render the header line (`status tool(args)`). Kept private
@@ -109,62 +206,94 @@ impl ToolExecutionComponent {
         let name = style::bold(&self.tool_name);
         format!("{glyph} {name}({})", style::dim(&self.args_pretty))
     }
+
+    /// Build the boxed bg closure that matches the current status.
+    ///
+    /// The returned `Box<dyn Fn>` clones an [`Arc`] off the stored
+    /// status closures and dispatches through it. Cloning the Arc
+    /// keeps the bubble's closure pointing at the same underlying
+    /// function as the rest of the chat theme, so calling sites
+    /// that share a theme also share their bg paint cache lines.
+    fn make_bg_box(&self) -> Box<dyn Fn(&str) -> String> {
+        let arc = match self.status {
+            Status::Started => Arc::clone(&self.bg_pending),
+            Status::Succeeded => Arc::clone(&self.bg_success),
+            Status::Failed => Arc::clone(&self.bg_error),
+        };
+        Box::new(move |s: &str| arc(s))
+    }
+
+    /// Tear down the bubble's children and rebuild them from the
+    /// current header / body state.
+    ///
+    /// Called from every state-changing path (`new`,
+    /// `update_partial`, `update_result`). `TextBox::clear`
+    /// invalidates the bubble's frame cache, and each freshly
+    /// constructed `Text` starts with an empty wrap cache, so the
+    /// next render does the wrap pass once and caches it. Renders
+    /// in between state changes return the cached output.
+    fn rebuild_children(&mut self) {
+        self.bubble.clear();
+
+        // Header. Zero internal padding so the `TextBox`'s
+        // 1-column inset is the only horizontal margin around it;
+        // double-padding would push the header off the visual
+        // grid the rest of the chat scrollback shares.
+        let header_text = Text::new(&self.header_line(), 0, 0);
+        self.bubble.add_child(Box::new(header_text));
+
+        // Body. Joining with `\n` lets `wrap_text_with_ansi`
+        // (called inside `Text::render`) see the body as one
+        // multi-line input and track its ANSI state across the
+        // implicit line breaks. The body helpers in this module
+        // each emit fully self-terminated styled rows, so the
+        // joined-vs-per-line wrap behaviour is identical for
+        // today's inputs; the join is the simpler shape and
+        // matches how `Text` already wraps the rest of the chat.
+        if !self.body.is_empty() {
+            let body_joined = self.body.join("\n");
+            let body_text = Text::new(&body_joined, 0, 0);
+            self.bubble.add_child(Box::new(body_text));
+        }
+    }
 }
 
 impl Component for ToolExecutionComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.body.len() + 2);
-        // Empty leading line so each tool call has visual breathing
-        // room from the previous chat entry; matches the
-        // user/assistant message padding rhythm.
-        out.push(String::new());
-
-        let header = self.header_line();
-        if width == 0 {
-            // Headless or zero-width edge case (the frame validator
-            // skips this terminal too). Emit lines verbatim and let
-            // the caller deal with downstream sizing.
-            out.push(header);
+        // Tiny widths drop into a degraded "render plain" path so
+        // the strict line-width check in `Tui::render` doesn't
+        // trip on the bg-padding pipeline. Headless and zero-width
+        // edge cases land here too. The bubble framing needs at
+        // least one column on each side plus one column of content,
+        // so anything below [`MIN_BUBBLE_WIDTH`] skips the box and
+        // falls back to the original wrap-per-line path.
+        if width < MIN_BUBBLE_WIDTH {
+            let mut out = Vec::with_capacity(self.body.len() + 1);
+            out.push(self.header_line());
             for line in &self.body {
-                out.push(format!("  {line}"));
+                out.extend(wrap_text_with_ansi(line, width.max(1)));
             }
             return out;
         }
 
-        // Wrap the header so a verbose argument summary (long
-        // `command="…"`, multi-field calls) doesn't overflow the
-        // terminal edge. Continuation lines fall back to column 0;
-        // that's fine since args are already truncated per-field
-        // and overflow stays the rare case.
-        out.extend(wrap_text_with_ansi(&header, width));
-
-        if width <= 2 {
-            // Too narrow to spare two columns for the body indent.
-            // Drop the indent rather than overflow the strict
-            // line-width check.
-            for line in &self.body {
-                out.extend(wrap_text_with_ansi(line, width));
-            }
-            return out;
-        }
-
-        // Wrap each body line to the indent-aware width so long
-        // tool output (e.g. clippy's `help: try: …` suggestions,
-        // wide file lines) doesn't blow past the terminal edge
-        // and trip the strict line-width check in `Tui::render`.
-        let body_width = width - 2;
-        for line in &self.body {
-            for wrapped in wrap_text_with_ansi(line, body_width) {
-                out.push(format!("  {wrapped}"));
-            }
-        }
-        out
+        // Steady-state hot path: delegates to the cached bubble.
+        // First render after a state change rebuilds the caches;
+        // every render in between is a `Vec<String>` clone out of
+        // the box's cache.
+        self.bubble.render(width)
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {
         false
+    }
+
+    fn invalidate(&mut self) {
+        // Propagate down. `TextBox::invalidate` drops its own
+        // cache and calls `invalidate` on each child `Text`, so
+        // the next render rebuilds from scratch.
+        self.bubble.invalidate();
     }
 }
 
@@ -232,8 +361,8 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
                 lines.push(line.to_string());
             }
             // Trim a trailing empty line introduced by a body that
-            // ended in `\n`; our caller already adds vertical
-            // padding through the chat container's spacing.
+            // ended in `\n`; the surrounding bubble's bottom pad
+            // already handles the vertical separation.
             if lines.last().is_some_and(|l| l.is_empty()) {
                 lines.pop();
             }
@@ -292,6 +421,13 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
 mod tests {
     use super::*;
     use aj_agent::tool::ToolDetails;
+    use aj_tui::ansi::visible_width;
+
+    use crate::config::theme::{Theme, ThemeHandle, chat_theme};
+
+    fn theme() -> ChatTheme {
+        chat_theme(&ThemeHandle::new(Theme::bundled_dark()))
+    }
 
     fn strip_ansi(s: &str) -> String {
         let mut out: Vec<u8> = Vec::with_capacity(s.len());
@@ -314,21 +450,35 @@ mod tests {
         String::from_utf8(out).expect("strip_ansi: surviving bytes remain valid UTF-8")
     }
 
-    #[test]
-    fn header_includes_tool_name_and_args_summary() {
-        let args = serde_json::json!({"path": "/tmp/foo.txt"});
-        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args);
-        // No update yet → `Started` glyph in header.
-        let lines: Vec<_> = c.render(80).into_iter().map(|l| strip_ansi(&l)).collect();
-        assert_eq!(lines[0], "");
-        assert!(lines[1].contains("read_file"));
-        assert!(lines[1].contains("path=\"/tmp/foo.txt\""));
-        assert!(lines[1].starts_with("…"));
+    /// True when the visible content of `line` (after stripping
+    /// ANSI escapes) is empty or all-whitespace — i.e. the row is
+    /// a bg-painted padding row.
+    fn is_blank_row(line: &str) -> bool {
+        strip_ansi(line).trim().is_empty()
     }
 
     #[test]
-    fn finalizing_with_text_body_renders_summary_and_body() {
-        let mut c = ToolExecutionComponent::new("read_file".to_string(), &serde_json::json!({}));
+    fn header_includes_tool_name_and_args_summary() {
+        let args = serde_json::json!({"path": "/tmp/foo.txt"});
+        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme());
+        let lines = c.render(80);
+        // First and last rows are bg-painted blank padding.
+        assert!(is_blank_row(&lines[0]));
+        assert!(is_blank_row(lines.last().expect("non-empty render")));
+        // Header lands inside the bubble. After stripping ANSI and
+        // trim, it starts with the spinner glyph and includes the
+        // tool name plus the args summary.
+        let header_plain = strip_ansi(&lines[1]);
+        let header_trimmed = header_plain.trim_start();
+        assert!(header_trimmed.starts_with("…"), "{header_trimmed:?}");
+        assert!(header_trimmed.contains("read_file"));
+        assert!(header_trimmed.contains("path=\"/tmp/foo.txt\""));
+    }
+
+    #[test]
+    fn finalizing_with_text_body_renders_summary_and_body_inside_the_bubble() {
+        let mut c =
+            ToolExecutionComponent::new("read_file".to_string(), &serde_json::json!({}), &theme());
         c.update_result(
             &ToolDetails::Text {
                 summary: "/tmp/foo.txt".into(),
@@ -336,19 +486,29 @@ mod tests {
             },
             false,
         );
-        let lines: Vec<_> = c.render(80).into_iter().map(|l| strip_ansi(&l)).collect();
-        // Header transitions to ✓ on success.
-        assert!(lines[1].starts_with("✓"));
-        // Summary plus body lines, both indented by the
-        // component's two-column body indent.
-        assert!(lines.iter().any(|l| l == "  /tmp/foo.txt"));
-        assert!(lines.iter().any(|l| l == "  line one"));
-        assert!(lines.iter().any(|l| l == "  line two"));
+        let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
+        // Success → ✓ glyph in the header row.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim_start().starts_with("✓") && l.contains("read_file")),
+        );
+        // Summary and body lines land somewhere inside the bubble.
+        // Stripping ANSI leaves trailing spaces (the bg fills the
+        // row to the full terminal width), so a `contains` check
+        // against `trim` is the robust shape.
+        assert!(
+            lines.iter().any(|l| l.trim().contains("/tmp/foo.txt")),
+            "{lines:#?}",
+        );
+        assert!(lines.iter().any(|l| l.trim().contains("line one")));
+        assert!(lines.iter().any(|l| l.trim().contains("line two")));
     }
 
     #[test]
     fn error_status_renders_a_red_cross_in_the_header() {
-        let mut c = ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}));
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
         c.update_result(
             &ToolDetails::Text {
                 summary: "boom".into(),
@@ -356,8 +516,8 @@ mod tests {
             },
             true,
         );
-        let lines: Vec<_> = c.render(80).into_iter().map(|l| strip_ansi(&l)).collect();
-        assert!(lines[1].starts_with("✗"));
+        let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
+        assert!(lines.iter().any(|l| l.trim_start().starts_with("✗")));
     }
 
     #[test]
@@ -378,7 +538,8 @@ mod tests {
         // ...` suggestions naming a fully-qualified type). The
         // component must wrap them so the strict line-width check
         // in `Tui::render` doesn't panic on the next frame.
-        let mut c = ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}));
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
         let long_line = "x".repeat(300);
         c.update_result(
             &ToolDetails::Text {
@@ -390,22 +551,12 @@ mod tests {
         let width = 80;
         let lines = c.render(width);
         for (i, line) in lines.iter().enumerate() {
-            let w = aj_tui::ansi::visible_width(line);
+            let w = visible_width(line);
             assert!(
                 w <= width,
                 "line {i} exceeds width: {w} > {width}: {line:?}",
             );
         }
-        // Wrapped body lines stay indented by the component's
-        // two-column body indent so they still read as attached
-        // to the header.
-        assert!(
-            lines
-                .iter()
-                .map(|l| strip_ansi(l))
-                .filter(|l| l.contains('x'))
-                .all(|l| l.starts_with("  ")),
-        );
     }
 
     #[test]
@@ -417,15 +568,91 @@ mod tests {
             "command": "echo hi",
             "description": "x".repeat(200),
         });
-        let mut c = ToolExecutionComponent::new("bash".to_string(), &args);
+        let mut c = ToolExecutionComponent::new("bash".to_string(), &args, &theme());
         let width = 60;
         let lines = c.render(width);
         for (i, line) in lines.iter().enumerate() {
-            let w = aj_tui::ansi::visible_width(line);
+            let w = visible_width(line);
             assert!(
                 w <= width,
                 "line {i} exceeds width: {w} > {width}: {line:?}",
             );
         }
+    }
+
+    #[test]
+    fn pending_running_succeeded_paint_with_distinct_backgrounds() {
+        // Three renders, three SGR background sequences. The
+        // bundled dark theme picks different RGB / 256-color
+        // values for each of `toolPendingBg` / `toolSuccessBg` /
+        // `toolErrorBg`, so the rendered rows must carry different
+        // escape sequences. We grab the bg-paint prefix off the
+        // first row of each render and compare them.
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+
+        let bg_sample = |c: &mut ToolExecutionComponent| -> String {
+            let lines = c.render(40);
+            // The first row is the top bg-pad — entirely a bg
+            // escape + spaces + bg-close. Take everything up to
+            // the first space; that's our prefix.
+            let first = &lines[0];
+            let cut = first.find(' ').unwrap_or(first.len());
+            first[..cut].to_string()
+        };
+
+        let pending = bg_sample(&mut c);
+        c.update_result(
+            &ToolDetails::Text {
+                summary: String::new(),
+                body: "ok".into(),
+            },
+            false,
+        );
+        let succeeded = bg_sample(&mut c);
+        c.update_result(
+            &ToolDetails::Text {
+                summary: String::new(),
+                body: "boom".into(),
+            },
+            true,
+        );
+        let failed = bg_sample(&mut c);
+
+        assert_ne!(pending, succeeded, "pending and succeeded share an escape");
+        assert_ne!(pending, failed, "pending and failed share an escape");
+        assert_ne!(succeeded, failed, "succeeded and failed share an escape");
+    }
+
+    #[test]
+    fn repeated_renders_return_byte_identical_output() {
+        // The whole point of the refactor: a finalised tool with a
+        // multi-line body should render the same bytes on every
+        // subsequent frame, *and* the second frame must not have
+        // to re-do the wrap pass. We can't directly observe cache
+        // hits from outside, but byte-equality on the rendered
+        // output is the user-visible contract and is what the
+        // diff-aware terminal write depends on. A regression that
+        // produced subtly different ANSI on cache hit (e.g. a
+        // closure that captured stateful counters) would surface
+        // here.
+        let body = (0..50)
+            .map(|i| format!("line {i:02}: lorem ipsum dolor sit amet"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut c =
+            ToolExecutionComponent::new("read_file".to_string(), &serde_json::json!({}), &theme());
+        c.update_result(
+            &ToolDetails::Text {
+                summary: "/tmp/big.txt".into(),
+                body,
+            },
+            false,
+        );
+        let first = c.render(80);
+        let second = c.render(80);
+        let third = c.render(80);
+        assert_eq!(first, second);
+        assert_eq!(second, third);
     }
 }

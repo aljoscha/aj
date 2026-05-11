@@ -3,26 +3,33 @@
 //! Renders a single user-role chat entry — the typed prompt that
 //! triggered the current turn or a replayed user-thread message.
 //!
-//! Wraps an [`aj_tui::components::markdown::Markdown`] with a
-//! `> ` prefix prepended to every paragraph so user messages are
-//! visually distinguishable from assistant output. The Markdown
-//! widget handles wrapping, code-block highlighting, and the
-//! padding rhythm shared with the assistant message component.
+//! The component wraps an [`aj_tui::components::markdown::Markdown`]
+//! widget and tints every row through the shared
+//! [`ChatTheme::user_message_bg`] closure so the bubble reads as a
+//! single coloured rectangle inset by one column on each side. No
+//! quote marker (`> ` / `│ `) is prepended: the background tint is
+//! the entire visual cue, which also keeps the rendered text
+//! cleanly copy-pasteable.
 //!
 //! See `docs/aj-next-plan.md` §4 — `components/user_message.rs`.
 
 use std::any::Any;
+use std::sync::Arc;
 
 use aj_tui::component::Component;
-use aj_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
+use aj_tui::components::markdown::{DefaultTextStyle, Markdown};
 use aj_tui::keys::InputEvent;
+
+use crate::config::theme::ChatTheme;
 
 /// Per-message vertical padding shared with the assistant message
 /// component. One blank line above and below each message gives
-/// the user a clean visual break between turns.
+/// the user a clean visual break between turns; both rows are
+/// background-painted by the markdown widget's row-emission stage
+/// so the bubble extends through them.
 const PADDING_Y: usize = 1;
 /// Per-message horizontal padding. One column on each side so the
-/// rendered text has a small inset from the terminal edges.
+/// tinted rectangle has a small inset from the terminal edges.
 const PADDING_X: usize = 1;
 
 /// On-screen representation of a user-role chat entry.
@@ -36,24 +43,19 @@ pub struct UserMessageComponent {
 
 impl UserMessageComponent {
     /// Build a user-message component rendering `text` through the
-    /// shared markdown theme.
-    pub fn new(text: &str, theme: MarkdownTheme) -> Self {
-        // Prefix every line with `> ` so the message stands out
-        // without needing a dedicated colour or border. The
-        // Markdown widget wraps each paragraph and re-applies the
-        // prefix on every wrapped line, so multi-line user input
-        // stays visually grouped.
-        let quoted = prefix_user_lines(text);
+    /// shared chat theme. The `bg_color` in [`DefaultTextStyle`]
+    /// hands the markdown widget the closure it routes every
+    /// rendered row (including the top and bottom padding rows)
+    /// through, so the entire bubble rectangle picks up the user
+    /// message background tint.
+    pub fn new(text: &str, theme: &ChatTheme) -> Self {
         let markdown = Markdown::new(
-            &quoted,
+            text,
             PADDING_X,
             PADDING_Y,
-            theme,
-            // Italicise the entire message so the prefixed `>` plus
-            // the slanted body reads unmistakably as user input —
-            // the assistant message component leaves text upright.
+            theme.markdown.clone(),
             Some(DefaultTextStyle {
-                italic: true,
+                bg_color: Some(Arc::clone(&theme.user_message_bg)),
                 ..DefaultTextStyle::default()
             }),
         );
@@ -83,46 +85,46 @@ impl AsRef<dyn Any> for UserMessageComponent {
     }
 }
 
-/// Prepend `> ` to every line of `text` so the markdown renderer
-/// styles the message as a quoted block. Empty lines stay empty so
-/// paragraph breaks survive the transformation.
-fn prefix_user_lines(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.lines().count() * 2);
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        if line.is_empty() {
-            continue;
-        }
-        out.push_str("> ");
-        out.push_str(line);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::theme::{Theme, ThemeHandle, chat_theme};
 
-    #[test]
-    fn prefixes_each_non_empty_line_with_a_quote_marker() {
-        let out = prefix_user_lines("hello\nworld");
-        assert_eq!(out, "> hello\n> world");
+    fn theme() -> ChatTheme {
+        chat_theme(&ThemeHandle::new(Theme::bundled_dark()))
     }
 
     #[test]
-    fn preserves_blank_lines_as_paragraph_breaks() {
-        let out = prefix_user_lines("a\n\nb");
-        assert_eq!(out, "> a\n\n> b");
+    fn renders_text_without_a_quote_prefix() {
+        // Regression: we used to prepend `> ` to every line so the
+        // markdown renderer styled the message as a blockquote.
+        // That produced a `│ ` border glyph the user couldn't
+        // exclude when copying the prompt back out. The new bubble
+        // relies entirely on the background tint, so no `│` should
+        // appear in the rendered output.
+        let mut c = UserMessageComponent::new("hello world", &theme());
+        let lines = c.render(40);
+        for line in &lines {
+            assert!(
+                !line.contains('│'),
+                "user message should not render a blockquote border, got: {line:?}",
+            );
+        }
     }
 
     #[test]
-    fn handles_a_trailing_newline_without_orphan_prefix() {
-        let out = prefix_user_lines("hi\n");
-        // `split('\n')` surfaces the empty trailing element; we
-        // intentionally render it as an empty line rather than as
-        // a prefix-only `> ` so trailing whitespace doesn't leak.
-        assert_eq!(out, "> hi\n");
+    fn rendered_rows_carry_the_user_message_background_escape() {
+        // The bundled dark theme's `userMsgBg` resolves to a
+        // truecolor (`\x1b[48;2;…m`) escape on capable terminals
+        // and a 256-color (`\x1b[48;5;…m`) escape elsewhere. Both
+        // share the `\x1b[48;` prefix, so checking for that is a
+        // robust assertion that the background tint actually
+        // reached the rendered rows.
+        let mut c = UserMessageComponent::new("hi", &theme());
+        let lines = c.render(20);
+        assert!(
+            lines.iter().any(|l| l.contains("\x1b[48;")),
+            "expected at least one row carrying a background escape, got: {lines:?}",
+        );
     }
 }
