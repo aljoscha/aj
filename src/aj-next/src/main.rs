@@ -43,7 +43,10 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::Models { command }) => handle_models_command(command).await,
         Some(Command::ListThreads) => handle_list_threads(),
-        Some(Command::Continue { thread_id: _ }) => {
+        Some(Command::Continue {
+            thread_id: _,
+            prompt: _,
+        }) => {
             // `continue` always lands in interactive mode (or
             // print mode if the user passed `--print`). The mode
             // itself decides how to resume; we just dispatch.

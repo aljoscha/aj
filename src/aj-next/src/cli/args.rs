@@ -78,10 +78,25 @@ pub enum Command {
     /// List existing conversation threads for this project.
     ListThreads,
     /// Continue a conversation thread (latest if no id given).
+    ///
+    /// Accepts an optional positional prompt after the thread id:
+    /// `aj-next continue ID prompt words...` resumes the thread
+    /// and (in `--print` mode) runs the supplied prompt as the
+    /// next turn. With no thread id, the latest thread for the
+    /// current project is resumed; supplying a prompt without a
+    /// thread id is ambiguous, so callers wanting "latest +
+    /// prompt" should pass the thread id explicitly (e.g. via
+    /// `aj-next list-threads`).
     Continue {
         /// Conversation ID to continue. If absent, the latest
         /// thread for this project is resumed.
         thread_id: Option<String>,
+        /// Free-form prompt for the resumed run. Only consulted
+        /// in `--print` mode today; interactive mode prompts for
+        /// input from the editor regardless. Multiple positional
+        /// args are joined with spaces; any `@path` token is
+        /// expanded by [`crate::cli::file_args`].
+        prompt: Vec<String>,
     },
     /// Manage the bundled model catalog at `~/.aj/models.json`.
     Models {

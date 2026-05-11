@@ -159,16 +159,18 @@ impl InteractiveMode {
         let mut log = match self.args.command {
             Some(Command::Continue {
                 thread_id: Some(id),
+                prompt: _,
             }) => ConversationLog::resume(&conversation_persistence, &id)?,
-            Some(Command::Continue { thread_id: None }) => {
-                match conversation_persistence.get_latest_thread_id()? {
-                    Some(latest) => ConversationLog::resume(&conversation_persistence, &latest)?,
-                    None => {
-                        eprintln!("No latest conversation to resume; starting a fresh thread.");
-                        ConversationLog::create(&conversation_persistence)?
-                    }
+            Some(Command::Continue {
+                thread_id: None,
+                prompt: _,
+            }) => match conversation_persistence.get_latest_thread_id()? {
+                Some(latest) => ConversationLog::resume(&conversation_persistence, &latest)?,
+                None => {
+                    eprintln!("No latest conversation to resume; starting a fresh thread.");
+                    ConversationLog::create(&conversation_persistence)?
                 }
-            }
+            },
             _ => ConversationLog::create(&conversation_persistence)?,
         };
 

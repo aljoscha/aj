@@ -1796,10 +1796,86 @@ adopts independently.
         `cargo clippy -p aj-next --all-targets` all pass clean
         (the only remaining warnings are pre-existing in
         `aj-agent`).
-  - [ ] Phase 2.1g (nice-to-have): `aj-next continue --print`.
-        Replace the explicit bail in `print::run` with a resume
-        flow that replays history through the JSONL sink and
-        runs the supplied prompt against the resumed transcript.
+  - [x] Phase 2.1g (nice-to-have): `aj-next continue --print`.
+        Replaces the explicit bail in `print::run` with a resume
+        flow that runs the supplied prompt against the resumed
+        transcript.
+
+        **`aj-next/cli/args.rs`:** the `Continue` subcommand grew a
+        positional `prompt: Vec<String>` after the optional
+        `thread_id`. Clap's greedy single-then-rest positional
+        consumption routes the first positional into `thread_id`
+        and joins the rest into `prompt` — so
+        `aj-next --print continue ID hello world` parses as
+        `thread_id=Some("ID"), prompt=["hello","world"]`. With no
+        thread id the parser treats the first positional as
+        `thread_id` (it always fills first), so the ambiguous
+        case `aj-next --print continue hello` resolves to a
+        "thread `hello` not found" error rather than silently
+        treating it as a prompt — users who want "latest +
+        prompt" should pass the thread id explicitly (typically
+        from `aj-next list-threads`).
+
+        **`aj-next/modes/print.rs`:**
+        - `collect_prompt_text` now consults both `args.prompt`
+          (top-level positional, populated for the no-subcommand
+          path) and `Continue.prompt` (subcommand positional,
+          populated for the resume path). Clap keeps them disjoint;
+          the helper picks whichever is non-empty and joins with
+          spaces. Both empty is still the same "requires a prompt
+          argument" error as before.
+        - `run` now dispatches on a `resume_request:
+          Option<Option<String>>` — `None` for the fresh-thread
+          path, `Some(Some(id))` for an explicit resume, and
+          `Some(None)` for "resume latest" (which `bail!`s when
+          the project has no threads to resume; print mode is
+          one-shot so silently falling through to a fresh thread
+          would surprise scripts).
+        - When resuming, the run mirrors the interactive resume
+          path exactly: reuse the persisted system prompt
+          (cache-warm; matches the bytes the model saw on the
+          prior turn, so prompt-cache hits aren't invalidated),
+          seed the sub-agent counter from the log's
+          `max_agent_id`, run [`repair_interrupted_tool_uses`]
+          (which synthesizes tool_results for any dangling
+          `tool_use` ids and warns if it did), re-linearize the
+          user thread, then seed the agent's transcript via
+          `Agent::seed_messages`.
+        - In JSON format mode the persisted history is drained
+          through the JSONL sink in [`aj_session::replay`] order
+          **before** subscribing any listeners to the bus, so
+          consumers see the full event trace (historical and
+          live) in emit order without double-firing the
+          persistence listener — the disk events are already
+          there. Text mode skips the historical events: callers
+          piping `aj-next --print "..."` into another process
+          want a clean final answer, not the prior conversation
+          re-stamped.
+
+        End-to-end smoke (`aj-next --print --format json continue
+        <thread-id> "Q"` against a real thread file): the binary
+        emits the historical `stream_chunk` user/thinking events
+        and `tool_execution_end` rows for the persisted tool
+        calls, then the live `agent_start` / `message_persisted`
+        (user prompt) / `turn_start` events, and surfaces the
+        expected `agent run failed (recoverable)` error when the
+        model endpoint is unreachable — confirming the resume +
+        replay + prompt + persistence path all run in the right
+        order. The `repair_interrupted_tool_uses` warning fires
+        from the resume path so users see "resuming past N
+        interrupted tool call(s); synthesizing error results"
+        before the JSON stream starts.
+
+        Five new unit tests in `print::tests` cover
+        `collect_prompt_text`: top-level prompt for the
+        no-subcommand path, the no-prompt error, continue +
+        explicit prompt → join with spaces, continue + thread id
+        but no prompt → error, and the lone-continue-positional
+        ambiguity (treated as thread id). Total `aj-next` unit
+        tests: 116 (up from 111). `cargo build`, `cargo test -p
+        aj-next`, `cargo fmt`, and `cargo clippy -p aj-next
+        --all-targets` all pass clean (the only remaining
+        warnings are pre-existing in `aj-agent`).
 - [ ] Rename `aj-next` → `aj`, delete legacy `aj` crate.
 - [ ] Drop `rustyline`, `termimad`, `console`.
 - [ ] Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`.
