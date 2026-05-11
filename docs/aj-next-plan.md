@@ -645,6 +645,86 @@ plain text to stdout. With `--json`, dumps each event as a JSONL
 line. Same code path lets us script the agent or embed it in a
 parent process.
 
+### 4.3 Settings persistence and selectors
+
+The `/settings` dialog, the `/model` selector, and the thinking-level
+selector are all thin views over an in-memory `SettingsManager` owned
+by `aj-conf`. The file
+format is TOML, building on the existing `aj-conf` `Config` loader
+that already reads `~/.aj/config.toml`.
+
+- **On-disk layout.** Global `~/.aj/config.toml`, project
+  `<cwd>/.aj/config.toml`. Effective settings are a deep merge with
+  project overriding global. (Project-scope is new — today only the
+  global file exists; the loader gains a project-scope read.)
+- **Load.** `SettingsManager` is constructed at startup and holds
+  the parsed global + project structs plus the merged view. It
+  replaces / wraps the current `aj-conf::Config::load`.
+- **Re-read on dialog open.** Opening the `/settings`, `/model`,
+  or thinking dialog re-reads both TOML files from disk before
+  populating the view. We prefer this fresher read (over relying on
+  an in-memory snapshot until an explicit `/reload`) so a user
+  editing the file in another window — or a concurrent `aj`
+  process — doesn't get clobbered by a stale snapshot when the
+  user toggles an unrelated row.
+- **Session state vs persisted default.** The session keeps its own
+  active model and thinking level (whatever it started with, plus
+  any in-session switches). The persisted defaults in `config.toml`
+  are a separate piece of state: they're what *new* sessions pick
+  up at startup. On open, the `/model` and thinking selectors
+  highlight the **session's active value** as the current choice
+  (so the dialog reflects "what this session is using right now"),
+  while the list of available entries and any other displayed
+  metadata come from the freshly re-read TOML. Picking an entry
+  (a) writes the new default to disk and (b) switches the current
+  session over to it. Not picking anything leaves both untouched.
+- **Write policy.** No Save button. Each row's callback calls a
+  typed `SettingsManager::set_*` setter, which:
+  1. mutates the in-memory scoped struct,
+  2. marks the field modified,
+  3. enqueues a serialized write task.
+  The write task takes a **file lock** (`fs2` / `fd-lock` advisory
+  lock on the TOML file), re-reads the on-disk file as a
+  `toml_edit::DocumentMut`, patches only the fields modified in
+  this session into the document (preserving comments, key order,
+  and unknown keys), and writes the result back atomically
+  (tempfile + rename in the same directory). This means:
+  - Unknown / future settings keys round-trip untouched.
+  - Hand-written comments and formatting are preserved.
+  - Concurrent edits to *other* fields by another process or editor
+    are preserved.
+  - Writes are serialized through an internal queue so two rapid
+    toggles can't race.
+- **Save queue.** A single background task per scope drains the
+  write queue; setters are fire-and-forget from the UI thread. A
+  `flush()` awaits the queue (used on shutdown and from tests).
+- **Model selector persistence.** Selecting a model writes
+  `default_provider` + `default_model` to global `config.toml`
+  immediately. There is no session-only mode in the UI. A future `--models` CLI scope flag can restrict the picker without
+  changing this — picking still persists the default.
+- **Thinking-level persistence.** Setting the thinking level (via
+  the `/settings` submenu, the cycle hotkey, or the standalone
+  selector) writes `default_thinking_level` (the existing
+  `thinking` key in `config.toml`) to global config, after clamping
+  to the current model's supported levels. Skip the write only when
+  the new level is `Off` and the active model doesn't support
+  thinking, so we don't stomp the user's preferred level while
+  temporarily on a non-reasoning model.
+- **Session-only fields.** A small set of fields are deliberately
+  session-only and never persisted: auto-compaction toggle, anything
+  else flagged as transient. These live on the session, not on
+  `SettingsManager`.
+- **Reload command.** `/reload` still exists and forces a full
+  re-read plus re-resolution of derived state (resource loader,
+  theme, keybindings); the per-dialog re-read is a narrower path.
+
+Crate placement: `SettingsManager`, the TOML schema types, and the
+file-lock/RMW machinery live in `aj-conf`. `aj-conf` gains a
+`toml_edit` dependency for format-preserving writes (it already
+depends on `toml` for reads). The selector components in `aj-next`
+depend on `aj-conf` for read/write and on `aj-models` for the model
+list.
+
 ---
 
 ## 5. Phase 2 — cutover
