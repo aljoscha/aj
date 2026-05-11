@@ -67,6 +67,7 @@ use crate::modes::interactive::components::session_selector::{
 use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
 };
+use crate::modes::interactive::editor_ext::{DEFAULT_MAX_ENTRIES, PromptHistory};
 use crate::modes::interactive::event_pump::{
     EventPump, set_editor_submit_enabled, take_submitted_prompt,
 };
@@ -269,6 +270,24 @@ impl InteractiveMode {
                 Arc::clone(&model_catalog),
             );
             editor.set_autocomplete_provider(Arc::new(provider));
+        }
+
+        // Bootstrap the editor's prompt-history ring from every
+        // `*.jsonl` file under the project's threads directory so
+        // pressing Up surfaces cross-session prompts the user has
+        // ever submitted in this project. Live submissions update
+        // the same ring through
+        // [`aj_tui::components::editor::Editor::add_to_history`]
+        // in the submit branch below; this bootstrap covers the
+        // "I just relaunched the binary" case where the in-memory
+        // ring would otherwise start empty. No persistence layer
+        // is involved — the conversation log files are the source
+        // of truth, so two `aj-next` processes running side by
+        // side can't clobber each other's history.
+        let prompt_history =
+            PromptHistory::bootstrap(&conversation_persistence, DEFAULT_MAX_ENTRIES);
+        if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+            prompt_history.install(editor);
         }
 
         // Header: thread id + resume/start banner. Footer: model +

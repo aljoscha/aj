@@ -1663,9 +1663,88 @@ adopts independently.
         and `cargo clippy -p aj-next --all-targets` all pass
         clean (the only remaining warnings are pre-existing in
         `aj-agent`). Total `aj-next` unit tests: 96 (up from 91).
-  - [ ] Phase 2.1e: Prompt history bootstrap from project JSONL
-        thread logs. Port the prompt-history extractor so the
-        editor's up-arrow surfaces cross-session history.
+  - [x] Phase 2.1e: Prompt history bootstrap from project JSONL
+        thread logs so the editor's up-arrow surfaces
+        cross-session history.
+
+        **`aj-next/.../interactive/editor_ext.rs`:** new
+        [`PromptHistory`] type and [`DEFAULT_MAX_ENTRIES`] (= 200)
+        constant that bootstraps an in-memory prompt history from
+        the project's JSONL thread logs and installs it into
+        [`aj_tui::components::editor::Editor`]. Three public
+        surfaces:
+
+        - [`PromptHistory::bootstrap(persistence, max)`] walks
+          every `*.jsonl` file in the project's threads directory
+          (sorted lex = chronological since filenames are
+          timestamps), parses each line, and pushes the text
+          content of every top-level user-role [`MessageParam`]
+          onto an internal `VecDeque<String>` capped at `max`.
+          Subagent threads, assistant messages, and tool-result-
+          only user messages are skipped; only "prompts the human
+          typed" land in the ring. Robustness contract: a single
+          unreadable file, an invalid-UTF-8 line, or an
+          unparseable JSON line is skipped without aborting the
+          rest of the walk — the in-memory shape survives
+          paste-corrupted scratch threads where the legacy
+          `~/.aj/history.txt` would have truncated.
+        - [`PromptHistory::install(editor)`] pushes every retained
+          entry through
+          [`aj_tui::components::editor::Editor::add_to_history`]
+          in oldest-first order so pressing Up surfaces the most
+          recent prompt. The editor's own [`Editor::HISTORY_LIMIT`]
+          (100) and consecutive-duplicate dedup apply naturally as
+          entries land — over-supplying with 200 entries gives the
+          editor's ring the right "100 most recent" semantics.
+        - [`PromptHistory::len`], [`is_empty`], and [`iter`] for
+          test introspection.
+
+        Live submissions update the same ring through the existing
+        `editor.add_to_history(&trimmed)` call in the submit branch
+        of the main loop, so no separate "record" path lives in
+        this module — the editor itself is the system of record
+        after bootstrap.
+
+        Why this lives in-memory rather than on a separate
+        `history.txt`: the legacy binary's flat history file was
+        brittle to non-UTF-8 content (a single bad paste truncated
+        every entry past the corruption point on the next submit)
+        and to concurrent-process clobber (two `aj` processes
+        running side by side each rewrote the whole file; last
+        writer wins). The JSONL conversation log we already
+        maintain is per-line robust to arbitrary bytes via
+        `serde_json` escaping, and each thread file is owned by
+        exactly one running process — so it's the natural source
+        of truth.
+
+        **`aj-next/modes/interactive.rs`:** new bootstrap call
+        right after the slash-command autocomplete provider
+        install: [`PromptHistory::bootstrap`] reads
+        `~/.aj/threads/<project>/` once at startup,
+        [`install`] pushes everything into the freshly-built
+        editor's ring before the main loop begins. The
+        [`ConversationPersistence`] handle that drove the
+        `/session` selector now also drives the prompt-history
+        walker — no extra I/O setup. Two `aj-next` processes in
+        side-by-side terminals each see their own newly-submitted
+        prompts in their own ring, plus every other process's
+        prompts on next launch (since both write to the JSONL log
+        independently).
+
+        Twelve new unit tests in `editor_ext::tests` cover
+        chronological-order assembly, multi-file
+        consolidation, invalid-UTF-8 / unparseable-JSON line skip,
+        null-byte / multiline prompt round-trip, consecutive-only
+        dedup, cap-at-max trimming, subagent / assistant /
+        tool-result skip rules, missing-dir empty return, and a
+        round-trip-through-editor test that uses
+        [`Editor::handle_input`] with [`Key::up()`] to walk the
+        installed ring and verify the most-recent-first surface
+        order. Total `aj-next` unit tests: 107 (up from 96).
+        `cargo build`, `cargo test -p aj-next`, `cargo fmt`, and
+        `cargo clippy -p aj-next --all-targets` all pass clean
+        (the only remaining warnings are pre-existing in
+        `aj-agent`).
   - [ ] Phase 2.1f: Per-turn `TurnUsage` rendering. Fill the
         placeholder arm in `event_pump.rs` with a dim status line
         matching the legacy `display_token_usage`.
