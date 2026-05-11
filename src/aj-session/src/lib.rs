@@ -29,6 +29,6 @@ pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     ConversationView, EntryId, ThreadFilter, ThreadKind,
 };
-pub use persistence::{ConversationPersistence, ThreadMetadata};
+pub use persistence::{ConversationPersistence, ThreadMetadata, ThreadPreview};
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;

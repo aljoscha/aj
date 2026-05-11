@@ -60,7 +60,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "session",
         description: "Resume a different conversation thread.",
-        argument_hint: None,
+        argument_hint: Some("[search]"),
     },
     BuiltinCommand {
         name: "clear",
@@ -214,6 +214,11 @@ pub enum SlashAction {
     /// pre-fills the search box so `/model sonn` opens the overlay
     /// already filtered.
     OpenModelSelector { initial_query: Option<String> },
+    /// Open the session selector overlay. The currently-active
+    /// thread is pre-selected; `Enter` swaps the agent over to the
+    /// chosen thread, `Esc` cancels. `initial_query` pre-fills the
+    /// search box so `/session fix bug` opens already filtered.
+    OpenSessionSelector { initial_query: Option<String> },
     /// User typed a recognised command whose UI lives in a
     /// follow-up commit. The host renders the embedded message as
     /// a notice and clears the editor.
@@ -270,9 +275,12 @@ pub fn dispatch(input: &str) -> SlashAction {
                 Some(rest.to_string())
             },
         },
-        "session" => SlashAction::NotYetImplemented {
-            command: "session",
-            message: "/session: selector not yet implemented; use `aj-next continue <id>` instead.",
+        "session" => SlashAction::OpenSessionSelector {
+            initial_query: if rest.is_empty() {
+                None
+            } else {
+                Some(rest.to_string())
+            },
         },
         "clear" => SlashAction::NotYetImplemented {
             command: "clear",
@@ -434,11 +442,7 @@ mod tests {
 
     #[test]
     fn dispatch_deferred_commands_return_not_yet_implemented() {
-        for (input, expected_command) in [
-            ("/session", "session"),
-            ("/clear", "clear"),
-            ("/help", "help"),
-        ] {
+        for (input, expected_command) in [("/clear", "clear"), ("/help", "help")] {
             match dispatch(input) {
                 SlashAction::NotYetImplemented { command, .. } => {
                     assert_eq!(command, expected_command);
@@ -446,6 +450,32 @@ mod tests {
                 other => panic!("expected NotYetImplemented for {input}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn dispatch_session_no_arg_opens_selector() {
+        assert_eq!(
+            dispatch("/session"),
+            SlashAction::OpenSessionSelector {
+                initial_query: None
+            }
+        );
+        assert_eq!(
+            dispatch("  /session  "),
+            SlashAction::OpenSessionSelector {
+                initial_query: None
+            }
+        );
+    }
+
+    #[test]
+    fn dispatch_session_with_query_pre_fills_search() {
+        assert_eq!(
+            dispatch("/session fix bug"),
+            SlashAction::OpenSessionSelector {
+                initial_query: Some("fix bug".to_string())
+            }
+        );
     }
 
     #[test]

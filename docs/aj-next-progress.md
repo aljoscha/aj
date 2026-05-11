@@ -1126,12 +1126,101 @@ adopts independently.
         `cargo clippy -p aj-next --all-targets` all pass clean (the
         only remaining warnings are pre-existing in `aj-agent`).
 
-  - [ ] Phase 1.4c: Session selector. Loads threads via
-        [`aj_session::ConversationPersistence::list_threads`] with
-        a streaming progress indicator for the `list-all` case.
-        On select, the host swaps the active log + agent over to
-        the chosen thread (mirroring `aj-next continue <id>` but
-        without restarting the binary).
+  - [x] Phase 1.4c: Session selector. Drives off
+        [`aj_session::ConversationPersistence::list_thread_previews`]
+        (a new richer-metadata loader added alongside the existing
+        [`list_threads`] cheap path). On select, the host swaps the
+        active log + agent over to the chosen thread without
+        restarting the binary.
+
+        **`aj-session`:** new [`ThreadPreview`] struct carrying
+        `thread_id`, `modified: DateTime<Utc>`, `size_bytes`,
+        `message_count`, and `first_user_message: Option<String>`
+        — the data the interactive overlay needs to render
+        recognisable rows. New
+        [`ConversationPersistence::list_thread_previews(on_progress)`]
+        walks the same threads-dir [`list_threads`] does, but for
+        each file opens the JSONL and counts `Message` entries
+        while capturing the first user-role textual block. The
+        progress callback fires once per file (with `(loaded,
+        total)`) so a future "Loading X/Y" indicator can wire
+        directly to it without changing the signature. Pre-refactor
+        files are filtered up-front so `total` reflects only
+        rows the selector will actually display. Tests cover the
+        happy path (count + preview), the empty-dir / pre-refactor
+        edge cases, the "no user text yet" case, and the progress
+        callback order.
+
+        **`aj-next/config/slash_commands.rs`:** `/session` no
+        longer returns [`SlashAction::NotYetImplemented`]; it now
+        returns [`SlashAction::OpenSessionSelector { initial_query }`]
+        — with `None` for the bare `/session` form, and
+        `Some("fix bug")` for `/session fix bug` so the overlay
+        opens already filtered. `BUILTIN_COMMANDS`' `/session`
+        entry grew a `[search]` argument hint to match.
+
+        **`aj-next/.../components/session_selector.rs`:** new
+        [`SessionSelectorComponent`] wrapping a
+        [`aj_tui::components::text_input::TextInput`] (live
+        fuzzy search) above an
+        [`aj_tui::components::select_list::SelectList`] (results).
+        Mirrors the model selector's design: the component owns
+        the catalog and rebuilds the inner list on every text
+        change via a reusable [`aj_tui::fuzzy::FuzzyMatcher`]
+        scoring against a `"<first_user_message> <thread_id>"`
+        haystack. The currently-active thread is pre-selected on
+        open and tagged `(current)` so a no-op confirm is
+        visually obvious. Each row's primary column carries the
+        first user message (truncated to 80 chars with a trailing
+        `…`); the description column carries `<count> msgs ·
+        <age>` where age is a coarse `now / 5m / 3h / 2d / 4w /
+        6mo / 2y` bucket relative to a single `now` snapshot
+        taken at construction time. `SelectList`'s default
+        32-char primary column was widened via
+        [`SelectListLayout::max_primary_column_width`] so long
+        previews don't get truncated below my own ellipsis cap.
+        Eleven unit tests cover open-pre-selects-current,
+        Enter-commits-highlighted, Esc-cancels, down-then-Enter,
+        live-filtering-on-typing, initial-query-pre-fills,
+        empty-catalog-no-match, no-user-message-placeholder,
+        ellipsis-on-very-long-previews, and the age-bucket
+        boundaries.
+
+        **`aj-next/modes/interactive.rs`:** wires the swap. The
+        `_persistence_handle` binding (previously underscore-
+        prefixed and immutable) became a plain `mut
+        persistence_handle: SubscriptionHandle` so a successful
+        swap can replace it with a fresh subscription tied to the
+        new log; same shape for the `Arc<TokioMutex<ConversationLog>>`
+        binding, which now lives behind `let mut log = …`.
+        [`OpenSelector`] grew a [`Session { handle, outcome }`]
+        variant; [`handle_slash_command`] picks up `log` +
+        `conversation_persistence` parameters so it can load
+        previews and pre-select the current thread on
+        [`SlashAction::OpenSessionSelector`]. The overlay is
+        anchored at center with `width: 80` (matches the model
+        selector — long preview text benefits from the room).
+
+        On a confirmed outcome, a new [`perform_thread_swap`]
+        function does the in-process equivalent of `aj-next
+        continue <id>`: it resumes the new log,
+        [`repair_interrupted_tool_uses`]es it, seeds the agent's
+        transcript / sub-agent counter / system prompt, drops
+        the old persistence subscription in favour of a fresh one
+        tied to the new log, clears the chat container, builds a
+        new [`EventPump`], replays the new log through it, and
+        refreshes the header. The dance is bracketed so the
+        in-memory state (agent transcript + Arc) only flips
+        after every fallible step has succeeded — a
+        [`ConversationLog::resume`] error leaves the previous
+        thread fully active. A no-op short-circuit catches the
+        "user picked the row that's already current" case so the
+        scrollback doesn't briefly blank out.
+
+        Slash-command dispatch is guaranteed to be between turns
+        (the editor's `disable_submit` flag blocks all submit
+        events mid-turn), so the swap path doesn't need to cancel
+        an in-flight `agent.prompt(...)` task.
 
   - [ ] Phase 1.4d: Configurable theme palette. Replace the
         hard-coded closures in `config/theme.rs` with a

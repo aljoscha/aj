@@ -5,12 +5,13 @@
 //! `aj continue`) and resolves a thread id to its on-disk path so
 //! [`crate::log::ConversationLog`] can open / create the right file.
 
+use aj_models::messages::{ContentBlockParam, Role};
 use chrono::{DateTime, Utc};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-use crate::log::{ConversationEntry, ConversationError};
+use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError};
 
 /// Handles persistence operations for conversations, including listing
 /// existing thread files and resolving their paths.
@@ -130,6 +131,74 @@ impl ConversationPersistence {
         let threads = self.list_threads()?;
         Ok(threads.first().map(|t| t.thread_id.clone()))
     }
+
+    /// List threads with rich per-thread previews — first user
+    /// message, message count, modified time, file size.
+    ///
+    /// Walks the threads directory in the same latest-first order
+    /// as [`Self::list_threads`], but for each file opens the JSONL
+    /// and scans line by line to count `Message` entries and capture
+    /// the first user-role textual block. `on_progress(loaded, total)`
+    /// fires once per file as previews complete so a caller showing
+    /// a "Loading X/Y" indicator can update incrementally. Files
+    /// whose first line does not parse as the new [`ConversationEntry`]
+    /// shape are skipped (consistent with [`Self::list_threads`]).
+    ///
+    /// Note on streaming: this function still returns the previews
+    /// in one `Vec` after every file has been scanned. The callback
+    /// is the streaming surface for progress reporting; a future
+    /// extension can flip the return type to an `Iterator` / async
+    /// stream if a single project ever grows enough threads that
+    /// the cumulative scan time becomes user-visible.
+    pub fn list_thread_previews(
+        &self,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<Vec<ThreadPreview>, ConversationError> {
+        if !self.threads_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let entries = fs::read_dir(&self.threads_dir)?;
+        let mut thread_files: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    thread_files.push(stem.to_string());
+                }
+            }
+        }
+        thread_files.sort_by(|a, b| b.cmp(a));
+
+        let mut previews = Vec::with_capacity(thread_files.len());
+        // Filter out pre-refactor files up-front so `total` in the
+        // progress callback reflects only files we'll actually
+        // surface — otherwise the bar would stall partway through.
+        let candidate_paths: Vec<(String, PathBuf)> = thread_files
+            .into_iter()
+            .map(|id| (id.clone(), self.thread_path(&id)))
+            .filter(|(_, p)| Self::looks_like_new_format(p))
+            .collect();
+
+        let total = candidate_paths.len();
+        for (i, (thread_id, path)) in candidate_paths.into_iter().enumerate() {
+            // Surface a preview even if a per-file read fails: the
+            // selector should still show the entry so the user can
+            // see which thread couldn't be parsed.
+            let preview = read_thread_preview_file(&thread_id, &path).unwrap_or_else(|err| {
+                tracing::warn!(
+                    "failed to read preview for thread {}: {err}",
+                    path.display()
+                );
+                ThreadPreview::placeholder(thread_id, &path)
+            });
+            previews.push(preview);
+            on_progress(i + 1, total);
+        }
+
+        Ok(previews)
+    }
 }
 
 /// Metadata about a conversation thread.
@@ -138,4 +207,308 @@ pub struct ThreadMetadata {
     pub thread_id: String,
     pub modified: String,
     pub size_display: String,
+}
+
+/// Richer per-thread snapshot used by the interactive session
+/// selector overlay.
+///
+/// Unlike [`ThreadMetadata`] (which is purely a filesystem-stat
+/// payload), [`ThreadPreview`] opens the JSONL and walks far enough
+/// to count `Message` entries and capture the first user-role text
+/// block. Producing one preview is therefore O(file size) per
+/// thread; [`ConversationPersistence::list_thread_previews`] streams
+/// progress through a callback so a UI rendering the list can show
+/// a `Loading X/Y` indicator while the walk completes.
+#[derive(Debug, Clone)]
+pub struct ThreadPreview {
+    /// Filename stem of the thread file (e.g.
+    /// `2025-05-11-14-22-03-512`).
+    pub thread_id: String,
+    /// Modification time read from the file system. Held as a
+    /// real [`DateTime`] (not a pre-formatted string) so the
+    /// renderer can choose whatever date/age formatting it likes.
+    pub modified: DateTime<Utc>,
+    /// On-disk size in bytes. Cheap to surface from the
+    /// `fs::metadata` we already had to call.
+    pub size_bytes: u64,
+    /// Number of [`ConversationEntryKind::Message`] entries in the
+    /// log. User and assistant messages both contribute; tool
+    /// results are projected on the wire as user-role messages so
+    /// they count too. Non-message entries (`SystemPrompt`,
+    /// `UserOutput`) are skipped.
+    pub message_count: usize,
+    /// First user-role textual content block in the file, if any.
+    /// `None` for a freshly-minted thread that hasn't yet seen a
+    /// user prompt. The string carries the verbatim text — the
+    /// renderer applies its own truncation policy.
+    pub first_user_message: Option<String>,
+}
+
+impl ThreadPreview {
+    /// Build a minimal preview for a file we could not parse — only
+    /// the id and file-system stat fields are populated. Used as a
+    /// fall-back so a corrupt thread file still appears in the
+    /// selector instead of silently dropping out of the listing.
+    fn placeholder(thread_id: String, path: &std::path::Path) -> Self {
+        let (modified, size_bytes) = match fs::metadata(path) {
+            Ok(md) => {
+                let modified = md
+                    .modified()
+                    .map(DateTime::<Utc>::from)
+                    .unwrap_or_else(|_| Utc::now());
+                (modified, md.len())
+            }
+            Err(_) => (Utc::now(), 0),
+        };
+        Self {
+            thread_id,
+            modified,
+            size_bytes,
+            message_count: 0,
+            first_user_message: None,
+        }
+    }
+}
+
+/// Open `path`, walk every JSONL line, and assemble a
+/// [`ThreadPreview`].
+///
+/// Lines that fail to parse are skipped (matching the resume-time
+/// tolerance for truncated trailing lines). The walk is one-pass:
+/// we read every line so `message_count` is accurate, but we stop
+/// updating `first_user_message` once we have one.
+fn read_thread_preview_file(
+    thread_id: &str,
+    path: &std::path::Path,
+) -> Result<ThreadPreview, ConversationError> {
+    let metadata = fs::metadata(path)?;
+    let modified = metadata
+        .modified()
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(|_| Utc::now());
+    let size_bytes = metadata.len();
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut message_count = 0usize;
+    let mut first_user_message: Option<String> = None;
+
+    for line_res in reader.lines() {
+        // A best-effort `Ok(_)`-only path: an IO error mid-file
+        // shouldn't mask the entries we already accumulated. Same
+        // policy as the resume tolerance for truncated lines.
+        let line = match line_res {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line) else {
+            continue;
+        };
+        if let ConversationEntryKind::Message(msg) = &entry.entry {
+            message_count += 1;
+            if first_user_message.is_none() && matches!(msg.role, Role::User) {
+                if let Some(text) = first_text_block(&msg.content) {
+                    first_user_message = Some(text);
+                }
+            }
+        }
+    }
+
+    Ok(ThreadPreview {
+        thread_id: thread_id.to_string(),
+        modified,
+        size_bytes,
+        message_count,
+        first_user_message,
+    })
+}
+
+/// Return the text from the first [`ContentBlockParam::TextBlock`]
+/// in `content`, if any. Used by [`read_thread_preview_file`] to
+/// capture the user-input preview without dragging tool-result
+/// content into it (tool result wire messages are user-role).
+fn first_text_block(content: &[ContentBlockParam]) -> Option<String> {
+    content.iter().find_map(|b| match b {
+        ContentBlockParam::TextBlock { text, .. } => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::log::{ConversationLog, ThreadKind};
+
+    /// Build a `ConversationPersistence` against a fresh temp dir.
+    fn fixture() -> (TempDir, ConversationPersistence) {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        (dir, persistence)
+    }
+
+    /// Append one user-text message and one assistant-text message to
+    /// `log`, returning the new tail id. Used by the preview tests so
+    /// the JSONL contains exactly the entries we want to assert on.
+    fn append_user_then_assistant(
+        log: &mut ConversationLog,
+        user_text: &str,
+        assistant_text: &str,
+    ) {
+        let user_msg = MessageParam {
+            role: Role::User,
+            content: vec![ContentBlockParam::TextBlock {
+                text: user_text.to_string(),
+                citations: None,
+                signature: None,
+            }],
+        };
+        let user_id = log
+            .append(
+                None,
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message(user_msg),
+            )
+            .expect("append user");
+        let assistant_msg = MessageParam {
+            role: Role::Assistant,
+            content: vec![ContentBlockParam::TextBlock {
+                text: assistant_text.to_string(),
+                citations: None,
+                signature: None,
+            }],
+        };
+        log.append(
+            Some(user_id),
+            ThreadKind::User,
+            None,
+            ConversationEntryKind::Message(assistant_msg),
+        )
+        .expect("append assistant");
+    }
+
+    #[test]
+    fn list_thread_previews_returns_empty_when_dir_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing");
+        let persistence = ConversationPersistence::new(path);
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert!(previews.is_empty());
+    }
+
+    #[test]
+    fn list_thread_previews_captures_first_user_message_and_count() {
+        let (_dir, persistence) = fixture();
+
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello world", "hi there");
+
+        // A second user-thread message so the count crosses 2.
+        let head = log
+            .latest_leaf(crate::ThreadFilter::USER)
+            .expect("head exists");
+        let user_msg2 = MessageParam {
+            role: Role::User,
+            content: vec![ContentBlockParam::TextBlock {
+                text: "follow-up".to_string(),
+                citations: None,
+                signature: None,
+            }],
+        };
+        log.append(
+            Some(head),
+            ThreadKind::User,
+            None,
+            ConversationEntryKind::Message(user_msg2),
+        )
+        .expect("append second user");
+
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert_eq!(previews.len(), 1);
+        let p = &previews[0];
+        assert_eq!(p.thread_id, log.thread_id());
+        assert_eq!(p.message_count, 3);
+        assert_eq!(p.first_user_message.as_deref(), Some("hello world"));
+        assert!(p.size_bytes > 0);
+    }
+
+    #[test]
+    fn list_thread_previews_emits_progress_callback_per_file() {
+        let (_dir, persistence) = fixture();
+        // Three separate thread files.
+        for i in 0..3 {
+            let mut log = ConversationLog::create(&persistence).expect("create");
+            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
+            // Tiny sleep so the millisecond-resolution mint sees a
+            // fresh timestamp for each file — otherwise `_N` suffix
+            // collisions still produce distinct files but ordering
+            // becomes a function of suffix rather than time.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let progress = RefCell::new(Vec::<(usize, usize)>::new());
+        let previews = persistence
+            .list_thread_previews(|loaded, total| progress.borrow_mut().push((loaded, total)))
+            .expect("list");
+        assert_eq!(previews.len(), 3);
+        let p = progress.into_inner();
+        // One callback per file, total is the candidate count.
+        assert_eq!(p, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[test]
+    fn list_thread_previews_ignores_first_text_when_empty() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        // First user message with no text block (e.g. only tool
+        // results). The preview should leave `first_user_message`
+        // at `None`.
+        let tool_only = MessageParam {
+            role: Role::User,
+            content: vec![ContentBlockParam::ToolResultBlock {
+                tool_use_id: "x".into(),
+                content: String::from("ok").into(),
+                is_error: false,
+            }],
+        };
+        log.append(
+            None,
+            ThreadKind::User,
+            None,
+            ConversationEntryKind::Message(tool_only),
+        )
+        .expect("append");
+
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert_eq!(previews.len(), 1);
+        assert!(previews[0].first_user_message.is_none());
+        assert_eq!(previews[0].message_count, 1);
+    }
+
+    #[test]
+    fn list_thread_previews_skips_pre_refactor_files() {
+        let (_dir, persistence) = fixture();
+        // Drop a bogus .jsonl that won't parse as the new format.
+        let bogus = persistence.threads_dir.join("old.jsonl");
+        std::fs::write(&bogus, "not json at all\n").expect("write");
+
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert!(previews.is_empty(), "got {previews:?}");
+    }
 }

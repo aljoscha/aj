@@ -24,6 +24,7 @@ pub mod layout;
 
 use std::sync::Arc;
 
+use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
@@ -35,6 +36,7 @@ use aj_session::{
 };
 use aj_tools::get_builtin_tools;
 use aj_tui::components::editor::Editor;
+use aj_tui::container::Container;
 use aj_tui::terminal::ProcessTerminal;
 use aj_tui::tui::{OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, Tui, TuiEvent};
 use anyhow::{Context, Result};
@@ -53,6 +55,9 @@ use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::model_selector::{
     ModelIdentityRef, ModelSelectorComponent, ModelSelectorOutcome,
     OutcomeHandle as ModelOutcomeHandle,
+};
+use crate::modes::interactive::components::session_selector::{
+    OutcomeHandle as SessionOutcomeHandle, SessionSelectorComponent, SessionSelectorOutcome,
 };
 use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
@@ -262,12 +267,18 @@ impl InteractiveMode {
         // ---- Wrap log + agent in shared handles -----------------------
         // After replay we hand the log to the persistence listener
         // and to any future code path that wants to read the thread
-        // id back. The agent goes behind a TokioMutex because the
+        // id back. Both `log` and `persistence_handle` are bound
+        // mutably so the `/session` selector can swap them out for
+        // the resumed thread without restarting the binary.
+        // The agent goes behind a TokioMutex because the
         // submit-handler spawns a task that holds it across an
         // `agent.prompt(...).await`.
-        let log = Arc::new(TokioMutex::new(log));
-        let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
+        let mut log = Arc::new(TokioMutex::new(log));
         let agent = Arc::new(TokioMutex::new(agent));
+        let mut persistence_handle: SubscriptionHandle = {
+            let a = agent.lock().await;
+            a.subscribe(persistence_listener(Arc::clone(&log)))
+        };
 
         // ---- Main event loop ------------------------------------------
         // `running_task` holds the in-flight `agent.prompt(...)`
@@ -371,6 +382,10 @@ impl InteractiveMode {
                                     sel,
                                     Arc::clone(&agent),
                                     Arc::clone(&current_model_key),
+                                    &mut log,
+                                    &mut persistence_handle,
+                                    &mut pump,
+                                    &conversation_persistence,
                                 ).await {
                                     SelectorPollOutcome::StillOpen(reopened) => {
                                         open_selector = Some(reopened);
@@ -408,6 +423,8 @@ impl InteractiveMode {
                                         Arc::clone(&agent),
                                         Arc::clone(&model_catalog),
                                         Arc::clone(&current_model_key),
+                                        Arc::clone(&log),
+                                        conversation_persistence.clone(),
                                         &trimmed,
                                     ).await {
                                         SlashHandled::Continue { selector, notice } => {
@@ -494,6 +511,10 @@ enum OpenSelector {
         handle: OverlayHandle,
         outcome: ModelOutcomeHandle,
     },
+    Session {
+        handle: OverlayHandle,
+        outcome: SessionOutcomeHandle,
+    },
 }
 
 /// Result of dispatching a `/...`-prefixed editor submission.
@@ -536,6 +557,8 @@ async fn handle_slash_command(
     agent: Arc<TokioMutex<Agent>>,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
+    log: Arc<TokioMutex<ConversationLog>>,
+    conversation_persistence: ConversationPersistence,
     text: &str,
 ) -> SlashHandled {
     match slash_dispatch(text) {
@@ -604,6 +627,58 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
+        SlashAction::OpenSessionSelector { initial_query } => {
+            // Read the current thread id so the overlay pre-selects
+            // the active row.
+            let current_thread_id = {
+                let l = log.lock().await;
+                l.thread_id().to_string()
+            };
+
+            // Load previews synchronously. At our scale (a few
+            // hundred threads per project on a busy machine) this
+            // is sub-second; if/when that stops being true we'll
+            // move it onto `tokio::task::spawn_blocking` with the
+            // [`ConversationPersistence::list_thread_previews`]
+            // progress callback wired into a header indicator.
+            let previews = match conversation_persistence.list_thread_previews(|_, _| {}) {
+                Ok(p) => p,
+                Err(err) => {
+                    return SlashHandled::Continue {
+                        selector: None,
+                        notice: Some(format!("Failed to list threads: {err}")),
+                    };
+                }
+            };
+
+            if previews.is_empty() {
+                return SlashHandled::Continue {
+                    selector: None,
+                    notice: Some("No threads to switch to in this project.".to_string()),
+                };
+            }
+
+            let component = SessionSelectorComponent::new(
+                select_list_theme(),
+                previews,
+                Some(current_thread_id),
+                initial_query,
+            );
+            let outcome = component.outcome_handle();
+            // Session picker needs as much room as the model picker
+            // — thread previews can carry meaningful prefixes worth
+            // showing without truncation.
+            let options = OverlayOptions {
+                anchor: OverlayAnchor::Center,
+                width: Some(SizeValue::Absolute(80)),
+                ..OverlayOptions::default()
+            };
+            let handle = tui.show_overlay(Box::new(component), options);
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::Session { handle, outcome }),
+                notice: None,
+            }
+        }
         SlashAction::NotYetImplemented { message, .. } => SlashHandled::Continue {
             selector: None,
             notice: Some(message.to_string()),
@@ -628,11 +703,16 @@ async fn handle_slash_command(
 /// pressed Enter or Esc yet; [`SelectorPollOutcome::Closed`] if the
 /// overlay completed, with an optional notice describing what
 /// happened.
+#[allow(clippy::too_many_arguments)]
 async fn handle_selector_outcome(
     tui: &mut Tui,
     selector: OpenSelector,
     agent: Arc<TokioMutex<Agent>>,
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
+    log: &mut Arc<TokioMutex<ConversationLog>>,
+    persistence_handle: &mut SubscriptionHandle,
+    pump: &mut EventPump,
+    conversation_persistence: &ConversationPersistence,
 ) -> SelectorPollOutcome {
     match selector {
         OpenSelector::Thinking { handle, outcome } => {
@@ -716,5 +796,193 @@ async fn handle_selector_outcome(
                 }
             }
         }
+        OpenSelector::Session { handle, outcome } => {
+            let outcome_value = outcome.lock().expect("session outcome poisoned").take();
+            match outcome_value {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Session { handle, outcome }),
+                Some(SessionSelectorOutcome::Confirmed(preview)) => {
+                    tui.hide_overlay(&handle);
+                    // No-op when the user picks the row that's
+                    // already active. Saves the swap dance (and
+                    // the chat-container clear that would briefly
+                    // hide the user's scrollback).
+                    let is_current = {
+                        let l = log.lock().await;
+                        l.thread_id() == preview.thread_id
+                    };
+                    if is_current {
+                        return SelectorPollOutcome::Closed {
+                            notice: Some(format!("Already on thread {}.", preview.thread_id)),
+                        };
+                    }
+                    match perform_thread_swap(
+                        tui,
+                        Arc::clone(&agent),
+                        log,
+                        persistence_handle,
+                        pump,
+                        conversation_persistence,
+                        &preview.thread_id,
+                    )
+                    .await
+                    {
+                        Ok(()) => SelectorPollOutcome::Closed {
+                            notice: Some(format!("Switched to thread {}.", preview.thread_id)),
+                        },
+                        Err(err) => SelectorPollOutcome::Closed {
+                            notice: Some(format!(
+                                "Failed to switch to thread {}: {err}",
+                                preview.thread_id
+                            )),
+                        },
+                    }
+                }
+                Some(SessionSelectorOutcome::Cancelled) => {
+                    tui.hide_overlay(&handle);
+                    SelectorPollOutcome::Closed { notice: None }
+                }
+            }
+        }
     }
+}
+
+/// Swap the agent + log + persistence wiring over to the thread
+/// identified by `thread_id`.
+///
+/// This is the in-process equivalent of `aj-next continue <id>`:
+/// the binary stays up and the user keeps their open editor, but
+/// the agent's transcript and the persistence target both rebind
+/// to the new thread file.
+///
+/// Steps:
+/// 1. Resume the new [`ConversationLog`] from disk.
+/// 2. Repair any interrupted tool uses recorded in that log so
+///    the resumed transcript ends cleanly on a user-role message.
+/// 3. Build a fresh `Conversation` view from the repaired log and
+///    seed it into the agent (`seed_messages`,
+///    `seed_sub_agent_counter`).
+/// 4. Resolve a system prompt for the new thread: reuse the one
+///    persisted at the log's root if present, otherwise assemble
+///    fresh from the current environment and freeze it onto the
+///    log so subsequent resumes hit the same cache.
+/// 5. Replace `*log` with the new `Arc<TokioMutex<…>>` and
+///    `*persistence_handle` with a fresh subscription so future
+///    events flow into the new file. The old handle's `Drop` runs
+///    here, detaching the previous persistence listener.
+/// 6. Clear the chat container, build a fresh [`EventPump`], and
+///    re-replay the new log through it so the user sees the
+///    swapped transcript.
+/// 7. Refresh the header's thread-id line.
+///
+/// Returns `Err` if any of the file-level operations fail; in
+/// that case the agent's previous bindings are left intact (we
+/// only replace `*log` and `*persistence_handle` after the new
+/// log has been built and the seed/system-prompt steps have
+/// succeeded).
+#[allow(clippy::too_many_arguments)]
+async fn perform_thread_swap(
+    tui: &mut Tui,
+    agent: Arc<TokioMutex<Agent>>,
+    log: &mut Arc<TokioMutex<ConversationLog>>,
+    persistence_handle: &mut SubscriptionHandle,
+    pump: &mut EventPump,
+    conversation_persistence: &ConversationPersistence,
+    thread_id: &str,
+) -> Result<()> {
+    // 1. Resume the new log from disk.
+    let mut new_log = ConversationLog::resume(conversation_persistence, thread_id)
+        .with_context(|| format!("failed to resume thread {thread_id}"))?;
+
+    // 2. Repair any interrupted tool uses so the resumed
+    //    transcript ends on a user-role message — same dance the
+    //    startup path does.
+    if let Some(head) = new_log.latest_leaf(ThreadFilter::USER) {
+        let conversation = new_log.linearize(&head, ThreadFilter::USER);
+        repair_interrupted_tool_uses(&mut new_log, &conversation)?;
+    }
+
+    // 3. Build the post-repair transcript and seed it into the
+    //    agent. Also reseed the sub-agent counter so freshly-
+    //    minted ids in this session don't collide with any
+    //    sub-agent subtrees already on the log.
+    let messages: Vec<_> = if let Some(head) = new_log.latest_leaf(ThreadFilter::USER) {
+        new_log
+            .linearize(&head, ThreadFilter::USER)
+            .messages()
+            .into_iter()
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let max_agent_id = new_log.max_agent_id();
+
+    // 4. Resolve the system prompt for the new thread. If the
+    //    log already carries one (persisted at the root entry),
+    //    reuse it verbatim to keep the model's prompt-cache warm.
+    //    Otherwise assemble fresh from the agent's env and
+    //    freeze it onto the new log so subsequent resumes hit
+    //    the same cache.
+    let prompt = if let Some(persisted) = new_log.system_prompt() {
+        persisted.to_string()
+    } else {
+        let assembled = {
+            let a = agent.lock().await;
+            a.assemble_system_prompt()
+        };
+        if new_log.is_empty() {
+            new_log.set_system_prompt(assembled.clone())?;
+        }
+        assembled
+    };
+
+    {
+        let mut a = agent.lock().await;
+        a.seed_messages(messages);
+        if let Some(max_id) = max_agent_id {
+            a.seed_sub_agent_counter(max_id);
+        }
+        a.set_assembled_system_prompt(prompt);
+    }
+
+    // 5. Swap the shared log + persistence handle. Order matters:
+    //    build the new persistence subscription *before* dropping
+    //    the old `persistence_handle`, otherwise a stray bus
+    //    event landing in the window would have no listener and
+    //    silently fail to persist. In practice the bus is quiet
+    //    between turns (no in-flight prompt is possible here —
+    //    `disable_submit` blocks editor submissions while a turn
+    //    is running, so no slash command can fire mid-turn), but
+    //    the ordering keeps the invariant honest.
+    let new_log_arc = Arc::new(TokioMutex::new(new_log));
+    let new_handle = {
+        let a = agent.lock().await;
+        a.subscribe(persistence_listener(Arc::clone(&new_log_arc)))
+    };
+    *persistence_handle = new_handle;
+    *log = new_log_arc;
+
+    // 6. Clear the chat container and replay the new log
+    //    through a fresh event pump so the user sees the swapped
+    //    transcript in the scrollback.
+    if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
+        chat.clear();
+    }
+    *pump = EventPump::new(markdown_theme());
+    {
+        let l = log.lock().await;
+        for event in replay(&l) {
+            pump.handle(tui, &event);
+        }
+    }
+
+    // 7. Refresh the header so the new thread id is visible in
+    //    the top bar without waiting for the next turn boundary.
+    if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
+        header.set_thread_id(Some(thread_id.to_string()));
+        header.set_notice(Some("Resumed conversation".to_string()));
+    }
+
+    tui.request_render();
+    Ok(())
 }
