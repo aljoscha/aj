@@ -15,6 +15,7 @@
 use aj_conf::Config;
 use aj_next::cli::args::{Args, Command, ModelsCommand};
 use aj_next::modes::{interactive::InteractiveMode, print};
+use aj_session::ConversationPersistence;
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -64,11 +65,34 @@ async fn dispatch_session_mode(args: Args) -> Result<()> {
     }
 }
 
-/// `aj-next list-threads`: list existing thread ids for the
-/// current project. Stub for the scaffold; the print-mode step
-/// wires it to [`aj_session::ConversationPersistence::list_threads`].
+/// `aj-next list-threads`: list existing conversation threads
+/// for the current project, latest first.
+///
+/// Mirrors the legacy `aj list-threads` output: one row per
+/// thread, formatted as `<thread_id> (modified: <utc-ts>,
+/// <size>)` so users carrying scripts or muscle memory across
+/// the cutover see no difference. The underlying iteration,
+/// pre-refactor-format filtering, and size formatting all live
+/// in [`ConversationPersistence::list_threads`] (`aj-session`);
+/// this function is a thin presentation wrapper.
 fn handle_list_threads() -> Result<()> {
-    anyhow::bail!("aj-next list-threads is not yet implemented");
+    let threads_dir = Config::get_threads_dir_path()?;
+    let conversation_persistence = ConversationPersistence::new(threads_dir);
+    let threads = conversation_persistence.list_threads()?;
+
+    if threads.is_empty() {
+        println!("No conversation threads found for this project.");
+        return Ok(());
+    }
+
+    for thread in threads {
+        println!(
+            "{} (modified: {}, {})",
+            thread.thread_id, thread.modified, thread.size_display
+        );
+    }
+
+    Ok(())
 }
 
 /// `aj-next models <subcommand>`. Stub for the scaffold; wired

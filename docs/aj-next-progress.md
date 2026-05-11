@@ -1470,7 +1470,44 @@ adopts independently.
 
 ## Phase 2 — Cutover (§5)
 
-- [ ] Behavioral parity verification for daily flows.
+- [ ] Behavioral parity verification for daily flows. Decomposed
+      into focused sub-bullets, each landing as its own commit:
+  - [x] Phase 2.1a: Wire `aj-next list-threads` — replace the stub
+        in `main.rs::handle_list_threads` with a port of the
+        legacy `aj`'s implementation. Drives off
+        [`ConversationPersistence::list_threads`] and prints
+        `<thread_id> (modified: <utc>, <size>)` per row, matching
+        the legacy format byte-for-byte so users with scripts /
+        muscle memory don't break. The empty case prints
+        `"No conversation threads found for this project."` —
+        same string the legacy binary uses. `cargo build`,
+        `cargo test -p aj-next`, `cargo fmt`, and `cargo clippy
+        -p aj-next --all-targets` all pass clean.
+  - [ ] Phase 2.1b: Wire `aj-next models update` — replace the
+        stub in `main.rs::handle_models_command` with a port of
+        the legacy `aj`'s implementation. Drives off
+        [`aj_models::refresh::refresh_user_cache`] and prints the
+        returned `summary.one_line()`. Required for `/model`
+        selector freshness — the catalog never updates today.
+  - [ ] Phase 2.1c: Startup `Context:` notice + sandbox warning.
+        Port the legacy `display_context` + sandbox-warning notice
+        (gated on `AJ_DISABLE_SANDBOX_WARNING`) so users see
+        which `AGENTS.md`/`CLAUDE.md` files the agent picked up
+        and that the agent runs unsandboxed.
+  - [ ] Phase 2.1d: End-of-session usage summary + resume hint.
+        Port `display_usage_summary` + the `Thread: <id>
+        (resume with: aj-next continue <id>)` line so users can
+        track cost and find their thread id on exit.
+  - [ ] Phase 2.1e: Prompt history bootstrap from project JSONL
+        thread logs. Port the prompt-history extractor so the
+        editor's up-arrow surfaces cross-session history.
+  - [ ] Phase 2.1f: Per-turn `TurnUsage` rendering. Fill the
+        placeholder arm in `event_pump.rs` with a dim status line
+        matching the legacy `display_token_usage`.
+  - [ ] Phase 2.1g (nice-to-have): `aj-next continue --print`.
+        Replace the explicit bail in `print::run` with a resume
+        flow that replays history through the JSONL sink and
+        runs the supplied prompt against the resumed transcript.
 - [ ] Rename `aj-next` → `aj`, delete legacy `aj` crate.
 - [ ] Drop `rustyline`, `termimad`, `console`.
 - [ ] Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`.
