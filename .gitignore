@@ -1,3 +1,10 @@
 /target
 .env
 .claude
+
+# Some users have a generic `config` rule in their global gitignore
+# (intended for `.git/config` etc.) that ends up matching our
+# `src/aj/src/config/` module directory. Re-include it explicitly so
+# new files under it aren't silently dropped from commits.
+!src/aj/src/config/
+!src/aj/src/config/**
