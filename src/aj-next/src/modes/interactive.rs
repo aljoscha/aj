@@ -35,6 +35,7 @@ use aj_session::{
     repair_interrupted_tool_uses, replay,
 };
 use aj_tools::get_builtin_tools;
+use aj_tui::EditorComponent;
 use aj_tui::components::editor::Editor;
 use aj_tui::container::Container;
 use aj_tui::terminal::ProcessTerminal;
@@ -50,7 +51,8 @@ use crate::config::slash_commands::{
     thinking_level_name,
 };
 use crate::config::theme::{
-    Theme, ThemeHandle, markdown_theme, select_list_theme, watch_user_theme,
+    Theme, ThemeHandle, editor_border_color_for_thinking, markdown_theme, select_list_theme,
+    watch_user_theme,
 };
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
@@ -245,6 +247,12 @@ impl InteractiveMode {
         tui.start()
             .map_err(|e| anyhow::anyhow!("failed to start terminal: {e}"))?;
         build_layout(&mut tui, &theme);
+
+        // Tint the editor border to match the agent's initial
+        // thinking level so the user sees the active reasoning mode
+        // at a glance the moment the TUI comes up. Updates flow
+        // through the same helper on every `/thinking` change.
+        apply_editor_border_for_thinking(&mut tui, &theme, agent.default_thinking().as_ref());
 
         // Install the slash-command autocomplete provider on the
         // editor. Every recognised command (/thinking, /model, …)
@@ -622,6 +630,27 @@ fn notice_event(text: &str) -> AgentEvent {
     }
 }
 
+/// Push the editor's border tint for the given thinking level.
+///
+/// Builds a fresh closure off the shared [`ThemeHandle`] and hands
+/// it to [`EditorComponent::set_border_color`]; the editor drops
+/// its render cache so the next frame paints with the new tint.
+/// No-op if the editor slot is missing (e.g. during test setup).
+///
+/// The closure resolves through the [`ThemeHandle`] on each call
+/// so a runtime theme reload (the fs-watcher arm of the main
+/// select loop) reskins the border automatically without
+/// re-invoking this helper.
+fn apply_editor_border_for_thinking(
+    tui: &mut Tui,
+    theme: &ThemeHandle,
+    level: Option<&aj_models::ThinkingConfig>,
+) {
+    if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+        editor.set_border_color(editor_border_color_for_thinking(theme, level));
+    }
+}
+
 /// Dispatch a freshly-submitted slash-prefixed line.
 #[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
@@ -654,9 +683,14 @@ async fn handle_slash_command(
             }
         }
         SlashAction::SetThinking(level) => {
-            let mut a = agent.lock().await;
+            {
+                let mut a = agent.lock().await;
+                a.set_default_thinking(level.clone());
+            }
+            // Mirror the change onto the editor's border tint so
+            // the visual cue tracks the active reasoning mode.
+            apply_editor_border_for_thinking(tui, theme, level.as_ref());
             let name = thinking_level_name(&level);
-            a.set_default_thinking(level);
             SlashHandled::Continue {
                 selector: None,
                 notice: Some(format!("Thinking level set to {name}.")),
@@ -795,9 +829,15 @@ async fn handle_selector_outcome(
                 None => SelectorPollOutcome::StillOpen(OpenSelector::Thinking { handle, outcome }),
                 Some(ThinkingSelectorOutcome::Confirmed(level)) => {
                     tui.hide_overlay(&handle);
-                    let mut a = agent.lock().await;
+                    {
+                        let mut a = agent.lock().await;
+                        a.set_default_thinking(level.clone());
+                    }
+                    // Mirror the change onto the editor's border
+                    // tint so the visual cue tracks the active
+                    // reasoning mode.
+                    apply_editor_border_for_thinking(tui, theme, level.as_ref());
                     let name = thinking_level_name(&level);
-                    a.set_default_thinking(level);
                     SelectorPollOutcome::Closed {
                         notice: Some(format!("Thinking level set to {name}.")),
                     }

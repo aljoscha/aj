@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use aj_models::ThinkingConfig;
 use aj_tui::components::editor::EditorTheme;
 use aj_tui::components::markdown::MarkdownTheme;
 use aj_tui::components::select_list::SelectListTheme;
@@ -1164,6 +1165,56 @@ pub fn markdown_theme(theme: &ThemeHandle) -> MarkdownTheme {
 }
 
 // ============================================================================
+// Editor border tints — thinking level / bash mode
+// ============================================================================
+
+/// Map a thinking level onto its dedicated [`ThemeColor`] token.
+///
+/// The mapping escalates visually with the model's reasoning
+/// budget: `None` → muted `Off`; `Low` → soft blue; … →
+/// `XHigh` / `Max` → strong magenta. `Max` is the highest value
+/// the model layer exposes; the JSON theme schema tops out at
+/// `ThinkingXhigh`, so the two highest levels share that tint —
+/// both represent "the strongest reasoning the active model
+/// supports" and the visual cue is the same intent.
+fn thinking_color_token(level: Option<&ThinkingConfig>) -> ThemeColor {
+    match level {
+        None => ThemeColor::ThinkingOff,
+        Some(ThinkingConfig::Low) => ThemeColor::ThinkingLow,
+        Some(ThinkingConfig::Medium) => ThemeColor::ThinkingMedium,
+        Some(ThinkingConfig::High) => ThemeColor::ThinkingHigh,
+        Some(ThinkingConfig::XHigh) | Some(ThinkingConfig::Max) => ThemeColor::ThinkingXhigh,
+    }
+}
+
+/// Build the editor-border closure for a given thinking level.
+///
+/// The returned closure resolves through the shared [`ThemeHandle`]
+/// on each call so a runtime theme reload reskins it without
+/// rebuilding the editor. The host hands the closure to
+/// [`aj_tui::editor_component::EditorComponent::set_border_color`]
+/// whenever the agent's default thinking level changes; the next
+/// render picks up the new tint automatically.
+pub fn editor_border_color_for_thinking(
+    theme: &ThemeHandle,
+    level: Option<&ThinkingConfig>,
+) -> Arc<dyn Fn(&str) -> String> {
+    theme.fg_closure(thinking_color_token(level))
+}
+
+/// Build the editor-border closure for bash quick-command mode.
+///
+/// Reserved for a future bash-mode toggle on the editor; preserved
+/// here alongside [`editor_border_color_for_thinking`] so the
+/// mode → token mapping lives in one file. Renders against the
+/// dedicated `bashMode` palette token (a vivid green in the
+/// bundled themes) so a "press `!` to drop into shell" mode is
+/// instantly visually distinct from thinking-level tints.
+pub fn editor_border_color_for_bash_mode(theme: &ThemeHandle) -> Arc<dyn Fn(&str) -> String> {
+    theme.fg_closure(ThemeColor::BashMode)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1381,6 +1432,127 @@ mod tests {
         assert!(
             (232..=255).contains(&idx),
             "expected grayscale index, got {idx}"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Editor border tints — thinking level / bash mode
+    // ------------------------------------------------------------
+
+    /// Each thinking level (and "off") must route to its dedicated
+    /// `ThemeColor` token. Locks the mapping so a future re-order
+    /// of `ThinkingConfig` variants or a renamed theme token
+    /// surfaces here rather than as a silently-wrong border tint.
+    #[test]
+    fn thinking_color_token_maps_each_level_to_its_token() {
+        assert_eq!(thinking_color_token(None), ThemeColor::ThinkingOff);
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Low)),
+            ThemeColor::ThinkingLow
+        );
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Medium)),
+            ThemeColor::ThinkingMedium
+        );
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::High)),
+            ThemeColor::ThinkingHigh
+        );
+        // `XHigh` and `Max` both top out at the highest tint the
+        // theme schema exposes (`ThinkingXhigh`) — they represent
+        // the same "strongest reasoning available" intent.
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::XHigh)),
+            ThemeColor::ThinkingXhigh
+        );
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Max)),
+            ThemeColor::ThinkingXhigh
+        );
+    }
+
+    /// The thinking-border closure paints with the resolved palette
+    /// token for the requested level. `medium` resolves to dark's
+    /// `#81a2be`, so the painted string must carry that escape.
+    #[test]
+    fn editor_border_color_for_thinking_paints_with_level_token() {
+        let handle = ThemeHandle::new(
+            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
+                .expect("dark.json must parse"),
+        );
+        let paint = editor_border_color_for_thinking(&handle, Some(&ThinkingConfig::Medium));
+        let painted = paint("─");
+        assert!(
+            painted.contains("\x1b[38;2;129;162;190m"),
+            "expected medium thinking tint, got {painted:?}"
+        );
+    }
+
+    /// `None` (i.e. "no thinking") routes to the `ThinkingOff`
+    /// token. Locks the muted-tint default so a future regression
+    /// that mis-routes an unset thinking level surfaces here.
+    #[test]
+    fn editor_border_color_for_thinking_off_paints_with_off_token() {
+        let handle = ThemeHandle::new(
+            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
+                .expect("dark.json must parse"),
+        );
+        let paint = editor_border_color_for_thinking(&handle, None);
+        let painted = paint("─");
+        // Dark's `thinkingOff` resolves to `darkGray` → `#505050`.
+        assert!(
+            painted.contains("\x1b[38;2;80;80;80m"),
+            "expected off-thinking dark-gray tint, got {painted:?}"
+        );
+    }
+
+    /// The hot-reload invariant carries through to the editor
+    /// border: a closure built before a `theme.replace()` must
+    /// paint with the new palette afterwards. This is what makes
+    /// the user-themes fs-watcher cover the editor border without
+    /// any additional plumbing.
+    #[test]
+    fn editor_border_color_picks_up_theme_replace() {
+        let handle = ThemeHandle::new(
+            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
+                .expect("dark.json must parse"),
+        );
+        let paint = editor_border_color_for_thinking(&handle, Some(&ThinkingConfig::High));
+        let before = paint("─");
+        // Dark's `thinkingHigh` resolves to `#b294bb`.
+        assert!(
+            before.contains("\x1b[38;2;178;148;187m"),
+            "expected dark `high` tint before swap, got {before:?}"
+        );
+
+        handle.replace(
+            Theme::from_json_with_mode("light", LIGHT_THEME_JSON, ColorMode::Truecolor)
+                .expect("light.json must parse"),
+        );
+        let after = paint("─");
+        // The escape must differ — the closure resolves through
+        // the shared handle, so the swap is visible immediately.
+        assert_ne!(
+            before, after,
+            "border closure must repaint after theme swap"
+        );
+    }
+
+    /// Bash mode routes to its dedicated palette token regardless
+    /// of thinking level — verifies the helper is wired into the
+    /// `BashMode` token, not folded into the thinking mapping.
+    #[test]
+    fn editor_border_color_for_bash_mode_paints_with_bash_token() {
+        let handle = ThemeHandle::new(
+            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
+                .expect("dark.json must parse"),
+        );
+        let paint = editor_border_color_for_bash_mode(&handle);
+        let painted = paint("─");
+        // Dark's `bashMode` resolves through `green` → `#b5bd68`.
+        assert!(
+            painted.contains("\x1b[38;2;181;189;104m"),
+            "expected bash-mode green tint, got {painted:?}"
         );
     }
 

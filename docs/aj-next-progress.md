@@ -1378,12 +1378,95 @@ adopts independently.
           --all-targets` all pass clean (the only remaining
           warnings are pre-existing in `aj-agent`).
 
-    - [ ] Phase 1.4d.iii: Surface the active thinking level and
+    - [x] Phase 1.4d.iii: Surface the active thinking level and
           bash mode through the editor's border color. Hook the
           editor's [`set_border_color`] off the agent's
           `default_thinking` setter and any future bash-mode
           toggle so `thinking` / `bash` modes are visually
           distinct.
+
+          **`config/theme.rs`:** new helpers
+          [`editor_border_color_for_thinking`] and
+          [`editor_border_color_for_bash_mode`] return an
+          `Arc<dyn Fn(&str) -> String>` closure painted with the
+          appropriate semantic token. The thinking helper takes
+          an `Option<&ThinkingConfig>` and routes via a private
+          `thinking_color_token` mapping that's locked by a
+          dedicated unit test:
+
+          | Level | Token |
+          |---|---|
+          | `None` (off) | `ThinkingOff` |
+          | `Low` | `ThinkingLow` |
+          | `Medium` | `ThinkingMedium` |
+          | `High` | `ThinkingHigh` |
+          | `XHigh` / `Max` | `ThinkingXhigh` |
+
+          `XHigh` and `Max` share the highest tint because the
+          theme schema (and the bundled `dark` / `light` palettes)
+          tops out at `thinkingXhigh` — both represent "the
+          strongest reasoning the active model supports" and the
+          visual cue is the same intent. The bash-mode helper
+          paints with the dedicated `BashMode` token (a vivid
+          green/yellow in the bundled themes) so a future
+          bash-mode toggle is instantly distinct from any
+          thinking tint.
+
+          Both closures resolve through the shared
+          [`ThemeHandle`] on each call so a runtime theme reload
+          (the fs-watcher arm of the main select loop) reskins
+          the border automatically without re-invoking the
+          helper. A `editor_border_color_picks_up_theme_replace`
+          unit test pins that invariant.
+
+          **`modes/interactive.rs`:** new
+          `apply_editor_border_for_thinking` private helper
+          looks up the editor slot via
+          `Tui::get_mut_as::<Editor>(SlotIndex::Editor.idx())`
+          and calls [`EditorComponent::set_border_color`] (the
+          trait method on `aj-tui`'s editor) with the freshly-
+          built closure. Wired into three call sites:
+
+          - On startup, immediately after [`build_layout`],
+            using the agent's initial `default_thinking()` so
+            the TUI comes up with the correct tint.
+          - In the `SlashAction::SetThinking` arm of
+            [`handle_slash_command`] (the `/thinking <level>`
+            short-form path that skips the overlay), after
+            [`Agent::set_default_thinking`] commits the change.
+          - In the [`ThinkingSelectorOutcome::Confirmed`] arm
+            of [`handle_selector_outcome`] (the `/thinking`
+            overlay confirm path), again after
+            [`Agent::set_default_thinking`].
+
+          Both update paths drop the brief
+          `TokioMutex<Agent>` lock before touching the TUI so
+          the `set_border_color` call doesn't hold the agent
+          lock across an editor render-cache invalidation; the
+          closure itself is constructed against a `&ThemeHandle`
+          borrow that lives independently of the agent.
+
+          The `perform_thread_swap` path doesn't update the
+          border: a session swap leaves the agent's default
+          thinking level untouched, so the existing closure
+          stays correct. Bash mode wiring is reserved for a
+          future commit alongside the `!`-prefix bash-mode
+          toggle on the editor; the helper exists today so the
+          mode → token mapping lives in one file once the
+          toggle lands.
+
+          Five new unit tests in `config::theme::tests` cover:
+          the `thinking_color_token` mapping for every
+          `ThinkingConfig` variant plus `None`, the
+          paint-with-level-token happy path (`medium` →
+          `#81a2be`), the off-thinking dark-gray fallback
+          (`None` → `thinkingOff` → `#505050`), the
+          hot-reload-through-replace invariant, and the
+          bash-mode green tint (`#b5bd68`). Total `aj-next`
+          unit tests: 86 (up from 81). `cargo build`, `cargo
+          test -p aj-next`, `cargo fmt`, and `cargo clippy -p
+          aj-next --all-targets` all pass clean (the only
+          remaining warnings are pre-existing in `aj-agent`).
 
 ## Phase 2 — Cutover (§5)
 
