@@ -52,8 +52,9 @@ Otherwise prefer the in-process `agent` tool — it's cheaper and simpler.
    SKILL_DIR/send.py refactor-auth "Now implement the plan; run cargo build."
    ```
    Use `-` as the message to read from stdin (handy for long prompts).
-   Use `--keys C-c` to send raw tmux keys instead (e.g. interrupting a tool).
-   For permission prompts (`Allow this command? (y/n):`) just send `y` or `n`.
+   Use `--keys C-c` to send raw tmux keys instead (e.g. interrupting a tool;
+   note that aj treats Ctrl-C as "quit", so use this to exit, not to abort a
+   single in-flight turn).
 
 5. **Stop** when done:
    ```bash
@@ -74,13 +75,16 @@ Otherwise prefer the in-process `agent` tool — it's cheaper and simpler.
 
 | state | meaning |
 |---|---|
-| `working` | aj is processing (model streaming, tool running, etc) |
-| `awaiting_input` | aj is at the `you:` prompt, ready for a message |
-| `awaiting_permission` | aj is asking `Allow this command? (y/n):` |
+| `working` | aj is processing (model streaming, tool running, etc) — the loader spinner is visible in the pane, or the TUI hasn't finished its first render |
+| `awaiting_input` | aj is idle at the editor prompt, ready for a message |
 | `exited` | the aj process is no longer running in the pane |
 
-`awaiting_input` and `awaiting_permission` are both "needs you" states, and
-`wait.py` wakes on either.
+`awaiting_input` is the only "needs you" state today, and `wait.py` wakes on
+it (and on `exited`). A fourth state, `awaiting_permission`, is reserved
+for a future aj that gates tool execution behind a confirmation prompt; the
+current binary executes tools unconditionally and prints an explicit
+"no sandboxing or permission checks" banner at startup, so the constant
+exists in the registry but is never emitted.
 
 ## Registry
 
@@ -94,6 +98,27 @@ where `<project_slug>` is derived from the current working directory. So:
 tmux sessions are named `aj-sub-<NAME>` — visible in `tmux ls` for debugging.
 You can `tmux attach -t aj-sub-NAME` to watch a sub-agent live (detach with
 `Ctrl-b d`; do not type into it while the orchestrator is also driving it).
+
+## How state is detected
+
+aj is a full inline-rendered TUI (crossterm raw mode, no alternate screen),
+so `tmux capture-pane -p -S -` still captures the chat scrollback. The pane's
+bottom region is re-rendered every frame and looks like:
+
+```
+... chat scrollback ...
+[ optional " ⠺ Working…" spinner row ]
+────────────                          (upper editor rule)
+[ editor body ]
+────────────                          (lower editor rule)
+<model> @ <url>  ·  <cwd>             (footer)
+```
+
+`detect_state` checks for the spinner row (→ `working`) and the editor
+rules (→ `awaiting_input` once the TUI has finished rendering). The
+bottom rows are stripped before `read.py --since-last-send` diffs the
+pre/post-send panes, so the volatile editor/footer area doesn't leak
+into the returned suffix.
 
 ## Tips
 
@@ -115,8 +140,8 @@ adjusting `SKILL_DIR`:
 > - `spawn.py NAME --task "..." --message "..."` — start an agent
 > - `wait.py --any [NAMES...] [--timeout S]` — block until one needs you
 > - `read.py NAME --since-last-send` — read its latest output
-> - `send.py NAME "..."` — reply (or `--keys C-c` to interrupt; `y`/`n` for
->   permission prompts)
+> - `send.py NAME "..."` — reply (or `--keys C-c` to interrupt the
+>   whole session; aj treats Ctrl-C as quit)
 > - `status.py [NAMES...]` — snapshot all sub-agents for this project
 > - `stop.py NAME` — terminate when done (graceful by default)
 >

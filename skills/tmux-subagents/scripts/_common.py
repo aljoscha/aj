@@ -18,16 +18,39 @@ from pathlib import Path
 from typing import Iterable
 
 # ---------------------------------------------------------------------------
-# Detection markers (see skills/tmux-subagents/SKILL.md for rationale).
-# aj is a line-oriented CLI using rustyline + termimad. `tmux capture-pane -p`
-# strips ANSI, so these literal strings appear verbatim in pane snapshots.
+# Detection markers.
+#
+# aj runs as a full inline-rendered TUI (crossterm raw mode + bracketed paste
+# + Kitty keyboard protocol, but no alternate screen — so tmux scrollback
+# still captures the chat history). The pane's bottom region is
+# re-rendered every frame and looks like:
+#
+#     ... chat scrollback (scrolls up into tmux history) ...
+#     [ optional spinner row: " ⠺ Working…" ]
+#     ────────────   (upper editor rule)
+#     [ editor body, may be multi-line ]
+#     ────────────   (lower editor rule)
+#     <model> @ <url>  ·  <cwd>      (footer)
+#
+# So state detection works by looking at the rendered pane content,
+# not the last line: the footer is always last when aj is running.
 # ---------------------------------------------------------------------------
 
-IDLE_RE = re.compile(r"^you: ?$")
-PERMISSION_RE = re.compile(r"^Allow this command\? \(y/n\): ?$")
+# A loader frame from `aj_tui::components::loader` (DEFAULT_FRAMES) followed by
+# the fixed message the event pump shows between AgentStart and AgentEnd.
+WORKING_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+Working…")
+
+# Editor borders are long lines of U+2500 BOX DRAWINGS LIGHT HORIZONTAL.
+# Presence in a pane capture means the TUI has finished its initial render.
+RULE_RE = re.compile(r"^\s*─{8,}\s*$")
 
 STATE_WORKING = "working"
 STATE_AWAITING_INPUT = "awaiting_input"
+# Reserved for a future aj that gates tool execution behind a confirmation
+# prompt; the current binary has no permission flow (it prints an explicit
+# "no sandboxing or permission checks" banner at startup), so `detect_state`
+# never emits this. Kept as a named constant so callers and `AWAITING_STATES`
+# don't have to be rewritten when the state comes back.
 STATE_AWAITING_PERMISSION = "awaiting_permission"
 STATE_EXITED = "exited"
 
@@ -86,11 +109,13 @@ class AgentRecord:
         path.write_text(json.dumps(asdict(self), indent=2))
 
     def mark_send(self) -> None:
-        # Snapshot the full scrollback at send time. read.py --since-last-send
-        # finds this snapshot as a prefix of the current pane and returns the
-        # suffix. We strip trailing blank lines because `capture-pane` pads the
-        # output to the pane's height with empties.
-        snapshot = _strip_trailing_blanks(capture_pane(self.session, history=True))
+        # Snapshot the full scrollback at send time, with the TUI's volatile
+        # bottom region (spinner? + editor rules + editor body + footer)
+        # stripped — those lines are re-rendered every frame and don't form
+        # a stable prefix. read.py --since-last-send finds this stripped
+        # snapshot as a prefix of the (also-stripped) current pane and
+        # returns the suffix.
+        snapshot = _strip_live_area(capture_pane(self.session, history=True))
         (project_dir() / f"{self.name}.last_send.txt").write_text(snapshot)
         (project_dir() / f"{self.name}.last_send").write_text(
             json.dumps({"time": time.time()})
@@ -186,16 +211,19 @@ def capture_pane(session: str, history: bool = False) -> str:
 def send_text(session: str, text: str, submit: bool = True) -> None:
     """Send a message to the aj prompt.
 
-    Newlines in ``text`` are sent as Ctrl-S (rustyline's "insert newline"
-    binding) so the message stays in a single submission. A final Enter
-    submits, unless ``submit`` is False.
+    Newlines in ``text`` are sent as Ctrl-J (a raw LF byte, recognized by
+    ``aj_tui::keys::is_newline_event`` alongside Alt+Enter and Shift+Enter)
+    so the message stays in a single submission. A final plain Enter
+    submits, unless ``submit`` is False — Enter is the default
+    ``tui.input.submit`` binding and isn't claimed by the newline matcher.
     """
     lines = text.split("\n")
     for i, line in enumerate(lines):
         if i > 0:
-            tmux("send-keys", "-t", session, "C-s")
+            tmux("send-keys", "-t", session, "C-j")
         if line:
-            tmux("send-keys", "-t", session, "-l", line)
+            # `--` so tmux doesn't interpret lines beginning with `-` as flags.
+            tmux("send-keys", "-t", session, "-l", "--", line)
     if submit:
         tmux("send-keys", "-t", session, "Enter")
 
@@ -223,13 +251,66 @@ def _strip_trailing_blanks(text: str) -> str:
     return "\n".join(lines)
 
 
-def diff_since_snapshot(current: str, snapshot: str) -> str:
-    """Return the suffix of ``current`` that comes after ``snapshot``.
+def _strip_live_area(pane: str) -> str:
+    """Strip the TUI's volatile bottom render area from a pane capture.
 
-    If ``snapshot`` is no longer a prefix of ``current`` (e.g. it scrolled out
-    of tmux history), fall back to returning ``current`` unchanged.
+    The bottom of the pane is re-rendered on every frame (optional
+    spinner row, two ``────`` editor rules, the editor body, and the
+    footer); those rows don't accumulate in tmux scrollback, so diffing
+    pre/post-send panes only makes sense after dropping them. What's left
+    is the append-only chat scrollback that `read.py --since-last-send`
+    actually wants to compare.
+
+    Layout consumed from the bottom up (each step is best-effort —
+    missing rows are skipped, never fatal):
+
+      trailing blank rows
+      footer (model identifier line)
+      lower editor rule(s)
+      editor body
+      upper editor rule(s)
+      optional spinner row (" ⠺ Working…")
+      blank rows that result
     """
-    cur = _strip_trailing_blanks(current)
+    lines = pane.splitlines()
+    # Trailing blank rows (capture-pane pads to pane height).
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+    # Footer (the model identifier line). Always present once the TUI has
+    # rendered; if it's not there we still want to drop the last row to
+    # stay symmetric with snapshots that did include it.
+    lines.pop()
+    # Lower editor rule (one row; loop guards against re-wrap artefacts).
+    while lines and RULE_RE.match(lines[-1]):
+        lines.pop()
+    # Editor body — walk back until we hit the upper rule.
+    while lines and not RULE_RE.match(lines[-1]):
+        lines.pop()
+    # Upper editor rule.
+    while lines and RULE_RE.match(lines[-1]):
+        lines.pop()
+    # Spinner row (only present while a turn is in flight).
+    if lines and WORKING_RE.search(lines[-1]):
+        lines.pop()
+    # Blank rows left behind by the strip.
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def diff_since_snapshot(current: str, snapshot: str) -> str:
+    """Return the suffix of ``current`` that came after ``snapshot``.
+
+    ``current`` is a raw pane capture; its volatile bottom region is
+    stripped here so it can be compared against the already-stripped
+    ``snapshot`` written by :meth:`AgentRecord.mark_send`. If the
+    snapshot is no longer a prefix (e.g. it scrolled out of tmux
+    history), fall back to a tail-match over the last few snapshot
+    lines, and finally to returning the stripped current unchanged.
+    """
+    cur = _strip_live_area(current)
     snap = _strip_trailing_blanks(snapshot)
     if not snap:
         return cur
@@ -238,7 +319,6 @@ def diff_since_snapshot(current: str, snapshot: str) -> str:
     # Snapshot may have aged out of scrollback. Try a line-based suffix match
     # of the last few snapshot lines instead.
     snap_lines = snap.splitlines()
-    cur_lines = cur.splitlines()
     tail = "\n".join(snap_lines[-10:])
     if tail and tail in cur:
         idx = cur.index(tail) + len(tail)
@@ -247,7 +327,21 @@ def diff_since_snapshot(current: str, snapshot: str) -> str:
 
 
 def detect_state(record: AgentRecord) -> tuple[str, str]:
-    """Return ``(state, last_line)``."""
+    """Return ``(state, last_line)``.
+
+    State machine:
+
+    - foreground command is no longer ``aj``  → :data:`STATE_EXITED`.
+    - pane contains a loader frame (" ⠺ Working…")  → :data:`STATE_WORKING`.
+    - pane contains at least one editor rule  → :data:`STATE_AWAITING_INPUT`
+      (the TUI is fully rendered and idle at the prompt).
+    - otherwise the TUI hasn't finished its first render; report
+      :data:`STATE_WORKING` so callers keep polling instead of trying
+      to send before the editor is up.
+
+    :data:`STATE_AWAITING_PERMISSION` is never emitted by this version;
+    see the constant's docstring.
+    """
     if not session_alive(record.session):
         return STATE_EXITED, ""
     cmd = pane_command(record.session)
@@ -257,10 +351,15 @@ def detect_state(record: AgentRecord) -> tuple[str, str]:
         # Foreground is no longer aj => the binary exited (shell prompt shown).
         # We still consider this "exited" even if the tmux session lingers.
         return STATE_EXITED, last
-    if PERMISSION_RE.match(last):
-        return STATE_AWAITING_PERMISSION, last
-    if IDLE_RE.match(last):
+    has_rule = False
+    for line in pane.splitlines():
+        if WORKING_RE.search(line):
+            return STATE_WORKING, last
+        if not has_rule and RULE_RE.match(line):
+            has_rule = True
+    if has_rule:
         return STATE_AWAITING_INPUT, last
+    # TUI not finished rendering yet; keep callers in their polling loop.
     return STATE_WORKING, last
 
 
