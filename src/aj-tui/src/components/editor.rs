@@ -22,7 +22,6 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ansi::{
     is_punctuation_grapheme, is_whitespace_grapheme, truncate_to_width, visible_width,
-    wrap_text_with_ansi,
 };
 use crate::autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteSession, AutocompleteSuggestions,
@@ -3008,52 +3007,55 @@ impl Component for Editor {
         let mut visual_lines: Vec<VisualLine> = Vec::new();
 
         for (line_idx, line) in self.lines.iter().enumerate() {
-            let wrapped = if line.is_empty() {
-                vec![String::new()]
+            // Use the content-preserving wrapper (the same one
+            // `build_visual_line_map` uses for navigation) so that
+            // trailing spaces typed at the end of a wrapped row are
+            // visible and the visual layout the renderer sees matches
+            // the one cursor navigation sees. Each chunk carries the
+            // exact byte offsets into `line`, so cursor positioning
+            // doesn't need to estimate from `wrapped_line.len()`.
+            let chunks: Vec<(String, usize, usize)> = if line.is_empty() {
+                vec![(String::new(), 0, 0)]
+            } else if visible_width(line) <= layout_width {
+                vec![(line.clone(), 0, line.len())]
             } else {
-                wrap_text_with_ansi(line, layout_width)
+                let segments = self.segment_line(line);
+                word_wrap_line_with_segments(line, layout_width, &segments)
+                    .into_iter()
+                    .map(|c| (c.text, c.start_index, c.end_index))
+                    .collect()
             };
 
-            // Find which wrapped line contains the cursor.
             let cursor_on_this_line = line_idx == self.cursor_line;
-            let mut cursor_byte_remaining = if cursor_on_this_line {
-                Some(self.cursor_col)
-            } else {
-                None
-            };
+            let n_chunks = chunks.len();
 
-            let mut chunk_start = 0;
-            for (i, wrapped_line) in wrapped.iter().enumerate() {
-                let chunk_end = if i < wrapped.len() - 1 {
-                    // Estimate: chunk covers approximately this much of the source line.
-                    chunk_start + wrapped_line.len()
-                } else {
-                    line.len()
-                };
-
+            for (i, (chunk_text, chunk_start, chunk_end)) in chunks.into_iter().enumerate() {
                 let mut has_cursor = false;
                 let mut cursor_vis_col = None;
 
-                if let Some(ref mut remaining) = cursor_byte_remaining {
-                    if *remaining <= chunk_end.saturating_sub(chunk_start) || i == wrapped.len() - 1
-                    {
+                if cursor_on_this_line {
+                    let is_last = i == n_chunks - 1;
+                    // The cursor belongs to the chunk that contains its
+                    // byte offset. End-of-line (cursor exactly at
+                    // `chunk_end`) only counts for the last chunk so a
+                    // cursor sitting on a wrap boundary lands on the
+                    // following chunk, not the trailing edge of the
+                    // previous one.
+                    let in_range = self.cursor_col >= chunk_start
+                        && (self.cursor_col < chunk_end
+                            || (is_last && self.cursor_col <= chunk_end));
+                    if in_range {
                         has_cursor = true;
-                        // Approximate visual column.
-                        let col_in_chunk = (*remaining).min(visible_width(wrapped_line));
-                        cursor_vis_col = Some(col_in_chunk);
-                        cursor_byte_remaining = None;
-                    } else {
-                        *remaining -= chunk_end - chunk_start;
+                        cursor_vis_col = Some(visible_width(&line[chunk_start..self.cursor_col]));
                     }
                 }
 
                 visual_lines.push(VisualLine {
-                    text: wrapped_line.clone(),
+                    text: chunk_text,
                     logical_line: line_idx,
                     has_cursor,
                     cursor_vis_col,
                 });
-                chunk_start = chunk_end;
             }
         }
 

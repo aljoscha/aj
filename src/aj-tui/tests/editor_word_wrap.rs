@@ -16,6 +16,7 @@ use aj_tui::components::editor::Editor;
 use aj_tui::tui::RenderHandle;
 
 use support::plain_lines;
+use support::strip_ansi;
 use support::themes::default_editor_theme;
 
 // ---------------------------------------------------------------------------
@@ -168,8 +169,84 @@ fn preserves_multiple_spaces_within_words_on_the_same_line() {
 }
 
 // ---------------------------------------------------------------------------
-// Edge cases
+// Trailing-whitespace preservation across wrap boundaries
 // ---------------------------------------------------------------------------
+
+/// Regression: typing a trailing space at the end of a wrapped row used
+/// to disappear visually until a non-space character was typed after
+/// it. The render path was wrapping with a trim-end variant that
+/// dropped the trailing space from each wrapped row, so the rendered
+/// row ended on the last non-space character even though the cursor
+/// had advanced past the space.
+#[test]
+fn trailing_space_at_end_of_wrapped_line_is_visible_immediately() {
+    // Width 16 → layout_width 15 (padding_x = 0 reserves one column for
+    // the cursor). Input length 17, ending in a space, so the line
+    // wraps and the wrap split lands at the last interior space —
+    // leaving a chunk that ends with the user-typed trailing space.
+    let mut e = editor_with_text("alpha beta gamma ");
+    let width = 16;
+    let lines = e.render(width);
+    let content = content_rows(&lines);
+
+    // The cursor lives on the row carrying the trailing space; the
+    // user-typed text must appear *before* the cursor cell. Inspect
+    // the prefix of the row before the first reverse-video escape and
+    // assert it ends with the trailing space we typed. Asserting on
+    // the whole row's plain text would be defeated by the right-side
+    // inner padding the editor adds to fill `content_width`.
+    let row = content
+        .iter()
+        .find(|r| r.contains("\x1b[7m"))
+        .expect("expected a content row with a cursor");
+    let cursor_start = row
+        .find("\x1b[7m")
+        .expect("expected a cursor reverse-video escape");
+    let prefix = strip_ansi(&row[..cursor_start]);
+    assert_eq!(
+        prefix, "gamma ",
+        "expected the cursor-row prefix (before the cursor cell) to \
+         end with the trailing space the user typed; got {prefix:?} \
+         from row {row:?}",
+    );
+}
+
+/// Regression companion: cursor at end-of-line stays at the correct
+/// visual column after the trailing space. The cursor cell renders as
+/// a highlighted space — when the underlying space is preserved on the
+/// row, the cursor appears one column past it, not on top of it.
+#[test]
+fn cursor_after_trailing_space_lands_past_the_space() {
+    let mut e = editor_with_text("alpha beta gamma ");
+    let width = 16;
+    let lines = e.render(width);
+
+    // Locate the content row that contains "gamma " — that's the row
+    // the cursor should be on. The cursor cell is `\x1b[7m \x1b[0m`,
+    // so by counting ANSI-stripped chars up to the start of the
+    // reverse-video cell we can verify column placement.
+    let content = content_rows(&lines);
+    let row = content
+        .iter()
+        .find(|r| strip_ansi(r).contains("gamma "))
+        .expect("expected a content row containing 'gamma '");
+
+    // Strip everything from the first reverse-video escape onward, then
+    // measure the visible width of the prefix.
+    let cursor_start = row
+        .find("\x1b[7m")
+        .expect("expected a cursor reverse-video escape in the row");
+    let prefix_visible_width = visible_width(&strip_ansi(&row[..cursor_start]));
+
+    // "alpha beta " is 11 chars and lives on the first wrap chunk.
+    // "gamma " is 6 chars on the second chunk. The cursor sits at the
+    // column right after the trailing space — column 6.
+    assert_eq!(
+        prefix_visible_width, 6,
+        "expected cursor at visible column 6 on the trailing-space row, \
+         got column {prefix_visible_width}; row = {row:?}",
+    );
+}
 
 #[test]
 fn renders_empty_input_as_border_plus_single_content_row() {
