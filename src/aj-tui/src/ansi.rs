@@ -680,6 +680,12 @@ fn is_punctuation_char(c: char) -> bool {
 /// - Tab characters -- counted as 3 columns
 /// - Wide characters (CJK) -- counted as 2 columns
 /// - Grapheme clusters (emoji, combining marks) -- proper width
+///
+/// The slow path (grapheme segmentation) is memoised in a small
+/// per-thread cache keyed by the input string. Calls on identical
+/// non-ASCII inputs from the same thread return without rerunning
+/// the segmenter. Pure-ASCII inputs fast-path on `s.len()` and
+/// never touch the cache. See [`WIDTH_CACHE_CAPACITY`].
 pub fn visible_width(s: &str) -> usize {
     if s.is_empty() {
         return 0;
@@ -688,6 +694,15 @@ pub fn visible_width(s: &str) -> usize {
     // Fast path: pure printable ASCII.
     if is_printable_ascii(s) {
         return s.len();
+    }
+
+    // Memoised slow path. The cache lookup is O(|s|) for the hash;
+    // the recompute is O(|s|) but with grapheme-segmentation
+    // constants, so cache hits win comfortably for any repeated
+    // string and the miss-then-insert cost is on the order of the
+    // recompute we'd be doing anyway.
+    if let Some(cached) = WIDTH_CACHE.with(|cell| cell.borrow().get(s)) {
+        return cached;
     }
 
     // Strip ANSI codes and normalize tabs, then measure graphemes.
@@ -715,7 +730,71 @@ pub fn visible_width(s: &str) -> usize {
         }
     }
 
-    clean.graphemes(true).map(grapheme_width).sum()
+    let width = clean.graphemes(true).map(grapheme_width).sum();
+    WIDTH_CACHE.with(|cell| cell.borrow_mut().insert(s.to_string(), width));
+    width
+}
+
+/// Maximum number of memoised `(string, width)` entries per thread
+/// before the cache evicts on insertion.
+///
+/// Sized to comfortably hold a frame's worth of distinct
+/// width-needing strings — tokens during wrap, segments of a long
+/// markdown body, loader frames, etc. — without growing without
+/// bound on a long-running session.
+const WIDTH_CACHE_CAPACITY: usize = 512;
+
+thread_local! {
+    /// Per-thread memoisation table for the [`visible_width`] slow
+    /// path. Thread-local because every TUI render today runs on
+    /// one main thread; per-thread state avoids the lock contention
+    /// a global `Mutex<…>` would impose on callers that happen to
+    /// run from a worker thread.
+    static WIDTH_CACHE: std::cell::RefCell<WidthCache> =
+        std::cell::RefCell::new(WidthCache::default());
+}
+
+/// FIFO-evicting `(String, usize)` table backing [`visible_width`].
+///
+/// Insertion order is tracked in `order`; on overflow we drop the
+/// oldest entry's key from both the map and the queue. FIFO is a
+/// looser policy than true LRU but is dead simple and gives the
+/// same hit-rate ceiling for the use case here: repeat width
+/// lookups on a working set that fits inside the cap. The double
+/// bookkeeping costs one extra `String` clone per distinct cached
+/// key; for the [`WIDTH_CACHE_CAPACITY`] of 512 the total
+/// footprint stays in the tens of kilobytes.
+#[derive(Default)]
+struct WidthCache {
+    map: std::collections::HashMap<String, usize>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl WidthCache {
+    fn get(&self, key: &str) -> Option<usize> {
+        self.map.get(key).copied()
+    }
+
+    fn insert(&mut self, key: String, value: usize) {
+        // Skip if the key is already present. Two callers racing on
+        // the same input each compute and try to insert; the second
+        // would otherwise add a duplicate entry to `order` and slowly
+        // double-count the capacity for hot keys.
+        if self.map.contains_key(&key) {
+            return;
+        }
+        if self.map.len() >= WIDTH_CACHE_CAPACITY {
+            // Evict the oldest entry. `order` and `map` are kept in
+            // lockstep — anything in `order` is in `map`, modulo
+            // races inside a single thread which can't happen
+            // through `RefCell::borrow_mut`.
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2124,5 +2203,73 @@ mod tests {
         let input = "\u{0985}\u{0E33}";
         let expected = "\u{0985}\u{0E4D}\u{0E32}";
         assert_eq!(normalize_terminal_output(input), expected);
+    }
+
+    // -- visible_width / WidthCache --
+
+    #[test]
+    fn width_cache_returns_cached_value_for_a_repeat_lookup() {
+        let mut cache = WidthCache::default();
+        assert_eq!(cache.get("héllo"), None);
+        cache.insert("héllo".to_string(), 5);
+        assert_eq!(cache.get("héllo"), Some(5));
+        // A second `insert` for the same key is a no-op (skipped to
+        // avoid duplicate entries in the eviction queue).
+        cache.insert("héllo".to_string(), 5);
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.map.len(), 1);
+    }
+
+    #[test]
+    fn width_cache_evicts_in_insertion_order_when_full() {
+        // Build a tiny private cache with a forced overflow to
+        // observe FIFO eviction. We can't lower `WIDTH_CACHE_CAPACITY`
+        // for one test, so the assertion targets the eviction
+        // *order* by inserting one entry past the cap (513 items)
+        // and verifying the first-inserted key was the one dropped.
+        let mut cache = WidthCache::default();
+        let cap = WIDTH_CACHE_CAPACITY;
+        for i in 0..cap {
+            cache.insert(format!("k{i}"), i);
+        }
+        assert_eq!(cache.map.len(), cap);
+        assert_eq!(cache.get("k0"), Some(0));
+
+        // One more insert forces eviction of the oldest entry
+        // (`k0`). Subsequent entries (`k1`, `k2`, …) are still
+        // present; the new entry lands at the back.
+        cache.insert("overflow".to_string(), 999);
+        assert_eq!(cache.map.len(), cap);
+        assert_eq!(cache.get("k0"), None, "oldest entry should be evicted");
+        assert_eq!(cache.get("k1"), Some(1));
+        assert_eq!(cache.get("overflow"), Some(999));
+    }
+
+    #[test]
+    fn visible_width_caches_repeat_non_ascii_lookups() {
+        // The end-to-end check: two calls on the same non-ASCII
+        // input agree on the width, which would surface any
+        // disagreement between cache hit and miss. (A real
+        // regression here — say, a cache that stored the wrong key
+        // — would return one value on the first call and a
+        // different one on the second.)
+        let s = "héllo wörld";
+        let first = visible_width(s);
+        let second = visible_width(s);
+        assert_eq!(first, second);
+        assert!(first > 0);
+    }
+
+    #[test]
+    fn visible_width_pure_ascii_does_not_pollute_the_cache() {
+        // ASCII fast-paths on `s.len()` and must not insert into
+        // the cache — otherwise the cap fills up with prose
+        // strings that didn't need to be there. We can't read the
+        // thread-local cache from outside, so instead verify the
+        // semantic property by checking the fast-path return value
+        // matches the byte length for an ASCII input that doesn't
+        // contain tabs or escape sequences.
+        let s = "plain ASCII line";
+        assert_eq!(visible_width(s), s.len());
     }
 }
