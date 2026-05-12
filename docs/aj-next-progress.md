@@ -2128,6 +2128,462 @@ adopts independently.
 
 ---
 
+## Phase 6 — `Provider` trait + unified types migration (§ models-progress 16–18)
+
+> **Bridge to `docs/models-progress.md`.** Steps 16/17/18 there
+> describe the same migration: switch `aj-agent`'s inference loop
+> off the legacy `aj_models::Model` trait, the
+> `aj_models::streaming::StreamingEvent` enum, and the
+> `aj_models::messages::*` wire types, and onto the unified
+> [`aj_models::provider::Provider`] /
+> [`aj_models::streaming::AssistantMessageEvent`] /
+> [`aj_models::types::*`] surface specified in
+> `docs/models-spec.md`. The Phase 0–2 work above intentionally
+> left this migration for last because the binary, persistence
+> layer, and test harness all needed to be built (and stabilized
+> on real on-disk data) first. With cutover complete, the legacy
+> wire surface is the only thing standing between us and the
+> models-spec end state.
+>
+> **This is the active section.** Phase 0/1/2 above are done and
+> intentionally not re-litigated; pick the next unchecked item
+> below. Once 6.9 lands, tick steps 16/17/18 in
+> `models-progress.md`.
+
+### Goals
+
+After Phase 6 lands:
+
+- `aj-models::lib` carries only `pub mod` declarations and the
+  shared error type. No `Model` trait, no `create_model`, no
+  `ModelArgs`, no `Model`-shaped re-exports.
+- `aj-models::streaming` carries only the unified
+  `AssistantMessageEvent` / `AssistantMessageEventStream` types
+  (plus the `DoneReason` / `ErrorReason` helpers that ride on
+  them). The legacy `StreamingEvent` enum is gone.
+- `aj-models::messages` is gone; its types either move into a
+  renamed `aj-models::wire` module or are absorbed into
+  `aj-models::types`. Decision deferred to step 6.9 — see the
+  "Architectural choices" subsection.
+- `aj-models::{anthropic,openai}::legacy` modules are deleted.
+  The new `aj-models::anthropic::provider` and the three OpenAI
+  provider impls (`openai::completions`, `openai::responses`,
+  `openai::codex`) operate on `aj_models::types::*` end-to-end —
+  no `crate::messages::` imports.
+- `aj-agent::Agent` holds an `Arc<dyn Provider>` plus an
+  `Arc<ModelInfo>` instead of an `Arc<dyn Model>`. The inference
+  loop consumes `AssistantMessageEvent` (with `partial:
+  AssistantMessage` snapshots on every event, per the unified
+  protocol) rather than walking `StreamingEvent` deltas. Per
+  `docs/models-spec.md` §2 every event already carries a
+  coherent `partial: AssistantMessage` snapshot, so the agent
+  doesn't have to maintain its own delta accumulator. The
+  transcript stays serialized as `Vec<MessageParam>` (so on-disk
+  JSONL is unchanged) and projects to
+  `Vec<aj_models::types::Message>` once per inference.
+- The binary's three `create_model(ModelArgs { ... })` call sites
+  (`aj/src/modes/interactive.rs` startup and `/model` swap,
+  `aj/src/modes/print.rs` startup) build the provider handle via
+  `aj_models::registry::ModelRegistry::load()` plus
+  `aj_models::provider::provider_for(&model_info.api)`.
+- `ScriptedModel` is replaced by a `ScriptedProvider` implementing
+  the new `Provider` trait. The demos catalog (`scripted/demos.rs`)
+  ports over; `aj-agent::event_protocol_tests`,
+  `aj/tests/replay_parity.rs`, and the `--scripted` CLI flag all
+  drive the new provider.
+
+### Out of scope
+
+- **On-disk persistence format change.** `aj-session` continues to
+  write `ConversationEntryKind::Message(MessageParam)` and
+  `ConversationEntryKind::ToolResult { content, details }` JSONL
+  exactly as today. The agent's in-memory transcript shape stays
+  `Vec<MessageParam>` for ergonomics and on-disk compat. A future
+  migration could replace the transcript with the tagged-union
+  `Vec<aj_models::types::Message>` shape plus a one-shot walker
+  like the one in `aj-session::migrate`, but that's a separate
+  piece of work decoupled from the provider flip.
+- **`AgentMessage` extension layer.** A future iteration may
+  want a custom-message extension surface so frontends can stash
+  UI-only rows (bash-execution display, compaction summaries,
+  branch summaries) in the transcript without sending them to the
+  model. We don't need this in Phase 6; the projection helper
+  introduced in step 6.5 makes it trivial to add later by growing
+  `convert_to_llm` into a user-injectable hook.
+- **`transformContext` / `prepareNextTurn` / `getApiKey` hooks.**
+  Reserved for later — `docs/aj-next-plan.md` §7 already flags
+  them as deferred. Same shape applies: each can become an
+  optional callback on `AgentOptions` without changing the inference
+  loop's contract.
+
+### Decomposition (atomic commits, in dependency order)
+
+Each step is independent: the binary and its test suite stay
+working between steps, and no step needs the next one to be useful.
+The order is bottom-up: clean up the providers, build the scripted
+impl, swap the agent's internals, swap the binary's call sites,
+then delete the corpses. Audit details (line numbers, call sites,
+import paths) are summarized inline; full audit is in the
+session notes for the planning commit.
+
+- [ ] **6.1: Anthropic provider off `crate::messages`.** Migrate
+       `aj-models::anthropic::provider` to operate on
+       `aj_models::types::*` exclusively. Today's provider imports
+       `MessageParam`, `ContentBlockParam`, `Role`, etc. at
+       `provider.rs:13` and threads them through the wire encoder
+       (lines 284, 285, 302, 319, 321, 344, 388, 399, 417, 444,
+       600, 603); each of those sites converts to or from
+       `aj_models::types::Message` instead. The provider's public
+       API (the `Provider` trait method) doesn't change — the
+       conversions are internal. Round-trip tests in
+       `tests/roundtrip/anthropic.rs` must pass unchanged. Adds
+       a `aj_models::types::message_param_to_message` /
+       `message_to_message_param` private helper for the
+       conversion; the tagged-union `Message::{User, Assistant,
+       ToolResult}` shape maps cleanly onto our flat
+       `MessageParam { role, content }` via a role-discriminator
+       switch (assistant blocks → `AssistantMessage`, user-role
+       tool_result blocks → one `Message::ToolResult` per
+       `tool_use_id`, everything else → `UserMessage`).
+
+- [ ] **6.2: OpenAI providers off `crate::messages`.** Same
+       migration for `openai::completions`, `openai::responses`,
+       and `openai::codex`. The three OpenAI providers share a
+       lot of conversion code through `pub(super)` helpers (most
+       of which sit in `responses.rs`); touch all three together
+       in one commit to avoid leaving a half-migrated `super`
+       boundary inside the `openai` module. Round-trip suites in
+       `tests/roundtrip/openai*.rs` (chat completions, responses,
+       codex responses, cross-provider transforms) must pass
+       unchanged. The `transform.rs` module also imports from
+       `crate::messages::` — flip those imports in the same
+       commit (it's a single-file rewrite using the helpers from
+       6.1).
+
+- [ ] **6.3: `ScriptedProvider`.** New
+       `aj-models::scripted::provider` module implementing the
+       `Provider` trait against `AssistantMessageEventStream`.
+       Scripts continue to be authored as `Vec<ScriptStep>` but
+       each step now carries an `AssistantMessageEvent` instead
+       of a `StreamingEvent`; the step's `delay` semantics stay
+       the same (pre-emit sleep). The demo helpers in
+       `scripted/demos.rs` (`text_only`, `thinking_then_text`,
+       `tool_use_then_result`, etc.) port over one by one. The
+       provider also gains a `Vec<AssistantMessage>` "final
+       message script" mode where it auto-generates the
+       `Start`/`*Start`/`*Delta`/`*End`/`Done` event sequence
+       from a static `AssistantMessage` (deltas are chunked off
+       the message's text blocks at a configurable token size).
+       Saves test authors from writing per-token deltas when
+       they only care about the agent's behaviour on the
+       finalized message — useful for the bulk of
+       `event_protocol_tests`'s scripts, which set the message
+       and don't care about live streaming shape.
+
+       Legacy `ScriptedModel` stays alive in parallel for now;
+       only its dependents migrate in step 6.8. The two impls
+       share the demo authoring vocabulary
+       (`Script::with_text_only(...)`, etc.) so we can lift
+       most demos without rewriting them.
+
+- [ ] **6.4: `LegacyProviderAdapter` (internal compat shim).**
+       New `aj-models::compat` module (gated on `#[doc(hidden)]`
+       and not re-exported from the crate root) housing a
+       `LegacyProviderAdapter` that wraps an `Arc<dyn Model>` and
+       implements `Provider`. The adapter transcodes the
+       legacy `StreamingEvent` stream into
+       `AssistantMessageEvent`s by holding an
+       `AssistantMessage` builder it clones into each event's
+       `partial:` slot (the legacy stream doesn't carry coherent
+       partials, so the adapter synthesizes them).
+
+       Mapping:
+       - `MessageStart { message }` → `Start { partial }` after
+         seeding the builder with the model/api/provider fields.
+       - `MessageDelta { content_block_index, delta }` →
+         `TextDelta` / `ThinkingDelta` / `ToolCallDelta`
+         depending on the block kind at that index in the
+         builder.
+       - `MessageContentBlockStart` / `MessageContentBlockEnd` →
+         the matching `*Start` / `*End` event variants.
+       - `UsageUpdate { usage }` updates the builder's
+         `usage` field; no separate event.
+       - `FinalizedMessage { message }` →
+         `Done { reason: message.stop_reason, message }`.
+       - `Error { error }` →
+         `Error { reason: classify_error(&error), error: synthesized }`
+         where the synthesized message captures the builder's
+         current state plus the error message.
+
+       The adapter is the bridge that lets step 6.5 (Agent
+       runs on `Provider`) land before steps 6.6–6.8 (binary
+       call sites + scripted + sub-agents) finish migrating. By
+       step 6.9 every adapter call site is gone and the module
+       is deleted along with the legacy types it bridges.
+
+- [ ] **6.5: `Agent` inference loop on `Provider`.** Replace
+       `Agent::model: Arc<dyn Model>` with
+       `Agent::provider: Arc<dyn Provider>` plus
+       `Agent::model_info: Arc<ModelInfo>`. The inference loop in
+       `aj-agent/src/lib.rs` (roughly lines 579–733 today)
+       rewrites to consume `AssistantMessageEvent` and project
+       tool calls off the finalized `AssistantMessage.content`
+       (filtering for `ToolCall` blocks). Per inference, the
+       agent calls a new private helper
+       `agent::projection::transcript_to_messages(transcript:
+       &[MessageParam]) -> Vec<aj_models::types::Message>` to
+       project the transcript, then builds a `Context` and
+       `StreamOptions` and calls `provider.stream_simple(...)`.
+
+       The streaming loop replaces today's `StreamingEvent`
+       match (lib.rs:579-733) with the unified match:
+       - `Start { partial }` — initialize the in-progress
+         `AssistantMessage`. No on-bus event yet; the existing
+         `StreamChunk { channel: ..., action: Start }` events
+         fire on the first `*Start` event for each channel.
+       - `TextStart` / `TextDelta` / `TextEnd` — emit
+         `StreamChunk { channel: Text, action: ... }`.
+       - `ThinkingStart` / `ThinkingDelta` / `ThinkingEnd` —
+         emit `StreamChunk { channel: Thinking, action: ... }`.
+       - `ToolCallStart` / `ToolCallDelta` / `ToolCallEnd` —
+         update an in-flight `ToolDetails` snapshot per call
+         (live argument echo). The existing `ToolExecutionStart`
+         event fires on the first delta, `ToolExecutionUpdate`
+         on subsequent ones, `ToolExecutionEnd` on the End.
+       - `Done { reason, message }` — finalize. Build a
+         `MessageParam` from `message`'s blocks, append it to
+         the transcript, emit `MessagePersisted::Assistant`,
+         then drive the tool batch off `message.content`'s
+         `ToolCall` blocks.
+       - `Error { reason, error }` — `TurnError::Recoverable`
+         or `TurnError::Aborted` depending on `reason`.
+
+       `Agent::new(...)` keeps its public signature (still takes
+       `Arc<dyn Model>`) but immediately wraps it in
+       `LegacyProviderAdapter` from step 6.4, plus constructs a
+       synthetic `ModelInfo` from `model.model_name()` /
+       `model.model_url()` so the new internal state is
+       complete. `Agent::set_model(...)` does the same. This
+       lets the binary and tests keep passing legacy-shaped
+       handles for one more step.
+
+       Per-turn `TurnUsage` events continue to fire from the
+       finalized message's `usage` field (which the unified
+       `AssistantMessage` carries directly per the unified
+       protocol).
+
+       Tests: `aj-agent::event_protocol_tests` continues to
+       drive `ScriptedModel` through the adapter. The locked
+       event sequences must not regress — that's the contract
+       the existing `EventLabel`-stamped snapshot tests
+       enforce, and it's the strongest signal that the
+       provider flip didn't shift any observable agent
+       behaviour.
+
+- [ ] **6.6: Binary builds `Provider` directly.** Replace the
+       three `create_model(ModelArgs {...})` call sites (two in
+       `aj/src/modes/interactive.rs` — startup line 142, /model
+       swap line 1033 — and one in `aj/src/modes/print.rs` line
+       147) with a unified `aj/src/model.rs` helper that:
+       1. Loads `ModelRegistry::load()` once at startup.
+       2. Resolves `(api, model_name)` against the registry to
+          a concrete `ModelInfo`. If `model_name` is `None`,
+          picks the registry's default for the api.
+       3. Calls `aj_models::provider::provider_for(&model_info.api)`
+          to obtain a `Box<dyn Provider>` and wraps it in an
+          `Arc`.
+       4. Reads the appropriate API key via
+          `aj_models::auth::find_env_keys(&model_info.provider)`
+          and stamps it onto `StreamOptions::api_key` along with
+          any `Speed`-driven beta headers.
+       5. Hands `(provider, model_info, options)` to
+          `Agent::new(...)` via a new constructor variant
+          `Agent::with_provider(...)` that takes the unified
+          shape.
+
+       Both legacy `Agent::new(Arc<dyn Model>, ...)` and the
+       new `Agent::with_provider(...)` stay alive for one more
+       commit; step 6.7 drops the legacy one. The `--scripted`
+       flag stays on `Arc<dyn Model>` for now — step 6.8 ports
+       it onto `ScriptedProvider` directly.
+
+       Catches: `Speed`-driven beta header plumbing currently
+       lives inside `aj-models::anthropic::legacy::AnthropicModel::new`
+       (it stamps the `anthropic-beta` header on the SDK
+       client). After 6.6 it has to flow through
+       `StreamOptions` instead; the Anthropic provider already
+       reads `StreamOptions::extra_headers` per
+       `models-spec.md` §6.2. The migration moves the existing
+       header build into the binary's `aj/src/model.rs` helper
+       (it's a 3-line `if let Some(speed) = speed { ... }`
+       block).
+
+- [ ] **6.7: `Agent::new` drops `Arc<dyn Model>`.** Remove the
+       legacy `Agent::new(model: Arc<dyn Model>, ...)`
+       constructor; `Agent::with_provider(...)` becomes the only
+       way in. Internal `LegacyProviderAdapter` usage inside
+       `Agent` goes away (no callers wrap legacy handles anymore).
+       Doc cleanup on `Agent::model()` / `Agent::set_model()`
+       — both rename to `model_info()` / `set_model_info(...)`
+       (or keep `model()` returning `&ModelInfo`; decide at
+       implementation time based on call-site noise).
+       `SessionContextWrapper::model: Arc<dyn Model>` in
+       `lib.rs:1246` flips to `Arc<dyn Provider> +
+       Arc<ModelInfo>` so sub-agent spawning threads the same
+       handle — sub-agents share the parent's provider
+       (matching the existing parent-bus / parent-cancellation
+       sharing pattern in `aj-next-plan.md` §1.6).
+
+       After this step, the only remaining caller of the legacy
+       `Model` trait is `ScriptedModel`'s impl block and the
+       test fixtures that build it. Those go in 6.8.
+
+- [ ] **6.8: Tests + `--scripted` flag onto `ScriptedProvider`.**
+       Migrate every test fixture that built `ScriptedModel`
+       scripts (`aj-agent::event_protocol_tests`,
+       `aj/tests/replay_parity.rs`, the scripted-demo eyeballing
+       tests) onto `ScriptedProvider` + `AssistantMessageEvent`
+       script steps. The `aj/src/scripted.rs` resolver returns
+       `(Arc<dyn Provider>, Arc<ModelInfo>)` instead of
+       `Arc<dyn Model>`; the `--scripted` CLI flag plumbs the
+       pair through to `Agent::with_provider(...)` exactly like
+       6.6 does for real providers.
+
+       Watchpoints:
+       - `replay_parity.rs` builds a `ScriptedModel` with one
+         fixed `StreamingEvent::FinalizedMessage` carrying a
+         single tool-use block. Under the new shape this becomes
+         a single `Done { message }` event. The test's
+         `ExhaustedBehavior::Panic` semantics carry over.
+       - The `--scripted` CLI flag's demo library (`text_only`,
+         `tool_use_demo`, `thinking_demo`, etc. in
+         `scripted/demos.rs`) ports each demo to the new event
+         shape. Most demos already specify deltas, so the
+         translation is mechanical: `MessageStart` → `Start`,
+         per-block deltas split into `*Start` / `*Delta` /
+         `*End` per the unified protocol.
+
+       After this step, **no production or test code calls
+       `aj_models::Model` / `aj_models::create_model` /
+       `aj_models::messages::*` / `aj_models::streaming::StreamingEvent`
+       directly.** The legacy types are reachable only through
+       `aj-models`'s own internal modules (which 6.9 deletes).
+
+- [ ] **6.9: Delete legacy.** With every call site migrated,
+       delete in one commit:
+       - The `Model` trait, `create_model`, `ModelArgs`, and
+         `ModelError` (if no other crate uses it) from
+         `aj-models::lib`.
+       - `aj-models::anthropic::legacy` and
+         `aj-models::openai::legacy` modules and their
+         `pub mod legacy;` declarations in `anthropic.rs` /
+         `openai.rs`. The `AnthropicModel` / `OpenAiModel`
+         re-exports go with them.
+       - `aj-models::streaming::StreamingEvent` enum. The
+         supporting types (`DoneReason` / `ErrorReason`) stay —
+         they're used by the unified protocol.
+       - The legacy `ScriptedModel` impl in
+         `aj-models::scripted` (its `impl Model` block, the
+         `StreamingEvent`-based `ScriptStep` shape, and the
+         legacy demo helpers). The `ScriptedProvider` from 6.3
+         keeps the demo catalog under its new event shape.
+       - The internal `LegacyProviderAdapter` from 6.4 and the
+         `aj-models::compat` module.
+       - `aj-models::messages` module. **Decision deferred to
+         this step:** either rename it to `aj-models::wire`
+         (preserving `MessageParam` / `ContentBlockParam` / etc.
+         as the on-disk + agent-transcript currency, separate
+         from the tagged-union `aj-models::types::Message`),
+         or absorb the types into `aj-models::types` under a
+         new `wire` submodule. Recommended: rename to `wire` —
+         it keeps the role-of-the-types clear (on-disk + agent
+         transcript) and avoids a single module owning two
+         distinct conceptual shapes. Update every import path
+         across `aj-agent`, `aj-session`, `aj-tools`, and `aj`
+         in the same commit; the audit identified the exact
+         lines.
+       - Doc comments referencing removed types in
+         `aj/src/cli/args.rs:53,60`,
+         `aj/src/scripted.rs:7,13`,
+         `aj/src/modes/interactive/components/model_selector.rs:247,263`,
+         `aj-agent/src/events.rs:286,323`,
+         `aj-agent/src/types.rs:26`,
+         `aj/src/modes/interactive/event_pump.rs:884`.
+
+       Then tick steps 16/17/18 in `models-progress.md`.
+
+### Architectural choices (decided up front)
+
+- **`Agent` transcript stays `Vec<MessageParam>`.** Keeps the
+  on-disk JSONL format unchanged (`aj-session` writes
+  `ConversationEntryKind::Message(MessageParam)` directly). The
+  agent owns a private
+  `convert_to_llm(transcript: &[MessageParam]) -> Vec<types::Message>`
+  helper called once per inference. Future work can replace
+  this with a richer `AgentMessage` enum and a user-injectable
+  `convert_to_llm` hook without disturbing the
+  6.x steps. The projection is mechanical:
+  `MessageParam { role: User, content }` →
+  `Message::User(UserMessage { ... })` filtering tool-result
+  blocks out into one `Message::ToolResult` per block;
+  `MessageParam { role: Assistant, content }` →
+  `Message::Assistant(AssistantMessage { ... })`.
+
+- **Provider lookup is per-`Agent`, not per-inference.** The
+  agent holds an `Arc<dyn Provider>` constructed once at startup
+  (or once per `/model` swap). A per-inference lookup indirection
+  (`(model, context, options) -> EventStream` closure) is
+  flexible but overkill for our current capabilities — we don't
+  have an in-process model registry that resolves providers per
+  inference, and reusing the constructed provider avoids
+  re-allocating the underlying SDK client on every turn. If we
+  ever need OAuth-refresh-per-call (per `models-spec.md` §9.4),
+  it can ride through `StreamOptions::api_key` without
+  re-architecting the provider handle.
+
+- **Tool results stay folded into the wire `MessageParam`
+  flow.** `aj-session` already round-trips
+  `ConversationEntryKind::ToolResult { content, details }` with
+  the structured `ToolDetails` map (per the Resume Fidelity
+  follow-up steps 1–6 below). The provider-facing projection
+  in 6.5 surfaces these as `aj_models::types::Message::ToolResult`
+  entries — one per `tool_use_id` — when building the per-
+  inference `Context`. The agent's own state shape doesn't
+  change; the projection helper does the encoding. This matches
+  the unified-types contract in `docs/models-spec.md` §1.2,
+  where `ToolResultMessage` is a top-level message variant
+  rather than a content block inside a user message.
+
+- **`StreamingEvent` → `AssistantMessageEvent` mapping (only
+  used inside `LegacyProviderAdapter`).** Detailed in step 6.4.
+  The adapter's transcoder is the only place the legacy
+  protocol meets the new one; once 6.7 / 6.8 land, the adapter
+  becomes unreachable from production code and 6.9 deletes it.
+
+- **`messages` → `wire`, not `messages` → `types`.** Keeping
+  `MessageParam` (flat `{ role, content }`) separate from
+  `types::Message` (tagged union of three message kinds)
+  matches the natural division: `MessageParam` is the wire
+  *for our persisted transcript*, while `types::Message` is
+  the wire *for provider inference*. Conflating them today
+  would force a JSONL format migration that's deliberately
+  out of scope for Phase 6.
+
+### Empirical references
+
+- A legacy-type audit (line numbers, call sites, import paths
+  for every `aj_models::Model`, `create_model`, `StreamingEvent`,
+  `messages::*`, and `legacy::*` reference across the workspace)
+  was captured during the planning step. The line-number
+  pointers in each sub-step above were drawn from that audit.
+- The streaming-event protocol and per-event `partial:
+  AssistantMessage` contract are defined in
+  `docs/models-spec.md` §2.
+- The provider trait contract is defined in
+  `docs/models-spec.md` §5.
+
+---
+
 ## Reconnaissance findings — `UserOutput` → `ToolDetails` migration
 
 Empirical sample taken from `~/.aj/threads/aj/` and

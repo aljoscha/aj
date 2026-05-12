@@ -357,7 +357,7 @@ this file is the bridge between the spec and the git history.
 - [x] 9. Message transformation (`aj-models::transform`) — §8
 - [x] 10. Partial JSON parser — §11.1
 - [x] 11. Error classification & overflow detection (`aj-models::errors`) — §1.3, §10
-- [ ] 11b. Round-trip test suite (`src/aj-models/tests/roundtrip/`) — §1.10, §12
+- [x] 11b. Round-trip test suite (`src/aj-models/tests/roundtrip/`) — §1.10, §12
    - [x] 11b.i. Scaffolding + Anthropic Messages: parse, serialize, semantic round-trip
    - [x] 11b.ii. OpenAI Chat Completions: parse, serialize, semantic round-trip
    - [x] 11b.iii. Cross-provider transform tests (one per direction)
@@ -372,19 +372,17 @@ this file is the bridge between the spec and the git history.
 
 ## Phase 6: Integration
 
-> **Note for future sessions:** steps 16–18 are being executed as the
-> concrete commit-by-commit rollout in `docs/aj-next-plan.md` §2
-> (Phase 0 — refactor the core), tracked in
-> `docs/aj-next-progress.md`. The aj-next plan decomposes step 16
-> (`Update aj-agent`) into ~6 atomic commits — contract types →
-> tool migrations → bus → flip → split loop → cleanup — each of
-> which keeps the `aj` binary byte-identical along the way.
-> Models-spec step 16 itself acknowledges this dependency: "if [the
-> aj-session extraction] lands first, `aj-agent` no longer touches
-> `ConversationLog` directly and this step has nothing to update on
-> the persistence path." Pick the next item from
-> `aj-next-progress.md`; check 16/17/18 off here once §2.4–§2.6 of
-> the aj-next plan land.
+> **Note for future sessions:** steps 16–18 are being executed as
+> the concrete commit-by-commit rollout in **`docs/aj-next-progress.md`
+> Phase 6** (`Provider` trait + unified types migration). The
+> Phase 0–2 work in `aj-next-progress.md` already landed and left
+> the binary working but still riding on the legacy `Model` /
+> `StreamingEvent` / `crate::messages::*` surface; Phase 6
+> decomposes the remaining migration into 9 atomic commits
+> (provider cleanup → scripted impl → legacy adapter → agent
+> internals → binary call sites → final deletion). Pick the next
+> unchecked item from `aj-next-progress.md` Phase 6; tick 16/17/18
+> off here once step 6.9 lands.
 
 - [ ] 16. Update `aj-agent` — migrate to new types and streaming
       (executed via aj-next §2.0–§2.5; see `aj-next-progress.md`)
