@@ -1544,15 +1544,14 @@ mod event_protocol_tests {
     use std::sync::Mutex;
 
     use aj_conf::AgentEnv;
-    use aj_models::compat::{synthetic_model_info, LegacyProviderAdapter};
-    use aj_models::messages::{
-        ContentBlock, ContentBlockParam, Message as LegacyMessage, MessageType, Role, StopReason,
-        Usage,
-    };
+    use aj_models::messages::ContentBlockParam;
     use aj_models::provider::Provider;
-    use aj_models::scripted::{ExhaustedBehavior, ScriptedModel};
-    use aj_models::streaming::StreamingEvent;
-    use aj_models::types::StreamOptions;
+    use aj_models::registry::{InputModality, ModelCost, ModelInfo};
+    use aj_models::scripted::provider::{ExhaustedBehavior, ScriptedProvider};
+    use aj_models::streaming::{AssistantMessageEvent, DoneReason};
+    use aj_models::types::{
+        AssistantContent, AssistantMessage, StopReason, StreamOptions, TextContent, ToolCall,
+    };
     use std::sync::Arc;
 
     use crate::bus::listener_from_sync;
@@ -1598,48 +1597,101 @@ mod event_protocol_tests {
         }
     }
 
-    /// Build a finalized [`LegacyMessage`] with a single tool_use
-    /// block.
-    fn finalize_tool_use(tool_use_id: &str, tool_name: &str) -> LegacyMessage {
-        LegacyMessage {
-            id: "test-msg-1".to_string(),
-            r#type: MessageType::Message,
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUseBlock {
-                id: tool_use_id.to_string(),
-                name: tool_name.to_string(),
-                input: serde_json::json!({}),
-                caller: None,
-            }],
-            model: "scripted".to_string(),
-            stop_reason: Some(StopReason::ToolUse),
-            stop_sequence: None,
-            stop_details: None,
-            usage: Usage::default(),
-            container: None,
-            context_management: None,
+    /// Identity stamped on every scripted [`AssistantMessage`] in this
+    /// module. Matches what [`ScriptedProvider`]'s demos use so the
+    /// agent's TUI / persistence listeners see a coherent provider
+    /// identity even in tests.
+    const SCRIPT_API: &str = "scripted";
+    const SCRIPT_PROVIDER: &str = "scripted";
+    const SCRIPT_MODEL: &str = "scripted";
+
+    /// Build a [`ModelInfo`] mirroring what [`ScriptedProvider`] stamps
+    /// onto every emitted [`AssistantMessage`] partial. The agent
+    /// reads identity off this struct for the TUI footer and the
+    /// `/model` selector; the values are only checked for "matches
+    /// what the provider claims", so any consistent triple works.
+    fn scripted_model_info() -> ModelInfo {
+        ModelInfo {
+            id: SCRIPT_MODEL.to_string(),
+            name: SCRIPT_MODEL.to_string(),
+            api: SCRIPT_API.to_string(),
+            provider: SCRIPT_PROVIDER.to_string(),
+            base_url: "scripted://internal".to_string(),
+            reasoning: false,
+            supports_xhigh: false,
+            supports_adaptive_thinking: false,
+            input: vec![InputModality::Text],
+            cost: ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+            headers: None,
         }
     }
 
-    /// Build a finalized [`LegacyMessage`] with a single text block.
-    fn finalize_text(text: &str) -> LegacyMessage {
-        LegacyMessage {
-            id: "test-msg-2".to_string(),
-            r#type: MessageType::Message,
-            role: Role::Assistant,
-            content: vec![ContentBlock::TextBlock {
-                text: text.to_string(),
-                citations: Vec::new(),
-                signature: None,
-            }],
-            model: "scripted".to_string(),
-            stop_reason: Some(StopReason::EndTurn),
-            stop_sequence: None,
-            stop_details: None,
-            usage: Usage::default(),
-            container: None,
-            context_management: None,
+    /// Build a finalized [`AssistantMessage`] with a single tool_call
+    /// block, stop_reason = `ToolUse`.
+    fn finalize_tool_use(tool_use_id: &str, tool_name: &str) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: tool_use_id.to_string(),
+                name: tool_name.to_string(),
+                arguments: serde_json::json!({}),
+            })],
+            api: SCRIPT_API.to_string(),
+            provider: SCRIPT_PROVIDER.to_string(),
+            model: SCRIPT_MODEL.to_string(),
+            response_id: Some("test-msg-1".to_string()),
+            usage: Default::default(),
+            stop_reason: StopReason::ToolUse,
+            error: None,
+            timestamp: 0,
         }
+    }
+
+    /// Build a finalized [`AssistantMessage`] with a single text
+    /// block, stop_reason = `Stop`.
+    fn finalize_text(text: &str) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            })],
+            api: SCRIPT_API.to_string(),
+            provider: SCRIPT_PROVIDER.to_string(),
+            model: SCRIPT_MODEL.to_string(),
+            response_id: Some("test-msg-2".to_string()),
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            error: None,
+            timestamp: 0,
+        }
+    }
+
+    /// Build an [`AssistantMessageEvent`] script for a single inference
+    /// that finalizes on the given message. The pair `Start + Done`
+    /// matches the spec's minimum-protocol shape: a stream begins with
+    /// `Start` and terminates with `Done`, with no per-block streaming
+    /// in between. The agent's match arm treats `Start` as a no-op and
+    /// drives all rendering off the finalized message blocks, so the
+    /// resulting bus events are independent of intermediate block
+    /// streaming — exactly the shape these locked-protocol tests want
+    /// to pin.
+    fn finalize_script(message: AssistantMessage) -> Vec<AssistantMessageEvent> {
+        let reason = match message.stop_reason {
+            StopReason::Stop => DoneReason::Stop,
+            StopReason::Length => DoneReason::Length,
+            StopReason::ToolUse => DoneReason::ToolUse,
+            other => panic!(
+                "finalize_script: unexpected non-success stop reason {other:?}; \
+                 use ScriptedProvider's error path for error/aborted cases"
+            ),
+        };
+        vec![
+            AssistantMessageEvent::Start {
+                partial: message.clone(),
+            },
+            AssistantMessageEvent::Done { reason, message },
+        ]
     }
 
     /// Compact, comparable representation of an [`AgentEvent`] for
@@ -1807,15 +1859,17 @@ mod event_protocol_tests {
         }
     }
 
-    fn build_agent(scripts: Vec<Vec<StreamingEvent>>, tools: Vec<ErasedToolDefinition>) -> Agent {
-        // Strict-mode scripted model: panic if the agent runs more
+    fn build_agent(
+        scripts: Vec<Vec<AssistantMessageEvent>>,
+        tools: Vec<ErasedToolDefinition>,
+    ) -> Agent {
+        // Strict-mode scripted provider: panic if the agent runs more
         // inferences than the test scripted, which would indicate a
         // regression that adds an unexpected loop iteration.
-        let model: Arc<dyn aj_models::Model> = Arc::new(
-            ScriptedModel::from_event_vecs(scripts).on_exhausted(ExhaustedBehavior::Panic),
+        let provider: Arc<dyn Provider> = Arc::new(
+            ScriptedProvider::from_event_vecs(scripts).on_exhausted(ExhaustedBehavior::Panic),
         );
-        let model_info = Arc::new(synthetic_model_info(&model));
-        let provider: Arc<dyn Provider> = Arc::new(LegacyProviderAdapter::new(model));
+        let model_info = Arc::new(scripted_model_info());
         let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::with_provider(
             env,
@@ -1838,12 +1892,8 @@ mod event_protocol_tests {
         //   2. Final text response after the tool result is fed
         //      back.
         let scripts = vec![
-            vec![StreamingEvent::FinalizedMessage {
-                message: finalize_tool_use("tu-1", "ping"),
-            }],
-            vec![StreamingEvent::FinalizedMessage {
-                message: finalize_text("done"),
-            }],
+            finalize_script(finalize_tool_use("tu-1", "ping")),
+            finalize_script(finalize_text("done")),
         ];
 
         let ping: ErasedToolDefinition = PingTool.into();
@@ -1925,12 +1975,8 @@ mod event_protocol_tests {
         // bash exit codes / sub-agent reports without re-running
         // the tool).
         let scripts = vec![
-            vec![StreamingEvent::FinalizedMessage {
-                message: finalize_tool_use("tu-only", "ping"),
-            }],
-            vec![StreamingEvent::FinalizedMessage {
-                message: finalize_text("done"),
-            }],
+            finalize_script(finalize_tool_use("tu-only", "ping")),
+            finalize_script(finalize_text("done")),
         ];
         let ping: ErasedToolDefinition = PingTool.into();
         let mut agent = build_agent(scripts, vec![ping]);
@@ -2008,9 +2054,7 @@ mod event_protocol_tests {
         // point) and verifies the bus brackets every run with an
         // `AgentStart` / `AgentEnd` pair tagged with the agent's
         // id.
-        let scripts = vec![vec![StreamingEvent::FinalizedMessage {
-            message: finalize_text("ok"),
-        }]];
+        let scripts = vec![finalize_script(finalize_text("ok"))];
 
         let mut agent = build_agent(scripts, Vec::new());
         agent.set_agent_id(AgentId::Sub(7));
@@ -2054,9 +2098,7 @@ mod event_protocol_tests {
         // before the assistant turn loop begins. This is the
         // contract the binary's persistence listener relies on
         // to write the user's typed input to disk.
-        let scripts = vec![vec![StreamingEvent::FinalizedMessage {
-            message: finalize_text("done"),
-        }]];
+        let scripts = vec![finalize_script(finalize_text("done"))];
 
         let mut agent = build_agent(scripts, Vec::new());
 
@@ -2108,9 +2150,7 @@ mod event_protocol_tests {
         // any extra User persistence event.
         use aj_models::messages::ContentBlockParam;
 
-        let scripts = vec![vec![StreamingEvent::FinalizedMessage {
-            message: finalize_text("retried"),
-        }]];
+        let scripts = vec![finalize_script(finalize_text("retried"))];
 
         let mut agent = build_agent(scripts, Vec::new());
         // Seed a user-role last message — typically the prompt the
@@ -2160,8 +2200,8 @@ mod event_protocol_tests {
         use aj_models::messages::{ContentBlockParam, MessageParam, Role};
 
         // No scripts queued: if the precondition check is missing
-        // and the agent runs an inference, the `ScriptedModel`
-        // panics ("ScriptedModel exhausted"). That'd produce a
+        // and the agent runs an inference, the `ScriptedProvider`
+        // panics ("ScriptedProvider exhausted"). That'd produce a
         // different failure than the `Fatal` we're checking for —
         // so a successful test here implies the check fired
         // *before* any inference attempt.

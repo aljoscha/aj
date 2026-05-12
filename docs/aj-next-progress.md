@@ -3070,21 +3070,45 @@ session notes for the planning commit.
          files). End-to-end `cargo run -p aj -- --scripted
          streaming-text --print "hi"` exercises the new path
          live and runs the canned demo to completion.
-   - [ ] 6.8.ii. `aj-agent::event_protocol_tests` onto
-         `ScriptedProvider`. Replace the
-         `ScriptedModel::from_event_vecs(...)` builder used in
-         every test in
-         `src/aj-agent/src/lib.rs::event_protocol_tests` with
-         `ScriptedProvider::from_messages(...)` (the unified
-         "final message script" mode) or
-         `from_event_vecs(...)` for tests that author per-event
-         deltas. Drop the `Arc<dyn Model> → LegacyProviderAdapter
-         → synthetic_model_info` plumbing from `build_agent`; the
-         test helper builds a `ScriptedProvider` and `ModelInfo`
-         directly. Locked event sequences should match
-         byte-for-byte across the migration (the
-         `LegacyProviderAdapter`'s transcoder produces the same
-         event shape `ScriptedProvider` emits natively).
+   - [x] 6.8.ii. `aj-agent::event_protocol_tests` onto
+         `ScriptedProvider`. Replaced the
+         `ScriptedModel::from_event_vecs(...)` builder used in every
+         test in `src/aj-agent/src/lib.rs::event_protocol_tests` with
+         `ScriptedProvider::from_event_vecs(...)` carrying
+         `vec![Start, Done]` event scripts per inference. The
+         `finalize_tool_use` / `finalize_text` helpers now return
+         unified [`AssistantMessage`] values (single-block `content`,
+         `stop_reason: ToolUse` / `Stop`, scripted identity triple),
+         and a new module-private `finalize_script(message)` helper
+         wraps each into the spec-mandated minimum `[Start { partial
+         }, Done { reason, message }]` pair (with `reason` derived
+         from `message.stop_reason`). Locked event sequences across
+         all 8 `event_protocol_tests` continue to pass byte-for-byte
+         — the `LegacyProviderAdapter`'s transcoder and the native
+         `ScriptedProvider` driver emit the same agent-visible event
+         shape for this minimum-protocol script (no per-block
+         streaming, `Start` is a no-op in the agent's match arm and
+         tool calls are collected off the finalized message's
+         content). Dropped the `Arc<dyn Model> →
+         LegacyProviderAdapter → synthetic_model_info` plumbing from
+         `build_agent`; the test helper now builds a
+         `ScriptedProvider` and a directly-constructed `ModelInfo`
+         (`scripted_model_info()` private helper, matching the
+         api/provider/model triple `ScriptedProvider::from_event_vecs`
+         stamps on partials). Updated stale `ScriptedModel` references
+         in test doc comments to `ScriptedProvider`. `cargo build`,
+         `cargo fmt`, `cargo test --workspace`, and
+         `cargo clippy -p aj-agent --all-targets` all pass clean
+         (only pre-existing `clone_on_ref_ptr` warnings in `bus.rs`,
+         `oauth/anthropic.rs`, and existing test fixtures remain —
+         none introduced by this change).
+
+         After this commit `event_protocol_tests` no longer touches
+         `aj_models::Model`, `aj_models::compat::*`,
+         `aj_models::scripted::ScriptedModel`, or
+         `aj_models::streaming::StreamingEvent`. The remaining
+         legacy-shaped caller in test code is
+         `aj/tests/replay_parity.rs` (6.8.iii).
    - [ ] 6.8.iii. `aj/tests/replay_parity.rs` onto
          `ScriptedProvider`. Same migration shape as 6.8.ii: drop
          the `ScriptedModel`-driven `one_tool_use_script` helper
