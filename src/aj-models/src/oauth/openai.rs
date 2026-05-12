@@ -721,7 +721,11 @@ fn token_to_credentials(t: TokenResponse) -> Result<OAuthCredentials, OAuthError
 /// We don't *verify* the JWT signature — that's the upstream's job
 /// (we just received the token from their token endpoint over TLS).
 /// We only base64-decode the payload to read a claim we need.
-fn extract_account_id(access_token: &str) -> Option<String> {
+///
+/// Exposed `pub(crate)` so the Codex provider in
+/// [`crate::openai::codex`] can re-decode the JWT at request time and
+/// stamp the `chatgpt-account-id` header for every outgoing request.
+pub(crate) fn extract_account_id(access_token: &str) -> Option<String> {
     let parts: Vec<&str> = access_token.split('.').collect();
     if parts.len() != 3 {
         return None;

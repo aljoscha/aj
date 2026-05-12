@@ -124,7 +124,161 @@ this file is the bridge between the spec and the git history.
          "removed"). Updated `registry_lookup_and_listing` to
          account for the codex provider being spliced into the
          registry's `providers()` listing.
-   - [ ] 8c.iii. SDK + provider implementation.
+   - [x] 8c.iii. SDK + provider implementation. New
+         [`openai-sdk::Client::codex_responses_stream`] method POSTs to
+         `{base_url}/codex/responses` while sharing the request body,
+         header machinery, and SSE parser with `responses_stream` (the
+         existing endpoint factors through a new private
+         `responses_stream_at_path` helper so the two methods differ
+         only in URL path). New `aj-models::openai::codex` module
+         ships [`OpenAiCodexResponsesProvider`] alongside the
+         §7.3 [`OpenAiResponsesProvider`]; it implements the §7.4 wire
+         differences enumerated below and reuses every other §7.3
+         behaviour through `pub(super)` helpers on
+         [`super::responses`].
+
+         **Authentication (§7.4.1).** The provider treats
+         [`StreamOptions::api_key`] as the OAuth JWT access token and
+         decodes the [`chatgpt_account_id`] claim at request time via
+         the existing OAuth helper (`oauth::openai::extract_account_id`,
+         promoted from `fn` to `pub(crate)`). Headers stamped via
+         `openai-sdk::Client::with_extra_header` on every request:
+         `Authorization: Bearer <jwt>` (handled by `bearer_auth`),
+         `chatgpt-account-id: <jwt claim>`, `originator: aj`,
+         `OpenAI-Beta: responses=experimental`,
+         `User-Agent: aj/<version> (<os> <arch>)`, plus the §7.3
+         session-correlation headers (`session_id`,
+         `x-client-request-id`) when [`StreamOptions::session_id`] is
+         set. Defaults: an empty `model.base_url` falls back to
+         `https://chatgpt.com/backend-api` so callers don't have to
+         restate the value the registry already encodes.
+
+         **Message conversion (§7.4.2).** Reuses
+         `responses::convert_messages` (which was made `pub(super)`
+         and parameterized on `api_name` so the cross-model
+         `tool_call.id` rewrite in `append_assistant_message` keys off
+         the correct provider). The system prompt is *not* added as an
+         input item; instead it rides on the top-level
+         `instructions` field per §7.4.3, with the §7.4.3 default
+         `"You are a helpful assistant."` when the caller leaves
+         [`Context::system_prompt`] empty.
+
+         **Request parameters (§7.4.3).** `store: false` and
+         `parallel_tool_calls: true` are hardcoded; `tool_choice` is
+         always `"auto"` regardless of [`StreamOptions::tool_choice`];
+         `strict` is omitted from every tool definition (new
+         `to_codex_tool` helper sets `strict: None`, which the
+         openai-sdk's `#[serde(skip_serializing_if = "Option::is_none")]`
+         drops on the wire); `text.verbosity`, `max_output_tokens`,
+         and `prompt_cache_retention` are never sent; `prompt_cache_key`
+         is sourced exclusively from `session_id`.
+
+         **Service-tier pricing (§7.4.4).** New
+         `codex_cost_multiplier` function pointer (exposed via a
+         `pub(super) const CODEX_COST_MULTIPLIER` to avoid an
+         `fn as CostMultiplierFn` cast at the call site) replaces the
+         responses-default multiplier inside the streaming state
+         machine. `flex → 0.5×`, `priority → 2×` for every model
+         except `gpt-5.5` where `priority → 2.5×`; the resolver
+         applies the request tier when the server echoes `default`
+         (today the SDK doesn't model a `default` variant on
+         [`OpenAIServiceTier`] so the branch is structural — when /
+         if the SDK adds it, only the resolver changes). Reuses
+         `responses::map_service_tier` for the [`ServiceTier`] →
+         [`OpenAIServiceTier`] projection.
+
+         **Stream event normalization (§7.4.5).** New
+         `normalize_codex_event` runs before each SSE event reaches
+         the shared `StreamState`:
+         - `response.done` and `response.incomplete` (the latter is a
+           legacy event name the Codex backend still emits in places)
+           are rewritten to `response.completed` with the inner
+           `response.status` normalized into the recognized set
+           (`completed`, `incomplete`, `failed`, `cancelled`, `queued`,
+           `in_progress`). For the `response.incomplete` rewrite the
+           inner status defaults to `Incomplete` if the wire omits it,
+           so the §7.3.8 length/content-filter branch picks the right
+           [`StopReason`] downstream. The terminal-event semantics
+           propagate via a new local `NormalizedEvent::Terminal`
+           variant that stops the SSE drain after dispatching the
+           rewritten event — enforces the "no more events after
+           completion" contract for Codex.
+         - Top-level `error` SSE events and `response.failed` events
+           surface as `Err(AssistantError)` via
+           `responses::error_from_code` (which delegates to the §10
+           [`classify_openai_error`] classifier), short-circuiting the
+           run before the state machine sees them.
+         - Everything else flows through unchanged. The shared §7.3.6
+           handlers in `StreamState::process` (text deltas, function
+           call arguments, reasoning summaries, output item
+           added/done) are bumped to `pub(super)` so the codex module
+           can call them.
+
+         **Error mapping (§7.4.6).** New `classify_codex_client_error`
+         wraps `responses::classify_client_error` to overlay a
+         friendly 429 message when the error code matches
+         `usage_limit_reached` / `usage_not_included` /
+         `rate_limit_exceeded` *or* the HTTP status is 429 without a
+         recognizable code. The optional `plan_type` / `resets_at`
+         fields are extracted from the raw error body (try the
+         `{"error":{...}}` envelope shape first, then the bare
+         `{"plan_type":...,"resets_at":...}` shape) and formatted as
+         `"You have hit your ChatGPT usage limit (<plan> plan). Try
+         again in ~<N> min."`. Minutes-until-reset is rounded to the
+         nearest minute and floored at 0 so a past `resets_at`
+         renders as `~0 min`. Category remains `RateLimit` for the
+         rate-limit code path so the agent's retry layer sees the
+         same semantics regardless of the friendly overlay.
+
+         **Reused machinery (§7.4.7).** The `StreamState` from
+         `responses.rs` was refactored to accept the API name and
+         cost-multiplier as constructor parameters (new
+         `StreamState::new_with(api_name, model, requested_tier,
+         multiplier)` constructor; the existing `new(model,
+         requested_tier)` is kept as a thin wrapper passing
+         `"openai-responses"` and the default multiplier). The api
+         name flows through the terminal error message templating and
+         the cross-model `append_assistant_message` check; the
+         multiplier function pointer flows through `StreamState::finalize`
+         so the per-provider pricing curve applies on top of the base
+         `calculate_cost` walk. Out-of-scope per §7.4.8: WebSocket
+         transport — the provider is SSE-only.
+
+         Twenty-five new unit tests in `openai::codex::tests` cover:
+         the User-Agent prefix; `build_request`'s system-prompt
+         routing into `instructions` (and the default when empty);
+         the hardcoded `store: false` / `tool_choice: "auto"` /
+         `parallel_tool_calls: true`; the omission of
+         `text.verbosity`, `max_output_tokens`,
+         `prompt_cache_retention`, and `strict` regardless of caller
+         inputs; the per-tool no-`strict` wire shape;
+         reasoning-only-on-reasoning-models;
+         `codex_cost_multiplier`'s default curve, the `gpt-5.5`
+         priority exception (2.5×), and the requested-tier fallback;
+         friendly-message construction with the envelope shape (plan
+         type + minutes), the bare 429 case, and the
+         non-usage-limit error skip path; `classify_codex_client_error`'s
+         429 overlay; event normalization for legacy `response.done` /
+         `response.incomplete` (with status preservation) and
+         top-level `error` events; the unknown-event passthrough; the
+         auth-error path when `api_key` is missing or the JWT lacks
+         the account-id claim; and the `to_codex_tool` strict-field
+         omission.
+
+         The `StreamState` API-name parameterization rippled into
+         three pre-existing tests in `responses.rs::tests`
+         (`classify_status_completed_with_tool_use`,
+         `classify_status_incomplete_subcases`) that now pass
+         `API_NAME` as the trailing argument. Existing
+         `openai-responses` round-trip tests
+         (`tests/roundtrip/openai_responses.rs`) compile and pass
+         unchanged.
+
+         `cargo build`, `cargo test --workspace`, `cargo fmt`, and
+         `cargo clippy -p aj-models --all-targets` all pass clean
+         (only the pre-existing `clone_on_ref_ptr` warnings in
+         `oauth/anthropic.rs` remain — none in the new `codex.rs`
+         module or the touched files).
    - [ ] 8c.iv. Wire `"openai-codex-responses"` into `provider_for`.
    - [ ] 8c.v. Round-trip parse / serialize / semantic fixtures.
 

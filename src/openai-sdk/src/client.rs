@@ -233,6 +233,40 @@ impl Client {
 
     pub async fn responses_stream(
         &self,
+        request: CreateResponseRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent, ClientError>> + Send>>,
+        ClientError,
+    > {
+        self.responses_stream_at_path("/responses", request).await
+    }
+
+    /// Stream the Codex Responses endpoint at `{base_url}/codex/responses`.
+    ///
+    /// The wire format and SSE event shape are identical to
+    /// [`responses_stream`](Self::responses_stream); only the URL path
+    /// differs. Codex-specific headers (`chatgpt-account-id`,
+    /// `originator`, `User-Agent`, `OpenAI-Beta`) are expected to be
+    /// installed on the [`Client`] via
+    /// [`with_extra_header`](Self::with_extra_header) before the call.
+    pub async fn codex_responses_stream(
+        &self,
+        request: CreateResponseRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent, ClientError>> + Send>>,
+        ClientError,
+    > {
+        self.responses_stream_at_path("/codex/responses", request)
+            .await
+    }
+
+    /// Shared implementation behind [`responses_stream`] and
+    /// [`codex_responses_stream`]: the two endpoints differ only in
+    /// URL path; the request body, header machinery, and SSE parser
+    /// are identical.
+    async fn responses_stream_at_path(
+        &self,
+        path: &str,
         mut request: CreateResponseRequest,
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent, ClientError>> + Send>>,
@@ -240,7 +274,7 @@ impl Client {
     > {
         request.stream = Some(true);
 
-        let url = format!("{}/responses", self.base_url);
+        let url = format!("{}{}", self.base_url, path);
         debug_log_request(&url, &request);
         let request_builder = self.apply_extra_headers(
             self.client

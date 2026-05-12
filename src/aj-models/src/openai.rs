@@ -6,12 +6,14 @@
 //! [`Model`](crate::Model)-based Responses-API client in [`legacy`],
 //! kept around until the agent migration in §12.16 lands.
 
+pub mod codex;
 pub mod legacy;
 pub mod provider;
 pub mod responses;
 
 // Re-exported so existing call sites that reference
 // `crate::openai::OpenAiModel` keep working without churn.
+pub use codex::OpenAiCodexResponsesProvider;
 pub use legacy::OpenAiModel;
 pub use provider::OpenAiCompletionsProvider;
 pub use responses::OpenAiResponsesProvider;

@@ -50,7 +50,7 @@ use crate::types::{
 /// `api` field reported on assistant messages produced by this provider.
 const API_NAME: &str = "openai-responses";
 /// Hard limit on item / message IDs accepted by the Responses API.
-const ID_LIMIT: usize = 64;
+pub(super) const ID_LIMIT: usize = 64;
 
 /// Stateless provider for the OpenAI Responses API.
 pub struct OpenAiResponsesProvider;
@@ -101,12 +101,12 @@ pub struct TextSignatureV1 {
 }
 
 #[derive(Debug, Default)]
-struct ParsedTextSignature {
-    id: Option<String>,
-    phase: Option<MessagePhase>,
+pub(super) struct ParsedTextSignature {
+    pub(super) id: Option<String>,
+    pub(super) phase: Option<MessagePhase>,
 }
 
-fn parse_text_signature(signature: Option<&str>) -> ParsedTextSignature {
+pub(super) fn parse_text_signature(signature: Option<&str>) -> ParsedTextSignature {
     let Some(signature) = signature else {
         return ParsedTextSignature::default();
     };
@@ -123,12 +123,12 @@ fn parse_text_signature(signature: Option<&str>) -> ParsedTextSignature {
     }
 }
 
-fn serialize_text_signature(id: String, phase: Option<MessagePhase>) -> Option<String> {
+pub(super) fn serialize_text_signature(id: String, phase: Option<MessagePhase>) -> Option<String> {
     let env = TextSignatureV1 { v: 1, id, phase };
     serde_json::to_string(&env).ok()
 }
 
-fn normalize_replay_message_id(id: String) -> String {
+pub(super) fn normalize_replay_message_id(id: String) -> String {
     if id.len() <= ID_LIMIT {
         id
     } else {
@@ -153,7 +153,7 @@ fn short_hash(s: &str) -> String {
 // Composite tool-call IDs (§7.3.5)
 // ---------------------------------------------------------------------------
 
-fn split_tool_use_id(tool_use_id: &str) -> (String, Option<String>) {
+pub(super) fn split_tool_use_id(tool_use_id: &str) -> (String, Option<String>) {
     if let Some((call_id, item_id)) = tool_use_id.split_once('|') {
         (call_id.to_string(), Some(item_id.to_string()))
     } else {
@@ -161,7 +161,7 @@ fn split_tool_use_id(tool_use_id: &str) -> (String, Option<String>) {
     }
 }
 
-fn compose_tool_use_id(call_id: &str, item_id: Option<&str>) -> String {
+pub(super) fn compose_tool_use_id(call_id: &str, item_id: Option<&str>) -> String {
     match item_id {
         Some(item_id) if !item_id.is_empty() => format!("{call_id}|{item_id}"),
         _ => call_id.to_string(),
@@ -274,7 +274,7 @@ async fn run_stream_inner(
     Ok(())
 }
 
-fn classify_client_error(err: &ClientError) -> AssistantError {
+pub(super) fn classify_client_error(err: &ClientError) -> AssistantError {
     match err {
         ClientError::ApiError {
             error,
@@ -293,7 +293,7 @@ fn classify_client_error(err: &ClientError) -> AssistantError {
     }
 }
 
-fn is_openai_host(base_url: &str) -> bool {
+pub(super) fn is_openai_host(base_url: &str) -> bool {
     // Match on the canonical host to avoid sending session-correlation
     // headers to Azure/proxy deployments that may reject them.
     base_url.contains("//api.openai.com")
@@ -318,7 +318,7 @@ fn build_request(
 
     // §8: cross-provider history rewrite first.
     let transformed = transform_messages(&context.messages, model);
-    convert_messages(&transformed, &mut input);
+    convert_messages(API_NAME, &transformed, &mut input);
 
     let tools: Vec<ResponseTool> = context.tools.iter().map(to_response_tool).collect();
     let tool_choice = to_response_tool_choice(options.tool_choice.as_ref(), !tools.is_empty());
@@ -403,7 +403,10 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
     }
 }
 
-fn map_reasoning_effort(level: Option<&ThinkingLevel>, model: &ModelInfo) -> ReasoningEffort {
+pub(super) fn map_reasoning_effort(
+    level: Option<&ThinkingLevel>,
+    model: &ModelInfo,
+) -> ReasoningEffort {
     match level {
         None => ReasoningEffort::None,
         Some(ThinkingLevel::Minimal) => ReasoningEffort::Minimal,
@@ -421,14 +424,22 @@ fn map_reasoning_effort(level: Option<&ThinkingLevel>, model: &ModelInfo) -> Rea
     }
 }
 
-fn map_service_tier(tier: &ServiceTier) -> OpenAIServiceTier {
+pub(super) fn map_service_tier(tier: &ServiceTier) -> OpenAIServiceTier {
     match tier {
         ServiceTier::Flex => OpenAIServiceTier::Flex,
         ServiceTier::Priority => OpenAIServiceTier::Priority,
     }
 }
 
-fn cost_multiplier(tier: Option<&OpenAIServiceTier>) -> f64 {
+pub(super) fn responses_cost_multiplier(
+    _model_id: &str,
+    server_tier: Option<&OpenAIServiceTier>,
+    requested_tier: Option<&OpenAIServiceTier>,
+) -> f64 {
+    cost_multiplier_from_tier(server_tier.or(requested_tier))
+}
+
+fn cost_multiplier_from_tier(tier: Option<&OpenAIServiceTier>) -> f64 {
     match tier {
         Some(OpenAIServiceTier::Flex) => 0.5,
         Some(OpenAIServiceTier::Priority) => 2.0,
@@ -472,11 +483,22 @@ fn to_response_tool_choice(
 // ---------------------------------------------------------------------------
 
 /// Project the unified message log onto Responses input items.
-fn convert_messages(messages: &[Message], out: &mut Vec<ResponseInputItem>) {
+///
+/// `api_name` controls the cross-model check inside
+/// [`append_assistant_message`]: an assistant message tagged with an
+/// `api` that differs from the current provider's identifier is
+/// treated as cross-model replay (per §7.3.1) and its tool-call
+/// `item_id`s are dropped so the server doesn't try to pair them
+/// with reasoning items it never produced.
+pub(super) fn convert_messages(
+    api_name: &str,
+    messages: &[Message],
+    out: &mut Vec<ResponseInputItem>,
+) {
     for msg in messages {
         match msg {
             Message::User(u) => append_user_message(u, out),
-            Message::Assistant(a) => append_assistant_message(a, out),
+            Message::Assistant(a) => append_assistant_message(api_name, a, out),
             Message::ToolResult(tr) => out.push(convert_tool_result(tr)),
         }
     }
@@ -497,7 +519,7 @@ fn append_user_message(m: &UserMessage, out: &mut Vec<ResponseInputItem>) {
     });
 }
 
-fn user_content_to_input_part(c: &UserContent) -> ResponseInputContentPart {
+pub(super) fn user_content_to_input_part(c: &UserContent) -> ResponseInputContentPart {
     match c {
         UserContent::Text(t) => ResponseInputContentPart::InputText {
             text: t.text.clone(),
@@ -514,8 +536,12 @@ fn user_content_to_input_part(c: &UserContent) -> ResponseInputContentPart {
 /// `AssistantContent` order. Reasoning items deserialize from
 /// `thinking_signature`; text blocks reuse / split message items by
 /// (id, phase); tool calls split the composite `{call_id}|{item_id}`.
-fn append_assistant_message(m: &AssistantMessage, out: &mut Vec<ResponseInputItem>) {
-    let cross_model = !m.api.is_empty() && m.api != API_NAME;
+fn append_assistant_message(
+    api_name: &str,
+    m: &AssistantMessage,
+    out: &mut Vec<ResponseInputItem>,
+) {
+    let cross_model = !m.api.is_empty() && m.api != api_name;
 
     let mut pending_parts: Vec<ResponseInputContentPart> = Vec::new();
     let mut pending_id: Option<String> = None;
@@ -624,7 +650,7 @@ fn reasoning_item_from_signature(signature: &str) -> Option<ResponseInputItem> {
     }
 }
 
-fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
+pub(super) fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
     let (call_id, _) = split_tool_use_id(&t.tool_call_id);
 
     // Split content into text + image parts; the Responses API supports
@@ -684,7 +710,7 @@ fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
 /// reasoning items it never produced.
 pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<ResponseInputItem> {
     let mut out = Vec::new();
-    append_assistant_message(message, &mut out);
+    append_assistant_message(API_NAME, message, &mut out);
     out
 }
 
@@ -821,6 +847,23 @@ fn join_reasoning_summary(summary: &[ReasoningSummary]) -> String {
 // Stream state machine (§7.3.6)
 // ---------------------------------------------------------------------------
 
+/// Cost-multiplier strategy. Codex uses a different curve than the
+/// public Responses API, so providers inject their own multiplier when
+/// constructing a [`StreamState`].
+///
+/// Arguments:
+/// - `model_id` — the model the assistant message ran against (the
+///   `gpt-5.5` exception in §7.4.4 keys off this).
+/// - `server_tier` — `response.service_tier` echoed back by the server.
+/// - `requested_tier` — the tier requested by the caller (used as a
+///   fallback when the server doesn't echo, and as the "intended" tier
+///   when the server echoes `default` despite the request).
+pub(super) type CostMultiplierFn = fn(
+    model_id: &str,
+    server_tier: Option<&OpenAIServiceTier>,
+    requested_tier: Option<&OpenAIServiceTier>,
+) -> f64;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 enum ItemSlot {
@@ -850,7 +893,7 @@ enum ItemSlot {
     },
 }
 
-struct StreamState {
+pub(super) struct StreamState {
     partial: AssistantMessage,
     started: bool,
     /// Slots keyed by `output_index` — stable per output item.
@@ -865,12 +908,30 @@ struct StreamState {
     /// Tier requested by the caller; preserved for cost calculations
     /// when the server doesn't echo it back.
     requested_tier: Option<OpenAIServiceTier>,
+    /// Provider api identifier stamped on terminal error messages
+    /// (`api_name: <reason>`).
+    api_name: &'static str,
+    /// Cost multiplier strategy for this provider; see [`CostMultiplierFn`].
+    cost_multiplier: CostMultiplierFn,
 }
 
 impl StreamState {
-    fn new(model: &ModelInfo, requested_tier: Option<ServiceTier>) -> Self {
+    pub(super) fn new(model: &ModelInfo, requested_tier: Option<ServiceTier>) -> Self {
+        const RESPONSES_COST_MULTIPLIER: CostMultiplierFn = responses_cost_multiplier;
+        Self::new_with(API_NAME, model, requested_tier, RESPONSES_COST_MULTIPLIER)
+    }
+
+    /// Provider-customizable constructor used by Codex (see
+    /// `openai::codex`) to pick its own api name and cost-multiplier
+    /// curve while reusing the §7.3 streaming machinery.
+    pub(super) fn new_with(
+        api_name: &'static str,
+        model: &ModelInfo,
+        requested_tier: Option<ServiceTier>,
+        cost_multiplier: CostMultiplierFn,
+    ) -> Self {
         let mut partial = AssistantMessage::empty();
-        partial.api = API_NAME.to_string();
+        partial.api = api_name.to_string();
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         Self {
@@ -881,10 +942,12 @@ impl StreamState {
             finish_status: None,
             finish_error: None,
             requested_tier: requested_tier.as_ref().map(map_service_tier),
+            api_name,
+            cost_multiplier,
         }
     }
 
-    fn process(&mut self, event: ResponseStreamEvent) -> Vec<AssistantMessageEvent> {
+    pub(super) fn process(&mut self, event: ResponseStreamEvent) -> Vec<AssistantMessageEvent> {
         let mut out = Vec::new();
         match event {
             ResponseStreamEvent::ResponseCreated { response, .. }
@@ -1282,14 +1345,17 @@ impl StreamState {
         });
     }
 
-    fn finalize(mut self) -> AssistantMessageEvent {
+    pub(super) fn finalize(mut self) -> AssistantMessageEvent {
         // Apply usage / cost from the captured terminal response.
         let server_tier = self
             .final_response
             .as_ref()
             .and_then(|r| r.service_tier.clone());
-        let effective_tier = server_tier.clone().or_else(|| self.requested_tier.clone());
-        let multiplier = cost_multiplier(effective_tier.as_ref());
+        let multiplier = (self.cost_multiplier)(
+            &self.partial.model,
+            server_tier.as_ref(),
+            self.requested_tier.as_ref(),
+        );
         if let Some(usage) = self.final_response.as_ref().and_then(|r| r.usage.as_ref()) {
             apply_usage(&mut self.partial.usage, usage);
         }
@@ -1310,6 +1376,7 @@ impl StreamState {
                 .and_then(|d| d.reason.as_deref()),
             has_tool_use,
             self.finish_error.take(),
+            self.api_name,
         );
         self.partial.stop_reason = stop_reason;
 
@@ -1325,8 +1392,8 @@ impl StreamState {
                 AssistantError::new(
                     ErrorCategory::Unknown,
                     format!(
-                        "openai-responses: terminated without recognized status ({:?})",
-                        self.finish_status
+                        "{}: terminated without recognized status ({:?})",
+                        self.api_name, self.finish_status
                     ),
                 )
             }));
@@ -1343,6 +1410,7 @@ fn classify_status(
     incomplete_reason: Option<&str>,
     has_tool_use: bool,
     error: Option<AssistantError>,
+    api_name: &str,
 ) -> (StopReason, Option<DoneReason>, Option<AssistantError>) {
     match status {
         Some(ResponseStatus::Completed) | None if has_tool_use => {
@@ -1371,7 +1439,7 @@ fn classify_status(
             Some(error.unwrap_or_else(|| {
                 AssistantError::new(
                     ErrorCategory::Unknown,
-                    format!("openai-responses: response status {:?}", status),
+                    format!("{}: response status {:?}", api_name, status),
                 )
             })),
         ),
@@ -1383,7 +1451,7 @@ fn classify_status(
     }
 }
 
-fn error_from_response(response: &Response) -> AssistantError {
+pub(super) fn error_from_response(response: &Response) -> AssistantError {
     if let Some(err) = &response.error {
         return error_from_code(Some(err.code.as_str()), err.message.clone());
     }
@@ -1395,7 +1463,7 @@ fn error_from_response(response: &Response) -> AssistantError {
     AssistantError::new(ErrorCategory::Unknown, message)
 }
 
-fn error_from_code(code: Option<&str>, message: String) -> AssistantError {
+pub(super) fn error_from_code(code: Option<&str>, message: String) -> AssistantError {
     classify_openai_error(code, None, None, None, message)
 }
 
@@ -1615,7 +1683,7 @@ mod tests {
             timestamp: 0,
         };
         let mut out = Vec::new();
-        convert_messages(&[UnifiedMessage::User(user)], &mut out);
+        convert_messages(API_NAME, &[UnifiedMessage::User(user)], &mut out);
         match &out[0] {
             ResponseInputItem::Message { content, .. } => match content {
                 ResponseInputMessageContent::Array(parts) => {
@@ -1633,7 +1701,8 @@ mod tests {
 
     #[test]
     fn classify_status_completed_with_tool_use() {
-        let (sr, dr, _) = classify_status(Some(&ResponseStatus::Completed), None, true, None);
+        let (sr, dr, _) =
+            classify_status(Some(&ResponseStatus::Completed), None, true, None, API_NAME);
         assert_eq!(sr, StopReason::ToolUse);
         assert_eq!(dr, Some(DoneReason::ToolUse));
     }
@@ -1645,6 +1714,7 @@ mod tests {
             Some("max_output_tokens"),
             false,
             None,
+            API_NAME,
         );
         assert_eq!(sr, StopReason::Length);
         assert_eq!(dr, Some(DoneReason::Length));
@@ -1654,6 +1724,7 @@ mod tests {
             Some("max_tool_calls"),
             false,
             None,
+            API_NAME,
         );
         assert_eq!(sr, StopReason::ToolUse);
         assert_eq!(dr, Some(DoneReason::ToolUse));
@@ -1663,12 +1734,19 @@ mod tests {
             Some("content_filter"),
             false,
             None,
+            API_NAME,
         );
         assert_eq!(sr, StopReason::Error);
         assert!(dr.is_none());
         assert_eq!(err.unwrap().category, ErrorCategory::ContentFilter);
 
-        let (sr, dr, _) = classify_status(Some(&ResponseStatus::Incomplete), None, false, None);
+        let (sr, dr, _) = classify_status(
+            Some(&ResponseStatus::Incomplete),
+            None,
+            false,
+            None,
+            API_NAME,
+        );
         assert_eq!(sr, StopReason::Length);
         assert!(dr.is_some());
     }
