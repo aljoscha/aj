@@ -343,6 +343,19 @@ impl EventPump {
         // a component now so the result is visible. Args aren't
         // available on the End event, so we render with an empty
         // object.
+        //
+        // The live path runs `append_tool_execution` on
+        // `ToolExecutionStart`, which clears `current_assistant`
+        // so the next streaming chunk opens a fresh assistant
+        // component *after* the tool. The replay fallback below
+        // builds an equivalent component but must replicate the
+        // same bookkeeping — otherwise a subsequent assistant
+        // text `StreamChunk` would attach to the previous turn's
+        // assistant component (created for the thinking block
+        // that *preceded* the tool), and the tool would appear
+        // visually below the next assistant message instead of
+        // between them. See the "Resume fidelity follow-up"
+        // section in `docs/aj-next-progress.md` for the trace.
         let idx = match self.tool_index.get(call_id) {
             Some(idx) => *idx,
             None => {
@@ -353,6 +366,7 @@ impl EventPump {
                 );
                 let idx = self.push_chat_child(tui, Box::new(component));
                 self.tool_index.insert(call_id.to_string(), idx);
+                self.current_assistant = None;
                 idx
             }
         };
@@ -559,6 +573,144 @@ mod tests {
         let chat = chat_theme(&theme);
         let pump = EventPump::new(chat.clone());
         (tui, pump, chat)
+    }
+
+    #[test]
+    fn replay_tool_result_without_start_does_not_steal_next_assistant_message() {
+        // Regression for the resume-fidelity reorder bug. On a
+        // resumed thread the disk shape is:
+        //   user prompt -> assistant (thinking + tool_use) ->
+        //   tool_result -> assistant (final text)
+        // Replay walks these in append order and (today) emits a
+        // `ToolExecutionEnd` without a matching
+        // `ToolExecutionStart`, so this listener falls into the
+        // build-on-miss branch of `update_tool_execution_result`.
+        // That branch must clear `current_assistant`, otherwise
+        // the *next* assistant message's `StreamChunk(Text, ...)`
+        // attaches to the assistant component that was already
+        // appended for the thinking block (which sits *above* the
+        // tool in the chat container), and the visible scrollback
+        // ends up with the final assistant text rendered *before*
+        // the tool execution. Pin the correct order with a
+        // canonical replay event sequence.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        let chat_len = |tui: &mut Tui| -> usize {
+            tui.get_mut_as::<Container>(SlotIndex::Chat.idx())
+                .expect("chat slot")
+                .len()
+        };
+        let chat_baseline = chat_len(&mut tui);
+
+        // User prompt → user message component.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::User,
+                action: StreamAction::Stop {
+                    snapshot: "please run a tool".into(),
+                },
+            },
+        );
+
+        // Assistant thinking block → assistant message component
+        // appended next (current_assistant points at it).
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Thinking,
+                action: StreamAction::Start {
+                    snapshot: String::new(),
+                },
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Thinking,
+                action: StreamAction::Stop {
+                    snapshot: "let me think".into(),
+                },
+            },
+        );
+
+        // Tool result lands without a preceding ToolExecutionStart
+        // (replay path). The build-on-miss branch creates the
+        // tool component AND must drop `current_assistant`.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "call-1".into(),
+                tool: "bash".into(),
+                result: aj_agent::tool::ToolDetails::Text {
+                    summary: "bash".into(),
+                    body: "hello from aj".into(),
+                },
+                is_error: false,
+            },
+        );
+
+        // Final assistant text (next persisted assistant message).
+        // After the fix this must open a *fresh* assistant
+        // component appended *after* the tool component, not
+        // reuse the thinking-block component that was appended
+        // before the tool.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Text,
+                action: StreamAction::Start {
+                    snapshot: String::new(),
+                },
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Text,
+                action: StreamAction::Stop {
+                    snapshot: "Done. Anything specific?".into(),
+                },
+            },
+        );
+
+        // Walk the chat container and verify (a) the last child
+        // is the final assistant text, and (b) a
+        // `ToolExecutionComponent` sits strictly before it. With
+        // the regression in place the tool would be the last
+        // child instead.
+        let chat = tui
+            .get_mut_as::<Container>(SlotIndex::Chat.idx())
+            .expect("chat slot");
+        let total = chat.len();
+        assert!(total > chat_baseline + 6, "got {total} children");
+        let last_idx = total - 1;
+        let last_is_assistant = chat
+            .get_mut_as::<AssistantMessageComponent>(last_idx)
+            .is_some();
+        assert!(
+            last_is_assistant,
+            "last chat child should be the final assistant message; \
+             a regression would leave the tool execution at the tail",
+        );
+        let mut tool_idx: Option<usize> = None;
+        for i in chat_baseline..last_idx {
+            if chat.get_mut_as::<ToolExecutionComponent>(i).is_some() {
+                tool_idx = Some(i);
+                break;
+            }
+        }
+        assert!(
+            tool_idx.is_some(),
+            "expected a ToolExecutionComponent before the final \
+             assistant message; got chat layout with {total} children",
+        );
     }
 
     #[test]
