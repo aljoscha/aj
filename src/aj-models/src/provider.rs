@@ -25,8 +25,9 @@ use crate::types::{
 /// A provider knows how to stream inference for a specific API type.
 ///
 /// Each variant of [`ModelInfo::api`] (e.g. `"anthropic-messages"`,
-/// `"openai-completions"`, `"openai-responses"`) has exactly one
-/// [`Provider`] implementation. Providers are responsible for translating
+/// `"openai-completions"`, `"openai-responses"`,
+/// `"openai-codex-responses"`) has exactly one [`Provider`]
+/// implementation. Providers are responsible for translating
 /// the unified [`Context`] / [`StreamOptions`] into the wire format their
 /// SDK expects, driving the streaming HTTP request, and emitting
 /// [`AssistantMessageEvent`]s onto the returned
@@ -60,15 +61,17 @@ pub trait Provider: Send + Sync {
 ///
 /// Returns [`None`] when no provider has been registered for `api`.
 /// Concrete providers (Anthropic, OpenAI Chat Completions, OpenAI
-/// Responses) plug in here as they land in §6 and §7; until each one
-/// arrives the top-level dispatch functions surface the missing provider
-/// as an [`AssistantMessageEvent::Error`] on the resulting stream so
-/// callers always observe a uniform stream shape.
+/// Responses, OpenAI Codex Responses) plug in here as they land in §6
+/// and §7; until each one arrives the top-level dispatch functions
+/// surface the missing provider as an [`AssistantMessageEvent::Error`]
+/// on the resulting stream so callers always observe a uniform stream
+/// shape.
 fn provider_for(api: &str) -> Option<Box<dyn Provider>> {
     match api {
         "anthropic-messages" => Some(Box::new(crate::anthropic::AnthropicProvider)),
         "openai-completions" => Some(Box::new(crate::openai::OpenAiCompletionsProvider)),
         "openai-responses" => Some(Box::new(crate::openai::OpenAiResponsesProvider)),
+        "openai-codex-responses" => Some(Box::new(crate::openai::OpenAiCodexResponsesProvider)),
         _ => None,
     }
 }
@@ -266,5 +269,33 @@ mod tests {
         let event = s.next().await.expect("at least one event");
         assert!(event.is_terminal());
         assert!(matches!(event, AssistantMessageEvent::Done { .. }));
+    }
+
+    /// `openai-codex-responses` is dispatched through `provider_for` to the
+    /// Codex provider rather than falling through to `unsupported_api_stream`.
+    ///
+    /// We verify this without a network call by calling [`complete`] with no
+    /// `api_key` set: the Codex provider's auth check fails fast with an
+    /// `Auth`-category error, whereas the unknown-API path would surface an
+    /// `InvalidRequest`-category error mentioning `"no provider registered"`.
+    /// The category discriminator is enough to tell the two paths apart.
+    #[tokio::test]
+    async fn openai_codex_responses_api_is_dispatched_to_codex_provider() {
+        let model = fake_model("openai-codex-responses");
+        let ctx = Context::new("system");
+        let result = complete(&model, &ctx, &StreamOptions::default()).await;
+        assert_eq!(result.stop_reason, StopReason::Error);
+        let err = result.error.expect("error populated");
+        assert_eq!(
+            err.category,
+            ErrorCategory::Auth,
+            "codex provider should surface Auth error (no api_key); \
+             got {:?} with message {:?}",
+            err.category,
+            err.message,
+        );
+        // The synthetic error still carries the requested api / provider /
+        // model identifiers so log lines attribute correctly.
+        assert_eq!(result.api, "openai-codex-responses");
     }
 }

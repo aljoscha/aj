@@ -279,7 +279,32 @@ this file is the bridge between the spec and the git history.
          (only the pre-existing `clone_on_ref_ptr` warnings in
          `oauth/anthropic.rs` remain — none in the new `codex.rs`
          module or the touched files).
-   - [ ] 8c.iv. Wire `"openai-codex-responses"` into `provider_for`.
+   - [x] 8c.iv. Wire `"openai-codex-responses"` into `provider_for`.
+         Added the match arm in `src/aj-models/src/provider.rs::provider_for`
+         that dispatches `api: "openai-codex-responses"` to
+         [`OpenAiCodexResponsesProvider`] instead of falling through to
+         the synthetic `unsupported_api_stream` error. Doc comments on
+         the [`Provider`] trait and `provider_for` were updated to list
+         the new api string alongside the existing three.
+
+         New unit test `openai_codex_responses_api_is_dispatched_to_codex_provider`
+         in `provider::tests` verifies the dispatch path without a
+         network call: it calls [`complete`] against a fake model with
+         `api: "openai-codex-responses"` and no `api_key` set, then
+         asserts the resulting `AssistantError` carries
+         [`ErrorCategory::Auth`] (the Codex provider's auth check
+         firing) rather than [`ErrorCategory::InvalidRequest`] (the
+         unknown-API path). The error category is the discriminator —
+         the unknown-API path emits a message starting with
+         `"no provider registered for api"` and an `InvalidRequest`
+         category, so a regression that drops the arm shows up
+         immediately. `result.api == "openai-codex-responses"` is
+         asserted alongside so attribution stays correct on log lines.
+
+         `cargo build`, `cargo test -p aj-models`, `cargo fmt`, and
+         `cargo clippy -p aj-models --all-targets` all pass clean
+         (only the pre-existing `clone_on_ref_ptr` warnings remain in
+         `oauth/anthropic.rs`).
    - [ ] 8c.v. Round-trip parse / serialize / semantic fixtures.
 
 ## Phase 4: Cross-Provider & Utilities
