@@ -20,6 +20,7 @@
 
 pub mod listener;
 pub mod log;
+pub mod migrate;
 pub mod persistence;
 pub mod repair;
 pub mod replay;
@@ -29,6 +30,7 @@ pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     ConversationView, EntryId, ThreadFilter, ThreadKind,
 };
+pub use migrate::{MigrationSummary, walk_threads_dir};
 pub use persistence::{ConversationPersistence, ThreadMetadata, ThreadPreview};
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;

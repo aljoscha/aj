@@ -9,7 +9,7 @@
 use aj::cli::args::{Args, Command, ModelsCommand};
 use aj::modes::{interactive::InteractiveMode, print};
 use aj_conf::Config;
-use aj_session::ConversationPersistence;
+use aj_session::{ConversationPersistence, walk_threads_dir};
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +34,14 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Migrate legacy on-disk thread shapes once per startup. The
+    // walker is idempotent (files with a sibling `.bak` are skipped)
+    // and a no-op for users without legacy data, so the cost on a
+    // fresh install is one stat() per `.jsonl` file. We run it
+    // before dispatch so every mode (interactive, print,
+    // list-threads, continue) sees the migrated shape.
+    run_migration();
+
     match args.command {
         Some(Command::Models { command }) => handle_models_command(command).await,
         Some(Command::ListThreads) => handle_list_threads(),
@@ -47,6 +55,42 @@ async fn main() -> Result<()> {
             dispatch_session_mode(args).await
         }
         None => dispatch_session_mode(args).await,
+    }
+}
+
+/// Run the one-shot legacy-shape migration over the project's
+/// threads directory. Errors are demoted to a `tracing::warn!` so a
+/// migration failure never blocks the user from starting a session;
+/// the legacy entries will simply continue rendering through the
+/// renderer's fallback path until the issue is resolved.
+fn run_migration() {
+    let threads_dir = match Config::get_threads_dir_path() {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!("migrate: could not resolve threads dir: {err}");
+            return;
+        }
+    };
+    match walk_threads_dir(&threads_dir) {
+        Ok(summary) => {
+            if summary.files_migrated > 0
+                || summary.entries_rewritten > 0
+                || summary.entries_dropped > 0
+                || summary.entries_orphaned > 0
+            {
+                tracing::info!(
+                    "migrate: rewrote {} file(s); promoted {} entry(ies), dropped {} duplicate(s), preserved {} orphan(s); skipped {} previously-migrated file(s)",
+                    summary.files_migrated,
+                    summary.entries_rewritten,
+                    summary.entries_dropped,
+                    summary.entries_orphaned,
+                    summary.files_skipped,
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!("migrate: walker failed: {err}");
+        }
     }
 }
 

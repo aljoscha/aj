@@ -2629,18 +2629,93 @@ end-to-end design above. Pick the next unchecked box.
       the pre-existing `clone_on_ref_ptr` warnings remain in
       `aj-agent`).
 
-- [ ] **Step 6: Migration walker for legacy
+- [x] **Step 6: Migration walker for legacy
       `UserOutput::ToolError`.** New `aj_session::migrate` module
-      with a one-shot `walk_threads_dir(path)` invoked from the
-      `aj` binary's startup. Per the §2.0 reconnaissance, the only
-      legacy `user_output` entries on disk are
-      `UserOutput::ToolError {tool_name, input, error}`; rewrite
-      each as a persisted tool_result with empty wire `content`
-      and `details = ToolDetails::Text { summary:
-      format!("{tool_name}: error"), body: error }`, anchored on
-      the same `parent_id`, with `is_error: true`. Each migrated
-      file gets a `.bak` sibling; the walker is idempotent (skip
-      files that already have a `.bak`) and one-way.
+      ships a one-shot `walk_threads_dir(path) -> MigrationSummary`
+      invoked once from `src/aj/src/main.rs::main` before the mode
+      dispatch (so interactive, `--print`, `continue`, and
+      `list-threads` all see the migrated shape). The walker is
+      idempotent — files with a sibling `<stem>.jsonl.bak` are
+      skipped on subsequent passes — and a no-op for users without
+      legacy data (no `.bak` sibling is created on a clean file).
+
+      Per-entry behaviour, refined to handle the transitional shape
+      modern logs took during the §3 ramp:
+
+      - Walk back the `parent_id` chain to the closest assistant
+        `ConversationEntryKind::Message` and match the legacy
+        entry's `tool_name` against its `ToolUseBlock`s. The first
+        unclaimed-and-unresolved candidate becomes the
+        `tool_use_id` for the migration.
+      - **Rewrite** the legacy entry as a structured
+        `ConversationEntryKind::ToolResult { content, details }`
+        when no existing `ToolResult` entry covers that
+        `tool_use_id`: `content` carries one
+        `ContentBlockParam::ToolResultBlock { tool_use_id, content:
+        error_text, is_error: true }` so the wire transcript stays
+        well-formed for the next inference, and `details` carries a
+        single-entry `HashMap<String, ToolDetails::Text { summary:
+        format!("{tool_name}: error"), body: error }>` keyed by the
+        same `tool_use_id` so the renderer's structured-payload
+        path lights up on resume. `id`, `parent_id`, `timestamp`,
+        `thread`, and `agent_id` are preserved so subsequent
+        entries (whose `parent_id` references this one) keep
+        linking cleanly.
+      - **Drop** the legacy entry when a `ConversationEntryKind::ToolResult`
+        (or legacy user-role `ConversationEntryKind::Message`
+        carrying `ToolResultBlock` content) in the same file already
+        carries the matching `tool_use_id`. That case is the
+        transitional double-write the agent emitted during the §3
+        ramp: the structured entry has the canonical payload, and
+        the freestanding error is redundant.
+      - **Preserve** the legacy entry verbatim when no preceding
+        `tool_use` block can be located in the parent chain
+        (orphan errors from very early thread shapes). The
+        renderer's legacy `UserOutput::ToolError` handler keeps
+        surfacing them; a file containing only orphans is left
+        untouched (no `.bak`, no rewrite) since orphans aren't a
+        semantic change.
+
+      File-level rewrite is atomic via a three-step ordering
+      (`fs::copy` original → `.bak`; write `.tmp`; `fsync`;
+      atomic same-directory `rename` `.tmp` → original) so every
+      crash point leaves a recoverable state. The `.bak` carries
+      the pre-migration bytes verbatim — covered by a unit test
+      that greps the backup for the legacy `"ToolError"` tag.
+
+      Eight unit tests in `aj_session::migrate::tests` cover:
+      `walk_is_noop_when_threads_dir_missing` (missing dir →
+      default summary, no error); `walk_skips_files_with_no_legacy_entries`
+      (clean file → no `.bak`, no counters bumped);
+      `walk_rewrites_legacy_tool_error_as_structured_tool_result`
+      (happy path: rewrite, `.bak` preserves original, structured
+      shape round-trips through `ConversationLog::resume` →
+      `linearize`); `walk_drops_legacy_tool_error_when_structured_result_already_covers_it`
+      (transitional double-write dedup); `walk_preserves_orphan_tool_error_without_preceding_tool_use`
+      (orphan path: no `.bak`, no rewrite, `files_migrated == 0`);
+      `walk_is_idempotent` (second pass observes `.bak` and skips);
+      `walk_handles_batch_of_errors_sharing_one_assistant_turn`
+      (two errors share one assistant turn with two `ToolUseBlock`s
+      → distinct `tool_use_id`s claimed in source order); and
+      `walk_preserves_parent_chain_after_rewrite` (entries
+      following the rewritten one still resolve their `parent_id`
+      and `linearize` walks past).
+
+      Startup wiring (`src/aj/src/main.rs::run_migration`) reads
+      the threads dir via `Config::get_threads_dir_path()` and
+      demotes both resolution and walker errors to
+      `tracing::warn!` so a migration failure never blocks a
+      session — the legacy entries simply keep rendering through
+      the renderer's fallback path until the issue is resolved. A
+      `tracing::info!` one-line summary fires when at least one
+      file or entry changed, with explicit `files_migrated`,
+      `entries_rewritten`, `entries_dropped`, `entries_orphaned`,
+      and `files_skipped` counters.
+
+      `cargo build`, `cargo test --workspace`, `cargo fmt`, and
+      `cargo clippy -p aj-session --all-targets` all pass clean
+      (only the pre-existing `clone_on_ref_ptr` warnings remain
+      in `aj-agent`).
 
 ### Original implementation-plan prose (preserved for reference)
 
