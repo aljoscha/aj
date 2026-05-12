@@ -3019,6 +3019,84 @@ session notes for the planning commit.
        directly.** The legacy types are reachable only through
        `aj-models`'s own internal modules (which 6.9 deletes).
 
+       Sub-progress:
+   - [x] 6.8.i. `--scripted` CLI resolver onto `ScriptedProvider`.
+         Rewrote `src/aj/src/scripted.rs::resolve_or_explain` to
+         look the demo name up in
+         [`aj_models::scripted::provider::demos`] (the new event-
+         shape catalog landed in 6.3.ii) and return a
+         [`ScriptedProvider`] preloaded with that demo's scripts.
+         The provider defaults to [`ExhaustedBehavior::EndTurn`]
+         so demos that run out of script (the user keeps chatting)
+         exit cleanly without panicking the inference task — same
+         semantics as the legacy resolver. The
+         [`ResolvedScriptedModel`] return shape is unchanged
+         (`{ provider: Arc<dyn Provider>, model_info: Arc<ModelInfo> }`),
+         so the two binary call sites (`interactive.rs`,
+         `print.rs`) didn't need an update.
+
+         The synthesized [`ModelInfo`] is now built inline by a
+         private `scripted_model_info(name)` helper instead of
+         going through [`aj_models::compat::synthetic_model_info`]
+         — the compat helper hardcoded `api: "legacy"` /
+         `provider: "legacy"`, whereas the new identity matches
+         what `ScriptedProvider` stamps onto every emitted
+         [`AssistantMessage`] partial (`api: "scripted"` /
+         `provider: "scripted"`). The model id is namespaced by
+         demo name (`scripted/<demo>`) so the TUI footer's
+         `format!("{} @ {}", info.id, info.base_url)` rendering
+         shows which canned flow is running — matches the legacy
+         resolver's `with_name(format!("scripted/{name}"))`
+         behaviour.
+
+         The `--scripted` flag's doc-comment in
+         `src/aj/src/cli/args.rs` had a stale paragraph claiming
+         the binary "registers a [`ScriptedModel`] in its place";
+         updated to point at [`ScriptedProvider`] and
+         [`AssistantMessageEvent`] instead.
+
+         After this commit `aj/src/scripted.rs` no longer touches
+         the legacy `Model` trait, `LegacyProviderAdapter`, or
+         `synthetic_model_info`; those references move out of the
+         binary entirely. Two call sites still use the compat
+         helpers — `aj-agent::event_protocol_tests` (6.8.ii) and
+         `aj/tests/replay_parity.rs` (6.8.iii) — and both go away
+         in their respective sub-steps. `cargo build`, `cargo
+         test --workspace`, `cargo fmt`, and `cargo clippy
+         --workspace --all-targets` all pass clean (only the
+         pre-existing `clone_on_ref_ptr` warnings in `bus.rs`,
+         `bash.rs`, `oauth/anthropic.rs`, and the agent's
+         `event_protocol_tests` remain — none in the touched
+         files). End-to-end `cargo run -p aj -- --scripted
+         streaming-text --print "hi"` exercises the new path
+         live and runs the canned demo to completion.
+   - [ ] 6.8.ii. `aj-agent::event_protocol_tests` onto
+         `ScriptedProvider`. Replace the
+         `ScriptedModel::from_event_vecs(...)` builder used in
+         every test in
+         `src/aj-agent/src/lib.rs::event_protocol_tests` with
+         `ScriptedProvider::from_messages(...)` (the unified
+         "final message script" mode) or
+         `from_event_vecs(...)` for tests that author per-event
+         deltas. Drop the `Arc<dyn Model> → LegacyProviderAdapter
+         → synthetic_model_info` plumbing from `build_agent`; the
+         test helper builds a `ScriptedProvider` and `ModelInfo`
+         directly. Locked event sequences should match
+         byte-for-byte across the migration (the
+         `LegacyProviderAdapter`'s transcoder produces the same
+         event shape `ScriptedProvider` emits natively).
+   - [ ] 6.8.iii. `aj/tests/replay_parity.rs` onto
+         `ScriptedProvider`. Same migration shape as 6.8.ii: drop
+         the `ScriptedModel`-driven `one_tool_use_script` helper
+         and rebuild it on `ScriptedProvider::from_messages`
+         (a one-block tool-use `AssistantMessage` with
+         `stop_reason: ToolUse`). After this, the integration
+         test no longer references `aj_models::Model` /
+         `aj_models::compat::*` / `aj_models::streaming::StreamingEvent`
+         and the `aj_models::scripted::ScriptedModel` /
+         `aj_models::scripted::Script` types — the only remaining
+         caller of those is `aj-models` itself, which 6.9 deletes.
+
 - [ ] **6.9: Delete legacy.** With every call site migrated,
        delete in one commit:
        - The `Model` trait, `create_model`, `ModelArgs`, and

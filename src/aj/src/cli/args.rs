@@ -50,18 +50,19 @@ pub struct Args {
     pub prompt: Vec<String>,
 
     /// Replace the live model with a scripted fake that replays a
-    /// canned [`StreamingEvent`](aj_models::streaming::StreamingEvent)
+    /// canned
+    /// [`AssistantMessageEvent`](aj_models::streaming::AssistantMessageEvent)
     /// sequence. Useful for eyeballing how the TUI / print mode
     /// renders thinking blocks, tool calls, errors, and the like,
     /// without spending a real API round-trip.
     ///
     /// The argument is the demo name. Pass `--scripted help` (or any
     /// unknown name) to see the catalog. When set the binary skips
-    /// `aj_models::create_model` entirely and registers a
-    /// [`aj_models::scripted::ScriptedModel`] in its place; every
-    /// other code path (TUI, persistence, tools, slash commands)
-    /// runs unchanged so the eyeball test exercises the real
-    /// surface.
+    /// registry-driven provider construction entirely and registers a
+    /// [`ScriptedProvider`](aj_models::scripted::provider::ScriptedProvider)
+    /// in its place; every other code path (TUI, persistence, tools,
+    /// slash commands) runs unchanged so the eyeball test exercises
+    /// the real surface.
     #[arg(long)]
     pub scripted: Option<String>,
 
