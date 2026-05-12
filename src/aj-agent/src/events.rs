@@ -13,6 +13,7 @@
 //!
 //! See `docs/aj-next-plan.md` §1.1.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use aj_models::messages::ContentBlockParam;
@@ -120,7 +121,23 @@ pub enum PersistedMessageKind {
     /// the end of every tool batch so the next inference sees the
     /// model's tool calls answered. Maps onto
     /// `aj_session::ConversationView::add_user_message`.
-    ToolResult { content: Vec<ContentBlockParam> },
+    ///
+    /// `details` carries the structured per-call [`ToolDetails`]
+    /// payload the agent emitted alongside the wire content, keyed
+    /// by `tool_use_id`. Every entry in `content` that is a
+    /// `ContentBlockParam::ToolResultBlock` has a matching entry
+    /// here; persistence rides both halves on the same on-disk
+    /// record so a resumed session can rehydrate the structured
+    /// renderer state (diffs, todo snapshots, bash exit codes,
+    /// sub-agent reports) instead of falling back to the wire
+    /// text-only projection. The map is `skip_serializing_if`
+    /// empty so legacy emitters and the rare details-less batch
+    /// don't pollute the JSON-on-the-wire shape.
+    ToolResult {
+        content: Vec<ContentBlockParam>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        details: HashMap<String, ToolDetails>,
+    },
     /// Append a freestanding [`UserOutput`] entry. Today only
     /// emitted for the synthesized [`UserOutput::ToolError`]
     /// records the agent writes when a tool-call's `input` JSON
@@ -435,5 +452,47 @@ mod tests {
         assert_eq!(json["type"], "message_persisted");
         assert_eq!(json["kind"]["kind"], "user");
         assert!(json["kind"]["content"].is_array());
+
+        // The `ToolResult` variant carries an additional `details`
+        // map keyed by `tool_use_id`. Empty maps are skipped so the
+        // common case (an empty / legacy details payload) stays
+        // identical to the pre-widening wire shape; a populated map
+        // surfaces as a JSON object whose values are the
+        // internally-tagged `ToolDetails` shape.
+        let persisted_empty = AgentEvent::MessagePersisted {
+            agent_id: AgentId::Main,
+            kind: PersistedMessageKind::ToolResult {
+                content: vec![],
+                details: HashMap::new(),
+            },
+        };
+        let json = serde_json::to_value(&persisted_empty).expect("empty tool-result serializes");
+        assert_eq!(json["kind"]["kind"], "tool_result");
+        assert!(json["kind"]["content"].is_array());
+        assert!(
+            json["kind"].get("details").is_none(),
+            "empty details map should be skipped on serialize: {json}"
+        );
+
+        let mut details = HashMap::new();
+        details.insert(
+            "tu-1".to_string(),
+            ToolDetails::Text {
+                summary: "ping".to_string(),
+                body: "pong".to_string(),
+            },
+        );
+        let persisted_with_details = AgentEvent::MessagePersisted {
+            agent_id: AgentId::Main,
+            kind: PersistedMessageKind::ToolResult {
+                content: vec![],
+                details,
+            },
+        };
+        let json = serde_json::to_value(&persisted_with_details)
+            .expect("tool-result with details serializes");
+        assert_eq!(json["kind"]["details"]["tu-1"]["kind"], "text");
+        assert_eq!(json["kind"]["details"]["tu-1"]["summary"], "ping");
+        assert_eq!(json["kind"]["details"]["tu-1"]["body"], "pong");
     }
 }

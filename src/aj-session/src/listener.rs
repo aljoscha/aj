@@ -148,7 +148,19 @@ fn persist(
         PersistedMessageKind::Assistant { content } => {
             view.add_assistant_message(content)?;
         }
-        PersistedMessageKind::ToolResult { content } => {
+        PersistedMessageKind::ToolResult { content, details } => {
+            // `details` carries the per-call structured renderer
+            // payload keyed by `tool_use_id`. Today we only persist
+            // the wire `content` (matching legacy behaviour);
+            // wiring `details` through to the on-disk record lands
+            // as the next commit in this series so that resumed
+            // sessions can rehydrate the structured renderer state
+            // (diffs, todo snapshots, bash exit codes,
+            // sub-agent reports) instead of falling back to the
+            // wire text-only projection. See
+            // `docs/aj-next-progress.md` §3 — "Resume fidelity
+            // follow-up".
+            let _ = details;
             view.add_user_message(content)?;
         }
         PersistedMessageKind::UserOutput { output } => {

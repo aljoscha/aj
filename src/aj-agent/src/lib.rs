@@ -842,6 +842,16 @@ impl Agent {
             // Execute tool calls if any
             if has_tool_use {
                 let mut tool_result_contents = Vec::new();
+                // Mirror of `tool_result_contents` for the
+                // structured renderer payload: each loop iteration
+                // pushes one wire block and one matching
+                // `(tool_use_id, ToolDetails)` entry here, so the
+                // batched `MessagePersisted::ToolResult` event at
+                // the end of the loop can persist both halves on
+                // the same record. Keyed by `tool_use_id` so the
+                // persistence layer can correlate without scanning
+                // the content vector.
+                let mut tool_result_details: HashMap<String, ToolDetails> = HashMap::new();
 
                 for (tool_id, tool_name, tool_input) in tool_calls {
                     // Mirror the start of every tool invocation on the
@@ -937,14 +947,17 @@ impl Agent {
 
                     // Project the structured `content` onto the
                     // legacy text-only `ToolResultContent::Text`
-                    // shape for the wire. The `details` ride
-                    // directly on the bus event below; persistence
-                    // captures both pieces (the wire content goes
-                    // into the synthesized user-role `ToolResult`
-                    // message; the structured details land via a
-                    // future `MessagePersisted::ToolDetails` once
-                    // the on-disk format catches up — see
-                    // `docs/aj-next-plan.md` §3 / §1.2).
+                    // shape for the wire. The structured `details`
+                    // ride twice: once on the per-call
+                    // [`AgentEvent::ToolExecutionEnd`] event below
+                    // (for live renderers), and once into
+                    // `tool_result_details` (keyed by `tool_use_id`)
+                    // so the batched [`PersistedMessageKind::ToolResult`]
+                    // event at the end of the loop carries the same
+                    // per-call payload through to persistence —
+                    // letting a resumed session rehydrate the
+                    // structured renderer state instead of falling
+                    // back to the wire text-only projection.
                     let return_value: String = outcome
                         .content
                         .iter()
@@ -962,6 +975,7 @@ impl Agent {
                     };
 
                     tool_result_contents.push(result_content_block);
+                    tool_result_details.insert(tool_id.clone(), outcome.details.clone());
 
                     self.bus
                         .emit(AgentEvent::ToolExecutionEnd {
@@ -986,6 +1000,7 @@ impl Agent {
                             agent_id: self.agent_id,
                             kind: PersistedMessageKind::ToolResult {
                                 content: tool_result_contents,
+                                details: tool_result_details,
                             },
                         })
                         .await
@@ -1472,7 +1487,8 @@ mod event_protocol_tests {
 
     use aj_conf::AgentEnv;
     use aj_models::messages::{
-        ContentBlock, Message as LegacyMessage, MessageType, Role, StopReason, Usage,
+        ContentBlock, ContentBlockParam, Message as LegacyMessage, MessageType, Role, StopReason,
+        Usage,
     };
     use aj_models::scripted::{ExhaustedBehavior, ScriptedModel};
     use aj_models::streaming::StreamingEvent;
@@ -1823,6 +1839,95 @@ mod event_protocol_tests {
             EventLabel::AgentEnd(AgentId::Sub(1)),
         ];
         assert_eq!(events, expected, "unexpected event sequence: {events:#?}");
+    }
+
+    #[tokio::test]
+    async fn tool_result_persistence_event_carries_structured_details_by_id() {
+        // The agent's batched [`PersistedMessageKind::ToolResult`]
+        // event must carry the per-call structured `details` keyed
+        // by `tool_use_id`, alongside the wire `content`. A
+        // downstream persistence listener relies on this so the
+        // on-disk record can pin both the LLM-facing text (used by
+        // the next inference) and the renderer payload (used by
+        // resumed sessions to rehydrate diffs / todo snapshots /
+        // bash exit codes / sub-agent reports without re-running
+        // the tool).
+        let scripts = vec![
+            vec![StreamingEvent::FinalizedMessage {
+                message: finalize_tool_use("tu-only", "ping"),
+            }],
+            vec![StreamingEvent::FinalizedMessage {
+                message: finalize_text("done"),
+            }],
+        ];
+        let ping: ErasedToolDefinition = PingTool.into();
+        let mut agent = build_agent(scripts, vec![ping]);
+        agent.set_agent_id(AgentId::Sub(42));
+
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            // Stash full events (not just labels) so the test can
+            // inspect the `details` map contents.
+            if let AgentEvent::MessagePersisted {
+                kind: PersistedMessageKind::ToolResult { .. },
+                ..
+            } = event
+            {
+                captured_clone.lock().unwrap().push(event.clone());
+            }
+        }));
+
+        agent
+            .run_single_turn("run ping".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one ToolResult persistence event: {events:#?}"
+        );
+
+        let AgentEvent::MessagePersisted {
+            kind: PersistedMessageKind::ToolResult { content, details },
+            ..
+        } = &events[0]
+        else {
+            panic!("captured non-ToolResult event: {:#?}", events[0]);
+        };
+
+        // Wire content carries exactly one tool_result block, with
+        // the same id the model's `tool_use` block had.
+        assert_eq!(content.len(), 1);
+        match &content[0] {
+            ContentBlockParam::ToolResultBlock {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "tu-only");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResultBlock, got {other:#?}"),
+        }
+
+        // The details map has a matching entry keyed by the same
+        // `tool_use_id`, carrying the structured `ToolDetails`
+        // [`PingTool`] returned (the test fixture emits a
+        // `Text { summary: "ping", body: "pong" }` outcome).
+        assert_eq!(details.len(), 1, "details: {details:#?}");
+        let payload = details
+            .get("tu-only")
+            .expect("details keyed by tool_use_id");
+        match payload {
+            ToolDetails::Text { summary, body } => {
+                assert_eq!(summary, "ping");
+                assert_eq!(body, "pong");
+            }
+            other => panic!("expected ToolDetails::Text, got {other:#?}"),
+        }
     }
 
     #[tokio::test]

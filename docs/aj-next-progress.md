@@ -2326,6 +2326,124 @@ disturbing replay or the agent loop.
 
 ### Implementation plan when §3 lands
 
+Decomposed into self-contained commits, each one a step from the
+end-to-end design above. Pick the next unchecked box.
+
+- [x] **Step 1: Widen `PersistedMessageKind::ToolResult` to carry
+      structured details.** The agent's batched tool-result
+      persistence event now ships a
+      `details: HashMap<String, ToolDetails>` field keyed by
+      `tool_use_id`, alongside the existing wire `content`. The
+      agent's tool-execution loop in `src/aj-agent/src/lib.rs`
+      accumulates a per-call mirror of `tool_result_contents`
+      during the batch loop and ships it on the
+      `MessagePersisted::ToolResult` event at the end of the turn.
+
+      The persistence listener in `aj-session::listener` destructures
+      the new field but does not yet route it onto disk (an
+      explicit `let _ = details;` plus a comment pointing at step 2);
+      this is the layered scaffolding the design intended — the
+      producer side ships the structured payload first, the
+      on-disk shape catches up next, replay catches up after that.
+
+      Pin-shape JSON test in `src/aj-agent/src/events.rs` now
+      asserts:
+      - The empty `details` map is skipped on serialize
+        (no shape change for legacy emitters / the rare
+        details-less batch).
+      - A populated map surfaces as a JSON object whose values are
+        the existing internally-tagged `ToolDetails` shape (e.g.
+        `{"kind": "text", "summary": "...", "body": "..."}`).
+
+      New unit test
+      `tool_result_persistence_event_carries_structured_details_by_id`
+      in `src/aj-agent/src/lib.rs` drives a full tool-call turn
+      against a scripted model + the existing `PingTool` fixture
+      and asserts:
+      - Exactly one `MessagePersisted::ToolResult` event fires per
+        turn.
+      - Its `content` carries the wire `ToolResultBlock` keyed by
+        the expected `tool_use_id`.
+      - Its `details` map has a matching entry keyed by the same
+        `tool_use_id`, carrying the structured `ToolDetails::Text`
+        payload `PingTool` returned.
+
+      Other downstream consumers of `PersistedMessageKind::ToolResult`
+      (`aj-agent`'s own `event_label`, `aj/src/modes/interactive/event_pump.rs`)
+      already used `{ .. }` patterns and were unaffected by the
+      widening. `cargo build`, `cargo test --workspace`, `cargo
+      fmt`, and `cargo clippy -p aj-agent -p aj-session
+      --all-targets` all pass clean (only the pre-existing
+      `clone_on_ref_ptr` warnings remain, matching the surrounding
+      test fixtures' style).
+
+- [ ] **Step 2: On-disk persistence — new entry shape +
+      `add_tool_result`.** Introduce a way to ride
+      `details: HashMap<String, ToolDetails>` on the on-disk record
+      alongside the wire `Vec<ContentBlockParam>`. Two equivalent
+      shapes to pick from (Option A is the lighter-weight default):
+
+      - **Option A:** a new `ConversationEntryKind::ToolResult { content,
+        details }` variant on the persisted entry, plus a matching
+        `ConversationView::add_tool_result(content, details)`
+        method. Replay matches on the variant directly. `Conversation::messages()`
+        needs to expose tool-result entries as user-role
+        `MessageParam`s so the wire layer continues to see one
+        `Role::User` message per tool batch.
+      - **Option B:** a persistence-only
+        `PersistedContentBlockParam` mirror of `ContentBlockParam`
+        with `details: Option<ToolDetails>` on the `ToolResultBlock`
+        variant, plus a custom serde boundary translating to the
+        wire shape on read-out.
+
+      Either way the on-disk schema is additive — legacy logs omit
+      the field (`#[serde(default, skip_serializing_if = "...")]`)
+      and replay falls through to today's text-only synthesis path.
+      No migration walker for this field; the §3 walker (step 6) is
+      for the legacy `UserOutput::ToolError` rewrites only.
+
+- [ ] **Step 3: Persistence listener dispatch.** Replace the
+      `let _ = details;` placeholder in `aj_session::listener::persist`
+      with a call into the step-2 `add_tool_result` method (or
+      whatever the chosen shape exposes), so the structured
+      details actually land on disk alongside the wire content.
+
+- [ ] **Step 4: Replay reads `details` (with legacy fallback).**
+      Update `aj_session::replay::ReplayState::project_user` (the
+      site that synthesizes `AgentEvent::ToolExecutionEnd { result:
+      ToolDetails::Text { ... } }` from the wire content) to read
+      the persisted `details` field if present and project it onto
+      the event directly. When the field is absent (legacy logs),
+      keep today's `ToolDetails::Text { summary: tool_name, body:
+      result_text }` synthesis as the fallback. The synthetic
+      `ToolExecutionStart` emitted today by `project_user`
+      continues to provide the args header; new logs with details
+      just get a richer body on top.
+
+- [ ] **Step 5: End-to-end replay-vs-live parity test.** A test in
+      `src/aj/` that runs a tool-call turn live (bash, edit_file,
+      todo_write fixtures), kills the process between persistence
+      and the next inference, resumes from the on-disk log, and
+      asserts the rendered scrollback bytes match the live ones
+      for each of the three tool kinds. Without this guard the
+      three rendering paths drift silently across future
+      refactors.
+
+- [ ] **Step 6: Migration walker for legacy
+      `UserOutput::ToolError`.** New `aj_session::migrate` module
+      with a one-shot `walk_threads_dir(path)` invoked from the
+      `aj` binary's startup. Per the §2.0 reconnaissance, the only
+      legacy `user_output` entries on disk are
+      `UserOutput::ToolError {tool_name, input, error}`; rewrite
+      each as a persisted tool_result with empty wire `content`
+      and `details = ToolDetails::Text { summary:
+      format!("{tool_name}: error"), body: error }`, anchored on
+      the same `parent_id`, with `is_error: true`. Each migrated
+      file gets a `.bak` sibling; the walker is idempotent (skip
+      files that already have a `.bak`) and one-way.
+
+### Original implementation-plan prose (preserved for reference)
+
 1. **Wire event variant.** Widen `PersistedMessageKind::ToolResult`
    (Option A) or introduce `PersistedToolResultBlock` (Option B) to
    carry the structured details. The agent emits this from the
