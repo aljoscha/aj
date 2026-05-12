@@ -2207,3 +2207,246 @@ and runs once on first launch of the new binary against
   for §2.0(a)).
 - Each migrated file gets a `.bak` sibling. Skip files that
   already have a `.bak` sibling (idempotent rerun).
+
+## Resume fidelity follow-up — persist `ToolDetails` inline on tool results
+
+A user-reported continue-session bug (chat scrollback rendered tools
+without their structured body) traced to three distinct gaps. Two of
+them landed already as `tui: clear current_assistant when replay
+synthesizes a tool component` and `session: replay emits
+ToolExecutionStart with captured tool_use args`. The third — the
+biggest — is captured here so it's picked up when we get to
+`docs/aj-next-plan.md` §3 ("Conversation log migration") and §1.2
+("`ToolDetails` persistence").
+
+### Symptom
+
+On a resumed thread, a tool call that ran live as e.g.
+
+```
+✓ bash(command="echo \"hi\"", description="Test")
+$ echo "hi"
+hi
+[exit 0]
+```
+
+renders on resume as a flat `ToolDetails::Text` shape:
+
+```
+✓ bash(command="echo \"hi\"", description="Test")   <-- args restored
+  bash                                              <-- summary == tool name
+  hi                                                <-- body == raw tool_result text
+```
+
+Same for `edit_file` / `write_file` (no diff visible — body shown as
+plain text) and `todo_write` (no structured list — body is the
+LLM-facing summary text).
+
+### Root cause
+
+The agent emits `AgentEvent::ToolExecutionEnd { result: ToolDetails }`
+on the live bus, and the renderer uses the structured variant
+(`ToolDetails::Bash { command, stdout, stderr, exit_code, truncated,
+... }`, `ToolDetails::Diff { path, before, after }`,
+`ToolDetails::Todos { items }`, etc.) to drive its specialised body
+renderers (`bash_execution.rs::render_bash_body`,
+`diff.rs::render_unified_diff`, the todo list view).
+
+`ToolDetails` is **not** persisted. The on-disk format only stores
+the wire `tool_result.content` (text-flattened
+`ContentBlockParam::ToolResultBlock`). On resume the replay walker
+can't reconstruct the structured variant, so it folds everything into
+`ToolDetails::Text { summary: tool_name, body: result_text }` and the
+renderer falls back to plain-text rendering of the body.
+
+Acknowledged in code at `src/aj-agent/src/lib.rs` (search for "the
+structured details land via a future `MessagePersisted::ToolDetails`
+once the on-disk format catches up"). Captured in the plan in §3 as
+the `ToolDetails`-replaces-`UserOutput::ToolResult*` migration row
+but tied to the broader rewriting walker.
+
+### Design: ride `details` inline on the tool-result record
+
+The shape we want:
+
+- Single on-disk record per tool call: `(assistant message with
+  toolCall content blocks) → (toolResult message with both
+  LLM-facing `content` and structured `details`)`.
+- The persisted tool-result record carries `content` (text/images
+  for the LLM) **and** `details` (structured rendering payload) on
+  the same wire record. Both are persisted on the same JSONL line.
+- **No separate "ToolDetails" entry kind, no separate
+  start/end persistence events.** The agent only ever writes one
+  record per tool call. The in-progress visual state is a
+  live-stream-only concept driven by the event bus; resumed sessions
+  skip it entirely (the tool is already finished by the time replay
+  runs).
+- Replay walks the linearized message list synchronously and uses an
+  in-flight `Map<tool_use_id, ToolExecutionComponent>` to wire the
+  tool result back to the component spawned for the matching
+  `tool_use` block on the preceding assistant message.
+
+That maps onto our types as: store the `ToolDetails` on the same
+persistence record that already carries the wire `tool_result.content`,
+not as a sidecar entry. The wire type
+`ContentBlockParam::ToolResultBlock` is shared with the
+provider SDK (Anthropic / OpenAI), so we can't add unknown fields to
+it directly without filtering on the wire-out path. Two clean
+shapes for where the details field rides:
+
+- **Option A (lightweight, preferred):** widen
+  `PersistedMessageKind::ToolResult` to
+  `ToolResult { content: Vec<ContentBlockParam>, details:
+  HashMap<String, (ToolDetails, bool /* is_error */)> }`, keyed by
+  `tool_use_id`. The agent already emits this event once per turn
+  with all tool results batched into one message (matching how
+  `aj-models` packs the wire response), so the details map sits at
+  the same level. Persistence listener writes both halves on the
+  same `ConversationEntry`. Replay reads `details` directly off the
+  entry and projects `ToolExecutionEnd { result: details.clone() }`
+  for each tool_use_id, no second pass or correlation pointer
+  needed.
+- **Option B (per-block):** introduce a
+  persistence-only `PersistedToolResultBlock` that wraps
+  `ContentBlockParam::ToolResultBlock` with an extra
+  `details: Option<ToolDetails>` field. `ConversationEntry`
+  flattens its persistence content blocks, but a custom
+  `Serialize`/`Deserialize` boundary translates between the
+  persistence shape and the wire shape when projecting
+  `Conversation::messages()` for the provider call. Slightly more
+  type surface, but each persisted tool_result is self-contained
+  (no separate details map to maintain).
+
+Both keep the wire-out path clean (no extra fields leak to the
+provider SDK) and both make the on-disk record the single source of
+truth for resume rendering. Pick Option A unless the field-soup of
+piggy-backing on top of `PersistedMessageKind::ToolResult` gets
+unwieldy; the implementer can flip to Option B inside §3 without
+disturbing replay or the agent loop.
+
+### Implementation plan when §3 lands
+
+1. **Wire event variant.** Widen `PersistedMessageKind::ToolResult`
+   (Option A) or introduce `PersistedToolResultBlock` (Option B) to
+   carry the structured details. The agent emits this from the
+   tool-execution loop in `Agent::run` (`src/aj-agent/src/lib.rs`)
+   alongside the existing wire `content`. Carry the same
+   `tool_use_id` the bus events use so replay can correlate the
+   details back to the persisted block. No new
+   `PersistedMessageKind::ToolDetails` variant — the existing
+   `ToolResult` event simply grows the field.
+
+2. **On-disk persistence.** Update
+   `aj_session::log::ConversationView::add_user_message` (or a new
+   `add_tool_result` method specialized for this shape) to accept
+   the details map alongside the content blocks and serialize both
+   into the same `ConversationEntryKind::Message` JSONL line. The
+   on-disk schema is additive: legacy logs simply omit the field
+   (`#[serde(default, skip_serializing_if = "...")]`) and replay
+   falls through to today's text-only synthesis path. **No
+   rewriting migration walker is needed for the new field** — the
+   walker described in §3 is still wanted for the legacy
+   `UserOutput::ToolError` rewrites, but a separate purpose.
+
+3. **Persistence listener.** Extend
+   `aj_session::listener::persist` to route the widened
+   `PersistedMessageKind::ToolResult` through the new `add_*`
+   method.
+
+4. **Replay.** Update `aj_session::replay::ReplayState` to read the
+   details field off each persisted tool_result and project
+   `AgentEvent::ToolExecutionEnd { result: details, is_error }`.
+   When the field is absent (legacy logs), keep today's fallback:
+   `ToolDetails::Text { summary: tool_name, body: result_text }`.
+   The synthetic `ToolExecutionStart` emitted today by
+   `project_user` continues to provide the args header; new logs
+   with details just get a richer body on top.
+
+5. **Migration walker (for legacy `UserOutput::ToolError` only).**
+   The rewriting walker sketched in §3 still applies to the legacy
+   `UserOutput::ToolError` entries (37/37 of the on-disk
+   `user_output` entries per the §2.0 reconnaissance). Rewrite each
+   as a persisted tool_result with an empty wire `content` and
+   `details = ToolDetails::Text { summary: format!("{tool_name}:
+   error"), body: error }`, anchored on the same `parent_id`. Per-
+   tool reconstruction for *successful* legacy tool results isn't
+   needed because there are zero `UserOutput::ToolResult*` entries
+   on disk; pre-§3 successes only existed in the wire
+   `tool_result.content`, which replay already projects to
+   `ToolDetails::Text` correctly.
+
+6. **Tests.**
+   - `aj-session::replay`: a persisted entry with `details` emits a
+     structured `ToolExecutionEnd`; an entry without `details`
+     falls through to today's text-only synthesis (regression
+     against legacy logs).
+   - `aj-session::listener`: `MessagePersisted::ToolResult` with
+     details writes both halves on the same JSONL line.
+   - `aj-session::migrate`: legacy `UserOutput::ToolError` is
+     rewritten as a structured tool_result with `is_error: true`;
+     idempotent on rerun.
+   - `aj`: an end-to-end replay test (live run → kill → resume) that
+     pins the rendered scrollback against the live one for bash,
+     edit_file, and todo_write fixtures. Without this test the
+     three rendering paths drift silently across the migration.
+
+### Architectural pointers
+
+These are second-order design points worth honouring when §3 lands
+even though they aren't strictly required by the fidelity bug:
+
+- **Render the assistant's text/thinking as one component, then walk
+  its toolCalls and append a tool component per call.** Don't try to
+  interleave tool components inside the assistant message's content
+  rendering. The natural turn boundary (model stops generating after a
+  toolUse stop reason) keeps the order correct: the next assistant
+  message lands after the toolResult. Today's `EventPump` already
+  follows this shape via the streaming event sequence; the §3 work
+  shouldn't disturb it.
+- **Tool result `content` always carries a useful text representation
+  for the LLM.** The `details` field is for the renderer; the LLM
+  still needs words to reason over. Don't shrink the wire content to
+  an empty string just because the structured `details` has the
+  "real" data — the next turn's prompt depends on the LLM seeing
+  something meaningful in `tool_result.content`.
+- **Snapshot full state for stateful tools (todos, plan-mode state)
+  in `details`.** Persist the full `todos: Vec<TodoItem>` snapshot in
+  each tool_result's `details` and reconstruct in-memory state on
+  resume by walking the message branch and replaying the latest
+  snapshot. Our `ToolDetails::Todos { items: Vec<TodoItem> }` already
+  has the right shape; just make sure resumes actually use it as the
+  rehydration source rather than re-running the tool.
+- **Persistence is just a listener on the agent's event bus.** Our
+  current §2.4b wiring already has this shape — keep it that way
+  through §3. Don't pass the log into `Agent::run`; let the binary
+  own the log and register the persistence listener.
+- **Persist eagerly.** Don't defer the first flush until the first
+  assistant message lands — that loses data on a pre-response crash.
+  Our current implementation persists each `MessagePersisted` event
+  as it arrives; keep that behaviour through §3. The cost (one
+  fsync per JSONL line) is well below the agent's other latencies.
+- **`ToolDetails` per-tool vs. closed enum.** An alternative shape is
+  to let each tool ship its own details type and `render_result`
+  closure, with the renderer registry looking up the right pair by
+  tool name. Our closed `enum ToolDetails { Text, Bash, Diff, Todos,
+  Json, SubAgentReport }` is simpler and is fine while the variant
+  set is small. If we start adding lots of one-off tools with bespoke
+  rendering, consider migrating to a `dyn ToolRenderer` registry to
+  avoid the god-type pattern. Not blocking for §3.
+- **Avoid duplicating the wire body in `details`.** A leaner shape
+  would keep only metadata (truncation flags, full-output path) in
+  `ToolDetails::Bash`, with the actual stdout living in the wire
+  `content[0].text`. Our current `ToolDetails::Bash` duplicates
+  stdout in both places, which is wasteful but harmless. Worth
+  tidying as part of §3 if a re-shape lands.
+
+### Out of scope for the immediate two commits
+
+The reorder fix (commit 1) and the args-on-replay fix (commit 2) are
+deliberately scoped to the **replay + renderer** side and don't
+touch the on-disk format. They make a resumed session look exactly
+like the live one *as far as the persisted bytes allow*. Closing the
+remaining gap requires the `details`-inline-on-tool-result change
+above and should land together with the §3 migration walker (for the
+legacy `UserOutput::ToolError` rewrites) so a single binary release
+covers both the new persistence path and the legacy cleanup.
