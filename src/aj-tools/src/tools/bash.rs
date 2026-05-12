@@ -247,8 +247,8 @@ impl ToolDefinition for BashTool {
         let stdout_truncated = stdout_state.lock().unwrap().truncated;
         let stderr_truncated = stderr_state.lock().unwrap().truncated;
         let truncated = stdout_truncated || stderr_truncated;
-        let stdout_str = bytes_to_lossy_string(stdout_data);
-        let stderr_str = bytes_to_lossy_string(stderr_data);
+        let stdout_str = decode_stream_output(stdout_data);
+        let stderr_str = decode_stream_output(stderr_data);
 
         // Persist the spill file iff we actually truncated; otherwise
         // drop it (NamedTempFile's Drop unlinks the file).
@@ -411,8 +411,8 @@ fn snapshot_partial(
         stdout_state.lock().unwrap().truncated || stderr_state.lock().unwrap().truncated;
     ToolDetails::Bash {
         command: command.to_string(),
-        stdout: bytes_to_lossy_string(stdout_data),
-        stderr: bytes_to_lossy_string(stderr_data),
+        stdout: decode_stream_output(stdout_data),
+        stderr: decode_stream_output(stderr_data),
         exit_code: None,
         truncated,
         full_output_path: None,
@@ -514,8 +514,18 @@ fn spawn_error_outcome(command: &str, error: String) -> ToolOutcome {
     }
 }
 
-fn bytes_to_lossy_string(bytes: Vec<u8>) -> String {
-    String::from_utf8_lossy(&bytes).into_owned()
+/// Decode subprocess output bytes to UTF-8 (lossy) and sanitise them
+/// before they leave the bash tool.
+///
+/// Sanitisation strips ANSI escape sequences, drops carriage returns,
+/// and removes other terminal-control bytes that would either corrupt
+/// the renderer's width math (so the tool-output bubble's right edge
+/// stays flush instead of breaking on overprints / erase-in-line) or
+/// waste tokens in the model's context. See [`crate::sanitize`] for
+/// the exact transform.
+fn decode_stream_output(bytes: Vec<u8>) -> String {
+    let lossy = String::from_utf8_lossy(&bytes);
+    crate::sanitize::sanitize_terminal_output(&lossy)
 }
 
 /// SIGKILL the entire process group rooted at `pid`. Negative argument

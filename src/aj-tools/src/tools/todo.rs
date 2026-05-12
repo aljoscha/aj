@@ -54,14 +54,22 @@ pub fn format_todo_list(todos: &[TodoItem]) -> String {
             TodoPriority::Low => " (low)",
         };
 
+        // Sanitise the content before wrapping it with styling so any
+        // stray ANSI / carriage-return / control bytes the model may
+        // have placed in the todo can't corrupt the renderer's width
+        // math or the model's own context the next time it reads the
+        // list back. The strikethrough SGR added below survives
+        // because it's emitted *after* sanitisation.
+        let content = crate::sanitize::sanitize_terminal_output(&todo.content);
+
         // Strike through completed items via the SGR strikethrough
         // attribute (`ESC[9m` on, `ESC[29m` off). Renderers that
         // strip ANSI fall back to the plain text content; renderers
         // that honor it dim the entry visually.
         let content = if todo.status == TodoStatus::Completed {
-            format!("\x1b[9m{}\x1b[29m", todo.content)
+            format!("\x1b[9m{}\x1b[29m", content)
         } else {
-            todo.content.clone()
+            content
         };
 
         result.push_str(&format!("{status_symbol} {content}{priority_text}\n"));

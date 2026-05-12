@@ -48,6 +48,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use aj_agent::tool::ToolDetails;
+use aj_tools::sanitize_terminal_output;
 use aj_tui::ansi::wrap_text_with_ansi;
 use aj_tui::component::Component;
 use aj_tui::components::text::Text;
@@ -350,12 +351,28 @@ fn quote_for_summary(s: &str) -> String {
 /// Render the body lines for a [`ToolDetails`] variant. Switching
 /// here keeps each variant's specialised rendering close to the
 /// component while letting [`Self::render`] stay variant-agnostic.
+///
+/// Every raw text field that originated outside this crate -- tool
+/// summaries, command strings, sub-agent reports, the diff payload
+/// -- passes through [`sanitize_terminal_output`] before any styling
+/// is applied. Today the bash tool already sanitises its own stdout
+/// / stderr at the source, so applying the transform a second time
+/// here is a no-op for that path; the call covers every other variant
+/// and guards against future tools that emit raw subprocess output
+/// without going through the bash tool's helper. The transform
+/// strips ANSI escapes, drops carriage returns, and removes other
+/// terminal-control bytes that would otherwise disagree with the
+/// renderer's width math (and produce a ragged right edge on the
+/// surrounding bubble) or clobber adjacent cells via cursor moves
+/// or erase-in-line side effects.
 fn render_details_body(details: &ToolDetails) -> Vec<String> {
     match details {
         ToolDetails::Text { summary, body } => {
+            let summary = sanitize_terminal_output(summary);
+            let body = sanitize_terminal_output(body);
             let mut lines = Vec::new();
             if !summary.is_empty() {
-                lines.push(style::dim(summary));
+                lines.push(style::dim(&summary));
             }
             for line in body.split('\n') {
                 lines.push(line.to_string());
@@ -372,7 +389,11 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
             path,
             before,
             after,
-        } => render_unified_diff(path, before, after),
+        } => render_unified_diff(
+            &sanitize_terminal_output(path),
+            &sanitize_terminal_output(before),
+            &sanitize_terminal_output(after),
+        ),
         ToolDetails::Bash {
             command,
             stdout,
@@ -381,10 +402,17 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
             truncated,
             full_output_path,
         } => {
+            let command = sanitize_terminal_output(command);
+            // `stdout` / `stderr` are already sanitised at the bash
+            // tool source; running the transform again here is cheap
+            // and keeps this match arm self-contained against future
+            // changes to the bash payload's provenance.
+            let stdout = sanitize_terminal_output(stdout);
+            let stderr = sanitize_terminal_output(stderr);
             let mut lines = vec![style::dim(&format!("$ {command}"))];
             lines.extend(render_bash_body(
-                stdout,
-                stderr,
+                &stdout,
+                &stderr,
                 *exit_code,
                 *truncated,
                 full_output_path.as_ref(),
@@ -396,6 +424,8 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
             task,
             report,
         } => {
+            let task = sanitize_terminal_output(task);
+            let report = sanitize_terminal_output(report);
             let mut lines = vec![style::dim(&format!("sub-agent {agent_id}: {task}"))];
             for line in report.split('\n') {
                 lines.push(line.to_string());
@@ -405,7 +435,10 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
         ToolDetails::Todos { items } => {
             // Reuse the canonical text rendering from `aj-tools`
             // so the interactive view matches the wire content the
-            // model sees in `tool_result`.
+            // model sees in `tool_result`. `format_todo_list`
+            // sanitises each item's content internally, so the
+            // strikethrough SGR it emits for completed items
+            // survives but raw control bytes in the content do not.
             let formatted = aj_tools::tools::todo::format_todo_list(items);
             formatted.split('\n').map(|s| s.to_string()).collect()
         }
@@ -654,5 +687,94 @@ mod tests {
         let third = c.render(80);
         assert_eq!(first, second);
         assert_eq!(second, third);
+    }
+
+    #[test]
+    fn body_with_carriage_returns_and_erase_in_line_renders_flush_width() {
+        // Regression for the ragged-right-edge bug. Real tool output
+        // (cargo / git / pip progress, ANSI-coloured clippy output)
+        // ships `\r` overprints and `ESC[K` erase-in-line sequences
+        // that disagree with the renderer's width measurement: `\r`
+        // was counted as zero-width but the terminal honours it, and
+        // `ESC[K` was stripped from measurement but its terminal side
+        // effect erases trailing cells with the *default* background
+        // -- chewing a hole in the bubble's painted tint. The body
+        // sanitisation in `render_details_body` removes both before
+        // they reach the wrap path, so every row of the bubble lands
+        // at exactly the render width.
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+        // Progress-style overprint, an SGR-reset followed by an
+        // erase-in-line (the canonical "ragged right edge"
+        // pattern), and a control byte (`\x08`) for good measure.
+        let body =
+            "progress: 10%\rprogress: 20%\nstatus\x1b[0m\x1b[Kdone\nback\x08space\n".to_string();
+        c.update_result(
+            &ToolDetails::Text {
+                summary: String::new(),
+                body,
+            },
+            false,
+        );
+        let width = 60;
+        let lines = c.render(width);
+        for (i, line) in lines.iter().enumerate() {
+            let w = visible_width(line);
+            assert!(
+                w == width,
+                "row {i} is not flush to width: visible_width={w}, expected={width}: {line:?}",
+            );
+            assert!(!line.contains('\r'), "row {i} still carries CR: {line:?}");
+            // Erase-in-line and other non-styling CSI must not survive.
+            assert!(
+                !line.contains("\x1b[K"),
+                "row {i} still carries erase-in-line: {line:?}",
+            );
+            // Backspace and other C0 controls must not survive.
+            assert!(
+                !line.chars().any(|c| {
+                    let code = u32::from(c);
+                    code <= 0x1f && c != '\t' && c != '\n' && c != '\x1b'
+                }),
+                "row {i} still carries a non-tab/-newline control byte: {line:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn bash_command_field_strips_control_bytes_from_header() {
+        // Defence in depth: if a future caller stuffs an ANSI / CR /
+        // control byte into `ToolDetails::Bash.command`, the dim-
+        // styled `$ <command>` header line must still render flush
+        // to width and contain only the visible command text.
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+        c.update_result(
+            &ToolDetails::Bash {
+                command: "echo \x1b[31mboom\x1b[0m\rmore".into(),
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                truncated: false,
+                full_output_path: None,
+            },
+            false,
+        );
+        let width = 60;
+        let lines = c.render(width);
+        for (i, line) in lines.iter().enumerate() {
+            let w = visible_width(line);
+            assert!(
+                w == width,
+                "row {i} not flush to width: visible_width={w}: {line:?}",
+            );
+            assert!(!line.contains('\r'), "row {i} still carries CR: {line:?}");
+        }
+        // The visible command text comes through, sans ANSI / CR.
+        let plain: Vec<_> = lines.iter().map(|l| strip_ansi(l)).collect();
+        assert!(
+            plain.iter().any(|l| l.contains("echo boommore")),
+            "{plain:#?}",
+        );
     }
 }
