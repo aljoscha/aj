@@ -15,6 +15,7 @@
 
 use std::any::Any;
 
+use aj_tui::ansi::truncate_to_width;
 use aj_tui::component::Component;
 use aj_tui::keys::InputEvent;
 use aj_tui::style;
@@ -68,7 +69,7 @@ impl Default for Footer {
 impl Component for Footer {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(m) = &self.model {
             parts.push(m.clone());
@@ -85,7 +86,19 @@ impl Component for Footer {
         // One-column left indent matches the header and the chat
         // scrollback's `padding_x = 1`, so the persistent status
         // bars share a left edge with the messages between them.
-        vec![format!(" {}", style::dim(&parts.join("  ·  ")))]
+        //
+        // Narrow-terminal handling: a long cwd or model name can
+        // easily push the joined row past the terminal width, so
+        // we truncate with an ellipsis instead of overflowing.
+        // Wrapping would push the editor up a row and shift the
+        // hardware cursor away from where the diff engine expects
+        // it; a single truncated row keeps the layout stable.
+        if width == 0 {
+            return vec![String::new()];
+        }
+        let content = parts.join("  ·  ");
+        let truncated = truncate_to_width(&content, width - 1, "…", false);
+        vec![format!(" {}", style::dim(&truncated))]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {
@@ -120,5 +133,26 @@ mod tests {
         assert!(visible.contains("claude-sonnet-4"));
         assert!(visible.contains("/home/user/proj"));
         assert!(visible.contains("·"));
+    }
+
+    /// Regression: a long cwd or model name on a narrow terminal
+    /// used to overflow because `render` ignored `width`. Mirrors
+    /// the equivalent test in `header.rs`.
+    #[test]
+    fn rendered_lines_never_exceed_width_for_any_width() {
+        let mut f = Footer::new();
+        f.set_model(Some("claude-sonnet-4-very-long-model-name".into()));
+        f.set_cwd(Some("/home/user/some/deeply/nested/project/path".into()));
+        f.set_usage(Some("in 12.3k / out 4.5k / cache 6.7k".into()));
+        for width in [0usize, 1, 2, 10, 40, 64, 80, 200] {
+            let lines = f.render(width);
+            for (i, line) in lines.iter().enumerate() {
+                let w = aj_tui::ansi::visible_width(line);
+                assert!(
+                    w <= width,
+                    "line {i} exceeds width {width}: visible_width = {w}, line = {line:?}",
+                );
+            }
+        }
     }
 }

@@ -15,6 +15,7 @@
 
 use std::any::Any;
 
+use aj_tui::ansi::truncate_to_width;
 use aj_tui::component::Component;
 use aj_tui::keys::InputEvent;
 use aj_tui::style;
@@ -64,7 +65,7 @@ impl Default for Header {
 impl Component for Header {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(id) = &self.thread_id {
             parts.push(format!("thread {id}"));
@@ -83,10 +84,22 @@ impl Component for Header {
         // only fires *between* children, not before the first one,
         // so without this blank the `Context:` notice would butt
         // directly against the banner.
-        vec![
-            format!(" {}", style::dim(&parts.join("  ·  "))),
-            String::new(),
-        ]
+        //
+        // Narrow-terminal handling: the banner is a single row, so
+        // we truncate (rather than wrap) when the joined content
+        // doesn't fit. `truncate_to_width` keeps ANSI escapes
+        // ANSI-clean and uses `…` as the visible elision marker.
+        // We reserve one column for the leading indent; on a
+        // zero-width terminal the row collapses to an empty
+        // string. Without this clamp the strict line-width check
+        // in `Tui::render` panics on terminals narrower than the
+        // banner content.
+        if width == 0 {
+            return vec![String::new(), String::new()];
+        }
+        let content = parts.join("  ·  ");
+        let truncated = truncate_to_width(&content, width - 1, "…", false);
+        vec![format!(" {}", style::dim(&truncated)), String::new()]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {
@@ -108,6 +121,33 @@ mod tests {
     fn empty_header_renders_nothing() {
         let mut h = Header::new();
         assert!(h.render(80).is_empty());
+    }
+
+    /// Regression: terminals narrower than the banner content used
+    /// to overflow because `render` ignored `width`. The strict
+    /// line-width check in `Tui::render` panicked on the first
+    /// frame. The renderer must now respect `width` for every
+    /// possible terminal size, truncating the visible content as
+    /// needed.
+    #[test]
+    fn rendered_lines_never_exceed_width_for_any_width() {
+        let mut h = Header::new();
+        h.set_thread_id(Some("2026-05-08-13-16-48-275".into()));
+        h.set_notice(Some("Chat with AJ — Ctrl+C to quit".into()));
+        // Sweep across the corner cases: zero, one (just the leading
+        // indent), a width where the elision marker starts to bite,
+        // the exact overflow the user hit (64), and a width that
+        // comfortably fits the full banner.
+        for width in [0usize, 1, 2, 10, 64, 65, 80, 200] {
+            let lines = h.render(width);
+            for (i, line) in lines.iter().enumerate() {
+                let w = aj_tui::ansi::visible_width(line);
+                assert!(
+                    w <= width,
+                    "line {i} exceeds width {width}: visible_width = {w}, line = {line:?}",
+                );
+            }
+        }
     }
 
     #[test]
