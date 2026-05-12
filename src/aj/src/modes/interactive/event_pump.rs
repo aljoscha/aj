@@ -1081,4 +1081,156 @@ mod tests {
              tool_index",
         );
     }
+
+    /// Runtime regression for the CPU-pegging bug the refcount fix
+    /// addresses. The four `#[test]`s above pin the bookkeeping
+    /// — `running_agents` transitions, `Loader::start` / `stop`
+    /// calls, `tool_index` lifetime — but they don't exercise the
+    /// thing the user actually feels: the loader's animation pump
+    /// spawning a fresh tokio task on every `Loader::start` and
+    /// only cancelling it on the matching `stop`.
+    ///
+    /// Old behaviour (sub-agent's `AgentEnd` calls `Loader::stop`
+    /// followed by the main turn's continuation re-triggering
+    /// `Loader::start`) would, over a session with many sub-agent
+    /// turns, leak animation pumps whose `request_render` ticks
+    /// kept the throttle saturated even when no visible work was
+    /// in flight. With the fix, `Loader::start` fires exactly once
+    /// per main turn (on the 0 → 1 transition of
+    /// `running_agents`) regardless of how many sub-agent starts /
+    /// ends nest inside it, so the render channel should be driven
+    /// at the loader's own 80 ms interval rather than at the
+    /// throttle's 16 ms cap.
+    ///
+    /// The assertion below counts `TuiEvent::Render`s the
+    /// throttle releases over a fixed window after many nested
+    /// cycles. A single active pump produces roughly
+    /// `window / 80 ms` renders; a regression that leaks pumps
+    /// would push the count toward `window / 16 ms`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_subagent_cycles_do_not_accumulate_animation_pumps() {
+        use std::time::Duration;
+
+        use aj_tui::tui::TuiEvent;
+        use tokio::time::Instant as TokioInstant;
+
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        // Suppress the implicit bootstrap render so the
+        // post-cycle counting window only sees renders from the
+        // loader's animation pump.
+        tui.set_initial_render(false);
+
+        // Drive many nested cycles synchronously. Each cycle
+        // brackets one main turn around one sub-agent turn:
+        //
+        //   Main start → Sub start → Sub end → Main end.
+        //
+        // With the fix, this produces 100 paired
+        // `Loader::start` / `Loader::stop` calls and the same
+        // number of animation-pump task spawns / cancellations
+        // — but at any instant only one pump should be alive,
+        // because each `Loader::start` cancels the prior token
+        // before spawning, and each `Loader::stop` cancels
+        // unconditionally.
+        for _ in 0..100 {
+            pump.handle(
+                &mut tui,
+                &AgentEvent::AgentStart {
+                    agent_id: AgentId::Main,
+                },
+            );
+            pump.handle(
+                &mut tui,
+                &AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(1),
+                },
+            );
+            pump.handle(
+                &mut tui,
+                &AgentEvent::AgentEnd {
+                    agent_id: AgentId::Sub(1),
+                    messages: Vec::new(),
+                },
+            );
+            pump.handle(
+                &mut tui,
+                &AgentEvent::AgentEnd {
+                    agent_id: AgentId::Main,
+                    messages: Vec::new(),
+                },
+            );
+        }
+
+        // Final main turn — the loader's pump is now running. If
+        // any cycle-phase pumps leaked, this is the moment their
+        // background `request_render` ticks would still be
+        // landing on the channel.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+
+        // Drain the synchronous `request_repaint` carry-over
+        // from the cycle phase + the final start. We give it a
+        // generous 80 ms (one loader interval) so leaked pumps
+        // — if any — get at least one chance to tick before
+        // the counting window starts. Without this, the
+        // measurement would race against the throttle's lazy
+        // initialisation on the first `next_event`.
+        let drain_until = TokioInstant::now() + Duration::from_millis(80);
+        while let Ok(maybe) = tokio::time::timeout_at(drain_until, tui.next_event()).await {
+            // Discard whatever we drain; we only care about the
+            // *rate* during the measurement window below.
+            if maybe.is_none() {
+                break;
+            }
+        }
+
+        // Measure: how many renders does the loader drive over a
+        // 320 ms window?
+        //
+        // - One healthy pump at 80 ms interval ≈ 4 renders.
+        // - The throttle's 16 ms floor caps the worst-case
+        //   regression at ≈ 20 renders.
+        //
+        // Assert well below the regression cap (and well above
+        // the healthy baseline) so CI scheduler jitter doesn't
+        // flake the test in either direction.
+        let window = Duration::from_millis(320);
+        let deadline = TokioInstant::now() + window;
+        let mut renders = 0usize;
+        while let Ok(maybe) = tokio::time::timeout_at(deadline, tui.next_event()).await {
+            match maybe {
+                Some(TuiEvent::Render) => renders += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        // Tidy up so the loader's pump is cancelled before the
+        // test exits (otherwise the task survives the `Tui`
+        // drop until the runtime tears down — harmless, but
+        // noisier than necessary).
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+
+        assert!(
+            renders <= 10,
+            "loader produced {renders} renders in {} ms; expected ≈4 \
+             from a single 80 ms-interval animation pump. A count \
+             approaching {} (the throttle cap of {} ms-interval \
+             ticks) suggests orphaned animation pumps leaking \
+             through the refcount fix.",
+            window.as_millis(),
+            window.as_millis() / 16,
+            16,
+        );
+    }
 }
