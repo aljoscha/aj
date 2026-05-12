@@ -49,6 +49,15 @@ const PADDING_X: usize = 1;
 /// glance that the model thought before responding.
 const HIDDEN_THINKING_LABEL: &str = "Thinking…";
 
+/// Inline prefix prepended to the expanded thinking widget's body
+/// so the rendered block is unambiguously identified as the
+/// model's reasoning channel rather than part of the visible
+/// answer. Kept inline (rather than emitted as a separate header
+/// row) so the dim italic styling carries over the prefix and the
+/// chunk reads naturally as one continuous thought, e.g.
+/// `Thinking: First, let me consider …`.
+const EXPANDED_THINKING_PREFIX: &str = "Thinking: ";
+
 /// On-screen representation of an assistant chat entry.
 ///
 /// The component owns up to two markdown widgets:
@@ -215,11 +224,17 @@ impl AssistantMessageComponent {
             self.thinking = None;
             return;
         }
+        // Prepend the `Thinking: ` prefix at the widget-feeding
+        // stage rather than mutating `thinking_buffer` so the
+        // buffer stays a clean transcript of what the model sent —
+        // `is_empty()` and the collapsed-mode placeholder logic
+        // both want the unadorned form.
+        let widget_text = format!("{EXPANDED_THINKING_PREFIX}{}", self.thinking_buffer);
         match self.thinking.as_mut() {
-            Some(md) => md.set_text(&self.thinking_buffer),
+            Some(md) => md.set_text(&widget_text),
             None => {
                 self.thinking = Some(Markdown::new(
-                    &self.thinking_buffer,
+                    &widget_text,
                     PADDING_X,
                     // Thinking sits flush with the upcoming text
                     // (no trailing blank line) so the answer
@@ -404,5 +419,36 @@ mod tests {
             lines.iter().all(|l| !l.contains(HIDDEN_THINKING_LABEL)),
             "got {lines:?}"
         );
+    }
+
+    #[test]
+    fn expanded_thinking_rendering_includes_inline_prefix() {
+        // The expanded thinking block is prefixed with
+        // `Thinking: ` inline so users can tell the reasoning
+        // channel apart from the visible answer at a glance.
+        let mut c = AssistantMessageComponent::new(&theme(), false);
+        c.set_thinking_snapshot("the model's reasoning here".to_string());
+        let lines = c.render(80);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Thinking: "),
+            "expected 'Thinking: ' prefix in expanded thinking render; got {lines:?}"
+        );
+        assert!(
+            joined.contains("the model's reasoning here"),
+            "expected the thinking body to still be rendered alongside the prefix; got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_buffer_excludes_prefix_so_collapse_logic_stays_clean() {
+        // The prefix is purely a render-time decoration; the
+        // stored buffer keeps the unadorned transcript so
+        // `is_empty()` and the collapse-mode placeholder logic
+        // see exactly what the model sent.
+        let mut c = AssistantMessageComponent::new(&theme(), false);
+        c.set_thinking_snapshot("raw thought".to_string());
+        assert_eq!(c.thinking_buffer, "raw thought");
+        assert!(!c.is_empty());
     }
 }
