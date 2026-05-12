@@ -724,13 +724,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_running_succeeded_paint_with_distinct_backgrounds() {
-        // Three renders, three SGR background sequences. The
-        // bundled dark theme picks different RGB / 256-color
-        // values for each of `toolPendingBg` / `toolSuccessBg` /
-        // `toolErrorBg`, so the rendered rows must carry different
-        // escape sequences. We grab the bg-paint prefix off the
-        // first row of each render and compare them.
+    fn pending_succeeded_failed_share_one_tool_background() {
+        // The bundled themes intentionally point all three
+        // `toolPendingBg` / `toolSuccessBg` / `toolErrorBg` color
+        // tokens at a single `toolBg` palette var — status is
+        // communicated through the header glyph (… / ✓ / ✗) and
+        // not the bubble tint. Grab the bg-paint prefix off the
+        // first row of each render and verify they're identical.
         let mut c =
             ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
 
@@ -762,9 +762,14 @@ mod tests {
         );
         let failed = bg_sample(&mut c);
 
-        assert_ne!(pending, succeeded, "pending and succeeded share an escape");
-        assert_ne!(pending, failed, "pending and failed share an escape");
-        assert_ne!(succeeded, failed, "succeeded and failed share an escape");
+        assert_eq!(
+            pending, succeeded,
+            "pending and succeeded should share the unified tool bg"
+        );
+        assert_eq!(
+            pending, failed,
+            "pending and failed should share the unified tool bg"
+        );
     }
 
     #[test]

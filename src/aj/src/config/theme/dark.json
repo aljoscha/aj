@@ -12,9 +12,7 @@
     "accent": "#8abeb7",
     "selectedBg": "#3a3a4a",
     "userMsgBg": "#343541",
-    "toolPendingBg": "#282832",
-    "toolSuccessBg": "#283228",
-    "toolErrorBg": "#4a2020",
+    "toolBg": "#282832",
     "customMsgBg": "#2d2838"
   },
   "colors": {
@@ -36,9 +34,9 @@
     "customMessageBg": "customMsgBg",
     "customMessageText": "",
     "customMessageLabel": "#9575cd",
-    "toolPendingBg": "toolPendingBg",
-    "toolSuccessBg": "toolSuccessBg",
-    "toolErrorBg": "toolErrorBg",
+    "toolPendingBg": "toolBg",
+    "toolSuccessBg": "toolBg",
+    "toolErrorBg": "toolBg",
     "toolTitle": "",
     "toolOutput": "gray",
 
