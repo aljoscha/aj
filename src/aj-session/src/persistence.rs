@@ -342,19 +342,41 @@ fn read_thread_preview_file(
         let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line) else {
             continue;
         };
-        if let ConversationEntryKind::Message(msg) = &entry.entry {
-            message_count += 1;
-            if first_user_message.is_none() && matches!(msg.role, Role::User) {
-                if let Some(text) = first_text_block(&msg.content) {
-                    first_user_message = Some(text);
+        // Both the legacy [`ConversationEntryKind::Message`] entries
+        // and the structured [`ConversationEntryKind::ToolResult`]
+        // entries (introduced by the §3 work — see
+        // `docs/aj-next-progress.md`) carry wire-level messages that
+        // count toward the thread's user-visible message count and
+        // its `last_message_at` recency bucket. The preview only
+        // ever needs the user's first text — which lives on a
+        // [`Message`] entry — for the row label, so the
+        // `first_user_message` capture stays on the
+        // [`Message`]-only path.
+        match &entry.entry {
+            ConversationEntryKind::Message(msg) => {
+                message_count += 1;
+                if first_user_message.is_none() && matches!(msg.role, Role::User) {
+                    if let Some(text) = first_text_block(&msg.content) {
+                        first_user_message = Some(text);
+                    }
+                }
+                if let Some(ts) = entry.timestamp {
+                    last_message_at = Some(match last_message_at {
+                        Some(prev) if prev >= ts => prev,
+                        _ => ts,
+                    });
                 }
             }
-            if let Some(ts) = entry.timestamp {
-                last_message_at = Some(match last_message_at {
-                    Some(prev) if prev >= ts => prev,
-                    _ => ts,
-                });
+            ConversationEntryKind::ToolResult { .. } => {
+                message_count += 1;
+                if let Some(ts) = entry.timestamp {
+                    last_message_at = Some(match last_message_at {
+                        Some(prev) if prev >= ts => prev,
+                        _ => ts,
+                    });
+                }
             }
+            _ => {}
         }
     }
 
@@ -654,6 +676,51 @@ mod tests {
         let expected =
             super::parse_thread_id_created_at(&thread_id).expect("freshly-minted id parses");
         assert_eq!(p.created_at, expected);
+    }
+
+    #[test]
+    fn list_thread_previews_counts_structured_tool_result_entries_as_messages() {
+        // The persistence preview's `message_count` and
+        // `last_message_at` must include the structured
+        // [`ConversationEntryKind::ToolResult`] entries written
+        // through [`ConversationView::add_tool_result`], not just
+        // the legacy [`ConversationEntryKind::Message`] entries.
+        // Otherwise a session that only used the new variant for
+        // its tool results would underreport its message count and
+        // surface an artificially-old `last_message_at` in the
+        // selector overlay.
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        // Seed a user / assistant exchange via the high-level view
+        // so each line lands with a real timestamp.
+        {
+            let mut view = crate::log::ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("u");
+            view.add_assistant_message(vec![ContentBlockParam::ToolUseBlock {
+                id: "tu-1".to_string(),
+                name: "ping".to_string(),
+                input: serde_json::json!({}),
+                caller: None,
+            }])
+            .expect("a");
+            view.add_tool_result(
+                vec![ContentBlockParam::ToolResultBlock {
+                    tool_use_id: "tu-1".to_string(),
+                    content: "ok".to_string().into(),
+                    is_error: false,
+                }],
+                std::collections::HashMap::new(),
+            )
+            .expect("tool result");
+        }
+
+        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        assert_eq!(previews.len(), 1);
+        let p = &previews[0];
+        // Three wire-level messages: user prompt, assistant tool-use
+        // turn, structured tool result.
+        assert_eq!(p.message_count, 3);
     }
 
     #[test]

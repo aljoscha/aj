@@ -45,29 +45,47 @@ pub fn repair_interrupted_tool_uses(
     conversation: &Conversation,
 ) -> Result<bool, anyhow::Error> {
     // Collect all tool_use ids from assistant messages and all
-    // tool_result ids seen in subsequent user messages. Anything in
-    // the first set that isn't in the second set is dangling.
+    // tool_result ids seen in subsequent user-thread tool-result
+    // payloads. Anything in the first set that isn't in the second
+    // set is dangling.
+    //
+    // Tool-result payloads can ride on either of two on-disk shapes:
+    // the legacy [`ConversationEntryKind::Message`] with a user role
+    // and `ToolResultBlock` content (pre-§3 logs and the synthesized
+    // resume-time repair entries), or the structured
+    // [`ConversationEntryKind::ToolResult`] variant introduced by the
+    // §3 work to ride structured [`ToolDetails`] alongside the wire
+    // content. Both encodings count as resolved here so that a
+    // resumed thread doesn't re-synthesize "interrupted tool call"
+    // markers for tool calls that already have a recorded result.
     let mut used: HashSet<String> = HashSet::new();
     let mut resolved: HashSet<String> = HashSet::new();
     for entry in conversation.entries() {
-        let ConversationEntryKind::Message(msg) = &entry.entry else {
-            continue;
-        };
-        match msg.role {
-            Role::Assistant => {
-                for block in &msg.content {
-                    if let ContentBlockParam::ToolUseBlock { id, .. } = block {
-                        used.insert(id.clone());
+        match &entry.entry {
+            ConversationEntryKind::Message(msg) => match msg.role {
+                Role::Assistant => {
+                    for block in &msg.content {
+                        if let ContentBlockParam::ToolUseBlock { id, .. } = block {
+                            used.insert(id.clone());
+                        }
                     }
                 }
-            }
-            Role::User => {
-                for block in &msg.content {
+                Role::User => {
+                    for block in &msg.content {
+                        if let ContentBlockParam::ToolResultBlock { tool_use_id, .. } = block {
+                            resolved.insert(tool_use_id.clone());
+                        }
+                    }
+                }
+            },
+            ConversationEntryKind::ToolResult { content, .. } => {
+                for block in content {
                     if let ContentBlockParam::ToolResultBlock { tool_use_id, .. } = block {
                         resolved.insert(tool_use_id.clone());
                     }
                 }
             }
+            _ => {}
         }
     }
 
@@ -178,5 +196,51 @@ mod tests {
             .expect("user head exists");
         let convo = log.linearize(&head, ThreadFilter::USER);
         assert_eq!(convo.len(), entry_count_before);
+    }
+
+    #[test]
+    fn repair_recognises_tool_use_ids_resolved_by_structured_tool_result_entries() {
+        // Tool batches written through the structured
+        // [`ConversationEntryKind::ToolResult`] variant carry the
+        // same `tool_use_id`-bearing `ToolResultBlock` content as
+        // the legacy [`Role::User`] message path. The repair walker
+        // must treat both encodings equivalently when classifying a
+        // tool_use as "resolved", otherwise a thread that's already
+        // been written with structured tool results would
+        // re-synthesize spurious "interrupted tool call" markers on
+        // resume.
+        let (_dir, mut log) = fresh_log();
+        let tool_use_id = "tu-structured".to_string();
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("u");
+            view.add_assistant_message(vec![ContentBlockParam::ToolUseBlock {
+                id: tool_use_id.clone(),
+                name: "ping".to_string(),
+                input: json!({}),
+                caller: None,
+            }])
+            .expect("a");
+            view.add_tool_result(
+                vec![ContentBlockParam::ToolResultBlock {
+                    tool_use_id: tool_use_id.clone(),
+                    content: "ok".to_string().into(),
+                    is_error: false,
+                }],
+                std::collections::HashMap::new(),
+            )
+            .expect("structured tool result");
+        }
+
+        let head = log
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user head exists");
+        let convo = log.linearize(&head, ThreadFilter::USER);
+        let repaired = repair_interrupted_tool_uses(&mut log, &convo).expect("repair");
+        assert!(
+            !repaired,
+            "structured ToolResult entries must resolve their tool_use_ids",
+        );
     }
 }

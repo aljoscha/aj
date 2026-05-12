@@ -19,6 +19,7 @@
 //! that today's agent uses to decide thinking budgets and resume
 //! state.
 
+use aj_agent::tool::ToolDetails;
 use aj_agent::types::UserOutput;
 use aj_models::messages::{ContentBlockParam, MessageParam, Role};
 use chrono::{DateTime, Utc};
@@ -105,6 +106,40 @@ pub struct ConversationEntry {
 pub enum ConversationEntryKind {
     /// A message exchanged between user and assistant (maps to `MessageParam`).
     Message(MessageParam),
+    /// A batched tool-result message synthesized by the agent at the
+    /// end of a tool batch. `content` carries the wire
+    /// `Vec<ContentBlockParam>` (every block a `ToolResultBlock`) that
+    /// the next inference sees on the wire; `details` carries the
+    /// structured per-call [`ToolDetails`] payload keyed by
+    /// `tool_use_id` so a resumed session can rehydrate the
+    /// structured renderer state (diffs, todo snapshots, bash exit
+    /// codes, sub-agent reports) instead of falling back to the
+    /// text-only projection of the wire content.
+    ///
+    /// Conceptually this is a refinement of [`ConversationEntryKind::Message`]
+    /// with `role: Role::User` and a `ToolResultBlock`-only `content`:
+    /// the [`Conversation`] projection treats `ToolResult` entries as
+    /// user-role messages on the wire so the model continues to see
+    /// one user message per tool batch. The variant is additive —
+    /// legacy logs continue to carry their tool results as
+    /// [`ConversationEntryKind::Message`] entries and `details`
+    /// defaults to an empty map for those (skipped on serialize so
+    /// the wire shape stays clean).
+    ToolResult {
+        /// Wire `tool_result` content blocks for the user-role
+        /// message the model sees.
+        content: Vec<ContentBlockParam>,
+        /// Structured renderer payload keyed by `tool_use_id`. One
+        /// entry per `ContentBlockParam::ToolResultBlock` in
+        /// `content` when the producer (the agent) supplied details
+        /// alongside the wire content. Skipped on serialize when
+        /// empty so the on-disk shape stays compact for callers
+        /// that don't have structured details to ship (e.g. the
+        /// repair-on-resume walker that synthesizes interrupted
+        /// tool-call markers).
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        details: HashMap<String, ToolDetails>,
+    },
     /// Information that is displayed to the user.
     UserOutput(UserOutput),
     /// The fully-assembled system prompt for this thread, frozen at
@@ -202,38 +237,54 @@ impl Conversation {
     pub fn message_count(&self) -> usize {
         self.entries
             .iter()
-            .filter(|entry| matches!(entry.entry, ConversationEntryKind::Message(_)))
+            .filter(|entry| {
+                matches!(
+                    entry.entry,
+                    ConversationEntryKind::Message(_) | ConversationEntryKind::ToolResult { .. }
+                )
+            })
             .count()
     }
 
-    /// Borrow every [`MessageParam`] in this view, in chronological
+    /// Borrow every wire-level message in this view, in chronological
     /// order. Non-message entries (system prompt, user outputs) are
     /// skipped — the wire layer only cares about turn-by-turn
     /// conversation, and out-of-band metadata travels through other
     /// channels.
-    pub fn messages(&self) -> Vec<&MessageParam> {
+    ///
+    /// Tool-result entries ([`ConversationEntryKind::ToolResult`]) are
+    /// projected as user-role [`MessageParam`]s carrying the wire
+    /// `content` blocks, so the model continues to see one user
+    /// message per tool batch regardless of which on-disk encoding
+    /// (legacy `Message` or structured `ToolResult`) the log uses.
+    /// The returned messages are owned because the projection
+    /// synthesizes new [`MessageParam`]s on the fly for `ToolResult`
+    /// entries.
+    pub fn messages(&self) -> Vec<MessageParam> {
         self.entries
             .iter()
-            .filter_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message(msg) => Some(msg),
-                _ => None,
-            })
+            .filter_map(|entry| message_param_for(&entry.entry))
             .collect()
     }
 
-    /// Get the last message in the view, if any.
-    pub fn last_message(&self) -> Option<&MessageParam> {
+    /// Get the last message in the view, if any. Returns an owned
+    /// [`MessageParam`] because [`ConversationEntryKind::ToolResult`]
+    /// entries are projected on the fly into a user-role message
+    /// rather than borrowed from disk.
+    pub fn last_message(&self) -> Option<MessageParam> {
         self.entries
             .iter()
             .rev()
-            .find_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message(msg) => Some(msg),
-                _ => None,
-            })
+            .find_map(|entry| message_param_for(&entry.entry))
     }
 
     /// Get the last user message in the view, if any. Only returns a
     /// message if it has actual input from the user, meaning a `TextBlock`.
+    ///
+    /// Tool-result entries are deliberately skipped — they carry only
+    /// `ToolResultBlock` content, never a `TextBlock`, so they don't
+    /// satisfy the "actual user input" filter that this helper exists
+    /// for (driving the thinking flag for the next inference).
     pub fn last_user_message(&self) -> Option<&MessageParam> {
         self.entries
             .iter()
@@ -284,6 +335,21 @@ impl Conversation {
                 }
                 _ => None,
             })
+    }
+}
+
+/// Project a [`ConversationEntryKind`] onto its wire-level
+/// [`MessageParam`] for callers that linearize the log for the
+/// model. Returns `None` for non-message entries (system prompts,
+/// freestanding user outputs).
+fn message_param_for(kind: &ConversationEntryKind) -> Option<MessageParam> {
+    match kind {
+        ConversationEntryKind::Message(msg) => Some(msg.clone()),
+        ConversationEntryKind::ToolResult { content, .. } => Some(MessageParam {
+            role: Role::User,
+            content: content.clone(),
+        }),
+        ConversationEntryKind::UserOutput(_) | ConversationEntryKind::SystemPrompt { .. } => None,
     }
 }
 
@@ -748,6 +814,33 @@ impl<'a> ConversationView<'a> {
         Ok(id)
     }
 
+    /// Append a batched tool-result entry carrying both the wire
+    /// `tool_result` content blocks and the structured per-call
+    /// [`ToolDetails`] payload keyed by `tool_use_id`.
+    ///
+    /// Maps the agent's batched
+    /// [`aj_agent::events::PersistedMessageKind::ToolResult`] event
+    /// onto a single [`ConversationEntryKind::ToolResult`] entry, so
+    /// resumed sessions can rehydrate the structured renderer state
+    /// (diffs, todo snapshots, bash exit codes, sub-agent reports)
+    /// without re-running the tool. On the wire this projects back
+    /// to a user-role message with the same `content`, matching the
+    /// shape today's [`add_user_message`](Self::add_user_message)
+    /// path produces for tool batches.
+    ///
+    /// Writes one JSONL line to disk before advancing the head.
+    pub fn add_tool_result(
+        &mut self,
+        content: Vec<ContentBlockParam>,
+        details: HashMap<String, ToolDetails>,
+    ) -> Result<EntryId, ConversationError> {
+        let entry = ConversationEntryKind::ToolResult { content, details };
+        let parent = self.parent_for_next_append();
+        let id = self.log.append(parent, self.thread, self.agent_id, entry)?;
+        self.head = Some(id.clone());
+        Ok(id)
+    }
+
     /// Determine the `parent_id` for the next append. Normally this is
     /// just the current `head`, but when a thread is being started for
     /// the first time on a log that already has a system-prompt root,
@@ -965,5 +1058,174 @@ mod tests {
         // Only the subagent's own message is collected; the user
         // ancestor and the SystemPrompt are walked through but filtered.
         assert_eq!(convo.entries().len(), 1);
+    }
+
+    #[test]
+    fn add_tool_result_writes_structured_entry_visible_through_messages_projection() {
+        // The [`ConversationEntryKind::ToolResult`] variant should:
+        // - round-trip through serialize/deserialize on a JSONL line,
+        // - project onto a user-role [`MessageParam`] through
+        //   [`Conversation::messages`] so the wire layer continues
+        //   to see one user message per tool batch,
+        // - count toward [`Conversation::message_count`].
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("sys".into()).expect("set sp");
+
+        let tool_use_id = "tu-1".to_string();
+        let details_payload = ToolDetails::Text {
+            summary: "ping".to_string(),
+            body: "pong".to_string(),
+        };
+
+        // Seed a normal user/assistant turn so the tool-result entry
+        // has a non-empty pre-existing thread to attach to (matches
+        // the production sequence where the agent emits a
+        // `ToolResult` only after an assistant turn with tool_use
+        // blocks).
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg");
+            view.add_assistant_message(vec![ContentBlockParam::ToolUseBlock {
+                id: tool_use_id.clone(),
+                name: "ping".to_string(),
+                input: serde_json::json!({}),
+                caller: None,
+            }])
+            .expect("assistant msg");
+
+            let mut details = HashMap::new();
+            details.insert(tool_use_id.clone(), details_payload.clone());
+            view.add_tool_result(
+                vec![ContentBlockParam::ToolResultBlock {
+                    tool_use_id: tool_use_id.clone(),
+                    content: "pong".to_string().into(),
+                    is_error: false,
+                }],
+                details,
+            )
+            .expect("tool result entry");
+        }
+
+        // Resume from disk so we exercise serialize → JSONL → parse
+        // → deserialize on the way back in.
+        let thread_id = log.thread_id().to_string();
+        drop(log);
+        let resumed = ConversationLog::resume(&persistence, &thread_id).expect("resume log");
+
+        let head = resumed
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user-thread head exists");
+        let convo = resumed.linearize(&head, ThreadFilter::USER);
+
+        // The structured entry shape must survive the round-trip.
+        let tool_result_entry = convo
+            .entries()
+            .iter()
+            .find(|e| matches!(e.entry, ConversationEntryKind::ToolResult { .. }))
+            .expect("tool result entry survived resume");
+        match &tool_result_entry.entry {
+            ConversationEntryKind::ToolResult { content, details } => {
+                assert_eq!(content.len(), 1);
+                let stored = details
+                    .get(&tool_use_id)
+                    .expect("details map keyed by tool_use_id");
+                match stored {
+                    ToolDetails::Text { summary, body } => {
+                        assert_eq!(summary, "ping");
+                        assert_eq!(body, "pong");
+                    }
+                    other => panic!("expected Text details, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolResult entry, got {other:?}"),
+        }
+
+        // The wire projection includes the tool result as a
+        // user-role message so the model continues to see one user
+        // message per tool batch — same shape today's
+        // `add_user_message`-on-tool-results path produces.
+        let messages: Vec<MessageParam> = convo.messages();
+        assert_eq!(messages.len(), 3, "user / assistant / tool-result");
+        let last = messages.last().expect("at least one message");
+        assert!(matches!(last.role, Role::User));
+        assert!(matches!(
+            last.content[0],
+            ContentBlockParam::ToolResultBlock { .. }
+        ));
+
+        // `message_count` must count `ToolResult` entries alongside
+        // `Message` entries (3 wire messages: user prompt,
+        // assistant turn, tool result).
+        assert_eq!(convo.message_count(), 3);
+
+        // `last_message` returns the projected user-role
+        // [`MessageParam`] for the tool-result entry.
+        let last_msg = convo.last_message().expect("last message present");
+        assert!(matches!(last_msg.role, Role::User));
+    }
+
+    #[test]
+    fn add_tool_result_with_empty_details_skips_field_on_disk() {
+        // An empty `details` map should be skipped on serialize so
+        // that callers without structured details (e.g. the
+        // resume-time repair walker that synthesizes interrupted
+        // tool-call markers) don't pollute the JSONL with
+        // `"details":{}`. The on-disk shape must still round-trip
+        // — the field defaults back to an empty map on
+        // deserialize.
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg");
+            view.add_tool_result(
+                vec![ContentBlockParam::ToolResultBlock {
+                    tool_use_id: "tu-1".to_string(),
+                    content: "ok".to_string().into(),
+                    is_error: false,
+                }],
+                HashMap::new(),
+            )
+            .expect("tool result entry");
+        }
+
+        // The raw JSONL line for the tool-result entry must not
+        // carry a `details` field.
+        let path = log.path().to_path_buf();
+        let body = std::fs::read_to_string(&path).expect("read log file");
+        let tool_result_line = body
+            .lines()
+            .find(|line| line.contains("\"type\":\"tool_result\""))
+            .expect("tool-result line present");
+        assert!(
+            !tool_result_line.contains("\"details\""),
+            "empty details should be skipped on serialize: {tool_result_line}"
+        );
+
+        // …and the entry still resumes cleanly with an empty
+        // details map (defaulted on deserialize).
+        let thread_id = log.thread_id().to_string();
+        drop(log);
+        let resumed = ConversationLog::resume(&persistence, &thread_id).expect("resume log");
+        let head = resumed
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user-thread head exists");
+        let convo = resumed.linearize(&head, ThreadFilter::USER);
+        let tool_result_entry = convo
+            .entries()
+            .iter()
+            .find(|e| matches!(e.entry, ConversationEntryKind::ToolResult { .. }))
+            .expect("tool result entry present");
+        match &tool_result_entry.entry {
+            ConversationEntryKind::ToolResult { details, .. } => {
+                assert!(details.is_empty(), "details defaults to empty");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 }

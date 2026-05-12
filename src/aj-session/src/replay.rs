@@ -109,6 +109,23 @@ impl ReplayState {
                 Role::Assistant => self.project_assistant(agent_id, &msg.content, out),
                 Role::User => self.project_user(agent_id, &msg.content, out),
             },
+            ConversationEntryKind::ToolResult { content, .. } => {
+                // For now, project the same way the legacy
+                // [`Role::User`] tool-result message path does: walk
+                // the wire `content` and synthesize a Start/End
+                // pair per `ToolResultBlock` falling back to a
+                // `ToolDetails::Text` body. The structured `details`
+                // map on the entry is intentionally ignored here —
+                // it lands as a follow-up commit that upgrades
+                // [`project_user`] to read the persisted details
+                // off [`ConversationEntryKind::ToolResult`] entries
+                // and project them onto
+                // [`AgentEvent::ToolExecutionEnd::result`]
+                // directly. Today's bridging mirrors the legacy
+                // behaviour byte-for-byte so this commit is a
+                // pure additive shape change.
+                self.project_user(agent_id, content, out);
+            }
             ConversationEntryKind::UserOutput(output) => {
                 project_user_output(agent_id, output, out);
             }
@@ -704,6 +721,86 @@ mod tests {
                 assert_eq!(tool, "tool", "fallback tool name");
             }
             other => panic!("expected tool execution end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_projects_structured_tool_result_entries_as_user_thread_events() {
+        // The new [`ConversationEntryKind::ToolResult`] variant must
+        // project onto the same Start/End event pair that the
+        // legacy [`Role::User`] tool-result message path produces,
+        // so renderers don't see a regression while the structured
+        // `details` projection hasn't landed yet. The follow-up
+        // commit upgrades this projection to use the persisted
+        // `details` map; until then the bridging shape uses the
+        // text body off the wire content.
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("u");
+            view.add_assistant_message(vec![ContentBlockParam::ToolUseBlock {
+                id: "tu-1".into(),
+                name: "ping".into(),
+                input: json!({"x": 1}),
+                caller: None,
+            }])
+            .expect("a");
+            view.add_tool_result(
+                vec![ContentBlockParam::ToolResultBlock {
+                    tool_use_id: "tu-1".into(),
+                    content: ToolResultContent::Text("pong".into()),
+                    is_error: false,
+                }],
+                std::collections::HashMap::new(),
+            )
+            .expect("structured tool result");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        // Walk the events list to find the synthesized
+        // ToolExecutionStart/End pair for `tu-1`. Existence and
+        // labeling are all that's required at this layer; the
+        // structured-details upgrade tests live with the follow-up
+        // commit.
+        let start = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolExecutionStart { call_id, .. } if call_id == "tu-1"))
+            .expect("ToolExecutionStart fires for the structured tool result");
+        match start {
+            AgentEvent::ToolExecutionStart { tool, args, .. } => {
+                assert_eq!(tool, "ping");
+                assert_eq!(args, &json!({"x": 1}));
+            }
+            _ => unreachable!(),
+        }
+
+        let end = events
+            .iter()
+            .find(
+                |e| matches!(e, AgentEvent::ToolExecutionEnd { call_id, .. } if call_id == "tu-1"),
+            )
+            .expect("ToolExecutionEnd fires for the structured tool result");
+        match end {
+            AgentEvent::ToolExecutionEnd {
+                tool,
+                result,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool, "ping");
+                assert!(!is_error);
+                // Step 2's projection still falls back to a text body
+                // off the wire content. Step 4 upgrades this to read
+                // the persisted structured `details` payload.
+                match result {
+                    ToolDetails::Text { body, .. } => assert_eq!(body, "pong"),
+                    other => panic!("expected Text fallback, got {other:?}"),
+                }
+            }
+            _ => unreachable!(),
         }
     }
 }

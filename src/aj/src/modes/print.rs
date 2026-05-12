@@ -241,7 +241,7 @@ pub async fn run(args: Args) -> Result<()> {
             .latest_leaf(ThreadFilter::USER)
             .expect("post-repair head exists when pre-repair head did");
         let conversation = log.linearize(&head, ThreadFilter::USER);
-        let messages: Vec<_> = conversation.messages().into_iter().cloned().collect();
+        let messages: Vec<_> = conversation.messages();
         agent.seed_messages(messages);
 
         if matches!(args.format, PrintFormat::Json) {

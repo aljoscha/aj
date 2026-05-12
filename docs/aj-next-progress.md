@@ -2377,30 +2377,102 @@ end-to-end design above. Pick the next unchecked box.
       `clone_on_ref_ptr` warnings remain, matching the surrounding
       test fixtures' style).
 
-- [ ] **Step 2: On-disk persistence — new entry shape +
-      `add_tool_result`.** Introduce a way to ride
+- [x] **Step 2: On-disk persistence — new entry shape +
+      `add_tool_result`.** Introduces a way to ride
       `details: HashMap<String, ToolDetails>` on the on-disk record
-      alongside the wire `Vec<ContentBlockParam>`. Two equivalent
-      shapes to pick from (Option A is the lighter-weight default):
+      alongside the wire `Vec<ContentBlockParam>`. Landed Option A
+      from the design exploration: a new
+      [`ConversationEntryKind::ToolResult { content, details }`]
+      variant on the persisted entry plus a matching
+      [`ConversationView::add_tool_result(content, details)`]
+      method. The on-disk schema is additive — legacy logs omit the
+      variant entirely, and a `ToolResult` entry with an empty
+      `details` map serializes to `{"type":"tool_result","content":[...]}`
+      with no `details` key thanks to
+      `#[serde(default, skip_serializing_if = "HashMap::is_empty")]`,
+      so the wire shape stays compact for callers that don't have
+      structured details to ship.
 
-      - **Option A:** a new `ConversationEntryKind::ToolResult { content,
-        details }` variant on the persisted entry, plus a matching
-        `ConversationView::add_tool_result(content, details)`
-        method. Replay matches on the variant directly. `Conversation::messages()`
-        needs to expose tool-result entries as user-role
-        `MessageParam`s so the wire layer continues to see one
-        `Role::User` message per tool batch.
-      - **Option B:** a persistence-only
-        `PersistedContentBlockParam` mirror of `ContentBlockParam`
-        with `details: Option<ToolDetails>` on the `ToolResultBlock`
-        variant, plus a custom serde boundary translating to the
-        wire shape on read-out.
+      `Conversation` projects [`ToolResult`] entries onto user-role
+      [`MessageParam`]s through a new private
+      [`message_param_for`] helper so the wire layer continues to
+      see one user message per tool batch regardless of which
+      on-disk encoding (legacy `Message` or structured `ToolResult`)
+      the log uses. [`messages()`] and [`last_message()`] now
+      return owned [`MessageParam`] values because the projection
+      synthesizes a new [`MessageParam`] on the fly for `ToolResult`
+      entries; the two call sites in the binary
+      (`aj/src/modes/print.rs::run` and
+      `aj/src/modes/interactive.rs::{run, perform_thread_swap}`)
+      dropped their `.into_iter().cloned().collect()` adapters
+      accordingly. [`message_count()`] counts `ToolResult` entries
+      alongside `Message` entries.
+      [`last_user_message()`] / [`last_assistant_message()`] are
+      unchanged — both filter on `TextBlock` content, which
+      `ToolResult` entries never carry, so the existing semantics
+      hold.
 
-      Either way the on-disk schema is additive — legacy logs omit
-      the field (`#[serde(default, skip_serializing_if = "...")]`)
-      and replay falls through to today's text-only synthesis path.
-      No migration walker for this field; the §3 walker (step 6) is
-      for the legacy `UserOutput::ToolError` rewrites only.
+      [`repair_interrupted_tool_uses`] now treats `tool_use_ids` on
+      `ToolResult` entries as resolved alongside the legacy
+      [`Role::User`] tool-result message path so a thread written
+      with structured tool results doesn't re-synthesize
+      "interrupted tool call" markers on resume.
+      [`read_thread_preview_file`] counts `ToolResult` entries
+      toward `message_count` and bumps `last_message_at` off their
+      timestamps so the session selector overlay's row stats stay
+      accurate when a session uses the new variant.
+      [`aj_session::replay`] picks up an additional match arm that
+      projects `ToolResult` entries via the existing
+      [`project_user`] helper (text-only synthesis off the wire
+      content); step 4 upgrades this projection to read the
+      persisted structured `details` payload directly.
+
+      Step 3 (persistence listener dispatch) flips
+      `let _ = details;` in
+      `aj_session::listener::persist` over to a call into the new
+      `add_tool_result` method so the agent's batched
+      [`PersistedMessageKind::ToolResult`] event actually lands on
+      disk as a `ConversationEntryKind::ToolResult` entry. Until
+      then the variant is reachable through tests and the public
+      API (a follow-up could already write `ToolResult` entries
+      via [`ConversationView::add_tool_result`] from outside the
+      listener), but the live agent run keeps writing tool batches
+      through the legacy [`add_user_message`] path so the on-disk
+      shape for new logs hasn't changed yet.
+
+      Four new tests pin the contract:
+      - `add_tool_result_writes_structured_entry_visible_through_messages_projection`
+        (in `aj-session::log::tests`) round-trips a populated
+        `details` payload through write → resume → linearize → read
+        and asserts the entry shape survives, the wire projection
+        renders as a user-role message, and `message_count` /
+        `last_message` see the new variant.
+      - `add_tool_result_with_empty_details_skips_field_on_disk`
+        (in `aj-session::log::tests`) asserts the empty-`details`
+        case never writes `"details"` on the JSONL line and that
+        the on-disk shape deserializes back with an empty map by
+        default.
+      - `repair_recognises_tool_use_ids_resolved_by_structured_tool_result_entries`
+        (in `aj-session::repair::tests`) verifies the repair
+        walker treats `tool_use_ids` resolved by structured
+        `ToolResult` entries the same as legacy `Message`-encoded
+        tool results.
+      - `replay_projects_structured_tool_result_entries_as_user_thread_events`
+        (in `aj-session::replay::tests`) pins the step-2 bridging
+        shape: `ToolExecutionStart` carrying the tool name + args
+        captured from the preceding assistant turn, followed by a
+        `ToolExecutionEnd` with a `ToolDetails::Text` fallback
+        body. Step 4's upgrade will tighten the assertion to read
+        the persisted `details` map.
+      - `list_thread_previews_counts_structured_tool_result_entries_as_messages`
+        (in `aj-session::persistence::tests`) verifies the
+        per-thread preview's `message_count` includes
+        `ToolResult` entries.
+
+      `cargo build`, `cargo test --workspace`, `cargo fmt`, and
+      `cargo clippy --workspace --all-targets` all pass clean (only
+      the pre-existing `clone_on_ref_ptr` warnings remain in
+      `aj-agent` / `aj-models` / `aj-tools`).
 
 - [ ] **Step 3: Persistence listener dispatch.** Replace the
       `let _ = details;` placeholder in `aj_session::listener::persist`

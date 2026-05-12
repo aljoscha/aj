@@ -228,7 +228,7 @@ impl InteractiveMode {
                 .latest_leaf(ThreadFilter::USER)
                 .expect("post-repair head exists when pre-repair head did");
             let conversation = log.linearize(&head, ThreadFilter::USER);
-            let messages: Vec<_> = conversation.messages().into_iter().cloned().collect();
+            let messages: Vec<_> = conversation.messages();
             agent.seed_messages(messages);
         }
 
@@ -1185,12 +1185,7 @@ async fn perform_thread_swap(
     //    minted ids in this session don't collide with any
     //    sub-agent subtrees already on the log.
     let messages: Vec<_> = if let Some(head) = new_log.latest_leaf(ThreadFilter::USER) {
-        new_log
-            .linearize(&head, ThreadFilter::USER)
-            .messages()
-            .into_iter()
-            .cloned()
-            .collect()
+        new_log.linearize(&head, ThreadFilter::USER).messages()
     } else {
         Vec::new()
     };
