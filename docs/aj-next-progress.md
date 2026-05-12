@@ -2555,7 +2555,7 @@ end-to-end design above. Pick the next unchecked box.
       (only the pre-existing `clone_on_ref_ptr` warnings remain
       in `aj-agent`).
 
-- [ ] **Step 5: End-to-end replay-vs-live parity test.** A test in
+- [x] **Step 5: End-to-end replay-vs-live parity test.** A test in
       `src/aj/` that runs a tool-call turn live (bash, edit_file,
       todo_write fixtures), kills the process between persistence
       and the next inference, resumes from the on-disk log, and
@@ -2563,6 +2563,71 @@ end-to-end design above. Pick the next unchecked box.
       for each of the three tool kinds. Without this guard the
       three rendering paths drift silently across future
       refactors.
+
+      Implemented as the integration test
+      `src/aj/tests/replay_parity.rs`. Three `#[tokio::test]`
+      cases (`replay_renders_bash_tool_identically_to_live`,
+      `replay_renders_edit_file_tool_identically_to_live`,
+      `replay_renders_todo_write_tool_identically_to_live`) share
+      a small `drive_live_turn` harness that:
+
+      1. Builds a temp `threads_dir` and working dir, plus a
+         scripted model that returns exactly one inference whose
+         finalized message carries a single tool_use block for
+         the target tool. `ExhaustedBehavior::Panic` traps any
+         path that would let the agent reach a second inference.
+      2. Registers three bus listeners in order: the production
+         `persistence_listener`, an event-capture listener that
+         pushes every observed `AgentEvent` into a `Vec`, and a
+         kill-switch listener that returns `Err` the first time
+         it sees `MessagePersisted::ToolResult`. The earlier
+         listeners run first per `EventBus::emit`'s
+         registration-order contract, so the disk write and the
+         capture both complete before the kill switch trips —
+         exactly mirroring "process dies after the tool result
+         persists but before the next inference starts".
+      3. Drives `agent.prompt(...)` and asserts it returns
+         `Err(TurnError::Fatal(_))`.
+
+      The test then renders two chat scrollbacks against the
+      same `build_layout`-built `Tui` (with a headless
+      `StubTerminal` that drops every write) and the same
+      `bundled_dark` theme:
+
+      - **Live:** drive the captured `AgentEvent`s through a
+        fresh `EventPump`, skipping `TurnUsage` events (the
+        agent emits per-turn usage on the bus but does not
+        persist it, so replay can't re-emit a matching event;
+        the divergence is unrelated to tool rendering and the
+        Step 5 test exists to guard the three tool render paths
+        specifically — restoring usage persistence later turns
+        the filter into a no-op).
+      - **Replay:** `ConversationLog::resume` the same file,
+        drive `replay(&log)` events through a second fresh
+        `EventPump`, and compare the chat container's
+        `Container::render(width)` output line-for-line.
+
+      Tool inputs are chosen so each fixture exercises a
+      distinct `ToolDetails` variant on the wire:
+
+      | Fixture | Tool | Variant exercised | Notes |
+      |---|---|---|---|
+      | `replay_renders_bash_tool_identically_to_live` | `bash` | `ToolDetails::Bash` | runs `echo hello` against the working tempdir |
+      | `replay_renders_edit_file_tool_identically_to_live` | `edit_file` | `ToolDetails::Diff` | seeds `sample.txt` with `"hello world\n"` and swaps `hello`→`goodbye` |
+      | `replay_renders_todo_write_tool_identically_to_live` | `todo_write` | `ToolDetails::Todos` | writes a two-item list (`in-progress` / `todo`) |
+
+      Comparison is byte-for-byte on the `Vec<String>` returned
+      by `Container::render` — ANSI escapes and all. A
+      side-by-side `diff_lines` helper feeds the panic message
+      when a future refactor regresses one of the renderers so
+      the failure mode is debuggable from CI output alone, no
+      re-run with extra println!s needed.
+
+      `cargo test -p aj --test replay_parity` passes (3 tests).
+      `cargo build`, `cargo test --workspace`, `cargo fmt`, and
+      `cargo clippy -p aj --all-targets` all pass clean (only
+      the pre-existing `clone_on_ref_ptr` warnings remain in
+      `aj-agent`).
 
 - [ ] **Step 6: Migration walker for legacy
       `UserOutput::ToolError`.** New `aj_session::migrate` module
