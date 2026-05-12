@@ -2474,11 +2474,35 @@ end-to-end design above. Pick the next unchecked box.
       the pre-existing `clone_on_ref_ptr` warnings remain in
       `aj-agent` / `aj-models` / `aj-tools`).
 
-- [ ] **Step 3: Persistence listener dispatch.** Replace the
+- [x] **Step 3: Persistence listener dispatch.** Replaced the
       `let _ = details;` placeholder in `aj_session::listener::persist`
-      with a call into the step-2 `add_tool_result` method (or
-      whatever the chosen shape exposes), so the structured
-      details actually land on disk alongside the wire content.
+      with a `view.add_tool_result(content, details)?` call so the
+      agent's batched [`PersistedMessageKind::ToolResult`] event
+      lands on disk as a [`ConversationEntryKind::ToolResult`]
+      entry carrying both halves — the wire `tool_result` content
+      blocks for the model, and the structured per-call
+      [`ToolDetails`] payload (keyed by `tool_use_id`) for the
+      renderer. New logs written by a `MessagePersisted::ToolResult`
+      emit now use the structured on-disk shape; legacy logs
+      written as plain user-role `Message` entries continue to
+      work because [`Conversation::messages`] and the replay
+      walker accept both encodings (see step 2). Step 4 still
+      tightens the replay projection to read the persisted
+      `details` directly off the entry.
+
+      New unit test in `aj_session::listener::tests`,
+      `tool_result_kind_writes_structured_tool_result_entry`,
+      drives a `PersistedMessageKind::ToolResult` event through a
+      bus-subscribed listener and asserts the freshly-appended
+      entry is a `ConversationEntryKind::ToolResult` with the
+      expected wire content + the `tool_use_id ↦
+      ToolDetails::Text` mapping, and that the wire projection
+      still surfaces it as one user-role message per tool batch
+      so the model continues to see the same shape on the next
+      inference. `cargo build`, `cargo test --workspace`, `cargo
+      fmt`, and `cargo clippy --workspace --all-targets` all pass
+      clean (only the pre-existing `clone_on_ref_ptr` warnings
+      remain in `aj-agent` / `aj-models` / `aj-tools`).
 
 - [ ] **Step 4: Replay reads `details` (with legacy fallback).**
       Update `aj_session::replay::ReplayState::project_user` (the

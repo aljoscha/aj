@@ -149,19 +149,18 @@ fn persist(
             view.add_assistant_message(content)?;
         }
         PersistedMessageKind::ToolResult { content, details } => {
-            // `details` carries the per-call structured renderer
-            // payload keyed by `tool_use_id`. Today we only persist
-            // the wire `content` (matching legacy behaviour);
-            // wiring `details` through to the on-disk record lands
-            // as the next commit in this series so that resumed
-            // sessions can rehydrate the structured renderer state
-            // (diffs, todo snapshots, bash exit codes,
-            // sub-agent reports) instead of falling back to the
-            // wire text-only projection. See
-            // `docs/aj-next-progress.md` §3 — "Resume fidelity
-            // follow-up".
-            let _ = details;
-            view.add_user_message(content)?;
+            // Ride the structured per-call [`ToolDetails`] payload
+            // alongside the wire `tool_result` blocks on a single
+            // [`ConversationEntryKind::ToolResult`] entry, so a
+            // resumed session can rehydrate the renderer state
+            // (diffs, todo snapshots, bash exit codes, sub-agent
+            // reports) instead of falling back to the wire
+            // text-only projection. The wire projection in
+            // [`Conversation::messages`] still surfaces the entry
+            // as one user-role message per tool batch, so the
+            // model continues to see the same shape on the next
+            // inference.
+            view.add_tool_result(content, details)?;
         }
         PersistedMessageKind::UserOutput { output } => {
             view.add_user_output(output)?;
@@ -181,12 +180,14 @@ fn filter_for(agent_id: AgentId) -> ThreadFilter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use aj_agent::bus::EventBus;
     use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind};
+    use aj_agent::tool::ToolDetails;
     use aj_agent::types::UserOutput;
-    use aj_models::messages::{ContentBlockParam, Role};
+    use aj_models::messages::{ContentBlockParam, Role, ToolResultContent};
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -313,6 +314,101 @@ mod tests {
         assert!(matches!(
             last.entry,
             ConversationEntryKind::UserOutput(UserOutput::ToolError { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_result_kind_writes_structured_tool_result_entry() {
+        // The listener routes `PersistedMessageKind::ToolResult`
+        // through [`ConversationView::add_tool_result`] so the
+        // structured per-call [`ToolDetails`] payload lands on disk
+        // alongside the wire `tool_result` content blocks. On resume
+        // the entry deserializes back to
+        // [`ConversationEntryKind::ToolResult`] with the same
+        // `tool_use_id ↦ ToolDetails` mapping, so the renderer can
+        // rehydrate the structured body (here a `ToolDetails::Text`
+        // for [`PingTool`]-style fixtures) instead of falling back
+        // to the text-only wire projection.
+        let (_dir, log) = fresh_log();
+        // Seed a user/assistant turn so the tool-result entry has a
+        // non-empty pre-existing thread to attach to (matches the
+        // production sequence: a `ToolResult` only ever follows an
+        // assistant turn carrying `tool_use` blocks).
+        {
+            let mut log_guard = log.lock().await;
+            let mut view = ConversationView::user(&mut log_guard, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("user msg");
+            view.add_assistant_message(vec![ContentBlockParam::ToolUseBlock {
+                id: "tu-1".into(),
+                name: "ping".into(),
+                input: serde_json::json!({}),
+                caller: None,
+            }])
+            .expect("assistant msg");
+        }
+
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
+
+        let mut details = HashMap::new();
+        details.insert(
+            "tu-1".to_string(),
+            ToolDetails::Text {
+                summary: "ping".to_string(),
+                body: "pong".to_string(),
+            },
+        );
+        bus.emit(AgentEvent::MessagePersisted {
+            agent_id: AgentId::Main,
+            kind: PersistedMessageKind::ToolResult {
+                content: vec![ContentBlockParam::ToolResultBlock {
+                    tool_use_id: "tu-1".into(),
+                    content: ToolResultContent::Text("pong".into()),
+                    is_error: false,
+                }],
+                details,
+            },
+        })
+        .await
+        .expect("emit tool result");
+
+        // The freshly-appended entry on the user thread must be a
+        // structured `ToolResult` carrying both halves — wire
+        // content for the model and structured details for the
+        // renderer.
+        let log_guard = log.lock().await;
+        let entries: Vec<_> = log_guard.entries_in_order().into_iter().cloned().collect();
+        let last = entries.last().expect("log has entries");
+        match &last.entry {
+            ConversationEntryKind::ToolResult { content, details } => {
+                assert_eq!(content.len(), 1);
+                let stored = details
+                    .get("tu-1")
+                    .expect("details map keyed by tool_use_id");
+                match stored {
+                    ToolDetails::Text { summary, body } => {
+                        assert_eq!(summary, "ping");
+                        assert_eq!(body, "pong");
+                    }
+                    other => panic!("expected Text details, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolResult entry, got {other:?}"),
+        }
+
+        // The wire projection still surfaces the entry as one
+        // user-role message per tool batch so the model continues
+        // to see the same shape on the next inference.
+        let head = log_guard
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user-thread head exists");
+        let convo = log_guard.linearize(&head, ThreadFilter::USER);
+        let projected = convo.last_message().expect("at least one message");
+        assert!(matches!(projected.role, Role::User));
+        assert!(matches!(
+            projected.content[0],
+            ContentBlockParam::ToolResultBlock { .. }
         ));
     }
 
