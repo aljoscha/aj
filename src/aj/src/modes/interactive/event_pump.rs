@@ -27,7 +27,9 @@ use aj_tui::container::Container;
 use aj_tui::tui::Tui;
 
 use crate::config::theme::ChatTheme;
-use crate::modes::interactive::components::assistant_message::AssistantMessageComponent;
+use crate::modes::interactive::components::assistant_message::{
+    AssistantMessageComponent, BlockKind,
+};
 use crate::modes::interactive::components::loader_status::LoaderStatus;
 use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
 use crate::modes::interactive::components::user_message::UserMessageComponent;
@@ -344,33 +346,39 @@ impl EventPump {
                     return;
                 };
                 match (channel, action) {
-                    (StreamChannel::Text, StreamAction::Start { snapshot })
-                    | (StreamChannel::Text, StreamAction::Stop { snapshot }) => {
-                        c.set_text_snapshot(snapshot.clone());
+                    (StreamChannel::Text, StreamAction::Start { snapshot }) => {
+                        c.open_block(BlockKind::Text, snapshot.clone());
                     }
                     (StreamChannel::Text, StreamAction::Update { delta }) => {
-                        c.append_text_delta(delta);
+                        c.append_delta(BlockKind::Text, delta);
+                    }
+                    (StreamChannel::Text, StreamAction::Stop { snapshot }) => {
+                        // Text channel carries a canonical final snapshot;
+                        // pass it through so the block matches the
+                        // model's authoritative bytes even if individual
+                        // deltas got dropped.
+                        c.close_block(BlockKind::Text, Some(snapshot.clone()));
                     }
                     (StreamChannel::Thinking, StreamAction::Start { snapshot }) => {
-                        c.set_thinking_snapshot(snapshot.clone());
+                        c.open_block(BlockKind::Thinking, snapshot.clone());
                     }
                     (StreamChannel::Thinking, StreamAction::Update { delta }) => {
-                        c.append_thinking_delta(delta);
+                        c.append_delta(BlockKind::Thinking, delta);
                     }
                     (StreamChannel::Thinking, StreamAction::Stop { snapshot }) => {
                         // `ThinkingStop` from the agent is documented as
                         // a "flush" signal: the streaming layer doesn't
                         // accumulate a canonical thinking snapshot, so
-                        // the agent emits an empty string here. Honour
-                        // that — overwriting with the empty payload
-                        // would wipe the buffer we built up from
-                        // deltas and visually drop the entire thinking
-                        // block the moment streaming finished. If a
-                        // future provider does push a non-empty
-                        // snapshot we still pick it up.
-                        if !snapshot.is_empty() {
-                            c.set_thinking_snapshot(snapshot.clone());
-                        }
+                        // the agent emits an empty string here. Pass
+                        // `None` in that case so we keep what deltas
+                        // built up; a future provider that does send a
+                        // non-empty payload is still honoured.
+                        let payload = if snapshot.is_empty() {
+                            None
+                        } else {
+                            Some(snapshot.clone())
+                        };
+                        c.close_block(BlockKind::Thinking, payload);
                     }
                     (StreamChannel::User, _) => unreachable!("guarded above"),
                 }
