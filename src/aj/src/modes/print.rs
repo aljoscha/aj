@@ -148,13 +148,18 @@ pub async fn run(args: Args) -> Result<()> {
     // registry so the binary owns provider dispatch, API key
     // resolution, and speed-driven beta headers.
     let mut agent = if let Some(name) = &args.scripted {
-        let model = crate::scripted::resolve_or_explain(name)?;
-        Agent::new(
+        let crate::scripted::ResolvedScriptedModel {
+            provider,
+            model_info,
+        } = crate::scripted::resolve_or_explain(name)?;
+        Agent::with_provider(
             env,
             SYSTEM_PROMPT,
             tools,
             config.disabled_tools.clone(),
-            Arc::clone(&model),
+            provider,
+            model_info,
+            aj_models::types::StreamOptions::default(),
             config.thinking,
         )
     } else {

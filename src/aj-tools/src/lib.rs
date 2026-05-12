@@ -31,7 +31,7 @@ pub use tools::read_file::ReadFileTool;
 pub use tools::todo::{TodoReadTool, TodoWriteTool};
 pub use tools::write_file::WriteFileTool;
 
-/// Build the catalog of every builtin tool, ready for `Agent::new`.
+/// Build the catalog of every builtin tool, ready for `Agent::with_provider`.
 ///
 /// The binary further filters this list against any tools the user
 /// has disabled before handing it to the agent. Sub-agents inherit

@@ -26,7 +26,7 @@ use crate::messages::{
     StopReason as LegacyStopReason, ToolResultContent, Usage as LegacyUsage,
 };
 use crate::provider::Provider;
-use crate::registry::ModelInfo;
+use crate::registry::{InputModality, ModelCost, ModelInfo};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, StreamingEvent,
 };
@@ -62,11 +62,33 @@ impl LegacyProviderAdapter {
     pub fn new(model: Arc<dyn Model>) -> Self {
         Self { model }
     }
+}
 
-    /// Borrow the wrapped legacy handle. Used by `Agent::model()` accessors
-    /// until step 6.7 drops the legacy constructor.
-    pub fn inner(&self) -> &Arc<dyn Model> {
-        &self.model
+/// Build a minimal [`ModelInfo`] off a legacy [`Model`] handle.
+///
+/// The legacy trait only exposes `model_name()` / `model_url()`; everything
+/// else is unknown, so this stamps `"legacy"` onto the `api` / `provider`
+/// slots and zeros out the capability flags. Call sites pair this with
+/// [`LegacyProviderAdapter::new`] when feeding an existing
+/// `Arc<dyn Model>` handle into a [`Provider`]-typed constructor (e.g.
+/// `Agent::with_provider`). Disappears with the legacy `Model` trait
+/// itself once every caller has migrated to the unified [`Provider`]
+/// surface.
+pub fn synthetic_model_info(model: &Arc<dyn Model>) -> ModelInfo {
+    ModelInfo {
+        id: model.model_name(),
+        name: model.model_name(),
+        api: "legacy".to_string(),
+        provider: "legacy".to_string(),
+        base_url: model.model_url(),
+        reasoning: false,
+        supports_xhigh: false,
+        supports_adaptive_thinking: false,
+        input: vec![InputModality::Text],
+        cost: ModelCost::default(),
+        context_window: 0,
+        max_tokens: 0,
+        headers: None,
     }
 }
 

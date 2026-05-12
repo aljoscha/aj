@@ -2933,25 +2933,60 @@ session notes for the planning commit.
        `AnthropicProvider::build_client`'s new
        `extra_betas_from_headers` parser.
 
-- [ ] **6.7: `Agent::new` drops `Arc<dyn Model>`.** Remove the
-       legacy `Agent::new(model: Arc<dyn Model>, ...)`
-       constructor; `Agent::with_provider(...)` becomes the only
-       way in. Internal `LegacyProviderAdapter` usage inside
-       `Agent` goes away (no callers wrap legacy handles anymore).
-       Doc cleanup on `Agent::model()` / `Agent::set_model()`
-       — both rename to `model_info()` / `set_model_info(...)`
-       (or keep `model()` returning `&ModelInfo`; decide at
-       implementation time based on call-site noise).
-       `SessionContextWrapper::model: Arc<dyn Model>` in
-       `lib.rs:1246` flips to `Arc<dyn Provider> +
-       Arc<ModelInfo>` so sub-agent spawning threads the same
-       handle — sub-agents share the parent's provider
-       (matching the existing parent-bus / parent-cancellation
-       sharing pattern in `aj-next-plan.md` §1.6).
+- [x] **6.7: `Agent::new` drops `Arc<dyn Model>`.** Removed the
+       legacy `Agent::new(model: Arc<dyn Model>, ...)` constructor;
+       `Agent::with_provider(...)` is the only way to build an
+       agent. Removed the `Agent::model: Option<Arc<dyn Model>>`
+       field, the `Agent::model()` accessor, and the
+       `Agent::set_model(Arc<dyn Model>)` mutator. Folded the
+       former `Self::build` helper directly into `with_provider`
+       since the dual-path indirection is gone. The legacy doc
+       refs on `Agent::model_info()` were cleaned up to no longer
+       reference the deleted constructor.
 
-       After this step, the only remaining caller of the legacy
-       `Model` trait is `ScriptedModel`'s impl block and the
-       test fixtures that build it. Those go in 6.8.
+       Internal `LegacyProviderAdapter` usage inside `Agent` is
+       gone — the agent never wraps a legacy handle anymore. The
+       `synthetic_model_info` helper that used to live in
+       `aj-agent::lib.rs` migrated to `aj-models::compat` as a
+       public free function so the two remaining call sites
+       (`aj/src/scripted.rs` and the test fixtures in
+       `aj-agent::event_protocol_tests` /
+       `aj/tests/replay_parity.rs`) can wrap a `ScriptedModel`
+       themselves and feed the resulting `(Provider, ModelInfo)`
+       pair into `Agent::with_provider`. The now-unused
+       `LegacyProviderAdapter::inner()` accessor went with it.
+
+       `SessionContextWrapper`'s `model: Option<Arc<dyn Model>>`
+       slot dropped; sub-agents always share the parent's
+       `provider` + `model_info` + `stream_options` triple per
+       `docs/aj-next-plan.md` §1.6. The `if let Some(model) = ...`
+       branch in `spawn_agent` collapsed to a single
+       `Agent::with_provider` call.
+
+       `aj/src/scripted.rs::resolve_or_explain` now returns a
+       new `ResolvedScriptedModel { provider, model_info }` struct
+       (mirroring the shape `crate::model::resolve` returns for
+       real providers) so the `--scripted` flag plumbs the same
+       `(Provider, ModelInfo, StreamOptions)` shape as the
+       registry-driven path. The two binary call sites
+       (`interactive.rs`, `print.rs`) and the replay-parity
+       integration test all flow through `Agent::with_provider`
+       now.
+
+       After this step the only remaining callers of the legacy
+       `Model` trait are `ScriptedModel` itself, the
+       `LegacyProviderAdapter::new(...)` wrap at the three call
+       sites listed above, and the legacy `Anthropic`/`OpenAI`
+       `Model` impl blocks (still spliced into `aj-models` for
+       6.8 to replace with `ScriptedProvider` and 6.9 to delete).
+       `cargo build`, `cargo fmt`, `cargo test --workspace`, and
+       `cargo clippy --workspace --all-targets` all pass clean
+       (pre-existing `clone_on_ref_ptr` warnings in `bus.rs`,
+       `bash.rs`, `oauth/anthropic.rs`, and the agent's
+       `event_protocol_tests` remain — none in the touched
+       files). End-to-end `aj --print --scripted streaming-text`
+       runs the canned demo to completion, confirming the
+       provider-only path works for the scripted flow.
 
 - [ ] **6.8: Tests + `--scripted` flag onto `ScriptedProvider`.**
        Migrate every test fixture that built `ScriptedModel`

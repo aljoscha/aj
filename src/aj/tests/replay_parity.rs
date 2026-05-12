@@ -52,11 +52,13 @@ use aj_agent::events::{AgentEvent, PersistedMessageKind};
 use aj_agent::tool::ErasedToolDefinition;
 use aj_agent::{Agent, TurnError};
 use aj_conf::AgentEnv;
+use aj_models::compat::{LegacyProviderAdapter, synthetic_model_info};
 use aj_models::messages::{ContentBlock, StopReason};
 use aj_models::scripted::{
     ExhaustedBehavior, Script, ScriptStep, ScriptedModel, finalized_message,
 };
 use aj_models::streaming::StreamingEvent;
+use aj_models::types::StreamOptions;
 use aj_session::{ConversationLog, ConversationPersistence, persistence_listener, replay};
 use aj_tools::{BashTool, EditFileTool, TodoWriteTool};
 use aj_tui::component::Component;
@@ -228,10 +230,23 @@ async fn drive_live_turn(
     let log_handle = Arc::new(TokioMutex::new(log));
 
     let scripts = one_tool_use_script(tool_use_id, tool_name, tool_input);
-    let model = Arc::new(ScriptedModel::new(scripts).on_exhausted(ExhaustedBehavior::Panic));
+    let model: Arc<dyn aj_models::Model> =
+        Arc::new(ScriptedModel::new(scripts).on_exhausted(ExhaustedBehavior::Panic));
+    let model_info = Arc::new(synthetic_model_info(&model));
+    let provider: Arc<dyn aj_models::provider::Provider> =
+        Arc::new(LegacyProviderAdapter::new(model));
 
     let env = empty_env(working_dir.to_path_buf());
-    let mut agent = Agent::new(env, "system prompt", vec![tool], Vec::new(), model, None);
+    let mut agent = Agent::with_provider(
+        env,
+        "system prompt",
+        vec![tool],
+        Vec::new(),
+        provider,
+        model_info,
+        StreamOptions::default(),
+        None,
+    );
     agent.set_assembled_system_prompt("test prompt".to_string());
 
     // 1. Persistence — writes terminal-state events to disk.

@@ -128,14 +128,17 @@ impl InteractiveMode {
         let mut agent: Agent;
         let current_model_key: Arc<std::sync::Mutex<(String, String)>>;
         if let Some(name) = &self.args.scripted {
-            let model = crate::scripted::resolve_or_explain(name)?;
+            let crate::scripted::ResolvedScriptedModel {
+                provider,
+                model_info,
+            } = crate::scripted::resolve_or_explain(name)?;
             let current_provider = self
                 .args
                 .model_api
                 .clone()
                 .or_else(|| config.model_api.clone())
                 .unwrap_or_else(|| crate::model::DEFAULT_PROVIDER_ID.to_string());
-            let current_id = model.model_name();
+            let current_id = model_info.id.clone();
             current_model_key = Arc::new(std::sync::Mutex::new((current_provider, current_id)));
             // ---- Tools (legacy / scripted path) -----------------------
             let mut tools = get_builtin_tools();
@@ -143,12 +146,14 @@ impl InteractiveMode {
                 tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
             }
             let env = AgentEnv::new();
-            agent = Agent::new(
+            agent = Agent::with_provider(
                 env,
                 SYSTEM_PROMPT,
                 tools,
                 config.disabled_tools.clone(),
-                Arc::clone(&model),
+                provider,
+                model_info,
+                aj_models::types::StreamOptions::default(),
                 config.thinking,
             );
         } else {
