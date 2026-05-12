@@ -43,6 +43,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aj::config::theme::{Theme, ThemeHandle, chat_theme};
 use aj::modes::interactive::event_pump::EventPump;
@@ -52,13 +53,10 @@ use aj_agent::events::{AgentEvent, PersistedMessageKind};
 use aj_agent::tool::ErasedToolDefinition;
 use aj_agent::{Agent, TurnError};
 use aj_conf::AgentEnv;
-use aj_models::compat::{LegacyProviderAdapter, synthetic_model_info};
-use aj_models::messages::{ContentBlock, StopReason};
-use aj_models::scripted::{
-    ExhaustedBehavior, Script, ScriptStep, ScriptedModel, finalized_message,
-};
-use aj_models::streaming::StreamingEvent;
-use aj_models::types::StreamOptions;
+use aj_models::provider::Provider;
+use aj_models::registry::{InputModality, ModelCost, ModelInfo};
+use aj_models::scripted::provider::{ExhaustedBehavior, ScriptedProvider};
+use aj_models::types::{AssistantContent, AssistantMessage, StopReason, StreamOptions, ToolCall};
 use aj_session::{ConversationLog, ConversationPersistence, persistence_listener, replay};
 use aj_tools::{BashTool, EditFileTool, TodoWriteTool};
 use aj_tui::component::Component;
@@ -130,33 +128,65 @@ fn empty_env(working_directory: PathBuf) -> AgentEnv {
     }
 }
 
-/// Build a one-inference script that returns a single `tool_use`
-/// block. The agent runs the tool, persists the result, and would
-/// continue to the next inference — except the kill switch fails
-/// the turn after the persistence event has fired.
-/// `ExhaustedBehavior::Panic` guards against a misconfigured kill
-/// switch that lets the agent reach the next inference: the script
-/// queue would be empty by then and the model would panic, making
-/// the test failure immediate and loud.
-fn one_tool_use_script(
+/// Identity stamped on every scripted [`AssistantMessage`] in this
+/// test module. Matches what [`ScriptedProvider`] stamps on every
+/// emitted partial, so the agent's TUI / persistence listeners see a
+/// coherent provider identity even in tests.
+const SCRIPT_API: &str = "scripted";
+const SCRIPT_PROVIDER: &str = "scripted";
+const SCRIPT_MODEL: &str = "scripted";
+
+/// Build a [`ModelInfo`] mirroring what [`ScriptedProvider`] stamps
+/// onto every emitted [`AssistantMessage`] partial. The agent reads
+/// identity off this struct for the TUI footer and the `/model`
+/// selector; values are only checked for "matches what the provider
+/// claims", so any consistent triple works.
+fn scripted_model_info() -> ModelInfo {
+    ModelInfo {
+        id: SCRIPT_MODEL.to_string(),
+        name: SCRIPT_MODEL.to_string(),
+        api: SCRIPT_API.to_string(),
+        provider: SCRIPT_PROVIDER.to_string(),
+        base_url: "scripted://internal".to_string(),
+        reasoning: false,
+        supports_xhigh: false,
+        supports_adaptive_thinking: false,
+        input: vec![InputModality::Text],
+        cost: ModelCost::default(),
+        context_window: 0,
+        max_tokens: 0,
+        headers: None,
+    }
+}
+
+/// Build a finalized [`AssistantMessage`] with a single `tool_call`
+/// block and `stop_reason: ToolUse`. The agent runs the tool,
+/// persists the result, and would continue to the next inference —
+/// except the kill switch fails the turn after the persistence event
+/// has fired. The provider is configured with
+/// [`ExhaustedBehavior::Panic`] in [`drive_live_turn`] so a
+/// misconfigured kill switch that lets the agent reach a second
+/// inference makes the failure immediate and loud.
+fn one_tool_use_message(
     tool_use_id: &str,
     tool_name: &str,
     tool_input: serde_json::Value,
-) -> Vec<Script> {
-    vec![Script {
-        steps: vec![ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-            message: finalized_message(
-                "scripted",
-                vec![ContentBlock::ToolUseBlock {
-                    id: tool_use_id.to_string(),
-                    name: tool_name.to_string(),
-                    input: tool_input,
-                    caller: None,
-                }],
-                StopReason::ToolUse,
-            ),
+) -> AssistantMessage {
+    AssistantMessage {
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: tool_use_id.to_string(),
+            name: tool_name.to_string(),
+            arguments: tool_input,
         })],
-    }]
+        api: SCRIPT_API.to_string(),
+        provider: SCRIPT_PROVIDER.to_string(),
+        model: SCRIPT_MODEL.to_string(),
+        response_id: Some("test-msg-1".to_string()),
+        usage: Default::default(),
+        stop_reason: StopReason::ToolUse,
+        error: None,
+        timestamp: 0,
+    }
 }
 
 /// Stand up a fresh `Tui` with the production interactive-mode
@@ -229,12 +259,18 @@ async fn drive_live_turn(
     let thread_id = log.thread_id().to_string();
     let log_handle = Arc::new(TokioMutex::new(log));
 
-    let scripts = one_tool_use_script(tool_use_id, tool_name, tool_input);
-    let model: Arc<dyn aj_models::Model> =
-        Arc::new(ScriptedModel::new(scripts).on_exhausted(ExhaustedBehavior::Panic));
-    let model_info = Arc::new(synthetic_model_info(&model));
-    let provider: Arc<dyn aj_models::provider::Provider> =
-        Arc::new(LegacyProviderAdapter::new(model));
+    let message = one_tool_use_message(tool_use_id, tool_name, tool_input);
+    // `chunk_size = 0` emits the tool call as a single delta carrying
+    // the full serialized arguments — matches the legacy script
+    // shape (one terminal event per inference) so the locked
+    // bus-event sequence is preserved across the migration.
+    // `ExhaustedBehavior::Panic` makes a runaway extra inference
+    // (kill switch failed to bite) panic immediately.
+    let provider: Arc<dyn Provider> = Arc::new(
+        ScriptedProvider::from_messages(vec![message], 0, Duration::ZERO)
+            .on_exhausted(ExhaustedBehavior::Panic),
+    );
+    let model_info = Arc::new(scripted_model_info());
 
     let env = empty_env(working_dir.to_path_buf());
     let mut agent = Agent::with_provider(

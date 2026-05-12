@@ -3109,17 +3109,46 @@ session notes for the planning commit.
          `aj_models::streaming::StreamingEvent`. The remaining
          legacy-shaped caller in test code is
          `aj/tests/replay_parity.rs` (6.8.iii).
-   - [ ] 6.8.iii. `aj/tests/replay_parity.rs` onto
-         `ScriptedProvider`. Same migration shape as 6.8.ii: drop
-         the `ScriptedModel`-driven `one_tool_use_script` helper
-         and rebuild it on `ScriptedProvider::from_messages`
-         (a one-block tool-use `AssistantMessage` with
-         `stop_reason: ToolUse`). After this, the integration
-         test no longer references `aj_models::Model` /
-         `aj_models::compat::*` / `aj_models::streaming::StreamingEvent`
-         and the `aj_models::scripted::ScriptedModel` /
-         `aj_models::scripted::Script` types — the only remaining
-         caller of those is `aj-models` itself, which 6.9 deletes.
+   - [x] 6.8.iii. `aj/tests/replay_parity.rs` onto
+         `ScriptedProvider`. Replaced the `ScriptedModel`-driven
+         `one_tool_use_script` helper (returning `Vec<Script>` of
+         `StreamingEvent::FinalizedMessage`) with
+         `one_tool_use_message` returning a single
+         [`AssistantMessage`] (one [`AssistantContent::ToolCall`]
+         block, `stop_reason: ToolUse`) and a
+         `ScriptedProvider::from_messages(vec![message], 0,
+         Duration::ZERO).on_exhausted(ExhaustedBehavior::Panic)`
+         provider built inline in `drive_live_turn`. `chunk_size = 0`
+         emits the tool call as a single delta carrying the full
+         serialized arguments — matches the legacy "one terminal
+         event per inference" script shape so the locked bus-event
+         sequence (and therefore the chat rendering) is preserved
+         across the migration. Added a `scripted_model_info()`
+         helper (and `SCRIPT_API` / `SCRIPT_PROVIDER` /
+         `SCRIPT_MODEL` constants) that mirrors what
+         `ScriptedProvider` stamps onto every emitted partial; the
+         agent's TUI / persistence listeners read identity off this
+         struct, so any consistent triple works. Dropped the
+         `Arc<dyn Model> → LegacyProviderAdapter →
+         synthetic_model_info` plumbing from `drive_live_turn`.
+
+         After this commit `aj/tests/replay_parity.rs` no longer
+         touches `aj_models::Model`, `aj_models::compat::*`,
+         `aj_models::scripted::ScriptedModel` /
+         `aj_models::scripted::Script` /
+         `aj_models::scripted::ScriptStep` /
+         `aj_models::scripted::finalized_message`,
+         `aj_models::streaming::StreamingEvent`, or
+         `aj_models::messages::*`. The only remaining caller of
+         those is `aj-models` itself, which 6.9 deletes. All three
+         per-tool fixtures (`bash`, `edit_file`, `todo_write`) pass
+         under the new provider; the captured live event sequence
+         continues to match the replayed log's event sequence
+         byte-for-byte at the chat-container rendering layer.
+         `cargo build`, `cargo fmt`, `cargo test --workspace`, and
+         `cargo clippy -p aj --all-targets` all pass clean (only
+         pre-existing `clone_on_ref_ptr` warnings in `bus.rs`
+         remain — none introduced by this change).
 
 - [ ] **6.9: Delete legacy.** With every call site migrated,
        delete in one commit:
