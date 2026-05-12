@@ -551,9 +551,13 @@ pub fn grapheme_width(grapheme: &str) -> usize {
 /// cursor positions, selections, and width math stay consistent; only the
 /// final bytes handed to the terminal go through this function.
 pub fn normalize_terminal_output(s: &str) -> String {
-    // Fast path: most strings contain neither codepoint, and scanning the
-    // bytes is cheaper than a full allocation.
-    if !s.contains(['\u{0E33}', '\u{0EB3}']) {
+    // Fast path: most strings don't contain either codepoint, and we
+    // call this on every painted line of every TUI frame. Scan the
+    // raw bytes for the two target UTF-8 sequences (`E0 B8 B3` for
+    // U+0E33, `E0 BA B3` for U+0EB3) instead of going through
+    // `str::contains([char])`, which builds a `MultiCharEqSearcher`
+    // and walks the input char by char.
+    if !contains_thai_lao_am(s.as_bytes()) {
         return s.to_string();
     }
 
@@ -572,6 +576,35 @@ pub fn normalize_terminal_output(s: &str) -> String {
         }
     }
     out
+}
+
+/// True iff `bytes` contains the UTF-8 encoding of either
+/// `U+0E33 THAI CHARACTER SARA AM` (`E0 B8 B3`) or
+/// `U+0EB3 LAO VOWEL SIGN AM` (`E0 BA B3`).
+///
+/// Implemented as a byte scan: [`memchr::memchr_iter`] (SIMD on
+/// supported targets) drives us to each `0xE0` lead byte, and we
+/// peek the next two bytes to see whether they finish the
+/// three-byte sequence we're looking for. Linear in `bytes.len()`
+/// with a single pass and no allocations; the fast-bail case (no
+/// `0xE0` anywhere in the input — which is true for every
+/// ASCII-only line) returns after the SIMD scan emits no hits.
+fn contains_thai_lao_am(bytes: &[u8]) -> bool {
+    for start in memchr::memchr_iter(0xE0, bytes) {
+        // Need two more bytes after `0xE0` for the sequence to fit.
+        // Guarding here also keeps the indexed accesses in-bounds.
+        if start + 2 >= bytes.len() {
+            break;
+        }
+        if bytes[start + 2] != 0xB3 {
+            continue;
+        }
+        let mid = bytes[start + 1];
+        if mid == 0xB8 || mid == 0xBA {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `g` contains any whitespace scalar. Empty input returns `false`.
@@ -2020,5 +2053,76 @@ mod tests {
         // Emoji ZWJ sequence with no punctuation scalar: still not
         // punctuation under either implementation.
         assert!(!is_punctuation_grapheme("\u{1f1fa}\u{1f1f8}")); // 🇺🇸
+    }
+
+    // -- normalize_terminal_output --
+
+    #[test]
+    fn normalize_passes_ascii_through_unchanged() {
+        let s = "no thai or lao here, just ASCII";
+        assert_eq!(normalize_terminal_output(s), s);
+    }
+
+    #[test]
+    fn normalize_passes_other_utf8_through_unchanged() {
+        // Plenty of non-ASCII codepoints, none in the precomposed
+        // Thai/Lao SARA AM set. Includes 0xE0 lead bytes that don't
+        // form a target sequence (Bengali / Devanagari / Tamil
+        // ranges share the `0xE0` first byte but with different
+        // continuation bytes), which the byte scan must not mistake
+        // for a hit.
+        let s = "héllo 你好 🇺🇸 \u{0985}\u{09BE} \u{0B85}\u{0BBE}";
+        assert_eq!(normalize_terminal_output(s), s);
+    }
+
+    #[test]
+    fn normalize_rewrites_thai_sara_am() {
+        // U+0E33 (`ำ`) → U+0E4D U+0E32 (`ํา`). One leading prose
+        // word so the rewrite has neighbours to keep in place.
+        let input = "คำ ทดสอบ";
+        let expected = "ค\u{0e4d}\u{0e32} ทดสอบ";
+        assert_eq!(normalize_terminal_output(input), expected);
+    }
+
+    #[test]
+    fn normalize_rewrites_lao_sara_am() {
+        // U+0EB3 (`ຳ`) → U+0ECD U+0EB2 (`ໍາ`).
+        let input = "ຄຳ";
+        let expected = "ຄ\u{0ecd}\u{0eb2}";
+        assert_eq!(normalize_terminal_output(input), expected);
+    }
+
+    #[test]
+    fn normalize_rewrites_multiple_occurrences() {
+        let input = "\u{0E33}-\u{0EB3}-\u{0E33}";
+        let expected = "\u{0E4D}\u{0E32}-\u{0ECD}\u{0EB2}-\u{0E4D}\u{0E32}";
+        assert_eq!(normalize_terminal_output(input), expected);
+    }
+
+    #[test]
+    fn normalize_handles_partial_three_byte_sequence_at_end_of_input() {
+        // The byte scan looks for `E0 _ B3`. A bare trailing `0xE0`,
+        // or `0xE0 _` without the third byte, must not be mistaken
+        // for a hit and must not read past the input's end. The
+        // byte-level helper is tested directly here so we can drive
+        // exact byte lengths without having to invent matching
+        // Unicode scalars for every edge.
+        assert!(!contains_thai_lao_am(&[0xE0]));
+        assert!(!contains_thai_lao_am(&[0xE0, 0xB8]));
+        assert!(!contains_thai_lao_am(&[0xE0, 0xB8, 0xB2])); // not 0xB3
+        assert!(contains_thai_lao_am(&[0xE0, 0xB8, 0xB3]));
+        assert!(contains_thai_lao_am(&[0xE0, 0xBA, 0xB3]));
+        assert!(!contains_thai_lao_am(&[0xE0, 0xB9, 0xB3])); // wrong mid byte
+    }
+
+    #[test]
+    fn normalize_finds_target_after_a_decoy_lead_byte() {
+        // Two `0xE0` lead bytes: the first does NOT start a SARA AM
+        // sequence (it's part of `\u{0985}` — Bengali letter `অ`,
+        // encoded `E0 A6 85`), the second does. The scan has to
+        // continue past the first hit.
+        let input = "\u{0985}\u{0E33}";
+        let expected = "\u{0985}\u{0E4D}\u{0E32}";
+        assert_eq!(normalize_terminal_output(input), expected);
     }
 }

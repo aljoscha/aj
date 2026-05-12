@@ -145,6 +145,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ignore",
+ "memchr",
  "nu-ansi-term 0.46.0",
  "nucleo",
  "nucleo-matcher",
