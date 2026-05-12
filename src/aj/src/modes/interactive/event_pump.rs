@@ -351,12 +351,26 @@ impl EventPump {
                     (StreamChannel::Text, StreamAction::Update { delta }) => {
                         c.append_text_delta(delta);
                     }
-                    (StreamChannel::Thinking, StreamAction::Start { snapshot })
-                    | (StreamChannel::Thinking, StreamAction::Stop { snapshot }) => {
+                    (StreamChannel::Thinking, StreamAction::Start { snapshot }) => {
                         c.set_thinking_snapshot(snapshot.clone());
                     }
                     (StreamChannel::Thinking, StreamAction::Update { delta }) => {
                         c.append_thinking_delta(delta);
+                    }
+                    (StreamChannel::Thinking, StreamAction::Stop { snapshot }) => {
+                        // `ThinkingStop` from the agent is documented as
+                        // a "flush" signal: the streaming layer doesn't
+                        // accumulate a canonical thinking snapshot, so
+                        // the agent emits an empty string here. Honour
+                        // that — overwriting with the empty payload
+                        // would wipe the buffer we built up from
+                        // deltas and visually drop the entire thinking
+                        // block the moment streaming finished. If a
+                        // future provider does push a non-empty
+                        // snapshot we still pick it up.
+                        if !snapshot.is_empty() {
+                            c.set_thinking_snapshot(snapshot.clone());
+                        }
                     }
                     (StreamChannel::User, _) => unreachable!("guarded above"),
                 }
@@ -809,6 +823,80 @@ mod tests {
             tool_idx.is_some(),
             "expected a ToolExecutionComponent before the final \
              assistant message; got chat layout with {total} children",
+        );
+    }
+
+    #[test]
+    fn thinking_stream_survives_empty_snapshot_stop_event() {
+        // Regression: the agent emits `ThinkingStop` with an
+        // empty snapshot (the streaming layer doesn't accumulate
+        // a canonical thinking-channel snapshot the way it does
+        // for text). A naive pump would feed that empty string
+        // back through `set_thinking_snapshot` and wipe the
+        // accumulated deltas, making the entire thinking block
+        // disappear the instant streaming finished.
+        //
+        // We assert that the rendered output still contains the
+        // streamed thinking content after the Stop event lands.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        // Open a thinking stream and append a non-trivial body.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Thinking,
+                action: StreamAction::Start {
+                    snapshot: String::new(),
+                },
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Thinking,
+                action: StreamAction::Update {
+                    delta: "first let me reason about the".to_string(),
+                },
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Thinking,
+                action: StreamAction::Update {
+                    delta: " inputs carefully".to_string(),
+                },
+            },
+        );
+        // The empty-snapshot Stop is the exact shape the agent
+        // emits on `StreamingEvent::ThinkingStop`. With the
+        // regression in place this wiped the buffer.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::StreamChunk {
+                agent_id: AgentId::Main,
+                channel: StreamChannel::Thinking,
+                action: StreamAction::Stop {
+                    snapshot: String::new(),
+                },
+            },
+        );
+
+        let chat = tui
+            .get_mut_as::<Container>(SlotIndex::Chat.idx())
+            .expect("chat slot");
+        let last = chat.len() - 1;
+        let assistant = chat
+            .get_mut_as::<AssistantMessageComponent>(last)
+            .expect("assistant message at chat tail after thinking stream");
+        let rendered = assistant.render(80).join("\n");
+        assert!(
+            rendered.contains("first let me reason about the inputs carefully"),
+            "expected accumulated thinking text to survive the empty-snapshot \
+             Stop event; got rendered:\n{rendered}"
         );
     }
 
