@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::UserOutput;
-use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+use aj_models::wire::{ContentBlockParam, MessageParam, Role};
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError};
 
@@ -420,7 +420,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use aj_models::messages::{ContentBlockParam, Role};
+    use aj_models::wire::{ContentBlockParam, Role};
     use serde_json::json;
     use tempfile::TempDir;
 

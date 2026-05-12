@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use aj_models::messages::{ContentBlockParam, Role};
+use aj_models::wire::{ContentBlockParam, Role};
 
 use crate::log::{
     Conversation, ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter,
@@ -123,7 +123,7 @@ mod tests {
     use super::*;
     use crate::log::{ConversationLog, ConversationView, ThreadFilter};
     use crate::persistence::ConversationPersistence;
-    use aj_models::messages::ContentBlockParam;
+    use aj_models::wire::ContentBlockParam;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -165,7 +165,7 @@ mod tests {
             .expect("user head exists post-repair");
         let convo = log.linearize(&head, ThreadFilter::USER);
         let last = convo.last_message().expect("at least one message");
-        assert!(matches!(last.role, aj_models::messages::Role::User));
+        assert!(matches!(last.role, aj_models::wire::Role::User));
         // Every block in the synthesized message is a tool_result.
         for block in &last.content {
             assert!(matches!(block, ContentBlockParam::ToolResultBlock { .. }));

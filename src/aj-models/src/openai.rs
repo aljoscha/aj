@@ -1,19 +1,15 @@
 //! OpenAI provider integration.
 //!
-//! Hosts the new unified [`Provider`](crate::provider::Provider)
-//! implementation for OpenAI's Chat Completions API in [`provider`]
-//! (per `docs/models-spec.md` §7.2) alongside the legacy
-//! [`Model`](crate::Model)-based Responses-API client in [`legacy`],
-//! kept around until the agent migration in §12.16 lands.
+//! Hosts the unified [`Provider`](crate::provider::Provider)
+//! implementations for the three OpenAI APIs: Chat Completions in
+//! [`provider`] (per `docs/models-spec.md` §7.2), Responses in
+//! [`responses`] (per §7.3), and the Codex Responses variant in
+//! [`codex`] (per §7.4).
 
 pub mod codex;
-pub mod legacy;
 pub mod provider;
 pub mod responses;
 
-// Re-exported so existing call sites that reference
-// `crate::openai::OpenAiModel` keep working without churn.
 pub use codex::OpenAiCodexResponsesProvider;
-pub use legacy::OpenAiModel;
 pub use provider::OpenAiCompletionsProvider;
 pub use responses::OpenAiResponsesProvider;

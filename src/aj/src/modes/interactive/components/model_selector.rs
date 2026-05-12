@@ -244,14 +244,15 @@ impl ModelSelectorComponent {
 
 /// Minimal trait the host uses to identify the agent's current
 /// model when constructing the selector. Implemented inline by the
-/// host wrapper around `aj_models::Model` (which only exposes
-/// `model_name`/`model_url`); the host knows the provider + id from
-/// the registry lookup it did when constructing `Agent`, so it can
-/// build the identity blob without us depending on the wire-level
-/// `Model` trait here.
+/// host's wrapper around the agent's current [`ModelInfo`]: the
+/// host knows the provider + id from the registry lookup it did
+/// when constructing the `Agent`, so it can build the identity
+/// blob without the selector depending on the wire layer.
 ///
 /// Kept narrow on purpose: the selector doesn't need any inference
 /// surface, just the two identifiers that key a row.
+///
+/// [`ModelInfo`]: aj_models::registry::ModelInfo
 pub trait ModelIdentity {
     fn provider(&self) -> &str;
     fn id(&self) -> &str;
@@ -260,8 +261,9 @@ pub trait ModelIdentity {
 /// Plain-struct implementation of [`ModelIdentity`] for callers that
 /// want to materialize the identity from two strings without
 /// implementing a trait. Useful for the host's startup path where
-/// the identity is held alongside the `Arc<dyn Model>` and a
-/// dedicated wrapper would be noise.
+/// the identity is held alongside the agent's
+/// [`ModelInfo`](aj_models::registry::ModelInfo) and a dedicated
+/// wrapper would be noise.
 pub struct ModelIdentityRef<'a> {
     pub provider: &'a str,
     pub id: &'a str,

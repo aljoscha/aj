@@ -2,8 +2,7 @@
 //! ready-to-plug-in [`Provider`] handle plus the
 //! registry-resolved [`ModelInfo`] and a baseline [`StreamOptions`].
 //!
-//! Replaces the legacy [`aj_models::create_model`] entry point for the
-//! non-scripted path: the binary loads the
+//! The binary loads the
 //! [`ModelRegistry`](aj_models::registry::ModelRegistry), picks a
 //! concrete model (either an explicit `(provider, id)` pair or the
 //! provider's first listed entry), looks up the matching
@@ -16,10 +15,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aj_models::auth::{find_env_keys, get_env_api_key};
-use aj_models::messages::Speed;
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
 use aj_models::types::StreamOptions;
+use aj_models::wire::Speed;
 use anyhow::{Result, anyhow, bail};
 
 /// Beta header value that opts an Anthropic request into the
@@ -35,9 +34,8 @@ use anyhow::{Result, anyhow, bail};
 pub const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// Fallback provider id used when neither CLI / env / config supplies
-/// one. Matches the legacy [`aj_models::create_model`] default so
-/// existing user setups keep working without an explicit
-/// `MODEL_API=anthropic` env var.
+/// one. Anthropic is the default so existing user setups keep
+/// working without an explicit `MODEL_API=anthropic` env var.
 pub const DEFAULT_PROVIDER_ID: &str = "anthropic";
 
 /// A model handle assembled by [`resolve`] (or [`from_model_info`])

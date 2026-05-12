@@ -2264,7 +2264,7 @@ session notes for the planning commit.
        `cargo test -p aj-models --test roundtrip`, 50 tests
        total).
 
-- [ ] **6.3: `ScriptedProvider`.** New
+- [x] **6.3: `ScriptedProvider`.** New
        `aj-models::scripted::provider` module implementing the
        `Provider` trait against `AssistantMessageEventStream`.
        Scripts continue to be authored as `Vec<ScriptStep>` but
@@ -2988,7 +2988,7 @@ session notes for the planning commit.
        runs the canned demo to completion, confirming the
        provider-only path works for the scripted flow.
 
-- [ ] **6.8: Tests + `--scripted` flag onto `ScriptedProvider`.**
+- [x] **6.8: Tests + `--scripted` flag onto `ScriptedProvider`.**
        Migrate every test fixture that built `ScriptedModel`
        scripts (`aj-agent::event_protocol_tests`,
        `aj/tests/replay_parity.rs`, the scripted-demo eyeballing
@@ -3150,48 +3150,96 @@ session notes for the planning commit.
          pre-existing `clone_on_ref_ptr` warnings in `bus.rs`
          remain — none introduced by this change).
 
-- [ ] **6.9: Delete legacy.** With every call site migrated,
-       delete in one commit:
-       - The `Model` trait, `create_model`, `ModelArgs`, and
-         `ModelError` (if no other crate uses it) from
-         `aj-models::lib`.
-       - `aj-models::anthropic::legacy` and
-         `aj-models::openai::legacy` modules and their
-         `pub mod legacy;` declarations in `anthropic.rs` /
-         `openai.rs`. The `AnthropicModel` / `OpenAiModel`
-         re-exports go with them.
-       - `aj-models::streaming::StreamingEvent` enum. The
-         supporting types (`DoneReason` / `ErrorReason`) stay —
-         they're used by the unified protocol.
-       - The legacy `ScriptedModel` impl in
-         `aj-models::scripted` (its `impl Model` block, the
-         `StreamingEvent`-based `ScriptStep` shape, and the
-         legacy demo helpers). The `ScriptedProvider` from 6.3
-         keeps the demo catalog under its new event shape.
-       - The internal `LegacyProviderAdapter` from 6.4 and the
-         `aj-models::compat` module.
-       - `aj-models::messages` module. **Decision deferred to
-         this step:** either rename it to `aj-models::wire`
-         (preserving `MessageParam` / `ContentBlockParam` / etc.
-         as the on-disk + agent-transcript currency, separate
-         from the tagged-union `aj-models::types::Message`),
-         or absorb the types into `aj-models::types` under a
-         new `wire` submodule. Recommended: rename to `wire` —
-         it keeps the role-of-the-types clear (on-disk + agent
-         transcript) and avoids a single module owning two
-         distinct conceptual shapes. Update every import path
-         across `aj-agent`, `aj-session`, `aj-tools`, and `aj`
-         in the same commit; the audit identified the exact
-         lines.
-       - Doc comments referencing removed types in
-         `aj/src/cli/args.rs:53,60`,
-         `aj/src/scripted.rs:7,13`,
-         `aj/src/modes/interactive/components/model_selector.rs:247,263`,
-         `aj-agent/src/events.rs:286,323`,
-         `aj-agent/src/types.rs:26`,
-         `aj/src/modes/interactive/event_pump.rs:884`.
+- [x] **6.9: Delete legacy.** With every call site migrated, all
+       four bullets landed in one commit.
 
-       Then tick steps 16/17/18 in `models-progress.md`.
+       **Files deleted.** `src/aj-models/src/anthropic/legacy.rs`,
+       `src/aj-models/src/openai/legacy.rs`,
+       `src/aj-models/src/compat.rs`, and the legacy demo library
+       at `src/aj-models/src/scripted/demos.rs`. The
+       `src/aj-models/src/scripted/provider/` directory collapsed:
+       its `provider.rs` became the new `scripted.rs` module body
+       and its inner `provider/demos.rs` moved up to
+       `scripted/demos.rs`. Net change in the workspace is one
+       module nesting level dropped, mirroring how the legacy
+       `scripted.rs` already used to host the canonical script
+       vocabulary.
+
+       **`aj-models::lib` slimmed.** The lib.rs root now carries
+       only `pub mod` declarations plus the
+       [`ThinkingConfig`](aj_models::ThinkingConfig) enum used by
+       the agent and the binary's UI to describe the user's
+       preferred reasoning depth. The legacy `Model` trait,
+       `create_model`, `ModelArgs`, and `ModelError` are gone
+       wholesale. The two `From<ModelError> for TurnError` /
+       `From<ApiError> for TurnError` impls in `aj-agent/src/lib.rs`
+       were already dead after step 6.5 swapped the inference path
+       to `Provider::stream_simple`; both go in the same commit.
+
+       **`aj-models::streaming` simplified.** The legacy
+       `StreamingEvent` enum (text/thinking/tool-call deltas and
+       parse-error variants) is gone; `DoneReason` and
+       `ErrorReason` stay as the terminal-event vocabulary for the
+       unified protocol. The module's preamble was rewritten to
+       reflect that this is now the only streaming protocol.
+
+       **`aj-models::messages` → `aj-models::wire`.** Renamed the
+       file in place and updated every import path across
+       `aj-agent`, `aj-session`, `aj-tools`, `aj`, and `aj-models`
+       itself (~25 files). The doc preamble on `wire.rs`
+       acknowledges its post-migration role: the wire-shaped
+       message types used for on-disk persistence and the agent's
+       in-memory transcript, projected onto the tagged-union
+       [`aj_models::types::Message`] once per inference for the
+       [`Provider`](aj_models::provider::Provider) trait. The
+       module collapse for `aj-models::scripted::provider` →
+       `aj-models::scripted` saved a level of indirection on the
+       four external callers (`aj/tests/replay_parity.rs`,
+       `aj/src/scripted.rs`, `aj-agent::event_protocol_tests`, plus
+       the `cli/args.rs` doc comment).
+
+       **`anthropic.rs` / `openai.rs` re-export cleanup.** The
+       `pub mod legacy;` declarations and the
+       `AnthropicModel` / `OpenAiModel` re-exports went with the
+       deleted modules. The remaining surface is the
+       [`AnthropicProvider`] (one module),
+       [`OpenAiCompletionsProvider`] / [`OpenAiResponsesProvider`]
+       / [`OpenAiCodexResponsesProvider`] (three modules).
+
+       **Doc comment cleanup.** The pre-flight audit-list landed
+       as in-place rewrites — no dangling `aj_models::Model` /
+       `aj_models::compat` references survive in
+       `aj-agent/src/events.rs`, `aj-agent/src/types.rs`,
+       `aj-agent/src/lib.rs::model_info`,
+       `aj-agent/src/projection.rs`,
+       `aj/src/cli/args.rs`,
+       `aj/src/scripted.rs`,
+       `aj/src/modes/interactive/components/model_selector.rs`,
+       `aj/src/modes/interactive/event_pump.rs`, or
+       `aj/src/model.rs`.
+
+       **Out-of-scope follow-up.** The Anthropic SDK still ships
+       its own legacy `streaming::StreamingEvent` enum and
+       `client.create_high_level_stream` helper used to feed the
+       deleted `aj-models::anthropic::legacy.rs`. They're now dead
+       code inside `anthropic-sdk` itself (`rg "anthropic_sdk::streaming"`
+       returns no out-of-crate matches), but the SDK cleanup
+       wasn't in 6.9's scope and is left for a future tidying
+       pass.
+
+       `cargo build --workspace`, `cargo test --workspace`,
+       `cargo fmt --all`, and `cargo clippy --workspace --all-targets`
+       all pass clean (only the pre-existing `clone_on_ref_ptr`
+       warnings in `bus.rs`, `bash.rs`, `oauth/anthropic.rs`, and
+       the agent's `event_protocol_tests` remain — none in the
+       touched files). End-to-end
+       `cargo run -p aj -- --scripted streaming-text --print "hi"`
+       runs the canned demo to completion against the new
+       slimmer-only-unified-protocol stack.
+
+       With this step landed, `models-progress.md` steps 16/17/18
+       can be ticked off too — see the bridge note at the top of
+       Phase 6.
 
 ### Architectural choices (decided up front)
 

@@ -2,8 +2,8 @@
 //! [`aj_models::types::Message`] shape used by the [`Provider`]
 //! trait, plus the reverse projection from unified
 //! [`aj_models::types::AssistantMessage`] back onto a
-//! [`aj_models::messages::MessageParam`] so the existing transcript
-//! and persistence flow stays on the legacy on-disk format.
+//! [`aj_models::wire::MessageParam`] so the existing transcript
+//! and persistence flow stays on the wire on-disk format.
 //!
 //! The agent's `transcript: Vec<MessageParam>` field is the
 //! authoritative on-disk + replay shape (`aj-session` round-trips
@@ -21,12 +21,12 @@
 //!
 //! [`Provider`]: aj_models::provider::Provider
 
-use aj_models::messages::{
-    ContentBlockParam, ImageSource, MessageParam, Role, ToolResultContent, Usage as LegacyUsage,
-};
 use aj_models::types::{
     AssistantContent, AssistantMessage, ImageContent, Message, TextContent, ThinkingContent,
     ToolCall, ToolResultMessage, Usage as UnifiedUsage, UserContent, UserMessage,
+};
+use aj_models::wire::{
+    ContentBlockParam, ImageSource, MessageParam, Role, ToolResultContent, Usage as LegacyUsage,
 };
 
 /// Project the agent's in-memory transcript onto the unified
@@ -294,7 +294,7 @@ fn option_when_nonzero(n: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aj_models::messages::{ImageSource, MessageParam, Role};
+    use aj_models::wire::{ImageSource, MessageParam, Role};
     use serde_json::json;
 
     #[test]

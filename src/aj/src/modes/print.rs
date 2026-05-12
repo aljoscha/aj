@@ -55,8 +55,8 @@ use aj_agent::TurnError;
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
-use aj_models::messages::{ContentBlockParam, Role, Speed};
 use aj_models::registry::ModelRegistry;
+use aj_models::wire::{ContentBlockParam, Role, Speed};
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,

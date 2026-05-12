@@ -1,10 +1,12 @@
-//! Named demo scripts for the `--scripted` CLI flag.
+//! Named demo scripts for the `--scripted` CLI flag, authored against the
+//! unified [`AssistantMessageEvent`] streaming protocol.
 //!
-//! Each demo is a [`Vec<Script>`] — one [`Script`](super::Script) per agent
-//! inference. The agent loop runs an inference, observes the resulting
-//! `FinalizedMessage`, executes any tool calls, then runs the next
-//! inference; demos that span multiple turns (e.g. tool-use → result →
-//! follow-up text) supply one script per turn.
+//! Each demo is a [`Vec<ProviderScript>`](super::ProviderScript) — one
+//! script per agent inference. The agent loop runs an inference, observes
+//! the resulting `Done`/`Error` event, executes any tool calls produced by
+//! the finalized [`AssistantMessage`], then runs the next inference; demos
+//! that span multiple turns (e.g. tool-use → result → follow-up text)
+//! supply one script per turn.
 //!
 //! The library is hand-rolled (not loaded from disk) so each demo can be
 //! tuned for its rendering target: thinking-only flows have realistic
@@ -15,30 +17,41 @@
 //! self-contained: a demo should run identically regardless of working
 //! directory, environment, or which builtins are enabled (modulo the
 //! `--disabled-tools` config, which the binary applies uniformly).
-//!
-//! # Future extensions
-//!
-//! Adding a TOML/JSON demo loader is straightforward — the [`Script`] and
-//! [`ScriptStep`](super::ScriptStep) shapes are serde-friendly modulo the
-//! `StreamingEvent` enum, which would need a stable on-disk representation.
-//! Not implemented yet; the in-process demos cover the eyeballing use case
-//! we have today.
 
 use std::time::Duration;
 
-use crate::messages::{ContentBlock, StopReason};
-use crate::streaming::StreamingEvent;
+use serde_json::Value;
 
-use super::{Script, ScriptStep, finalized_message, stream_text_steps, stream_thinking_steps};
+use crate::streaming::{DoneReason, ErrorReason};
+use crate::types::{AssistantError, ErrorCategory};
 
+use super::{ProviderScript, ScriptBuilder};
+
+/// Identity stamped onto every emitted [`AssistantMessage`] partial. The
+/// `--scripted` resolver overrides the human-facing name with the demo
+/// label (e.g. `scripted/thinking-basic`) when building the model handle.
+const API: &str = "scripted";
+const PROVIDER: &str = "scripted";
 const MODEL: &str = "scripted";
 
-/// Pacing used by the demo library — slow enough that the TUI's live render
+/// Per-chunk pacing for streaming demos. Slow enough that the live render
 /// is observable to a human eye, fast enough that the demo doesn't drag.
 const CHUNK_MS: u64 = 25;
 /// Pause between major sections (thinking → text, tool result → follow-up)
 /// so the user can tell sections apart visually.
 const SECTION_MS: u64 = 200;
+
+/// Approximate character width per text delta. Picked so a sentence
+/// streams in several chunks rather than landing in one frame.
+const TEXT_CHUNK: usize = 8;
+/// Smaller chunks for thinking blocks so the collapsible thinking widget
+/// gets exercised on its live-update path.
+const THINKING_CHUNK: usize = 6;
+
+/// Opaque signature attached to every demo thinking block. Real providers
+/// carry provider-specific reasoning signatures here (Anthropic requires
+/// them for multi-turn replay); scripted runs only need a stable string.
+const THINKING_SIG: &str = "scripted-sig";
 
 fn chunk_delay() -> Duration {
     Duration::from_millis(CHUNK_MS)
@@ -48,12 +61,22 @@ fn section_delay() -> Duration {
     Duration::from_millis(SECTION_MS)
 }
 
+/// Construct a freshly-configured [`ScriptBuilder`] with the demo identity
+/// and default chunking applied. Each demo calls this once per inference
+/// script it wants to build.
+fn builder() -> ScriptBuilder {
+    ScriptBuilder::new(API, PROVIDER, MODEL)
+        .with_chunk_size(TEXT_CHUNK)
+        .with_chunk_delay(chunk_delay())
+}
+
 /// Lookup table for the `--scripted <NAME>` flag.
 ///
-/// Returning a `Vec<(name, summary, builder)>` keeps the catalog data-driven:
-/// the CLI lists names and one-line summaries via the same source the lookup
-/// uses, so a new demo only needs one entry here to be visible everywhere.
-pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<Script>)> {
+/// Returning a `Vec<(name, summary, builder)>` keeps the catalog
+/// data-driven: the CLI lists names and one-line summaries via the same
+/// source the lookup uses, so a new demo only needs one entry here to be
+/// visible everywhere.
+pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>)> {
     vec![
         (
             "thinking-basic",
@@ -104,7 +127,7 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<Script>)> {
 }
 
 /// Look up a demo by name, returning the per-inference scripts.
-pub fn lookup(name: &str) -> Option<Vec<Script>> {
+pub fn lookup(name: &str) -> Option<Vec<ProviderScript>> {
     catalog()
         .into_iter()
         .find(|(n, _, _)| *n == name)
@@ -121,7 +144,7 @@ pub fn names() -> Vec<&'static str> {
 // ===========================================================================
 
 /// `thinking-basic`: one thinking block, one text response.
-fn thinking_basic() -> Vec<Script> {
+fn thinking_basic() -> Vec<ProviderScript> {
     let thinking = "\
 The user asked a simple question. Let me think about what they want — \
 a quick acknowledgement should be fine here. I'll keep the response short \
@@ -129,31 +152,22 @@ and friendly.";
     let response = "Hello! I'm a scripted demo. Thinking blocks should render \
 above this message.";
 
-    let mut steps = Vec::new();
-    steps.extend(stream_thinking_steps(thinking, 6, chunk_delay()));
-    steps.extend(delay_first(
-        stream_text_steps(response, 8, chunk_delay()),
-        section_delay(),
-    ));
-    steps.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![
-                ContentBlock::ThinkingBlock {
-                    signature: "scripted-sig".to_string(),
-                    thinking: thinking.to_string(),
-                },
-                ContentBlock::new_text_block(response.to_string()),
-            ],
-            StopReason::EndTurn,
-        ),
-    }));
-
-    vec![Script { steps }]
+    let script = builder()
+        .start()
+        .thinking_block_chunked(
+            thinking,
+            Some(THINKING_SIG.into()),
+            THINKING_CHUNK,
+            chunk_delay(),
+        )
+        .delay(section_delay())
+        .text_block(response)
+        .done(DoneReason::Stop);
+    vec![script]
 }
 
 /// `thinking-long`: long multi-paragraph thinking, then text.
-fn thinking_long() -> Vec<Script> {
+fn thinking_long() -> Vec<ProviderScript> {
     let thinking = "\
 First, let me consider what the user is actually asking. They want me to \
 walk through a non-trivial reasoning chain so they can see the thinking \
@@ -178,32 +192,23 @@ channel — another path worth visually verifying.";
 collapsible with Ctrl+T, and this paragraph should appear immediately below \
 it without any extra blank lines.";
 
-    let mut steps = Vec::new();
-    steps.extend(stream_thinking_steps(thinking, 4, chunk_delay()));
-    steps.extend(delay_first(
-        stream_text_steps(response, 10, chunk_delay()),
-        section_delay(),
-    ));
-    steps.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![
-                ContentBlock::ThinkingBlock {
-                    signature: "scripted-sig".to_string(),
-                    thinking: thinking.to_string(),
-                },
-                ContentBlock::new_text_block(response.to_string()),
-            ],
-            StopReason::EndTurn,
-        ),
-    }));
-
-    vec![Script { steps }]
+    let script = builder()
+        .start()
+        .thinking_block_chunked(
+            thinking,
+            Some(THINKING_SIG.into()),
+            THINKING_CHUNK,
+            chunk_delay(),
+        )
+        .delay(section_delay())
+        .text_block(response)
+        .done(DoneReason::Stop);
+    vec![script]
 }
 
 /// `thinking-then-tool`: thinking → tool_use → (real tool runs) → follow-up
 /// thinking + text.
-fn thinking_then_tool() -> Vec<Script> {
+fn thinking_then_tool() -> Vec<ProviderScript> {
     let thinking_a = "The user wants me to demonstrate a tool call. I'll \
 run `bash` with a harmless echo so the renderer shows the full \
 tool-execution flow: start, streaming body, end with the captured stdout.";
@@ -218,55 +223,35 @@ block, a tool execution panel, and now this text — all in sequence.";
         "description": "Demo bash invocation for the scripted runner."
     });
 
-    let mut steps_1 = Vec::new();
-    steps_1.extend(stream_thinking_steps(thinking_a, 6, chunk_delay()));
-    steps_1.push(ScriptStep::new(
-        section_delay(),
-        StreamingEvent::FinalizedMessage {
-            message: finalized_message(
-                MODEL,
-                vec![
-                    ContentBlock::ThinkingBlock {
-                        signature: "scripted-sig".to_string(),
-                        thinking: thinking_a.to_string(),
-                    },
-                    ContentBlock::ToolUseBlock {
-                        id: "tu-demo-1".to_string(),
-                        name: "bash".to_string(),
-                        input: tool_input,
-                        caller: None,
-                    },
-                ],
-                StopReason::ToolUse,
-            ),
-        },
-    ));
+    let script_1 = builder()
+        .start()
+        .thinking_block_chunked(
+            thinking_a,
+            Some(THINKING_SIG.into()),
+            THINKING_CHUNK,
+            chunk_delay(),
+        )
+        .delay(section_delay())
+        .tool_call_block_chunked("tu-demo-1", "bash", tool_input, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
 
-    let mut steps_2 = Vec::new();
-    steps_2.extend(stream_thinking_steps(thinking_b, 6, chunk_delay()));
-    steps_2.extend(delay_first(
-        stream_text_steps(final_text, 8, chunk_delay()),
-        section_delay(),
-    ));
-    steps_2.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![
-                ContentBlock::ThinkingBlock {
-                    signature: "scripted-sig".to_string(),
-                    thinking: thinking_b.to_string(),
-                },
-                ContentBlock::new_text_block(final_text.to_string()),
-            ],
-            StopReason::EndTurn,
-        ),
-    }));
+    let script_2 = builder()
+        .start()
+        .thinking_block_chunked(
+            thinking_b,
+            Some(THINKING_SIG.into()),
+            THINKING_CHUNK,
+            chunk_delay(),
+        )
+        .delay(section_delay())
+        .text_block(final_text)
+        .done(DoneReason::Stop);
 
-    vec![Script { steps: steps_1 }, Script { steps: steps_2 }]
+    vec![script_1, script_2]
 }
 
 /// `interleaved`: text → thinking → text → thinking → text.
-fn interleaved() -> Vec<Script> {
+fn interleaved() -> Vec<ProviderScript> {
     let t1 = "First thought before any reply text. Tests that an initial \
 thinking block at content_index 0 renders correctly.";
     let r1 = "First reply chunk after the opening thought.";
@@ -276,44 +261,22 @@ them across the thinking divide.";
     let r2 = "Second reply chunk. If you can read this on its own line \
 below the second thinking block, the interleaving renders correctly.";
 
-    let mut steps = Vec::new();
-    steps.extend(stream_thinking_steps(t1, 6, chunk_delay()));
-    steps.extend(delay_first(
-        stream_text_steps(r1, 8, chunk_delay()),
-        section_delay(),
-    ));
-    steps.extend(delay_first(
-        stream_thinking_steps(t2, 6, chunk_delay()),
-        section_delay(),
-    ));
-    steps.extend(delay_first(
-        stream_text_steps(r2, 8, chunk_delay()),
-        section_delay(),
-    ));
-    steps.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![
-                ContentBlock::ThinkingBlock {
-                    signature: "scripted-sig".to_string(),
-                    thinking: t1.to_string(),
-                },
-                ContentBlock::new_text_block(r1.to_string()),
-                ContentBlock::ThinkingBlock {
-                    signature: "scripted-sig".to_string(),
-                    thinking: t2.to_string(),
-                },
-                ContentBlock::new_text_block(r2.to_string()),
-            ],
-            StopReason::EndTurn,
-        ),
-    }));
+    let script = builder()
+        .start()
+        .thinking_block_chunked(t1, Some(THINKING_SIG.into()), THINKING_CHUNK, chunk_delay())
+        .delay(section_delay())
+        .text_block(r1)
+        .delay(section_delay())
+        .thinking_block_chunked(t2, Some(THINKING_SIG.into()), THINKING_CHUNK, chunk_delay())
+        .delay(section_delay())
+        .text_block(r2)
+        .done(DoneReason::Stop);
 
-    vec![Script { steps }]
+    vec![script]
 }
 
 /// `tool-error`: bash with a non-zero exit, then a follow-up.
-fn tool_error() -> Vec<Script> {
+fn tool_error() -> Vec<ProviderScript> {
     let intro = "I'll demonstrate a failing tool call. The bash invocation \
 below exits non-zero; the renderer should mark the tool result as an \
 error.";
@@ -326,128 +289,93 @@ result panel above should be styled as an error.";
         "description": "Demo bash invocation that intentionally fails."
     });
 
-    let mut steps_1 = stream_text_steps(intro, 8, chunk_delay());
-    steps_1.push(ScriptStep::new(
-        section_delay(),
-        StreamingEvent::FinalizedMessage {
-            message: finalized_message(
-                MODEL,
-                vec![
-                    ContentBlock::new_text_block(intro.to_string()),
-                    ContentBlock::ToolUseBlock {
-                        id: "tu-demo-err".to_string(),
-                        name: "bash".to_string(),
-                        input: tool_input,
-                        caller: None,
-                    },
-                ],
-                StopReason::ToolUse,
-            ),
-        },
-    ));
+    let script_1 = builder()
+        .start()
+        .text_block(intro)
+        .delay(section_delay())
+        .tool_call_block_chunked("tu-demo-err", "bash", tool_input, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
 
-    let mut steps_2 = stream_text_steps(follow_up, 8, chunk_delay());
-    steps_2.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![ContentBlock::new_text_block(follow_up.to_string())],
-            StopReason::EndTurn,
-        ),
-    }));
+    let script_2 = builder()
+        .start()
+        .text_block(follow_up)
+        .done(DoneReason::Stop);
 
-    vec![Script { steps: steps_1 }, Script { steps: steps_2 }]
+    vec![script_1, script_2]
 }
 
 /// `protocol-error`: emit a protocol error mid-stream.
 ///
-/// The agent surfaces this as an [`AgentEvent::Error`] and continues to
-/// produce a finalized message for the turn, so the renderer should show an
-/// error notice followed by whatever text we managed to assemble.
-fn protocol_error() -> Vec<Script> {
+/// Maps onto the unified protocol's terminal [`AssistantMessageEvent::Error`]
+/// event: the provider streams a preamble, then surfaces a transient
+/// failure that the agent's retry layer treats as a recoverable turn
+/// error. The renderer should show whatever text was emitted before the
+/// error plus an error notice.
+fn protocol_error() -> Vec<ProviderScript> {
     let preamble = "I'll start replying, then the provider stream will \
 emit a protocol error to verify the renderer's error path.";
 
-    let mut steps = stream_text_steps(preamble, 8, chunk_delay());
-    steps.push(ScriptStep::new(
-        section_delay(),
-        StreamingEvent::ProtocolError {
-            error: "scripted: synthetic protocol error for demo".to_string(),
-        },
-    ));
-    steps.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![ContentBlock::new_text_block(preamble.to_string())],
-            StopReason::EndTurn,
-        ),
-    }));
+    let script = builder()
+        .start()
+        .text_block(preamble)
+        .delay(section_delay())
+        .error(
+            ErrorReason::Error,
+            AssistantError::new(
+                ErrorCategory::Transient,
+                "scripted: synthetic protocol error for demo",
+            ),
+        );
 
-    vec![Script { steps }]
+    vec![script]
 }
 
-/// `tool-use-parse-error`: emit a malformed tool_use the agent can't parse.
+/// `tool-use-parse-error`: emit a tool_use block whose arguments the agent
+/// can't satisfy, exercising the synthesized-error tool_result path.
 ///
-/// The agent synthesizes a paired error tool_result and continues; the
-/// renderer should show the error notice plus the synthesized result.
-fn tool_use_parse_error() -> Vec<Script> {
+/// The unified protocol doesn't carry a dedicated `ToolUseParseError`
+/// event; instead, the [`ToolCallEnd`](AssistantMessageEvent::ToolCallEnd)
+/// event surfaces whatever arguments survived parsing. Here we emit a
+/// tool call with a [`Value::Null`] argument payload, which the bash
+/// tool's input-schema validation rejects: the agent synthesizes an
+/// `is_error: true` tool_result so the renderer's error-panel path runs.
+fn tool_use_parse_error() -> Vec<ProviderScript> {
     let preamble = "I'll attempt a tool call with malformed JSON arguments.";
     let final_text = "The agent recovered by synthesizing an error tool_result. The \
 renderer should have shown the parse-error notice and the error result.";
 
-    let mut steps_1 = stream_text_steps(preamble, 8, chunk_delay());
-    steps_1.push(ScriptStep::new(
-        section_delay(),
-        StreamingEvent::ToolUseParseError {
-            id: "tu-demo-parse".to_string(),
-            name: "bash".to_string(),
-            error: "expected object, got truncated stream".to_string(),
-            raw_data: "{\"command\": \"echo".to_string(),
-        },
-    ));
-    steps_1.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            // The agent strips ToolUseParseError'd blocks from the content,
-            // so we leave only the preamble text here.
-            vec![ContentBlock::new_text_block(preamble.to_string())],
-            StopReason::ToolUse,
-        ),
-    }));
+    let script_1 = builder()
+        .start()
+        .text_block(preamble)
+        .delay(section_delay())
+        .tool_call_block_chunked("tu-demo-parse", "bash", Value::Null, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
 
-    let mut steps_2 = stream_text_steps(final_text, 8, chunk_delay());
-    steps_2.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![ContentBlock::new_text_block(final_text.to_string())],
-            StopReason::EndTurn,
-        ),
-    }));
+    let script_2 = builder()
+        .start()
+        .text_block(final_text)
+        .done(DoneReason::Stop);
 
-    vec![Script { steps: steps_1 }, Script { steps: steps_2 }]
+    vec![script_1, script_2]
 }
 
 /// `streaming-text`: plain text streaming, no thinking. Control case.
-fn streaming_text() -> Vec<Script> {
+fn streaming_text() -> Vec<ProviderScript> {
     let response = "This is a plain text-only demo. No thinking, no tool \
 calls — just a few sentences streamed in chunks so you can verify the \
 baseline text rendering path. If this looks fine but the thinking demos \
 don't, the bug is on the thinking channel rather than the renderer itself.";
 
-    let mut steps = stream_text_steps(response, 8, chunk_delay());
-    steps.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![ContentBlock::new_text_block(response.to_string())],
-            StopReason::EndTurn,
-        ),
-    }));
-
-    vec![Script { steps }]
+    let script = builder()
+        .start()
+        .text_block(response)
+        .done(DoneReason::Stop);
+    vec![script]
 }
 
 /// `multi-tool`: two sequential tool calls (`bash echo`, `bash date`) and a
 /// wrap-up text response.
-fn multi_tool() -> Vec<Script> {
+fn multi_tool() -> Vec<ProviderScript> {
     let intro = "I'll run two bash commands back-to-back so you can see the \
 renderer transition between tool panels.";
     let mid = "First tool returned. Running the second one now.";
@@ -465,82 +393,38 @@ two distinct tool panels with their respective outputs.";
         "description": "Second demo bash call (UTC date)."
     });
 
-    let mut steps_1 = stream_text_steps(intro, 8, chunk_delay());
-    steps_1.push(ScriptStep::new(
-        section_delay(),
-        StreamingEvent::FinalizedMessage {
-            message: finalized_message(
-                MODEL,
-                vec![
-                    ContentBlock::new_text_block(intro.to_string()),
-                    ContentBlock::ToolUseBlock {
-                        id: "tu-demo-multi-1".to_string(),
-                        name: "bash".to_string(),
-                        input: echo_input,
-                        caller: None,
-                    },
-                ],
-                StopReason::ToolUse,
-            ),
-        },
-    ));
+    let script_1 = builder()
+        .start()
+        .text_block(intro)
+        .delay(section_delay())
+        .tool_call_block_chunked("tu-demo-multi-1", "bash", echo_input, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
 
-    let mut steps_2 = stream_text_steps(mid, 8, chunk_delay());
-    steps_2.push(ScriptStep::new(
-        section_delay(),
-        StreamingEvent::FinalizedMessage {
-            message: finalized_message(
-                MODEL,
-                vec![
-                    ContentBlock::new_text_block(mid.to_string()),
-                    ContentBlock::ToolUseBlock {
-                        id: "tu-demo-multi-2".to_string(),
-                        name: "bash".to_string(),
-                        input: date_input,
-                        caller: None,
-                    },
-                ],
-                StopReason::ToolUse,
-            ),
-        },
-    ));
+    let script_2 = builder()
+        .start()
+        .text_block(mid)
+        .delay(section_delay())
+        .tool_call_block_chunked("tu-demo-multi-2", "bash", date_input, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
 
-    let mut steps_3 = stream_text_steps(wrap, 8, chunk_delay());
-    steps_3.push(ScriptStep::immediate(StreamingEvent::FinalizedMessage {
-        message: finalized_message(
-            MODEL,
-            vec![ContentBlock::new_text_block(wrap.to_string())],
-            StopReason::EndTurn,
-        ),
-    }));
+    let script_3 = builder().start().text_block(wrap).done(DoneReason::Stop);
 
-    vec![
-        Script { steps: steps_1 },
-        Script { steps: steps_2 },
-        Script { steps: steps_3 },
-    ]
+    vec![script_1, script_2, script_3]
 }
 
-// ---------------------------------------------------------------------------
-// Helpers.
-// ---------------------------------------------------------------------------
-
-/// Set the leading delay on the first step of `steps`, leaving subsequent
-/// step delays untouched. Cheaper than splicing an extra spacer event into
-/// the stream and avoids emitting a redundant Start marker between sections.
-fn delay_first(mut steps: Vec<ScriptStep>, delay: Duration) -> Vec<ScriptStep> {
-    if let Some(first) = steps.first_mut() {
-        first.delay = delay;
-    }
-    steps
-}
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::AssistantMessageEvent;
 
     /// Sanity: every catalog entry produces at least one script with at
-    /// least one event, and the last script ends with a finalized message.
+    /// least one event, and each script ends with a terminal event
+    /// ([`AssistantMessageEvent::Done`] or [`AssistantMessageEvent::Error`])
+    /// so the provider's stream-drive contract holds.
     #[test]
     fn catalog_demos_are_well_formed() {
         for (name, _summary, build) in catalog() {
@@ -551,13 +435,15 @@ mod tests {
                     !script.steps.is_empty(),
                     "demo {name} script {idx} is empty"
                 );
+                let last_step = script.steps.last().expect("non-empty");
+                assert!(
+                    matches!(
+                        last_step.event,
+                        AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
+                    ),
+                    "demo {name} script {idx} doesn't end with a terminal event"
+                );
             }
-            let last = scripts.last().expect("non-empty");
-            let last_step = last.steps.last().expect("non-empty");
-            assert!(
-                matches!(last_step.event, StreamingEvent::FinalizedMessage { .. }),
-                "demo {name} doesn't end with FinalizedMessage"
-            );
         }
     }
 

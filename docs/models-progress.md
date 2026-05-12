@@ -384,23 +384,28 @@ this file is the bridge between the spec and the git history.
 > unchecked item from `aj-next-progress.md` Phase 6; tick 16/17/18
 > off here once step 6.9 lands.
 
-- [ ] 16. Update `aj-agent` — migrate to new types and streaming
-      (executed via aj-next §2.0–§2.5; see `aj-next-progress.md`)
-- [ ] 17. Update `aj` CLI — add provider flag, model registry
-      (executed via aj-next §2.5; see `aj-next-progress.md`)
-- [ ] 18. Remove old code — replaced by the models-spec rewrite.
-      Mandatory: the legacy `Model` trait, `create_model`, the legacy
-      `StreamingEvent` enum, the `messages` module (replaced by
-      `types`), the `aj-models::anthropic::legacy` and
-      `aj-models::openai::legacy` modules (replaced by the new
-      `Provider` impls — `legacy.rs` is unconditional dead code once
-      `aj-agent` migrates off the `Model` trait), the `async-openai`
-      dependency if it's still pulled in, and the `openai_ng` module
-      if it survived earlier cleanups. Audit: grep for `Model::` /
-      `StreamingEvent` / `crate::messages::` / `legacy::` / `aj_models::Model`
-      after the §2.5 binary swap and remove every remaining reference.
-      Constraint: this step lands only after step 8b *and* aj-next
-      §2.4–§2.5 — both the new Provider trait must cover every model
-      surface the catalog points at, and the binary must have moved
-      off the legacy `Model` trait, before legacy.rs can be deleted.
-      (executed via aj-next §2.6; see `aj-next-progress.md`)
+- [x] 16. Update `aj-agent` — migrate to new types and streaming
+      (executed via aj-next §2.0–§2.5 and Phase 6 step 6.5; see
+      `aj-next-progress.md`)
+- [x] 17. Update `aj` CLI — add provider flag, model registry
+      (executed via aj-next §2.5 and Phase 6 step 6.6; see
+      `aj-next-progress.md`)
+- [x] 18. Remove old code — replaced by the models-spec rewrite.
+      Executed via Phase 6 step 6.9 in `aj-next-progress.md`: the
+      legacy `Model` trait, `create_model`, `ModelArgs`, and
+      `ModelError` are removed from `aj-models::lib`; the legacy
+      `StreamingEvent` enum is removed from `aj-models::streaming`;
+      `aj-models::anthropic::legacy` and `aj-models::openai::legacy`
+      modules are deleted along with their `pub mod legacy;`
+      declarations and the `AnthropicModel` / `OpenAiModel`
+      re-exports; the legacy `ScriptedModel` impl and its
+      `ScriptStep` / demo helpers are deleted (the new
+      `ScriptedProvider` from step 6.3 keeps the demo catalog on
+      the unified event protocol); the `aj-models::compat` module
+      housing the internal `LegacyProviderAdapter` is deleted; and
+      `aj-models::messages` is renamed to `aj-models::wire` with
+      every external import path updated in the same commit. Grep
+      audit clean: `aj_models::Model` / `aj_models::create_model` /
+      `aj_models::compat` / `aj_models::messages` /
+      `aj_models::streaming::StreamingEvent` /
+      `aj-models::*::legacy` return zero out-of-crate matches.

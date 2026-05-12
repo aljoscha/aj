@@ -187,7 +187,7 @@ mod tests {
     use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind};
     use aj_agent::tool::ToolDetails;
     use aj_agent::types::UserOutput;
-    use aj_models::messages::{ContentBlockParam, Role, ToolResultContent};
+    use aj_models::wire::{ContentBlockParam, Role, ToolResultContent};
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 

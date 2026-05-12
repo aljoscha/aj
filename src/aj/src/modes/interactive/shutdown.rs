@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use aj_agent::Agent;
 use aj_agent::types::{SubAgentUsage, UsageSummary};
-use aj_models::messages::Usage;
+use aj_models::wire::Usage;
 use aj_tui::style;
 
 /// Compute the structured end-of-session token-usage summary from

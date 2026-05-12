@@ -3,7 +3,7 @@
 //! Both [`interactive`](crate::modes::interactive) and
 //! [`print`](crate::modes::print) modes share the same resolution path:
 //! given the user-supplied demo name, either look it up in
-//! [`aj_models::scripted::provider::demos`] and hand back a ready-to-
+//! [`aj_models::scripted::demos`] and hand back a ready-to-
 //! plug-in [`Provider`](aj_models::provider::Provider) handle, or —
 //! when the name is unknown or the user passed the sentinel `help` /
 //! `list` / `?` — print the catalog to stderr and exit so the caller
@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use aj_models::provider::Provider;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
-use aj_models::scripted::provider::demos;
-use aj_models::scripted::provider::{ExhaustedBehavior, ScriptedProvider};
+use aj_models::scripted::demos;
+use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use anyhow::{Result, bail};
 
 /// Resolved scripted provider in the same shape the real-provider path
@@ -49,7 +49,7 @@ pub struct ResolvedScriptedModel {
 /// after the canned script runs out, rather than panicking the
 /// inference task. Tests that want strict scripting can construct a
 /// [`ScriptedProvider`] directly with
-/// [`ExhaustedBehavior::Panic`](aj_models::scripted::provider::ExhaustedBehavior::Panic).
+/// [`ExhaustedBehavior::Panic`](aj_models::scripted::ExhaustedBehavior::Panic).
 pub fn resolve_or_explain(name: &str) -> Result<ResolvedScriptedModel> {
     if matches!(name, "help" | "list" | "?" | "") {
         print_catalog();

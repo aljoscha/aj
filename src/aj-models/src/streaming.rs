@@ -1,20 +1,10 @@
-//! Streaming event protocols.
+//! Streaming event protocol.
 //!
-//! This module hosts two parallel streaming protocols:
-//!
-//! - The **legacy** [`StreamingEvent`] enum, used by the current
-//!   [`crate::Model`] trait and the in-tree provider implementations.
-//!   Kept for backward compatibility while the migration in
-//!   `docs/models-spec.md` rolls out and removed in Phase 6.
-//!
-//! - The **unified** [`AssistantMessageEvent`] / [`AssistantMessageEventStream`]
-//!   protocol described in `docs/models-spec.md` §2. Every event carries an
-//!   owned `partial` snapshot of the in-progress assistant message, and the
-//!   stream terminates with either [`AssistantMessageEvent::Done`] or
-//!   [`AssistantMessageEvent::Error`].
-//!
-//! New code should target the unified protocol; the legacy enum exists only
-//! to keep the old call sites compiling until each provider is migrated.
+//! The unified [`AssistantMessageEvent`] / [`AssistantMessageEventStream`]
+//! protocol described in `docs/models-spec.md` §2. Every event carries an
+//! owned `partial` snapshot of the in-progress assistant message, and the
+//! stream terminates with exactly one of [`AssistantMessageEvent::Done`]
+//! or [`AssistantMessageEvent::Error`].
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,69 +15,7 @@ use futures::Stream;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::messages::{ApiError, Citation, Message, UsageDelta};
 use crate::types::{AssistantError, AssistantMessage, ErrorCategory, StopReason, ToolCall};
-
-// ===========================================================================
-// Legacy streaming event protocol.
-// ===========================================================================
-
-// High-level streaming events with both diff updates and a running snapshot of
-// the accumulated message.
-#[derive(Clone, Debug)]
-pub enum StreamingEvent {
-    MessageStart {
-        message: Message,
-    },
-    UsageUpdate {
-        usage: UsageDelta,
-    },
-    FinalizedMessage {
-        message: Message,
-    },
-    Error {
-        error: ApiError,
-    },
-    TextStart {
-        text: String,
-        citations: Vec<Citation>,
-    },
-    TextUpdate {
-        diff: String,
-        snapshot: String,
-    },
-    TextStop {
-        /// The complete text block.
-        text: String,
-    },
-    ThinkingStart {
-        thinking: String,
-    },
-    ThinkingUpdate {
-        diff: String,
-        snapshot: String,
-    },
-    ThinkingStop,
-    ParseError {
-        error: String,
-        raw_data: String,
-    },
-    /// A `tool_use` block whose `input` JSON failed to parse. Carries
-    /// the id/name so the agent can synthesize a matching `tool_result`.
-    ///
-    /// NOTE: providers can only emit this once the block has fully
-    /// streamed. With incremental tool-call parsing the id would be
-    /// known earlier and we could include the partial `input` too.
-    ToolUseParseError {
-        id: String,
-        name: String,
-        error: String,
-        raw_data: String,
-    },
-    ProtocolError {
-        error: String,
-    },
-}
 
 // ===========================================================================
 // Unified streaming event protocol (docs/models-spec.md §2).

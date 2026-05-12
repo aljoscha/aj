@@ -16,9 +16,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aj_models::messages::ContentBlockParam;
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantMessage, ToolResultMessage};
+use aj_models::wire::ContentBlockParam;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -281,12 +281,14 @@ pub enum AgentEvent {
     // --- Streaming bridge (§2.3 → §2.4) -----------------------------------
     /// Streaming progress for an in-flight assistant content block.
     ///
-    /// Bridging shape used while the agent still drives inference
-    /// through the legacy `Model::run_inference_streaming` /
-    /// `StreamingEvent` pipeline. In §2.4 this folds into
-    /// [`AgentEvent::MessageUpdate`] carrying an
+    /// Bridging shape: the agent re-emits each provider
+    /// [`AssistantMessageEvent`] as a coarser-grained
+    /// `(channel, action)` pair so frontends can render text and
+    /// thinking deltas without learning the unified protocol's
+    /// per-block-index bookkeeping. In a future iteration this folds
+    /// into [`AgentEvent::MessageUpdate`] carrying the raw
     /// [`AssistantMessageEvent`]; until then, [`StreamChannel`] +
-    /// [`StreamAction`] cover what the legacy CLI renderer needs.
+    /// [`StreamAction`] cover what the CLI / TUI renderer needs.
     StreamChunk {
         agent_id: AgentId,
         channel: StreamChannel,
@@ -319,12 +321,13 @@ pub enum AgentEvent {
     /// and a listener that returns `Err` (e.g. on a disk-write
     /// failure) aborts the run via [`crate::TurnError::Fatal`].
     ///
-    /// Bridging shape used while the agent still drives inference
-    /// through the legacy [`MessageParam`](aj_models::messages::MessageParam)
-    /// flow. Folds into [`AgentEvent::MessageEnd`] in §2.4 once
-    /// `aj-agent` migrates to the unified
-    /// [`aj_models::types::Message`] types and the on-disk format
-    /// switches to typed message entries.
+    /// Bridging shape: the agent's in-memory transcript still uses
+    /// the wire-shaped [`MessageParam`](aj_models::wire::MessageParam)
+    /// rather than the tagged-union
+    /// [`aj_models::types::Message`], so this event carries the wire
+    /// shape directly. A future migration may swap both the
+    /// transcript and the on-disk format onto the typed shape; this
+    /// variant folds into [`AgentEvent::MessageEnd`] then.
     MessagePersisted {
         agent_id: AgentId,
         kind: PersistedMessageKind,

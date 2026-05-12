@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+use aj_models::wire::{ContentBlockParam, MessageParam, Role};
 use aj_session::{ConversationEntry, ConversationEntryKind, ConversationPersistence, ThreadKind};
 use aj_tui::components::editor::Editor;
 

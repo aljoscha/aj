@@ -29,8 +29,8 @@ use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
-use aj_models::messages::Speed;
 use aj_models::registry::ModelRegistry;
+use aj_models::wire::Speed;
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,

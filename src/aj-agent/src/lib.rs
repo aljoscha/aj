@@ -18,7 +18,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aj_conf::{AgentEnv, ConfigThinkingLevel};
-use aj_models::messages::{ApiError, ContentBlockParam, MessageParam, Role, Usage};
 use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
@@ -27,7 +26,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, Context, ErrorCategory, SimpleStreamOptions, StreamOptions,
     ThinkingLevel, ToolCall, ToolDefinition as UnifiedToolDefinition, UserContent,
 };
-use aj_models::ModelError;
+use aj_models::wire::{ContentBlockParam, MessageParam, Role, Usage};
 use aj_models::ThinkingConfig;
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
@@ -353,10 +352,9 @@ impl Agent {
     ///
     /// The TUI footer renders `id @ base_url` off this handle so the
     /// scripted and real-provider paths render identically. The
-    /// `--scripted` flag synthesises a minimal [`ModelInfo`] off the
-    /// legacy [`Model`](aj_models::Model) handle via
-    /// [`aj_models::compat::synthetic_model_info`]; real providers
-    /// see the registry entry the binary plucked out at startup.
+    /// `--scripted` flag synthesises a minimal [`ModelInfo`] inline;
+    /// real providers see the registry entry the binary plucked out
+    /// at startup.
     ///
     /// [`ModelRegistry`]: aj_models::registry::ModelRegistry
     pub fn model_info(&self) -> Arc<ModelInfo> {
@@ -1495,30 +1493,18 @@ pub enum TurnError {
     Fatal(anyhow::Error),
 }
 
-impl From<ModelError> for TurnError {
-    fn from(e: ModelError) -> Self {
-        TurnError::Recoverable(e.into())
-    }
-}
-
-impl From<ApiError> for TurnError {
-    fn from(e: ApiError) -> Self {
-        TurnError::Recoverable(e.into())
-    }
-}
-
 impl From<anyhow::Error> for TurnError {
     fn from(e: anyhow::Error) -> Self {
         TurnError::Fatal(e)
     }
 }
 
-/// Map a legacy [`ThinkingConfig`] onto the unified
-/// [`ThinkingLevel`] the [`Provider`] trait consumes.
+/// Map the agent / binary's [`ThinkingConfig`] policy onto the
+/// unified [`ThinkingLevel`] the [`Provider`] trait consumes.
 ///
-/// Legacy `ThinkingConfig::Max` collapses onto `ThinkingLevel::XHigh`
+/// `ThinkingConfig::Max` collapses onto `ThinkingLevel::XHigh`
 /// because the unified protocol caps at XHigh — providers that
-/// support a higher reasoning budget than XHigh treat the legacy
+/// support a higher reasoning budget than XHigh treat the
 /// "Max" rung as a synonym for XHigh.
 fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
     match level {
@@ -1544,14 +1530,14 @@ mod event_protocol_tests {
     use std::sync::Mutex;
 
     use aj_conf::AgentEnv;
-    use aj_models::messages::ContentBlockParam;
     use aj_models::provider::Provider;
     use aj_models::registry::{InputModality, ModelCost, ModelInfo};
-    use aj_models::scripted::provider::{ExhaustedBehavior, ScriptedProvider};
+    use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
     use aj_models::streaming::{AssistantMessageEvent, DoneReason};
     use aj_models::types::{
         AssistantContent, AssistantMessage, StopReason, StreamOptions, TextContent, ToolCall,
     };
+    use aj_models::wire::ContentBlockParam;
     use std::sync::Arc;
 
     use crate::bus::listener_from_sync;
@@ -2148,7 +2134,7 @@ mod event_protocol_tests {
         // a transcript ending in a user-role message and verify
         // `continue_run` drives one assistant turn without firing
         // any extra User persistence event.
-        use aj_models::messages::ContentBlockParam;
+        use aj_models::wire::ContentBlockParam;
 
         let scripts = vec![finalize_script(finalize_text("retried"))];
 
@@ -2156,9 +2142,9 @@ mod event_protocol_tests {
         // Seed a user-role last message — typically the prompt the
         // user already submitted before the previous turn errored
         // out.
-        agent.seed_messages(vec![aj_models::messages::MessageParam::new_user_message(
-            vec![ContentBlockParam::new_text_block("retry me".into())],
-        )]);
+        agent.seed_messages(vec![aj_models::wire::MessageParam::new_user_message(vec![
+            ContentBlockParam::new_text_block("retry me".into()),
+        ])]);
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
@@ -2197,7 +2183,7 @@ mod event_protocol_tests {
         // user-role message before inference. `continue_run`
         // enforces that precondition with a fatal error rather
         // than letting the model API surface an obscure 4xx.
-        use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+        use aj_models::wire::{ContentBlockParam, MessageParam, Role};
 
         // No scripts queued: if the precondition check is missing
         // and the agent runs an inference, the `ScriptedProvider`
@@ -2244,7 +2230,7 @@ mod event_protocol_tests {
         // Sanity check on the test-only helper: a transcript
         // ending in an assistant tool_use without a matching
         // tool_result reports the dangling id.
-        use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+        use aj_models::wire::{ContentBlockParam, MessageParam, Role};
 
         let transcript = vec![
             MessageParam::new_user_message(vec![ContentBlockParam::new_text_block("hi".into())]),

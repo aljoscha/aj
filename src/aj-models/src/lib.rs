@@ -1,18 +1,19 @@
-use futures::Stream;
-use std::pin::Pin;
-use std::sync::Arc;
-use thiserror::Error;
-
-use crate::messages::MessageParam;
-use crate::streaming::StreamingEvent;
-use crate::tools::Tool;
+//! `aj-models` — the wire layer for AJ.
+//!
+//! This crate hosts the unified message and streaming types defined in
+//! `docs/models-spec.md`, the [`Provider`](provider::Provider) trait
+//! that concrete API integrations implement, the
+//! [`ModelRegistry`](registry::ModelRegistry) that ships the catalog
+//! of available models, and the wire-shaped types in [`wire`] used by
+//! `aj-session` for on-disk persistence and by `aj-agent` for the
+//! in-memory transcript.
+//!
+//! Everything above the wire (event bus, tools, persistence
+//! framing, UI) lives in `aj-agent`, `aj-session`, and the binary.
 
 pub mod anthropic;
 pub mod auth;
-#[doc(hidden)]
-pub mod compat;
 pub mod errors;
-pub mod messages;
 pub mod oauth;
 pub mod openai;
 pub mod partial_json;
@@ -24,35 +25,20 @@ pub mod streaming;
 pub mod tools;
 pub mod transform;
 pub mod types;
+pub mod wire;
 
-/// Trait for LLM model providers.
+/// Thinking-policy enum used by the agent and the binary's UI to
+/// describe the user's preferred reasoning depth.
 ///
-/// The legacy `Model` trait operates over a flat slice of
-/// [`MessageParam`]s — the wire layer's view of the conversation.
-/// On-disk persistence (entry framing, sub-agent threads, system
-/// prompts) is the responsibility of `aj-session`; that crate
-/// linearizes a [`crate::messages::MessageParam`] sequence and hands
-/// it to the model. Keeping the trait persistence-free lets
-/// `aj-models` stay purely wire (per `docs/aj-next-plan.md` §1).
-#[async_trait::async_trait]
-pub trait Model: Send + Sync {
-    /// Run streaming inference with the given messages.
-    async fn run_inference_streaming(
-        &self,
-        messages: &[MessageParam],
-        system_prompt: String,
-        tools: Vec<Tool>,
-        thinking: Option<ThinkingConfig>,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError>;
-
-    /// Returns the name of the model.
-    fn model_name(&self) -> String;
-
-    /// Returns the URL of the model endpoint.
-    fn model_url(&self) -> String;
-}
-
-/// Thinking configuration for models that support it
+/// The agent projects this onto the unified
+/// [`crate::types::ThinkingLevel`] before each inference: `Low`,
+/// `Medium`, `High` map directly, while `XHigh` and `Max` both
+/// collapse onto [`crate::types::ThinkingLevel::XHigh`] (the unified
+/// ceiling). `None` (i.e. `Option<ThinkingConfig>::None`) means
+/// "extended thinking off" — different from
+/// [`crate::types::ThinkingLevel::Minimal`], which is the lowest
+/// effort rung for reasoning models that don't support disabling
+/// thinking entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingConfig {
     Low,
@@ -60,59 +46,4 @@ pub enum ThinkingConfig {
     High,
     XHigh,
     Max,
-}
-
-/// Configuration arguments for model client creation.
-#[derive(Debug, Clone)]
-pub struct ModelArgs {
-    /// The model API to use (e.g., "anthropic")
-    pub api: String,
-    /// Optional custom endpoint URL
-    pub url: Option<String>,
-    /// Optional model name to use
-    pub model_name: Option<String>,
-    /// Optional inference speed mode (Anthropic beta `speed` parameter).
-    pub speed: Option<crate::messages::Speed>,
-}
-
-/// Create a model instance based on the provided [ModelArgs].
-pub fn create_model(model_args: ModelArgs) -> Result<Arc<dyn Model>, ModelError> {
-    match model_args.api.as_str() {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_OAUTH_TOKEN")
-                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-                .map_err(|_| {
-                    ModelError::Client(anyhow::anyhow!(
-                        "Neither ANTHROPIC_OAUTH_TOKEN nor ANTHROPIC_API_KEY found in environment variables"
-                    ))
-                })?;
-
-            let model = crate::anthropic::AnthropicModel::new(model_args, api_key);
-
-            Ok(Arc::new(model))
-        }
-        "openai" => {
-            let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-                ModelError::Client(anyhow::anyhow!(
-                    "OPENAI_API_KEY not found in environment variables"
-                ))
-            })?;
-
-            let model = crate::openai::OpenAiModel::new(model_args, api_key);
-
-            Ok(Arc::new(model))
-        }
-        _ => Err(ModelError::Client(anyhow::anyhow!(
-            "Unsupported model API: {}",
-            model_args.api
-        ))),
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum ModelError {
-    #[error("Client error: {0}")]
-    Client(#[from] anyhow::Error),
-    #[error("JSON parsing error: {0}")]
-    Json(#[from] serde_json::Error),
 }

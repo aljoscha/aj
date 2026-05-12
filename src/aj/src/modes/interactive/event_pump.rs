@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
 use aj_agent::types::TokenUsage;
-use aj_models::messages::ContentBlockParam;
+use aj_models::wire::ContentBlockParam;
 use aj_tui::components::editor::Editor;
 use aj_tui::components::spacer::Spacer;
 use aj_tui::components::text::Text;
@@ -880,8 +880,8 @@ mod tests {
             },
         );
         // The empty-snapshot Stop is the exact shape the agent
-        // emits on `StreamingEvent::ThinkingStop`. With the
-        // regression in place this wiped the buffer.
+        // emits when the provider finalizes a thinking block. With
+        // the regression in place this wiped the buffer.
         pump.handle(
             &mut tui,
             &AgentEvent::StreamChunk {

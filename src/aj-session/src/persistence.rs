@@ -5,7 +5,7 @@
 //! `aj continue`) and resolves a thread id to its on-disk path so
 //! [`crate::log::ConversationLog`] can open / create the right file.
 
-use aj_models::messages::{ContentBlockParam, Role};
+use aj_models::wire::{ContentBlockParam, Role};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -458,7 +458,7 @@ fn first_text_block(content: &[ContentBlockParam]) -> Option<String> {
 mod tests {
     use std::cell::RefCell;
 
-    use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+    use aj_models::wire::{ContentBlockParam, MessageParam, Role};
     use tempfile::TempDir;
 
     use super::*;

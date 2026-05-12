@@ -55,7 +55,7 @@ use aj_agent::{Agent, TurnError};
 use aj_conf::AgentEnv;
 use aj_models::provider::Provider;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
-use aj_models::scripted::provider::{ExhaustedBehavior, ScriptedProvider};
+use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{AssistantContent, AssistantMessage, StopReason, StreamOptions, ToolCall};
 use aj_session::{ConversationLog, ConversationPersistence, persistence_listener, replay};
 use aj_tools::{BashTool, EditFileTool, TodoWriteTool};

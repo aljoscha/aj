@@ -1,6 +1,16 @@
-//! A 1-to-1 copy of our Anthropic API message definitions, but meant as our
-//! generic model independent API. Let's see how far we get with this when
-//! adding support for other providers and models.
+//! Wire-shaped message types used for on-disk persistence and the
+//! agent's in-memory transcript.
+//!
+//! These types pre-date the unified [`crate::types::Message`] tagged
+//! union and live on as the currency between [`aj-session`] (which
+//! writes them to JSONL) and [`aj-agent`] (which keeps the transcript
+//! as `Vec<MessageParam>` for ergonomic append + replay). The agent
+//! projects them onto [`crate::types::Message`] once per inference
+//! before handing them to a [`Provider`](crate::provider::Provider).
+//!
+//! The Anthropic API's message shape was the original model and the
+//! field layout still mirrors it; renames and trims happen here as
+//! providers diverge.
 
 use std::fmt::Display;
 

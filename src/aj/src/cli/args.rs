@@ -59,7 +59,7 @@ pub struct Args {
     /// The argument is the demo name. Pass `--scripted help` (or any
     /// unknown name) to see the catalog. When set the binary skips
     /// registry-driven provider construction entirely and registers a
-    /// [`ScriptedProvider`](aj_models::scripted::provider::ScriptedProvider)
+    /// [`ScriptedProvider`](aj_models::scripted::ScriptedProvider)
     /// in its place; every other code path (TUI, persistence, tools,
     /// slash commands) runs unchanged so the eyeball test exercises
     /// the real surface.

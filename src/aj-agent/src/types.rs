@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The accumulator semantics match what the agent maintains in
 /// [`crate::Agent::accumulated_usage`]: every successful turn adds
-/// its [`aj_models::messages::Usage`] into the accumulator, and the
+/// its [`aj_models::wire::Usage`] into the accumulator, and the
 /// snapshot here is taken *after* that add, so `accumulated_*`
 /// already includes the current turn's contribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]

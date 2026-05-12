@@ -21,7 +21,7 @@
 
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::UserOutput;
-use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+use aj_models::wire::{ContentBlockParam, MessageParam, Role};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -856,7 +856,7 @@ impl<'a> ConversationView<'a> {
 mod tests {
     use super::*;
     use crate::persistence::ConversationPersistence;
-    use aj_models::messages::ContentBlockParam;
+    use aj_models::wire::ContentBlockParam;
 
     /// Allocate a unique scratch directory for one test's persistence
     /// state. Uses the process id, the test thread id, and a nanosecond
