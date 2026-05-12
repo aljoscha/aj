@@ -725,6 +725,90 @@ depends on `toml` for reads). The selector components in `aj-next`
 depend on `aj-conf` for read/write and on `aj-models` for the model
 list.
 
+### 4.4 Thinking-block rendering
+
+The assistant message component owns rendering for the
+[`StreamChannel::Thinking`] channel. Two display modes, both fed by
+the same cumulative thinking snapshot the event pump pushes into
+the component:
+
+- **Expanded** (default). The thinking snapshot is rendered as
+  italic markdown using the `thinkingText` theme color. The
+  widget's [`DefaultTextStyle`] sets `italic: true` and
+  `color = theme.fg_closure(ThemeColor::ThinkingText)` so a theme
+  reload reskins the block without rebuilding the widget. This is
+  the verbose mode — the user reads the model's reasoning prose
+  inline above the visible answer.
+- **Collapsed**. The thinking snapshot is replaced by a single
+  italic line in the same `thinkingText` color reading `Thinking…`
+  (one-line `Text` component, `padding_x = 1`, `padding_y = 0`).
+  This stands in for the entire thinking block regardless of how
+  long the streaming snapshot is. The collapsed line never
+  animates and carries no spinner — the global working indicator
+  is the only motion the user sees.
+
+Both modes use the same `AssistantMessageComponent` instance and
+the same buffer, so flipping between them is a render-time
+decision that takes effect on the next paint. Live streaming and
+replay are visually identical for a given setting: the component
+makes no distinction between an in-flight `StreamChunk` snapshot
+and a replayed terminal snapshot.
+
+**Spacing rule.** When the component renders both a thinking
+block (expanded or collapsed) and a visible text block, a single
+blank row separates them. When only thinking is present (e.g. a
+turn that emits thinking and then a tool call, with no visible
+text yet), no trailing row is emitted — the chat container's
+auto-spacer handles the gap before the next sibling (the tool
+execution component). This matches the existing per-message
+layout and avoids a stray blank row between thinking and a
+following tool call.
+
+**Persistent setting.** A new `hide_thinking_block: bool` field
+on `aj-conf::Config` (TOML key `hide_thinking_block`, default
+`false`) determines the startup mode. The setting is global only
+(no project override). When `SettingsManager` lands in §4.3 the
+field migrates onto it without changing the TOML key or the
+default; the field is documented in the `Config` struct so the
+shape is preserved across the SettingsManager transition.
+
+**Runtime toggle.** `Ctrl+T` toggles the mode for the active
+session. The handler:
+
+1. Flips the in-memory `EventPump::hide_thinking_block` flag.
+2. Walks the chat container's children and calls
+   `AssistantMessageComponent::set_hide_thinking_block(hide)` on
+   every assistant message, in-flight or finalized, so the next
+   render reflects the new mode for both the current streaming
+   turn and every historical message in scrollback.
+3. Invalidates the TUI to flush any cached render bytes that
+   captured the previous mode.
+4. Surfaces a chat notice (`Thinking blocks: hidden` or
+   `Thinking blocks: visible`) so the user gets immediate
+   feedback that the keystroke was consumed.
+
+Toggling does not persist to disk in this commit — persistence
+lands together with the rest of the §4.3 settings machinery, at
+which point this toggle becomes a `SettingsManager::set_*` call
+that round-trips through the same RMW pipeline as the other
+settings. Until then, the runtime toggle is session-only and the
+`config.toml` value is read once at startup. The `/settings`
+dialog (§4.3) will surface the same flag as a row, matching the
+keybinding behavior.
+
+**Print mode.** Print text mode continues to suppress thinking
+entirely (per `modes/print.rs`); JSON mode continues to emit it
+as part of the event stream. The `hide_thinking_block` setting
+has no effect outside the interactive TUI.
+
+**Theme integration.** Both bundled themes (`dark`, `light`)
+already ship a `thinkingText` color; the assistant message
+component pulls it through the `ChatTheme` bundle so the same
+closure feeds the expanded-mode markdown style and the
+collapsed-mode `Text` widget. User themes that don't define
+`thinkingText` fall back to the bundled theme value via the
+existing JSON-loader fallback.
+
 ---
 
 ## 5. Phase 2 — cutover
