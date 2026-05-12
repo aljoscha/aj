@@ -9,32 +9,39 @@
 pub mod bus;
 pub mod events;
 pub mod message;
+mod projection;
 pub mod tool;
 pub mod types;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::{pin, Pin};
 use std::time::Duration;
 
 use aj_conf::{AgentEnv, ConfigThinkingLevel};
-use aj_models::messages::{
-    ApiError, ContentBlock, ContentBlockParam, Message, MessageParam, Role, Usage,
-};
-use aj_models::streaming::StreamingEvent;
+use aj_models::compat::LegacyProviderAdapter;
+use aj_models::messages::{ApiError, ContentBlockParam, MessageParam, Role, Usage};
+use aj_models::provider::Provider;
+use aj_models::registry::{InputModality, ModelCost, ModelInfo};
+use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use aj_models::tools::Tool;
-use aj_models::types::UserContent;
+use aj_models::types::{
+    AssistantContent, AssistantMessage, Context, ErrorCategory, SimpleStreamOptions, StreamOptions,
+    ThinkingLevel, ToolCall, ToolDefinition as UnifiedToolDefinition, UserContent,
+};
 use aj_models::ModelError;
 use aj_models::{Model, ThinkingConfig};
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
 use crate::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
+use crate::projection::{
+    assistant_message_to_message_param, transcript_to_messages, usage_unified_to_legacy,
+};
 use crate::tool::{
     ErasedToolDefinition, SpawnedAgent, TodoItem, ToolContext, ToolDetails, ToolOutcome,
 };
 use crate::types::{TokenUsage, UserOutput};
 use anyhow::anyhow;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 use tokio_util::sync::CancellationToken;
@@ -61,7 +68,26 @@ pub struct Agent {
     /// Mirrors the filter applied to the top-level agent so
     /// subagents inherit the same tool restrictions.
     disabled_tools: Vec<String>,
+    /// Legacy model handle. Kept alive alongside [`Self::provider`]
+    /// while [`Agent::new`] / [`Agent::set_model`] still accept
+    /// `Arc<dyn Model>`; the legacy handle is what
+    /// [`SessionContextWrapper::spawn_agent`] threads into the
+    /// sub-agent's `Agent::new` so the legacy entry point keeps
+    /// working through step 6.5. Drops in step 6.7 of
+    /// `docs/aj-next-progress.md`.
     model: Arc<dyn Model>,
+    /// Unified provider handle used by the inference loop. Built by
+    /// wrapping [`Self::model`] in [`LegacyProviderAdapter`] today;
+    /// step 6.6 swaps the binary's call sites onto real
+    /// [`Provider`]s built off the registry, and step 6.7 drops the
+    /// legacy adapter wrapping entirely.
+    provider: Arc<dyn Provider>,
+    /// Identity / capability metadata stamped onto the [`Context`]
+    /// passed to [`Provider::stream_simple`]. Synthesised from the
+    /// legacy [`Model::model_name`] / [`Model::model_url`] today;
+    /// step 6.6 starts populating this from the real registry
+    /// lookup.
+    model_info: Arc<ModelInfo>,
     session_state: SessionState,
     default_thinking: Option<ThinkingConfig>,
     /// Identifier used on every event emitted by this agent. The
@@ -131,6 +157,16 @@ impl Agent {
             ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
         });
 
+        // Wrap the legacy handle on the unified [`Provider`] trait.
+        // Step 6.6 (`docs/aj-next-progress.md`) will start handing
+        // a real `Provider` directly from the registry; until then
+        // every inference flows through this adapter so the agent's
+        // inference loop can be written against the unified
+        // streaming protocol regardless of the actual call-site
+        // shape.
+        let provider: Arc<dyn Provider> = Arc::new(LegacyProviderAdapter::new(Arc::clone(&model)));
+        let model_info = Arc::new(synthetic_model_info(&model));
+
         Self {
             env,
             system_prompt,
@@ -139,6 +175,8 @@ impl Agent {
             tools: api_tools,
             disabled_tools,
             model,
+            provider,
+            model_info,
             session_state,
             default_thinking,
             agent_id: AgentId::Main,
@@ -326,6 +364,12 @@ impl Agent {
     /// that were already constructed retain the old one (they
     /// were cloned from `self.model` at spawn time).
     pub fn set_model(&mut self, model: Arc<dyn Model>) {
+        // Rebuild the unified provider and synthetic [`ModelInfo`]
+        // off the new handle so the inference loop picks them up on
+        // the next call. The bus subscriptions and cancellation
+        // token are unaffected — only the wire layer changes.
+        self.provider = Arc::new(LegacyProviderAdapter::new(Arc::clone(&model)));
+        self.model_info = Arc::new(synthetic_model_info(&model));
         self.model = model;
     }
 
@@ -562,244 +606,226 @@ impl Agent {
         let mut retry_strategy = None;
 
         'outer: loop {
-            let response_stream = self.run_inference_streaming().await?;
+            let mut response_stream = self.run_inference_streaming();
 
-            let mut response: Option<Message> = None;
-            // Tool_use blocks whose `input` JSON failed to parse
-            // arrive as ToolUseParseError and are dropped from the
-            // assistant content. Collect (id, name, error) so we
-            // can resurrect them with a paired `is_error: true`
-            // tool_result below.
-            let mut tool_use_parse_errors: Vec<(String, String, String)> = Vec::new();
+            // Terminal `AssistantMessage` captured from the stream's
+            // `Done` (success) or `Error` (failure) event. The
+            // unified streaming protocol guarantees exactly one
+            // terminal event per stream, so once this is `Some` we
+            // break out and stop polling.
+            let mut final_message: Option<AssistantMessage> = None;
+            let mut final_was_error = false;
 
-            {
-                let mut response_stream = pin!(response_stream);
-                while let Some(event) = response_stream.next().await {
-                    match event {
-                        StreamingEvent::MessageStart { .. } => {}
-                        StreamingEvent::UsageUpdate { .. } => {}
-                        StreamingEvent::FinalizedMessage { message } => {
-                            response = Some(message);
-                        }
-                        StreamingEvent::Error { error } if error.is_overloaded() => {
-                            // We initialize the strategy when we see the first
-                            // overloaded error.
-                            if retry_strategy.is_none() {
-                                retry_strategy = Some(Self::create_retry_strategy());
-                            }
-
-                            let retry_sleep =
-                                retry_strategy.as_mut().expect("known to be some").next();
-
-                            if let Some(retry_sleep) = retry_sleep {
-                                let message =
-                                    format!("{}, retrying in {}s...", error, retry_sleep.as_secs());
-                                self.bus
-                                    .emit(AgentEvent::Error {
-                                        agent_id: self.agent_id,
-                                        text: message,
-                                    })
-                                    .await
-                                    .map_err(TurnError::Fatal)?;
-                                retry_attempt = retry_attempt.saturating_add(1);
-                                self.bus
-                                    .emit(AgentEvent::StreamRetry {
-                                        agent_id: self.agent_id,
-                                        attempt: retry_attempt,
-                                        delay: retry_sleep,
-                                        error: error.to_string(),
-                                    })
-                                    .await
-                                    .map_err(TurnError::Fatal)?;
-
-                                tokio::time::sleep(retry_sleep).await;
-
-                                continue 'outer;
-                            } else {
-                                return Err(error.into());
-                            }
-                        }
-                        StreamingEvent::Error { error } => {
-                            return Err(error.into());
-                        }
-                        StreamingEvent::TextStart { text, citations: _ } => {
-                            self.bus
-                                .emit(AgentEvent::StreamChunk {
-                                    agent_id: self.agent_id,
-                                    channel: StreamChannel::Text,
-                                    action: StreamAction::Start {
-                                        snapshot: text.clone(),
-                                    },
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
-                        StreamingEvent::TextUpdate { diff, snapshot: _ } => {
-                            self.bus
-                                .emit(AgentEvent::StreamChunk {
-                                    agent_id: self.agent_id,
-                                    channel: StreamChannel::Text,
-                                    action: StreamAction::Update {
-                                        delta: diff.clone(),
-                                    },
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
-                        StreamingEvent::TextStop { text } => {
-                            self.bus
-                                .emit(AgentEvent::StreamChunk {
-                                    agent_id: self.agent_id,
-                                    channel: StreamChannel::Text,
-                                    action: StreamAction::Stop {
-                                        snapshot: text.clone(),
-                                    },
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
-                        StreamingEvent::ThinkingStart { thinking } => {
-                            self.bus
-                                .emit(AgentEvent::StreamChunk {
-                                    agent_id: self.agent_id,
-                                    channel: StreamChannel::Thinking,
-                                    action: StreamAction::Start {
-                                        snapshot: thinking.clone(),
-                                    },
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
-                        StreamingEvent::ThinkingUpdate { diff, snapshot: _ } => {
-                            self.bus
-                                .emit(AgentEvent::StreamChunk {
-                                    agent_id: self.agent_id,
-                                    channel: StreamChannel::Thinking,
-                                    action: StreamAction::Update {
-                                        delta: diff.clone(),
-                                    },
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
-                        StreamingEvent::ThinkingStop => {
-                            // Thinking streaming has no terminal text
-                            // (the streaming layer doesn't accumulate
-                            // a final snapshot for thinking blocks),
-                            // so the renderer-bridge listener treats
-                            // this as a "thinking finished, flush
-                            // newline" signal regardless of snapshot
-                            // contents.
-                            self.bus
-                                .emit(AgentEvent::StreamChunk {
-                                    agent_id: self.agent_id,
-                                    channel: StreamChannel::Thinking,
-                                    action: StreamAction::Stop {
-                                        snapshot: String::new(),
-                                    },
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
-                        StreamingEvent::ParseError { error, raw_data } => {
-                            let message = format!("Parse error: {error} (raw data: {raw_data})");
-                            self.bus
-                                .emit(AgentEvent::Error {
-                                    agent_id: self.agent_id,
-                                    text: message,
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
-                        StreamingEvent::ToolUseParseError {
-                            id,
-                            name,
-                            error,
-                            raw_data,
-                        } => {
-                            let message = format!(
-                                "Tool use parse error for '{name}' (id={id}): {error} \
-                                 (raw data: {raw_data})"
-                            );
-                            self.bus
-                                .emit(AgentEvent::Error {
-                                    agent_id: self.agent_id,
-                                    text: message,
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                            tool_use_parse_errors.push((id, name, error));
-                        }
-                        StreamingEvent::ProtocolError { error } => {
-                            let message = format!("Protocol error: {error}");
-                            self.bus
-                                .emit(AgentEvent::Error {
-                                    agent_id: self.agent_id,
-                                    text: message,
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
-                        }
+            while let Some(event) = response_stream.next().await {
+                match event {
+                    AssistantMessageEvent::Start { .. } => {
+                        // The leading `Start` event carries the
+                        // identity-stamped empty partial; no
+                        // listener-facing emit is required (the
+                        // renderer opens its assistant slot once the
+                        // first content block arrives below).
                     }
-
-                    // We've successfully received an event, reset the retry
-                    // strategy. That way, when we get an Overloaded error again
-                    // we'll initialize with a fresh retry_strategy.
-                    retry_strategy = None;
-                    retry_attempt = 0;
+                    AssistantMessageEvent::TextStart { .. } => {
+                        // Open the text slot for the renderer with an
+                        // empty snapshot. The unified protocol carries
+                        // initial text on a follow-up `TextDelta`
+                        // rather than on `TextStart` itself, so the
+                        // renderer appends as it goes.
+                        self.bus
+                            .emit(AgentEvent::StreamChunk {
+                                agent_id: self.agent_id,
+                                channel: StreamChannel::Text,
+                                action: StreamAction::Start {
+                                    snapshot: String::new(),
+                                },
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                    }
+                    AssistantMessageEvent::TextDelta { delta, .. } => {
+                        self.bus
+                            .emit(AgentEvent::StreamChunk {
+                                agent_id: self.agent_id,
+                                channel: StreamChannel::Text,
+                                action: StreamAction::Update { delta },
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                    }
+                    AssistantMessageEvent::TextEnd { content, .. } => {
+                        self.bus
+                            .emit(AgentEvent::StreamChunk {
+                                agent_id: self.agent_id,
+                                channel: StreamChannel::Text,
+                                action: StreamAction::Stop { snapshot: content },
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                    }
+                    AssistantMessageEvent::ThinkingStart { .. } => {
+                        self.bus
+                            .emit(AgentEvent::StreamChunk {
+                                agent_id: self.agent_id,
+                                channel: StreamChannel::Thinking,
+                                action: StreamAction::Start {
+                                    snapshot: String::new(),
+                                },
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                    }
+                    AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                        self.bus
+                            .emit(AgentEvent::StreamChunk {
+                                agent_id: self.agent_id,
+                                channel: StreamChannel::Thinking,
+                                action: StreamAction::Update { delta },
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                    }
+                    AssistantMessageEvent::ThinkingEnd { content, .. } => {
+                        self.bus
+                            .emit(AgentEvent::StreamChunk {
+                                agent_id: self.agent_id,
+                                channel: StreamChannel::Thinking,
+                                action: StreamAction::Stop { snapshot: content },
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                    }
+                    AssistantMessageEvent::ToolCallStart { .. }
+                    | AssistantMessageEvent::ToolCallDelta { .. }
+                    | AssistantMessageEvent::ToolCallEnd { .. } => {
+                        // Argument-echo deltas during streaming are
+                        // not surfaced as events today: the agent
+                        // collects tool calls off the finalized
+                        // `Done { message }` payload below, then
+                        // brackets each invocation with its own
+                        // `ToolExecutionStart` / `ToolExecutionEnd`
+                        // pair. Live tool-argument echo can be added
+                        // by emitting `ToolExecutionUpdate` here once
+                        // a renderer needs it.
+                    }
+                    AssistantMessageEvent::Done { message, .. } => {
+                        final_message = Some(message);
+                        final_was_error = false;
+                        break;
+                    }
+                    AssistantMessageEvent::Error { reason, error } => {
+                        let _ = reason;
+                        final_message = Some(error);
+                        final_was_error = true;
+                        break;
+                    }
                 }
             }
 
-            let mut response = response.ok_or_else(|| {
-                TurnError::Recoverable(anyhow!(
-                    "model stream ended without producing a final message"
-                ))
-            })?;
-            let turn_usage = response.usage.clone();
-
-            // Resurrect tool_use blocks dropped by the streaming layer
-            // due to malformed input JSON. We add a synthetic
-            // ToolUseBlock with `null` input to keep the assistant
-            // message structurally valid; the matching `is_error: true`
-            // tool_result is produced in the execution loop below so the
-            // model can retry instead of the user being bumped to the
-            // prompt.
-            //
-            // TODO: with incremental tool-call parsing we'd have the
-            // partial `input` bytes here and could pass them through
-            // instead of `null`.
-            let mut tool_use_parse_failures: HashMap<String, String> = HashMap::new();
-            for (id, name, error) in tool_use_parse_errors.drain(..) {
-                response.content.push(ContentBlock::ToolUseBlock {
-                    id: id.clone(),
-                    name,
-                    input: serde_json::Value::Null,
-                    caller: None,
-                });
-                tool_use_parse_failures.insert(id, error);
-            }
-
-            // Collect tool use blocks from the response
-            let mut tool_calls = Vec::new();
-            let mut has_tool_use = false;
-
-            for content in response.content.iter() {
-                if let ContentBlock::ToolUseBlock {
-                    id, name, input, ..
-                } = content
-                {
-                    tool_calls.push((id.clone(), name.clone(), input.clone()));
-                    has_tool_use = true;
+            // Drain any trailing events the producer queued after the
+            // terminal one (the stream contract drops them, but the
+            // explicit drop here frees the channel sooner) and fall
+            // back to `result()` if we never observed a terminal
+            // event in the loop above (channel closed silently —
+            // `result()` then synthesizes a transient error).
+            let final_message = match final_message {
+                Some(m) => m,
+                None => {
+                    // The stream ended without emitting Done / Error;
+                    // pull the synthesized terminal from the
+                    // side-channel.
+                    final_was_error = true;
+                    response_stream.result().await
                 }
+            };
+            drop(response_stream);
+
+            if final_was_error {
+                let assistant_err = final_message.error.clone();
+                // Retry strictly on `Overloaded` to match the legacy
+                // agent's behavior; other retryable categories
+                // (RateLimit, Transient) bubble up as recoverable
+                // errors today.
+                let is_overloaded = assistant_err
+                    .as_ref()
+                    .is_some_and(|e| e.category == ErrorCategory::Overloaded);
+                if is_overloaded {
+                    if retry_strategy.is_none() {
+                        retry_strategy = Some(Self::create_retry_strategy());
+                    }
+                    let retry_sleep = retry_strategy.as_mut().expect("known to be some").next();
+                    if let Some(retry_sleep) = retry_sleep {
+                        let err_text = assistant_err
+                            .as_ref()
+                            .map(|e| e.message.clone())
+                            .unwrap_or_else(|| "overloaded".to_string());
+                        let message =
+                            format!("{err_text}, retrying in {}s...", retry_sleep.as_secs(),);
+                        self.bus
+                            .emit(AgentEvent::Error {
+                                agent_id: self.agent_id,
+                                text: message,
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                        retry_attempt = retry_attempt.saturating_add(1);
+                        self.bus
+                            .emit(AgentEvent::StreamRetry {
+                                agent_id: self.agent_id,
+                                attempt: retry_attempt,
+                                delay: retry_sleep,
+                                error: err_text,
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+                        tokio::time::sleep(retry_sleep).await;
+                        continue 'outer;
+                    }
+                }
+
+                // Non-retryable / retry-exhausted: surface a
+                // recoverable turn error so the binary keeps the
+                // session alive and the user can re-prompt.
+                let detail = assistant_err
+                    .map(|e| e.message)
+                    .unwrap_or_else(|| "model stream failed without details".to_string());
+                return Err(TurnError::Recoverable(anyhow!(detail)));
             }
 
-            // Append the assistant's message to the transcript and
-            // mirror it on the bus for the persistence listener.
-            // The transcript update happens before the bus emit so
-            // a listener that errors out can't leave the
-            // transcript and the log out of sync (the listener's
-            // failure is fatal regardless — see [`TurnError::Fatal`]).
-            let message_param = response.into_message_param();
+            // Reset the retry budget after a successful inference.
+            retry_strategy = None;
+            retry_attempt = 0;
+
+            let response = final_message;
+            let turn_usage_unified = response.usage.clone();
+            let turn_usage = usage_unified_to_legacy(&turn_usage_unified);
+
+            // Collect tool calls off the finalized assistant
+            // content. The unified `AssistantContent::ToolCall`
+            // variant carries `(id, name, arguments)` directly; we
+            // mirror the legacy tuple shape so the rest of the loop
+            // can stay byte-for-byte identical to the pre-flip flow.
+            let tool_calls: Vec<(String, String, serde_json::Value)> = response
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::ToolCall(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    }) => Some((id.clone(), name.clone(), arguments.clone())),
+                    _ => None,
+                })
+                .collect();
+            let has_tool_use = !tool_calls.is_empty();
+
+            // Re-project the finalized unified assistant message
+            // onto the agent's transcript shape (flat
+            // [`ContentBlockParam`] content). The bus emit happens
+            // after the transcript update so a listener that errors
+            // out can't leave the transcript ahead of the log (the
+            // listener failure is fatal anyway — see
+            // [`TurnError::Fatal`]).
+            let message_param = assistant_message_to_message_param(&response);
             self.transcript.push(message_param.clone());
             self.bus
                 .emit(AgentEvent::MessagePersisted {
@@ -868,79 +894,51 @@ impl Agent {
                         .await
                         .map_err(TurnError::Fatal)?;
 
-                    // Run the tool (or synthesize an error outcome
-                    // for tool_use blocks the streaming layer
-                    // rejected with a parse error). Success and
-                    // recoverable error both come back as a
-                    // [`ToolOutcome`] the rest of the loop projects
-                    // onto the wire `tool_result` block (text-
-                    // flattened `content`) and the bus
-                    // [`AgentEvent::ToolExecutionEnd`] event
-                    // (structured `details` + `is_error`).
-                    let outcome = if let Some(parse_err) = tool_use_parse_failures.remove(&tool_id)
+                    // Run the tool. Success and recoverable error
+                    // both come back as a [`ToolOutcome`] the rest
+                    // of the loop projects onto the wire
+                    // `tool_result` block (text-flattened `content`)
+                    // and the bus [`AgentEvent::ToolExecutionEnd`]
+                    // event (structured `details` + `is_error`).
+                    //
+                    // Tool-input parse failures in the unified
+                    // streaming protocol surface as a
+                    // [`AssistantContent::ToolCall`] with
+                    // `arguments == Value::Null`; the tool's own
+                    // deserializer rejects the payload, the call
+                    // bubbles up here as an `Err`, and the synthetic
+                    // `UserOutput::ToolError` persistence event
+                    // mirrors the legacy on-disk shape regardless of
+                    // whether the failure was a wire parse error or
+                    // a per-tool validation rejection.
+                    let outcome = match self
+                        .execute_tool(&tool_id, &tool_name, tool_input.clone())
+                        .await
                     {
-                        // Persist a freestanding [`UserOutput::ToolError`]
-                        // for the legacy on-disk shape (per the §2.0
-                        // reconnaissance: every freestanding user_output
-                        // entry on disk is a `ToolError`). The §3
-                        // migration walker rewrites these into
-                        // structured `ToolDetails` entries.
-                        self.bus
-                            .emit(AgentEvent::MessagePersisted {
-                                agent_id: self.agent_id,
-                                kind: PersistedMessageKind::UserOutput {
-                                    output: UserOutput::ToolError {
-                                        tool_name: tool_name.clone(),
-                                        input: "<malformed json>".to_string(),
-                                        error: parse_err.clone(),
-                                    },
-                                },
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
-
-                        let body = format!("Tool input parse error: {parse_err}");
-                        ToolOutcome {
-                            content: vec![UserContent::text(body.clone())],
-                            details: ToolDetails::Text {
-                                summary: format!("{tool_name}: error"),
-                                body,
-                            },
-                            is_error: true,
-                        }
-                    } else {
-                        let result = self
-                            .execute_tool(&tool_id, &tool_name, tool_input.clone())
-                            .await;
-
-                        match result {
-                            Ok(outcome) => outcome,
-                            Err(err) => {
-                                // Same legacy persistence as the
-                                // parse-failure path.
-                                self.bus
-                                    .emit(AgentEvent::MessagePersisted {
-                                        agent_id: self.agent_id,
-                                        kind: PersistedMessageKind::UserOutput {
-                                            output: UserOutput::ToolError {
-                                                tool_name: tool_name.clone(),
-                                                input: tool_input.to_string(),
-                                                error: err.to_string(),
-                                            },
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            self.bus
+                                .emit(AgentEvent::MessagePersisted {
+                                    agent_id: self.agent_id,
+                                    kind: PersistedMessageKind::UserOutput {
+                                        output: UserOutput::ToolError {
+                                            tool_name: tool_name.clone(),
+                                            input: tool_input.to_string(),
+                                            error: err.to_string(),
                                         },
-                                    })
-                                    .await
-                                    .map_err(TurnError::Fatal)?;
-
-                                let body = err.to_string();
-                                ToolOutcome {
-                                    content: vec![UserContent::text(format!("{err}"))],
-                                    details: ToolDetails::Text {
-                                        summary: format!("{tool_name}: error"),
-                                        body,
                                     },
-                                    is_error: true,
-                                }
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
+
+                            let body = err.to_string();
+                            ToolOutcome {
+                                content: vec![UserContent::text(format!("{err}"))],
+                                details: ToolDetails::Text {
+                                    summary: format!("{tool_name}: error"),
+                                    body,
+                                },
+                                is_error: true,
                             }
                         }
                     };
@@ -1029,9 +1027,20 @@ impl Agent {
             .map(jitter)
     }
 
-    async fn run_inference_streaming(
-        &self,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
+    /// Run a single streaming inference against the agent's
+    /// in-memory transcript and return the resulting
+    /// [`AssistantMessageEventStream`].
+    ///
+    /// Projects the legacy [`MessageParam`] transcript onto the
+    /// unified [`aj_models::types::Message`] sequence the
+    /// [`Provider`] trait expects, projects the agent's
+    /// `Vec<Tool>` onto the unified
+    /// [`aj_models::types::ToolDefinition`] shape, builds a
+    /// [`Context`] / [`SimpleStreamOptions`] pair, and hands them
+    /// to [`Provider::stream_simple`]. The agent does not block
+    /// on the stream here: it's returned to the caller, which
+    /// polls it inside [`Self::execute_turn`]'s outer retry loop.
+    fn run_inference_streaming(&self) -> AssistantMessageEventStream {
         let thinking = self.determine_thinking();
 
         tracing::debug!(?thinking, "thinking budget");
@@ -1041,17 +1050,30 @@ impl Agent {
             .clone()
             .expect("system prompt must be resolved before inference");
 
-        let response = self
-            .model
-            .run_inference_streaming(
-                &self.transcript,
-                system_prompt,
-                self.tools.clone(),
-                thinking,
-            )
-            .await?;
+        let messages = transcript_to_messages(&self.transcript);
+        let tools: Vec<UnifiedToolDefinition> = self
+            .tools
+            .iter()
+            .map(|t| UnifiedToolDefinition {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: t.input_schema.clone(),
+            })
+            .collect();
 
-        Ok(response)
+        let context = Context {
+            system_prompt: Some(system_prompt),
+            messages,
+            tools,
+        };
+
+        let options = SimpleStreamOptions {
+            base: StreamOptions::default(),
+            reasoning: thinking.as_ref().map(thinking_config_to_level),
+        };
+
+        self.provider
+            .stream_simple(&self.model_info, &context, &options)
     }
 
     /// Determine the thinking configuration based on trigger texts in the user
@@ -1468,6 +1490,51 @@ impl From<ApiError> for TurnError {
 impl From<anyhow::Error> for TurnError {
     fn from(e: anyhow::Error) -> Self {
         TurnError::Fatal(e)
+    }
+}
+
+/// Map a legacy [`ThinkingConfig`] onto the unified
+/// [`ThinkingLevel`] the [`Provider`] trait consumes.
+///
+/// Legacy `ThinkingConfig::Max` collapses onto `ThinkingLevel::XHigh`
+/// because the unified protocol caps at XHigh — providers that
+/// support a higher reasoning budget than XHigh treat the legacy
+/// "Max" rung as a synonym for XHigh.
+fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
+    match level {
+        ThinkingConfig::Low => ThinkingLevel::Low,
+        ThinkingConfig::Medium => ThinkingLevel::Medium,
+        ThinkingConfig::High => ThinkingLevel::High,
+        ThinkingConfig::XHigh | ThinkingConfig::Max => ThinkingLevel::XHigh,
+    }
+}
+
+/// Build a minimal [`ModelInfo`] from a legacy [`Model`] handle.
+///
+/// The legacy trait only exposes `model_name()` and `model_url()`;
+/// everything else is unknown to it. We stamp `"legacy"` onto the
+/// `api` / `provider` slots (the value never reaches the wire when
+/// the request flows through [`LegacyProviderAdapter`] — the legacy
+/// handle constructs the request body off `model_name()` directly)
+/// and zero out capability flags. Step 6.6 (`docs/aj-next-progress.md`)
+/// replaces this synthesis with a real registry lookup so the
+/// identity fields on emitted [`AssistantMessage`]s line up with the
+/// catalog.
+fn synthetic_model_info(model: &Arc<dyn Model>) -> ModelInfo {
+    ModelInfo {
+        id: model.model_name(),
+        name: model.model_name(),
+        api: "legacy".to_string(),
+        provider: "legacy".to_string(),
+        base_url: model.model_url(),
+        reasoning: false,
+        supports_xhigh: false,
+        supports_adaptive_thinking: false,
+        input: vec![InputModality::Text],
+        cost: ModelCost::default(),
+        context_window: 0,
+        max_tokens: 0,
+        headers: None,
     }
 }
 

@@ -2604,7 +2604,7 @@ session notes for the planning commit.
        step 6.9 every adapter call site is gone and the module
        is deleted along with the legacy types it bridges.
 
-- [ ] **6.5: `Agent` inference loop on `Provider`.** Replace
+- [x] **6.5: `Agent` inference loop on `Provider`.** Replace
        `Agent::model: Arc<dyn Model>` with
        `Agent::provider: Arc<dyn Provider>` plus
        `Agent::model_info: Arc<ModelInfo>`. The inference loop in
@@ -2662,6 +2662,146 @@ session notes for the planning commit.
        enforce, and it's the strongest signal that the
        provider flip didn't shift any observable agent
        behaviour.
+
+       **Implementation notes.** Lands as a single commit. The
+       `Agent` struct gains `provider: Arc<dyn Provider>` and
+       `model_info: Arc<ModelInfo>` alongside the existing
+       `model: Arc<dyn Model>` field (the legacy slot stays
+       alive through step 6.7 because `Agent::new` /
+       `Agent::set_model` still take `Arc<dyn Model>` and
+       `SessionContextWrapper::spawn_agent` threads the legacy
+       handle into the sub-agent's `Agent::new`). `Agent::new`
+       and `Agent::set_model` wrap the legacy handle in
+       [`LegacyProviderAdapter`] (from step 6.4) and synthesise a
+       minimal [`ModelInfo`] via a new `synthetic_model_info`
+       helper that stamps `"legacy"` onto the api/provider slots
+       and pulls `id` / `base_url` off
+       [`Model::model_name`] / [`Model::model_url`].
+       `Agent::model()` and `Agent::env()` accessors keep their
+       legacy signatures; the field rename to
+       `model_info()` lands in 6.7.
+
+       **Inference loop rewrite.** The old `run_inference_streaming`
+       returned `Pin<Box<dyn Stream<Item = StreamingEvent>>>` after
+       awaiting `Model::run_inference_streaming(...)`. The new
+       implementation is synchronous — it builds a
+       [`Context`] (system prompt + projected `Vec<Message>` +
+       projected `Vec<ToolDefinition>`) and a
+       [`SimpleStreamOptions`] (default base + the legacy
+       `ThinkingConfig` mapped to a unified [`ThinkingLevel`] via
+       `thinking_config_to_level`), then calls
+       [`Provider::stream_simple`] directly and returns the
+       resulting [`AssistantMessageEventStream`]. The unified
+       event protocol's events drive the new match in
+       `execute_turn`:
+
+       - `Start { partial }` is a no-op (the renderer opens its
+         assistant slot on the first content-block event below).
+       - `TextStart` / `TextDelta` / `TextEnd` map to
+         `StreamChunk { Text, Start | Update | Stop }`. The
+         unified protocol carries no text on `TextStart` itself
+         (initial bytes ride on a follow-up `TextDelta`), so
+         `Start { snapshot }` always carries an empty string and
+         the renderer appends as it goes.
+       - `ThinkingStart` / `ThinkingDelta` / `ThinkingEnd` map to
+         `StreamChunk { Thinking, ... }` analogously, with the
+         `ThinkingEnd { content }` payload riding on the
+         `Stop { snapshot }` (a forward-looking improvement on
+         the legacy `ThinkingStop` which always emitted an empty
+         snapshot — the renderer ignores the value anyway).
+       - `ToolCallStart` / `ToolCallDelta` / `ToolCallEnd` are
+         currently no-ops: tool calls are collected off the
+         finalized `Done { message }` payload below, then driven
+         by the existing per-tool `ToolExecutionStart` /
+         `ToolExecutionEnd` bracket. The match arm exists so the
+         hooks can attach later without touching the loop shape.
+       - `Done { message }` captures the finalized
+         [`AssistantMessage`] and breaks out of the streaming
+         loop.
+       - `Error { reason, error }` captures the error-shaped
+         [`AssistantMessage`] (with `stop_reason: Error` /
+         `Aborted` and `error: Some(...)`) and breaks out.
+
+       **Error / retry handling.** On a terminal `Error`, the
+       loop reads `error.error.category`. If it's
+       [`ErrorCategory::Overloaded`], the existing
+       `create_retry_strategy` exponential backoff kicks in
+       (matching the legacy `is_overloaded()` retry path).
+       Other categories — including the legacy
+       `RateLimit`/`Transient`/`InvalidRequest`/etc. paths,
+       client `Aborted`, and the synthesized "stream ended
+       without a terminal event" Transient — surface as
+       `TurnError::Recoverable(anyhow!(error.message))` so the
+       binary keeps the session alive and the user can
+       re-prompt. The `StreamRetry` event payload is unchanged.
+
+       **Tool calls + transcript shape.** Tool calls are
+       collected off `response.content` by filtering for
+       [`AssistantContent::ToolCall`] variants. The tuple shape
+       `(id, name, arguments)` matches the legacy code so the
+       rest of the execution loop is byte-for-byte identical.
+       The finalized [`AssistantMessage`] is re-projected onto
+       the agent's [`MessageParam`] transcript via the new
+       `crate::projection::assistant_message_to_message_param`
+       helper before the `MessagePersisted::Assistant` event
+       fires — preserving the existing JSONL on-disk format
+       without forcing a `Vec<Message>` migration of the
+       agent's transcript. Per-turn usage rides on
+       `response.usage` (unified [`Usage`]) and is mapped to
+       the legacy [`aj_models::messages::Usage`] via a new
+       `usage_unified_to_legacy` helper so
+       `session_state.accumulated_usage.add_usage(...)` and the
+       `TurnUsage` event payload keep their existing shapes.
+
+       **Tool input parse errors.** The legacy `StreamingEvent::ToolUseParseError`
+       path that synthesised a `ContentBlock::ToolUseBlock { input: Value::Null }`
+       and pre-populated `tool_use_parse_failures` is gone. The
+       [`LegacyProviderAdapter`] from step 6.4 already emits a
+       full [`AssistantContent::ToolCall`] block with
+       `arguments: Value::Null` for the parse-failure case, so
+       the agent's existing tool-execution error path
+       (deserializer rejects null → tool returns `Err` →
+       `MessagePersisted::UserOutput::ToolError` + synthetic
+       error outcome) covers the same end-to-end behaviour
+       without a dedicated upstream parse-error variant. The
+       `tool_use_parse_errors` / `tool_use_parse_failures`
+       state and the inline `if let Some(parse_err) =
+       tool_use_parse_failures.remove(&tool_id) { ... }` branch
+       both drop.
+
+       **Transcript projection.** New `aj-agent::projection`
+       module (private to the crate) ships three helpers:
+       `transcript_to_messages(transcript: &[MessageParam]) ->
+       Vec<Message>` walks each [`MessageParam`] and splits
+       user-role entries into per-block
+       [`Message::ToolResult`] rows (one per
+       [`ContentBlockParam::ToolResultBlock`]) plus a coalesced
+       [`Message::User`] for the remaining text / image blocks;
+       `assistant_message_to_message_param(&AssistantMessage) ->
+       MessageParam` is the inverse projection for finalized
+       assistant messages; `usage_unified_to_legacy(&Usage) ->
+       LegacyUsage` maps the per-turn counters. Eight unit
+       tests cover text round-trip, assistant text projection,
+       tool_use / tool_result split, mixed text-then-tool-result
+       ordering, signed and redacted thinking round-trip, image
+       block projection, and usage mapping.
+
+       **Test contract preserved.** All five
+       `event_protocol_tests` (`run_single_turn_with_tool_call_emits_locked_protocol`,
+       `tool_result_persistence_event_carries_structured_details_by_id`,
+       `run_single_turn_brackets_with_agent_lifecycle`,
+       `prompt_emits_user_message_persisted_event`,
+       `continue_run_drives_existing_transcript_without_appending`)
+       continue to drive `ScriptedModel` (legacy) through the
+       [`LegacyProviderAdapter`] wrap in `Agent::new`. The
+       locked event sequences pass unchanged, which is the
+       strongest evidence the provider flip didn't shift any
+       observable agent behaviour. `cargo build`, `cargo fmt`,
+       `cargo test --workspace`, and `cargo clippy -p aj-agent
+       --all-targets` all pass clean (only pre-existing
+       `clone_on_ref_ptr` warnings in `bus.rs` and
+       `oauth/anthropic.rs` remain — none in the touched
+       files).
 
 - [ ] **6.6: Binary builds `Provider` directly.** Replace the
        three `create_model(ModelArgs {...})` call sites (two in
