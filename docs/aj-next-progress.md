@@ -2803,7 +2803,7 @@ session notes for the planning commit.
        `oauth/anthropic.rs` remain — none in the touched
        files).
 
-- [ ] **6.6: Binary builds `Provider` directly.** Replace the
+- [x] **6.6: Binary builds `Provider` directly.** Replace the
        three `create_model(ModelArgs {...})` call sites (two in
        `aj/src/modes/interactive.rs` — startup line 142, /model
        swap line 1033 — and one in `aj/src/modes/print.rs` line
@@ -2830,16 +2830,108 @@ session notes for the planning commit.
        flag stays on `Arc<dyn Model>` for now — step 6.8 ports
        it onto `ScriptedProvider` directly.
 
-       Catches: `Speed`-driven beta header plumbing currently
-       lives inside `aj-models::anthropic::legacy::AnthropicModel::new`
-       (it stamps the `anthropic-beta` header on the SDK
-       client). After 6.6 it has to flow through
-       `StreamOptions` instead; the Anthropic provider already
-       reads `StreamOptions::extra_headers` per
-       `models-spec.md` §6.2. The migration moves the existing
-       header build into the binary's `aj/src/model.rs` helper
-       (it's a 3-line `if let Some(speed) = speed { ... }`
-       block).
+       **Implementation notes.** Lands as the binary-side helper
+       at `src/aj/src/model.rs` (new module, registered in
+       `lib.rs`) plus the matching wiring in
+       `aj/src/modes/{interactive,print}.rs` and the runtime
+       additions in `aj-agent/src/lib.rs`. The helper exposes:
+       [`ResolvedModel`] (the `(Arc<dyn Provider>, Arc<ModelInfo>,
+       StreamOptions)` bundle ready to plug into the agent),
+       `resolve(&registry, provider_id, model_id, url, speed)`
+       for the CLI / config / env path, and
+       `from_model_info(model_info, speed)` for the `/model`
+       selector swap path (which already has the catalog row in
+       hand). Default provider is `"anthropic"` when nothing in
+       CLI / env / config picks one; default model is the first
+       entry the registry lists for that provider (catalog order
+       preserved by `ModelRegistry::from_catalog_with_overrides`,
+       so a future "preferred default per provider" hook lands
+       in §4.3 SettingsManager without touching the helper).
+
+       **Speed → beta header.** The fast-inference Anthropic
+       beta (`fast-mode-2026-02-01`) is stamped onto
+       [`StreamOptions::headers`] when `--speed fast` / config
+       `speed = "fast"` is set *and* the resolved
+       `model_info.api` is `anthropic-messages`. Other APIs
+       silently ignore the speed knob — same end-user effect as
+       the legacy `AnthropicModel::new`'s 3-line `if speed.is_some()
+       { client.with_beta(...) }` block, just relocated to the
+       binary so the provider crate stays generic. New
+       [`AnthropicProvider::build_client`] reads
+       [`StreamOptions::headers`] for any `anthropic-beta`
+       entries (comma-split, case-insensitive, empty-trim) and
+       appends them to the SDK client's beta list before the
+       request goes out. Six new unit tests in
+       `aj-models::anthropic::provider::tests` pin the parsing
+       logic (`extra_betas_from_headers_*`).
+
+       **Agent runtime additions.** [`Agent::with_provider`]
+       (alongside the existing legacy [`Agent::new`]) takes the
+       `(provider, model_info, stream_options, thinking)` quad
+       and routes through a shared private `build` constructor
+       so tool flattening + default-thinking projection lives in
+       one place. `Agent::model: Arc<dyn Model>` becomes
+       `Option<Arc<dyn Model>>`, populated only on the legacy
+       path; [`Agent::model_info`] is the new accessor that's
+       always populated and is what the TUI footer / startup
+       banner now read off (previously
+       `agent.model().model_name()` / `.model_url()`).
+       [`Agent::set_provider`] is the registry-driven swap
+       counterpart of `Agent::set_model`. The inference loop's
+       `run_inference_streaming` now seeds
+       [`SimpleStreamOptions::base`] from `self.stream_options`
+       instead of `StreamOptions::default()`, so the resolved
+       api_key and headers reach every provider call.
+       [`SessionContextWrapper`] gains
+       `provider: Arc<dyn Provider>` /
+       `model_info: Arc<ModelInfo>` /
+       `stream_options: StreamOptions` so sub-agents spawned
+       from a `with_provider` parent reuse the same triple via
+       [`Agent::with_provider`]; legacy parents continue
+       spawning through [`Agent::new`] so the `--scripted`
+       path and the event-protocol tests stay byte-for-byte
+       unchanged.
+
+       **Binary call sites.** `interactive.rs` startup splits
+       on `args.scripted`: scripted runs go through
+       `scripted::resolve_or_explain` + `Agent::new` (legacy);
+       real runs go through `ModelRegistry::load` +
+       `model::resolve` + `Agent::with_provider`. The `/model`
+       selector's swap path calls `model::from_model_info(info)`
+       + `agent.set_provider(...)`. `print.rs` mirrors the same
+       split. The TUI footer reads `id @ base_url` off
+       `agent.model_info()` so both paths render identically.
+
+       **Tests.** 11 new unit tests in `model::tests`:
+       `pick_model_returns_explicit_match`,
+       `pick_model_falls_back_to_first_listed`,
+       `pick_model_errors_for_unknown_provider`,
+       `pick_model_errors_for_unknown_model_in_known_provider`,
+       `apply_speed_headers_skips_when_speed_unset`,
+       `apply_speed_headers_skips_standard_speed`,
+       `apply_speed_headers_stamps_fast_mode_beta_on_anthropic`,
+       `apply_speed_headers_is_noop_for_non_anthropic_providers`,
+       `add_beta_header_creates_when_missing`,
+       `add_beta_header_appends_to_existing_value`,
+       `add_beta_header_skips_duplicate`. Plus 6 new tests in
+       `aj-models::anthropic::provider::tests` for the header
+       parsing path. The existing
+       `event_protocol_tests::run_single_turn_*` and
+       `aj/tests/replay_parity.rs` suites continue to drive
+       `ScriptedModel` through `Agent::new`, locked event
+       sequences pass unchanged — strongest signal the
+       legacy-shaped scripted path is untouched. `cargo build`,
+       `cargo fmt`, `cargo test --workspace`, and
+       `cargo clippy -p aj-agent --all-targets` all pass (only
+       pre-existing `clone_on_ref_ptr` warnings in `bus.rs` and
+       `oauth/anthropic.rs` remain).
+
+       Catches resolved: `Speed`-driven beta header plumbing
+       moved out of the legacy `AnthropicModel::new` into the
+       binary's `model::apply_speed_headers` helper, threaded
+       through `StreamOptions::headers`, and consumed by
+       `AnthropicProvider::build_client`'s new
+       `extra_betas_from_headers` parser.
 
 - [ ] **6.7: `Agent::new` drops `Arc<dyn Model>`.** Remove the
        legacy `Agent::new(model: Arc<dyn Model>, ...)`

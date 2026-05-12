@@ -1,0 +1,379 @@
+//! Resolve a CLI / config triple `(api, model_name, url)` into a
+//! ready-to-plug-in [`Provider`] handle plus the
+//! registry-resolved [`ModelInfo`] and a baseline [`StreamOptions`].
+//!
+//! Replaces the legacy [`aj_models::create_model`] entry point for the
+//! non-scripted path: the binary loads the
+//! [`ModelRegistry`](aj_models::registry::ModelRegistry), picks a
+//! concrete model (either an explicit `(provider, id)` pair or the
+//! provider's first listed entry), looks up the matching
+//! [`Provider`] impl by the model's `api` string, and resolves the
+//! API key from environment variables. The resulting bundle is what
+//! [`aj_agent::Agent::with_provider`] / [`aj_agent::Agent::set_provider`]
+//! consume directly — no further conversion at the call site.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use aj_models::auth::{find_env_keys, get_env_api_key};
+use aj_models::messages::Speed;
+use aj_models::provider::{Provider, provider_for};
+use aj_models::registry::{ModelInfo, ModelRegistry};
+use aj_models::types::StreamOptions;
+use anyhow::{Result, anyhow, bail};
+
+/// Beta header value that opts an Anthropic request into the
+/// fast-inference variant of the model. Stamped onto the outgoing
+/// request via the `anthropic-beta` header when the user set
+/// `--speed fast` (or the equivalent config key) and the resolved
+/// provider is `anthropic-messages`.
+///
+/// Kept inline here rather than re-exported from `aj-models` because
+/// the routing decision (Speed → beta header) is a binary-level
+/// policy: the provider crate stays generic over the headers list
+/// and the binary picks which extras to opt into per user request.
+pub const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+
+/// Fallback provider id used when neither CLI / env / config supplies
+/// one. Matches the legacy [`aj_models::create_model`] default so
+/// existing user setups keep working without an explicit
+/// `MODEL_API=anthropic` env var.
+pub const DEFAULT_PROVIDER_ID: &str = "anthropic";
+
+/// A model handle assembled by [`resolve`] (or [`from_model_info`])
+/// ready to plug into [`aj_agent::Agent::with_provider`] or
+/// [`aj_agent::Agent::set_provider`].
+pub struct ResolvedModel {
+    /// Provider implementation matching `model_info.api`. Stateless,
+    /// safe to clone across sub-agents.
+    pub provider: Arc<dyn Provider>,
+    /// Registry-resolved metadata for the picked model. Carries the
+    /// catalog `id`, `provider` id, `base_url`, capability flags,
+    /// and pricing tables.
+    pub model_info: Arc<ModelInfo>,
+    /// Baseline [`StreamOptions`] applied to every inference call:
+    /// resolved API key plus any extra HTTP headers (e.g. the fast-
+    /// inference beta). The agent layers per-turn reasoning on top.
+    pub stream_options: StreamOptions,
+}
+
+/// Build a [`ResolvedModel`] from a CLI / config triple.
+///
+/// `provider_id` is the catalog `provider` value (e.g. `"anthropic"`,
+/// `"openai"`, `"openai-codex"`). When [`None`] the helper falls back
+/// to [`DEFAULT_PROVIDER_ID`] so an unconfigured run still works.
+///
+/// `model_id` selects an entry from the provider's catalog. When
+/// [`None`] the helper picks the first listed model for that
+/// provider; the registry preserves insertion order so the choice is
+/// deterministic given a fixed catalog.
+///
+/// `url_override` replaces `model_info.base_url` after lookup so a
+/// caller can point at a staging proxy or a self-hosted endpoint
+/// without editing the catalog file.
+///
+/// `speed` opts into provider-specific fast-inference variants by
+/// stamping extra HTTP headers on every request. Today only
+/// `anthropic-messages` participates (via the `anthropic-beta`
+/// header); other providers ignore the field. The Speed enum lives
+/// in `aj-models` because it's plumbed through the Anthropic SDK
+/// wire types as well.
+pub fn resolve(
+    registry: &ModelRegistry,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    url_override: Option<&str>,
+    speed: Option<Speed>,
+) -> Result<ResolvedModel> {
+    let provider_id = provider_id.unwrap_or(DEFAULT_PROVIDER_ID);
+    let mut model_info = pick_model(registry, provider_id, model_id)?;
+    if let Some(url) = url_override {
+        // Mirrors the legacy `ModelArgs::url` precedence: a custom
+        // URL trumps the catalog default but everything else
+        // (capability flags, pricing) stays sourced from the
+        // registry.
+        model_info.base_url = url.to_string();
+    }
+    from_model_info(model_info, speed)
+}
+
+/// Build a [`ResolvedModel`] from a pre-picked [`ModelInfo`] — used by
+/// the `/model` selector which already has the catalog row in hand.
+///
+/// Same effect as [`resolve`] minus the lookup: dispatch the
+/// `model_info.api` to the matching [`Provider`] impl, resolve the
+/// API key from env, and stamp speed-driven headers onto the
+/// baseline [`StreamOptions`].
+pub fn from_model_info(model_info: ModelInfo, speed: Option<Speed>) -> Result<ResolvedModel> {
+    let provider = provider_for(&model_info.api).ok_or_else(|| {
+        anyhow!(
+            "no provider registered for api {:?} (model {}/{})",
+            model_info.api,
+            model_info.provider,
+            model_info.id,
+        )
+    })?;
+
+    let api_key = match get_env_api_key(&model_info.provider) {
+        Some(key) => key,
+        None => {
+            // Surface the env vars we *would* have consulted so the
+            // user knows what to set. Sorted by preference so the
+            // first listed var is the canonical one.
+            let vars = find_env_keys(&model_info.provider);
+            if vars.is_empty() {
+                bail!(
+                    "no API key resolver for provider {:?}; \
+                     set `headers` overrides in models.json or wait \
+                     for the §4.3 SettingsManager auth pipeline",
+                    model_info.provider
+                );
+            }
+            bail!(
+                "no API key in environment for provider {:?}; \
+                 set one of: {}",
+                model_info.provider,
+                vars.join(", "),
+            );
+        }
+    };
+
+    let mut stream_options = StreamOptions {
+        api_key: Some(api_key),
+        ..StreamOptions::default()
+    };
+    apply_speed_headers(&mut stream_options, &model_info, speed);
+
+    Ok(ResolvedModel {
+        provider: Arc::from(provider),
+        model_info: Arc::new(model_info),
+        stream_options,
+    })
+}
+
+/// Pick a [`ModelInfo`] for the given `(provider, model)` pair.
+///
+/// Errors with a structured message if the provider is unknown or
+/// the named model isn't in its listing — the caller wraps the
+/// result with extra context (CLI flag, config key) before showing
+/// it to the user.
+fn pick_model(
+    registry: &ModelRegistry,
+    provider_id: &str,
+    model_id: Option<&str>,
+) -> Result<ModelInfo> {
+    match model_id {
+        Some(id) => registry
+            .get(provider_id, id)
+            .cloned()
+            .ok_or_else(|| anyhow!("model {provider_id}/{id} not found in registry")),
+        None => default_model_for(registry, provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no models listed for provider {provider_id:?}")),
+    }
+}
+
+/// Pick the first model the registry knows about for `provider_id`.
+///
+/// The registry preserves insertion order from the catalog, so the
+/// "first" entry is whatever ships at the top of the bundled
+/// `models.json` (or the user's refreshed cache). A richer
+/// "preferred default per provider" hook is reserved for the §4.3
+/// SettingsManager work; for now the catalog order is the source of
+/// truth.
+fn default_model_for<'a>(registry: &'a ModelRegistry, provider_id: &str) -> Option<&'a ModelInfo> {
+    registry.models(provider_id).into_iter().next()
+}
+
+/// Apply per-call HTTP headers derived from the [`Speed`] knob.
+///
+/// Today the only consumer is `anthropic-messages`, which accepts
+/// the `fast-mode-2026-02-01` beta header for opt-in low-latency
+/// inference. Other providers see the speed flag but ignore the
+/// headers (we still set them — the providers strip what they don't
+/// know how to handle).
+fn apply_speed_headers(options: &mut StreamOptions, model: &ModelInfo, speed: Option<Speed>) {
+    match speed {
+        Some(Speed::Fast) if model.api == "anthropic-messages" => {
+            let headers = options.headers.get_or_insert_with(HashMap::new);
+            add_beta_header(headers, "anthropic-beta", FAST_MODE_BETA);
+        }
+        // Standard / unset / non-Anthropic providers: nothing to
+        // stamp. Future fast-mode equivalents on other providers
+        // plug in here.
+        _ => {}
+    }
+}
+
+/// Append `value` to a comma-separated `name` header in `headers`
+/// without duplicating it. If the header isn't set yet, create it.
+///
+/// Anthropic accepts comma-separated values for `anthropic-beta`,
+/// and the SDK already coalesces caller-supplied betas with its own
+/// (e.g. `fine-grained-tool-streaming-2025-05-14`), so the binary's
+/// extension here only has to worry about the user-facing axis
+/// (Speed::Fast → fast-mode beta).
+fn add_beta_header(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    headers
+        .entry(name.to_string())
+        .and_modify(|existing| {
+            if !existing.split(',').any(|b| b.trim() == value) {
+                if !existing.is_empty() {
+                    existing.push(',');
+                }
+                existing.push_str(value);
+            }
+        })
+        .or_insert_with(|| value.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aj_models::registry::{Catalog, InputModality, ModelCost, OverridesFile};
+
+    fn sample_model(provider: &str, id: &str, api: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            api: api.into(),
+            provider: provider.into(),
+            base_url: "https://example.invalid".into(),
+            reasoning: false,
+            supports_xhigh: false,
+            supports_adaptive_thinking: false,
+            input: vec![InputModality::Text],
+            cost: ModelCost::default(),
+            context_window: 1_000,
+            max_tokens: 100,
+            headers: None,
+        }
+    }
+
+    fn registry(models: Vec<ModelInfo>) -> ModelRegistry {
+        // Build a tiny in-memory registry so we don't reach for the
+        // bundled catalog (which would include unrelated providers
+        // and make the per-provider defaults non-deterministic).
+        let catalog = Catalog {
+            updated_at: 0,
+            source: "test".into(),
+            models,
+        };
+        let overrides = OverridesFile { overrides: vec![] };
+        ModelRegistry::from_catalog_with_overrides(catalog, overrides, "test-catalog")
+    }
+
+    #[test]
+    fn pick_model_returns_explicit_match() {
+        let reg = registry(vec![
+            sample_model("anthropic", "claude-x", "anthropic-messages"),
+            sample_model("anthropic", "claude-y", "anthropic-messages"),
+        ]);
+        let m = pick_model(&reg, "anthropic", Some("claude-y")).expect("found");
+        assert_eq!(m.id, "claude-y");
+    }
+
+    #[test]
+    fn pick_model_falls_back_to_first_listed() {
+        let reg = registry(vec![
+            sample_model("anthropic", "claude-x", "anthropic-messages"),
+            sample_model("anthropic", "claude-y", "anthropic-messages"),
+        ]);
+        let m = pick_model(&reg, "anthropic", None).expect("found");
+        // Insertion order: catalog order is preserved by
+        // `from_catalog_with_overrides`, so the first listed entry
+        // wins. The Codex seed is spliced in after but only injects
+        // openai-codex models, so the anthropic-first stays stable.
+        assert_eq!(m.id, "claude-x");
+    }
+
+    #[test]
+    fn pick_model_errors_for_unknown_provider() {
+        let reg = registry(vec![sample_model(
+            "anthropic",
+            "claude-x",
+            "anthropic-messages",
+        )]);
+        let err = pick_model(&reg, "no-such", None).expect_err("error");
+        assert!(err.to_string().contains("no models listed"), "{err}");
+    }
+
+    #[test]
+    fn pick_model_errors_for_unknown_model_in_known_provider() {
+        let reg = registry(vec![sample_model(
+            "anthropic",
+            "claude-x",
+            "anthropic-messages",
+        )]);
+        let err = pick_model(&reg, "anthropic", Some("claude-z")).expect_err("error");
+        assert!(err.to_string().contains("not found in registry"), "{err}");
+    }
+
+    #[test]
+    fn apply_speed_headers_skips_when_speed_unset() {
+        let mut opts = StreamOptions::default();
+        let model = sample_model("anthropic", "claude-x", "anthropic-messages");
+        apply_speed_headers(&mut opts, &model, None);
+        assert!(opts.headers.is_none());
+    }
+
+    #[test]
+    fn apply_speed_headers_skips_standard_speed() {
+        let mut opts = StreamOptions::default();
+        let model = sample_model("anthropic", "claude-x", "anthropic-messages");
+        apply_speed_headers(&mut opts, &model, Some(Speed::Standard));
+        assert!(opts.headers.is_none());
+    }
+
+    #[test]
+    fn apply_speed_headers_stamps_fast_mode_beta_on_anthropic() {
+        let mut opts = StreamOptions::default();
+        let model = sample_model("anthropic", "claude-x", "anthropic-messages");
+        apply_speed_headers(&mut opts, &model, Some(Speed::Fast));
+        let headers = opts.headers.expect("headers populated");
+        assert_eq!(
+            headers.get("anthropic-beta").map(String::as_str),
+            Some(FAST_MODE_BETA)
+        );
+    }
+
+    #[test]
+    fn apply_speed_headers_is_noop_for_non_anthropic_providers() {
+        let mut opts = StreamOptions::default();
+        let model = sample_model("openai", "gpt-x", "openai-responses");
+        apply_speed_headers(&mut opts, &model, Some(Speed::Fast));
+        assert!(opts.headers.is_none());
+    }
+
+    #[test]
+    fn add_beta_header_creates_when_missing() {
+        let mut headers = HashMap::new();
+        add_beta_header(&mut headers, "anthropic-beta", "alpha-1");
+        assert_eq!(
+            headers.get("anthropic-beta").map(String::as_str),
+            Some("alpha-1")
+        );
+    }
+
+    #[test]
+    fn add_beta_header_appends_to_existing_value() {
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-beta".into(), "existing-1".into());
+        add_beta_header(&mut headers, "anthropic-beta", "alpha-1");
+        assert_eq!(
+            headers.get("anthropic-beta").map(String::as_str),
+            Some("existing-1,alpha-1"),
+        );
+    }
+
+    #[test]
+    fn add_beta_header_skips_duplicate() {
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-beta".into(), "alpha-1,beta-2".into());
+        add_beta_header(&mut headers, "anthropic-beta", "alpha-1");
+        assert_eq!(
+            headers.get("anthropic-beta").map(String::as_str),
+            Some("alpha-1,beta-2"),
+        );
+    }
+}

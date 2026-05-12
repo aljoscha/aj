@@ -56,7 +56,7 @@ use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
 use aj_models::messages::{ContentBlockParam, Role, Speed};
-use aj_models::{ModelArgs, create_model};
+use aj_models::registry::ModelRegistry;
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
@@ -68,6 +68,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command, PrintFormat};
 use crate::cli::file_args;
+use crate::model::ResolvedModel;
 
 /// Drive a single print-mode run from `args`.
 ///
@@ -128,25 +129,6 @@ pub async fn run(args: Args) -> Result<()> {
         ConfigSpeed::Fast => Speed::Fast,
     });
 
-    let model_args = ModelArgs {
-        api: args
-            .model_api
-            .clone()
-            .or_else(|| config.model_api.clone())
-            .unwrap_or_else(|| "anthropic".to_string()),
-        url: args.model_url.clone().or_else(|| config.model_url.clone()),
-        model_name: args
-            .model_name
-            .clone()
-            .or_else(|| config.model_name.clone()),
-        speed,
-    };
-    let model = if let Some(name) = &args.scripted {
-        crate::scripted::resolve_or_explain(name)?
-    } else {
-        create_model(model_args).context("failed to construct model handle")?
-    };
-
     // Build the tool list. Disabled tools are filtered up-front so
     // the agent never advertises them to the model; this matches the
     // legacy binary's behaviour and keeps the print/interactive
@@ -158,14 +140,48 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let env = AgentEnv::new();
-    let mut agent = Agent::new(
-        env,
-        SYSTEM_PROMPT,
-        tools,
-        config.disabled_tools.clone(),
-        Arc::clone(&model),
-        config.thinking,
-    );
+    // Build the agent in one of two ways depending on the
+    // `--scripted` flag. The scripted path keeps the legacy
+    // `Arc<dyn Model>` surface (step 6.8 of
+    // `docs/aj-next-progress.md` will port it onto
+    // `ScriptedProvider`); the real-model path goes through the
+    // registry so the binary owns provider dispatch, API key
+    // resolution, and speed-driven beta headers.
+    let mut agent = if let Some(name) = &args.scripted {
+        let model = crate::scripted::resolve_or_explain(name)?;
+        Agent::new(
+            env,
+            SYSTEM_PROMPT,
+            tools,
+            config.disabled_tools.clone(),
+            Arc::clone(&model),
+            config.thinking,
+        )
+    } else {
+        let registry = ModelRegistry::load();
+        let ResolvedModel {
+            provider,
+            model_info,
+            stream_options,
+        } = crate::model::resolve(
+            &registry,
+            args.model_api.as_deref().or(config.model_api.as_deref()),
+            args.model_name.as_deref().or(config.model_name.as_deref()),
+            args.model_url.as_deref().or(config.model_url.as_deref()),
+            speed,
+        )
+        .context("failed to resolve model from registry")?;
+        Agent::with_provider(
+            env,
+            SYSTEM_PROMPT,
+            tools,
+            config.disabled_tools.clone(),
+            provider,
+            model_info,
+            stream_options,
+            config.thinking,
+        )
+    };
 
     // Resolve the [`ConversationLog`] for this run: resume an
     // existing thread (by explicit id or latest-for-project) or

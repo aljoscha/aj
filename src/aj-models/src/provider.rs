@@ -66,7 +66,12 @@ pub trait Provider: Send + Sync {
 /// surface the missing provider as an [`AssistantMessageEvent::Error`]
 /// on the resulting stream so callers always observe a uniform stream
 /// shape.
-fn provider_for(api: &str) -> Option<Box<dyn Provider>> {
+///
+/// Exposed `pub` so the binary can build a provider handle once at
+/// startup and pass it to the agent through [`Provider`]-aware
+/// constructors, rather than re-dispatching the API string on every
+/// inference call.
+pub fn provider_for(api: &str) -> Option<Box<dyn Provider>> {
     match api {
         "anthropic-messages" => Some(Box::new(crate::anthropic::AnthropicProvider)),
         "openai-completions" => Some(Box::new(crate::openai::OpenAiCompletionsProvider)),

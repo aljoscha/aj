@@ -68,26 +68,44 @@ pub struct Agent {
     /// Mirrors the filter applied to the top-level agent so
     /// subagents inherit the same tool restrictions.
     disabled_tools: Vec<String>,
-    /// Legacy model handle. Kept alive alongside [`Self::provider`]
-    /// while [`Agent::new`] / [`Agent::set_model`] still accept
-    /// `Arc<dyn Model>`; the legacy handle is what
-    /// [`SessionContextWrapper::spawn_agent`] threads into the
-    /// sub-agent's `Agent::new` so the legacy entry point keeps
-    /// working through step 6.5. Drops in step 6.7 of
+    /// Legacy model handle, kept alongside the unified
+    /// [`Self::provider`] handle so existing call sites that build the
+    /// agent via [`Agent::new`] (in particular the `--scripted` flag
+    /// and the test fixtures) keep working unchanged. Populated only
+    /// when the agent was constructed off a legacy
+    /// [`Arc<dyn Model>`]; set to [`None`] by
+    /// [`Agent::with_provider`] / [`Agent::set_provider`]. Sub-agent
+    /// spawn (`SessionContextWrapper`) routes through whichever side
+    /// is populated. Drops in step 6.7 of
     /// `docs/aj-next-progress.md`.
-    model: Arc<dyn Model>,
-    /// Unified provider handle used by the inference loop. Built by
-    /// wrapping [`Self::model`] in [`LegacyProviderAdapter`] today;
-    /// step 6.6 swaps the binary's call sites onto real
-    /// [`Provider`]s built off the registry, and step 6.7 drops the
-    /// legacy adapter wrapping entirely.
+    model: Option<Arc<dyn Model>>,
+    /// Unified provider handle used by the inference loop. Built off
+    /// the legacy [`Self::model`] via [`LegacyProviderAdapter`] when
+    /// the agent was constructed via [`Agent::new`], or supplied
+    /// directly by [`Agent::with_provider`] / [`Agent::set_provider`].
+    /// Either way the inference loop only ever reaches for this
+    /// field, so the choice between paths is opaque past
+    /// construction time.
     provider: Arc<dyn Provider>,
     /// Identity / capability metadata stamped onto the [`Context`]
     /// passed to [`Provider::stream_simple`]. Synthesised from the
-    /// legacy [`Model::model_name`] / [`Model::model_url`] today;
-    /// step 6.6 starts populating this from the real registry
-    /// lookup.
+    /// legacy [`Model::model_name`] / [`Model::model_url`] when
+    /// constructed via [`Agent::new`]; resolved against the model
+    /// registry when constructed via [`Agent::with_provider`].
     model_info: Arc<ModelInfo>,
+    /// Base [`StreamOptions`] applied to every inference call. Carries
+    /// the resolved api key, per-call HTTP headers (e.g. an
+    /// `anthropic-beta` line for the fast-mode beta), session
+    /// correlation id, etc. The agent layers per-turn reasoning on
+    /// top inside `run_inference_streaming`; everything else flows
+    /// through verbatim.
+    ///
+    /// Empty (`StreamOptions::default()`) when the agent runs on
+    /// the legacy [`Self::model`] path — the
+    /// [`LegacyProviderAdapter`] wraps a `Model` handle that already
+    /// owns its own credential, so a duplicate `api_key` here would
+    /// be ignored.
+    stream_options: StreamOptions,
     session_state: SessionState,
     default_thinking: Option<ThinkingConfig>,
     /// Identifier used on every event emitted by this agent. The
@@ -129,6 +147,81 @@ impl Agent {
         model: Arc<dyn Model>,
         default_thinking: Option<ConfigThinkingLevel>,
     ) -> Self {
+        // Wrap the legacy handle on the unified [`Provider`] trait.
+        // Step 6.6 of `docs/aj-next-progress.md` introduces
+        // [`Agent::with_provider`] as the registry-driven entry point
+        // for real providers; legacy callers (`--scripted`, the
+        // event-protocol tests) continue to flow through here so the
+        // single inference loop is shared between both paths.
+        let provider: Arc<dyn Provider> = Arc::new(LegacyProviderAdapter::new(Arc::clone(&model)));
+        let model_info = Arc::new(synthetic_model_info(&model));
+        Self::build(
+            env,
+            system_prompt,
+            tools,
+            disabled_tools,
+            Some(model),
+            provider,
+            model_info,
+            StreamOptions::default(),
+            default_thinking,
+        )
+    }
+
+    /// Build an agent off a unified [`Provider`] handle.
+    ///
+    /// `model_info` is the registry-resolved metadata the agent
+    /// stamps onto the [`Context`] passed to
+    /// [`Provider::stream_simple`]; `stream_options` carries the
+    /// resolved API key, per-call HTTP headers (`anthropic-beta`
+    /// values, etc.), session id, and any other knobs the binary
+    /// pre-computed at startup.
+    ///
+    /// Sub-agents spawned by this agent inherit the same `provider`,
+    /// `model_info`, and `stream_options` (per
+    /// `docs/aj-next-plan.md` §1.6) so the whole hierarchy talks to
+    /// the same backend.
+    pub fn with_provider(
+        env: AgentEnv,
+        system_prompt: &'static str,
+        tools: Vec<ErasedToolDefinition>,
+        disabled_tools: Vec<String>,
+        provider: Arc<dyn Provider>,
+        model_info: Arc<ModelInfo>,
+        stream_options: StreamOptions,
+        default_thinking: Option<ConfigThinkingLevel>,
+    ) -> Self {
+        Self::build(
+            env,
+            system_prompt,
+            tools,
+            disabled_tools,
+            None,
+            provider,
+            model_info,
+            stream_options,
+            default_thinking,
+        )
+    }
+
+    /// Shared constructor body used by both [`Agent::new`] and
+    /// [`Agent::with_provider`]. Pulled into a `pub(crate)` helper so
+    /// the two public entry points stay tiny and the actual init
+    /// sequence (tool flattening, default-thinking projection,
+    /// session state, fresh bus, fresh cancellation token) lives in
+    /// one place.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        env: AgentEnv,
+        system_prompt: &'static str,
+        tools: Vec<ErasedToolDefinition>,
+        disabled_tools: Vec<String>,
+        model: Option<Arc<dyn Model>>,
+        provider: Arc<dyn Provider>,
+        model_info: Arc<ModelInfo>,
+        stream_options: StreamOptions,
+        default_thinking: Option<ConfigThinkingLevel>,
+    ) -> Self {
         // Convert ErasedToolDefinition to Tool for Model API
         let api_tools: Vec<Tool> = tools
             .iter()
@@ -157,16 +250,6 @@ impl Agent {
             ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
         });
 
-        // Wrap the legacy handle on the unified [`Provider`] trait.
-        // Step 6.6 (`docs/aj-next-progress.md`) will start handing
-        // a real `Provider` directly from the registry; until then
-        // every inference flows through this adapter so the agent's
-        // inference loop can be written against the unified
-        // streaming protocol regardless of the actual call-site
-        // shape.
-        let provider: Arc<dyn Provider> = Arc::new(LegacyProviderAdapter::new(Arc::clone(&model)));
-        let model_info = Arc::new(synthetic_model_info(&model));
-
         Self {
             env,
             system_prompt,
@@ -177,6 +260,7 @@ impl Agent {
             model,
             provider,
             model_info,
+            stream_options,
             session_state,
             default_thinking,
             agent_id: AgentId::Main,
@@ -346,31 +430,84 @@ impl Agent {
         text
     }
 
-    /// Borrow the model handle. The binary clones this for the
-    /// startup `Model: <name>, at <url>` notice and uses it during
-    /// listener wiring; the agent itself drives inference through
-    /// the same handle internally.
-    pub fn model(&self) -> Arc<dyn Model> {
-        Arc::clone(&self.model)
+    /// Borrow the legacy [`Model`] handle if one is attached.
+    ///
+    /// Returns [`Some`] only when the agent was constructed via
+    /// [`Agent::new`] (legacy / scripted path); agents built via
+    /// [`Agent::with_provider`] return [`None`] because the unified
+    /// provider handle is the only currency they carry. Call sites
+    /// that just want identity / capability metadata should prefer
+    /// [`Agent::model_info`].
+    pub fn model(&self) -> Option<Arc<dyn Model>> {
+        self.model.as_ref().map(Arc::clone)
     }
 
-    /// Replace the model handle mid-session.
+    /// Borrow the registry-resolved [`ModelInfo`] this agent is
+    /// currently running against.
     ///
-    /// Used by the interactive `/model` selector to switch the
-    /// active model without restarting the session. Takes effect
-    /// on the next inference; an in-flight turn keeps running
+    /// Always populated regardless of which constructor was used:
+    /// legacy [`Agent::new`] callers see a synthetic [`ModelInfo`]
+    /// built off [`Model::model_name`] / [`Model::model_url`], while
+    /// [`Agent::with_provider`] callers see the entry that the
+    /// binary plucked out of the [`ModelRegistry`] at startup. The
+    /// TUI footer renders `id @ base_url` off this handle so the
+    /// scripted and real-provider paths render identically.
+    ///
+    /// [`ModelRegistry`]: aj_models::registry::ModelRegistry
+    pub fn model_info(&self) -> Arc<ModelInfo> {
+        Arc::clone(&self.model_info)
+    }
+
+    /// Replace the model handle mid-session via the legacy
+    /// [`Arc<dyn Model>`] surface.
+    ///
+    /// Used by the `--scripted` flag's hot-swap (and by tests) to
+    /// inject a fake model on top of an already-built agent. Takes
+    /// effect on the next inference; an in-flight turn keeps running
     /// against whatever handle it was already using. Sub-agents
     /// spawned after this call inherit the new handle; sub-agents
-    /// that were already constructed retain the old one (they
-    /// were cloned from `self.model` at spawn time).
+    /// that were already constructed retain the old one (they were
+    /// cloned from `self.provider` at spawn time).
+    ///
+    /// The registry-driven equivalent for swapping to a real
+    /// provider is [`Agent::set_provider`].
     pub fn set_model(&mut self, model: Arc<dyn Model>) {
         // Rebuild the unified provider and synthetic [`ModelInfo`]
         // off the new handle so the inference loop picks them up on
         // the next call. The bus subscriptions and cancellation
-        // token are unaffected — only the wire layer changes.
+        // token are unaffected — only the wire layer changes. The
+        // accompanying `stream_options` is reset to default because
+        // the legacy adapter owns its own credential and any leftover
+        // api_key / headers from a prior `set_provider` call would be
+        // misleading (the adapter ignores them).
         self.provider = Arc::new(LegacyProviderAdapter::new(Arc::clone(&model)));
         self.model_info = Arc::new(synthetic_model_info(&model));
-        self.model = model;
+        self.model = Some(model);
+        self.stream_options = StreamOptions::default();
+    }
+
+    /// Replace the provider handle, model metadata, and per-call
+    /// [`StreamOptions`] mid-session.
+    ///
+    /// Used by the interactive `/model` selector to swap to a fresh
+    /// registry entry without restarting the session. Same lifecycle
+    /// rules as [`Agent::set_model`]: takes effect on the next
+    /// inference, in-flight turns keep their old handle, sub-agents
+    /// spawned after the call see the new one.
+    ///
+    /// Drops the legacy [`Self::model`] slot — call sites that need
+    /// to interrogate the legacy `Model` after a `set_provider` swap
+    /// must use [`Agent::model_info`] instead.
+    pub fn set_provider(
+        &mut self,
+        provider: Arc<dyn Provider>,
+        model_info: Arc<ModelInfo>,
+        stream_options: StreamOptions,
+    ) {
+        self.provider = provider;
+        self.model_info = model_info;
+        self.stream_options = stream_options;
+        self.model = None;
     }
 
     /// Borrow the agent's environment. The binary uses this to
@@ -1068,7 +1205,7 @@ impl Agent {
         };
 
         let options = SimpleStreamOptions {
-            base: StreamOptions::default(),
+            base: self.stream_options.clone(),
             reasoning: thinking.as_ref().map(thinking_config_to_level),
         };
 
@@ -1178,7 +1315,10 @@ impl Agent {
                 .expect("system prompt must be resolved before sub-agent spawn"),
             system_prompt: self.system_prompt,
             disabled_tools: &self.disabled_tools,
-            model: Arc::clone(&self.model),
+            model: self.model.as_ref().map(Arc::clone),
+            provider: Arc::clone(&self.provider),
+            model_info: Arc::clone(&self.model_info),
+            stream_options: self.stream_options.clone(),
             sub_agent_tools,
             parent_bus: self.bus.clone(),
             parent_agent_id: self.agent_id,
@@ -1265,7 +1405,20 @@ struct SessionContextWrapper<'a> {
     assembled_system_prompt: String,
     system_prompt: &'static str,
     disabled_tools: &'a [String],
-    model: Arc<dyn Model>,
+    /// Legacy model handle. Populated only when the parent agent was
+    /// constructed via [`Agent::new`]; sub-agents spawned through
+    /// this wrapper go through [`Agent::new`] in that case.
+    /// [`None`] when the parent was built via [`Agent::with_provider`],
+    /// in which case sub-agents reuse the parent's `provider` /
+    /// `model_info` / `stream_options` triple instead.
+    model: Option<Arc<dyn Model>>,
+    /// Unified provider handle threaded into sub-agents when the
+    /// parent agent runs on the registry-driven path. Always
+    /// populated alongside [`Self::model_info`] / [`Self::stream_options`];
+    /// only consumed when [`Self::model`] is [`None`].
+    provider: Arc<dyn Provider>,
+    model_info: Arc<ModelInfo>,
+    stream_options: StreamOptions,
     /// Snapshot of the parent's tool list. Sub-agents inherit this
     /// minus the `agent` tool. Cloning per-spawn is cheap because
     /// every `ErasedToolDefinition` field is `Clone` and the
@@ -1346,15 +1499,34 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // Create a new agent rooted in this session's env and
             // tools. Its transcript starts empty; the prompt the
             // tool invoked us with is appended as the first user
-            // message inside `run_single_turn`.
-            let mut sub_agent = Agent::new(
-                self.env.clone(),
-                self.system_prompt,
-                sub_agent_tools,
-                disabled_tools,
-                Arc::clone(&self.model),
-                None,
-            );
+            // message inside `run_single_turn`. The constructor we
+            // pick mirrors the parent's path: legacy `Arc<dyn Model>`
+            // parents spawn legacy children so the existing
+            // `--scripted` / test fixtures keep working unchanged;
+            // [`Agent::with_provider`] parents spawn provider-driven
+            // children that reuse the resolved [`StreamOptions`]
+            // (api key, headers, etc.) verbatim.
+            let mut sub_agent = if let Some(model) = self.model.as_ref() {
+                Agent::new(
+                    self.env.clone(),
+                    self.system_prompt,
+                    sub_agent_tools,
+                    disabled_tools,
+                    Arc::clone(model),
+                    None,
+                )
+            } else {
+                Agent::with_provider(
+                    self.env.clone(),
+                    self.system_prompt,
+                    sub_agent_tools,
+                    disabled_tools,
+                    Arc::clone(&self.provider),
+                    Arc::clone(&self.model_info),
+                    self.stream_options.clone(),
+                    None,
+                )
+            };
             sub_agent.set_agent_id(child_id);
             sub_agent.set_assembled_system_prompt(self.assembled_system_prompt.clone());
             // Share the parent's bus per `docs/aj-next-plan.md`

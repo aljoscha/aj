@@ -30,7 +30,7 @@ use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
 use aj_models::messages::Speed;
-use aj_models::{ModelArgs, create_model};
+use aj_models::registry::ModelRegistry;
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
@@ -55,6 +55,7 @@ use crate::config::theme::{
     Theme, ThemeHandle, chat_theme, editor_border_color_for_thinking, select_list_theme,
     watch_user_theme,
 };
+use crate::model::{ResolvedModel, from_model_info};
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::model_selector::{
@@ -110,51 +111,102 @@ impl InteractiveMode {
             ConfigSpeed::Fast => Speed::Fast,
         });
 
-        let model_args = ModelArgs {
-            api: self
+        // Resolve the model in one of two ways depending on the
+        // `--scripted` flag. The scripted path keeps the legacy
+        // `Arc<dyn Model>` surface (step 6.8 of
+        // `docs/aj-next-progress.md` will port it onto
+        // `ScriptedProvider`); the real-model path goes through the
+        // registry so the binary owns provider dispatch + API key
+        // resolution + speed-driven beta headers, and the agent only
+        // sees the resulting `(Provider, ModelInfo, StreamOptions)`
+        // bundle.
+        //
+        // `current_model_key` keeps `(provider_id, model_id)` around
+        // for the `/model` selector overlay so it can pre-select the
+        // active row when opened and track the swap target on
+        // confirm.
+        let mut agent: Agent;
+        let current_model_key: Arc<std::sync::Mutex<(String, String)>>;
+        if let Some(name) = &self.args.scripted {
+            let model = crate::scripted::resolve_or_explain(name)?;
+            let current_provider = self
                 .args
                 .model_api
                 .clone()
                 .or_else(|| config.model_api.clone())
-                .unwrap_or_else(|| "anthropic".to_string()),
-            url: self
-                .args
-                .model_url
-                .clone()
-                .or_else(|| config.model_url.clone()),
-            model_name: self
-                .args
-                .model_name
-                .clone()
-                .or_else(|| config.model_name.clone()),
-            speed,
-        };
-        // Capture the (provider, id) pair separately from the
-        // constructed handle so the `/model` selector can pre-select
-        // the active row and update it on a successful swap. We
-        // resolve the id post-construction so the captured value
-        // reflects whatever default `create_model` applied when
-        // `model_name` was unset on the CLI / config.
-        let current_provider = model_args.api.clone();
-        let model = if let Some(name) = &self.args.scripted {
-            crate::scripted::resolve_or_explain(name)?
+                .unwrap_or_else(|| crate::model::DEFAULT_PROVIDER_ID.to_string());
+            let current_id = model.model_name();
+            current_model_key = Arc::new(std::sync::Mutex::new((current_provider, current_id)));
+            // ---- Tools (legacy / scripted path) -----------------------
+            let mut tools = get_builtin_tools();
+            if !config.disabled_tools.is_empty() {
+                tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
+            }
+            let env = AgentEnv::new();
+            agent = Agent::new(
+                env,
+                SYSTEM_PROMPT,
+                tools,
+                config.disabled_tools.clone(),
+                Arc::clone(&model),
+                config.thinking,
+            );
         } else {
-            create_model(model_args).context("failed to construct model handle")?
-        };
-        let current_id = model.model_name();
-        let current_model_key = Arc::new(std::sync::Mutex::new((current_provider, current_id)));
+            // Load the registry once at startup; the same handle
+            // also feeds the `/model` selector's model catalog.
+            // `ModelRegistry::load` is cheap (single JSON read) so
+            // the duplication versus `load_model_catalog` below is
+            // not worth deduplicating today.
+            let registry = ModelRegistry::load();
+            let resolved = crate::model::resolve(
+                &registry,
+                self.args
+                    .model_api
+                    .as_deref()
+                    .or(config.model_api.as_deref()),
+                self.args
+                    .model_name
+                    .as_deref()
+                    .or(config.model_name.as_deref()),
+                self.args
+                    .model_url
+                    .as_deref()
+                    .or(config.model_url.as_deref()),
+                speed,
+            )
+            .context("failed to resolve model from registry")?;
+            current_model_key = Arc::new(std::sync::Mutex::new((
+                resolved.model_info.provider.clone(),
+                resolved.model_info.id.clone(),
+            )));
+            // ---- Tools (registry / real-provider path) ----------------
+            let mut tools = get_builtin_tools();
+            if !config.disabled_tools.is_empty() {
+                tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
+            }
+            let env = AgentEnv::new();
+            let ResolvedModel {
+                provider,
+                model_info,
+                stream_options,
+            } = resolved;
+            agent = Agent::with_provider(
+                env,
+                SYSTEM_PROMPT,
+                tools,
+                config.disabled_tools.clone(),
+                provider,
+                model_info,
+                stream_options,
+                config.thinking,
+            );
+        }
 
         // Snapshot the model catalog up-front so the `/model`
         // selector overlay and the editor's argument completer
         // share a single load (registry::load reads JSON twice
         // otherwise — once per consumer).
         let model_catalog = load_model_catalog();
-
-        // ---- Tools -----------------------------------------------------
-        let mut tools = get_builtin_tools();
-        if !config.disabled_tools.is_empty() {
-            tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
-        }
 
         // ---- Conversation log: resume or create -----------------------
         let threads_dir = Config::get_threads_dir_path()?;
@@ -178,16 +230,9 @@ impl InteractiveMode {
             _ => ConversationLog::create(&conversation_persistence)?,
         };
 
-        // ---- Build the agent ------------------------------------------
-        let env = AgentEnv::new();
-        let mut agent = Agent::new(
-            env,
-            SYSTEM_PROMPT,
-            tools,
-            config.disabled_tools.clone(),
-            Arc::clone(&model),
-            config.thinking,
-        );
+        // (The agent was built above alongside the model resolution
+        // step so the legacy / registry split could pick its own
+        // tool list and env. Nothing else to do here.)
 
         // Resolve system prompt: reuse a persisted one (cache-warm
         // resume) or assemble fresh from the env. On a fresh log,
@@ -308,11 +353,8 @@ impl InteractiveMode {
             }));
         }
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
-            footer.set_model(Some(format!(
-                "{} @ {}",
-                agent.model().model_name(),
-                agent.model().model_url()
-            )));
+            let info = agent.model_info();
+            footer.set_model(Some(format!("{} @ {}", info.id, info.base_url)));
             footer.set_cwd(Some(format!("{}", agent.env().working_directory.display())));
         }
 
@@ -1017,26 +1059,28 @@ async fn handle_selector_outcome(
                 None => SelectorPollOutcome::StillOpen(OpenSelector::Model { handle, outcome }),
                 Some(ModelSelectorOutcome::Confirmed(info)) => {
                     tui.hide_overlay(&handle);
-                    // Construct a fresh handle from the picked
-                    // catalog entry. Speed is intentionally left
-                    // unset on selector-driven swaps; users who want
-                    // the Anthropic fast-inference beta pass
+                    // Construct a fresh provider handle from the
+                    // picked catalog entry. Speed is intentionally
+                    // left unset on selector-driven swaps; users who
+                    // want the Anthropic fast-inference beta pass
                     // `--speed fast` at startup (it survives the
                     // swap if they re-pick a model that supports
                     // it; otherwise it silently degrades).
-                    let model_args = ModelArgs {
-                        api: info.provider.clone(),
-                        url: Some(info.base_url.clone()),
-                        model_name: Some(info.id.clone()),
-                        speed: None,
-                    };
-                    match create_model(model_args) {
-                        Ok(model) => {
-                            let new_name = model.model_name();
-                            let new_url = model.model_url();
+                    match from_model_info(info.clone(), None) {
+                        Ok(ResolvedModel {
+                            provider,
+                            model_info,
+                            stream_options,
+                        }) => {
+                            let new_id = model_info.id.clone();
+                            let new_url = model_info.base_url.clone();
                             {
                                 let mut a = agent.lock().await;
-                                a.set_model(Arc::clone(&model));
+                                a.set_provider(
+                                    Arc::clone(&provider),
+                                    Arc::clone(&model_info),
+                                    stream_options,
+                                );
                             }
                             // Track the new key so a re-open of the
                             // selector pre-selects the freshly-
@@ -1053,7 +1097,7 @@ async fn handle_selector_outcome(
                             // turn boundary.
                             if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx())
                             {
-                                footer.set_model(Some(format!("{} @ {}", new_name, new_url)));
+                                footer.set_model(Some(format!("{} @ {}", new_id, new_url)));
                             }
                             SelectorPollOutcome::Closed {
                                 notice: Some(format!(

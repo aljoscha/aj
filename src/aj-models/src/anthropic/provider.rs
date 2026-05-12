@@ -137,7 +137,7 @@ async fn run_stream_inner(
         )
     })?;
 
-    let client = build_client(model, api_key, reasoning);
+    let client = build_client(model, api_key, reasoning, options);
     let request = build_request(model, context, options, reasoning);
 
     if let Some(cb) = options.on_payload.as_ref() {
@@ -181,7 +181,12 @@ async fn run_stream_inner(
 // Client construction
 // ---------------------------------------------------------------------------
 
-fn build_client(model: &ModelInfo, api_key: String, reasoning: Option<&ThinkingLevel>) -> Client {
+fn build_client(
+    model: &ModelInfo,
+    api_key: String,
+    reasoning: Option<&ThinkingLevel>,
+    options: &StreamOptions,
+) -> Client {
     let base_url = if model.base_url.is_empty() {
         None
     } else {
@@ -195,7 +200,35 @@ fn build_client(model: &ModelInfo, api_key: String, reasoning: Option<&ThinkingL
     if reasoning.is_some() && model.reasoning && !supports_adaptive_thinking(model) {
         client = client.with_interleaved_thinking(true);
     }
+    for beta in extra_betas_from_headers(options.headers.as_ref()) {
+        client = client.with_beta(beta);
+    }
     client
+}
+
+/// Extract the per-call `anthropic-beta` values out of
+/// [`StreamOptions::headers`] so they can be merged into the SDK
+/// client's beta list. Comma-separated values are split because that's
+/// the wire format the API accepts when callers stuff several betas
+/// into a single header value. Matching is case-insensitive and
+/// whitespace around each entry is trimmed; empty entries are dropped
+/// silently so a stray trailing comma doesn't poison the request.
+fn extra_betas_from_headers(
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let Some(headers) = headers else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("anthropic-beta") {
+            continue;
+        }
+        for beta in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(beta.to_string());
+        }
+    }
+    out
 }
 
 /// Classify a transport-layer or SDK-surfaced error into the unified
@@ -1696,5 +1729,62 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn extra_betas_from_headers_returns_empty_when_no_headers() {
+        assert!(extra_betas_from_headers(None).is_empty());
+    }
+
+    #[test]
+    fn extra_betas_from_headers_skips_unrelated_keys() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("x-custom-header".into(), "value".into());
+        headers.insert("authorization".into(), "Bearer x".into());
+        assert!(extra_betas_from_headers(Some(&headers)).is_empty());
+    }
+
+    #[test]
+    fn extra_betas_from_headers_extracts_single_beta() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-beta".into(), "fast-mode-2026-02-01".into());
+        let betas = extra_betas_from_headers(Some(&headers));
+        assert_eq!(betas, vec!["fast-mode-2026-02-01".to_string()]);
+    }
+
+    #[test]
+    fn extra_betas_from_headers_splits_comma_separated_values() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-beta".into(), "alpha-1, beta-2 ,gamma-3".into());
+        let betas = extra_betas_from_headers(Some(&headers));
+        assert_eq!(
+            betas,
+            vec![
+                "alpha-1".to_string(),
+                "beta-2".to_string(),
+                "gamma-3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_betas_from_headers_matches_case_insensitively() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("Anthropic-Beta".into(), "mixed-case-1".into());
+        let betas = extra_betas_from_headers(Some(&headers));
+        assert_eq!(betas, vec!["mixed-case-1".to_string()]);
+    }
+
+    #[test]
+    fn extra_betas_from_headers_drops_empty_entries() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("anthropic-beta".into(), ",a,,b,".into());
+        let betas = extra_betas_from_headers(Some(&headers));
+        assert_eq!(betas, vec!["a".to_string(), "b".to_string()]);
     }
 }
