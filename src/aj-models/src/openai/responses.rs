@@ -536,7 +536,7 @@ pub(super) fn user_content_to_input_part(c: &UserContent) -> ResponseInputConten
 /// `AssistantContent` order. Reasoning items deserialize from
 /// `thinking_signature`; text blocks reuse / split message items by
 /// (id, phase); tool calls split the composite `{call_id}|{item_id}`.
-fn append_assistant_message(
+pub(super) fn append_assistant_message(
     api_name: &str,
     m: &AssistantMessage,
     out: &mut Vec<ResponseInputItem>,
@@ -723,8 +723,19 @@ pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<Respo
 /// round-trip suite can replay request bodies through the same parse
 /// path.
 pub fn parse_assistant_input_items(items: &[ResponseInputItem]) -> AssistantMessage {
+    parse_assistant_input_items_with_api(API_NAME, items)
+}
+
+/// Like [`parse_assistant_input_items`] but lets the caller pin the
+/// `api` field on the returned message. Used by sibling providers
+/// (`openai-codex-responses`) that share the Responses wire shape but
+/// have their own api identifier.
+pub(super) fn parse_assistant_input_items_with_api(
+    api_name: &str,
+    items: &[ResponseInputItem],
+) -> AssistantMessage {
     let mut out = AssistantMessage::empty();
-    out.api = API_NAME.to_string();
+    out.api = api_name.to_string();
     for item in items {
         match item {
             ResponseInputItem::Reasoning { .. } => {

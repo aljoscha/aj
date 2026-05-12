@@ -1,0 +1,20 @@
+[
+  {
+    "type": "reasoning",
+    "id": "rs_codex_1",
+    "summary": [
+      {"text": "Planning the response.", "type": "summary_text"}
+    ],
+    "encrypted_content": "codex-opaque",
+    "status": "completed"
+  },
+  {
+    "type": "message",
+    "id": "msg_codex_2",
+    "role": "assistant",
+    "content": [
+      {"type": "output_text", "text": "Result: 1764."}
+    ],
+    "status": "completed"
+  }
+]

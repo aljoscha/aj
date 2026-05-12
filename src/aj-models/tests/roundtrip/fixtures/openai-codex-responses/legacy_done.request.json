@@ -1,0 +1,11 @@
+[
+  {
+    "type": "message",
+    "id": "msg_codex_legacy_1",
+    "role": "assistant",
+    "content": [
+      {"type": "output_text", "text": "Codex legacy frame."}
+    ],
+    "status": "completed"
+  }
+]

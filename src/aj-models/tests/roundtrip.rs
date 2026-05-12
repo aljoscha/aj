@@ -15,7 +15,10 @@
 //!
 //! Each provider gets three test shapes (parse / serialize / semantic
 //! round-trip). Cross-provider directions live in `cross_provider.rs`,
-//! one end-to-end transform test per direction.
+//! one end-to-end transform test per direction. The Codex provider's
+//! suite (`openai_codex_responses.rs`) adds a fourth scenario that
+//! exercises the §7.4.5 event-normalization layer (legacy
+//! `response.done` rewrites).
 
 // Submodules live in a sibling directory matching this file's stem.
 // Default Rust module-path resolution searches the parent of *this*
@@ -32,6 +35,9 @@ mod openai_completions;
 
 #[path = "roundtrip/openai_responses.rs"]
 mod openai_responses;
+
+#[path = "roundtrip/openai_codex_responses.rs"]
+mod openai_codex_responses;
 
 #[path = "roundtrip/cross_provider.rs"]
 mod cross_provider;

@@ -44,7 +44,7 @@ this file is the bridge between the spec and the git history.
       `openai-sdk::Client` got `with_extra_header` to plumb the
       session-correlation headers without forking the streaming
       path.
-- [ ] 8c. Implement OpenAI Codex Responses provider
+- [x] 8c. Implement OpenAI Codex Responses provider
       (`aj-models::openai::codex`) — §7.4. Lands as a new module
       sharing helpers with `aj-models::openai::responses`; wires
       `api: "openai-codex-responses"` into `provider_for`; renames
@@ -305,7 +305,52 @@ this file is the bridge between the spec and the git history.
          `cargo clippy -p aj-models --all-targets` all pass clean
          (only the pre-existing `clone_on_ref_ptr` warnings remain in
          `oauth/anthropic.rs`).
-   - [ ] 8c.v. Round-trip parse / serialize / semantic fixtures.
+   - [x] 8c.v. Round-trip parse / serialize / semantic fixtures.
+         New [`aj_models::openai::codex::assistant_message_to_input_items`],
+         [`parse_assistant_input_items`], and [`replay_sse_events`]
+         helpers expose the Codex-tagged §1.10 round-trip surface so
+         the test suite can replay request bodies through the same
+         parse / serialize path the live provider uses. The helpers
+         delegate to the shared `super::responses` machinery: a new
+         `pub(super) fn append_assistant_message` and
+         `parse_assistant_input_items_with_api(api_name, items)`
+         factor out the api-name-parameterized parse so codex stamps
+         `api = "openai-codex-responses"` on the returned message
+         without duplicating logic; the replay helper wraps the
+         `StreamState::new_with(...)` constructor in a loop that runs
+         every event through `normalize_codex_event` first, surfacing
+         terminal `error` / `response.failed` frames as
+         message-level errors with `stop_reason = Error` and the §10
+         classifier output on `error`.
+
+         **Fixtures.** New `tests/roundtrip/fixtures/openai-codex-responses/`
+         directory ships four scenarios: `text_only`, `thinking_text`,
+         `tool_call` (mirrors the public Responses suite's shapes
+         under the Codex `api` / `provider` identity), plus
+         `legacy_done` — a Codex-specific scenario whose terminal SSE
+         event is `response.done` (the older event name the Codex
+         backend still emits in places) instead of
+         `response.completed`. Each scenario has a hand-crafted `.sse`
+         dump and a `.request.json` golden file. SSE event sequence
+         numbers are dense and start at 0; `usage` carries
+         non-zero `input_tokens` / `output_tokens` so the parse
+         test's assertion on the unified [`Usage`] survives.
+
+         **Test file.** `tests/roundtrip/openai_codex_responses.rs`
+         registers via `roundtrip.rs` and runs the standard
+         parse / serialize / semantic round-trip shape per scenario,
+         plus a fifth `legacy_done_terminator_normalized` test that
+         pins the post-normalization state (`stop_reason: Stop`,
+         `response_id: Some("resp_codex_legacy_1")`, non-zero usage)
+         so a future regression that drops the §7.4.5 rewrite shows
+         up as an explicit fail rather than a subtle stop-reason
+         drift to the state machine's unterminated-stream default.
+         Thirteen new tests in total (4 × {parse, serialize,
+         semantic_roundtrip} + 1 normalization assertion). `cargo
+         build`, `cargo test -p aj-models`, `cargo fmt`, and `cargo
+         clippy -p aj-models --all-targets` all pass clean (only
+         pre-existing `clone_on_ref_ptr` warnings in
+         `oauth/anthropic.rs` remain).
 
 ## Phase 4: Cross-Provider & Utilities
 

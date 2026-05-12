@@ -48,13 +48,13 @@ use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream, Error
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantError, AssistantMessage, Context, ErrorCategory,
-    ReasoningSummary as UnifiedReasoningSummary, SimpleStreamOptions, StopReason, StreamOptions,
-    ThinkingLevel, ToolDefinition,
+    ReasoningSummary as UnifiedReasoningSummary, ServiceTier, SimpleStreamOptions, StopReason,
+    StreamOptions, ThinkingLevel, ToolDefinition,
 };
 
 use super::responses::{
-    CostMultiplierFn, StreamState, convert_messages, error_from_code, map_reasoning_effort,
-    map_service_tier,
+    CostMultiplierFn, StreamState, append_assistant_message, convert_messages, error_from_code,
+    map_reasoning_effort, map_service_tier, parse_assistant_input_items_with_api,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
@@ -599,6 +599,87 @@ fn resolve_codex_service_tier<'a>(
         (Some(s), _) => Some(s),
         (None, Some(r)) => Some(r),
         (None, None) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round-trip helpers (`docs/models-spec.md` §1.10)
+// ---------------------------------------------------------------------------
+
+/// Serialize side of the §1.10 invariant for `openai-codex-responses`:
+/// project an [`AssistantMessage`] onto the typed input items the
+/// Codex endpoint expects on the request side.
+///
+/// Identical wire shape to the public Responses API
+/// ([`super::responses::assistant_message_to_input_items`]), but tagged
+/// with the Codex `api` identifier so cross-model checks in
+/// [`super::responses::append_assistant_message`] see the right
+/// provider identity (a message produced by `openai-codex-responses`
+/// stays "same-provider" when re-serialized through this helper).
+pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<ResponseInputItem> {
+    let mut out = Vec::new();
+    append_assistant_message(API_NAME, message, &mut out);
+    out
+}
+
+/// Inverse of [`assistant_message_to_input_items`]: parse a sequence
+/// of Codex `input` items whose role is `assistant` (plus interleaved
+/// reasoning / function_call items) back into a unified
+/// [`AssistantMessage`] tagged with [`API_NAME`].
+///
+/// Symmetric to the streaming state machine; exposed so the round-trip
+/// suite can replay request bodies through the same parse path.
+pub fn parse_assistant_input_items(items: &[ResponseInputItem]) -> AssistantMessage {
+    parse_assistant_input_items_with_api(API_NAME, items)
+}
+
+/// Replay a sequence of pre-decoded Codex stream events through the
+/// provider's state machine and return the finalized
+/// [`AssistantMessage`]. Each event runs through the §7.4.5
+/// normalization layer first (legacy `response.done` /
+/// `response.incomplete` rewrites, terminal `error` /
+/// `response.failed` events surface as message-level errors), then the
+/// shared §7.3.6 state machine consumes the normalized event under the
+/// Codex API identifier and pricing curve.
+///
+/// Mirror of [`super::responses::replay_sse_events`] for round-trip
+/// tests; the live provider uses the same machinery through
+/// [`run_stream_inner`].
+pub fn replay_sse_events(
+    model: &ModelInfo,
+    events: impl IntoIterator<Item = ResponseStreamEvent>,
+    requested_tier: Option<ServiceTier>,
+) -> AssistantMessage {
+    let mut state = StreamState::new_with(API_NAME, model, requested_tier, CODEX_COST_MULTIPLIER);
+    for ev in events {
+        match normalize_codex_event(ev) {
+            Ok(NormalizedEvent::Forward(ev)) => {
+                let _ = state.process(ev);
+            }
+            Ok(NormalizedEvent::Terminal(ev)) => {
+                let _ = state.process(ev);
+                break;
+            }
+            Err(err) => {
+                // Codex backends sometimes inject a terminal `error`
+                // SSE frame mid-stream; surface it as a finalized
+                // error message so the round-trip suite can assert on
+                // the classified payload without spinning up a full
+                // provider run.
+                let mut error = AssistantMessage::empty();
+                error.api = API_NAME.to_string();
+                error.provider = model.provider.clone();
+                error.model = model.id.clone();
+                error.stop_reason = StopReason::Error;
+                error.error = Some(err);
+                return error;
+            }
+        }
+    }
+    match state.finalize() {
+        AssistantMessageEvent::Done { message, .. }
+        | AssistantMessageEvent::Error { error: message, .. } => message,
+        other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
     }
 }
 

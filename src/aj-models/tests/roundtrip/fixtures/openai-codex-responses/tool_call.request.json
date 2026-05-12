@@ -1,0 +1,19 @@
+[
+  {
+    "type": "message",
+    "id": "msg_codex_tool_1",
+    "role": "assistant",
+    "content": [
+      {"type": "output_text", "text": "Listing the directory."}
+    ],
+    "status": "completed"
+  },
+  {
+    "type": "function_call",
+    "id": "fc_codex_1",
+    "call_id": "call_codex_1",
+    "name": "ls",
+    "arguments": "{\"path\":\"/srv/data\"}",
+    "status": "completed"
+  }
+]
