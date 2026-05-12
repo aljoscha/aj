@@ -90,12 +90,16 @@ enum Status {
     /// dim spinner glyph; the bubble paints with the neutral
     /// pending tint.
     Started,
-    /// The tool finished without flagging an error (we observed
-    /// `ToolExecutionEnd { is_error: false }`). Header shows a
-    /// green check; the bubble paints with the success tint.
+    /// The tool finished and the viewer should read it as a
+    /// success: header shows a green check, the bubble paints
+    /// with the success tint. Maps from `is_error: false` *and*
+    /// (for bash) a zero or unknown exit code. See
+    /// [`derive_status`] for the full rule.
     Succeeded,
-    /// The tool finished with `is_error: true`. Header shows a red
-    /// cross and the bubble paints with the error tint.
+    /// The tool finished and the viewer should read it as a
+    /// failure: header shows a red cross, the bubble paints
+    /// with the error tint. Maps from `is_error: true` or (for
+    /// bash) a non-zero exit code.
     Failed,
 }
 
@@ -181,11 +185,7 @@ impl ToolExecutionComponent {
     /// [`aj_agent::events::AgentEvent::ToolExecutionEnd`].
     pub fn update_result(&mut self, details: &ToolDetails, is_error: bool) {
         self.body = render_details_body(details);
-        self.status = if is_error {
-            Status::Failed
-        } else {
-            Status::Succeeded
-        };
+        self.status = derive_status(details, is_error);
         // The status flip pulls a different bg closure into the
         // box. `set_bg_fn` doesn't invalidate the cache itself;
         // `TextBox::render` compares a sampled application of the
@@ -302,6 +302,37 @@ impl AsRef<dyn Any> for ToolExecutionComponent {
     fn as_ref(&self) -> &(dyn Any + 'static) {
         self
     }
+}
+
+/// Decide which [`Status`] to paint a finalized tool with.
+///
+/// The agent's `is_error` flag is reserved for catastrophic
+/// failures (tool cancellation, timeout, JSON parse errors). It
+/// deliberately does *not* fire for a successful invocation that
+/// happens to return a non-zero exit code: per the bash tool's
+/// contract the model can read the `exit_code` field of the
+/// `ToolDetails::Bash` payload and decide what to do, and we don't
+/// want to second-guess that for the model's input view.
+///
+/// For the *human* viewer, though, a `[exit 1]` line is plainly a
+/// failure and a green ✓ on the same bubble reads wrong. So we
+/// override here: any tool result that carries an explicit non-
+/// zero exit code paints as [`Status::Failed`] regardless of the
+/// agent-side flag. Other variants fall back to `is_error`.
+fn derive_status(details: &ToolDetails, is_error: bool) -> Status {
+    if is_error {
+        return Status::Failed;
+    }
+    if let ToolDetails::Bash {
+        exit_code: Some(code),
+        ..
+    } = details
+    {
+        if *code != 0 {
+            return Status::Failed;
+        }
+    }
+    Status::Succeeded
 }
 
 /// Build a single-line argument summary from the tool's input
@@ -551,6 +582,85 @@ mod tests {
         );
         let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
         assert!(lines.iter().any(|l| l.trim_start().starts_with("✗")));
+    }
+
+    #[test]
+    fn nonzero_bash_exit_code_paints_as_failure_even_without_is_error() {
+        // The bash tool deliberately leaves `is_error: false` on a
+        // non-zero exit so the model can read `exit_code` from the
+        // structured payload and decide for itself; the *visual*
+        // however needs to match what the user sees in the `[exit
+        // N]` footer. Verify the bubble paints with the failure
+        // glyph in that case.
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+        c.update_result(
+            &ToolDetails::Bash {
+                command: "exit 1".into(),
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: Some(1),
+                truncated: false,
+                full_output_path: None,
+            },
+            false,
+        );
+        let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
+        assert!(
+            lines.iter().any(|l| l.trim_start().starts_with("✗")),
+            "expected ✗ glyph in header for non-zero exit; got {lines:?}",
+        );
+    }
+
+    #[test]
+    fn zero_bash_exit_code_still_paints_as_success() {
+        // Don't regress the happy path: a zero exit must keep the
+        // green check even though we now look at exit_code.
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+        c.update_result(
+            &ToolDetails::Bash {
+                command: "echo hi".into(),
+                stdout: "hi\n".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                truncated: false,
+                full_output_path: None,
+            },
+            false,
+        );
+        let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
+        assert!(
+            lines.iter().any(|l| l.trim_start().starts_with("✓")),
+            "expected ✓ glyph in header for zero exit; got {lines:?}",
+        );
+    }
+
+    #[test]
+    fn missing_bash_exit_code_paints_as_success_when_not_flagged() {
+        // Signal-terminated processes (e.g. SIGTERM after a
+        // timeout) leave `exit_code: None`. Those are catastrophic
+        // and the agent already raises `is_error: true` in that
+        // path; with the flag clear we don't second-guess the
+        // tool and keep the success styling.
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+        c.update_result(
+            &ToolDetails::Bash {
+                command: "true".into(),
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+                truncated: false,
+                full_output_path: None,
+            },
+            false,
+        );
+        let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
+        assert!(
+            lines.iter().any(|l| l.trim_start().starts_with("✓")),
+            "expected ✓ glyph in header when exit_code is None and is_error is false; got {lines:?}",
+        );
     }
 
     #[test]
