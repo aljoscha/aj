@@ -15,7 +15,7 @@
 //! See `docs/aj-next-plan.md` §1.1 (event protocol) and §4
 //! (event-pump shape).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
 use aj_agent::types::TokenUsage;
@@ -53,6 +53,18 @@ pub struct EventPump {
     /// stable for the lifetime of the chat session because the
     /// container only ever appends.
     tool_index: HashMap<String, usize>,
+    /// Identifiers of agents that have emitted [`AgentEvent::AgentStart`]
+    /// without a matching [`AgentEvent::AgentEnd`] yet.
+    ///
+    /// Sub-agents share the parent's bus and emit their own
+    /// `AgentStart` / `AgentEnd` pair, so a single main turn that
+    /// spawns sub-agents produces nested events on this listener.
+    /// The set is the refcount that decides when the working
+    /// spinner runs: the loader starts on the 0→1 transition and
+    /// stops on the 1→0 transition, so the spinner is visible for
+    /// the entire span between the *first* `AgentStart` and the
+    /// *last* `AgentEnd`, regardless of how the events nest.
+    running_agents: HashSet<AgentId>,
 }
 
 impl EventPump {
@@ -64,6 +76,7 @@ impl EventPump {
             theme,
             current_assistant: None,
             tool_index: HashMap::new(),
+            running_agents: HashSet::new(),
         }
     }
 
@@ -75,13 +88,52 @@ impl EventPump {
     pub fn handle(&mut self, tui: &mut Tui, event: &AgentEvent) {
         match event {
             // ---- Lifecycle: start / stop the working spinner. ----
-            AgentEvent::AgentStart { .. } => {
-                self.with_loader(tui, |l| l.start());
+            //
+            // Sub-agents share the parent's bus and emit their own
+            // `AgentStart` / `AgentEnd` bracket inside the main
+            // agent's turn, so we can't naively start/stop the
+            // loader on each event — a sub-agent's `AgentEnd` would
+            // otherwise turn the spinner off while the main turn
+            // is still mid-execution, and (worse) leave the
+            // loader's animation pump running unmatched if the
+            // sub-agent's `AgentStart` had already cancelled and
+            // re-spawned it. Track the set of in-flight agents
+            // instead and only start/stop on the boundary
+            // transitions.
+            AgentEvent::AgentStart { agent_id } => {
+                // A top-level `AgentStart(Main)` is a hard resync
+                // point: any state left over from a previous turn
+                // (e.g. a sub-agent whose `AgentEnd` never made it
+                // through because the agent task panicked) would
+                // otherwise pin the loader on forever, so we drop
+                // the stale set before inserting.
+                if *agent_id == AgentId::Main {
+                    self.running_agents.clear();
+                }
+                let was_idle = self.running_agents.is_empty();
+                self.running_agents.insert(*agent_id);
+                if was_idle {
+                    self.with_loader(tui, |l| l.start());
+                }
             }
-            AgentEvent::AgentEnd { .. } => {
-                self.with_loader(tui, |l| l.stop());
-                self.current_assistant = None;
-                self.tool_index.clear();
+            AgentEvent::AgentEnd { agent_id, .. } => {
+                let was_present = self.running_agents.remove(agent_id);
+                if was_present && self.running_agents.is_empty() {
+                    self.with_loader(tui, |l| l.stop());
+                }
+                // Streaming-target and tool-index bookkeeping is
+                // scoped to the main turn: a sub-agent's end
+                // leaves the main agent's pending `agent` tool
+                // call (the one that *invoked* the sub-agent)
+                // mid-flight, so clearing `tool_index` here would
+                // strand the lookup the upcoming
+                // `ToolExecutionEnd` for that call needs. Only
+                // the main agent's `AgentEnd` ends the turn from
+                // the chat-scrollback's perspective.
+                if *agent_id == AgentId::Main {
+                    self.current_assistant = None;
+                    self.tool_index.clear();
+                }
             }
             AgentEvent::TurnStart { .. } => {
                 // Each new turn starts with a fresh assistant
@@ -759,6 +811,274 @@ mod tests {
         assert!(
             joined.contains("\x1b[2m"),
             "row should be wrapped in the dim ANSI escape",
+        );
+    }
+
+    #[test]
+    fn nested_subagent_lifecycle_keeps_loader_running_until_main_ends() {
+        // The loader's only periodic source of `request_render`
+        // calls is its animation pump. If a sub-agent run's
+        // `AgentStart` / `AgentEnd` events drop the loader while
+        // the main turn is still in flight, the user loses the
+        // spinner for the resume — and conversely, an off-by-one
+        // in the lifecycle leaves the pump running indefinitely
+        // and the render loop pegged at the 80 ms tick rate.
+        // Pin the expected behaviour: the loader stays active
+        // through nested events and only stops on the main agent's
+        // `AgentEnd`.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        fn is_loader_active(tui: &mut Tui) -> bool {
+            tui.get_mut_as::<Container>(SlotIndex::Status.idx())
+                .expect("status slot")
+                .get_mut_as::<LoaderStatus>(0)
+                .expect("loader status")
+                .is_active()
+        }
+
+        // Fresh pump: loader is idle.
+        assert!(!is_loader_active(&mut tui));
+
+        // Main turn starts.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        assert!(is_loader_active(&mut tui), "loader should start on main");
+
+        // Sub-agent starts inside the main turn.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        assert!(
+            is_loader_active(&mut tui),
+            "loader should stay active across the sub-agent start",
+        );
+
+        // Sub-agent ends — main is still running.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert!(
+            is_loader_active(&mut tui),
+            "loader must NOT stop on the sub-agent's AgentEnd: \
+             the main turn is still running and the user expects \
+             a spinner during the resume",
+        );
+
+        // Main turn ends.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+        assert!(
+            !is_loader_active(&mut tui),
+            "loader should stop once the main agent ends",
+        );
+    }
+
+    #[test]
+    fn unmatched_subagent_end_does_not_stop_the_loader() {
+        // Defensive: a stray `AgentEnd` event for a sub-agent we
+        // never saw start (in practice this shouldn't happen, but
+        // the bus is the only source of ordering and any
+        // out-of-order event must not leave the loader in a state
+        // that contradicts the main agent's true running status).
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(7),
+                messages: Vec::new(),
+            },
+        );
+        let status = tui
+            .get_mut_as::<Container>(SlotIndex::Status.idx())
+            .expect("status slot");
+        let loader = status.get_mut_as::<LoaderStatus>(0).expect("loader status");
+        assert!(
+            loader.is_active(),
+            "a sub-agent AgentEnd must not stop the loader while \
+             the main agent is still active",
+        );
+    }
+
+    #[test]
+    fn second_main_turn_recovers_loader_after_a_leaked_subagent() {
+        // Defence-in-depth: even if the agent task between two
+        // main turns somehow leaves a sub-agent's `AgentEnd`
+        // unemitted (panic, future cancellation), the next
+        // top-level turn must reset cleanly. The first turn
+        // simulates the leak; the second verifies the loader
+        // start/stop cycle works as expected after.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        fn is_loader_active(tui: &mut Tui) -> bool {
+            tui.get_mut_as::<Container>(SlotIndex::Status.idx())
+                .expect("status slot")
+                .get_mut_as::<LoaderStatus>(0)
+                .expect("loader status")
+                .is_active()
+        }
+
+        // Turn 1: main starts, sub-agent starts, but the sub's
+        // `AgentEnd` never arrives (leak). Main eventually ends.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(3),
+            },
+        );
+        // Note: no AgentEnd(Sub(3)) here.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+        // The leaked sub means the set isn't empty, so the loader
+        // is still on. This is the locally-correct behaviour given
+        // the bus state — the loader doesn't lie about whether
+        // *something* is running. The resync happens on the next
+        // top-level start.
+        assert!(
+            is_loader_active(&mut tui),
+            "loader stays active when the sub's End leaks, until \
+             the next top-level start resyncs",
+        );
+
+        // Turn 2: a fresh `AgentStart(Main)` is the resync point.
+        // The stale Sub(3) is dropped from the set, the new turn
+        // is the only one in flight, and the loader's start /
+        // stop cycle transitions cleanly through it.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        assert!(is_loader_active(&mut tui));
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+        assert!(
+            !is_loader_active(&mut tui),
+            "second main turn must end with the loader stopped — \
+             the previous turn's leaked sub-agent id was discarded \
+             at the new turn's AgentStart",
+        );
+    }
+
+    #[test]
+    fn subagent_end_does_not_clear_main_tool_index() {
+        // Regression: while a sub-agent is running, the main
+        // agent's pending `agent` tool call is still in flight
+        // (the tool body *is* the sub-agent's run). The
+        // `ToolExecutionEnd` for that call lands after the
+        // sub-agent's `AgentEnd`. Clearing `tool_index` on the
+        // sub's `AgentEnd` would strand the lookup; the result
+        // would either silently drop or — through the
+        // build-on-miss fallback in `update_tool_execution_result`
+        // — append a second `ToolExecutionComponent` for the same
+        // call, leaving the original stuck on its `Started`
+        // spinner glyph.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        // Main agent fires the `agent` tool.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        let call_id = "call-agent-1";
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: call_id.to_string(),
+                tool: "agent".to_string(),
+                args: serde_json::json!({"task": "summarise"}),
+            },
+        );
+        let chat_len_after_tool_start = tui
+            .get_mut_as::<Container>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .len();
+
+        // Sub-agent runs and ends, with its `AgentStart` /
+        // `AgentEnd` bracketing.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+
+        // Now the agent-tool's End lands. With the old
+        // `tool_index.clear()`-on-every-End behaviour, the lookup
+        // would miss and a *second* `ToolExecutionComponent`
+        // would be appended; with the fix the existing component
+        // is updated in place and the chat length is unchanged.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: call_id.to_string(),
+                tool: "agent".to_string(),
+                result: aj_agent::tool::ToolDetails::Text {
+                    summary: "summary".into(),
+                    body: "the sub-agent's report".into(),
+                },
+                is_error: false,
+            },
+        );
+        let chat_len_after_tool_end = tui
+            .get_mut_as::<Container>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .len();
+        assert_eq!(
+            chat_len_after_tool_start, chat_len_after_tool_end,
+            "ToolExecutionEnd should update the existing component \
+             in place, not append a second one — the sub-agent's \
+             AgentEnd must not have cleared the main agent's \
+             tool_index",
         );
     }
 }
