@@ -2414,7 +2414,7 @@ session notes for the planning commit.
          `clone_on_ref_ptr` warnings in `oauth/anthropic.rs`
          remain).
 
-- [ ] **6.4: `LegacyProviderAdapter` (internal compat shim).**
+- [x] **6.4: `LegacyProviderAdapter` (internal compat shim).**
        New `aj-models::compat` module (gated on `#[doc(hidden)]`
        and not re-exported from the crate root) housing a
        `LegacyProviderAdapter` that wraps an `Arc<dyn Model>` and
@@ -2425,23 +2425,178 @@ session notes for the planning commit.
        `partial:` slot (the legacy stream doesn't carry coherent
        partials, so the adapter synthesizes them).
 
-       Mapping:
-       - `MessageStart { message }` → `Start { partial }` after
-         seeding the builder with the model/api/provider fields.
-       - `MessageDelta { content_block_index, delta }` →
-         `TextDelta` / `ThinkingDelta` / `ToolCallDelta`
-         depending on the block kind at that index in the
-         builder.
-       - `MessageContentBlockStart` / `MessageContentBlockEnd` →
-         the matching `*Start` / `*End` event variants.
-       - `UsageUpdate { usage }` updates the builder's
-         `usage` field; no separate event.
-       - `FinalizedMessage { message }` →
-         `Done { reason: message.stop_reason, message }`.
-       - `Error { error }` →
-         `Error { reason: classify_error(&error), error: synthesized }`
-         where the synthesized message captures the builder's
-         current state plus the error message.
+       Lands as `src/aj-models/src/compat.rs`, registered via
+       `#[doc(hidden)] pub mod compat;` in `lib.rs`. Public
+       surface: [`LegacyProviderAdapter::new(Arc<dyn Model>)`]
+       and the [`Provider`] impl; everything else is module-
+       private.
+
+       **Stream-side transcoder.** `Transcoder` holds the running
+       `AssistantMessage` partial, the cumulative legacy `Usage`
+       (re-mapped to unified `Usage` on every update so every
+       emitted snapshot stays coherent), the currently-open
+       content-block index, plus `started`/`terminated` flags.
+       `ensure_started` lazily emits the opening
+       [`AssistantMessageEvent::Start`] the first time any event
+       arrives — providers that skip `MessageStart` (notably the
+       legacy OpenAI Chat Completions path, which only emits
+       `TextStart` / `TextUpdate`) still produce a well-formed
+       prelude.
+
+       **Per-event mapping (actual `StreamingEvent` surface).**
+       - `MessageStart { message }` seeds `response_id` from the
+         legacy message id and pre-seeds `partial.usage` from the
+         start-event usage (Anthropic stamps a non-zero usage
+         here). Emits [`Start`] via `ensure_started`.
+       - `UsageUpdate { usage }` applies the cumulative delta
+         via `LegacyUsage::apply_delta` and re-projects onto
+         `partial.usage`. No on-wire event — matches the spec's
+         "usage rides on subsequent partials" contract.
+       - `TextStart` / `TextUpdate` / `TextStop` →
+         [`TextStart`] / [`TextDelta`] / [`TextEnd`], maintaining
+         a single open block index. `TextStart` with non-empty
+         text also emits an immediate [`TextDelta`] so the
+         consumer sees both the open event and the seed bytes
+         (Anthropic streams the first token inside the start
+         event). `TextStop` reconciles the block's accumulated
+         text against the provider's authoritative final string.
+       - `ThinkingStart` / `ThinkingUpdate` / `ThinkingStop` →
+         the [`ThinkingStart`] / [`ThinkingDelta`] / [`ThinkingEnd`]
+         analogues. `ThinkingStop` carries no final text in the
+         legacy protocol; the transcoder pulls the reconciled
+         text from `partial.content[idx]` so the unified
+         [`ThinkingEnd::content`] field stays populated.
+       - `FinalizedMessage { message }` → walks the message's
+         content blocks and synthesises
+         [`ToolCallStart`] / [`ToolCallEnd`] for every
+         `ToolUseBlock` (the legacy protocol has no streaming
+         tool-call events, so every tool call surfaces here),
+         then emits [`Done`] with the rebuilt
+         [`AssistantMessage`]. The final message's identity
+         fields (`api` / `provider` / `model`) come from the
+         caller's `ModelInfo` — the legacy `Message.model` is
+         only consulted for `response_id`. Stop-reason mapping
+         lives in [`map_legacy_stop_reason`]:
+         `EndTurn`/`StopSequence`/`PauseTurn`/`Compaction`/`None`
+         → `(Stop, DoneReason::Stop)`; `MaxTokens` → `Length`;
+         `ToolUse` → `ToolUse`; `Refusal` and
+         `ModelContextWindowExceeded` map to
+         `(Stop, DoneReason::Stop)` since the legacy agent
+         already treated them as ordinary finalized messages.
+       - `Error { error }` → terminal
+         [`AssistantMessageEvent::Error`] with category from
+         [`classify_legacy_api_error`] (AuthenticationError /
+         PermissionError → `Auth`; RateLimitError → `RateLimit`;
+         OverloadedError → `Overloaded`; GatewayTimeoutError →
+         `Transient`; InvalidRequestError / NotFoundError /
+         BillingError → `InvalidRequest`; ApiError → `Unknown`).
+       - `ParseError` / `ProtocolError` → terminal Error with
+         `Transient` category. Legacy semantics were non-fatal
+         diagnostics, but the unified protocol only has terminal
+         Error; surfacing as Transient lets the agent's retry
+         layer treat them as recoverable (same end-user effect as
+         the legacy "log and keep streaming" path, since the
+         next inference re-issues the call).
+       - `ToolUseParseError { id, name, error, raw_data }` →
+         synthesises [`ToolCallStart`] / [`ToolCallEnd`] with
+         `arguments: Value::Null`. The agent's per-tool
+         input-schema validation rejects the null payload at
+         execution time and synthesises an `is_error: true`
+         tool_result, matching the legacy agent's "resurrect
+         tool_use, paired error result" behaviour without
+         needing a dedicated unified event variant.
+
+       **Unterminated streams.** When the legacy stream closes
+       without `FinalizedMessage` or `Error`, the driver
+       synthesises a terminal [`AssistantMessageEvent::Error`]
+       with `Transient` category so consumers awaiting
+       `result()` always see a typed event. Matches the spec
+       contract that the stream terminates with exactly one of
+       `Done` or `Error`.
+
+       **Unified → legacy projection.** Used to feed the wrapped
+       `Model::run_inference_streaming`:
+       - `Message::User` → `MessageParam { role: User }` with
+         `UserContent::Text` → `TextBlock` and
+         `UserContent::Image` → `ImageBlock { source: Base64 }`.
+       - `Message::Assistant` → `MessageParam { role: Assistant }`
+         with `AssistantContent::Text` → `TextBlock` (carrying
+         `text_signature`), `AssistantContent::Thinking` →
+         `ThinkingBlock` / `RedactedThinkingBlock` (selected by
+         the `redacted` flag, signature on
+         `thinking_signature`), `AssistantContent::ToolCall` →
+         `ToolUseBlock`.
+       - `Message::ToolResult` → user-role `MessageParam`
+         carrying a single `ToolResultBlock` whose `content` is
+         `ToolResultContent::Blocks(...)` projected from
+         `UserContent`. Symmetric with the wire format the
+         legacy providers already round-trip on input.
+       - Tools project field-by-field (`name`,
+         `description`, `parameters` → `input_schema`,
+         `r#type: None`).
+       - `SimpleStreamOptions::reasoning` → `ThinkingConfig` via
+         [`map_thinking_level_to_legacy`]: Minimal / Low → Low;
+         Medium → Medium; High → High; XHigh → XHigh. The
+         legacy enum has no Minimal rung; mapping to Low keeps
+         thinking enabled on Anthropic for the smallest-rung
+         case.
+
+       **Identity stamping.** The wrapped `Model::model_name()` /
+       `model_url()` are intentionally ignored: the adapter
+       stamps `api` / `provider` / `model` on every emitted
+       partial / terminal message from the caller's `ModelInfo`,
+       matching how the concrete providers behave. `response_id`
+       is sourced from the legacy message id when non-empty.
+
+       **Spawned task.** The legacy `run_inference_streaming` is
+       async and returns an owned stream; we drive it from a
+       spawned tokio task so [`Provider::stream`] can return
+       synchronously like the real provider impls do. The setup
+       call's `Result<_, ModelError>` is surfaced as an
+       immediate terminal `Error { Transient }` on the consumer
+       stream so callers always see a well-formed stream.
+
+       Ten unit tests cover the surface:
+       - `finalized_text_only_message_emits_start_and_done` pins
+         the Start → Done sequence on a single-text-block
+         finalized message, including stamped identity / usage /
+         response_id round-trip.
+       - `finalized_tool_use_synthesises_tool_call_events`
+         verifies the `ToolCallStart` / `ToolCallEnd`
+         synthesis path and the `DoneReason::ToolUse` /
+         `StopReason::ToolUse` projection.
+       - `streaming_text_deltas_round_trip` exercises
+         `TextStart` / `TextUpdate` / `TextStop` and asserts the
+         partial's running text matches the diffs, plus the
+         terminal `Done` reconciles to the provider's
+         authoritative final text.
+       - `legacy_api_error_maps_to_unified_error` confirms an
+         `OverloadedError` lands on
+         `AssistantMessageEvent::Error` with
+         `ErrorCategory::Overloaded`.
+       - `tool_use_parse_error_synthesises_null_tool_call`
+         covers the parse-error recovery path.
+       - `unterminated_legacy_stream_synthesises_transient_error`
+         pins the safety-net error when the wrapped model
+         closes the stream without a terminal event.
+       - `stream_simple_passes_thinking_to_legacy_model` is a
+         recording-model test confirming the
+         `ThinkingLevel` → `ThinkingConfig` projection reaches
+         the wrapped model.
+       - `tool_result_message_projects_to_user_role_tool_result_block`
+         pins the structural shape of the unified → legacy
+         projection for tool results.
+       - `thinking_round_trip_preserves_signature` exercises
+         both projection directions for thinking content,
+         making sure `thinking_signature` round-trips.
+       - `tool_call_projection_drops_caller_field` pins the
+         caller-field handling on both sides of the projection.
+
+       `cargo build`, `cargo test -p aj-models compat`,
+       `cargo test --workspace`, `cargo fmt`, and
+       `cargo clippy -p aj-models --all-targets` all pass clean
+       (only pre-existing `clone_on_ref_ptr` warnings in
+       `oauth/anthropic.rs` remain — none in `compat.rs`).
 
        The adapter is the bridge that lets step 6.5 (Agent
        runs on `Provider`) land before steps 6.6–6.8 (binary

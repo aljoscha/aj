@@ -9,6 +9,8 @@ use crate::tools::Tool;
 
 pub mod anthropic;
 pub mod auth;
+#[doc(hidden)]
+pub mod compat;
 pub mod errors;
 pub mod messages;
 pub mod oauth;
