@@ -65,19 +65,66 @@ pub struct EventPump {
     /// the entire span between the *first* `AgentStart` and the
     /// *last* `AgentEnd`, regardless of how the events nest.
     running_agents: HashSet<AgentId>,
+    /// Whether new and existing assistant-message components
+    /// should render thinking blocks as a single italic
+    /// `Thinking…` placeholder line instead of the full expanded
+    /// markdown widget. Toggled at runtime by
+    /// [`Self::set_hide_thinking_block`]; see
+    /// `docs/aj-next-plan.md` §4.4.
+    hide_thinking_block: bool,
 }
 
 impl EventPump {
     /// Build a fresh pump bound to the supplied [`ChatTheme`]
     /// (used when constructing assistant / user message
-    /// components on the fly).
-    pub fn new(theme: ChatTheme) -> Self {
+    /// components on the fly). `hide_thinking_block` is the
+    /// initial mode for the thinking channel; the host loads it
+    /// from `~/.aj/config.toml` (`hide_thinking_block` key) on
+    /// startup and can flip it at runtime via
+    /// [`Self::set_hide_thinking_block`].
+    pub fn new(theme: ChatTheme, hide_thinking_block: bool) -> Self {
         Self {
             theme,
             current_assistant: None,
             tool_index: HashMap::new(),
             running_agents: HashSet::new(),
+            hide_thinking_block,
         }
+    }
+
+    /// Current thinking-block render mode. Exposed so the host's
+    /// `Ctrl+T` handler can flip the state without first reading
+    /// it back through a separate getter.
+    pub fn hide_thinking_block(&self) -> bool {
+        self.hide_thinking_block
+    }
+
+    /// Update the thinking-block render mode for this session.
+    ///
+    /// Updates the pump's own flag so freshly-created assistant
+    /// message components pick up the new mode, then walks every
+    /// existing child of the chat container and calls
+    /// [`AssistantMessageComponent::set_hide_thinking_block`] on
+    /// each one so the next render reflects the new mode for both
+    /// finalized history and any in-flight streaming message.
+    /// Finally invalidates the TUI's cached render output so the
+    /// next paint actually picks the change up — without this the
+    /// chat container would re-emit its memoised lines from
+    /// before the toggle.
+    pub fn set_hide_thinking_block(&mut self, tui: &mut Tui, hide: bool) {
+        if self.hide_thinking_block == hide {
+            return;
+        }
+        self.hide_thinking_block = hide;
+        if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
+            for i in 0..chat.len() {
+                if let Some(msg) = chat.get_mut_as::<AssistantMessageComponent>(i) {
+                    msg.set_hide_thinking_block(hide);
+                }
+            }
+        }
+        tui.invalidate();
+        tui.request_render();
     }
 
     /// Dispatch one [`AgentEvent`] onto `tui`'s slot tree. Returns
@@ -336,7 +383,7 @@ impl EventPump {
         if let Some(idx) = self.current_assistant {
             return idx;
         }
-        let component = AssistantMessageComponent::new(self.theme.markdown.clone());
+        let component = AssistantMessageComponent::new(&self.theme, self.hide_thinking_block);
         let idx = self.push_chat_child(tui, Box::new(component));
         self.current_assistant = Some(idx);
         idx
@@ -623,7 +670,7 @@ mod tests {
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
         build_layout(&mut tui, &theme);
         let chat = chat_theme(&theme);
-        let pump = EventPump::new(chat.clone());
+        let pump = EventPump::new(chat.clone(), false);
         (tui, pump, chat)
     }
 

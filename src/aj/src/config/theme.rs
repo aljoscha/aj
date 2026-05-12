@@ -1150,6 +1150,13 @@ pub struct ChatTheme {
     /// Foreground / styling theme passed to every [`aj_tui::components::markdown::Markdown`]
     /// widget the chat renders.
     pub markdown: MarkdownTheme,
+    /// Foreground colour applied to thinking-channel content.
+    /// Drives both the expanded mode (the [`aj_tui::components::markdown::Markdown`]
+    /// widget's [`aj_tui::components::markdown::DefaultTextStyle::color`])
+    /// and the collapsed-mode `Thinking…` placeholder line. Sharing
+    /// one closure keeps the two render paths visually consistent
+    /// and makes a theme reload reskin both at once.
+    pub thinking_text: Arc<dyn Fn(&str) -> String>,
     /// Background-paint closure for the user-message bubble. Wraps
     /// each rendered row through [`Theme::bg`] with the
     /// [`ThemeBg::UserMessageBg`] palette token so the bubble's
@@ -1183,6 +1190,7 @@ pub struct ChatTheme {
 pub fn chat_theme(theme: &ThemeHandle) -> ChatTheme {
     ChatTheme {
         markdown: markdown_theme(theme),
+        thinking_text: theme.fg_closure(ThemeColor::ThinkingText),
         user_message_bg: theme.bg_closure(ThemeBg::UserMessageBg),
         tool_pending_bg: theme.bg_closure(ThemeBg::ToolPendingBg),
         tool_success_bg: theme.bg_closure(ThemeBg::ToolSuccessBg),

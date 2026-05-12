@@ -256,6 +256,7 @@ pub enum ConfigError {
 /// thinking = "low"
 /// theme = "dark"
 /// disabled_tools = ["todo_read", "todo_write"]
+/// hide_thinking_block = false
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
@@ -278,6 +279,12 @@ pub struct Config {
     /// available to the agent.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Replace expanded thinking blocks with a single italic
+    /// "Thinking…" placeholder line in the interactive TUI.
+    /// Defaults to `false` (expanded). Toggled at runtime with
+    /// `Ctrl+T`; see `docs/aj-next-plan.md` §4.4.
+    #[serde(default)]
+    pub hide_thinking_block: bool,
 }
 
 /// Inference speed mode set in `config.toml` (Anthropic only).
@@ -529,6 +536,22 @@ disabled_tools = ["todo_read", "todo_write"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.disabled_tools, vec!["todo_read", "todo_write"]);
+    }
+
+    #[test]
+    fn test_config_deserialize_hide_thinking_block_default() {
+        let config: Config = toml::from_str("").unwrap();
+        // Defaults to `false` so a user with no entry in their
+        // `config.toml` keeps seeing the verbose expanded thinking
+        // blocks they get today.
+        assert!(!config.hide_thinking_block);
+    }
+
+    #[test]
+    fn test_config_deserialize_hide_thinking_block_explicit() {
+        let toml_str = "hide_thinking_block = true\n";
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.hide_thinking_block);
     }
 
     #[test]
