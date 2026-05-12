@@ -38,6 +38,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+pub mod demos;
+
 use crate::provider::Provider;
 use crate::registry::ModelInfo;
 use crate::streaming::{

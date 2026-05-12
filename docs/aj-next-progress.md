@@ -2341,7 +2341,7 @@ session notes for the planning commit.
          clippy -p aj-models --all-targets` all pass (only
          pre-existing `clone_on_ref_ptr` warnings in
          `oauth/anthropic.rs` remain).
-   - [ ] 6.3.ii. Port the 9 named demos from
+   - [x] 6.3.ii. Port the 9 named demos from
          `scripted/demos.rs` (`thinking-basic`, `thinking-long`,
          `thinking-then-tool`, `interleaved`, `tool-error`,
          `protocol-error`, `tool-use-parse-error`,
@@ -2353,6 +2353,66 @@ session notes for the planning commit.
          binary call site. Add a `catalog_demos_are_well_formed`
          test mirroring the legacy one (every demo non-empty,
          last step is `Done` or `Error`).
+
+         Lands as `src/aj-models/src/scripted/provider/demos.rs`,
+         registered via `pub mod demos;` inside `provider.rs`.
+         Each demo builds its per-inference scripts via
+         [`ScriptBuilder`] threaded through a small `builder()`
+         helper that stamps the `scripted` / `scripted` /
+         `scripted` identity tuple and the default `TEXT_CHUNK = 8`
+         / `CHUNK_MS = 25` chunking onto the running partial. Text
+         blocks ride on the builder defaults; thinking blocks use
+         the `_chunked` variants to drop the chunk size to
+         `THINKING_CHUNK = 6` (smaller chunks stress the
+         collapsible-thinking widget's live update path);
+         tool-call blocks use `tool_call_block_chunked(..., 0,
+         Duration::ZERO)` to emit a single delta carrying the
+         full serialized arguments (matches the legacy demos'
+         "single tool_use event" shape so the rendering compares
+         apples-to-apples). Section breaks between thinking →
+         text or text → tool_use ride on `builder().delay(...)`
+         which schedules a one-shot 200 ms pre-emit delay on the
+         next step.
+
+         Translation rules between protocols:
+         - Legacy `StopReason::EndTurn` → [`DoneReason::Stop`].
+         - Legacy `StopReason::ToolUse` → [`DoneReason::ToolUse`].
+         - Legacy `StreamingEvent::ProtocolError { error }` mid-
+           stream + `FinalizedMessage` → terminal
+           [`AssistantMessageEvent::Error`] with
+           [`ErrorReason::Error`] and an
+           [`AssistantError`]`(ErrorCategory::Transient, ...)`
+           payload. The unified protocol's terminal-event
+           contract means the demo's preamble text comes through
+           in the partial captured on the Error event; the
+           agent's retry layer in 6.5 will treat the transient
+           category as recoverable (same end-user effect as the
+           legacy non-terminal protocol error).
+         - Legacy `StreamingEvent::ToolUseParseError` → a regular
+           tool-call block with `Value::Null` arguments. The
+           unified protocol carries no dedicated parse-error
+           event; the bash tool's input-schema validation rejects
+           the null payload at execution time and the agent
+           synthesizes an `is_error: true` tool result (same
+           rendering path as the legacy demo).
+
+         Four tests cover the module:
+         `catalog_demos_are_well_formed` (every demo non-empty,
+         every script ends in `Done` or `Error` — covers all
+         scripts within a multi-script demo, not just the last,
+         which is slightly stronger than the legacy test);
+         `lookup_returns_some_for_known_names`;
+         `lookup_returns_none_for_unknown`;
+         `catalog_names_match_legacy_demo_set` (asserts the new
+         catalog has the exact same name vector as
+         `scripted::demos::names()` so a future drift between
+         the two surfaces shows up immediately — relevant until
+         6.8 swaps the binary resolver and 6.9 deletes the
+         legacy library). `cargo build`, `cargo fmt`, `cargo
+         test -p aj-models`, and `cargo clippy -p aj-models
+         --all-targets` all pass clean (only the pre-existing
+         `clone_on_ref_ptr` warnings in `oauth/anthropic.rs`
+         remain).
 
 - [ ] **6.4: `LegacyProviderAdapter` (internal compat shim).**
        New `aj-models::compat` module (gated on `#[doc(hidden)]`
