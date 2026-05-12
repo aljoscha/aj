@@ -2504,17 +2504,56 @@ end-to-end design above. Pick the next unchecked box.
       clean (only the pre-existing `clone_on_ref_ptr` warnings
       remain in `aj-agent` / `aj-models` / `aj-tools`).
 
-- [ ] **Step 4: Replay reads `details` (with legacy fallback).**
-      Update `aj_session::replay::ReplayState::project_user` (the
-      site that synthesizes `AgentEvent::ToolExecutionEnd { result:
-      ToolDetails::Text { ... } }` from the wire content) to read
-      the persisted `details` field if present and project it onto
-      the event directly. When the field is absent (legacy logs),
-      keep today's `ToolDetails::Text { summary: tool_name, body:
-      result_text }` synthesis as the fallback. The synthetic
-      `ToolExecutionStart` emitted today by `project_user`
-      continues to provide the args header; new logs with details
-      just get a richer body on top.
+- [x] **Step 4: Replay reads `details` (with legacy fallback).**
+      [`aj_session::replay::ReplayState::project_user`] now takes
+      an `Option<&HashMap<String, ToolDetails>>` alongside the wire
+      `content` slice and, for each [`ToolResultBlock`], uses
+      `details.and_then(|map| map.get(tool_use_id)).cloned()` as the
+      payload for the synthesized [`AgentEvent::ToolExecutionEnd`]
+      event. When `details` is `None` (legacy
+      [`ConversationEntryKind::Message`] user-role entries) or the
+      map lacks an entry for a given `tool_use_id` (e.g. the
+      repair-on-resume walker's empty-map writes, or a future
+      partial-details producer), the projection falls back to the
+      pre-Step-4 text-only [`ToolDetails::Text { summary: tool_name,
+      body: content.text() }`] synthesis so the renderer still has
+      something to paint. The synthetic [`ToolExecutionStart`]
+      continues to ship the args header captured from the preceding
+      assistant turn's `tool_use` block; new logs with structured
+      details just get a richer body on the matching End event.
+
+      Three tests cover the new behaviour in
+      `aj-session::replay::tests`:
+      - `replay_projects_persisted_tool_details_on_resume` writes a
+        structured tool-result entry with two
+        distinct [`ToolDetails`] variants ([`Diff`] for an
+        edit_file-style call, [`Bash`] for a bash-style call) in a
+        single batch and asserts each End event surfaces the
+        persisted payload verbatim — pinning the
+        tool_use_id-keyed lookup so the map isn't collapsed to its
+        first or last entry.
+      - `replay_falls_back_to_text_for_tool_use_ids_missing_from_details`
+        writes an entry with a partially-populated `details` map
+        (one `tool_use_id` has a [`Diff`] payload, the other has
+        nothing) and asserts the missing entry falls through to
+        the text-only synthesis with the wire body and the
+        resolved tool name as the summary.
+      - `replay_projects_structured_tool_result_entries_as_user_thread_events`
+        (renamed comment, same body) keeps pinning the empty-map
+        fallback path used by the repair walker.
+
+      The legacy [`Role::User`] tool-result message path passes
+      `None` as the `details` argument from
+      [`ReplayState::project_entry`], so its byte-for-byte
+      behaviour is preserved — the existing
+      `replay_projects_assistant_thinking_text_and_tool_results`
+      and `replay_falls_back_when_tool_use_id_is_not_tracked`
+      tests continue to pass without modification.
+
+      `cargo build`, `cargo test -p aj-session`, `cargo fmt`, and
+      `cargo clippy -p aj-session --all-targets` all pass clean
+      (only the pre-existing `clone_on_ref_ptr` warnings remain
+      in `aj-agent`).
 
 - [ ] **Step 5: End-to-end replay-vs-live parity test.** A test in
       `src/aj/` that runs a tool-call turn live (bash, edit_file,

@@ -107,24 +107,28 @@ impl ReplayState {
             }
             ConversationEntryKind::Message(msg) => match msg.role {
                 Role::Assistant => self.project_assistant(agent_id, &msg.content, out),
-                Role::User => self.project_user(agent_id, &msg.content, out),
+                // Legacy user-role messages predate the structured
+                // [`ConversationEntryKind::ToolResult`] variant and
+                // never carry a `details` map on disk, so the
+                // synthesized text-only [`ToolDetails::Text`]
+                // fallback inside `project_user` is the only
+                // payload available to the renderer here.
+                Role::User => self.project_user(agent_id, &msg.content, None, out),
             },
-            ConversationEntryKind::ToolResult { content, .. } => {
-                // For now, project the same way the legacy
-                // [`Role::User`] tool-result message path does: walk
-                // the wire `content` and synthesize a Start/End
-                // pair per `ToolResultBlock` falling back to a
-                // `ToolDetails::Text` body. The structured `details`
-                // map on the entry is intentionally ignored here —
-                // it lands as a follow-up commit that upgrades
-                // [`project_user`] to read the persisted details
-                // off [`ConversationEntryKind::ToolResult`] entries
-                // and project them onto
-                // [`AgentEvent::ToolExecutionEnd::result`]
-                // directly. Today's bridging mirrors the legacy
-                // behaviour byte-for-byte so this commit is a
-                // pure additive shape change.
-                self.project_user(agent_id, content, out);
+            ConversationEntryKind::ToolResult { content, details } => {
+                // Structured tool-result entries ship the per-call
+                // [`ToolDetails`] payload alongside the wire content
+                // (see `add_tool_result` in `aj_session::log`).
+                // Threading the map through `project_user` lets
+                // each [`ToolResultBlock`] pull its structured
+                // result keyed by `tool_use_id`; missing entries
+                // (or empty maps from callers that didn't have
+                // structured details to ship, e.g. the
+                // repair-on-resume walker that synthesizes
+                // interrupted tool-call markers) keep the
+                // text-only synthesis as the fallback so legacy
+                // logs still render.
+                self.project_user(agent_id, content, Some(details), out);
             }
             ConversationEntryKind::UserOutput(output) => {
                 project_user_output(agent_id, output, out);
@@ -184,10 +188,21 @@ impl ReplayState {
     /// the renderer can paint the user-input pane. Anything else
     /// (images, documents) is currently not user-rendered on
     /// resume.
+    ///
+    /// `details` is `Some` for structured
+    /// [`ConversationEntryKind::ToolResult`] entries and `None` for
+    /// legacy user-role [`ConversationEntryKind::Message`] entries
+    /// that predate the structured shape. When supplied, the
+    /// payload for the `ToolExecutionEnd` event is taken from the
+    /// map keyed by `tool_use_id`; entries missing from the map
+    /// (e.g. an empty map from the repair walker) keep the
+    /// text-only synthesis off the wire content so the renderer
+    /// still has something to paint.
     fn project_user(
         &self,
         agent_id: AgentId,
         content: &[ContentBlockParam],
+        details: Option<&HashMap<String, ToolDetails>>,
         out: &mut Vec<AgentEvent>,
     ) {
         for block in content {
@@ -221,15 +236,26 @@ impl ReplayState {
                     tool: tool_name.clone(),
                     args,
                 });
-                let body = content.text();
+                // Prefer the persisted structured details payload
+                // when the entry shipped one; fall back to a
+                // text-only synthesis off the wire content for
+                // legacy logs (or for tool_use_ids the producer
+                // never recorded details for). This is what lets
+                // a resumed session render diffs, bash exit codes,
+                // todo snapshots, and sub-agent reports the same
+                // way a live run does.
+                let result = details
+                    .and_then(|map| map.get(tool_use_id))
+                    .cloned()
+                    .unwrap_or_else(|| ToolDetails::Text {
+                        summary: tool_name.clone(),
+                        body: content.text(),
+                    });
                 out.push(AgentEvent::ToolExecutionEnd {
                     agent_id,
                     call_id: tool_use_id.clone(),
-                    tool: tool_name.clone(),
-                    result: ToolDetails::Text {
-                        summary: tool_name,
-                        body,
-                    },
+                    tool: tool_name,
+                    result,
                     is_error: *is_error,
                 });
             }
@@ -726,14 +752,16 @@ mod tests {
 
     #[test]
     fn replay_projects_structured_tool_result_entries_as_user_thread_events() {
-        // The new [`ConversationEntryKind::ToolResult`] variant must
-        // project onto the same Start/End event pair that the
-        // legacy [`Role::User`] tool-result message path produces,
-        // so renderers don't see a regression while the structured
-        // `details` projection hasn't landed yet. The follow-up
-        // commit upgrades this projection to use the persisted
-        // `details` map; until then the bridging shape uses the
-        // text body off the wire content.
+        // The structured [`ConversationEntryKind::ToolResult`] variant
+        // must project onto the same Start/End event pair that the
+        // legacy [`Role::User`] tool-result message path produces.
+        // This test pins the empty-`details` fallback: callers that
+        // didn't have structured details to ship (e.g. the
+        // repair-on-resume walker that synthesizes interrupted
+        // tool-call markers) get a text-only synthesis off the wire
+        // content instead, so the renderer still has something to
+        // paint. The non-empty-details path is covered separately
+        // by `replay_projects_persisted_tool_details_on_resume`.
         let dir = fresh_threads_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -754,17 +782,16 @@ mod tests {
                     content: ToolResultContent::Text("pong".into()),
                     is_error: false,
                 }],
-                std::collections::HashMap::new(),
+                HashMap::new(),
             )
             .expect("structured tool result");
         }
 
         let events: Vec<AgentEvent> = replay(&log).collect();
         // Walk the events list to find the synthesized
-        // ToolExecutionStart/End pair for `tu-1`. Existence and
-        // labeling are all that's required at this layer; the
-        // structured-details upgrade tests live with the follow-up
-        // commit.
+        // ToolExecutionStart/End pair for `tu-1`. With an empty
+        // `details` map the End event falls back to a `Text` body
+        // off the wire content (the assertion below).
         let start = events
             .iter()
             .find(|e| matches!(e, AgentEvent::ToolExecutionStart { call_id, .. } if call_id == "tu-1"))
@@ -792,14 +819,256 @@ mod tests {
             } => {
                 assert_eq!(tool, "ping");
                 assert!(!is_error);
-                // Step 2's projection still falls back to a text body
-                // off the wire content. Step 4 upgrades this to read
-                // the persisted structured `details` payload.
+                // Empty `details` map: text-only synthesis off the
+                // wire content.
                 match result {
                     ToolDetails::Text { body, .. } => assert_eq!(body, "pong"),
                     other => panic!("expected Text fallback, got {other:?}"),
                 }
             }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn replay_projects_persisted_tool_details_on_resume() {
+        // When the producer (the agent's persistence listener)
+        // shipped structured [`ToolDetails`] alongside the wire
+        // content, replay must surface that payload on the
+        // synthesized [`AgentEvent::ToolExecutionEnd`] event so a
+        // resumed session renders diffs, bash exit codes, todo
+        // snapshots, and sub-agent reports the same way a live run
+        // does. This is the core of Step 4 of the resume-fidelity
+        // follow-up plan.
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("edit it".into())])
+                .expect("u");
+            // Two tool calls in one assistant batch: one with a
+            // structured `Diff` detail (mirroring write_file /
+            // edit_file), one with a `Bash` detail (mirroring the
+            // bash tool). Exercising two distinct ToolDetails
+            // variants in the same batch pins the
+            // tool_use_id-keyed lookup so we don't accidentally
+            // collapse to the first or last entry.
+            view.add_assistant_message(vec![
+                ContentBlockParam::ToolUseBlock {
+                    id: "tu-edit".into(),
+                    name: "edit_file".into(),
+                    input: json!({"path": "/tmp/x", "old_string": "a", "new_string": "b"}),
+                    caller: None,
+                },
+                ContentBlockParam::ToolUseBlock {
+                    id: "tu-bash".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "echo hi"}),
+                    caller: None,
+                },
+            ])
+            .expect("a");
+
+            let mut details = HashMap::new();
+            details.insert(
+                "tu-edit".into(),
+                ToolDetails::Diff {
+                    path: "/tmp/x".into(),
+                    before: "a".into(),
+                    after: "b".into(),
+                },
+            );
+            details.insert(
+                "tu-bash".into(),
+                ToolDetails::Bash {
+                    command: "echo hi".into(),
+                    stdout: "hi\n".into(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    truncated: false,
+                    full_output_path: None,
+                },
+            );
+
+            view.add_tool_result(
+                vec![
+                    ContentBlockParam::ToolResultBlock {
+                        tool_use_id: "tu-edit".into(),
+                        content: ToolResultContent::Text("edited".into()),
+                        is_error: false,
+                    },
+                    ContentBlockParam::ToolResultBlock {
+                        tool_use_id: "tu-bash".into(),
+                        content: ToolResultContent::Text("hi".into()),
+                        is_error: false,
+                    },
+                ],
+                details,
+            )
+            .expect("structured tool result with details");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+
+        // Find both End events and verify each carries the
+        // persisted `ToolDetails` variant verbatim, not the
+        // text-only fallback.
+        let edit_end = events
+            .iter()
+            .find(
+                |e| matches!(e, AgentEvent::ToolExecutionEnd { call_id, .. } if call_id == "tu-edit"),
+            )
+            .expect("ToolExecutionEnd for tu-edit");
+        match edit_end {
+            AgentEvent::ToolExecutionEnd { tool, result, .. } => {
+                assert_eq!(tool, "edit_file");
+                match result {
+                    ToolDetails::Diff {
+                        path,
+                        before,
+                        after,
+                    } => {
+                        assert_eq!(path, "/tmp/x");
+                        assert_eq!(before, "a");
+                        assert_eq!(after, "b");
+                    }
+                    other => {
+                        panic!("expected persisted Diff details on resume, got {other:?}")
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        let bash_end = events
+            .iter()
+            .find(
+                |e| matches!(e, AgentEvent::ToolExecutionEnd { call_id, .. } if call_id == "tu-bash"),
+            )
+            .expect("ToolExecutionEnd for tu-bash");
+        match bash_end {
+            AgentEvent::ToolExecutionEnd { tool, result, .. } => {
+                assert_eq!(tool, "bash");
+                match result {
+                    ToolDetails::Bash {
+                        command,
+                        stdout,
+                        exit_code,
+                        ..
+                    } => {
+                        assert_eq!(command, "echo hi");
+                        assert_eq!(stdout, "hi\n");
+                        assert_eq!(*exit_code, Some(0));
+                    }
+                    other => {
+                        panic!("expected persisted Bash details on resume, got {other:?}")
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn replay_falls_back_to_text_for_tool_use_ids_missing_from_details() {
+        // A structured [`ConversationEntryKind::ToolResult`] entry
+        // can carry a `details` map that's partially populated —
+        // e.g. one block has structured details, another doesn't
+        // (the producer might have failed to capture the details
+        // for some calls, or this might be a future repair walker
+        // synthesizing partial entries). For every `tool_use_id`
+        // missing from the map, the projection must fall back to
+        // a text-only synthesis off the wire content so the
+        // renderer still has something to paint. Pinning this
+        // guarantees we never drop a tool result on the floor
+        // just because the structured payload is incomplete.
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
+                .expect("u");
+            view.add_assistant_message(vec![
+                ContentBlockParam::ToolUseBlock {
+                    id: "tu-with".into(),
+                    name: "edit_file".into(),
+                    input: json!({"path": "/tmp/y"}),
+                    caller: None,
+                },
+                ContentBlockParam::ToolUseBlock {
+                    id: "tu-without".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "/tmp/z"}),
+                    caller: None,
+                },
+            ])
+            .expect("a");
+
+            // Only `tu-with` has structured details; `tu-without`
+            // exercises the fallback.
+            let mut details = HashMap::new();
+            details.insert(
+                "tu-with".into(),
+                ToolDetails::Diff {
+                    path: "/tmp/y".into(),
+                    before: "old".into(),
+                    after: "new".into(),
+                },
+            );
+
+            view.add_tool_result(
+                vec![
+                    ContentBlockParam::ToolResultBlock {
+                        tool_use_id: "tu-with".into(),
+                        content: ToolResultContent::Text("edited".into()),
+                        is_error: false,
+                    },
+                    ContentBlockParam::ToolResultBlock {
+                        tool_use_id: "tu-without".into(),
+                        content: ToolResultContent::Text("file body".into()),
+                        is_error: false,
+                    },
+                ],
+                details,
+            )
+            .expect("structured tool result with mixed details");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+
+        // tu-with: structured Diff comes through.
+        let with_end = events
+            .iter()
+            .find(
+                |e| matches!(e, AgentEvent::ToolExecutionEnd { call_id, .. } if call_id == "tu-with"),
+            )
+            .expect("ToolExecutionEnd for tu-with");
+        match with_end {
+            AgentEvent::ToolExecutionEnd { result, .. } => match result {
+                ToolDetails::Diff { .. } => {}
+                other => panic!("expected structured Diff for tu-with, got {other:?}"),
+            },
+            _ => unreachable!(),
+        }
+
+        // tu-without: text-only fallback, body matches the wire
+        // content, summary matches the resolved tool name.
+        let without_end = events
+            .iter()
+            .find(
+                |e| matches!(e, AgentEvent::ToolExecutionEnd { call_id, .. } if call_id == "tu-without"),
+            )
+            .expect("ToolExecutionEnd for tu-without");
+        match without_end {
+            AgentEvent::ToolExecutionEnd { result, .. } => match result {
+                ToolDetails::Text { summary, body } => {
+                    assert_eq!(summary, "read_file");
+                    assert_eq!(body, "file body");
+                }
+                other => panic!("expected Text fallback for tu-without, got {other:?}"),
+            },
             _ => unreachable!(),
         }
     }
