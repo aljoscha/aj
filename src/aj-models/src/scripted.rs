@@ -43,6 +43,7 @@ use crate::tools::Tool;
 use crate::{Model, ModelError, ThinkingConfig};
 
 pub mod demos;
+pub mod provider;
 
 /// A single streaming event with an optional pre-emit delay.
 #[derive(Clone, Debug)]

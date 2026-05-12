@@ -2226,39 +2226,43 @@ then delete the corpses. Audit details (line numbers, call sites,
 import paths) are summarized inline; full audit is in the
 session notes for the planning commit.
 
-- [ ] **6.1: Anthropic provider off `crate::messages`.** Migrate
-       `aj-models::anthropic::provider` to operate on
-       `aj_models::types::*` exclusively. Today's provider imports
-       `MessageParam`, `ContentBlockParam`, `Role`, etc. at
-       `provider.rs:13` and threads them through the wire encoder
-       (lines 284, 285, 302, 319, 321, 344, 388, 399, 417, 444,
-       600, 603); each of those sites converts to or from
-       `aj_models::types::Message` instead. The provider's public
-       API (the `Provider` trait method) doesn't change — the
-       conversions are internal. Round-trip tests in
-       `tests/roundtrip/anthropic.rs` must pass unchanged. Adds
-       a `aj_models::types::message_param_to_message` /
-       `message_to_message_param` private helper for the
-       conversion; the tagged-union `Message::{User, Assistant,
-       ToolResult}` shape maps cleanly onto our flat
-       `MessageParam { role, content }` via a role-discriminator
-       switch (assistant blocks → `AssistantMessage`, user-role
-       tool_result blocks → one `Message::ToolResult` per
-       `tool_use_id`, everything else → `UserMessage`).
+- [x] **6.1: Anthropic provider off `crate::messages`.** Already
+       complete on arrival at Phase 6 — the Anthropic provider was
+       written against `aj_models::types::*` from the initial
+       implementation (commit `130d40e`). The provider's
+       `convert_messages`, `convert_user_message`,
+       `convert_assistant_message`, etc. take and return unified
+       `aj_models::types::Message` / `AssistantMessage` /
+       `UserMessage` shapes; the only `MessageParam` /
+       `ContentBlockParam` / `Role` imports in
+       `aj-models/src/anthropic/provider.rs` come from the
+       `anthropic_sdk::messages` wire crate, not from
+       `crate::messages`. No `crate::messages::*` references exist
+       anywhere in the provider file (`rg "crate::messages"
+       src/aj-models/src/anthropic/provider.rs` returns empty). The
+       round-trip suite (`cargo test -p aj-models --test roundtrip`,
+       50 tests) passes clean. The plan's audit referenced the
+       SDK-side `anthropic_sdk::messages::MessageParam` import; that
+       boundary is the right shape (`Provider` trait surface uses
+       `types::*`, internals convert to/from the SDK's wire types)
+       and matches `docs/models-spec.md` §6.2. The conversion
+       helpers the plan suggested (`message_param_to_message` /
+       `message_to_message_param`) aren't needed because the
+       provider works on the unified types directly without any
+       crate-level `MessageParam` intermediary.
 
-- [ ] **6.2: OpenAI providers off `crate::messages`.** Same
-       migration for `openai::completions`, `openai::responses`,
-       and `openai::codex`. The three OpenAI providers share a
-       lot of conversion code through `pub(super)` helpers (most
-       of which sit in `responses.rs`); touch all three together
-       in one commit to avoid leaving a half-migrated `super`
-       boundary inside the `openai` module. Round-trip suites in
-       `tests/roundtrip/openai*.rs` (chat completions, responses,
-       codex responses, cross-provider transforms) must pass
-       unchanged. The `transform.rs` module also imports from
-       `crate::messages::` — flip those imports in the same
-       commit (it's a single-file rewrite using the helpers from
-       6.1).
+- [x] **6.2: OpenAI providers off `crate::messages`.** Same story
+       as 6.1. All three OpenAI providers
+       (`openai::completions`, `openai::responses`,
+       `openai::codex`) and `transform.rs` were written against
+       `aj_models::types::*` from their initial implementations;
+       `rg "crate::messages" src/aj-models/src/{openai,transform.rs}`
+       returns matches only inside `openai::legacy` (the legacy
+       `Model` trait impl, removed in step 6.9). The round-trip
+       suites for chat completions, responses, codex responses, and
+       cross-provider transforms all pass unchanged (covered by
+       `cargo test -p aj-models --test roundtrip`, 50 tests
+       total).
 
 - [ ] **6.3: `ScriptedProvider`.** New
        `aj-models::scripted::provider` module implementing the
@@ -2285,6 +2289,70 @@ session notes for the planning commit.
        share the demo authoring vocabulary
        (`Script::with_text_only(...)`, etc.) so we can lift
        most demos without rewriting them.
+
+       Sub-progress:
+   - [x] 6.3.i. Provider core, builder vocabulary, and
+         `from_messages` auto-generation mode. Lands as
+         `src/aj-models/src/scripted/provider.rs`. New types:
+         [`ProviderScript`], [`ProviderScriptStep`],
+         [`ExhaustedBehavior`] (mirrors the legacy variant),
+         [`ScriptedProvider`] implementing the unified
+         [`Provider`] trait, and [`ScriptBuilder`] threading a
+         running `AssistantMessage` partial through every emitted
+         event. Constructors: `new(scripts)` (defaults to
+         `ExhaustedBehavior::EndTurn`), `from_event_vecs(vecs)`,
+         and `from_messages(messages, chunk_size, chunk_delay)` —
+         the latter is the "final message script" mode the plan
+         calls out, walking each static `AssistantMessage`'s
+         content blocks and synthesising the
+         `Start`/`*Start`/`*Delta`/`*End`/`Done` (or `Error`)
+         triplet automatically. `chunk_size == 0` short-circuits
+         to a single delta per block, the path
+         `event_protocol_tests` will want once it migrates in
+         6.8. Builder methods: `start()`, `text_block(...)`,
+         `thinking_block(...)`, `tool_call_block(...)`,
+         `done(reason)`, `error(reason, error)`, each with a
+         `_chunked` variant accepting a per-call `chunk_size` /
+         `chunk_delay` override; `delay(d)` schedules a one-shot
+         pre-emit delay for the next pushed step. Tool-call
+         deltas chunk the serialized JSON so the agent's
+         partial-JSON parser path stays exercised, with the
+         final `ToolCallEnd` carrying the fully parsed
+         arguments. `StopReason` → terminal-event mapping
+         covers `Stop`/`Length`/`ToolUse` → `Done` and
+         `Error`/`Aborted` → `Error` with the corresponding
+         `ErrorReason`. The exhausted-`EndTurn` fallback stamps
+         the requested model's `api` / `provider` / `id` onto
+         the synthetic `Done` so attribution survives even when
+         the queue is empty (matches the agent's expectation
+         that every `AssistantMessage` carries identity fields).
+         Seventeen unit tests cover: `split_chunks`'s zero /
+         empty / multi-byte cases, in-order replay,
+         `from_messages` event sequences (text only, chunked
+         text, thinking + tool call, `Error` mapping, `Aborted`
+         mapping), exhausted-EndTurn synthetic Done,
+         exhausted-Panic abort, builder partial threading,
+         builder Done / Error payload propagation, per-script
+         dispatch across multiple `stream()` calls, the
+         `stream_simple` → `stream` delegation, and tool-call
+         delta chunk concatenation. The legacy `ScriptedModel`
+         in `scripted.rs` stays alive untouched. `cargo build`,
+         `cargo fmt`, `cargo test -p aj-models`, and `cargo
+         clippy -p aj-models --all-targets` all pass (only
+         pre-existing `clone_on_ref_ptr` warnings in
+         `oauth/anthropic.rs` remain).
+   - [ ] 6.3.ii. Port the 9 named demos from
+         `scripted/demos.rs` (`thinking-basic`, `thinking-long`,
+         `thinking-then-tool`, `interleaved`, `tool-error`,
+         `protocol-error`, `tool-use-parse-error`,
+         `streaming-text`, `multi-tool`) into a new
+         `scripted::provider::demos` module using
+         `ScriptBuilder`. Add a `lookup` / `catalog` / `names`
+         API matching the legacy one so step 6.8 can swap the
+         `--scripted` CLI flag's resolver without touching the
+         binary call site. Add a `catalog_demos_are_well_formed`
+         test mirroring the legacy one (every demo non-empty,
+         last step is `Done` or `Error`).
 
 - [ ] **6.4: `LegacyProviderAdapter` (internal compat shim).**
        New `aj-models::compat` module (gated on `#[doc(hidden)]`
