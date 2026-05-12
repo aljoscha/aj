@@ -54,6 +54,7 @@ use aj_agent::events::{AgentEvent, AgentId, StreamAction, StreamChannel};
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::UserOutput;
 use aj_models::messages::{ContentBlockParam, Role};
+use serde_json::Value;
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationLog, ThreadKind};
 
@@ -75,15 +76,17 @@ pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> {
 /// Per-walk projection state.
 #[derive(Default)]
 struct ReplayState {
-    /// Map of `tool_use_id` ↦ `tool_name` populated from each
-    /// `ToolUseBlock` we see on assistant messages. Used to label
-    /// the synthesized [`AgentEvent::ToolExecutionEnd`] event for
-    /// the matching `ToolResultBlock` later in the log. A persisted
-    /// log can in principle contain a tool_result whose tool_use was
-    /// truncated off the front (legacy logs that pre-date this
-    /// crate), in which case the tool name falls back to a generic
-    /// placeholder.
-    tool_uses: HashMap<String, String>,
+    /// Map of `tool_use_id` ↦ (`tool_name`, `input`) populated from
+    /// each `ToolUseBlock` we see on assistant messages. Used to
+    /// synthesize a matching [`AgentEvent::ToolExecutionStart`]
+    /// (carrying the args) and label the
+    /// [`AgentEvent::ToolExecutionEnd`] for the corresponding
+    /// `ToolResultBlock` later in the log. A persisted log can in
+    /// principle contain a tool_result whose tool_use was truncated
+    /// off the front (legacy logs that pre-date this crate), in
+    /// which case the tool name falls back to a generic placeholder
+    /// and the args fall back to an empty JSON object.
+    tool_uses: HashMap<String, (String, Value)>,
 }
 
 impl ReplayState {
@@ -143,12 +146,17 @@ impl ReplayState {
         }
 
         // Track tool_use blocks so subsequent tool_result blocks
-        // can name the tool that produced them. We do this last so
-        // any thinking/text replay precedes the synthesized tool
-        // events that live on the next user-role message.
+        // can synthesize a `ToolExecutionStart` (with args) followed
+        // by a `ToolExecutionEnd`. We do this last so any
+        // thinking/text replay precedes the synthesized tool events
+        // that live on the next user-role message.
         for block in content {
-            if let ContentBlockParam::ToolUseBlock { id, name, .. } = block {
-                self.tool_uses.insert(id.clone(), name.clone());
+            if let ContentBlockParam::ToolUseBlock {
+                id, name, input, ..
+            } = block
+            {
+                self.tool_uses
+                    .insert(id.clone(), (name.clone(), input.clone()));
             }
         }
     }
@@ -172,11 +180,30 @@ impl ReplayState {
                 is_error,
             } = block
             {
-                let tool_name = self
+                // Look up the tool name and input args captured
+                // from the preceding assistant message's tool_use
+                // block. Missing entries (truncated/legacy logs)
+                // fall back to a generic name and empty args; the
+                // renderer copes with both.
+                let (tool_name, args) = self
                     .tool_uses
                     .get(tool_use_id)
                     .cloned()
-                    .unwrap_or_else(|| "tool".to_string());
+                    .unwrap_or_else(|| ("tool".to_string(), Value::Object(Default::default())));
+                // Emit a synthetic Start so the renderer can paint
+                // the `tool(args)` header with the real input
+                // arguments. Without this the renderer's
+                // build-on-miss fallback in
+                // `update_tool_execution_result` constructs a
+                // component with `json!({})` and the header reads
+                // as `bash()` instead of
+                // `bash(command="...", ...)`.
+                out.push(AgentEvent::ToolExecutionStart {
+                    agent_id,
+                    call_id: tool_use_id.clone(),
+                    tool: tool_name.clone(),
+                    args,
+                });
                 let body = content.text();
                 out.push(AgentEvent::ToolExecutionEnd {
                     agent_id,
@@ -421,8 +448,9 @@ mod tests {
         //   StreamChunk(Thinking, Stop "let me think")
         //   StreamChunk(Text, Start)
         //   StreamChunk(Text, Stop "hello")
-        //   ToolExecutionEnd { tool: "read_file", call_id: "call-1" }
-        assert_eq!(events.len(), 7, "got events: {events:#?}");
+        //   ToolExecutionStart { tool: "read_file", call_id: "call-1", args }
+        //   ToolExecutionEnd   { tool: "read_file", call_id: "call-1" }
+        assert_eq!(events.len(), 8, "got events: {events:#?}");
 
         // First user message → StreamChannel::User pair.
         match &events[0] {
@@ -478,8 +506,28 @@ mod tests {
             other => panic!("expected text Stop, got {other:?}"),
         }
 
-        // Tool result event keyed off the prior tool_use block.
+        // Tool start event with the captured input args.
         match &events[6] {
+            AgentEvent::ToolExecutionStart {
+                agent_id,
+                call_id,
+                tool,
+                args,
+            } => {
+                assert_eq!(*agent_id, AgentId::Main);
+                assert_eq!(call_id, "call-1");
+                assert_eq!(tool, "read_file");
+                // The args must round-trip the input JSON from the
+                // seeded tool_use block — this is what makes the
+                // renderer print `read_file(path="/tmp/x")` on resume
+                // instead of an empty `read_file()`.
+                assert_eq!(args, &json!({"path": "/tmp/x"}));
+            }
+            other => panic!("expected tool execution start, got {other:?}"),
+        }
+
+        // Tool result event keyed off the prior tool_use block.
+        match &events[7] {
             AgentEvent::ToolExecutionEnd {
                 agent_id,
                 call_id,
@@ -639,8 +687,19 @@ mod tests {
         }
 
         let events: Vec<AgentEvent> = replay(&log).collect();
-        assert_eq!(events.len(), 1, "got: {events:#?}");
+        // Both a synthetic ToolExecutionStart (with empty args
+        // because we never saw the tool_use block) and a
+        // ToolExecutionEnd (with the result body) get emitted; the
+        // renderer copes with the missing args fine.
+        assert_eq!(events.len(), 2, "got: {events:#?}");
         match &events[0] {
+            AgentEvent::ToolExecutionStart { tool, args, .. } => {
+                assert_eq!(tool, "tool", "fallback tool name");
+                assert_eq!(args, &serde_json::Value::Object(Default::default()));
+            }
+            other => panic!("expected tool execution start, got {other:?}"),
+        }
+        match &events[1] {
             AgentEvent::ToolExecutionEnd { tool, .. } => {
                 assert_eq!(tool, "tool", "fallback tool name");
             }
