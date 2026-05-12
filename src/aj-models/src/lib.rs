@@ -17,6 +17,7 @@ pub mod partial_json;
 pub mod provider;
 pub mod refresh;
 pub mod registry;
+pub mod scripted;
 pub mod streaming;
 pub mod tools;
 pub mod transform;

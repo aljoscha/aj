@@ -1474,11 +1474,8 @@ mod event_protocol_tests {
     use aj_models::messages::{
         ContentBlock, Message as LegacyMessage, MessageType, Role, StopReason, Usage,
     };
+    use aj_models::scripted::{ExhaustedBehavior, ScriptedModel};
     use aj_models::streaming::StreamingEvent;
-    use aj_models::tools::Tool;
-    use aj_models::{Model, ModelError, ThinkingConfig};
-    use async_trait::async_trait;
-    use futures::stream;
     use std::sync::Arc;
 
     use crate::bus::listener_from_sync;
@@ -1487,55 +1484,6 @@ mod event_protocol_tests {
         ErasedToolDefinition, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
     };
     use crate::Agent;
-
-    /// Fake [`Model`] that hands back canned [`StreamingEvent`]
-    /// streams.
-    ///
-    /// The agent loops over inferences when the model returns a
-    /// `tool_use`, so the test feeds in one stream per inference.
-    /// Each `Vec<StreamingEvent>` is consumed in source order; the
-    /// test panics if the agent runs more inferences than were
-    /// queued, which would indicate a regression that adds an
-    /// unexpected loop iteration.
-    struct ScriptedModel {
-        scripts: Mutex<std::vec::IntoIter<Vec<StreamingEvent>>>,
-    }
-
-    impl ScriptedModel {
-        fn new(scripts: Vec<Vec<StreamingEvent>>) -> Self {
-            Self {
-                scripts: Mutex::new(scripts.into_iter()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Model for ScriptedModel {
-        async fn run_inference_streaming(
-            &self,
-            _messages: &[aj_models::messages::MessageParam],
-            _system_prompt: String,
-            _tools: Vec<Tool>,
-            _thinking: Option<ThinkingConfig>,
-        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = StreamingEvent> + Send>>, ModelError>
-        {
-            let next = self
-                .scripts
-                .lock()
-                .unwrap()
-                .next()
-                .expect("ScriptedModel exhausted: agent ran more inferences than scripted");
-            Ok(Box::pin(stream::iter(next)))
-        }
-
-        fn model_name(&self) -> String {
-            "scripted".to_string()
-        }
-
-        fn model_url(&self) -> String {
-            "fake://test".to_string()
-        }
-    }
 
     /// Trivial tool that returns a fixed string. Implements the
     /// [`ToolDefinition`] trait so the test exercises the same
@@ -1783,7 +1731,12 @@ mod event_protocol_tests {
     }
 
     fn build_agent(scripts: Vec<Vec<StreamingEvent>>, tools: Vec<ErasedToolDefinition>) -> Agent {
-        let model = Arc::new(ScriptedModel::new(scripts));
+        // Strict-mode scripted model: panic if the agent runs more
+        // inferences than the test scripted, which would indicate a
+        // regression that adds an unexpected loop iteration.
+        let model = Arc::new(
+            ScriptedModel::from_event_vecs(scripts).on_exhausted(ExhaustedBehavior::Panic),
+        );
         let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::new(env, "irrelevant", tools, Vec::new(), model, None);
         agent.set_assembled_system_prompt("test system prompt".to_string());
