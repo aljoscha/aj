@@ -30,6 +30,23 @@ const SEED_MODELS_JSON: &str = include_str!("../data/models.json");
 /// cache alike.
 const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 
+/// Bundled OpenAI Codex seed. The `openai-codex` provider points at
+/// the ChatGPT subscription backend (`chatgpt.com/backend-api`) and
+/// is not enumerated by models.dev, so its model list is maintained
+/// here alongside the overrides file (per §3.4.7). The list is
+/// authoritative: refresh appends these entries to every fresh cache
+/// (defensively filtering any upstream re-emission first), and load
+/// splices them in so users on a stale cache or an older bundled seed
+/// still see Codex models. `context_window` is set to `272000` (the
+/// observed server cap, not the marketing number) and `max_tokens`
+/// to `128000`; pricing is hand-curated.
+const CODEX_SEED_JSON: &str = include_str!("../data/codex.json");
+
+/// Provider id used to key Codex catalog entries. Exposed so the
+/// refresh and load paths agree on the value used for filtering and
+/// splicing.
+pub const CODEX_PROVIDER_ID: &str = "openai-codex";
+
 /// Maximum allowed catalog age before the registry warns the user.
 /// 90 days is a compromise — pricing changes on the order of months and
 /// new models ship every few weeks; tighter thresholds would warn too
@@ -227,6 +244,12 @@ impl ModelRegistry {
         source_label: impl Into<String>,
     ) -> Self {
         let mut models = catalog.models;
+        // Splice in the Codex seed before overrides run so authored
+        // patches can target Codex models too. Entries already present
+        // in the catalog (e.g. a freshly-refreshed user cache that
+        // included them) are not duplicated; the splice is purely
+        // additive for `(provider, id)` keys that aren't there yet.
+        splice_codex_seed(&mut models, bundled_codex_seed());
         // Apply overrides in declared order. Each entry shallow-merges
         // its patch onto the first matching `(provider, id)`.
         for entry in &overrides.overrides {
@@ -411,6 +434,74 @@ pub fn bundled_overrides() -> OverridesFile {
     })
 }
 
+/// On-disk shape of the bundled Codex seed file. Lives in its own
+/// struct so the catalog and seed files don't share the
+/// `updated_at`/`source` framing — the Codex list has no upstream and
+/// no refresh timestamp.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CodexSeedFile {
+    pub models: Vec<ModelInfo>,
+}
+
+/// Parse the bundled OpenAI Codex seed (`data/codex.json`). Failure
+/// here is non-fatal: we log a warning and proceed with an empty list,
+/// so a malformed file at most hides Codex models without bricking the
+/// registry. Each entry must already carry
+/// `provider == CODEX_PROVIDER_ID`; non-Codex entries are dropped with
+/// a warning so the file can't accidentally inject other providers.
+pub fn bundled_codex_seed() -> Vec<ModelInfo> {
+    let parsed: CodexSeedFile = match serde_json::from_str(CODEX_SEED_JSON) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::warn!("failed to parse bundled codex.json: {err}; ignoring");
+            return Vec::new();
+        }
+    };
+    parsed
+        .models
+        .into_iter()
+        .filter(|m| {
+            if m.provider == CODEX_PROVIDER_ID {
+                true
+            } else {
+                tracing::warn!(
+                    "codex.json entry {}/{} has unexpected provider; dropping",
+                    m.provider,
+                    m.id
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+/// Splice the Codex seed onto an existing model list, adding entries
+/// for `(provider, id)` keys not already present and leaving existing
+/// entries untouched. The catalog's prior contents win on conflict so
+/// a user cache that already carries refreshed Codex models doesn't
+/// have its values silently rewritten by the in-process seed.
+///
+/// Returns the number of entries appended; useful in diagnostics and
+/// tests.
+pub fn splice_codex_seed(models: &mut Vec<ModelInfo>, seed: Vec<ModelInfo>) -> usize {
+    if seed.is_empty() {
+        return 0;
+    }
+    let existing: std::collections::HashSet<(String, String)> = models
+        .iter()
+        .map(|m| (m.provider.clone(), m.id.clone()))
+        .collect();
+    let mut appended = 0;
+    for entry in seed {
+        if existing.contains(&(entry.provider.clone(), entry.id.clone())) {
+            continue;
+        }
+        models.push(entry);
+        appended += 1;
+    }
+    appended
+}
+
 /// Resolve the user-cache path (`~/.aj/models.json`). Returns `None` if
 /// the home directory cannot be determined.
 pub fn user_cache_path() -> Option<PathBuf> {
@@ -540,8 +631,10 @@ mod tests {
         assert!(reg.get("openai", "gpt-missing").is_none());
         assert!(reg.get("nope", "x").is_none());
 
-        // Stable ordering
-        assert_eq!(reg.providers(), vec!["anthropic", "openai"]);
+        // Stable ordering. The bundled Codex seed splice appends
+        // `openai-codex` after the explicit catalog providers when
+        // the catalog itself doesn't carry the Codex entries.
+        assert_eq!(reg.providers(), vec!["anthropic", "openai", "openai-codex"]);
         let anthropic_ids: Vec<_> = reg
             .models("anthropic")
             .iter()
@@ -549,6 +642,19 @@ mod tests {
             .collect();
         assert_eq!(anthropic_ids, vec!["claude-x", "claude-y"]);
         assert!(reg.models("nope").is_empty());
+
+        // The codex splice fed entries; the registry surfaces them
+        // under the codex provider with the codex api string.
+        let codex_ids: Vec<_> = reg
+            .models("openai-codex")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert!(!codex_ids.is_empty(), "codex seed populated");
+        for m in reg.models("openai-codex") {
+            assert_eq!(m.api, "openai-codex-responses");
+            assert_eq!(m.base_url, "https://chatgpt.com/backend-api");
+        }
     }
 
     #[test]
@@ -710,5 +816,153 @@ mod tests {
         if let Some(m) = reg.get("openai", "gpt-5.2") {
             assert!(supports_xhigh(m), "gpt-5.2 should support xhigh");
         }
+    }
+
+    /// The bundled Codex seed must parse and every entry must carry
+    /// the expected provider id / api / base url. Misconfigured seed
+    /// entries would silently hide Codex models from the picker, so
+    /// pin the invariants here.
+    #[test]
+    fn bundled_codex_seed_well_formed() {
+        let seed = bundled_codex_seed();
+        assert!(!seed.is_empty(), "codex seed must be non-empty");
+
+        // §7.4.1 + §3.4.3: every codex entry shares the same fixed
+        // provider/api/base_url triple.
+        for m in &seed {
+            assert_eq!(m.provider, CODEX_PROVIDER_ID);
+            assert_eq!(m.api, "openai-codex-responses");
+            assert_eq!(m.base_url, "https://chatgpt.com/backend-api");
+            // §3.4.7: max_tokens hard-coded at 128_000 across the
+            // entire codex set.
+            assert_eq!(m.max_tokens, 128_000);
+        }
+
+        // §3.4.7 calls out the canonical id list; spot-check the
+        // headline entries.
+        let ids: std::collections::HashSet<&str> = seed.iter().map(|m| m.id.as_str()).collect();
+        for expected in [
+            "gpt-5.1",
+            "gpt-5.1-codex-max",
+            "gpt-5.1-codex-mini",
+            "gpt-5.2",
+            "gpt-5.2-codex",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.3-codex-spark",
+        ] {
+            assert!(ids.contains(expected), "codex seed missing {expected}");
+        }
+
+        // §3.4.7: context_window is 272_000 for the canonical entries
+        // (the observed server cap). The free-preview spark model is
+        // narrower; assert the bulk are at the canonical value.
+        let canonical_window_count = seed.iter().filter(|m| m.context_window == 272_000).count();
+        assert!(
+            canonical_window_count >= seed.len() - 1,
+            "at least all but the spark preview should sit at the 272k cap"
+        );
+    }
+
+    /// `splice_codex_seed` must be additive only: entries already in
+    /// the model list win over the seed so refreshed user caches
+    /// aren't silently rewritten by the in-process seed.
+    #[test]
+    fn splice_codex_seed_is_additive_only() {
+        let mut models = vec![ModelInfo {
+            id: "gpt-5.1".into(),
+            name: "gpt-5.1 (from cache)".into(),
+            api: "openai-codex-responses".into(),
+            provider: CODEX_PROVIDER_ID.into(),
+            base_url: "https://chatgpt.com/backend-api".into(),
+            reasoning: true,
+            supports_xhigh: false,
+            supports_adaptive_thinking: false,
+            input: vec![InputModality::Text, InputModality::Image],
+            cost: ModelCost {
+                input: 9.99,
+                output: 9.99,
+                cache_read: 9.99,
+                cache_write: 9.99,
+            },
+            context_window: 272_000,
+            max_tokens: 128_000,
+            headers: None,
+        }];
+
+        let seed = bundled_codex_seed();
+        let total_seed = seed.len();
+        let appended = splice_codex_seed(&mut models, seed);
+
+        // The seed entry for gpt-5.1 should not have been re-applied.
+        assert_eq!(appended, total_seed - 1);
+        assert_eq!(models.len(), total_seed);
+
+        // The pre-existing entry's cost is preserved.
+        let gpt51 = models
+            .iter()
+            .find(|m| m.id == "gpt-5.1")
+            .expect("gpt-5.1 present");
+        assert_eq!(gpt51.name, "gpt-5.1 (from cache)");
+        assert!((gpt51.cost.input - 9.99).abs() < 1e-9);
+
+        // A second splice with the same seed appends nothing.
+        let appended_again = splice_codex_seed(&mut models, bundled_codex_seed());
+        assert_eq!(appended_again, 0);
+    }
+
+    /// Non-codex entries in `codex.json` would be a maintainer
+    /// mistake; the loader filters them out rather than letting them
+    /// inject a foreign provider into the registry.
+    #[test]
+    fn splice_skips_non_codex_entries() {
+        let stray = ModelInfo {
+            id: "claude-zoo".into(),
+            name: "Claude Zoo".into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            reasoning: false,
+            supports_xhigh: false,
+            supports_adaptive_thinking: false,
+            input: vec![InputModality::Text],
+            cost: ModelCost::default(),
+            context_window: 1,
+            max_tokens: 1,
+            headers: None,
+        };
+        let mut models = Vec::new();
+        let appended = splice_codex_seed(&mut models, vec![stray]);
+        // The splice accepts whatever the caller passes — filtering of
+        // non-codex entries happens inside `bundled_codex_seed` before
+        // the splice runs, not in the splice itself. Pin the splice's
+        // behavior here so it doesn't grow surprising filters later.
+        assert_eq!(appended, 1);
+        assert_eq!(models.len(), 1);
+    }
+
+    /// `ModelRegistry::load()` must surface the Codex models, even
+    /// when the bundled `models.json` snapshot predates the codex
+    /// seed.
+    #[test]
+    fn load_surfaces_codex_models() {
+        let reg = ModelRegistry::load();
+        assert!(reg.providers().contains(&"openai-codex"));
+        let codex = reg.models("openai-codex");
+        assert!(!codex.is_empty());
+
+        // gpt-5.5 is the canonical xhigh-capable, top-tier codex model.
+        let gpt55 = reg
+            .get("openai-codex", "gpt-5.5")
+            .expect("gpt-5.5 present after load");
+        assert!(gpt55.reasoning);
+        assert!(supports_xhigh(gpt55));
+        assert!(!supports_adaptive_thinking(gpt55));
+        assert_eq!(gpt55.api, "openai-codex-responses");
+        assert_eq!(gpt55.base_url, "https://chatgpt.com/backend-api");
+        assert_eq!(gpt55.context_window, 272_000);
+        assert_eq!(gpt55.max_tokens, 128_000);
     }
 }

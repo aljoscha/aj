@@ -79,7 +79,51 @@ this file is the bridge between the spec and the git history.
          §9.5 env-var split. Existing tests (`default_registry_has_*`,
          `openai_oauth_implements_provider_metadata`) updated to
          match the renamed id.
-   - [ ] 8c.ii. Catalog seed + refresh preservation.
+   - [x] 8c.ii. Catalog seed + refresh preservation. Added the
+         hand-curated codex seed list as `src/aj-models/data/codex.json`
+         (10 entries: `gpt-5.1`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`,
+         `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`,
+         `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, all with the fixed
+         `api: "openai-codex-responses"` / `provider: "openai-codex"` /
+         `base_url: "https://chatgpt.com/backend-api"` triple per §3.4.3,
+         hand-curated per-model pricing, `context_window: 272000` /
+         `max_tokens: 128000` per §3.4.7 — except `gpt-5.3-codex-spark`
+         which carries `context_window: 128000` and text-only input).
+         `aj_models::registry` ships `bundled_codex_seed()` (parses
+         `codex.json`, drops any non-codex entries with a warning to
+         keep the file from accidentally injecting foreign providers),
+         `splice_codex_seed(models, seed)` (additive-only merge keyed
+         by `(provider, id)` — existing entries always win so a
+         refreshed user cache isn't silently rewritten by the
+         in-process seed), and the public `CODEX_PROVIDER_ID` constant
+         so refresh/load agree on the key. `ModelRegistry::from_catalog_with_overrides`
+         calls the splice *before* overrides run so authored patches
+         can target codex models too. `aj_models::refresh::build_catalog_from_json`
+         filters any upstream entry whose mapped provider would be
+         `openai-codex` (defensive — models.dev doesn't categorize
+         anything that way today, but the guard keeps the seed
+         authoritative if it ever changes) and then splices the codex
+         seed onto the catalog before sort/overrides, so refresh
+         writes the codex entries into the user cache and subsequent
+         refreshes diff cleanly. Updated three pre-existing refresh
+         tests to use `bundled_codex_seed().len()` for counts and to
+         look up models by id rather than positional index (since the
+         codex tail shifted indices). Added five new tests:
+         `bundled_codex_seed_well_formed` pins provider/api/base_url/
+         max_tokens invariants and the canonical id list;
+         `splice_codex_seed_is_additive_only` proves the additive
+         semantics and idempotency on re-splice;
+         `splice_skips_non_codex_entries` pins the splice's contract
+         (filtering of foreign providers happens in
+         `bundled_codex_seed`, not in the splice);
+         `load_surfaces_codex_models` proves `ModelRegistry::load()`
+         exposes the codex set with `gpt-5.5` correctly tagged as
+         xhigh-capable; and `refresh_preserves_codex_entries_across_runs`
+         proves a second refresh against the same upstream feed
+         produces an empty diff (no codex entries flagged as
+         "removed"). Updated `registry_lookup_and_listing` to
+         account for the codex provider being spliced into the
+         registry's `providers()` listing.
    - [ ] 8c.iii. SDK + provider implementation.
    - [ ] 8c.iv. Wire `"openai-codex-responses"` into `provider_for`.
    - [ ] 8c.v. Round-trip parse / serialize / semantic fixtures.

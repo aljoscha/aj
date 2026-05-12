@@ -18,8 +18,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::registry::{
-    Catalog, InputModality, ModelCost, ModelInfo, apply_override, bundled_overrides,
-    user_cache_path,
+    CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelInfo, apply_override,
+    bundled_codex_seed, bundled_overrides, splice_codex_seed, user_cache_path,
 };
 
 /// Upstream catalog endpoint. Public so callers (tests, alternative
@@ -224,9 +224,27 @@ fn build_catalog_from_json(body: &str) -> Result<Catalog> {
             if m.tool_call != Some(true) {
                 continue;
             }
-            models.push(map_model(fixed, id, m));
+            let mapped = map_model(fixed, id, m);
+            // §3.4.7: Codex models are seeded by hand; defensively
+            // drop any upstream re-emission so the seed below is the
+            // single source of truth for `(provider="openai-codex",
+            // id=*)`. models.dev does not categorize anything under
+            // `openai-codex` today, so this is a guard rather than a
+            // live filter, but it keeps the invariant explicit if a
+            // future upstream entry leaks in.
+            if mapped.provider == CODEX_PROVIDER_ID {
+                continue;
+            }
+            models.push(mapped);
         }
     }
+
+    // §3.4.7: re-emit Codex models from the hand-curated seed after
+    // upstream filtering. Refresh writes the codex entries into the
+    // user cache so subsequent refreshes diff cleanly (without the
+    // codex set showing up as "removed" every run because models.dev
+    // doesn't include them).
+    splice_codex_seed(&mut models, bundled_codex_seed());
 
     // Stable sort: provider then id. Catalog ordering should not depend
     // on HashMap iteration order, otherwise diffs against the seed are
@@ -442,24 +460,35 @@ mod tests {
     #[test]
     fn build_catalog_filters_and_maps() {
         let cat = build_catalog_from_json(FIXTURE).expect("parses");
-        // google must be ignored (not a target provider) and the
-        // non-tool anthropic model must be filtered out.
-        assert_eq!(cat.models.len(), 2);
+        // Two upstream models survive filtering plus the bundled
+        // Codex seed appended at the end. google must be ignored (not
+        // a target provider) and the non-tool anthropic model must be
+        // filtered out.
+        let codex_count = bundled_codex_seed().len();
+        assert!(codex_count > 0, "codex seed must be non-empty");
+        assert_eq!(cat.models.len(), 2 + codex_count);
         assert_eq!(cat.source, "models.dev");
         assert!(cat.updated_at > 0);
 
-        // Sorted: anthropic first, then openai.
-        let identities: Vec<_> = cat
+        // Upstream entries come first, sorted by (provider, id): the
+        // codex seed is appended after them (no global resort across
+        // upstream + seed) so its position is deterministic.
+        let upstream_identities: Vec<_> = cat
             .models
             .iter()
+            .filter(|m| m.provider != "openai-codex")
             .map(|m| (m.provider.as_str(), m.id.as_str()))
             .collect();
         assert_eq!(
-            identities,
+            upstream_identities,
             vec![("anthropic", "claude-test-tool"), ("openai", "gpt-test"),]
         );
 
-        let claude = &cat.models[0];
+        let claude = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-test-tool")
+            .expect("claude entry present");
         assert_eq!(claude.api, "anthropic-messages");
         assert_eq!(claude.base_url, "https://api.anthropic.com");
         assert!(claude.reasoning);
@@ -473,12 +502,23 @@ mod tests {
         assert_eq!(claude.context_window, 200_000);
         assert_eq!(claude.max_tokens, 64_000);
 
-        let gpt = &cat.models[1];
+        let gpt = cat
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-test")
+            .expect("gpt entry present");
         assert_eq!(gpt.api, "openai-responses");
         assert_eq!(gpt.base_url, "https://api.openai.com/v1");
         // Default modality fallback: text-only when "image" isn't in
         // the modalities list.
         assert_eq!(gpt.input, vec![InputModality::Text]);
+
+        // Every codex entry must land under the codex provider with
+        // the codex api + base url.
+        for m in cat.models.iter().filter(|m| m.provider == "openai-codex") {
+            assert_eq!(m.api, "openai-codex-responses");
+            assert_eq!(m.base_url, "https://chatgpt.com/backend-api");
+        }
     }
 
     #[test]
@@ -492,8 +532,13 @@ mod tests {
             }
         }"#;
         let cat = build_catalog_from_json(body).expect("parses");
-        assert_eq!(cat.models.len(), 1);
-        let m = &cat.models[0];
+        // One upstream model + the bundled codex seed.
+        assert_eq!(cat.models.len(), 1 + bundled_codex_seed().len());
+        let m = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-bare")
+            .expect("bare entry present");
         // Name falls back to id.
         assert_eq!(m.name, "claude-bare");
         assert_eq!(m.cost.input, 0.0);
@@ -511,6 +556,9 @@ mod tests {
 
         // First write: everything is "added".
         let cat1 = build_catalog_from_json(FIXTURE).expect("parses");
+        let codex_count = bundled_codex_seed().len();
+        let expected_total = 2 + codex_count;
+        assert_eq!(cat1.models.len(), expected_total);
         write_catalog_atomically(&dest, &cat1).expect("writes");
         let summary = build_summary(&dest, &cat1);
         // After the write, the previous-on-disk equals the new catalog
@@ -519,13 +567,24 @@ mod tests {
         assert!(summary.added.is_empty());
         assert!(summary.removed.is_empty());
         assert!(summary.price_changed.is_empty());
-        assert_eq!(summary.total, 2);
+        assert_eq!(summary.total, expected_total);
 
-        // Now mutate the in-memory catalog: change a price and remove
-        // one model. Diff against the on-disk previous (which is cat1).
+        // Now mutate the in-memory catalog: change a price on an
+        // upstream model and remove one. Diff against the on-disk
+        // previous (which is cat1).
         let mut cat2 = cat1.clone();
-        cat2.models[0].cost.input = 99.0;
-        cat2.models.pop();
+        let claude_idx = cat2
+            .models
+            .iter()
+            .position(|m| m.id == "claude-test-tool")
+            .expect("claude entry present");
+        cat2.models[claude_idx].cost.input = 99.0;
+        let gpt_idx = cat2
+            .models
+            .iter()
+            .position(|m| m.id == "gpt-test")
+            .expect("gpt entry present");
+        cat2.models.remove(gpt_idx);
         let summary2 = build_summary(&dest, &cat2);
         assert_eq!(summary2.price_changed, vec!["anthropic/claude-test-tool"]);
         assert_eq!(summary2.removed, vec!["openai/gpt-test"]);
@@ -555,5 +614,56 @@ mod tests {
         assert!(line.contains("removed 0"));
         assert!(line.contains("price changes on 2"));
         assert!(line.contains("total: 42"));
+    }
+
+    /// Refresh must preserve codex entries across rounds: the first
+    /// refresh writes the codex set; the second refresh produces an
+    /// identical catalog and diffs cleanly (no codex entries showing
+    /// as "removed" just because models.dev doesn't list them).
+    #[test]
+    fn refresh_preserves_codex_entries_across_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("models.json");
+
+        // First refresh: writes upstream + codex seed.
+        let cat1 = build_catalog_from_json(FIXTURE).expect("parses");
+        write_catalog_atomically(&dest, &cat1).expect("writes");
+
+        let codex_count = bundled_codex_seed().len();
+        let codex_in_cat1 = cat1
+            .models
+            .iter()
+            .filter(|m| m.provider == CODEX_PROVIDER_ID)
+            .count();
+        assert_eq!(codex_in_cat1, codex_count);
+
+        // Second refresh from an identical upstream feed: the catalog
+        // is unchanged on disk (after rewrite, the diff is empty).
+        let cat2 = build_catalog_from_json(FIXTURE).expect("parses");
+        let summary = build_summary(&dest, &cat2);
+        assert!(
+            summary.removed.is_empty(),
+            "second refresh must not flag codex entries as removed: {:?}",
+            summary.removed
+        );
+        assert!(summary.added.is_empty());
+        assert!(summary.price_changed.is_empty());
+
+        // Both refreshes produced the same codex set in the same
+        // positions (the seed is appended unconditionally after
+        // upstream filtering).
+        let codex_ids_1: Vec<_> = cat1
+            .models
+            .iter()
+            .filter(|m| m.provider == CODEX_PROVIDER_ID)
+            .map(|m| m.id.as_str())
+            .collect();
+        let codex_ids_2: Vec<_> = cat2
+            .models
+            .iter()
+            .filter(|m| m.provider == CODEX_PROVIDER_ID)
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(codex_ids_1, codex_ids_2);
     }
 }
