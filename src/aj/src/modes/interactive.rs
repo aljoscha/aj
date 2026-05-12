@@ -136,7 +136,11 @@ impl InteractiveMode {
         // reflects whatever default `create_model` applied when
         // `model_name` was unset on the CLI / config.
         let current_provider = model_args.api.clone();
-        let model = create_model(model_args).context("failed to construct model handle")?;
+        let model = if let Some(name) = &self.args.scripted {
+            crate::scripted::resolve_or_explain(name)?
+        } else {
+            create_model(model_args).context("failed to construct model handle")?
+        };
         let current_id = model.model_name();
         let current_model_key = Arc::new(std::sync::Mutex::new((current_provider, current_id)));
 

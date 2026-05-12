@@ -25,3 +25,4 @@ pub mod cli;
 pub mod config;
 pub mod modes;
 pub mod persistence;
+pub mod scripted;

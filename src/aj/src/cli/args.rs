@@ -49,6 +49,22 @@ pub struct Args {
     /// `@path` token is expanded by [`crate::cli::file_args`].
     pub prompt: Vec<String>,
 
+    /// Replace the live model with a scripted fake that replays a
+    /// canned [`StreamingEvent`](aj_models::streaming::StreamingEvent)
+    /// sequence. Useful for eyeballing how the TUI / print mode
+    /// renders thinking blocks, tool calls, errors, and the like,
+    /// without spending a real API round-trip.
+    ///
+    /// The argument is the demo name. Pass `--scripted help` (or any
+    /// unknown name) to see the catalog. When set the binary skips
+    /// `aj_models::create_model` entirely and registers a
+    /// [`aj_models::scripted::ScriptedModel`] in its place; every
+    /// other code path (TUI, persistence, tools, slash commands)
+    /// runs unchanged so the eyeball test exercises the real
+    /// surface.
+    #[arg(long)]
+    pub scripted: Option<String>,
+
     /// Subcommand selector for the non-conversational utilities
     /// (`list-threads`, `continue`, `models`).
     #[command(subcommand)]

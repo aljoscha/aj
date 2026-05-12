@@ -141,7 +141,11 @@ pub async fn run(args: Args) -> Result<()> {
             .or_else(|| config.model_name.clone()),
         speed,
     };
-    let model = create_model(model_args).context("failed to construct model handle")?;
+    let model = if let Some(name) = &args.scripted {
+        crate::scripted::resolve_or_explain(name)?
+    } else {
+        create_model(model_args).context("failed to construct model handle")?
+    };
 
     // Build the tool list. Disabled tools are filtered up-front so
     // the agent never advertises them to the model; this matches the
