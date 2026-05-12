@@ -92,6 +92,21 @@ fn markdown_theme() -> MarkdownTheme {
     }
 }
 
+/// How long the simulated bot "thinks" — i.e. how long the loader
+/// spins after a user submission before the canned response replaces
+/// it. Defaults to one second; override via the
+/// `CHAT_SIMPLE_THINK_MS` environment variable to exercise the
+/// spinner over longer windows (useful for eyeballing the loader's
+/// steady-state CPU footprint with `top` / `htop` against a known
+/// duration).
+fn think_duration() -> Duration {
+    let ms = std::env::var("CHAT_SIMPLE_THINK_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(1000);
+    Duration::from_millis(ms)
+}
+
 /// Tiny non-cryptographic PRNG so we can pick a response without pulling
 /// in a dependency. Seeded from the monotonic clock on first call.
 fn pseudo_random_index(modulus: usize) -> usize {
@@ -334,7 +349,7 @@ fn handle_submitted_text(tui: &mut Tui, bot_state: &mut BotState) {
                 with_editor(tui, |e| e.disable_submit = true);
 
                 *bot_state = BotState::Thinking {
-                    deadline: tokio::time::Instant::now() + Duration::from_millis(1000),
+                    deadline: tokio::time::Instant::now() + think_duration(),
                     loader_ptr,
                 };
             }
