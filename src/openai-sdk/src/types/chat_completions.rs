@@ -503,10 +503,6 @@ pub struct FunctionCallDelta {
     pub arguments: Option<String>,
 }
 
-// Error types are in common.rs
-
-// Additional type definitions for the complete CreateChatCompletionRequest
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum ResponseFormat {
@@ -659,6 +655,22 @@ impl FinishReason {
             other => Self::Other(other.to_string()),
         }
     }
+
+    /// Whether the generation completed naturally (not due to a length
+    /// limit or content filter).
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Stop | Self::ToolCalls | Self::FunctionCall)
+    }
+
+    /// Whether the generation was truncated by the model's token limit.
+    pub fn is_truncated(&self) -> bool {
+        matches!(self, Self::Length)
+    }
+
+    /// Whether the generation was halted by the content-policy filter.
+    pub fn is_filtered(&self) -> bool {
+        matches!(self, Self::ContentFilter)
+    }
 }
 
 impl Serialize for FinishReason {
@@ -689,27 +701,6 @@ pub enum Role {
     #[serde(rename = "developer")]
     Developer,
 }
-
-// Verbosity, PromptCacheRetention, ServiceTier are in common.rs
-
-impl FinishReason {
-    /// Returns true if the generation completed naturally (not due to length limit or filter)
-    pub fn is_complete(&self) -> bool {
-        matches!(self, Self::Stop | Self::ToolCalls | Self::FunctionCall)
-    }
-
-    /// Returns true if the generation was truncated due to token limits
-    pub fn is_truncated(&self) -> bool {
-        matches!(self, Self::Length)
-    }
-
-    /// Returns true if the generation was filtered by content policies
-    pub fn is_filtered(&self) -> bool {
-        matches!(self, Self::ContentFilter)
-    }
-}
-
-// Convenience implementations
 
 impl CreateChatCompletionRequest {
     pub fn new(model: String, messages: Vec<ChatCompletionRequestMessage>) -> Self {

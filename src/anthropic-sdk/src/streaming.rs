@@ -1,5 +1,5 @@
-//! Types for a higher-level streaming API built on the low-lever server-sent
-//! events defined in the messages API.
+//! Types for a higher-level streaming API built on the lower-level
+//! server-sent events defined in the messages API.
 
 use std::pin::Pin;
 

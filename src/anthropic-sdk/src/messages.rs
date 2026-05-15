@@ -1,8 +1,8 @@
 //! Types for the Anthropic Messages API, as described at
 //! <https://platform.claude.com/docs/en/api/messages>.
 //!
-//! Covers the latest API surface including server tools, MCP toolsets,
-//! adaptive thinking, output configuration, and structured tool types.
+//! Covers request bodies, content blocks, response messages, SSE
+//! events, and the tool-definition union.
 
 use std::collections::HashMap;
 use std::fmt::Display;
