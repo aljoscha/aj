@@ -48,7 +48,6 @@ version = "0.1.0"
 dependencies = [
  "aj-conf",
  "aj-models",
- "aj-session",
  "aj-ui",
  "anyhow",
  "async-trait",
@@ -104,12 +103,16 @@ dependencies = [
 name = "aj-session"
 version = "0.1.0"
 dependencies = [
+ "aj-agent",
  "aj-models",
  "aj-ui",
+ "anyhow",
  "chrono",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

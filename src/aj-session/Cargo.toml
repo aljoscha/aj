@@ -4,24 +4,24 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aj-agent = { path = "../aj-agent" }
 aj-models = { path = "../aj-models" }
 # Temporary, until §2.6 deletes `aj-ui`. `ConversationEntryKind`
 # carries the legacy `UserOutput` variant; the migration walker in
 # §2.0 / §3 rewrites these to `ToolDetails` on disk, after which the
 # dependency can drop.
 aj-ui = { path = "../aj-ui" }
+anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
-# `aj-session` will pick up an `aj-agent` dependency once
-# `aj-agent` stops touching `ConversationLog` (aj-next plan §2.4) so
-# the dep direction settles. Until then a `aj-session → aj-agent`
-# edge would form a cycle — `aj-agent` still imports
-# `ConversationLog` from `aj-session` — and is therefore forbidden.
-# See `src/replay.rs` for the matching note.
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

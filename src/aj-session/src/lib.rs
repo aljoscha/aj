@@ -18,13 +18,17 @@
 //!
 //! See `docs/aj-next-plan.md` §1, §2.0(a), and §2.5.
 
+pub mod listener;
 pub mod log;
 pub mod persistence;
+pub mod repair;
 pub mod replay;
 
+pub use listener::persistence_listener;
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     ConversationView, EntryId, ThreadFilter, ThreadKind,
 };
 pub use persistence::{ConversationPersistence, ThreadMetadata};
+pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;

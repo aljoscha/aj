@@ -1,34 +1,31 @@
-// Event-driven contract modules consumed by `aj-next`, the
-// upcoming `aj-session` crate, and the in-tree `aj` binary. The
-// agent runtime in this file drives tools through the new
-// [`tool::ToolDefinition`] / [`tool::ToolContext`] surface; the
-// legacy `&mut dyn AjUi`-bound tool trait was retired in §2.4a of
-// the aj-next plan. `aj_ui::AjUi` itself stays alive for run-level
-// orchestration (notices, history display, readline loop, usage
-// summary) until §2.4b moves that responsibility to the binary.
+// Event-driven contract modules consumed by `aj-next`, `aj-session`,
+// and the in-tree `aj` binary. The agent runtime in this file drives
+// tools through the [`tool::ToolDefinition`] / [`tool::ToolContext`]
+// surface and emits every state transition through its internal
+// [`bus::EventBus`]; the binary subscribes a renderer listener and a
+// persistence listener (the latter lives in `aj-session` per the
+// dependency graph in `docs/aj-next-plan.md` §1) and owns the
+// readline loop, log management, and history display.
 pub mod bus;
 pub mod events;
 pub mod message;
-pub mod persistence;
 pub mod tool;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::{pin, Pin};
 use std::time::Duration;
 
-use aj_conf::{display_path, AgentEnv, ConfigThinkingLevel};
-use aj_models::messages::{ApiError, ContentBlock, ContentBlockParam, Message, Role, Usage};
+use aj_conf::{AgentEnv, ConfigThinkingLevel};
+use aj_models::messages::{
+    ApiError, ContentBlock, ContentBlockParam, Message, MessageParam, Role, Usage,
+};
 use aj_models::streaming::StreamingEvent;
 use aj_models::tools::Tool;
 use aj_models::types::UserContent;
 use aj_models::ModelError;
 use aj_models::{Model, ThinkingConfig};
-use aj_session::{
-    Conversation, ConversationEntryKind, ConversationError, ConversationLog, ConversationView,
-    EntryId, ThreadFilter, ThreadKind,
-};
-use aj_ui::{AjUi, SubAgentUsage, TokenUsage, UsageSummary, UserOutput};
+use aj_ui::{TokenUsage, UserOutput};
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
 use crate::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
@@ -38,63 +35,66 @@ use crate::tool::{
 use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 use tokio_util::sync::CancellationToken;
 
-pub struct Agent<UI: AjUi> {
+pub struct Agent {
     env: AgentEnv,
-    ui: UI,
-    /// The base system prompt template provided by the host (compile-time
-    /// constant, ships with the binary). The full prompt sent to the
-    /// model is derived from this plus environment-dependent context
-    /// (`AgentEnv`), and then frozen on the conversation log so that
-    /// resumed threads reuse the original assembly verbatim and keep
-    /// hitting Anthropic's prompt cache.
+    /// The base system prompt template provided by the host
+    /// (compile-time constant, ships with the binary). The full
+    /// prompt sent to the model is derived from this plus
+    /// environment-dependent context (`AgentEnv`); the binary
+    /// resolves it once and pushes it onto the agent through
+    /// [`Agent::set_assembled_system_prompt`] so resumed threads
+    /// reuse the original assembly verbatim and keep hitting
+    /// Anthropic's prompt cache.
     system_prompt: &'static str,
-    /// The fully-assembled system prompt for the current run, populated
-    /// by [Agent::resolve_system_prompt] on the first turn. Equal to the
-    /// thread's persisted [aj_session::ConversationEntryKind::SystemPrompt]
-    /// when one exists; otherwise freshly assembled (and persisted on
-    /// fresh logs).
+    /// The fully-assembled system prompt for the current run.
+    /// Populated by [`Agent::set_assembled_system_prompt`] (resume
+    /// path or fresh assembly) before any turn runs; inference
+    /// reads it directly.
     assembled_system_prompt: Option<String>,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
-    /// Names of builtin tools to exclude when spawning subagents. Mirrors the
-    /// filter applied to the top-level agent so subagents inherit the same
-    /// tool restrictions.
+    /// Names of builtin tools to exclude when spawning subagents.
+    /// Mirrors the filter applied to the top-level agent so
+    /// subagents inherit the same tool restrictions.
     disabled_tools: Vec<String>,
     model: Arc<dyn Model>,
     session_state: SessionState,
     default_thinking: Option<ThinkingConfig>,
     /// Identifier used on every event emitted by this agent. The
-    /// top-level instance constructed by the binary keeps the default
-    /// [AgentId::Main]; sub-agents created via
-    /// [SessionContextWrapper::spawn_agent] override this so listeners
-    /// can route nested transcripts.
+    /// top-level instance constructed by the binary keeps the
+    /// default [`AgentId::Main`]; sub-agents created via
+    /// [`SessionContextWrapper::spawn_agent`] override this so
+    /// listeners can route nested transcripts.
     agent_id: AgentId,
     /// Internal event bus. Every state transition the agent goes
-    /// through is mirrored here as an [AgentEvent]; today nothing
-    /// production-side subscribes (the CLI still drives off the
-    /// `self.ui.*` calls), but tests subscribe to lock the protocol
-    /// shape, and §2.3 of `docs/aj-next-plan.md` swaps in production
-    /// listeners for rendering and persistence.
+    /// through is mirrored here as an [`AgentEvent`]; the binary
+    /// subscribes a renderer listener and a persistence listener
+    /// (the latter lives in `aj_session::persistence_listener`).
     bus: EventBus,
     /// Cancellation token surfaced to tools through
     /// [`ToolContext::cancellation`]. Today the agent never fires
     /// it: cancellation propagation lands in §1.8 of the aj-next
     /// plan, but the field is wired through now so tools observing
     /// `select!` against `ctx.cancellation()` compile cleanly.
-    /// Sub-agents inherit a child token derived from their parent's
-    /// (`docs/aj-next-plan.md` §1.6) so a single eventual `cancel()`
-    /// call reaches the whole hierarchy.
+    /// Sub-agents inherit a child token derived from their
+    /// parent's per `docs/aj-next-plan.md` §1.6 so a single
+    /// eventual `cancel()` call reaches the whole hierarchy.
     cancellation: CancellationToken,
+    /// In-memory transcript: every wire-level [`MessageParam`] this
+    /// agent has seen, in append order. Replaces the agent's reach
+    /// into [`aj_session::ConversationLog`] (per
+    /// `docs/aj-next-plan.md` §2.4b): the binary owns the log,
+    /// resumes it on startup, and seeds the transcript via
+    /// [`Agent::seed_messages`] before the first turn.
+    transcript: Vec<MessageParam>,
 }
 
-impl<UI: AjUi> Agent<UI> {
+impl Agent {
     pub fn new(
         env: AgentEnv,
-        ui: UI,
         system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
         disabled_tools: Vec<String>,
@@ -131,7 +131,6 @@ impl<UI: AjUi> Agent<UI> {
 
         Self {
             env,
-            ui,
             system_prompt,
             assembled_system_prompt: None,
             tool_definitions,
@@ -143,52 +142,48 @@ impl<UI: AjUi> Agent<UI> {
             agent_id: AgentId::Main,
             bus: EventBus::new(),
             cancellation: CancellationToken::new(),
+            transcript: Vec::new(),
         }
     }
 
-    /// Override this agent's [AgentId] before driving any turns.
+    /// Override this agent's [`AgentId`] before driving any turns.
     ///
-    /// Used by [SessionContextWrapper::spawn_agent] when constructing
-    /// a sub-agent so the events it emits carry the correct
-    /// [AgentId::Sub] tag. Top-level instances built by the binary
-    /// keep the default [AgentId::Main] and never call this.
+    /// Used by [`SessionContextWrapper::spawn_agent`] when
+    /// constructing a sub-agent so the events it emits carry the
+    /// correct [`AgentId::Sub`] tag. Top-level instances built by
+    /// the binary keep the default [`AgentId::Main`] and never
+    /// call this.
     pub fn set_agent_id(&mut self, id: AgentId) {
         self.agent_id = id;
     }
 
     /// Replace this agent's event bus.
     ///
-    /// Used by [SessionContextWrapper::spawn_agent] to make a
+    /// Used by [`SessionContextWrapper::spawn_agent`] to make a
     /// sub-agent share the parent's bus per `docs/aj-next-plan.md`
-    /// §1.6: every event the child emits then reaches every listener
-    /// the binary registered on the parent (rendering, persistence,
-    /// future TUI components), tagged by the child's
-    /// [AgentId::Sub]. Must be called before any turn runs;
+    /// §1.6: every event the child emits then reaches every
+    /// listener the binary registered on the parent (rendering,
+    /// persistence, future TUI components), tagged by the child's
+    /// [`AgentId::Sub`]. Must be called before any turn runs;
     /// subscriptions registered on the bus that's about to be
     /// replaced are silently dropped.
     pub fn set_bus(&mut self, bus: EventBus) {
         self.bus = bus;
     }
 
-    /// Subscribe an async listener to the agent's internal event bus.
+    /// Subscribe an async listener to the agent's internal event
+    /// bus.
     ///
-    /// Returns a [SubscriptionHandle] whose drop removes the listener.
-    /// Listeners are awaited inline in registration order; a listener
-    /// returning `Err` aborts the in-flight operation with a fatal
-    /// error. See [EventBus::subscribe] for the full protocol.
+    /// Returns a [`SubscriptionHandle`] whose drop removes the
+    /// listener. Listeners are awaited inline in registration
+    /// order; a listener returning `Err` aborts the in-flight
+    /// operation with a fatal error. See [`EventBus::subscribe`]
+    /// for the full protocol.
     pub fn subscribe(&self, listener: Listener) -> SubscriptionHandle {
         self.bus.subscribe(listener)
     }
 
     /// Borrow the agent's internal event bus.
-    ///
-    /// Sub-systems (currently only [SessionContextWrapper::spawn_agent])
-    /// clone this so events emitted on a sub-agent's bus can later be
-    /// forwarded to the parent's listeners — the eventual
-    /// "sub-agents share the parent's bus" arrangement from
-    /// `docs/aj-next-plan.md` §1.6 lands once the per-tool migration
-    /// in §2.2 finishes; for now sub-agents own their own bus and
-    /// the parent emits only correlation events.
     pub fn bus(&self) -> &EventBus {
         &self.bus
     }
@@ -201,209 +196,183 @@ impl<UI: AjUi> Agent<UI> {
         self.session_state.accumulated_usage()
     }
 
-    pub async fn run(
-        &mut self,
-        log: Arc<TokioMutex<ConversationLog>>,
-    ) -> Result<(), anyhow::Error> {
+    /// Borrow the per-sub-agent accumulated [`Usage`] map. The
+    /// binary uses this to compute the end-of-session usage summary
+    /// (the agent no longer renders one — the binary owns
+    /// presentation).
+    pub fn sub_agent_usage(&self) -> &HashMap<usize, Usage> {
+        &self.session_state.sub_agent_usage
+    }
+
+    /// Borrow the agent's in-memory transcript. The binary uses
+    /// this on shutdown to decide whether to print the resume hint
+    /// (only when the agent observed at least one message) and on
+    /// each loop iteration to decide whether to ask for input
+    /// (depending on whether the last message is from the
+    /// assistant).
+    pub fn messages(&self) -> &[MessageParam] {
+        &self.transcript
+    }
+
+    /// Replace the in-memory transcript with `messages`. Used on
+    /// resume: the binary opens the log, linearizes the user
+    /// thread, and pushes the resulting `Vec<MessageParam>` into
+    /// the agent so the next turn sees the prior conversation.
+    pub fn seed_messages(&mut self, messages: Vec<MessageParam>) {
+        self.transcript = messages;
+    }
+
+    /// Seed the sub-agent counter so subsequent
+    /// [`SessionState::next_sub_agent_id`] calls mint ids strictly
+    /// greater than `value`. Used on resume to avoid colliding with
+    /// sub-agent subtrees already persisted in the log.
+    pub fn seed_sub_agent_counter(&mut self, value: usize) {
+        self.session_state.seed_sub_agent_counter(value);
+    }
+
+    /// Provide the freshly-assembled (or persisted) system prompt
+    /// to the agent. Must be called before any turn runs; inference
+    /// reads it directly. Idempotent: subsequent calls overwrite
+    /// the previous value, but in practice the binary calls this
+    /// exactly once per session.
+    pub fn set_assembled_system_prompt(&mut self, prompt: String) {
+        self.assembled_system_prompt = Some(prompt);
+    }
+
+    /// Borrow the assembled system prompt. Returns `None` until
+    /// [`Agent::set_assembled_system_prompt`] runs.
+    pub fn assembled_system_prompt(&self) -> Option<&str> {
+        self.assembled_system_prompt.as_deref()
+    }
+
+    /// Assemble the system prompt from the constant template plus
+    /// the agent's environment context. The binary calls this when
+    /// no persisted prompt exists on the log and uses the result
+    /// as the freshly-frozen system prompt for the session.
+    pub fn assemble_system_prompt(&self) -> String {
+        let mut text = self.system_prompt.to_string();
+
+        // Stitch in every context file, in order. Each file is
+        // wrapped in an `<agents-md>` block so the model can
+        // clearly tell where instructions start and end, with the
+        // kind-specific prefix text introducing it.
+        for file in &self.env.context_files {
+            text.push_str(&format!(
+                "\n\n{}\n<agents-md>\n{}\n</agents-md>",
+                file.kind.prompt_prefix(),
+                file.content
+            ));
+        }
+
+        text.push_str(&format!(
+            "\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
+            self.env
+        ));
+
+        text
+    }
+
+    /// Borrow the model handle. The binary clones this for the
+    /// startup `Model: <name>, at <url>` notice and uses it during
+    /// listener wiring; the agent itself drives inference through
+    /// the same handle internally.
+    pub fn model(&self) -> Arc<dyn Model> {
+        Arc::clone(&self.model)
+    }
+
+    /// Borrow the agent's environment. The binary uses this to
+    /// render the startup `Context:` notice listing every
+    /// agents.md file injected into the system prompt.
+    pub fn env(&self) -> &AgentEnv {
+        &self.env
+    }
+
+    /// Run a single turn for the top-level agent.
+    ///
+    /// If `prompt` is `Some`, append it as a user message to the
+    /// transcript and emit [`AgentEvent::MessagePersisted::User`]
+    /// before driving the assistant turn loop. If `prompt` is
+    /// `None`, the agent assumes the transcript already ends in a
+    /// user-role message (typically a synthesized tool_result, on
+    /// the recovery path after a recoverable turn error) and
+    /// continues from there.
+    ///
+    /// The turn loop runs one inference, processes any tool calls
+    /// the assistant emits (each with its own
+    /// [`AgentEvent::ToolExecutionStart`] /
+    /// [`AgentEvent::ToolExecutionEnd`] bracket), and loops until
+    /// the assistant produces a non-tool turn.
+    pub async fn run_turn(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
         // bus. `AgentEnd.messages` will eventually carry a snapshot
         // of the agent's transcript per `docs/aj-next-plan.md` §1.4;
-        // until §2.4 migrates the agent to the unified message types,
-        // we ship an empty snapshot so the protocol shape (event
-        // ordering, agent_id routing) is exercised without forcing a
-        // premature legacy→unified bridge.
+        // until §2.4 migrates the agent to the unified message
+        // types, we ship an empty snapshot so the protocol shape
+        // (event ordering, agent_id routing) is exercised without
+        // forcing a premature legacy→unified bridge.
         self.bus
             .emit(AgentEvent::AgentStart {
                 agent_id: self.agent_id,
             })
-            .await?;
+            .await
+            .map_err(TurnError::Fatal)?;
 
-        let outcome = self.run_inner(log).await;
+        let outcome = self.run_turn_inner(prompt).await;
 
         self.bus
             .emit(AgentEvent::AgentEnd {
                 agent_id: self.agent_id,
                 messages: Vec::new(),
             })
-            .await?;
+            .await
+            .map_err(TurnError::Fatal)?;
 
         outcome
     }
 
-    /// Body of [Agent::run], split out so [Agent::run] itself can
-    /// emit `AgentStart` / `AgentEnd` events around the run regardless
-    /// of which exit path the loop takes.
-    async fn run_inner(
-        &mut self,
-        log: Arc<TokioMutex<ConversationLog>>,
-    ) -> Result<(), anyhow::Error> {
-        // Setup phase. We hold the log lock for the duration of this
-        // block so resolve / repair / linearize see a consistent
-        // snapshot, but we never call `bus.emit` inside it — the
-        // persistence listener also needs the lock and would deadlock.
-        let resume_info: Option<(String, Conversation)> = {
-            let mut log_guard = log.lock().await;
-            // Resolve the system prompt up front: either reuse the
-            // one persisted on the log (cache-friendly resume) or
-            // assemble a fresh one from the current environment and
-            // persist it as the log's root entry. After this returns,
-            // every subsequent append from any thread (including
-            // subagents) anchors to the system-prompt entry, and
-            // inference reuses `self.assembled_system_prompt`
-            // verbatim.
-            self.resolve_system_prompt(&mut log_guard)?;
-
-            // Seed the subagent counter from the log so ids minted
-            // in this session don't collide with subagent subtrees
-            // already persisted from a prior session.
-            if let Some(max_id) = log_guard.max_agent_id() {
-                self.session_state.seed_sub_agent_counter(max_id);
-            }
-
-            if let Some(head) = log_guard.latest_leaf(ThreadFilter::USER) {
-                let conversation = log_guard.linearize(&head, ThreadFilter::USER);
-                // Because the log writes to disk after every event,
-                // resuming can land us on a state where the last
-                // assistant message carries `tool_use` blocks that
-                // never got their matching `tool_result`s (process
-                // was killed between the two). Sending that to the
-                // model would fail, so synthesize "interrupted"
-                // tool_results for any dangling tool_use ids before
-                // we carry on.
-                repair_interrupted_tool_uses(&mut log_guard, &conversation)?;
-                Some((log_guard.thread_id().to_string(), conversation))
-            } else {
-                None
-            }
-        };
-
-        // Render conversation history through the legacy UI before
-        // any bus emit fires so the user sees it interleaved
-        // correctly with the resume notice below. `display_*` is
-        // synchronous and doesn't touch the log.
-        if let Some((_, conversation)) = &resume_info {
-            self.display_conversation_history(conversation);
-        }
-
-        if let Some((thread_id, _)) = &resume_info {
-            self.notice(format!(
-                "Resuming conversation {thread_id} (use 'ctrl-c' or 'ctrl-d' to quit)"
-            ))
-            .await?;
-        } else {
-            self.notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)")
-                .await?;
-        }
-
-        self.notice(format!(
-            "Model: {}, at {}",
-            self.model.model_name(),
-            self.model.model_url()
-        ))
-        .await?;
-
-        self.display_context().await?;
-
-        if std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err() {
-            self.warning(
-                "WARNING: AJ has no sandboxing or permission checks. The agent can execute \
-                 arbitrary commands on your system. Do not use AJ if you don't understand what \
-                 this means. Set AJ_DISABLE_SANDBOX_WARNING=1 to suppress this warning.",
-            )
-            .await?;
-        }
-
-        let mut force_user_input = false;
-        loop {
-            // Decide whether the next iteration needs user input.
-            // Lock briefly to peek at the user thread; drop before
-            // we touch the UI.
-            let (need_user_input, has_history) = {
-                let log_guard = log.lock().await;
-                let head = log_guard.latest_leaf(ThreadFilter::USER);
-                let need = force_user_input
-                    || match &head {
-                        Some(id) => {
-                            let conversation = log_guard.linearize(id, ThreadFilter::USER);
-                            match conversation.last_message() {
-                                Some(last) => matches!(last.role, Role::Assistant),
-                                None => true,
-                            }
-                        }
-                        None => true,
-                    };
-                (need, head.is_some())
-            };
-            force_user_input = false;
-
-            if need_user_input {
-                let user_input = self.ui.get_user_input();
-                let user_input = if let Some(user_input) = user_input {
-                    user_input
-                } else {
-                    self.display_usage_summary();
-                    // Show the resume hint only if the user has
-                    // actually sent at least one message so far.
-                    if has_history {
-                        let id = log.lock().await.thread_id().to_string();
-                        self.notice(format!("Thread: {id} (resume with: aj continue {id})"))
-                            .await?;
-                    }
-                    break;
-                };
-                // Persist the user message directly (the binary will
-                // own this write in §2.5; until then, the agent
-                // still drives the readline loop and writes its own
-                // input). No bus emit yet — we need the lock.
-                let mut log_guard = log.lock().await;
-                let head = log_guard.latest_leaf(ThreadFilter::USER);
-                let mut view = ConversationView::user(&mut log_guard, head);
-                view.add_user_message(vec![ContentBlockParam::new_text_block(user_input)])?;
-            }
-
-            match self
-                .execute_turn(Arc::clone(&log), ThreadKind::User, None)
+    async fn run_turn_inner(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
+        if let Some(text) = prompt {
+            // Append the user message to the in-memory transcript
+            // and emit a `MessagePersisted::User` event for the
+            // persistence listener. The transcript update happens
+            // unconditionally — even if the listener errors out we
+            // still want the in-memory state to reflect the
+            // intent, so the bus call is at-most one event behind
+            // the transcript (per `docs/aj-next-plan.md` §1.4).
+            let content = vec![ContentBlockParam::new_text_block(text)];
+            self.transcript
+                .push(MessageParam::new_user_message(content.clone()));
+            self.bus
+                .emit(AgentEvent::MessagePersisted {
+                    agent_id: self.agent_id,
+                    kind: PersistedMessageKind::User { content },
+                })
                 .await
-            {
-                Ok(()) => {}
-                Err(TurnError::Recoverable(err)) => {
-                    self.error(format!("{err:#}")).await?;
-                    // The pending user message is still on disk.
-                    // Force a prompt next iteration so we don't
-                    // immediately re-send the same broken request to
-                    // the model. The user can type a follow-up
-                    // (which will be appended to the conversation)
-                    // or hit Ctrl-C/D to quit.
-                    force_user_input = true;
-                    continue;
-                }
-                Err(TurnError::Fatal(err)) => return Err(err),
-            }
+                .map_err(TurnError::Fatal)?;
         }
 
-        Ok(())
+        self.execute_turn().await
     }
 
-    pub async fn run_single_turn(
-        &mut self,
-        log: Arc<TokioMutex<ConversationLog>>,
-        parent_head: EntryId,
-        agent_id: usize,
-        prompt: String,
-    ) -> Result<String, anyhow::Error> {
+    /// Run a single sub-agent turn. Used internally by the `agent`
+    /// builtin via [`ToolContext::spawn_agent`]; not for top-level
+    /// use.
+    ///
+    /// Appends `prompt` as a user message on the sub-agent's own
+    /// transcript, runs the assistant turn loop, and returns the
+    /// final assistant text the sub-agent produced.
+    pub async fn run_single_turn(&mut self, prompt: String) -> Result<String, anyhow::Error> {
         // Sub-agent runs share the same lifecycle framing as the
-        // top-level agent — `AgentStart` / `AgentEnd` events bracket
-        // the entire run so listeners that group by `agent_id` see a
-        // self-contained nested transcript.
+        // top-level agent — `AgentStart` / `AgentEnd` events
+        // bracket the entire run so listeners that group by
+        // `agent_id` see a self-contained nested transcript.
         self.bus
             .emit(AgentEvent::AgentStart {
                 agent_id: self.agent_id,
             })
             .await?;
 
-        let outcome = self
-            .run_single_turn_inner(log, parent_head, agent_id, prompt)
-            .await;
+        let outcome = self.run_single_turn_inner(prompt).await;
 
         self.bus
             .emit(AgentEvent::AgentEnd {
@@ -415,45 +384,32 @@ impl<UI: AjUi> Agent<UI> {
         outcome
     }
 
-    async fn run_single_turn_inner(
-        &mut self,
-        log: Arc<TokioMutex<ConversationLog>>,
-        parent_head: EntryId,
-        agent_id: usize,
-        prompt: String,
-    ) -> Result<String, anyhow::Error> {
-        // Resolve the system prompt before any inference. For
-        // sub-agents the parent has already populated the log's
-        // `SystemPrompt` entry, so this just reads it back; the
-        // assembled prompt is shared across the whole session.
-        {
-            let mut log_guard = log.lock().await;
-            self.resolve_system_prompt(&mut log_guard)?;
-        }
-
-        // Append the prompt as the sub-agent's first user message
-        // anchored at `parent_head` (the spawning assistant message
-        // on the parent thread). Direct write — no bus emit so we
-        // hold the lock through it.
-        {
-            let mut log_guard = log.lock().await;
-            let mut view = ConversationView::subagent(&mut log_guard, parent_head, agent_id);
-            view.add_user_message(vec![ContentBlockParam::new_text_block(prompt)])?;
-        }
-
-        self.execute_turn(Arc::clone(&log), ThreadKind::Subagent, Some(agent_id))
+    async fn run_single_turn_inner(&mut self, prompt: String) -> Result<String, anyhow::Error> {
+        // Append the prompt as the sub-agent's first user message.
+        // The persistence listener anchors this entry under the
+        // parent's spawning assistant message via the
+        // `SubAgentStart` hook (see
+        // `aj_session::listener::persistence_listener`).
+        let content = vec![ContentBlockParam::new_text_block(prompt)];
+        self.transcript
+            .push(MessageParam::new_user_message(content.clone()));
+        self.bus
+            .emit(AgentEvent::MessagePersisted {
+                agent_id: self.agent_id,
+                kind: PersistedMessageKind::User { content },
+            })
             .await?;
+
+        self.execute_turn().await?;
 
         // Extract the last assistant message text from the
-        // subagent's own linearized history.
-        let log_guard = log.lock().await;
-        let head = log_guard
-            .latest_leaf(ThreadFilter::subagent(agent_id))
-            .ok_or_else(|| anyhow!("subagent produced no entries"))?;
-        let conversation = log_guard.linearize(&head, ThreadFilter::subagent(agent_id));
-        let last_msg = conversation
-            .last_assistant_message()
-            .ok_or_else(|| anyhow!("subagent produced no assistant text output"))?;
+        // sub-agent's own transcript.
+        let last_msg = self
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Assistant))
+            .ok_or_else(|| anyhow!("sub-agent produced no assistant text output"))?;
 
         let last_assistant_text: String = last_msg
             .content
@@ -467,52 +423,32 @@ impl<UI: AjUi> Agent<UI> {
         Ok(last_assistant_text)
     }
 
-    /// Executes a single "turn" of the conversation, this will potentially
-    /// include mutliple back-and-forth interactions with the model, in case
-    /// there are thinking blocks or tool calls.
+    /// Execute one assistant-message turn against the in-memory
+    /// transcript: run inference, process any tool calls, append
+    /// each result, loop until the assistant produces a non-tool
+    /// turn.
     ///
-    /// The turn's writes (assistant message, per-tool user outputs,
-    /// tool-result user message) flow out as
+    /// The turn's writes (assistant message, per-tool user
+    /// outputs, tool-result user message) flow out as
     /// [`AgentEvent::MessagePersisted`] events. The persistence
     /// listener subscribed on the bus translates them into
-    /// [`ConversationView`] appends, one JSONL line per event, so
-    /// the on-disk state stays at-most one event behind reality
-    /// (see `docs/aj-next-plan.md` §2.3b).
-    async fn execute_turn(
-        &mut self,
-        log: Arc<TokioMutex<ConversationLog>>,
-        thread: ThreadKind,
-        agent_id: Option<usize>,
-    ) -> Result<(), TurnError> {
+    /// `aj_session::ConversationView` appends, one JSONL line per
+    /// event, so the on-disk state stays at-most one event behind
+    /// reality (see `docs/aj-next-plan.md` §2.3b).
+    async fn execute_turn(&mut self) -> Result<(), TurnError> {
         self.session_state.turn_counter += 1;
 
         // `TurnStart` mirrors entry to the assistant-message cycle.
         // The matching `TurnEnd` event (which carries the finalized
-        // assistant message and tool-result list per `docs/aj-next-plan.md`
-        // §1.1) lands in §2.4 once `aj-agent` migrates to the unified
-        // message types; today we have only the legacy `MessageParam`
-        // shape, and bridging it through a throwaway converter would
-        // be code we'd delete in the same week.
+        // assistant message and tool-result list per
+        // `docs/aj-next-plan.md` §1.1) lands in §2.4 once
+        // `aj-agent` migrates to the unified message types.
         self.bus
             .emit(AgentEvent::TurnStart {
                 agent_id: self.agent_id,
             })
             .await
             .map_err(TurnError::Fatal)?;
-
-        let filter = match thread {
-            ThreadKind::User => ThreadFilter::USER,
-            ThreadKind::Subagent => {
-                ThreadFilter::subagent(agent_id.expect("subagent thread requires agent_id"))
-            }
-            // `execute_turn` only runs against user/subagent threads;
-            // meta entries are structural and never the subject of a turn.
-            ThreadKind::Meta => {
-                return Err(TurnError::Fatal(anyhow!(
-                    "execute_turn called with ThreadKind::Meta"
-                )));
-            }
-        };
 
         // Number of streaming retries observed for the current
         // inference. Reported on `StreamRetry` events so listeners
@@ -521,23 +457,14 @@ impl<UI: AjUi> Agent<UI> {
         let mut retry_strategy = None;
 
         'outer: loop {
-            // Lock briefly to snapshot the conversation for inference.
-            // The lock is dropped before the inference call so the
-            // persistence listener (or anything else) can take it.
-            let conversation = {
-                let log_guard = log.lock().await;
-                let head = log_guard
-                    .latest_leaf(filter)
-                    .ok_or_else(|| anyhow!("execute_turn called on an empty thread"))?;
-                log_guard.linearize(&head, filter)
-            };
-            let response_stream = self.run_inference_streaming(&conversation).await?;
+            let response_stream = self.run_inference_streaming().await?;
 
             let mut response: Option<Message> = None;
-            // Tool_use blocks whose `input` JSON failed to parse arrive
-            // as ToolUseParseError and are dropped from the assistant
-            // content. Collect (id, name, error) so we can resurrect
-            // them with a paired `is_error: true` tool_result below.
+            // Tool_use blocks whose `input` JSON failed to parse
+            // arrive as ToolUseParseError and are dropped from the
+            // assistant content. Collect (id, name, error) so we
+            // can resurrect them with a paired `is_error: true`
+            // tool_result below.
             let mut tool_use_parse_errors: Vec<(String, String, String)> = Vec::new();
 
             {
@@ -761,14 +688,14 @@ impl<UI: AjUi> Agent<UI> {
                 }
             }
 
-            // Persist the assistant's message via the bus. The
-            // persistence listener writes it to disk before this
-            // `emit` resolves (listeners are awaited inline), so
-            // when we re-read `latest_leaf` immediately after we
-            // see the freshly-appended entry. `assistant_head` is
-            // the id sub-agents spawned while handling tool_use
-            // blocks below anchor at.
+            // Append the assistant's message to the transcript and
+            // mirror it on the bus for the persistence listener.
+            // The transcript update happens before the bus emit so
+            // a listener that errors out can't leave the
+            // transcript and the log out of sync (the listener's
+            // failure is fatal regardless — see [`TurnError::Fatal`]).
             let message_param = response.into_message_param();
+            self.transcript.push(message_param.clone());
             self.bus
                 .emit(AgentEvent::MessagePersisted {
                     agent_id: self.agent_id,
@@ -778,14 +705,6 @@ impl<UI: AjUi> Agent<UI> {
                 })
                 .await
                 .map_err(TurnError::Fatal)?;
-            let assistant_head = {
-                let log_guard = log.lock().await;
-                log_guard.latest_leaf(filter).ok_or_else(|| {
-                    TurnError::Fatal(anyhow!(
-                        "persistence listener failed to append assistant message"
-                    ))
-                })?
-            };
 
             let usage = TokenUsage {
                 accumulated_input: self.session_state.accumulated_usage.input_tokens,
@@ -823,10 +742,7 @@ impl<UI: AjUi> Agent<UI> {
                     // Mirror the start of every tool invocation on the
                     // bus before we do any work — listeners that render
                     // a "running…" placeholder rely on seeing this
-                    // event before any update or end. The matching
-                    // `ToolExecutionEnd` is emitted below regardless of
-                    // whether the call succeeded, errored, or was a
-                    // parse-failure that bypassed execution.
+                    // event before any update or end.
                     self.bus
                         .emit(AgentEvent::ToolExecutionStart {
                             agent_id: self.agent_id,
@@ -837,14 +753,13 @@ impl<UI: AjUi> Agent<UI> {
                         .await
                         .map_err(TurnError::Fatal)?;
 
-                    // Run the tool (or synthesize an error outcome for
-                    // tool_use blocks the streaming layer rejected
-                    // with a parse error). The agent now drives the
-                    // new [`tool::ToolDefinition`] surface end-to-end:
-                    // success and recoverable error both come back as
-                    // a [`ToolOutcome`] the rest of the loop projects
-                    // onto the wire `tool_result` block (text-flattened
-                    // `content`) and the bus
+                    // Run the tool (or synthesize an error outcome
+                    // for tool_use blocks the streaming layer
+                    // rejected with a parse error). Success and
+                    // recoverable error both come back as a
+                    // [`ToolOutcome`] the rest of the loop projects
+                    // onto the wire `tool_result` block (text-
+                    // flattened `content`) and the bus
                     // [`AgentEvent::ToolExecutionEnd`] event
                     // (structured `details` + `is_error`).
                     let outcome = if let Some(parse_err) = tool_use_parse_failures.remove(&tool_id)
@@ -880,19 +795,14 @@ impl<UI: AjUi> Agent<UI> {
                         }
                     } else {
                         let result = self
-                            .execute_tool(
-                                Arc::clone(&log),
-                                assistant_head.clone(),
-                                &tool_id,
-                                &tool_name,
-                                tool_input.clone(),
-                            )
+                            .execute_tool(&tool_id, &tool_name, tool_input.clone())
                             .await;
 
                         match result {
                             Ok(outcome) => outcome,
                             Err(err) => {
-                                // Same legacy persistence as the parse-failure path.
+                                // Same legacy persistence as the
+                                // parse-failure path.
                                 self.bus
                                     .emit(AgentEvent::MessagePersisted {
                                         agent_id: self.agent_id,
@@ -921,15 +831,15 @@ impl<UI: AjUi> Agent<UI> {
                     };
 
                     // Project the structured `content` onto the
-                    // legacy text-only `ToolResultContent::Text` shape
-                    // for the wire. The `details` ride directly on
-                    // the bus event below; persistence captures both
-                    // pieces (the wire content goes into the
-                    // synthesized user-role `ToolResult` message; the
-                    // structured details land via a future
-                    // `MessagePersisted::ToolDetails` once the on-disk
-                    // format catches up — see `docs/aj-next-plan.md`
-                    // §3 / §1.2).
+                    // legacy text-only `ToolResultContent::Text`
+                    // shape for the wire. The `details` ride
+                    // directly on the bus event below; persistence
+                    // captures both pieces (the wire content goes
+                    // into the synthesized user-role `ToolResult`
+                    // message; the structured details land via a
+                    // future `MessagePersisted::ToolDetails` once
+                    // the on-disk format catches up — see
+                    // `docs/aj-next-plan.md` §3 / §1.2).
                     let return_value: String = outcome
                         .content
                         .iter()
@@ -961,6 +871,11 @@ impl<UI: AjUi> Agent<UI> {
                 }
 
                 if !tool_result_contents.is_empty() {
+                    // Append the synthesized user-role
+                    // tool_result message to the transcript and
+                    // mirror it on the bus.
+                    self.transcript
+                        .push(MessageParam::new_user_message(tool_result_contents.clone()));
                     self.bus
                         .emit(AgentEvent::MessagePersisted {
                             agent_id: self.agent_id,
@@ -972,12 +887,13 @@ impl<UI: AjUi> Agent<UI> {
                         .map_err(TurnError::Fatal)?;
                 }
 
-                // Continue the conversation loop to get the model's response to tool results
+                // Continue the conversation loop to get the model's
+                // response to tool results.
                 continue;
             } else {
-                // We are now ready to finish this turn. Every event that
-                // belongs to this turn has already been appended
-                // individually; there is no per-turn save.
+                // We are now ready to finish this turn. Every event
+                // that belongs to this turn has already been
+                // emitted individually; there is no per-turn save.
                 break;
             }
         }
@@ -995,31 +911,24 @@ impl<UI: AjUi> Agent<UI> {
 
     async fn run_inference_streaming(
         &self,
-        conversation: &Conversation,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ModelError> {
-        let thinking = self.determine_thinking(conversation);
+        let thinking = self.determine_thinking();
 
         tracing::debug!(?thinking, "thinking budget");
 
-        // `resolve_system_prompt` is called at the top of each public
-        // entry point (`run`, `run_single_turn`) before any inference,
-        // so the cache is always populated by the time we get here.
         let system_prompt = self
             .assembled_system_prompt
             .clone()
             .expect("system prompt must be resolved before inference");
 
-        // The legacy `Model` trait operates on a flat slice of
-        // `MessageParam`s — the wire view of the conversation. Project
-        // the linearized log down to that shape here; non-message
-        // entries (system prompts, tool-output stand-ins) are
-        // structural metadata and never reach the wire.
-        let messages: Vec<aj_models::messages::MessageParam> =
-            conversation.messages().into_iter().cloned().collect();
-
         let response = self
             .model
-            .run_inference_streaming(&messages, system_prompt, self.tools.clone(), thinking)
+            .run_inference_streaming(
+                &self.transcript,
+                system_prompt,
+                self.tools.clone(),
+                thinking,
+            )
             .await?;
 
         Ok(response)
@@ -1032,10 +941,32 @@ impl<UI: AjUi> Agent<UI> {
     /// - "think hard" -> 10,000 tokens
     /// - "think" -> 4,000 tokens
     /// - default -> falls back to configured default thinking level
-    fn determine_thinking(&self, conversation: &Conversation) -> Option<ThinkingConfig> {
-        let last_user_message = conversation.last_user_message();
+    fn determine_thinking(&self) -> Option<ThinkingConfig> {
+        // Walk back through the transcript for the most recent
+        // user-role message that contained any text content.
+        // (Tool-result-only user messages don't count: they're
+        // synthesized after a tool batch and shouldn't influence
+        // thinking budget for the follow-up inference.)
+        let last_user_text = self
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|message| match message.role {
+                Role::User => {
+                    let has_text_input = message
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlockParam::TextBlock { .. }));
+                    if has_text_input {
+                        Some(message)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
 
-        if let Some(message) = last_user_message {
+        if let Some(message) = last_user_text {
             // Extract text content from the message
             let text_content = message
                 .content
@@ -1070,75 +1001,8 @@ impl<UI: AjUi> Agent<UI> {
         self.default_thinking.clone()
     }
 
-    /// Assemble the system prompt we pass to the model from the actual system
-    /// prompt and additional information we might want or need, such as
-    /// information about the environment.
-    fn assemble_system_prompt(&self) -> String {
-        let mut text = self.system_prompt.to_string();
-
-        // Stitch in every context file, in order. Each file is wrapped in an
-        // `<agents-md>` block so the model can clearly tell where instructions
-        // start and end, with the kind-specific prefix text introducing it.
-        for file in &self.env.context_files {
-            text.push_str(&format!(
-                "\n\n{}\n<agents-md>\n{}\n</agents-md>",
-                file.kind.prompt_prefix(),
-                file.content
-            ));
-        }
-
-        text.push_str(&format!(
-            "\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
-            self.env
-        ));
-
-        text
-    }
-
-    /// Determine the system prompt to use for this run, populating
-    /// [Self::assembled_system_prompt]. Idempotent: subsequent calls
-    /// within the same run are no-ops.
-    ///
-    /// Resolution rules:
-    /// - If the log already carries a persisted `SystemPrompt` entry
-    ///   (resumed thread, or a thread the parent agent already
-    ///   initialized), use that verbatim. This is the cache-friendly
-    ///   path: the prompt sent to the model is byte-for-byte identical
-    ///   to the one used on the previous turn, so Anthropic's prompt
-    ///   cache stays warm across UTC date rollovers and restarts.
-    /// - Else if the log is empty, freshly assemble from the static
-    ///   prompt + current env and persist as the root entry. Future
-    ///   resumes of this thread will then take the first branch.
-    /// - Else (legacy thread file with no persisted system prompt),
-    ///   freshly assemble without persisting, falling back to the
-    ///   pre-persistence behavior. The assembly may differ from what
-    ///   the model originally saw on this thread, but legacy threads
-    ///   never had a stable cached prompt anyway.
-    fn resolve_system_prompt(
-        &mut self,
-        log: &mut ConversationLog,
-    ) -> Result<(), ConversationError> {
-        if self.assembled_system_prompt.is_some() {
-            return Ok(());
-        }
-
-        if let Some(persisted) = log.system_prompt() {
-            self.assembled_system_prompt = Some(persisted.to_string());
-            return Ok(());
-        }
-
-        let assembled = self.assemble_system_prompt();
-        if log.is_empty() {
-            log.set_system_prompt(assembled.clone())?;
-        }
-        self.assembled_system_prompt = Some(assembled);
-        Ok(())
-    }
-
     async fn execute_tool(
         &mut self,
-        log: Arc<TokioMutex<ConversationLog>>,
-        parent_head: EntryId,
         _call_id: &str,
         tool_name: &str,
         tool_input: serde_json::Value,
@@ -1157,20 +1021,19 @@ impl<UI: AjUi> Agent<UI> {
         let sub_agent_tools: Vec<ErasedToolDefinition> =
             self.tool_definitions.values().cloned().collect();
 
-        // Build the [`ToolContext`] the tool sees: working directory,
-        // todos, sub-agent spawn, cancellation token, no-op
-        // `emit_update`. The wrapper holds the still-required pieces
-        // for sub-agent spawning (parent log handle, parent head id,
-        // model, disabled tools, parent bus, parent agent id, sub-
-        // agent tool list, and a clone of the parent's UI for the
-        // sub-agent's `AjUi` while §2.4a leaves run-level
-        // orchestration on `self.ui`).
+        // Build the [`ToolContext`] the tool sees: working
+        // directory, todos, sub-agent spawn, cancellation token,
+        // no-op `emit_update`. After §2.4b the wrapper no longer
+        // touches the conversation log; sub-agent persistence is
+        // anchored via the `SubAgentStart` event the wrapper emits
+        // before the child runs.
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_ctx: &mut self.session_state,
-            ui: self.ui.shallow_clone(),
             env: &self.env,
-            log,
-            parent_head,
+            assembled_system_prompt: self
+                .assembled_system_prompt
+                .clone()
+                .expect("system prompt must be resolved before sub-agent spawn"),
             system_prompt: self.system_prompt,
             disabled_tools: &self.disabled_tools,
             model: Arc::clone(&self.model),
@@ -1183,258 +1046,9 @@ impl<UI: AjUi> Agent<UI> {
         let outcome = (tool_def.func)(&mut session_ctx_wrapper, tool_input).await?;
         Ok(outcome)
     }
-
-    fn display_user_output(&mut self, user_outputs: &[UserOutput]) {
-        for output in user_outputs {
-            match output {
-                UserOutput::Notice(msg) => {
-                    self.ui.display_notice(msg);
-                }
-                UserOutput::Error(msg) => {
-                    self.ui.display_error(msg);
-                }
-                UserOutput::ToolResult {
-                    tool_name,
-                    input,
-                    output,
-                } => {
-                    self.ui.display_tool_result(tool_name, input, output);
-                }
-                UserOutput::ToolResultDiff {
-                    tool_name,
-                    input,
-                    before,
-                    after,
-                } => {
-                    self.ui
-                        .display_tool_result_diff(tool_name, input, before, after);
-                }
-                UserOutput::ToolError {
-                    tool_name,
-                    input,
-                    error,
-                } => {
-                    self.ui.display_tool_error(tool_name, input, error);
-                }
-                UserOutput::TokenUsage(usage) => {
-                    self.ui.display_token_usage(usage);
-                }
-                UserOutput::TokenUsageSummary(summary) => {
-                    self.ui.display_token_usage_summary(summary);
-                }
-            }
-        }
-    }
-
-    /// Display the context (system prompt addenda) at startup so the user can
-    /// see which agent files (and, in the future, skills) are being injected
-    /// into the model's system prompt.
-    async fn display_context(&mut self) -> Result<(), anyhow::Error> {
-        let text = if self.env.context_files.is_empty() {
-            "Context: (none)".to_string()
-        } else {
-            let mut lines = String::from("Context:");
-            for file in &self.env.context_files {
-                lines.push_str(&format!(
-                    "\n  - {} ({})",
-                    display_path(&file.path),
-                    file.kind.label()
-                ));
-            }
-            lines
-        };
-        self.notice(text).await
-    }
-
-    /// Display a notice both through the UI and on the bus.
-    ///
-    /// The bus emit is awaited inline so a listener that returns
-    /// `Err` (e.g. a future persistence listener that observes a
-    /// disk-write failure) propagates the failure back to the
-    /// caller. Today no production subscribers exist; the helper
-    /// pairs the legacy UI call with a `Notice` event so tests can
-    /// snapshot the protocol shape without touching the binary.
-    async fn notice(&mut self, text: impl Into<String>) -> Result<(), anyhow::Error> {
-        let text = text.into();
-        self.ui.display_notice(&text);
-        self.bus
-            .emit(AgentEvent::Notice {
-                agent_id: self.agent_id,
-                text,
-            })
-            .await
-    }
-
-    /// Sibling of [Self::notice] for warnings.
-    async fn warning(&mut self, text: impl Into<String>) -> Result<(), anyhow::Error> {
-        let text = text.into();
-        self.ui.display_warning(&text);
-        self.bus
-            .emit(AgentEvent::Warning {
-                agent_id: self.agent_id,
-                text,
-            })
-            .await
-    }
-
-    /// Sibling of [Self::notice] for errors.
-    async fn error(&mut self, text: impl Into<String>) -> Result<(), anyhow::Error> {
-        let text = text.into();
-        self.ui.display_error(&text);
-        self.bus
-            .emit(AgentEvent::Error {
-                agent_id: self.agent_id,
-                text,
-            })
-            .await
-    }
-
-    fn display_usage_summary(&mut self) {
-        // Create main agent usage
-        let main_agent_usage = SubAgentUsage {
-            agent_id: None,
-            input_tokens: self.session_state.accumulated_usage.input_tokens,
-            output_tokens: self.session_state.accumulated_usage.output_tokens,
-            cache_creation_tokens: self
-                .session_state
-                .accumulated_usage
-                .cache_creation_input_tokens
-                .unwrap_or(0),
-            cache_read_tokens: self
-                .session_state
-                .accumulated_usage
-                .cache_read_input_tokens
-                .unwrap_or(0),
-        };
-
-        // Create sub-agent usage list
-        let mut sub_agent_usage = Vec::new();
-        let mut total_sub_agent_input = 0;
-        let mut total_sub_agent_output = 0;
-        let mut total_sub_agent_cache_creation = 0;
-        let mut total_sub_agent_cache_read = 0;
-
-        for (agent_id, usage) in &self.session_state.sub_agent_usage {
-            let sub_usage = SubAgentUsage {
-                agent_id: Some(*agent_id),
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-            };
-
-            total_sub_agent_input += sub_usage.input_tokens;
-            total_sub_agent_output += sub_usage.output_tokens;
-            total_sub_agent_cache_creation += sub_usage.cache_creation_tokens;
-            total_sub_agent_cache_read += sub_usage.cache_read_tokens;
-
-            sub_agent_usage.push(sub_usage);
-        }
-
-        // Create total usage
-        let total_usage = SubAgentUsage {
-            agent_id: None,
-            input_tokens: main_agent_usage.input_tokens + total_sub_agent_input,
-            output_tokens: main_agent_usage.output_tokens + total_sub_agent_output,
-            cache_creation_tokens: main_agent_usage.cache_creation_tokens
-                + total_sub_agent_cache_creation,
-            cache_read_tokens: main_agent_usage.cache_read_tokens + total_sub_agent_cache_read,
-        };
-
-        // Create usage summary
-        let summary = UsageSummary {
-            main_agent_usage,
-            sub_agent_usage,
-            total_usage,
-        };
-
-        // Display using UI
-        self.ui.display_token_usage_summary(&summary);
-    }
-
-    fn display_conversation_history(&mut self, conversation: &Conversation) {
-        if conversation.is_empty() {
-            return;
-        }
-
-        for entry in conversation.entries() {
-            match &entry.entry {
-                ConversationEntryKind::Message(msg) => {
-                    match msg.role {
-                        Role::User => {
-                            // Extract text content from user message
-                            let text_content = msg
-                                .content
-                                .iter()
-                                .filter_map(|content| {
-                                    if let ContentBlockParam::TextBlock { text, .. } = content {
-                                        Some(text.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ");
-
-                            if !text_content.is_empty() {
-                                self.ui.user_text_start("");
-                                self.ui.user_text_stop(&text_content);
-                            }
-                        }
-                        Role::Assistant => {
-                            // First, display thinking content
-                            for content in &msg.content {
-                                if let ContentBlockParam::ThinkingBlock { thinking, .. } = content {
-                                    self.ui.agent_thinking_start(thinking);
-                                    self.ui.agent_thinking_stop();
-                                } else if let ContentBlockParam::RedactedThinkingBlock { data } =
-                                    content
-                                {
-                                    self.ui.agent_thinking_start(&format!(
-                                        "[Redacted thinking: {}]",
-                                        data
-                                    ));
-                                    self.ui.agent_thinking_stop();
-                                }
-                            }
-
-                            // Then, display text content
-                            let text_content = msg
-                                .content
-                                .iter()
-                                .filter_map(|content| {
-                                    if let ContentBlockParam::TextBlock { text, .. } = content {
-                                        Some(text.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ");
-
-                            if !text_content.is_empty() {
-                                self.ui.agent_text_start("");
-                                self.ui.agent_text_stop(&text_content);
-                            }
-                        }
-                    }
-                }
-                ConversationEntryKind::UserOutput(user_output) => {
-                    // Display user output (tool results, etc.)
-                    self.display_user_output(std::slice::from_ref(user_output));
-                }
-                // SystemPrompt entries are model-facing metadata, not
-                // shown in the user-visible conversation history.
-                ConversationEntryKind::SystemPrompt { .. } => {}
-            }
-        }
-
-        self.ui
-            .display_notice("--- End of conversation history ---");
-    }
 }
 
-/// Mutable state of an [Agent] session.
+/// Mutable state of an [`Agent`] session.
 #[derive(Debug)]
 pub struct SessionState {
     working_directory: PathBuf,
@@ -1483,9 +1097,9 @@ impl SessionState {
     }
 
     /// Seed the subagent counter to `value` so subsequent
-    /// [SessionState::next_sub_agent_id] calls mint ids strictly greater
-    /// than `value`. Used on resume to avoid colliding with subagent
-    /// subtrees already persisted in the log.
+    /// [`SessionState::next_sub_agent_id`] calls mint ids strictly
+    /// greater than `value`. Used on resume to avoid colliding
+    /// with subagent subtrees already persisted in the log.
     fn seed_sub_agent_counter(&mut self, value: usize) {
         self.sub_agent_counter = value;
     }
@@ -1495,51 +1109,47 @@ impl SessionState {
     }
 }
 
-/// Wrapper that provides partial access to mutable [Agent] state, while we have
-/// partial immutable access to other parts. Used in [Agent::execute_tool].
-struct SessionContextWrapper<'a, UI: AjUi> {
+/// Wrapper that provides partial access to mutable [`Agent`] state,
+/// while we have partial immutable access to other parts. Used in
+/// [`Agent::execute_tool`].
+struct SessionContextWrapper<'a> {
     session_ctx: &'a mut SessionState,
     env: &'a AgentEnv,
-    ui: UI,
-    /// The one log owned by this session. Subagents append into it
-    /// (through their own [ConversationView]) rather than creating
-    /// sibling files. Held behind an `Arc<tokio::sync::Mutex<_>>`
-    /// per `docs/aj-next-plan.md` §2.3b so the agent and the
-    /// persistence listener can both reach it; the wrapper only
-    /// passes it through to the spawned sub-agent.
-    log: Arc<TokioMutex<ConversationLog>>,
-    /// The entry id that subagents spawned from this tool invocation
-    /// should anchor at. Typically the assistant message that carried
-    /// the spawning `tool_use` block.
-    parent_head: EntryId,
+    /// The fully-assembled system prompt for the current run,
+    /// captured at the moment the tool is invoked. Sub-agents
+    /// spawned through this wrapper inherit it verbatim so the
+    /// session has a single, consistent system prompt across all
+    /// agents.
+    assembled_system_prompt: String,
     system_prompt: &'static str,
     disabled_tools: &'a [String],
     model: Arc<dyn Model>,
     /// Snapshot of the parent's tool list. Sub-agents inherit this
     /// minus the `agent` tool. Cloning per-spawn is cheap because
-    /// every `ErasedToolDefinition` field is `Clone` and the closure
-    /// is `Arc`-shared.
+    /// every `ErasedToolDefinition` field is `Clone` and the
+    /// closure is `Arc`-shared.
     sub_agent_tools: Vec<ErasedToolDefinition>,
-    /// Clone of the parent agent's event bus. Used to emit
-    /// [AgentEvent::SubAgentStart] / [AgentEvent::SubAgentEnd]
-    /// correlation events on the parent's bus when this wrapper's
-    /// [ToolContext::spawn_agent] runs. Sub-agents share this bus
-    /// per `docs/aj-next-plan.md` §1.6 so every event a child emits
-    /// reaches the listeners the binary registered on the parent,
-    /// tagged with [`AgentId::Sub`].
+    /// Clone of the parent agent's event bus. Sub-agents share
+    /// this bus per `docs/aj-next-plan.md` §1.6 so every event a
+    /// child emits reaches the listeners the binary registered on
+    /// the parent, tagged with [`AgentId::Sub`]. The wrapper also
+    /// emits [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
+    /// correlation events on this bus before / after the child
+    /// runs.
     parent_bus: EventBus,
     /// Identifier of the parent agent that owns this wrapper. The
-    /// `parent` field of [AgentEvent::SubAgentStart] /
-    /// [AgentEvent::SubAgentEnd].
+    /// `parent` field of [`AgentEvent::SubAgentStart`] /
+    /// [`AgentEvent::SubAgentEnd`].
     parent_agent_id: AgentId,
-    /// Cancellation token surfaced through [`ToolContext::cancellation`].
-    /// Derived from the parent agent's token via
-    /// [`CancellationToken::child_token`] so a future `Agent::cancel`
-    /// reaches in-flight tools and any sub-agents they spawn.
+    /// Cancellation token surfaced through
+    /// [`ToolContext::cancellation`]. Derived from the parent
+    /// agent's token via [`CancellationToken::child_token`] so a
+    /// future `Agent::cancel` reaches in-flight tools and any
+    /// sub-agents they spawn.
     cancellation: CancellationToken,
 }
 
-impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
+impl<'a> ToolContext for SessionContextWrapper<'a> {
     fn working_directory(&self) -> PathBuf {
         self.session_ctx.working_directory()
     }
@@ -1564,7 +1174,9 @@ impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
             let child_id = AgentId::Sub(agent_id);
 
             // Mirror sub-agent lifecycle on the parent's bus so a
-            // single listener (e.g. the future TUI's event pump) can
+            // single listener (e.g. the future TUI's event pump,
+            // or the persistence listener that needs to capture
+            // the parent anchor for the child's first write) can
             // group nested transcripts under the parent's
             // tool-execution component.
             self.parent_bus
@@ -1575,15 +1187,12 @@ impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
                 })
                 .await?;
 
-            // Create a sub-agent UI wrapper with the agent number
-            let sub_ui = self.ui.get_subagent_ui(agent_id);
-
-            // Build the sub-agent's tool list by cloning the parent's
-            // (the toolset is filtered upstream when the binary calls
-            // `Agent::new`), then dropping the `agent` tool itself to
-            // prevent infinite recursion. We clone rather than re-call
-            // `get_builtin_tools` so `aj-agent` doesn't depend on
-            // `aj-tools`.
+            // Build the sub-agent's tool list by cloning the
+            // parent's (the toolset is filtered upstream when the
+            // binary calls `Agent::new`), then dropping the
+            // `agent` tool itself to prevent infinite recursion.
+            // We clone rather than re-call `get_builtin_tools` so
+            // `aj-agent` doesn't depend on `aj-tools`.
             let disabled_tools = self.disabled_tools.to_vec();
             let sub_agent_tools: Vec<ErasedToolDefinition> = self
                 .sub_agent_tools
@@ -1592,12 +1201,12 @@ impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
                 .cloned()
                 .collect();
 
-            // Create a new agent with the sub-agent UI. It shares this
-            // session's log; its entries are appended as `Subagent`
-            // entries in the same file, rooted at `self.parent_head`.
+            // Create a new agent rooted in this session's env and
+            // tools. Its transcript starts empty; the prompt the
+            // tool invoked us with is appended as the first user
+            // message inside `run_single_turn`.
             let mut sub_agent = Agent::new(
                 self.env.clone(),
-                sub_ui,
                 self.system_prompt,
                 sub_agent_tools,
                 disabled_tools,
@@ -1605,24 +1214,17 @@ impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
                 None,
             );
             sub_agent.set_agent_id(child_id);
-            // Share the parent's bus per `docs/aj-next-plan.md` §1.6:
-            // every event the sub-agent emits during its run reaches
-            // the listeners the binary registered on the parent
-            // (rendering, persistence), tagged with `Sub(n)`. Without
-            // this the sub-agent runs on its own bus and the binary's
-            // bridge listener never sees its activity.
+            sub_agent.set_assembled_system_prompt(self.assembled_system_prompt.clone());
+            // Share the parent's bus per `docs/aj-next-plan.md`
+            // §1.6: every event the sub-agent emits during its
+            // run reaches the listeners the binary registered on
+            // the parent (rendering, persistence), tagged with
+            // `Sub(n)`. Without this the sub-agent runs on its
+            // own bus and the binary's bridge listener never sees
+            // its activity.
             sub_agent.set_bus(self.parent_bus.clone());
 
-            // Run the sub-agent with the task, anchored at the parent
-            // tool-use's assistant message.
-            let result = sub_agent
-                .run_single_turn(
-                    Arc::clone(&self.log),
-                    self.parent_head.clone(),
-                    agent_id,
-                    task,
-                )
-                .await;
+            let result = sub_agent.run_single_turn(task).await;
 
             // Get the sub-agent's accumulated usage
             let sub_agent_usage = sub_agent.session_state.accumulated_usage.clone();
@@ -1648,26 +1250,27 @@ impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
                 })
                 .await?;
 
-            // Surface the freshly-allocated sub-agent id alongside the
-            // child's final assistant text. Errors still propagate via
-            // `?` so the agent runtime keeps synthesizing a generic
-            // tool-error result for failed spawns.
+            // Surface the freshly-allocated sub-agent id alongside
+            // the child's final assistant text. Errors still
+            // propagate via `?` so the agent runtime keeps
+            // synthesizing a generic tool-error result for failed
+            // spawns.
             result.map(|report| SpawnedAgent { agent_id, report })
         })
     }
 
     fn emit_update(&mut self, _partial: ToolDetails) {
-        // No-op for §2.4a. The trait's `emit_update` is synchronous
+        // No-op for now. The trait's `emit_update` is synchronous
         // but the bus's `emit` is async, so we cannot drive
         // [`AgentEvent::ToolExecutionUpdate`] inline from a sync
-        // context without breaking the bus's "listeners are awaited
-        // inline" guarantee (firing the listener from a spawned task
-        // would let `Update` events arrive after `End`). Today only
-        // `bash` calls `emit_update`, the legacy CLI doesn't render
-        // it, and dropping the snapshot is functionally equivalent
-        // to the pre-§2.4a behavior. A bus-side `try_emit_sync` (or
-        // an async `emit_update` on the trait) lands when the TUI
-        // needs progress streaming.
+        // context without breaking the bus's "listeners are
+        // awaited inline" guarantee (firing the listener from a
+        // spawned task would let `Update` events arrive after
+        // `End`). Today only `bash` calls `emit_update`, the
+        // legacy CLI doesn't render it, and dropping the snapshot
+        // is functionally equivalent to the pre-§2.4a behavior. A
+        // bus-side `try_emit_sync` (or an async `emit_update` on
+        // the trait) lands when the TUI needs progress streaming.
     }
 
     fn cancellation(&self) -> CancellationToken {
@@ -1675,27 +1278,19 @@ impl<'a, UI: AjUi> ToolContext for SessionContextWrapper<'a, UI> {
     }
 }
 
-/// Scan the linearized user thread for `tool_use` blocks that never got a
-/// matching `tool_result`. If any are found, synthesize a single user
-/// message with one `tool_result` block per dangling id and append it to
-/// the log so the conversation is valid input for the model again.
-///
-/// Without this, a process killed between writing the assistant message
-/// and writing the tool_result user message would leave the file in a
-/// state that both Anthropic and OpenAI APIs reject on resume.
-fn repair_interrupted_tool_uses(
-    log: &mut ConversationLog,
-    conversation: &Conversation,
-) -> Result<(), anyhow::Error> {
-    // Collect all tool_use ids from assistant messages and all
-    // tool_result ids seen in subsequent user messages. Anything in the
-    // first set that isn't in the second set is dangling.
-    let mut used: HashSet<String> = HashSet::new();
-    let mut resolved: HashSet<String> = HashSet::new();
-    for entry in conversation.entries() {
-        let ConversationEntryKind::Message(msg) = &entry.entry else {
-            continue;
-        };
+/// Inspect a freshly-seeded transcript for `tool_use` blocks that
+/// never received a matching `tool_result`. This is the in-memory
+/// counterpart of `aj_session::repair_interrupted_tool_uses`: the
+/// binary calls the session-side helper to write recovery entries
+/// to disk, then re-seeds the agent; if the binary instead seeds
+/// without repairing, [`scan_dangling_tool_uses`] surfaces the
+/// invariant violation here. Used by the agent's tests; not part
+/// of the run-time path.
+#[cfg(test)]
+fn scan_dangling_tool_uses(transcript: &[MessageParam]) -> std::collections::HashSet<String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in transcript {
         match msg.role {
             Role::Assistant => {
                 for block in &msg.content {
@@ -1713,52 +1308,26 @@ fn repair_interrupted_tool_uses(
             }
         }
     }
-
-    let dangling: Vec<String> = used.difference(&resolved).cloned().collect();
-    if dangling.is_empty() {
-        return Ok(());
-    }
-
-    tracing::warn!(
-        "resuming past {} interrupted tool call(s); synthesizing error results",
-        dangling.len()
-    );
-
-    let tool_result_contents: Vec<ContentBlockParam> = dangling
-        .into_iter()
-        .map(|tool_use_id| ContentBlockParam::ToolResultBlock {
-            tool_use_id,
-            content: "Previous session was interrupted before this tool call completed."
-                .to_string()
-                .into(),
-            is_error: true,
-        })
-        .collect();
-
-    let head = log
-        .latest_leaf(ThreadFilter::USER)
-        .expect("repair called with a non-empty user thread");
-    let mut view = ConversationView::user(log, Some(head));
-    view.add_user_message(tool_result_contents)?;
-    Ok(())
+    used.difference(&resolved).cloned().collect()
 }
 
-/// Error returned from [Agent::execute_turn].
+/// Error returned from [`Agent::run_turn`] / [`Agent::run_single_turn`].
 ///
-/// `Recoverable` errors (model API failures, malformed streaming responses,
-/// etc.) are surfaced to the user so they can retry or rephrase, rather
-/// than aborting the program. `Fatal` errors (log persistence failures,
-/// internal invariant violations) bubble out so the user gets a clean
-/// exit instead of silently looping.
+/// `Recoverable` errors (model API failures, malformed streaming
+/// responses, etc.) are surfaced to the user so they can retry or
+/// rephrase, rather than aborting the program. `Fatal` errors
+/// (listener-write failures, internal invariant violations) bubble
+/// out so the user gets a clean exit instead of silently looping.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
-    /// An ephemeral error encountered while talking to the model. The
-    /// conversation log is in a consistent state and the user can retry
-    /// by submitting another message.
+    /// An ephemeral error encountered while talking to the model.
+    /// The transcript is in a consistent state and the user can
+    /// retry by submitting another message.
     #[error("{0:#}")]
     Recoverable(anyhow::Error),
-    /// A persistent failure (e.g. failed disk write) or an internal
-    /// invariant violation. Bubble out to the top level.
+    /// A persistent failure (e.g. failed disk write through the
+    /// persistence listener) or an internal invariant violation.
+    /// Bubble out to the top level.
     #[error(transparent)]
     Fatal(anyhow::Error),
 }
@@ -1775,12 +1344,6 @@ impl From<ApiError> for TurnError {
     }
 }
 
-impl From<ConversationError> for TurnError {
-    fn from(e: ConversationError) -> Self {
-        TurnError::Fatal(e.into())
-    }
-}
-
 impl From<anyhow::Error> for TurnError {
     fn from(e: anyhow::Error) -> Self {
         TurnError::Fatal(e)
@@ -1791,11 +1354,12 @@ impl From<anyhow::Error> for TurnError {
 mod event_protocol_tests {
     //! Snapshot the event protocol the agent emits on its bus.
     //!
-    //! Per `docs/aj-next-plan.md` §2.1, the bus runs alongside the
-    //! legacy `AjUi` calls during Phase 0; this module locks the
-    //! event sequence for known-shape turns so subsequent commits
-    //! (per-tool migration, atomic CLI swap, type unification)
-    //! cannot silently regress the protocol.
+    //! Per `docs/aj-next-plan.md` §2.1 / §2.4b, the bus is the
+    //! agent's only output channel. These tests pin the event
+    //! sequence for known-shape turns so subsequent commits cannot
+    //! silently regress the protocol; the agent runs in isolation
+    //! (no log, no UI), with a scripted model, and the test
+    //! observes events directly.
 
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1807,68 +1371,19 @@ mod event_protocol_tests {
     use aj_models::streaming::StreamingEvent;
     use aj_models::tools::Tool;
     use aj_models::{Model, ModelError, ThinkingConfig};
-    use aj_session::{ConversationLog, ConversationPersistence};
-    use aj_ui::{AjUi, TokenUsage, UsageSummary};
     use async_trait::async_trait;
     use futures::stream;
     use std::sync::Arc;
-    use tempfile::TempDir;
-    use tokio::sync::Mutex as TokioMutex;
 
     use crate::bus::listener_from_sync;
     use crate::events::{AgentEvent, AgentId, PersistedMessageKind};
-    use crate::persistence::persistence_listener;
     use crate::tool::{
         ErasedToolDefinition, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
     };
     use crate::Agent;
 
-    /// Stub AjUi that swallows every interaction. We assert against
-    /// the bus, not against the legacy UI; the agent still routes
-    /// every notice/warning/error through both during §2.1.
-    #[derive(Clone)]
-    struct NoopUi;
-
-    impl AjUi for NoopUi {
-        fn display_notice(&mut self, _notice: &str) {}
-        fn display_warning(&mut self, _warning: &str) {}
-        fn display_error(&mut self, _error: &str) {}
-        fn get_user_input(&mut self) -> Option<String> {
-            None
-        }
-        fn agent_text_start(&mut self, _text: &str) {}
-        fn agent_text_update(&mut self, _diff: &str) {}
-        fn agent_text_stop(&mut self, _text: &str) {}
-        fn user_text_start(&mut self, _text: &str) {}
-        fn user_text_update(&mut self, _diff: &str) {}
-        fn user_text_stop(&mut self, _text: &str) {}
-        fn agent_thinking_start(&mut self, _thinking: &str) {}
-        fn agent_thinking_update(&mut self, _diff: &str) {}
-        fn agent_thinking_stop(&mut self) {}
-        fn display_tool_result(&mut self, _tool_name: &str, _input: &str, _output: &str) {}
-        fn display_tool_result_diff(
-            &mut self,
-            _tool_name: &str,
-            _input: &str,
-            _before: &str,
-            _after: &str,
-        ) {
-        }
-        fn display_tool_error(&mut self, _tool_name: &str, _input: &str, _error: &str) {}
-        fn ask_permission(&mut self, _message: &str) -> bool {
-            false
-        }
-        fn display_token_usage(&mut self, _usage: &TokenUsage) {}
-        fn display_token_usage_summary(&mut self, _summary: &UsageSummary) {}
-        fn get_subagent_ui(&mut self, _agent_number: usize) -> Box<dyn AjUi> {
-            Box::new(NoopUi)
-        }
-        fn shallow_clone(&mut self) -> Box<dyn AjUi> {
-            Box::new(NoopUi)
-        }
-    }
-
-    /// Fake [Model] that hands back canned [StreamingEvent] streams.
+    /// Fake [`Model`] that hands back canned [`StreamingEvent`]
+    /// streams.
     ///
     /// The agent loops over inferences when the model returns a
     /// `tool_use`, so the test feeds in one stream per inference.
@@ -1917,7 +1432,7 @@ mod event_protocol_tests {
     }
 
     /// Trivial tool that returns a fixed string. Implements the
-    /// new-shape [`ToolDefinition`] so the test exercises the same
+    /// [`ToolDefinition`] trait so the test exercises the same
     /// driving path the production builtins go through.
     #[derive(Clone)]
     struct PingTool;
@@ -1952,7 +1467,8 @@ mod event_protocol_tests {
         }
     }
 
-    /// Build a finalized [LegacyMessage] with a single tool_use block.
+    /// Build a finalized [`LegacyMessage`] with a single tool_use
+    /// block.
     fn finalize_tool_use(tool_use_id: &str, tool_name: &str) -> LegacyMessage {
         LegacyMessage {
             id: "test-msg-1".to_string(),
@@ -1974,7 +1490,7 @@ mod event_protocol_tests {
         }
     }
 
-    /// Build a finalized [LegacyMessage] with a single text block.
+    /// Build a finalized [`LegacyMessage`] with a single text block.
     fn finalize_text(text: &str) -> LegacyMessage {
         LegacyMessage {
             id: "test-msg-2".to_string(),
@@ -1995,11 +1511,12 @@ mod event_protocol_tests {
         }
     }
 
-    /// Compact, comparable representation of an [AgentEvent] for
-    /// snapshot assertions. We don't `derive(PartialEq)` on the real
-    /// enum because some payloads (e.g. the legacy `AssistantMessage`
-    /// once it arrives in §2.4) don't implement `PartialEq` cleanly,
-    /// and a label per variant keeps test failures readable.
+    /// Compact, comparable representation of an [`AgentEvent`] for
+    /// snapshot assertions. We don't `derive(PartialEq)` on the
+    /// real enum because some payloads (e.g. the legacy
+    /// `AssistantMessage` once it arrives in §2.4) don't implement
+    /// `PartialEq` cleanly, and a label per variant keeps test
+    /// failures readable.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum EventLabel {
         AgentStart(AgentId),
@@ -2038,9 +1555,9 @@ mod event_protocol_tests {
         },
         TurnUsage(AgentId),
         /// Persistence write request. The label captures only the
-        /// kind discriminator (Assistant / ToolResult / UserOutput)
-        /// so test assertions don't have to care about the exact
-        /// content blocks the event carries.
+        /// kind discriminator (User / Assistant / ToolResult /
+        /// UserOutput) so test assertions don't have to care
+        /// about the exact content blocks the event carries.
         MessagePersisted {
             agent_id: AgentId,
             kind: &'static str,
@@ -2125,6 +1642,7 @@ mod event_protocol_tests {
             AgentEvent::TurnUsage { agent_id, .. } => EventLabel::TurnUsage(*agent_id),
             AgentEvent::MessagePersisted { agent_id, kind } => {
                 let kind = match kind {
+                    PersistedMessageKind::User { .. } => "User",
                     PersistedMessageKind::Assistant { .. } => "Assistant",
                     PersistedMessageKind::ToolResult { .. } => "ToolResult",
                     PersistedMessageKind::UserOutput { .. } => "UserOutput",
@@ -2143,20 +1661,7 @@ mod event_protocol_tests {
         }
     }
 
-    /// Set up a temp directory with an empty conversation log carrying
-    /// a fixed system prompt. Returns the log behind the same shared
-    /// handle the agent expects so each test can register its own
-    /// persistence listener and pass the handle into `run_single_turn`.
-    fn fresh_log() -> (TempDir, Arc<TokioMutex<ConversationLog>>) {
-        let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("threads"));
-        let mut log = ConversationLog::create(&persistence).expect("ConversationLog::create");
-        log.set_system_prompt("test system prompt".to_string())
-            .expect("set_system_prompt on fresh log");
-        (dir, Arc::new(TokioMutex::new(log)))
-    }
-
-    /// Build an [AgentEnv] that doesn't pull instructions from the
+    /// Build an [`AgentEnv`] that doesn't pull instructions from the
     /// host — context loading is environment-dependent, and we want
     /// a deterministic event sequence regardless of where the test
     /// runs.
@@ -2170,19 +1675,20 @@ mod event_protocol_tests {
         }
     }
 
+    fn build_agent(scripts: Vec<Vec<StreamingEvent>>, tools: Vec<ErasedToolDefinition>) -> Agent {
+        let model = Arc::new(ScriptedModel::new(scripts));
+        let env = empty_env(std::env::temp_dir());
+        let mut agent = Agent::new(env, "irrelevant", tools, Vec::new(), model, None);
+        agent.set_assembled_system_prompt("test system prompt".to_string());
+        agent
+    }
+
     #[tokio::test]
     async fn run_single_turn_with_tool_call_emits_locked_protocol() {
-        let (_dir, log) = fresh_log();
-        let parent_head = log
-            .lock()
-            .await
-            .system_prompt_id()
-            .expect("set_system_prompt populates the root entry")
-            .clone();
-
         // Two scripted inferences:
         //   1. Tool call (id="tu-1", name="ping").
-        //   2. Final text response after the tool result is fed back.
+        //   2. Final text response after the tool result is fed
+        //      back.
         let scripts = vec![
             vec![StreamingEvent::FinalizedMessage {
                 message: finalize_tool_use("tu-1", "ping"),
@@ -2191,31 +1697,14 @@ mod event_protocol_tests {
                 message: finalize_text("done"),
             }],
         ];
-        let model = Arc::new(ScriptedModel::new(scripts));
 
-        let env = empty_env(std::env::temp_dir());
         let ping: ErasedToolDefinition = PingTool.into();
-        let mut agent = Agent::new(
-            env,
-            NoopUi,
-            "irrelevant — log already has a frozen system prompt",
-            vec![ping],
-            Vec::new(),
-            model,
-            None,
-        );
+        let mut agent = build_agent(scripts, vec![ping]);
         // Mirror what `SessionContextWrapper::spawn_agent` does in
         // production: tagging the agent with its sub-agent id keeps
-        // bus events and persistence writes aligned to the
-        // [`ThreadKind::Subagent`] entries `run_single_turn` will
-        // append below.
+        // bus events aligned to the [`ThreadKind::Subagent`]
+        // entries the persistence listener would write.
         agent.set_agent_id(AgentId::Sub(1));
-
-        // Register the persistence listener so `MessagePersisted`
-        // events actually reach disk; without this the agent can't
-        // recover the assistant message's id via `latest_leaf` after
-        // the emit and the run aborts with a Fatal error.
-        let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
@@ -2224,20 +1713,22 @@ mod event_protocol_tests {
         }));
 
         agent
-            .run_single_turn(Arc::clone(&log), parent_head, 1, "run ping".to_string())
+            .run_single_turn("run ping".to_string())
             .await
             .expect("run_single_turn");
 
         let events = recorded.lock().unwrap().clone();
         let expected = vec![
             EventLabel::AgentStart(AgentId::Sub(1)),
+            // The sub-agent's first persistence event is the
+            // user-prompt message (the persistence listener uses
+            // this to anchor at the parent's spawning entry).
+            EventLabel::MessagePersisted {
+                agent_id: AgentId::Sub(1),
+                kind: "User",
+            },
             EventLabel::TurnStart(AgentId::Sub(1)),
-            // First inference: the model returned a tool_use, so a
-            // `MessagePersisted::Assistant` event fires (the
-            // listener writes the assistant message to disk before
-            // the emit resolves), `TurnUsage` reports the per-turn
-            // token counts, and the tool-execution lifecycle runs
-            // against the synthesized `ping` tool.
+            // First inference: the model returned a tool_use.
             EventLabel::MessagePersisted {
                 agent_id: AgentId::Sub(1),
                 kind: "Assistant",
@@ -2256,18 +1747,14 @@ mod event_protocol_tests {
                 body: "pong".to_string(),
                 is_error: false,
             },
-            // After the tool batch finishes, the agent emits one
-            // `MessagePersisted::ToolResult` event so the listener
-            // appends the synthesized user-role tool_result message
-            // (which the next inference will see).
+            // After the tool batch finishes, one
+            // `MessagePersisted::ToolResult` event for the
+            // synthesized user-role tool_result message.
             EventLabel::MessagePersisted {
                 agent_id: AgentId::Sub(1),
                 kind: "ToolResult",
             },
-            // Second inference: the model returned plain text, so
-            // we get one more `MessagePersisted::Assistant` (the
-            // text response itself), `TurnUsage` fires, and the
-            // loop exits without another tool batch.
+            // Second inference: the model returned plain text.
             EventLabel::MessagePersisted {
                 agent_id: AgentId::Sub(1),
                 kind: "Assistant",
@@ -2280,39 +1767,16 @@ mod event_protocol_tests {
 
     #[tokio::test]
     async fn run_single_turn_brackets_with_agent_lifecycle() {
-        // Drives `run_single_turn` (the public sub-agent entry point)
-        // and verifies the bus brackets every run with an
-        // `AgentStart` / `AgentEnd` pair tagged with the agent's id.
-        let (_dir, log) = fresh_log();
-
-        // run_single_turn anchors on a parent_head from the log; the
-        // system_prompt entry (root) is reachable and works as the
-        // parent for the sub-agent thread.
-        let parent_head = log
-            .lock()
-            .await
-            .system_prompt_id()
-            .expect("set_system_prompt populates the root entry")
-            .clone();
-
+        // Drives `run_single_turn` (the public sub-agent entry
+        // point) and verifies the bus brackets every run with an
+        // `AgentStart` / `AgentEnd` pair tagged with the agent's
+        // id.
         let scripts = vec![vec![StreamingEvent::FinalizedMessage {
             message: finalize_text("ok"),
         }]];
-        let model = Arc::new(ScriptedModel::new(scripts));
 
-        let env = empty_env(std::env::temp_dir());
-        let mut agent = Agent::new(
-            env,
-            NoopUi,
-            "irrelevant",
-            Vec::new(),
-            Vec::new(),
-            model,
-            None,
-        );
+        let mut agent = build_agent(scripts, Vec::new());
         agent.set_agent_id(AgentId::Sub(7));
-
-        let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = recorded.clone();
@@ -2321,19 +1785,19 @@ mod event_protocol_tests {
         }));
 
         agent
-            .run_single_turn(Arc::clone(&log), parent_head, 7, "test prompt".to_string())
+            .run_single_turn("test prompt".to_string())
             .await
             .expect("run_single_turn");
 
         let events = recorded.lock().unwrap().clone();
-        // The exact subset we lock: lifecycle markers, the turn
-        // boundary, the assistant-message persistence event, and
-        // the per-turn token-usage event. Everything else (no tool
-        // calls, no errors) means there are no other events this run.
         assert_eq!(
             events,
             vec![
                 EventLabel::AgentStart(AgentId::Sub(7)),
+                EventLabel::MessagePersisted {
+                    agent_id: AgentId::Sub(7),
+                    kind: "User",
+                },
                 EventLabel::TurnStart(AgentId::Sub(7)),
                 EventLabel::MessagePersisted {
                     agent_id: AgentId::Sub(7),
@@ -2344,5 +1808,87 @@ mod event_protocol_tests {
             ],
             "unexpected event sequence: {events:#?}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_turn_emits_user_message_persisted_event() {
+        // The top-level entry point appends the user prompt to the
+        // transcript and emits a `MessagePersisted::User` event
+        // before the assistant turn loop begins. This is the
+        // contract the binary's persistence listener relies on
+        // to write the user's typed input to disk.
+        let scripts = vec![vec![StreamingEvent::FinalizedMessage {
+            message: finalize_text("done"),
+        }]];
+
+        let mut agent = build_agent(scripts, Vec::new());
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        agent
+            .run_turn(Some("hello agent".to_string()))
+            .await
+            .expect("run_turn");
+
+        let events = recorded.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                EventLabel::AgentStart(AgentId::Main),
+                EventLabel::MessagePersisted {
+                    agent_id: AgentId::Main,
+                    kind: "User",
+                },
+                EventLabel::TurnStart(AgentId::Main),
+                EventLabel::MessagePersisted {
+                    agent_id: AgentId::Main,
+                    kind: "Assistant",
+                },
+                EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::AgentEnd(AgentId::Main),
+            ],
+            "unexpected event sequence: {events:#?}"
+        );
+
+        // The transcript reflects both the user prompt and the
+        // assistant reply.
+        assert_eq!(agent.messages().len(), 2);
+    }
+
+    #[test]
+    fn scan_dangling_tool_uses_finds_unmatched_ids() {
+        // Sanity check on the test-only helper: a transcript
+        // ending in an assistant tool_use without a matching
+        // tool_result reports the dangling id.
+        use aj_models::messages::{ContentBlockParam, MessageParam, Role};
+
+        let transcript = vec![
+            MessageParam::new_user_message(vec![ContentBlockParam::new_text_block("hi".into())]),
+            MessageParam {
+                role: Role::Assistant,
+                content: vec![ContentBlockParam::ToolUseBlock {
+                    id: "tu-1".to_string(),
+                    name: "ping".to_string(),
+                    input: serde_json::json!({}),
+                    caller: None,
+                }],
+            },
+        ];
+        let dangling = super::scan_dangling_tool_uses(&transcript);
+        assert!(dangling.contains("tu-1"));
+
+        let mut transcript_with_resolution = transcript.clone();
+        transcript_with_resolution.push(MessageParam::new_user_message(vec![
+            ContentBlockParam::ToolResultBlock {
+                tool_use_id: "tu-1".to_string(),
+                content: "done".to_string().into(),
+                is_error: false,
+            },
+        ]));
+        assert!(super::scan_dangling_tool_uses(&transcript_with_resolution).is_empty());
     }
 }

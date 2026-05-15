@@ -515,12 +515,62 @@ materializes the "agent is bus-only" end state.
       (notices, history display, readline loop, usage summary)
       and still takes `Arc<TokioMutex<ConversationLog>>` as a
       parameter — those both move out in §2.4b.
-- [ ] §2.4b: Remove `self.ui` and the `ConversationLog` parameter
-      from `Agent`. Move the readline loop, history display, and
-      log management to the binary; the agent uses an in-memory
-      transcript and emits `MessagePersisted::User` events for
-      user input. `aj-session` is no longer reached from
-      `aj-agent`.
+- [x] §2.4b: Remove `self.ui` and the `ConversationLog` parameter
+      from `Agent`. The agent's `UI: AjUi` generic is gone — the
+      struct is now plain `Agent` and the binary owns the renderer.
+      The agent maintains an in-memory `Vec<MessageParam>` transcript;
+      [`Agent::seed_messages`] (called once on startup) replaces the
+      previous reach into [`ConversationLog::linearize`]. The
+      readline loop, history display, repair-on-resume, sub-agent-
+      counter seeding, system-prompt resolution, sandbox warning,
+      `Model: <name>, at <url>` notice, `Context:` notice, and
+      end-of-session usage summary all moved to `aj/src/main.rs`.
+      The agent's API surface is now a turn-level
+      [`Agent::run_turn(prompt: Option<String>)`] for the top-level
+      flow and the simplified [`Agent::run_single_turn(prompt)`] for
+      sub-agents (via `ToolContext::spawn_agent`).
+
+      `aj-agent` no longer depends on `aj-session`. The persistence
+      listener factory moved from `aj_agent::persistence::persistence_listener`
+      to `aj_session::persistence_listener`; `aj-session` picked up
+      an `aj-agent` dependency (per the §1 dependency graph) so it
+      can build the listener directly. The old
+      `Agent::repair_interrupted_tool_uses` helper moved to
+      `aj_session::repair_interrupted_tool_uses` since it operates
+      on a [`ConversationLog`]; the binary calls it on resume after
+      linearizing the user thread, before seeding the agent's
+      transcript. `Agent::resolve_system_prompt(&mut log)` was
+      replaced by [`Agent::assemble_system_prompt`] (compute) +
+      [`Agent::set_assembled_system_prompt`] (push); the binary
+      decides whether to reuse the persisted prompt or freeze a
+      fresh one and then pushes the final string into the agent.
+
+      [`PersistedMessageKind::User { content }`] is new — emitted by
+      both [`Agent::run_turn`] (top-level user input) and
+      [`Agent::run_single_turn`] (sub-agent prompt). The session-
+      side persistence listener now also observes
+      [`AgentEvent::SubAgentStart`] to capture the parent thread's
+      current head: the sub-agent's first
+      [`AgentEvent::MessagePersisted`] (whose own thread is empty)
+      anchors at that captured head; subsequent sub-agent writes
+      follow the chain via
+      [`ConversationLog::latest_leaf`](aj_session::ConversationLog).
+      The agent no longer needs to hand a `parent_head: EntryId`
+      through to the sub-agent — a benefit of the
+      `AgentId`-tagged event stream — so
+      [`SessionContextWrapper::spawn_agent`] dropped its log /
+      parent-head fields entirely.
+
+      The agent's `event_protocol_tests` were reworked to run in
+      isolation: they no longer construct a [`ConversationLog`] or
+      register a persistence listener (the agent doesn't depend on
+      `aj-session`), they assert the event sequence directly off the
+      bus. A new `run_turn_emits_user_message_persisted_event` test
+      pins the new [`PersistedMessageKind::User`] event to the
+      top-level flow. The session-side persistence-listener tests
+      live in `aj_session::listener::tests` and cover the new
+      sub-agent first-entry anchoring path on top of the existing
+      assistant / tool-result / user-output writes.
 
 ### §2.5 Split agent loop from input loop
 

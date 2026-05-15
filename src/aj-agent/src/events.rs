@@ -76,23 +76,28 @@ pub enum StreamAction {
 /// What the persistence listener should append to the log when it
 /// observes an [`AgentEvent::MessagePersisted`].
 ///
-/// Each variant maps directly onto the legacy
-/// [`aj_session::ConversationView`] write the agent used to make
-/// inline; carrying the payload on the event keeps the listener
-/// stateless (the listener doesn't need to know anything about turn
-/// structure — it just appends what it's told). Folds into the
-/// per-message [`AgentEvent::MessageEnd`] payload in §2.4 when the
-/// on-disk format switches to typed messages.
+/// Each variant maps directly onto a single
+/// `aj_session::ConversationView` write the persistence listener
+/// performs in response. Carrying the payload on the event keeps
+/// the listener stateless (it doesn't need to know anything about
+/// turn structure — it just appends what it's told). Folds into
+/// the per-message [`AgentEvent::MessageEnd`] payload in §2.4 when
+/// the on-disk format switches to typed messages.
 #[derive(Clone, Debug)]
 pub enum PersistedMessageKind {
+    /// Append a user-role message carrying typed user input — the
+    /// readline loop's prompt for the top-level agent, or a
+    /// sub-agent's spawning task. Maps onto
+    /// `aj_session::ConversationView::add_user_message`.
+    User { content: Vec<ContentBlockParam> },
     /// Append an assistant message with the given content blocks.
-    /// Maps onto [`aj_session::ConversationView::add_assistant_message`].
+    /// Maps onto `aj_session::ConversationView::add_assistant_message`.
     Assistant { content: Vec<ContentBlockParam> },
     /// Append a user-role message carrying one or more
     /// `tool_result` content blocks. Synthesized by the agent at
     /// the end of every tool batch so the next inference sees the
     /// model's tool calls answered. Maps onto
-    /// [`aj_session::ConversationView::add_user_message`].
+    /// `aj_session::ConversationView::add_user_message`.
     ToolResult { content: Vec<ContentBlockParam> },
     /// Append a freestanding [`UserOutput`] entry. Today only
     /// emitted for the synthesized [`UserOutput::ToolError`]

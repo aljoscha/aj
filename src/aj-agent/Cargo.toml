@@ -7,7 +7,10 @@ edition = "2021"
 anyhow = { workspace = true }
 aj-conf = { path = "../aj-conf" }
 aj-models = { path = "../aj-models" }
-aj-session = { path = "../aj-session" }
+# `aj-ui` stays alive only for `TokenUsage` / `UserOutput` types
+# carried on bus events; the trait `AjUi` is no longer touched here
+# (per `docs/aj-next-plan.md` §2.4b). §2.6 absorbs these types into
+# `aj-agent` and drops the dependency entirely.
 aj-ui = { path = "../aj-ui" }
 chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
