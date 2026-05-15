@@ -71,12 +71,14 @@ pub enum StreamChannel {
 
 /// Streaming progress action for an in-flight assistant content block.
 ///
-/// `Start`, `Update`, `Stop` mirror the legacy `agent_text_*` /
-/// `agent_thinking_*` callback shape so the bridge listener in the
-/// `aj` binary can drive the existing `AjCli` rendering helpers
-/// without translation. Once the agent migrates to unified streaming
-/// (`AssistantMessageEvent`) in §2.4, this enum and the
-/// [`AgentEvent::StreamChunk`] variant fold into [`AgentEvent::MessageUpdate`].
+/// `Start` opens a new block with its initial snapshot, `Update`
+/// reports incremental deltas as the model streams more tokens, and
+/// `Stop` finalizes the block with its complete content. Renderers
+/// that miss intermediate `Update`s can repaint cleanly off the
+/// `Stop` snapshot. Once the agent migrates to unified streaming
+/// (`AssistantMessageEvent`) in §2.4 of `docs/aj-next-plan.md`, this
+/// enum and the [`AgentEvent::StreamChunk`] variant fold into
+/// [`AgentEvent::MessageUpdate`].
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamAction {

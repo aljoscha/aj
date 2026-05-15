@@ -25,7 +25,7 @@ use aj_tui::components::editor::Editor;
 ///
 /// Set above [`Editor::HISTORY_LIMIT`] (100) so a fresh bootstrap
 /// over-supplies the editor's ring and lets the editor's own cap
-/// keep only the most recent entries.
+/// keep only the most recent entries automatically.
 pub const DEFAULT_MAX_ENTRIES: usize = 200;
 
 /// In-memory prompt history extracted from on-disk thread logs.

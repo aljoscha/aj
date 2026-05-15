@@ -2072,7 +2072,27 @@ adopts independently.
       the pre-existing `clone_on_ref_ptr` warnings in `aj-agent` /
       `aj-models` / `aj-tools`. Neither crate appears in `Cargo.lock`
       anymore (no transitive consumers).
-- [ ] Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`.
+- [x] Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`.
+      The legacy types and modules were already deleted alongside the
+      `aj` crate rename (see the §5 step 2 entry above): `AjCli`,
+      `AjCliCommon`, `SubAgentCli`, `cli_sub_agent`, and the legacy
+      `prompt_history` module all came out with the `src/aj/`
+      directory removal. The prompt-history bootstrap was ported into
+      the new binary's editor wiring as Phase 2.1e
+      ([`PromptHistory`] in `src/aj/src/modes/interactive/editor_ext.rs`).
+      This commit cleans up two stale doc comments that still
+      referenced the removed types — the [`StreamAction`] doc in
+      `src/aj-agent/src/events.rs` rewrites the "mirrors the legacy
+      `agent_text_*` callback shape so the bridge listener can drive
+      the existing `AjCli` rendering helpers" framing into a
+      self-contained description of `Start`/`Update`/`Stop`'s
+      semantics, and the [`DEFAULT_MAX_ENTRIES`] doc in
+      `editor_ext.rs` drops the "same effective behaviour the legacy
+      binary produced with `rustyline`'s history file" trailer in
+      favour of just stating that the editor's own cap keeps the
+      most recent entries. No code changes. `cargo build`, `cargo
+      test -p aj -p aj-agent`, and `cargo fmt` pass clean (139 tests
+      across the two crates).
 - [ ] Update `README.md` and `AGENTS.md`.
 
 ---
