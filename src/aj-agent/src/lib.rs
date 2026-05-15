@@ -1,4 +1,4 @@
-// Event-driven contract modules consumed by `aj-next`, `aj-session`,
+// Event-driven contract modules consumed by `aj`, `aj-session`,
 // and the in-tree `aj` binary. The agent runtime in this file drives
 // tools through the [`tool::ToolDefinition`] / [`tool::ToolContext`]
 // surface and emits every state transition through its internal
@@ -77,9 +77,10 @@ pub struct Agent {
     bus: EventBus,
     /// Cancellation token surfaced to tools through
     /// [`ToolContext::cancellation`]. Today the agent never fires
-    /// it: cancellation propagation lands in §1.8 of the aj-next
-    /// plan, but the field is wired through now so tools observing
-    /// `select!` against `ctx.cancellation()` compile cleanly.
+    /// it: cancellation propagation lands in §1.8 of
+    /// `docs/aj-next-plan.md`, but the field is wired through now
+    /// so tools observing `select!` against `ctx.cancellation()`
+    /// compile cleanly.
     /// Sub-agents inherit a child token derived from their
     /// parent's per `docs/aj-next-plan.md` §1.6 so a single
     /// eventual `cancel()` call reaches the whole hierarchy.

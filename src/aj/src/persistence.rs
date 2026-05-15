@@ -8,7 +8,7 @@
 //! `continue_run` drive writes synchronously through the bus.
 //!
 //! This module exists per `docs/aj-next-plan.md` §4 to give the
-//! two modes a single home for any `aj-next`-specific persistence
+//! two modes a single home for any `aj`-specific persistence
 //! decisions (e.g. observability hooks, `.bak` migration triggers
 //! on first launch). The scaffold leaves it empty; the print mode
 //! step adds the first wiring helper.

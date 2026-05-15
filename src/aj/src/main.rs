@@ -1,84 +1,19 @@
-use std::sync::{Arc, Mutex};
+//! Binary entry point for the `aj` CLI.
+//!
+//! Loads `~/.aj/.env`, parses CLI args (see
+//! [`aj::cli::args::Args`]), and dispatches to either
+//! [`aj::modes::print`] or [`aj::modes::interactive`].
+//! Subcommands (`list-threads`, `continue`, `models update`)
+//! short-circuit before mode dispatch.
 
-use aj::SYSTEM_PROMPT;
-use aj::cli::AjCli;
-use aj::event_bridge::EventBridgeListener;
-use aj::prompt_history::{DEFAULT_MAX_ENTRIES, PromptHistory};
-use aj_agent::bus::Listener;
-use aj_agent::types::{SubAgentUsage, UsageSummary};
-use aj_agent::{Agent, TurnError};
-use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
-use aj_models::messages::{Role, Speed};
-use aj_models::{ModelArgs, create_model};
-use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
-    repair_interrupted_tool_uses, replay,
-};
-use aj_tools::get_builtin_tools;
+use aj::cli::args::{Args, Command, ModelsCommand};
+use aj::modes::{interactive::InteractiveMode, print};
+use aj_conf::Config;
+use aj_session::ConversationPersistence;
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use tokio::sync::Mutex as TokioMutex;
+use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser)]
-#[command(name = "aj")]
-#[command(about = "AI-driven agent for software engineering")]
-#[command(flatten_help = true)]
-struct Cli {
-    /// Model API to use.
-    #[arg(long, env)]
-    model_api: Option<String>,
-
-    /// Model endpoint URL.
-    #[arg(long, env)]
-    model_url: Option<String>,
-
-    /// Model name to use.
-    #[arg(long, env)]
-    model_name: Option<String>,
-
-    /// Inference speed mode: `standard` (default) or `fast` (Anthropic
-    /// beta `speed` parameter; requires the `fast-inference-2025-10-02`
-    /// beta header).
-    #[arg(long, env)]
-    speed: Option<String>,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-#[command(flatten_help = true)]
-enum Commands {
-    /// List existing conversation threads.
-    ListThreads,
-    /// Continue a conversation thread (latest if no id given).
-    Continue {
-        /// Conversation ID to continue (if not provided, continues latest
-        /// thread).
-        thread_id: Option<String>,
-    },
-    /// Manage the bundled model catalog.
-    Models {
-        #[command(subcommand)]
-        command: ModelsCommands,
-    },
-}
-
-#[derive(Subcommand)]
-#[command(flatten_help = true)]
-enum ModelsCommands {
-    /// Refresh the user model catalog at `~/.aj/models.json` from
-    /// `https://models.dev/api.json`. Filters to tool-capable Anthropic
-    /// and OpenAI models, applies the bundled overrides, and writes the
-    /// result atomically. On any fetch or parse failure the existing
-    /// cache is left untouched.
-    Update,
-}
-
-/// A harness that's setting up our logging, environment variables,
-/// etc. and drives the [`Agent`] turn-by-turn against a
-/// [`ConversationLog`] owned by this binary.
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -86,409 +21,58 @@ async fn main() -> Result<()> {
         .with_ansi(true)
         .init();
 
-    // Load config.toml first (lowest priority).
-    let config = Config::load().unwrap_or_else(|e| {
-        tracing::warn!("failed to load config.toml: {e}");
-        Config::default()
-    });
-
-    // Load .env files (these set env vars, which are medium priority).
+    // `~/.aj/.env` first (highest priority for env-driven config),
+    // then a project-local `.env` if present. CLI flags layered on
+    // top via clap's `env = ...` per-arg attribute.
     if let Ok(dotenv_path) = Config::get_dotenv_file_path() {
         tracing::info!("loading .env from {:?}", dotenv_path);
         dotenv::from_path(dotenv_path).ok();
     } else {
         tracing::info!("no .env in config directory");
     }
-
     dotenv::dotenv().ok();
 
-    // Parse CLI flags (highest priority).
-    let cli = Cli::parse();
+    let args = Args::parse();
 
-    // `models update` is a standalone catalog-management subcommand; it
-    // doesn't need an API key, history, or agent. Short-circuit before
-    // any of that setup, both to keep startup fast and to let users run
-    // the command without configured credentials.
-    if let Some(Commands::Models { command }) = &cli.command {
-        return handle_models_command(command).await;
+    match args.command {
+        Some(Command::Models { command }) => handle_models_command(command).await,
+        Some(Command::ListThreads) => handle_list_threads(),
+        Some(Command::Continue {
+            thread_id: _,
+            prompt: _,
+        }) => {
+            // `continue` always lands in interactive mode (or
+            // print mode if the user passed `--print`). The mode
+            // itself decides how to resume; we just dispatch.
+            dispatch_session_mode(args).await
+        }
+        None => dispatch_session_mode(args).await,
     }
+}
 
+/// Dispatch to the interactive or print mode based on `--print`.
+///
+/// Per `docs/aj-next-plan.md` §4.2 the same binary serves both;
+/// the only difference is which subscriber drives the agent's bus.
+async fn dispatch_session_mode(args: Args) -> Result<()> {
+    if args.print {
+        print::run(args).await
+    } else {
+        InteractiveMode::from_args(args)?.run().await
+    }
+}
+
+/// `aj list-threads`: list existing conversation threads
+/// for the current project, latest first.
+///
+/// Output: one row per thread, formatted as `<thread_id>
+/// (modified: <utc-ts>, <size>)`. The underlying iteration,
+/// pre-refactor-format filtering, and size formatting all live
+/// in [`ConversationPersistence::list_threads`] (`aj-session`);
+/// this function is a thin presentation wrapper.
+fn handle_list_threads() -> Result<()> {
     let threads_dir = Config::get_threads_dir_path()?;
-
-    // Resolve settings with precedence: CLI flags > env vars > config.toml > defaults.
-    let env = AgentEnv::new();
     let conversation_persistence = ConversationPersistence::new(threads_dir);
-
-    // Bootstrap the prompt history from the project's JSONL conversation
-    // logs. The resulting `Arc<Mutex<_>>` is shared (via shallow_clone)
-    // between the harness UI and the cloned UI handed to the bridge
-    // listener, so submissions made during the session immediately show
-    // up in the editor's up-arrow stack.
-    let ui = AjCli::new(Arc::new(Mutex::new(PromptHistory::bootstrap(
-        &conversation_persistence,
-        DEFAULT_MAX_ENTRIES,
-    ))));
-
-    let speed = match cli.speed {
-        Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
-        None => config.speed,
-    }
-    .map(|s| match s {
-        ConfigSpeed::Standard => Speed::Standard,
-        ConfigSpeed::Fast => Speed::Fast,
-    });
-
-    let model_args = ModelArgs {
-        api: cli
-            .model_api
-            .or(config.model_api)
-            .unwrap_or_else(|| "anthropic".to_string()),
-        url: cli.model_url.or(config.model_url),
-        model_name: cli.model_name.or(config.model_name),
-        speed,
-    };
-    let model = create_model(model_args)?;
-
-    let mut tools = get_builtin_tools();
-    if !config.disabled_tools.is_empty() {
-        tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
-        tracing::info!(disabled = ?config.disabled_tools, "filtered disabled tools");
-    }
-
-    let mut agent = Agent::new(
-        env,
-        SYSTEM_PROMPT,
-        tools,
-        config.disabled_tools.clone(),
-        Arc::clone(&model),
-        config.thinking,
-    );
-
-    // Register the bus -> AjCliCommon rendering bridge before any
-    // turns run, so every event the agent emits during inference
-    // flows back into the existing renderer. The listener owns a
-    // clone of the binary's `AjCliCommon` (the rendering subset of
-    // [`AjCli`]) plus lazily-created `AjCliCommon`s for any
-    // sub-agent the session spawns; per `docs/aj-next-plan.md` §1.6
-    // sub-agents share the parent's bus, so all of their events
-    // flow through this same listener too. The handle stays alive
-    // for the rest of the process: we hold it on the stack until
-    // `main` returns.
-    //
-    // Keep a clone of the listener around so the resume path can
-    // drain `aj_session::replay` events through the same closure
-    // without going via the bus (which would also fire the
-    // persistence listener and re-write the events we're reading
-    // straight off disk).
-    let bridge_listener: Listener = EventBridgeListener::new(ui.renderer()).into_listener();
-    let _bridge_handle = agent.subscribe(Arc::clone(&bridge_listener));
-
-    match cli.command {
-        Some(Commands::ListThreads) => {
-            list_threads(&conversation_persistence)?;
-        }
-        Some(Commands::Continue { thread_id }) => {
-            let log = if let Some(id) = thread_id {
-                ConversationLog::resume(&conversation_persistence, &id)?
-            } else if let Some(latest) = conversation_persistence.get_latest_thread_id()? {
-                ConversationLog::resume(&conversation_persistence, &latest)?
-            } else {
-                ui.display_notice("No latest conversation to resume");
-                return Ok(());
-            };
-            run_session(
-                &mut agent,
-                &ui,
-                log,
-                /* resuming = */ true,
-                Arc::clone(&bridge_listener),
-            )
-            .await?;
-        }
-        Some(Commands::Models { .. }) => {
-            // Handled earlier in `main` before agent setup. Reaching
-            // this arm would mean we forgot to short-circuit above.
-            unreachable!("models subcommand handled before agent setup");
-        }
-        None => {
-            // Default behavior: start a fresh log and run the agent.
-            let log = ConversationLog::create(&conversation_persistence)?;
-            run_session(
-                &mut agent,
-                &ui,
-                log,
-                /* resuming = */ false,
-                Arc::clone(&bridge_listener),
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Drive a single conversation session: resolve the system prompt,
-/// optionally replay history, register the persistence listener, then
-/// own the readline loop calling [`Agent::run_turn`] turn-by-turn.
-///
-/// Per `docs/aj-next-plan.md` §2.4b the agent doesn't reach into the
-/// conversation log at all; the binary linearizes the user thread,
-/// repairs any interrupted tool calls, seeds the agent's transcript
-/// once, and otherwise watches the bus for updates.
-///
-/// `bridge_listener` is the [`Listener`] already subscribed to the
-/// agent's bus for live rendering; this function calls it directly
-/// for each event produced by [`replay`] when resuming, so the
-/// rendered history goes through the same code path as live events
-/// (§2.5b). The persistence listener is intentionally not driven
-/// during replay — those events are *already* on disk.
-async fn run_session(
-    agent: &mut Agent,
-    ui: &AjCli,
-    mut log: ConversationLog,
-    resuming: bool,
-    bridge_listener: Listener,
-) -> Result<()> {
-    // Resolve the system prompt: reuse a persisted one (cache-warm
-    // resume) or assemble fresh from the env. On a fresh log we
-    // freeze the assembled prompt as the root entry so future
-    // resumes reuse the same bytes.
-    let system_prompt = if let Some(persisted) = log.system_prompt() {
-        persisted.to_string()
-    } else {
-        let assembled = agent.assemble_system_prompt();
-        if log.is_empty() {
-            log.set_system_prompt(assembled.clone())?;
-        }
-        assembled
-    };
-    agent.set_assembled_system_prompt(system_prompt);
-
-    // Seed the sub-agent counter so freshly-minted ids in this
-    // session don't collide with sub-agent subtrees already
-    // persisted in the log.
-    if let Some(max_id) = log.max_agent_id() {
-        agent.seed_sub_agent_counter(max_id);
-    }
-
-    // Replay user-thread history through the renderer (resume only)
-    // and seed the agent's in-memory transcript. We read the user
-    // thread, then run `repair_interrupted_tool_uses` to write
-    // synthesized tool_results for any dangling `tool_use` ids
-    // (process-killed-mid-batch recovery), then re-linearize so the
-    // seed sees the post-repair view. The renderer drains the same
-    // [`AgentEvent`] stream a live run produces so live and resumed
-    // sessions go through identical UI code paths (§2.5b).
-    let resumed_thread_id = if let Some(head) = log.latest_leaf(ThreadFilter::USER) {
-        let conversation = log.linearize(&head, ThreadFilter::USER);
-        repair_interrupted_tool_uses(&mut log, &conversation)?;
-        if resuming {
-            // Drive replay events directly through the bridge
-            // listener (not the bus) so they don't also trip the
-            // persistence listener — replay is reading from disk,
-            // re-writing would duplicate every entry.
-            for event in replay(&log) {
-                bridge_listener(&event).await?;
-            }
-            ui.display_notice("--- End of conversation history ---");
-        }
-        // Re-linearize after repair to capture any synthesized
-        // tool_result message.
-        let head = log
-            .latest_leaf(ThreadFilter::USER)
-            .expect("post-repair head exists when pre-repair head did");
-        let conversation = log.linearize(&head, ThreadFilter::USER);
-        let messages: Vec<_> = conversation.messages().into_iter().cloned().collect();
-        agent.seed_messages(messages);
-        Some(log.thread_id().to_string())
-    } else {
-        None
-    };
-
-    // Start-of-session notices.
-    if resuming {
-        let id = log.thread_id().to_string();
-        ui.display_notice(&format!(
-            "Resuming conversation {id} (use 'ctrl-c' or 'ctrl-d' to quit)"
-        ));
-    } else {
-        ui.display_notice("Chat with AJ (use 'ctrl-c' or 'ctrl-d' to quit)");
-    }
-
-    {
-        let model = agent.model();
-        ui.display_notice(&format!(
-            "Model: {}, at {}",
-            model.model_name(),
-            model.model_url()
-        ));
-    }
-
-    display_context(ui, agent.env());
-
-    if std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err() {
-        ui.display_warning(
-            "WARNING: AJ has no sandboxing or permission checks. The agent can execute \
-             arbitrary commands on your system. Do not use AJ if you don't understand what \
-             this means. Set AJ_DISABLE_SANDBOX_WARNING=1 to suppress this warning.",
-        );
-    }
-
-    // Wrap the log in an Arc<TokioMutex<_>> for the persistence
-    // listener; we lock briefly only for the trailing
-    // resume-hint thread-id read.
-    let log = Arc::new(TokioMutex::new(log));
-    // Register the persistence listener AFTER the bridge listener
-    // so a disk-write failure (which the listener surfaces as
-    // `Err`) aborts the run before the bridge gets to render
-    // anything stale. Sub-agents share the parent's bus per §1.6,
-    // so this single registration covers nested runs too.
-    let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
-
-    // Main turn loop. The binary owns this loop; the agent's
-    // `prompt` / `continue_run` runs one assistant cycle and
-    // returns. We decide whether to ask for user input by
-    // inspecting the last message in the agent's transcript: if the
-    // assistant just spoke, we need new input; if the last message
-    // is from the user (e.g. a synthesized tool_result on the
-    // recovery path), we continue without prompting.
-    let mut force_user_input = false;
-    let mut sent_any_input = resumed_thread_id.is_some();
-    loop {
-        let need_user_input = force_user_input
-            || match agent.messages().last() {
-                Some(last) => matches!(last.role, Role::Assistant),
-                None => true,
-            };
-        force_user_input = false;
-
-        // Two distinct entry points: a fresh user prompt drives
-        // [`Agent::prompt`]; resuming from a recoverable error or a
-        // synthesized tool_result drives [`Agent::continue_run`].
-        // The latter never appends a new user message — the prior
-        // turn already wrote one to the transcript and to disk.
-        let result = if need_user_input {
-            match ui.get_user_input() {
-                Some(text) => {
-                    sent_any_input = true;
-                    agent.prompt(text).await
-                }
-                None => {
-                    // Ctrl-C / Ctrl-D / empty: print the closing
-                    // notices and exit.
-                    display_usage_summary(ui, agent);
-                    if sent_any_input {
-                        let id = log.lock().await.thread_id().to_string();
-                        ui.display_notice(&format!("Thread: {id} (resume with: aj continue {id})"));
-                    }
-                    break;
-                }
-            }
-        } else {
-            agent.continue_run().await
-        };
-
-        match result {
-            Ok(()) => {}
-            Err(TurnError::Recoverable(err)) => {
-                ui.display_error(&format!("{err:#}"));
-                // The pending user message is on disk and in the
-                // transcript. Force a fresh prompt next iteration
-                // so we don't immediately re-send the same broken
-                // request to the model. The user can type a
-                // follow-up (which will be appended) or quit.
-                force_user_input = true;
-                continue;
-            }
-            Err(TurnError::Fatal(err)) => return Err(err),
-        }
-    }
-
-    Ok(())
-}
-
-/// Render the startup `Context:` notice listing every agents.md
-/// file injected into the agent's system prompt. Mirrors the
-/// pre-§2.4b behavior of `Agent::display_context` so the user
-/// continues to see which context files are in play.
-fn display_context(ui: &AjCli, env: &AgentEnv) {
-    let text = if env.context_files.is_empty() {
-        "Context: (none)".to_string()
-    } else {
-        let mut lines = String::from("Context:");
-        for file in &env.context_files {
-            lines.push_str(&format!(
-                "\n  - {} ({})",
-                display_path(&file.path),
-                file.kind.label()
-            ));
-        }
-        lines
-    };
-    ui.display_notice(&text);
-}
-
-/// Render the end-of-session token-usage summary by reading the
-/// agent's accumulated counts and per-sub-agent breakdown. Mirrors
-/// the pre-§2.4b `Agent::display_usage_summary`.
-fn display_usage_summary(ui: &AjCli, agent: &Agent) {
-    let main = agent.accumulated_usage();
-    let main_agent_usage = SubAgentUsage {
-        agent_id: None,
-        input_tokens: main.input_tokens,
-        output_tokens: main.output_tokens,
-        cache_creation_tokens: main.cache_creation_input_tokens.unwrap_or(0),
-        cache_read_tokens: main.cache_read_input_tokens.unwrap_or(0),
-    };
-
-    let mut sub_agent_usage = Vec::new();
-    let mut total_sub_input = 0;
-    let mut total_sub_output = 0;
-    let mut total_sub_cache_creation = 0;
-    let mut total_sub_cache_read = 0;
-
-    // Sort by sub-agent id for deterministic output regardless of
-    // HashMap iteration order.
-    let mut subs: Vec<(usize, &aj_models::messages::Usage)> = agent
-        .sub_agent_usage()
-        .iter()
-        .map(|(id, usage)| (*id, usage))
-        .collect();
-    subs.sort_by_key(|(id, _)| *id);
-
-    for (agent_id, usage) in subs {
-        let sub_usage = SubAgentUsage {
-            agent_id: Some(agent_id),
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-            cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-        };
-        total_sub_input += sub_usage.input_tokens;
-        total_sub_output += sub_usage.output_tokens;
-        total_sub_cache_creation += sub_usage.cache_creation_tokens;
-        total_sub_cache_read += sub_usage.cache_read_tokens;
-        sub_agent_usage.push(sub_usage);
-    }
-
-    let total_usage = SubAgentUsage {
-        agent_id: None,
-        input_tokens: main_agent_usage.input_tokens + total_sub_input,
-        output_tokens: main_agent_usage.output_tokens + total_sub_output,
-        cache_creation_tokens: main_agent_usage.cache_creation_tokens + total_sub_cache_creation,
-        cache_read_tokens: main_agent_usage.cache_read_tokens + total_sub_cache_read,
-    };
-
-    let summary = UsageSummary {
-        main_agent_usage,
-        sub_agent_usage,
-        total_usage,
-    };
-
-    ui.display_token_usage_summary(&summary);
-}
-
-fn list_threads(conversation_persistence: &ConversationPersistence) -> Result<()> {
     let threads = conversation_persistence.list_threads()?;
 
     if threads.is_empty() {
@@ -506,11 +90,21 @@ fn list_threads(conversation_persistence: &ConversationPersistence) -> Result<()
     Ok(())
 }
 
-/// Dispatch for `aj models <subcommand>`. Currently only `update`,
-/// but the layer is in place for future catalog management commands.
-async fn handle_models_command(command: &ModelsCommands) -> Result<()> {
+/// `aj models <subcommand>`: catalog-management utilities.
+///
+/// Today only `update` is wired, which refreshes the on-disk model
+/// catalog at `~/.aj/models.json` from `models.dev`. The
+/// `/model` selector overlay reads that catalog at startup, so
+/// running this command is how users surface freshly-released
+/// models to the picker without restarting from a different
+/// catalog source.
+///
+/// The output is a one-line summary (added / removed /
+/// price-changes counts plus total + destination path) suitable
+/// for scripting.
+async fn handle_models_command(command: ModelsCommand) -> Result<()> {
     match command {
-        ModelsCommands::Update => {
+        ModelsCommand::Update => {
             let summary = aj_models::refresh::refresh_user_cache().await?;
             println!("{}", summary.one_line());
             Ok(())

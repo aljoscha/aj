@@ -41,7 +41,7 @@ pub const DEFAULT_MAX_ENTRIES: usize = 200;
 ///    with `BufReader::lines()` errors out on the first invalid-UTF-8
 ///    line, then a load-then-rewrite-whole-file pattern truncates
 ///    every entry past the corruption point on the next submit.
-/// 2. **Concurrent-process clobber.** Two `aj-next` processes
+/// 2. **Concurrent-process clobber.** Two `aj` processes
 ///    running side by side each read the file, add their own new
 ///    entry, and rewrite the whole file. Last writer wins; the
 ///    other terminal's entries are silently lost.
@@ -249,7 +249,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("aj-next-prompt-history-{label}-{nanos}-{n}"));
+        let dir = std::env::temp_dir().join(format!("aj-prompt-history-{label}-{nanos}-{n}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

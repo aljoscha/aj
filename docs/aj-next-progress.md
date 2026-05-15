@@ -1876,7 +1876,42 @@ adopts independently.
         aj-next`, `cargo fmt`, and `cargo clippy -p aj-next
         --all-targets` all pass clean (the only remaining
         warnings are pre-existing in `aj-agent`).
-- [ ] Rename `aj-next` → `aj`, delete legacy `aj` crate.
+- [x] Rename `aj-next` → `aj`, delete legacy `aj` crate. The
+      legacy `src/aj/` crate (rustyline readline loop, `AjCli` /
+      `AjCliCommon` / `cli_sub_agent` / `prompt_history` /
+      `event_bridge` modules, plus the `test_diff` and
+      `test_markdown` helper binaries) is gone. `src/aj-next/`
+      was renamed to `src/aj/` and its `Cargo.toml` was retitled
+      (`name = "aj"`, `[[bin]] name = "aj"`) so `cargo run -p aj`
+      and `cargo install --path src/aj` produce a binary called
+      `aj`. The workspace `Cargo.toml` now lists `src/aj` exactly
+      once (the renamed crate).
+
+      `SYSTEM_PROMPT.md` moved alongside the rename so the
+      `include_str!` path in `src/aj/src/lib.rs` collapses from
+      `../../aj/SYSTEM_PROMPT.md` to `../SYSTEM_PROMPT.md`. All
+      user-facing strings referencing the old binary name were
+      updated: `cli/args.rs` (`#[command(name = "aj")]`, the
+      `aj continue ID prompt...` help text), the resume hint in
+      `modes/interactive/shutdown.rs` (`Thread: <id> (resume
+      with: aj continue <id>)`), `print::run`'s error messages
+      (`aj --print requires a prompt argument`,
+      `aj --print does not accept this subcommand`, etc.), the
+      `/clear` slash-command "restart `aj`" notice, and the
+      scratch-dir prefix in `editor_ext` tests
+      (`aj-prompt-history-...`). Doc comments in
+      `lib.rs`/`main.rs`/`cli.rs`/`config/*` were also retitled.
+      References to the spec file (`docs/aj-next-plan.md`) stay
+      intact since they're filename pointers, not binary-name
+      pointers.
+
+      `cargo build`, `cargo fmt`, `cargo test --workspace`, and
+      `cargo clippy -p aj --all-targets` all pass clean (the
+      only remaining warnings are pre-existing in `aj-agent`).
+      `cargo run -p aj -- --help` prints `Usage: aj ...`; `cargo
+      run -p aj -- list-threads` lists threads exactly like the
+      legacy binary did. Total `aj` unit tests: 116 (renamed
+      from the prior `aj-next` count).
 - [ ] Drop `rustyline`, `termimad`, `console`.
 - [ ] Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`.
 - [ ] Update `README.md` and `AGENTS.md`.

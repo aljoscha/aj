@@ -1,4 +1,4 @@
-//! Run modes for the `aj-next` binary.
+//! Run modes for the `aj` binary.
 //!
 //! Per `docs/aj-next-plan.md` §4 the binary supports two modes
 //! sharing the same agent core:

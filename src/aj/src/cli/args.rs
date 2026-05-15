@@ -1,19 +1,16 @@
-//! [`clap`]-derived argument parsing for the `aj-next` binary.
+//! [`clap`]-derived argument parsing for the `aj` binary.
 //!
-//! The shape mirrors today's legacy `aj` binary so users see the
-//! same flags during the Phase 0 → Phase 2 transition window, with
-//! one addition: the `--print` / `--json` toggles select the
-//! non-interactive print mode (§4.2).
-//!
-//! Subsequent steps in `docs/aj-next-progress.md` Phase 1 fill in
-//! the dispatch logic; the scaffold only defines the structs.
+//! The `--print` / `--json` toggles select the non-interactive
+//! print mode (§4.2); otherwise the binary runs the interactive
+//! TUI. Subcommands (`list-threads`, `continue`, `models`)
+//! short-circuit before mode dispatch.
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-/// Top-level CLI for the `aj-next` binary.
+/// Top-level CLI for the `aj` binary.
 #[derive(Parser, Debug)]
-#[command(name = "aj-next")]
-#[command(about = "AI-driven agent for software engineering (next-generation TUI)")]
+#[command(name = "aj")]
+#[command(about = "AI-driven agent for software engineering")]
 #[command(flatten_help = true)]
 pub struct Args {
     /// Model API to use (e.g. `anthropic`, `openai`, `openai-codex`).
@@ -71,7 +68,7 @@ pub enum PrintFormat {
     Json,
 }
 
-/// Non-conversational subcommands. Mirrors today's legacy `aj`.
+/// Non-conversational subcommands.
 #[derive(Subcommand, Debug)]
 #[command(flatten_help = true)]
 pub enum Command {
@@ -80,13 +77,13 @@ pub enum Command {
     /// Continue a conversation thread (latest if no id given).
     ///
     /// Accepts an optional positional prompt after the thread id:
-    /// `aj-next continue ID prompt words...` resumes the thread
+    /// `aj continue ID prompt words...` resumes the thread
     /// and (in `--print` mode) runs the supplied prompt as the
     /// next turn. With no thread id, the latest thread for the
     /// current project is resumed; supplying a prompt without a
     /// thread id is ambiguous, so callers wanting "latest +
     /// prompt" should pass the thread id explicitly (e.g. via
-    /// `aj-next list-threads`).
+    /// `aj list-threads`).
     Continue {
         /// Conversation ID to continue. If absent, the latest
         /// thread for this project is resumed.
@@ -105,7 +102,7 @@ pub enum Command {
     },
 }
 
-/// `aj-next models <subcommand>` dispatch.
+/// `aj models <subcommand>` dispatch.
 #[derive(Subcommand, Debug)]
 #[command(flatten_help = true)]
 pub enum ModelsCommand {

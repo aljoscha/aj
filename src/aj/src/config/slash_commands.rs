@@ -284,7 +284,7 @@ pub fn dispatch(input: &str) -> SlashAction {
         },
         "clear" => SlashAction::NotYetImplemented {
             command: "clear",
-            message: "/clear: not yet implemented; restart `aj-next` to begin a fresh thread.",
+            message: "/clear: not yet implemented; restart `aj` to begin a fresh thread.",
         },
         "help" => SlashAction::NotYetImplemented {
             command: "help",

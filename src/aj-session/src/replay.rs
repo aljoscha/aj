@@ -8,7 +8,7 @@
 //! disk and that pipeline.
 //!
 //! See `docs/aj-next-plan.md` §2.5 for the binary-side wiring (the
-//! `aj` / `aj-next` binary opens a log, registers persistence and
+//! `aj` binary opens a log, registers persistence and
 //! renderer listeners on the agent, then drains `replay(...)` into
 //! the renderer pipeline before entering its input loop).
 //!

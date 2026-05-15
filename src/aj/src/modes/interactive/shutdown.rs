@@ -1,19 +1,17 @@
 //! End-of-session shutdown banner: token usage summary plus
 //! resume hint.
 //!
-//! Mirrors the legacy `aj` binary's end-of-session output: a
-//! per-agent token-usage breakdown (main + each sub-agent + grand
-//! total) followed by a `Thread: <id> (resume with: aj-next
-//! continue <id>)` line so the user can pick the conversation
-//! back up later.
+//! Prints a per-agent token-usage breakdown (main + each
+//! sub-agent + grand total) followed by a `Thread: <id> (resume
+//! with: aj continue <id>)` line so the user can pick the
+//! conversation back up later.
 //!
 //! Both lines are printed to stdout *after* [`aj_tui::tui::Tui::stop`]
 //! so the bytes land in the user's regular shell scrollback rather
 //! than the alternate-screen TUI buffer that gets cleared on exit.
 //! `aj_tui::style::dim` adds an ANSI dim attribute so the banner
 //! sits visually below whatever the user's normal terminal output
-//! looks like, matching the legacy binary's `console::style(...).dim()`
-//! presentation.
+//! looks like.
 
 use std::collections::HashMap;
 
@@ -132,7 +130,7 @@ pub fn format_usage_summary(summary: &UsageSummary) -> String {
 /// [`print_resume_hint`] wraps this in an ANSI dim style and emits
 /// it to stdout.
 pub fn format_resume_hint(thread_id: &str) -> String {
-    format!("Thread: {thread_id} (resume with: aj-next continue {thread_id})")
+    format!("Thread: {thread_id} (resume with: aj continue {thread_id})")
 }
 
 /// Print the end-of-session usage summary to stdout, dimmed to
@@ -288,9 +286,6 @@ mod tests {
     #[test]
     fn format_resume_hint_round_trips_thread_id() {
         let hint = format_resume_hint("abc123");
-        assert_eq!(
-            hint,
-            "Thread: abc123 (resume with: aj-next continue abc123)"
-        );
+        assert_eq!(hint, "Thread: abc123 (resume with: aj continue abc123)");
     }
 }

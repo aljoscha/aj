@@ -926,7 +926,7 @@ impl ThemeHandle {
 
     /// Read access to the underlying [`Theme`]. Used by callers
     /// that need to read a token directly without going through a
-    /// closure (currently nothing in `aj-next` does this — exposed
+    /// closure (currently nothing in `aj` does this — exposed
     /// for completeness and tests).
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Theme> {
         self.inner.read().expect("theme rwlock poisoned")

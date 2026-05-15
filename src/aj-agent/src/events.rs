@@ -32,7 +32,7 @@ use crate::types::{TokenUsage, UserOutput};
 /// assigned by the parent's session state and are stable for the
 /// lifetime of the parent.
 ///
-/// JSON shape (used by `aj-next --format json` and any other listener
+/// JSON shape (used by `aj --format json` and any other listener
 /// that serializes events): `"main"` for [`AgentId::Main`] and
 /// `{"sub": N}` for [`AgentId::Sub`]. Variant names are lowercased to
 /// match the rest of the event protocol's serde convention.
@@ -135,7 +135,7 @@ pub enum PersistedMessageKind {
 /// persistence writer or the TUI's event pump) can serve both the
 /// main agent and any nested sub-agents.
 ///
-/// Serialization shape (used by `aj-next --format json` and any other
+/// Serialization shape (used by `aj --format json` and any other
 /// listener that ships events out-of-process): an internally tagged
 /// JSON object with the variant discriminator under `"type"` and the
 /// payload fields lifted to the top level. The three message-
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(sub_evt.agent_id(), AgentId::Sub(3));
     }
 
-    /// Pin the JSON-on-the-wire shape used by `aj-next --format json`.
+    /// Pin the JSON-on-the-wire shape used by `aj --format json`.
     ///
     /// Listeners that ship events out-of-process (today the print-mode
     /// JSONL writer; tomorrow any RPC bridge) rely on this contract,

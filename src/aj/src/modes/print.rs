@@ -1,6 +1,6 @@
 //! Non-interactive print mode.
 //!
-//! Per `docs/aj-next-plan.md` §4.2 the same `aj-next` binary can run
+//! Per `docs/aj-next-plan.md` §4.2 the same `aj` binary can run
 //! without a TUI: it subscribes to the agent's event bus and writes
 //! plain text (or JSONL with `--format json`) to stdout, exiting when
 //! `Agent::prompt` returns. Same code path lets callers script the
@@ -11,7 +11,7 @@
 //! - **Text** ([`PrintFormat::Text`]). Best-effort human-readable
 //!   output. Once the prompt completes, the last assistant message's
 //!   visible text content is printed to stdout. Streaming partials
-//!   are intentionally suppressed — a caller piping `aj-next --print`
+//!   are intentionally suppressed — a caller piping `aj --print`
 //!   into another process wants a clean final answer, not interleaved
 //!   thinking/streaming chatter. Aborted/error stop reasons surface
 //!   via the agent's [`crate::TurnError`] return path and exit
@@ -25,10 +25,10 @@
 //!   writer; both observe the same event sequence.
 //!
 //! Print mode opens (or for `continue`, resumes) a [`ConversationLog`]
-//! the same way interactive mode does, so a `aj-next --print "do X"`
+//! the same way interactive mode does, so a `aj --print "do X"`
 //! invocation leaves a resumable thread on disk.
 //!
-//! With `aj-next continue --print "Q"` (optionally specifying a
+//! With `aj continue --print "Q"` (optionally specifying a
 //! thread id), the resume flow does the same disk handshake as the
 //! interactive resume: open the thread, reuse the persisted system
 //! prompt, repair any interrupted tool calls, then seed the agent's
@@ -42,9 +42,9 @@
 //!
 //! Print mode always requires a positional `prompt` argument — it's
 //! fundamentally one-shot and there's no readline to fall back on.
-//! In particular, `aj-next continue --print` *without* a prompt is
+//! In particular, `aj continue --print` *without* a prompt is
 //! an error: callers who just want to recover an interrupted tool
-//! batch should resume interactively (`aj-next continue`) and let
+//! batch should resume interactively (`aj continue`) and let
 //! the readline loop drive the recovery turn.
 
 use std::io::{self, Write};
@@ -101,14 +101,14 @@ pub async fn run(args: Args) -> Result<()> {
         None => None,
         Some(Command::Continue { thread_id, .. }) => Some(thread_id.clone()),
         Some(Command::ListThreads) | Some(Command::Models { .. }) => {
-            bail!("aj-next --print does not accept this subcommand");
+            bail!("aj --print does not accept this subcommand");
         }
     };
 
     let prompt_text = collect_prompt_text(&args)?;
 
     // Load config.toml first (lowest priority). Missing or invalid
-    // config falls back to defaults so a one-shot `aj-next --print`
+    // config falls back to defaults so a one-shot `aj --print`
     // works in a freshly-cloned checkout without any setup.
     let config = Config::load().unwrap_or_else(|e| {
         tracing::warn!("failed to load config.toml: {e}");
@@ -178,7 +178,7 @@ pub async fn run(args: Args) -> Result<()> {
             Some(latest) => ConversationLog::resume(&conversation_persistence, &latest)
                 .with_context(|| format!("failed to resume latest thread {latest}"))?,
             None => bail!(
-                "no conversation threads to resume; invoke `aj-next --print \"...\"` \
+                "no conversation threads to resume; invoke `aj --print \"...\"` \
                  without `continue` to start a fresh thread"
             ),
         },
@@ -265,7 +265,7 @@ pub async fn run(args: Args) -> Result<()> {
     //
     // For text mode we still register a listener — but it only
     // forwards a synchronous beat per event so the bus is not idle
-    // (debug ergonomics; otherwise `cargo run -p aj-next -- --print
+    // (debug ergonomics; otherwise `cargo run -p aj -- --print
     // ...` would look frozen between events). The actual rendering
     // happens after `prompt` returns when we walk
     // `agent.messages()`. The listener is therefore essentially a
@@ -318,9 +318,9 @@ pub async fn run(args: Args) -> Result<()> {
 ///
 /// Prompt text can come from two places depending on the dispatch
 /// shape: the top-level positional `args.prompt` (for the
-/// no-subcommand path: `aj-next --print "hello"`), or the
+/// no-subcommand path: `aj --print "hello"`), or the
 /// `Continue.prompt` positional that lives after the thread id
-/// (for the resume path: `aj-next --print continue ID "hello"`).
+/// (for the resume path: `aj --print continue ID "hello"`).
 /// Clap's greedy positional consumption keeps these disjoint —
 /// once the parser sees the `continue` subcommand it routes
 /// further positionals into `Continue`, so at most one of the
@@ -337,7 +337,7 @@ fn collect_prompt_text(args: &Args) -> Result<String> {
         _ => &args.prompt,
     };
     if prompt_parts.is_empty() {
-        bail!("aj-next --print requires a prompt argument");
+        bail!("aj --print requires a prompt argument");
     }
     let joined = prompt_parts.join(" ");
     file_args::expand(joined).context("failed to expand @file references in prompt")
@@ -361,13 +361,13 @@ fn json_event_listener() -> Listener {
         match serde_json::to_string(event) {
             Ok(line) => {
                 if let Err(e) = writeln!(io::stdout(), "{line}") {
-                    eprintln!("aj-next: failed to write event to stdout: {e}");
+                    eprintln!("aj: failed to write event to stdout: {e}");
                 }
             }
             Err(e) => {
                 // The skipped variants land here. Surface enough
                 // detail to debug but don't kill the run.
-                eprintln!("aj-next: failed to serialize event: {e}");
+                eprintln!("aj: failed to serialize event: {e}");
             }
         }
     })
@@ -417,9 +417,9 @@ mod tests {
     /// / prompt-collection logic without spinning up the binary.
     fn parse(args: &[&str]) -> Args {
         // `clap::Parser::parse_from` includes a binary-name arg at
-        // position 0; we slot in `"aj-next"` so help text matches
+        // position 0; we slot in `"aj"` so help text matches
         // the real surface.
-        let mut argv = vec!["aj-next"];
+        let mut argv = vec!["aj"];
         argv.extend_from_slice(args);
         Args::parse_from(argv)
     }
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn collect_prompt_text_treats_lone_continue_positional_as_thread_id() {
-        // `aj-next --print continue hello` is ambiguous between
+        // `aj --print continue hello` is ambiguous between
         // "resume thread `hello`" and "resume latest, run prompt
         // `hello`". Clap's greedy positional consumption picks the
         // first interpretation (single `Option<String>` slot fills

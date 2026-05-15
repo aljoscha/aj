@@ -284,7 +284,7 @@ impl InteractiveMode {
         // "I just relaunched the binary" case where the in-memory
         // ring would otherwise start empty. No persistence layer
         // is involved — the conversation log files are the source
-        // of truth, so two `aj-next` processes running side by
+        // of truth, so two `aj` processes running side by
         // side can't clobber each other's history.
         let prompt_history =
             PromptHistory::bootstrap(&conversation_persistence, DEFAULT_MAX_ENTRIES);
@@ -1093,7 +1093,7 @@ async fn handle_selector_outcome(
 /// Swap the agent + log + persistence wiring over to the thread
 /// identified by `thread_id`.
 ///
-/// This is the in-process equivalent of `aj-next continue <id>`:
+/// This is the in-process equivalent of `aj continue <id>`:
 /// the binary stays up and the user keeps their open editor, but
 /// the agent's transcript and the persistence target both rebind
 /// to the new thread file.
