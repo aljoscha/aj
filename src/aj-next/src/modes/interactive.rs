@@ -27,7 +27,7 @@ use std::sync::Arc;
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
-use aj_conf::{AgentEnv, Config, ConfigSpeed};
+use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
 use aj_models::messages::Speed;
 use aj_models::{ModelArgs, create_model};
 use aj_session::{
@@ -293,6 +293,20 @@ impl InteractiveMode {
         let mut pump = EventPump::new(markdown_theme(&theme));
         for event in replay(&log) {
             pump.handle(&mut tui, &event);
+        }
+
+        // Startup notices: list the AGENTS.md / CLAUDE.md files
+        // stitched into the system prompt, then (unless suppressed)
+        // print the sandbox warning. Both flow through the pump's
+        // existing `Notice` / `Warning` arms so they appear as dim
+        // chat-scrollback rows just above the editor — close enough
+        // to where the user starts typing that they're hard to
+        // miss, but out of the way of replayed history or the
+        // header/footer status panes. Placed *after* replay so a
+        // resumed thread's historical content stays on top.
+        pump.handle(&mut tui, &notice_event(&build_context_notice(agent.env())));
+        if sandbox_warning_enabled() {
+            pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
         }
 
         // ---- Wrap log + agent in shared handles -----------------------
@@ -628,6 +642,55 @@ fn notice_event(text: &str) -> AgentEvent {
         agent_id: aj_agent::events::AgentId::Main,
         text: text.to_string(),
     }
+}
+
+/// Wrap a warning string in the [`AgentEvent::Warning`] shape so
+/// the event pump renders it with the warning style (yellow dim
+/// text row in the chat scrollback).
+fn warning_event(text: &str) -> AgentEvent {
+    AgentEvent::Warning {
+        agent_id: aj_agent::events::AgentId::Main,
+        text: text.to_string(),
+    }
+}
+
+/// Build the chat-scrollback "Context:" notice listing every
+/// agents.md-style file the agent injected into its system prompt.
+/// Returns either `"Context: (none)"` (when no instruction files
+/// were discovered) or a multi-line listing with one row per file
+/// formatted as `  - <tildified path> (<kind label>)` so the user
+/// can verify which guidance is actually active.
+fn build_context_notice(env: &AgentEnv) -> String {
+    if env.context_files.is_empty() {
+        "Context: (none)".to_string()
+    } else {
+        let mut lines = String::from("Context:");
+        for file in &env.context_files {
+            lines.push_str(&format!(
+                "\n  - {} ({})",
+                display_path(&file.path),
+                file.kind.label()
+            ));
+        }
+        lines
+    }
+}
+
+/// The exact sandbox-warning string the binary emits at startup
+/// unless `AJ_DISABLE_SANDBOX_WARNING` is set in the environment.
+/// Kept in a `const` so it's easy to assert on in tests.
+const SANDBOX_WARNING: &str = "WARNING: AJ has no sandboxing or permission checks. The agent can execute \
+     arbitrary commands on your system. Do not use AJ if you don't understand what \
+     this means. Set AJ_DISABLE_SANDBOX_WARNING=1 to suppress this warning.";
+
+/// Returns `true` when the sandbox warning should be shown — i.e.
+/// when `AJ_DISABLE_SANDBOX_WARNING` is unset in the environment.
+/// Mirrors the legacy binary's
+/// `std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()` check
+/// exactly: setting the var to *any* value (including the empty
+/// string) suppresses the warning.
+fn sandbox_warning_enabled() -> bool {
+    std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()
 }
 
 /// Push the editor's border tint for the given thinking level.
@@ -1101,4 +1164,131 @@ async fn perform_thread_swap(
 
     tui.request_render();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use aj_conf::{AgentEnv, ContextFile, ContextFileKind};
+
+    use super::*;
+
+    /// Build an [`AgentEnv`] for use in the helper tests below.
+    /// Working directory / OS / date / git root are all stubbed —
+    /// only `context_files` matters for the `Context:` notice
+    /// builder.
+    fn env_with(context_files: Vec<ContextFile>) -> AgentEnv {
+        AgentEnv {
+            working_directory: PathBuf::from("/tmp"),
+            git_root_directory: None,
+            operating_system: "linux".to_string(),
+            today_date: "2025-01-01".to_string(),
+            context_files,
+        }
+    }
+
+    #[test]
+    fn build_context_notice_empty_renders_none_marker() {
+        let env = env_with(Vec::new());
+        assert_eq!(build_context_notice(&env), "Context: (none)");
+    }
+
+    #[test]
+    fn build_context_notice_lists_files_with_label_and_tildified_path() {
+        // `display_path` tildifies under `$HOME`, so build the path
+        // off the live `HOME` env var to keep the assertion stable
+        // across machines.
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let user_path = PathBuf::from(&home).join(".agents/AGENTS.md");
+        let project_path = PathBuf::from("/var/project/AGENTS.md");
+        let env = env_with(vec![
+            ContextFile {
+                path: user_path,
+                kind: ContextFileKind::UserInstructions,
+                content: String::new(),
+            },
+            ContextFile {
+                path: project_path,
+                kind: ContextFileKind::ProjectInstructions,
+                content: String::new(),
+            },
+        ]);
+
+        let notice = build_context_notice(&env);
+        let expected = "Context:\n  - ~/.agents/AGENTS.md (user instructions)\n  \
+             - /var/project/AGENTS.md (project instructions)";
+        assert_eq!(notice, expected);
+    }
+
+    #[test]
+    fn sandbox_warning_enabled_tracks_env_var_presence() {
+        // SAFETY: tests in this module run on a single thread so
+        // mutating the process env is fine. We save/restore the
+        // pre-existing value so other tests aren't disturbed.
+        let prev = std::env::var("AJ_DISABLE_SANDBOX_WARNING").ok();
+
+        // SAFETY: single-threaded test runner per `cargo test`'s
+        // default; no other test reads this var concurrently.
+        unsafe {
+            std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING");
+        }
+        assert!(
+            sandbox_warning_enabled(),
+            "warning should show when the var is absent"
+        );
+
+        // SAFETY: same scope as above.
+        unsafe {
+            std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", "1");
+        }
+        assert!(
+            !sandbox_warning_enabled(),
+            "warning should be suppressed when the var is set"
+        );
+
+        // Matches legacy `is_err()` semantics: even an empty value
+        // counts as "set" and suppresses the warning.
+        // SAFETY: same scope as above.
+        unsafe {
+            std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", "");
+        }
+        assert!(
+            !sandbox_warning_enabled(),
+            "warning should stay suppressed when the var is set to the empty string"
+        );
+
+        // Restore.
+        // SAFETY: same scope as above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", v),
+                None => std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING"),
+            }
+        }
+    }
+
+    #[test]
+    fn notice_event_carries_main_agent_id() {
+        let evt = notice_event("hi");
+        match evt {
+            AgentEvent::Notice { agent_id, text } => {
+                assert_eq!(agent_id, aj_agent::events::AgentId::Main);
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected Notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warning_event_carries_main_agent_id() {
+        let evt = warning_event(SANDBOX_WARNING);
+        match evt {
+            AgentEvent::Warning { agent_id, text } => {
+                assert_eq!(agent_id, aj_agent::events::AgentId::Main);
+                assert_eq!(text, SANDBOX_WARNING);
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+    }
 }

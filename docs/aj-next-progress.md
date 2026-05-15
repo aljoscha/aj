@@ -1496,11 +1496,76 @@ adopts independently.
         watching for that line keep working. `cargo build`,
         `cargo test -p aj-next`, `cargo fmt`, and `cargo clippy
         -p aj-next --all-targets` all pass clean.
-  - [ ] Phase 2.1c: Startup `Context:` notice + sandbox warning.
-        Port the legacy `display_context` + sandbox-warning notice
-        (gated on `AJ_DISABLE_SANDBOX_WARNING`) so users see
-        which `AGENTS.md`/`CLAUDE.md` files the agent picked up
-        and that the agent runs unsandboxed.
+  - [x] Phase 2.1c: Startup `Context:` notice + sandbox warning.
+        Ports the legacy [`display_context`] flow plus the
+        `AJ_DISABLE_SANDBOX_WARNING`-gated sandbox notice into the
+        `aj-next` interactive mode. Both emit through the existing
+        event pump as [`AgentEvent::Notice`] / [`AgentEvent::Warning`]
+        events, so the pump's pre-existing notice/warning arms paint
+        them as dim chat-scrollback rows just above the editor
+        without bypassing the rendering pipeline. The notices fire
+        *after* the resume-time replay loop so a resumed thread's
+        historical content stays on top of the scrollback, and the
+        Context/sandbox rows sit closest to the active editor where
+        they're easy to spot at startup.
+
+        **`config/theme.rs` (unchanged):** no theme work — the
+        warning routing through `AgentEvent::Warning` picks up the
+        existing yellow style closure the pump uses for slash-
+        command status feedback.
+
+        **`modes/interactive.rs`:**
+        - New private helper [`build_context_notice(env)`] mirrors
+          legacy [`display_context`] byte-for-byte: emits
+          `"Context: (none)"` for an empty `context_files` vector,
+          otherwise a multi-line listing with one row per file
+          formatted as `  - <tildified path> (<kind label>)`. The
+          tildification routes through [`aj_conf::display_path`] so
+          paths under `$HOME` collapse to `~/...` just like in the
+          legacy binary.
+        - New private helper [`warning_event(text)`] mirrors the
+          existing [`notice_event(text)`] helper but constructs an
+          [`AgentEvent::Warning`] (yellow style) instead of a
+          notice.
+        - New private helper [`sandbox_warning_enabled()`] returns
+          `true` iff `AJ_DISABLE_SANDBOX_WARNING` is unset in the
+          environment, exactly matching the legacy
+          `std::env::var(...).is_err()` semantics — setting the var
+          to *any* value (including the empty string) suppresses
+          the warning.
+        - New `const SANDBOX_WARNING` carries the exact 234-char
+          warning text the legacy binary emits, lifted verbatim
+          (the line-continuation indentation is collapsed by
+          `rustc` so the at-runtime string is identical to the
+          legacy version — verified with a one-shot `rustc` build).
+        - Wired into [`InteractiveMode::run`] right after the
+          replay loop (line 296-ish) and before the
+          persistence-listener registration: one
+          `pump.handle(&mut tui, &notice_event(&build_context_notice(...)))`
+          call followed by a conditional
+          `pump.handle(&mut tui, &warning_event(SANDBOX_WARNING))`
+          gated on `sandbox_warning_enabled()`.
+
+        Session swaps via `/session` deliberately don't re-emit
+        these notices: working directory is fixed for the run so
+        the context files don't change, and a freshly-swapped
+        thread's replay shouldn't be cluttered with redundant
+        startup banners.
+
+        Five new unit tests in `modes::interactive::tests` cover:
+        the empty-`context_files` rendering, the populated case
+        (asserts on the live `$HOME` to keep the tildified-path
+        assertion stable across machines), the
+        `AJ_DISABLE_SANDBOX_WARNING` gate (unset / set / empty
+        string), and the two event wrappers'
+        [`AgentId::Main`] tagging. The env-var test
+        save/restores the pre-existing value so it doesn't
+        disturb other tests in the same process.
+
+        `cargo build`, `cargo test -p aj-next`, `cargo fmt`, and
+        `cargo clippy -p aj-next --all-targets` all pass clean
+        (the only remaining warnings are pre-existing in
+        `aj-agent`). Total `aj-next` unit tests: 91 (up from 86).
   - [ ] Phase 2.1d: End-of-session usage summary + resume hint.
         Port `display_usage_summary` + the `Thread: <id>
         (resume with: aj-next continue <id>)` line so users can
