@@ -276,120 +276,80 @@ enum ThinkingLevel {
 
 The wire types in §1.1–1.6 describe only what reaches the provider.
 The agent transcript additionally holds entries that never leave the
-process — notices emitted to the user, tool-result summaries rendered
-in the TUI, token-usage markers, etc. These live one layer up and
-are out of scope for `aj-models`.
+process — notices emitted to the user, tool-result summaries
+rendered in the TUI, token-usage markers, etc. These live one layer
+up and are out of scope for `aj-models`.
 
-Consumers that need them (today: `aj-agent`, which owns the existing
-`UserOutput` type defined in `aj-ui`) define their own extension type
-and project it onto wire `Message`s at each provider call boundary:
+The agent crate (`aj-agent`) owns this extension. It defines an
+`AgentMessage` enum that wraps wire `Message` values and adds the
+UI-only entries:
 
 ```rust
-// In aj-agent (or wherever the transcript lives):
+// In aj-agent::message:
 enum AgentMessage {
-    Llm(Message),           // wire message from aj-models
-    UserOutput(UserOutput), // UI-only entry
+    Llm(Message),                  // wire message from aj-models
+    ToolDetails(ToolDetails),      // UI-only entry
     // ... future: steering notes, branch markers, etc.
 }
 
 fn to_wire(msgs: &[AgentMessage]) -> Vec<Message> {
     msgs.iter().filter_map(|m| match m {
         AgentMessage::Llm(m) => Some(m.clone()),
-        AgentMessage::UserOutput(_) => None, // dropped from wire
+        AgentMessage::ToolDetails(_) => None, // dropped from wire
     }).collect()
 }
 ```
 
 `aj-models` never sees `AgentMessage`. Provider calls take
 `Context { messages: Vec<Message> }`. The agent is responsible for
-the `AgentMessage → Message` projection before each call and for
-storing the full `AgentMessage` stream in the thread file (see §1.8).
+the `AgentMessage → Message` projection before each call.
 
-### 1.8 Thread Persistence Format
+**Persistence is a separate layer.** The on-disk thread format —
+JSONL files in `~/.aj/threads/` — lives in the `aj-session` crate,
+not in `aj-models`. `aj-session` consumes both wire `Message`s
+(from `aj-models`) and `AgentMessage`s (from `aj-agent`) and writes
+them to disk. See `docs/aj-next-plan.md` §2.0 and §3 for the
+on-disk schema, the migration plan, and the bus-listener model that
+drives writes.
 
-Threads are stored as JSONL under
-`~/.aj/threads/<encoded-cwd>/<thread_id>.jsonl`, where `<encoded-cwd>`
-is the sanitized form of the project directory (matching the current
-aj layout — e.g. `Dev-aj` for a project at `~/Dev/aj`). The on-disk
-format is distinct from the wire types and has its own versioning.
+### 1.8 Thread Persistence (out of scope)
 
-**Line 1 is a header** carrying format metadata:
+Thread persistence is **not** part of `aj-models`. The JSONL on-disk
+format, `ConversationLog`, replay, and thread navigation all live in
+the `aj-session` crate, which is layered on top of `aj-models` and
+`aj-agent`. See `docs/aj-next-plan.md` for the design.
 
-```rust
-struct ThreadHeader {
-    kind: String,                  // always "thread" (tag literal)
-    format_version: u32,           // current: 1
-    thread_id: String,
-    created_at: i64,               // unix ms
-    /// Project directory at thread creation. Required. Used to
-    /// derive the thread's storage location (`~/.aj/threads/
-    /// <encoded-cwd>/<thread_id>.jsonl`, same sharding pattern as
-    /// today) and as a human-readable record on resume. Informational
-    /// only on resume — the loader does not validate that the current
-    /// process cwd matches this value; callers may resume a thread from
-    /// any directory.
-    cwd: String,
-    parent_thread: Option<String>, // id of the thread this was forked from
-}
-```
-
-**Every subsequent line is a `ThreadEntry`**, a tagged union:
-
-```rust
-struct ThreadEntry {
-    timestamp: i64,
-    #[serde(flatten)]
-    kind: ThreadEntryKind,
-}
-
-enum ThreadEntryKind {
-    /// An LLM message (user / assistant / tool-result).
-    Message(Message),
-    /// Agent-level entries that never go on the wire (see §1.7).
-    /// Defined in the agent crate; aj-models treats the payload as
-    /// opaque JSON so it can read threads produced by callers that
-    /// extend the agent message type differently.
-    Agent(serde_json::Value),
-}
-```
-
-**Version handling.** The loader must check `format_version`. Unknown
-values are rejected loudly (do not silently attempt to parse an
-unrecognized format). The current version is `1`; bump it whenever
-`ThreadEntry` or the embedded `Message` shape changes in a
-non-backwards-compatible way.
-
-**Pre-existing threads.** Adoption of this spec is a clean break.
-The prior on-disk format is not supported by the v1 loader and there
-is no migrator — threads directories from earlier builds must be
-wiped (or moved aside) before running a v1-capable binary. Unknown
-`format_version` values surface as a load error so stale files fail
-fast instead of getting mis-parsed.
+This is a deliberate split. `aj-models` is reusable from any
+frontend (CLI, TUI, RPC server, embedded harness) without forcing a
+particular persistence story; each frontend can drive `aj-session`,
+use a different store, or skip persistence entirely.
 
 **What lives where.**
 
 | Layer | Type | Crate | On wire? | Persisted? |
 |---|---|---|---|---|
-| Wire | `Message` (§1.2) | `aj-models` | Yes | Yes (as `ThreadEntryKind::Message`) |
-| Agent | `AgentMessage` (§1.7) | `aj-agent` (or caller) | No | Yes (as `ThreadEntryKind::Agent`) |
-| Thread file | `ThreadHeader` + `Vec<ThreadEntry>` | `aj-models` | No | Yes (this layer) |
+| Wire | `Message` (§1.2) | `aj-models` | Yes | Yes (by `aj-session`) |
+| Agent | `AgentMessage` (§1.7), `ToolDetails`, events | `aj-agent` | No | Yes (by `aj-session`) |
+| Thread file | `ConversationLog`, JSONL framing, replay | `aj-session` | No | Yes (this layer) |
 
-`aj-models` owns `ThreadHeader`, `ThreadEntry`, `ThreadEntryKind`,
-and the JSONL reader/writer. It does not know the shape of
-`AgentMessage`; that field is a `serde_json::Value`. The agent crate
-deserializes it into its own enum when loading and serializes its
-enum into a Value when writing. This keeps `aj-models` agnostic to
-callers that extend the agent message type.
+**Pre-existing threads.** Adoption of this spec, in combination
+with the `aj-next` cutover, is a clean break in `aj-models` terms:
+the new wire `Message` types differ from today's `MessageParam`
+shape, and any pre-existing thread files use the old shape. The
+migration walker in `aj-session` (see `aj-next-plan.md` §3)
+rewrites the agent-level fields (`UserOutput` → `ToolDetails`); a
+separate one-shot pass handles wire-message migration when the
+`aj-models` rewrite lands. Both walkers leave `.bak` files; both
+are one-way.
 
 ### 1.9 Deliberately Out of Scope
 
-Several content-block and entry kinds present in the current
-in-repo SDK types (`ContentBlockParam` variants beyond the five
-we keep) are deliberately excluded from the unified `Message` types
-and the v1 thread format. None of them have an agent/tool/CLI caller
-today. Any can be reintroduced later by adding a new
-`AssistantContent` / `UserContent` variant and the matching provider
-mapping, accompanied by a `format_version` bump.
+Several content-block kinds present in the current in-repo SDK types
+(`ContentBlockParam` variants beyond the five we keep) are
+deliberately excluded from the unified `Message` types. None of
+them have an agent/tool/CLI caller today. Any can be reintroduced
+later by adding a new `AssistantContent` / `UserContent` variant
+and the matching provider mapping.
 
 | Omitted | Rationale | Re-add path |
 |---|---|---|
@@ -400,9 +360,12 @@ mapping, accompanied by a `format_version` bump.
 | `Citation` on text / tool-result | Plumbed through SDK, no UI rendering | Add `citations: Vec<Citation>` on `TextContent` + render path |
 | Multi-block system prompt with per-block `cache_control` | `Context::system_prompt: Option<String>` sends one block. §6.2 auto-applies `cache_control` to the single block, which covers the common case. | Change to `system_prompt: Vec<SystemBlock>` with per-block `cache_breakpoint: bool`; update §6.2 to emit one `system` array entry per block and §7.2 / §7.3.1 to concatenate blocks with `\n\n` |
 
-The following *thread-entry* kinds from other agent harnesses
-(pi-mono, Claude Code session format, etc.) are also out of scope
-for v1, but worth flagging as obvious future entry-kind candidates:
+The following *agent-level* / *session-level* entry kinds from
+other agent harnesses (Claude Code session format, etc.) are also
+out of scope here. They belong to the agent + session layers, not
+`aj-models`; they would be added as new variants on `AgentMessage`
+in `aj-agent` or as new entry kinds in `aj-session`, not to the
+wire types in this spec:
 
 - `model_change` / `thinking_level_change` — record mid-thread
   config changes. Today these events are lost on replay (the
@@ -417,8 +380,8 @@ for v1, but worth flagging as obvious future entry-kind candidates:
 - `label` / `thread_info` — user-facing metadata (bookmarks,
   display names).
 
-These are out of scope because the agent doesn't produce any of them
-yet. Calling them out here documents the absence rather than
+These are out of scope because the agent doesn't produce any of
+them yet. Calling them out here documents the absence rather than
 committing to add them.
 
 ### 1.10 Round-trip Invariants
@@ -2189,8 +2152,14 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
 
 16. **Update `aj-agent`**: Migrate the agent loop to use the new unified
     types and streaming protocol. Replace direct `Model` trait usage with
-    `stream_simple()` calls. Update conversation persistence to use the
-    new `Message` types. Wire up auth storage for API key resolution.
+    `stream_simple()` calls. Wire up auth storage for API key resolution.
+    Note that the `aj-next` plan extracts persistence into `aj-session`
+    — if that lands first, `aj-agent` no longer touches
+    `ConversationLog` directly and this step has nothing to update on
+    the persistence path. If `aj-models` lands first, `aj-agent` keeps
+    its existing `ConversationLog` calls until the `aj-session`
+    extraction runs, at which point they move to a bus listener in
+    the binary.
 
 17. **Update `aj` CLI**: Add `--provider` flag alongside existing
     `--model_api`. Add `/login` command support. Wire up model registry
@@ -2198,6 +2167,8 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
 
 18. **Remove old code**: Remove the `messages` module (replaced by
     `types`), remove the old `Model` trait and `create_model` function,
-    remove the old `StreamingEvent` enum, remove the `openai_ng` module,
-    remove `conversation.rs` message types (replaced by unified types).
-    Remove the `async-openai` dependency.
+    remove the old `StreamingEvent` enum, remove the `openai_ng` module.
+    Remove the `async-openai` dependency. The conversation persistence
+    that today lives in `aj-models::conversation` is removed from
+    `aj-models` entirely (moved to `aj-session`); see
+    `docs/aj-next-plan.md` §2.0.

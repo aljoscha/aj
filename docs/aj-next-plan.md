@@ -1,477 +1,577 @@
 # `aj-next` plan — event-driven core + new TUI
 
-This replaces the previous "keep `AjUi` and bridge into the TUI" plan.
-The new shape: the agent is a pure state machine that emits a typed
-event stream; consumers (a TUI, a plain-text CLI, an RPC server, log
-persistence, tests) subscribe.
+Companion to `docs/models-spec.md`. This plan assumes the wire-layer
+rewrite from that spec has already landed: `aj-models` exposes the
+unified `Message`, `AssistantMessage`, `AssistantMessageEvent`,
+`Usage`, etc. Anything that talks about the wire is defined there;
+this doc covers everything above it.
 
-The plan is in three large pieces:
+The shape splits cleanly into three layers:
 
-1. **Phase 0 — refactor `aj-agent` and `aj-tools` to the event-driven
-   shape.** This is foundation work; the existing `aj` binary keeps
-   working by riding a thin event-to-CLI bridge.
-2. **Phase 1 — build `aj-next` on top of the new core.** Print mode
+- **Wire layer** (`aj-models`): provider SDKs and unified message
+  types. Knows nothing about persistence or UI.
+- **Agent layer** (`aj-agent`): the `Agent` runtime, the typed
+  `AgentEvent` stream, the tool trait, and an `AgentMessage`
+  extension that adds agent-only entries on top of wire `Message`s.
+  Knows nothing about persistence or UI.
+- **Session layer** (`aj-session`, new): the on-disk thread format,
+  `ConversationLog`, replay, and thread navigation. Bridges the
+  wire and agent types into JSONL files. Not part of the runtime.
+
+The agent is a state machine that emits typed events; everything
+else (TUI, plain CLI, RPC server, persistence, tests) subscribes.
+Persistence is just one subscriber, living in its own crate so
+multiple frontends can share it without pulling in a UI.
+
+The plan has three pieces:
+
+1. **Phase 0** — split out `aj-session`, refactor `aj-agent` and
+   `aj-tools`. The existing `aj` binary keeps working throughout
+   via a thin event-to-CLI bridge.
+2. **Phase 1** — build `aj-next` on top of the new core. Print mode
    first, then interactive TUI, then selectors and theming.
-3. **Phase 2 — cutover.** `aj-next` becomes `aj`; `aj-ui` and the
+3. **Phase 2** — cutover. `aj-next` becomes `aj`; `aj-ui` and the
    legacy CLI go away.
-
-Phase 0 lands first and ships the workspace in a state where the
-existing `aj` binary still works end-to-end. Phase 1 then layers the
-new TUI without touching the now-stable agent core.
 
 ---
 
 ## 1. The new core shape
 
-Two crates change shape; one is born; one dies. The dependency
-direction between `aj-agent` and `aj-tools` flips: tools depend on the
-agent core, not the other way around. The contract types (events,
-tool trait, tool outcome) live in the same package as the `Agent`
-runtime, and tool implementations sit a layer up.
+Dependency graph after Phase 0:
+
+```
+aj-models  ←  aj-agent  ←  aj-tools
+               ↑              ↑
+               └─  aj-session  ─┘
+                       ↑
+                 ┌─────┴─────┐
+                 aj         aj-next
+```
 
 | Crate | Today | After Phase 0 |
-|-------|-------|---------------|
-| `aj-agent` | Owns `Agent<UI: AjUi>`; pushes through `dyn AjUi`. Depends on `aj-tools`. | Owns the **agent contract**: `AgentEvent`, `AgentId`, `ToolDefinition`, `ToolContext`, `ToolOutcome`, `ToolDetails`, `TokenUsage`, `UsageSummary`, `StopReason`, plus the `Agent` runtime. No UI generic; emits events on a bus via `Agent::subscribe`. Does **not** depend on `aj-tools`. |
-| `aj-tools` | Defines `ToolDefinition` trait + 11 tool implementations. Depends on `aj-ui`. | Tool implementations only. Depends on `aj-agent` for the trait + types. Each tool returns `ToolOutcome { model_output, details, is_error }`. |
-| `aj-ui` | Defines `AjUi` trait + `UserOutput` + `TokenUsage` types. | Deleted. Its types either move into `aj-agent` (events, usage) or vanish (`AjUi`, `UserOutput`, `AjUiAskPermission`). |
-| `aj` | Rustyline CLI implementing `AjUi`. | Same binary, but its UI is now an event listener that calls into `AjCli`'s rendering helpers. |
-| `aj-next` | — | New crate with the TUI. Subscribes to the same event bus. |
+|---|---|---|
+| `aj-models` | wire + persistence + UI dep | wire only (per `models-spec.md`) |
+| `aj-agent` | `Agent<UI: AjUi>`, depends on tools/UI | runtime + contract types (events, tool trait, `ToolDetails`, `AgentMessage`). Depends only on `aj-models`. No UI generic |
+| `aj-session` (new) | — | on-disk format, `ConversationLog`, `ConversationView`, `ConversationPersistence`, replay. Depends on `aj-models` + `aj-agent` |
+| `aj-tools` | depends on `aj-ui` | tool implementations only; depends on `aj-agent` |
+| `aj-ui` | the `AjUi` trait | deleted; types absorbed by `aj-agent` |
+| `aj` | rustyline CLI implementing `AjUi` | same binary; UI is now an event subscriber over `AjCli` rendering helpers |
+| `aj-next` (new) | — | TUI binary; same core dependencies as `aj`, plus `aj-tui` |
 
-The only place `aj-agent` reaches into `aj-tools` today is sub-agent
-spawn (it calls `get_builtin_tools()` to assemble the child's tool
-list). That gets pushed up: the binary builds the tool list once and
-passes it to `Agent::new`; sub-agents reuse the same list (minus the
-`agent` tool to prevent recursion).
+The agent's only reach into `aj-tools` today is `get_builtin_tools()`
+during sub-agent spawn. That moves up: the binary builds the tool
+list once and passes it to `Agent::new`; sub-agents reuse it minus
+the `agent` tool. After Phase 2, `aj` is deleted and `aj-next` is
+renamed.
 
-After Phase 2 `aj` is deleted and `aj-next` is renamed.
+### 1.0 Terminology
 
-### 1.1 The event enum
+| Term | Meaning |
+|---|---|
+| **Inference** | One streaming LLM call (one `Provider::stream` invocation). |
+| **Turn** | One assistant-message cycle, ending when the model emits `Done` (or `Error`/`Aborted`). A turn typically runs several inferences if it contains tool calls. |
+| **Agent loop** | The driver inside `Agent::prompt` that runs turns until exit. With steering and follow-up queues a single `prompt` call can span multiple turns. |
+| **Input loop** | The binary's outer loop: read user input, call `agent.prompt`, repeat. Lives in the binary, not in `aj-agent`. |
 
-Lives in `aj-agent`. Every variant carries an `agent_id: AgentId` so
-listeners can route sub-agent output (or, in v2, parallel agent fan-
-out) into nested transcripts.
+### 1.1 Event stream
 
-```rust
-#[derive(Clone, Debug)]
-pub enum AgentEvent {
-    // Lifecycle
-    AgentStart   { agent_id: AgentId, model: ModelInfo, thinking: ThinkingLevel },
-    AgentEnd     { agent_id: AgentId },
-    TurnStart    { agent_id: AgentId, turn: usize },
-    TurnEnd      { agent_id: AgentId, turn: usize, usage: TokenUsage },
+`AgentEvent` is intentionally a small set of variants, with the
+fine-grained streaming detail surfaced through a nested
+`AssistantMessageEvent` (defined in `aj-models`) rather than lifted
+into top-level variants. This keeps the agent crate decoupled from
+the wire streaming protocol — the agent re-emits whatever the
+provider produced.
 
-    // User input (emitted when a user message is accepted)
-    UserMessage  { agent_id: AgentId, text: String },
+The variants, grouped:
 
-    // Assistant streaming
-    AssistantMessageStart { agent_id: AgentId },
-    AssistantTextStart    { agent_id: AgentId, text: String },
-    AssistantTextDelta    { agent_id: AgentId, diff: String },
-    AssistantTextStop     { agent_id: AgentId, text: String },
-    AssistantThinkingStart{ agent_id: AgentId, text: String },
-    AssistantThinkingDelta{ agent_id: AgentId, diff: String },
-    AssistantThinkingStop { agent_id: AgentId },
-    AssistantMessageEnd   { agent_id: AgentId, stop_reason: StopReason },
+- **Lifecycle.** `AgentStart`, `AgentEnd { messages }`, `TurnStart`,
+  `TurnEnd { message, tool_results }`.
+- **Message lifecycle.** `MessageStart { message }`,
+  `MessageUpdate { message, event: AssistantMessageEvent }` (only
+  during assistant streaming), `MessageEnd { message }`.
+  Emitted for user, assistant, and tool-result messages alike;
+  `MessageUpdate` only fires for assistant streaming and carries the
+  full `partial: AssistantMessage` snapshot inside `event` (see
+  `models-spec.md` §2).
+- **Tool execution lifecycle.** `ToolExecutionStart { call_id, tool, args }`,
+  `ToolExecutionUpdate { call_id, tool, args, partial: ToolDetails }`,
+  `ToolExecutionEnd { call_id, tool, result: ToolDetails, is_error }`.
+- **Sub-agents.** `SubAgentStart { parent, child, task }`,
+  `SubAgentEnd { parent, child, report }` for correlation.
+- **Notices.** `Notice { text }`, `Warning { text }`, `Error { text }`,
+  `StreamRetry { attempt, delay, error }`. Transient; not persisted.
+- **Queue snapshots.** `QueueUpdate { steering, follow_up }` whenever
+  either queue changes; full snapshots so the TUI's pending-messages
+  indicator renders from a single event.
 
-    // Tool execution
-    ToolExecutionStart  { agent_id: AgentId, call_id: String, tool: String,
-                          input: serde_json::Value },
-    ToolExecutionUpdate { agent_id: AgentId, call_id: String, partial: ToolDetails },
-    ToolExecutionEnd    { agent_id: AgentId, call_id: String, outcome: ToolOutcome },
+Every event carries an `agent_id: AgentId` (`Main` or `Sub(usize)`)
+so listeners can route sub-agent output into nested transcripts.
 
-    // Sub-agent lifecycle (correlation aid)
-    SubAgentStart { parent: AgentId, child: AgentId, task: String },
-    SubAgentEnd   { parent: AgentId, child: AgentId, report: Option<String> },
+The agent loop calls `aj-models::stream_simple`, gets back an
+`AssistantMessageEventStream`, and re-emits each event inside
+`MessageUpdate`. The `partial` snapshot inside the event already
+carries the running text/thinking/tool-call state; the agent doesn't
+need to track it separately.
 
-    // Notices / errors / retries
-    Notice  { agent_id: AgentId, message: String },
-    Warning { agent_id: AgentId, message: String },
-    Error   { agent_id: AgentId, message: String },
-    StreamRetry { agent_id: AgentId, attempt: usize, delay: Duration, error: String },
+### 1.2 Tool outcomes — `ToolDetails`
 
-    // Final summary, emitted once at the end of a `prompt()` call.
-    UsageSummary(UsageSummary),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum AgentId { Main, Sub(usize) }
-```
-
-`StopReason` mirrors today's stop-reason values (end_turn, tool_use,
-max_tokens, error, aborted).
-
-### 1.2 Tool outcomes — structured details
-
-Today: tools format strings and call `ui.display_tool_result*`.
-After: tools return structured details and the listener formats them.
+Tools today format strings and call `ui.display_tool_result*`. After:
+they return structured details, the listener formats them.
 
 ```rust
-#[derive(Clone, Debug)]
 pub struct ToolOutcome {
-    /// What goes back to the model as the tool_result content.
-    pub model_output: String,
+    /// Content sent back to the model as the tool_result message.
+    /// Maps directly onto aj_models::ToolResultMessage.content.
+    pub content: Vec<UserContent>,
     /// Structured payload for UI rendering. Tool-specific.
     pub details: ToolDetails,
-    /// Whether this is an error result (model still sees it,
-    /// flagged with the provider's error marker, e.g. `is_error: true`).
     pub is_error: bool,
-}
-
-#[derive(Clone, Debug)]
-pub enum ToolDetails {
-    /// Plain summary + optional collapsible body. Default for read_file,
-    /// ls, glob, grep, agent, todo_*, anything that doesn't have a
-    /// dedicated variant.
-    Text { summary: String, body: Option<String> },
-
-    /// File mutation. Listener renders a syntax-highlighted unified diff.
-    Diff { path: String, before: String, after: String },
-
-    /// Bash command output.
-    Bash {
-        command: String,
-        stdout: String,
-        stderr: String,
-        exit_code: Option<i32>,
-        truncated: bool,
-    },
-
-    /// Sub-agent report. The listener can collapse / expand the report.
-    SubAgentReport { agent_id: usize, task: String, report: String },
-
-    /// Todo list snapshot.
-    Todos { items: Vec<TodoItem> },
-
-    /// Escape hatch for tools that haven't been given a dedicated variant.
-    /// `model_output` already covers the model-facing string; `Json` is
-    /// for the UI.
-    Json(serde_json::Value),
 }
 ```
 
+`ToolDetails` is a closed enum with one variant per rendering shape,
+not per tool:
+
+- `Text { summary, body }` — default for `read_file`, `ls`, `glob`,
+  `grep`, `agent`, `todo_*`, anything without a dedicated variant.
+- `Diff { path, before, after }` — `write_file`, `edit_file`,
+  `edit_file_multi`. Listener renders a syntax-highlighted unified
+  diff.
+- `Bash { command, stdout, stderr, exit_code, truncated, full_output_path }` —
+  `bash`. `stdout`/`stderr` carry a bounded rolling tail; if output
+  exceeded the cap, the implementation spills the full stream to a
+  temp file and surfaces its path here.
+- `SubAgentReport { agent_id, task, report }` — the `agent` tool.
+- `Todos { items }` — `todo_read`, `todo_write`.
+- `Json(Value)` — escape hatch for tools that don't warrant their
+  own variant.
+
 `ToolDetails` is `Clone + Send + Sync` and serializable, so it round-
-trips through the conversation log.
+trips through the conversation log alongside the wire `Message`.
+
+**Why a closed enum, not tool-owned rendering.** A reasonable
+alternative is to give each `ToolDefinition` a `render_call` /
+`render_result` method that returns UI components. We don't:
+
+- The closed enum round-trips through `aj-session` for free — same
+  shape on disk, in `--json` print mode, and in replay. Trait-object
+  rendering would force tool details to be `serde_json::Value` on
+  disk and typed only inside each tool, losing the static guarantee
+  at the persistence boundary.
+- Listeners stay decoupled from `aj-tui`. If tools owned rendering,
+  either `aj-agent` would have to know about `aj_tui::Component` (or
+  every frontend would need its own per-tool registry).
+- We have 11 builtin tools and no third-party tool extension story
+  today. Adding a variant + updating listener `match` arms is bounded.
+
+Trade-off: a new tool with novel rendering needs a new variant.
+Escape hatch is `Json(Value)`. A listener-side per-tool renderer
+registry can be added in `aj-next` later (keyed by tool name,
+without touching this enum).
 
 ### 1.3 Tool trait
 
-```rust
-pub trait ToolDefinition {
-    type Input: JsonSchema + DeserializeOwned + Send;
+The trait surface:
 
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+- An associated `Input: JsonSchema + DeserializeOwned + Send`.
+- `name()`, `description()`, `input_schema()` (default-derived).
+- `execute(ctx, input) -> impl Future<Output = Result<ToolOutcome>>`.
+- An optional `execution_mode()` returning `Sequential | Parallel`,
+  default `Parallel`.
 
-    fn execute(
-        &self,
-        ctx: &mut dyn ToolContext,
-        input: Self::Input,
-    ) -> impl Future<Output = Result<ToolOutcome, anyhow::Error>> + Send;
+The execution context (`ToolContext`) gives tools:
 
-    fn input_schema(&self) -> Value { derive_schema::<Self::Input>() }
-}
+- `working_directory()`.
+- `get_todo_list()` / `set_todo_list(...)`.
+- `spawn_agent(task) -> impl Future<Output = Result<String>>` — the
+  child runs on the parent's bus and returns its final assistant
+  text.
+- `emit_update(partial: ToolDetails)` for `ToolExecutionUpdate`
+  events. Tools that produce many updates self-throttle (~10/s,
+  100ms leading-edge debounce). Tools with potentially-large output
+  use bounded buffers and spill to a temp file once the cap is hit.
+- `cancellation()` — a `CancellationToken` tools must honor for
+  long-running work or external processes (see §1.8).
 
-pub trait ToolContext: Send {
-    fn working_directory(&self) -> PathBuf;
+There is no `&mut dyn AjUi` parameter and no `display_tool_result*`
+calls. Tools no longer know there's a UI.
 
-    fn get_todo_list(&self) -> Vec<TodoItem>;
-    fn set_todo_list(&mut self, todos: Vec<TodoItem>);
+**Per-tool execution mode.** Default is `Parallel`. The agent's
+batch-execution rule (§1.5) is: if any tool in a batch is
+`Sequential`, the whole batch runs sequentially. Builtin
+classification:
 
-    /// Spawn a sub-agent and await its final assistant text. The agent
-    /// emits `SubAgentStart` / nested events / `SubAgentEnd` on the same
-    /// bus this tool is contributing to.
-    fn spawn_agent(&mut self, task: String)
-        -> Pin<Box<dyn Future<Output = Result<String, anyhow::Error>> + Send + '_>>;
+| Sequential | Parallel |
+|---|---|
+| `bash`, `write_file`, `edit_file`, `edit_file_multi` | `read_file`, `ls`, `glob`, `grep`, `agent`, `todo_read`, `todo_write` |
 
-    /// Push a partial-result update for the in-flight tool call. The
-    /// agent loop wraps it in a `ToolExecutionUpdate` event. Cumulative
-    /// snapshots, not deltas.
-    fn emit_update(&mut self, partial: ToolDetails);
+The four sequential tools either mutate the filesystem or run
+arbitrary commands; serializing avoids interleaved writes and
+output-channel contention.
 
-    /// Cancellation token; tools that block must honor it.
-    fn cancellation(&self) -> &CancellationToken;
-}
-```
+### 1.4 Agent surface
 
-The `&mut dyn AjUi` parameter and all `display_tool_result*` calls are
-gone. Tools no longer know there's a UI.
+`Agent` is a runtime handle. The public surface, by responsibility:
 
-### 1.4 Agent shape
+- **Construction.** `Agent::new(env, system_prompt, tools, disabled_tools, model, default_thinking)`.
+  System prompt is fully assembled by the caller; the agent stores
+  it but doesn't persist it (that's `aj-session`'s job). Sub-agents
+  share the parent's bus (§1.6).
+- **Subscription.** `subscribe(listener)` registers an async closure
+  invoked for each event in registration order. Returns a handle
+  that drops the subscription. Listeners are awaited inline: a
+  listener that returns `Err` fails the run with `TurnError::Fatal`.
+  This is the same mechanism for both durable (persistence) and
+  best-effort (rendering) consumers — see "hook vs subscriber"
+  below.
+- **Channel sugar.** `subscribe_channel() -> mpsc::UnboundedReceiver<AgentEvent>`
+  is built on top of `subscribe`: it registers a non-blocking-send
+  listener and returns the receiver. The TUI uses this; the agent
+  is never blocked by a slow renderer.
+- **Hooks.** Single-slot setters (`Option<Box<...>>`):
+  - `set_after_tool_call(hook)` — invoked after a tool returns,
+    before the corresponding `ToolExecutionEnd` and `ToolResult`
+    message events fire. Can override `content`, `details`,
+    `is_error`, or `terminate`. Use case: redaction, auto-truncation.
+  - `set_should_stop_after_turn(hook)` (deferred to v1.1; mentioned
+    here so we don't re-litigate the API shape later).
+  - `set_before_tool_call(hook)` (permission gating, deferred).
+- **Transcript management.** `seed_messages(messages)` replaces the
+  current in-memory transcript on resume. Doesn't emit events; the
+  caller renders history through `aj-session::ConversationLog::replay`.
+  `messages()` returns a slice for projection / persistence.
+- **Run.** `prompt(message_or_messages)` runs one user turn (or a
+  batch of seed messages). `continue_run()` resumes from the
+  existing transcript when the last message is a user or tool-result
+  message — used after a recoverable error or abort, to retry
+  without re-injecting a prompt.
+- **Cancel.** `cancel()` is idempotent; it triggers the agent's
+  `CancellationToken`. See §1.8.
+- **State accessors.** `current_turn()`, `accumulated_usage()`,
+  plus a small `state()` snapshot (`is_streaming`,
+  `streaming_message`, `pending_tool_calls`, `last_error`) for the
+  TUI.
 
-```rust
-pub struct Agent {
-    env: AgentEnv,
-    system_prompt: &'static str,
-    assembled_system_prompt: Option<String>,
-    tool_definitions: HashMap<String, ErasedToolDefinition>,
-    tools: Vec<Tool>,
-    disabled_tools: Vec<String>,
-    model: Arc<dyn Model>,
-    session_state: SessionState,
-    default_thinking: Option<ThinkingConfig>,
+**Hook vs subscriber pattern.** There is a single `subscribe`
+mechanism with awaited listeners; persistence is just one of those
+listeners and earns its durability guarantee from "the agent awaits
+each listener inline before moving on". Persistence is therefore
+one of the listeners the binary registers at startup, returning
+`Err` if the on-disk write fails (which fails the prompt).
+Rendering listeners use the channel sugar so they never block.
 
-    // New
-    bus: AgentEventBus,
-    cancel: CancellationToken,
-}
+The result is the same "at-most one event behind reality" guarantee
+today's code provides via inline `view.add_*` calls, with no special
+hook slot.
 
-impl Agent {
-    pub fn new(env, system_prompt, tools, disabled_tools, model, default_thinking) -> Self;
+**`prompt` does not take a `&mut ConversationLog`.** The agent
+doesn't know there's a log. The binary owns the log and registers
+a persistence listener. This is what makes the agent equally
+embeddable from a TUI, CLI, RPC server, or test harness.
 
-    /// Subscribe to events. Returns an unbounded receiver. Multiple
-    /// listeners can subscribe; each gets its own receiver. Sub-agents
-    /// inherit the same bus.
-    pub fn subscribe(&mut self) -> mpsc::UnboundedReceiver<AgentEvent>;
+### 1.5 Tool-call execution
 
-    /// Run one user turn: appends the user message, drives the model
-    /// loop until end_turn or error. Events flow on the bus throughout.
-    /// Returns when the bus has nothing left to emit for this prompt.
-    pub async fn prompt(
-        &mut self,
-        log: &mut ConversationLog,
-        message: String,
-    ) -> Result<(), TurnError>;
+Per turn, after the assistant message finalizes, the agent collects
+its `ToolCall` content blocks into a batch and runs them according
+to the per-tool `execution_mode`:
 
-    /// Re-emit events for an already-persisted log. Doesn't call the
-    /// model. Useful on resume.
-    pub fn replay(&mut self, log: &ConversationLog);
+- **Sequential batch.** Any tool in the batch with `Sequential`
+  mode forces serial execution: prepare → execute → finalize → emit
+  end, one call at a time, in source order.
+- **Parallel batch.** All tools `Parallel`: prepare each call
+  sequentially (validation, `before_tool_call` hook), then drive
+  all `execute` futures concurrently. `ToolExecutionEnd` events
+  fire in completion order; the resulting `ToolResultMessage`s are
+  appended in source order so the wire transcript stays
+  deterministic.
 
-    /// Cancel the in-flight prompt. Idempotent.
-    pub fn cancel(&self);
-
-    pub fn current_turn(&self) -> usize;
-    pub fn accumulated_usage(&self) -> &Usage;
-}
-```
-
-`AgentEventBus` is a small `Vec<UnboundedSender<AgentEvent>>` with
-prune-on-emit (drop closed senders). Listeners are awaited or polled
-out of band.
-
-### 1.5 Replay
-
-`Agent::replay(log)` walks the persisted conversation entries and emits
-the same `AgentEvent`s the original turn produced. The log already
-captures user/assistant messages and (after Phase 0) tool details, so
-this is mechanical. Critically, the **same listener code** that handles
-live events also handles replay — no `display_conversation_history`
-special case.
-
-For the conversation log itself: today's `ConversationEntryKind`
-includes `UserOutput`. We rename it to `ToolDetails` and persist the
-`ToolDetails` produced by the new tool trait. The old `UserOutput` enum
-is migrated 1:1 (Notice/Error/ToolResult/ToolResultDiff/ToolError/
-TokenUsage/TokenUsageSummary). On-disk JSONL files written before
-the migration need a small `serde` rename or a one-shot migration
-walker; details in §3.
+Errors during validation, the (future) before-hook, or `execute`
+itself produce a synthesized `ToolDetails::Text` error result with
+`is_error: true`. If every tool in the batch returns
+`terminate: true`, the agent ends the turn and emits `AgentEnd`
+without a follow-up inference.
 
 ### 1.6 Sub-agents
 
-Sub-agents share the parent's event bus. The `agent` tool spawns a
-child `Agent` with `agent_id = AgentId::Sub(n)` and connects its bus
-into the parent's. Every event the child emits carries `Sub(n)` so
-listeners can render nested transcripts. The TUI groups sub-agent
-events under the parent's `ToolExecutionComponent`.
+The `agent` tool calls `ctx.spawn_agent(task)`; tools never
+construct a child `Agent` directly. The implementation lives in
+`aj-agent` and:
 
-There's no separate `get_subagent_ui` factory anymore. The bus is the
-abstraction; routing happens listener-side.
+- Allocates a fresh `AgentId::Sub(n)` from the parent's session
+  state.
+- Builds the child's tool list as the parent's minus `agent` (no
+  recursion).
+- Clones the parent's bus, model handle, and system prompt.
+- Derives the child's cancellation token from
+  `parent.cancel.child_token()` so `parent.cancel()` reaches the
+  child recursively.
+- Awaits `child.prompt(task).await`, rolls the child's accumulated
+  usage into the parent's accounting, and returns the child's last
+  assistant text.
+
+Bus sharing means every event the child emits reaches every
+listener on the parent's bus, tagged with `Sub(n)`. Listeners
+group nested transcripts by id — the persistence listener writes
+sub-agent events under `ThreadKind::Subagent` framing in the same
+JSONL file (§3); the TUI groups them under the parent's
+`ToolExecutionComponent`.
 
 ### 1.7 Permissions
 
-Dropped. The current `AjUi::ask_permission` is dead code (defined and
-forwarded but never called by `aj-agent` or any tool), and the new TUI
-won't ship per-tool permission gating either. If a tool decides
-something is unsafe it returns `is_error: true` from `execute`, and
-that's the entire surface.
+Dropped. The current `AjUi::ask_permission` is dead code (defined
+but never called). A tool that decides something is unsafe returns
+`is_error: true`. The `set_before_tool_call` slot is reserved for
+v1.1 if we want gating later — same shape as `set_after_tool_call`.
 
-If we want gating later, the hook to add is a
-`Agent::set_before_tool_call` callback that the binary can register.
-Not in v1.
+### 1.8 Cancellation
+
+`Agent::cancel()` is idempotent and triggers the agent's
+`CancellationToken`. The token is awaited at two checkpoints inside
+the turn loop:
+
+1. **Streaming inference.** The provider's `AssistantMessageEventStream`
+   is `select!`-ed against `cancel.cancelled()`. On cancel the
+   in-flight HTTP request is dropped, the provider synthesizes
+   `Error { reason: Aborted }` per `models-spec.md` §2, and the
+   loop returns `TurnError::Aborted`.
+2. **Each tool execution.** The future returned by `ToolDefinition::execute`
+   is `select!`-ed against the token. On cancel, the future is
+   dropped.
+
+Tools observing a long-running body (network I/O, sub-process)
+should also `select!` against `ctx.cancellation()` internally.
+External processes (`bash`) **must** kill their process group on
+cancel — drop alone leaks the child.
+
+**Persistence on cancellation.** Listeners run synchronously for
+every event emitted *before* the abort. The agent emits
+`AssistantMessage { stop_reason: Aborted, ... }` and synthesizes
+`is_error: true` tool-result messages for any in-flight tool calls
+before returning, so the persisted log stays internally consistent
+— no dangling tool calls without matching results. This eliminates
+the cancel-path branch from today's `repair_interrupted_tool_uses`
+walker (which still handles the process-kill case where persistence
+didn't get a chance to run).
+
+`Agent::prompt` returns `Err(TurnError::Aborted)` on cancel; the
+binary's main loop treats it as "continue to next user input"
+rather than fatal.
+
+### 1.9 Steering and follow-up queues
+
+While `prompt` is running, the user may want to inject another
+message — either to redirect mid-task ("wait, do this instead") or
+to schedule work after the current task ("then also clean up the
+temp files"). Two queues handle these:
+
+- **Steering** (`steer(message)`): drained at each turn boundary
+  (after the assistant turn completes its tool batch, before the
+  next inference). Injected messages run with the full prior
+  context.
+- **Follow-up** (`follow_up(message)`): drained when the agent
+  would otherwise exit the loop. Continues the run instead of
+  returning from `prompt`.
+
+Both queues take `&self` (interior mutability) because the user
+calls them from a different code path than the one driving
+`prompt`. A `std::sync::Mutex` is enough — contention is brief.
+
+Queue API: `steer`, `follow_up`, `pending_steering`,
+`pending_follow_ups`, `clear_steering`, `clear_follow_ups`.
+`QueueUpdate` events fire on every change carrying full snapshots
+of both queues.
+
+**Drain mode.** Two modes are supported: `"all"` (drain every
+queued message into the next turn at once) and `"one-at-a-time"`
+(inject the head of the queue, run a turn, then check again).
+We default to `"one-at-a-time"` — interleaving multiple steering
+messages across multiple turns gives the model a chance to react
+before the next is injected. Configurable via `AgentOptions`.
+
+**Cancellation interaction.** `Agent::cancel()` does not clear the
+queues. `clear_steering` / `clear_follow_ups` are separate
+operations; the TUI's "double-Esc" cancel can bind both.
 
 ---
 
 ## 2. Phase 0 — refactor the core
 
-Six small commits, each shippable independently. The existing `aj` CLI
-keeps working throughout.
+Six commits. The legacy `aj` CLI keeps working throughout.
 
-### 2.0 — preparation
+### 2.0 Preparation
 
-- Move the contract types into `aj-agent`. New module
-  `aj_agent::events` defines `AgentEvent`, `AgentId`, `StopReason`,
-  `TokenUsage`, `UsageSummary`, `SubAgentUsage` (the last three move
-  here from `aj-ui`). New module `aj_agent::tool` defines
-  `ToolDefinition`, `ToolContext`, `ToolOutcome`, `ToolDetails`,
-  `ErasedToolDefinition`. No trait, no impls beyond
-  `Clone + Debug + serde`.
-- Flip the `aj-tools` dependency: it now depends on `aj-agent` instead
-  of `aj-ui`. The trait + erased wrapper move out of `aj-tools`; only
-  the 11 tool implementations and `get_builtin_tools()` stay.
-- The legacy `AjUi` trait stays in `aj-ui` for now so the refactor
-  steps below can land incrementally without breaking the binary.
-- Look at a few real on-disk thread files in `~/.aj/threads/` to
-  decide whether the planned `UserOutput` → `ToolDetails` serde rename
-  is sufficient or whether we need a `schema_version` header.
+Three structural moves, in order:
 
-Commit: `agent: introduce events and tool contract modules; flip tool dep direction`.
+- **(a) Extract `aj-session`.** New crate, takes today's
+  `aj_models::conversation::*` (`ConversationLog`, `ConversationView`,
+  `ConversationPersistence`, `ConversationEntry`,
+  `ConversationEntryKind`, `ThreadKind`, `ThreadFilter`, `EntryId`,
+  `ConversationError`). Adds a replay module returning
+  `impl Iterator<Item = AgentEvent>`. Depends on `aj-models` and
+  `aj-agent`.
+- **(b) Move contract types into `aj-agent`.** New modules:
+  `events` (`AgentEvent`, `AgentId`, queue types), `tool`
+  (`ToolDefinition`, `ToolContext`, `ToolOutcome`, `ToolDetails`,
+  `ErasedToolDefinition`), `message` (`AgentMessage`,
+  `AgentMessageKind`).
+- **(c) Flip `aj-tools`'s dependency** to `aj-agent` instead of
+  `aj-ui`. Tool implementations + `get_builtin_tools()` only.
 
-### 2.1 — agent emits events alongside AjUi calls
+`AjUi` stays alive in `aj-ui` through these moves; the bus runs
+alongside it for several commits before deletion.
 
-`aj-agent::Agent` gains a private `AgentEventBus`. Every `self.ui.foo(...)`
-call gets a parallel `bus.emit(AgentEvent::Foo {...})`. No behavior
-change to the CLI yet; we just have a working bus alongside the
-existing trait calls.
+**Reconnaissance step:** look at real on-disk thread files in
+`~/.aj/threads/` and decide whether the `UserOutput` → `ToolDetails`
+migration is a serde rename or a rewriting walker (see §3).
 
-This step is the biggest read-and-mirror pass. Tests: a `RecordingBus`
-listener captures all events for a known prompt; we snapshot the
-sequence to lock the protocol.
+Commits, in order: `aj-agent: introduce events/tool/message
+contract modules` → `aj-tools: depend on aj-agent` → `aj-session:
+extract conversation persistence into a new crate`.
+
+### 2.1 Agent emits events alongside `AjUi` calls
+
+`Agent` gains a private bus. Every `self.ui.foo(...)` call gets a
+parallel `bus.emit(AgentEvent::Foo {...})`. **No production
+subscribers yet** — only tests subscribe. CLI behavior is byte-
+identical. A `RecordingListener` test snapshots the event sequence
+for a known prompt to lock the protocol.
 
 Commit: `agent: emit AgentEvents through an internal bus`.
 
-### 2.2 — refactor tools to ToolContext + ToolOutcome
+### 2.2 Refactor tools to `ToolContext` + `ToolOutcome`
 
-For each of the 11 tools (read_file, write_file, edit_file,
-edit_file_multi, ls, glob, grep, bash, agent, todo_read, todo_write):
+Per tool: replace `&mut dyn AjUi` with `&mut dyn ToolContext`,
+return `ToolOutcome { content, details, is_error }`, drop the
+trailing `ui.display_tool_result*` call. Pick a `ToolDetails`
+variant per the table:
 
-1. Replace `&mut dyn AjUi` with `&mut dyn ToolContext`.
-2. Replace the trailing `ui.display_tool_result*` call with
-   `Ok(ToolOutcome { model_output, details, is_error: false })`.
-3. Per tool, pick the right `ToolDetails` variant:
+| Tool | Variant |
+|---|---|
+| `read_file`, `ls`, `glob`, `grep`, `agent` (text result), `todo_read`/`todo_write` (still also emit `Todos`) | `Text` |
+| `write_file`, `edit_file`, `edit_file_multi` | `Diff` |
+| `bash` | `Bash` |
+| `agent` (when run as sub-agent reporter) | `SubAgentReport` |
+| `todo_read`, `todo_write` | `Todos` |
 
-   | Tool | Variant |
-   |------|---------|
-   | `read_file` | `Text { summary: "<path><:lines>", body: Some(formatted) }` |
-   | `write_file` | `Diff { path, before: "", after }` |
-   | `edit_file` | `Diff { path, before, after }` |
-   | `edit_file_multi` | `Diff { path, before, after }` (final diff) |
-   | `ls` | `Text { summary, body }` |
-   | `glob` | `Text { summary, body }` |
-   | `grep` | `Text { summary, body }` |
-   | `bash` | `Bash { command, stdout, stderr, exit_code, truncated }` |
-   | `agent` | `SubAgentReport { agent_id, task, report }` |
-   | `todo_read` | `Todos { items }` |
-   | `todo_write` | `Todos { items }` |
-
-In `Agent::execute_tool`, we now consume `ToolOutcome` directly:
-
-- Emit `ToolExecutionEnd { outcome }` on the bus.
-- Stash `outcome.details` in the conversation log entry that today
-  holds `UserOutput::ToolResult{,Diff}`.
-- Use `outcome.model_output` as the tool_result content sent back to
-  the model.
-
-Tests: per-tool unit tests assert the right `ToolDetails` variant on
-known inputs. The existing tool-behavior tests (file contents, exit
-codes, etc.) still apply.
+The agent consumes `ToolOutcome` directly: emit `ToolExecutionEnd`,
+project `content` onto a `ToolResultMessage` for the wire. The
+agent does not persist `details` itself — that's the persistence
+listener's job.
 
 Commits, one per tool: `tools/<name>: return ToolOutcome with structured details`.
 
-### 2.3 — drive the legacy CLI off the event bus
+### 2.3 Drive the legacy CLI off the bus
 
-`aj` adds a small `EventBridgeListener` that subscribes to the bus and
-calls into the existing `AjCli` rendering helpers:
+**Atomic swap.** In one commit:
 
-```rust
-async fn run_event_bridge(
-    cli: &mut AjCli,
-    mut events: mpsc::UnboundedReceiver<AgentEvent>,
-) {
-    while let Some(event) = events.recv().await {
-        match event {
-            AgentEvent::Notice { message, .. }   => cli.display_notice(&message),
-            AgentEvent::AssistantTextStart{..}   => cli.agent_text_start(""),
-            AgentEvent::AssistantTextDelta{diff,..} => cli.agent_text_update(&diff),
-            AgentEvent::AssistantTextStop{text,..}  => cli.agent_text_stop(&text),
-            AgentEvent::ToolExecutionEnd{outcome, ..} => render_outcome(cli, outcome),
-            // …
-        }
-    }
-}
-```
+1. Add an `EventBridgeListener` in `aj` that subscribes to the bus
+   and calls into existing `AjCli` rendering helpers.
+2. Add a persistence listener that translates each event into a
+   `ConversationEntry` and appends through `aj-session`.
+3. Delete the `self.ui.*` and `view.add_*` calls inside
+   `Agent::execute_turn`.
 
-`render_outcome` switches on `ToolDetails` and calls
-`display_tool_result` / `display_tool_result_diff` exactly like today.
+Splitting (3) out would render and persist every event twice for
+one commit; splitting it merged would leave `bus.emit` as dead
+code. The atomicity matters.
 
-`Agent::run` and `Agent::run_single_turn` still exist and still own
-the user-input loop for the legacy CLI; they just route through the
-bus internally. The bridge listener runs on a `tokio::spawn`.
+After this commit `Agent::execute_turn` is bus-only.
+`Agent::run` and `Agent::run_single_turn` still own the input loop
+and call `self.ui.*` for things outside the turn loop (startup
+notices, model header, sandbox warning, readline, end-of-session
+usage summary). Those move to the binary in §2.5.
 
-Commit: `aj: bridge AgentEvents to AjCli rendering`.
+The persistence listener returns `Err` on disk failure → fails the
+run with `TurnError::Fatal`, preserving today's durability.
+The renderer uses the channel sugar (`subscribe_channel` →
+`tokio::spawn`) so a slow render never blocks the agent.
 
-### 2.4 — flip Agent::run to bus-only
+Commit: `aj: bridge AgentEvents to AjCli rendering and persistence`.
 
-Now that the bridge works, remove `self.ui` from `Agent`. The trait
-calls inside `Agent::run` go away; the bus is the only output channel.
-`AjUi` stops being used by the agent crate.
+### 2.4 Flip `Agent::run` to bus-only
 
-`Agent::run` keeps its current shape (it takes a small input provider
-trait — see §2.5 — for `get_user_input`) but no longer pushes UI calls.
+Remove `self.ui` and the `&mut ConversationLog` parameter from
+`Agent`. The direct `view.add_*` / trait calls inside `Agent::run`
+go away; the bus is the only output. `aj-session` is no longer
+reached from `aj-agent`.
 
-Commit: `agent: remove AjUi dependency, route everything through the bus`.
+Commit: `agent: remove AjUi and ConversationLog dependencies`.
 
-### 2.5 — split agent loop from input loop
+### 2.5 Split agent loop from input loop
 
-Today `Agent::run` owns both the model loop and the readline loop.
 After this commit:
 
-- `Agent::prompt(log, message)` runs one user turn.
-- The legacy `aj` binary owns its own readline loop:
+- `Agent::prompt(message)` runs one turn; `Agent::continue_run()`
+  resumes from transcript when the last message is user/tool-result.
+- The `aj` binary owns its own readline loop and its own
+  `ConversationLog`. On startup it: opens or creates a log,
+  registers a persistence listener and a renderer listener,
+  replays persisted history through the renderer, calls
+  `agent.seed_messages(log.messages())`, then enters the input
+  loop calling `agent.prompt(...)`.
+- Replay lives on `aj_session::ConversationLog::replay()`, not on
+  `Agent`. The agent never reads the log.
 
-  ```rust
-  loop {
-      let line = match cli.read_line()? { Some(l) => l, None => break };
-      agent.prompt(&mut log, line).await?;
-  }
-  ```
+Commit: `agent: expose prompt/continue API; move input loop and persistence to the binary`.
 
-- `Agent::replay(log)` re-emits the historical events on resume.
+### 2.6 Cleanup
 
-This is what unblocks `aj-next`: the same `Agent::prompt` API powers
-both the legacy CLI and the new TUI.
+- Delete `RecordingAjUi`.
+- Delete the `aj-ui` crate from the workspace. `AjUi`,
+  `UserOutput`, `AjUiAskPermission`, `Box<dyn AjUi>` impls go with
+  it.
+- Replace `AjCli` (the trait impl) with a plain `Renderer` struct
+  (`pub struct AjCli { common, history }`).
 
-Commit: `agent: expose prompt/replay/cancel API; move readline to the binary`.
+Commit: `aj-ui: delete; replace AjCli with a plain renderer`.
 
-### 2.6 — cleanup
-
-- Delete `RecordingAjUi` (unused).
-- Delete `aj-ui` from the workspace. Remove its entry from the
-  workspace `Cargo.toml`. The `AjUi` trait, `UserOutput`,
-  `AjUiAskPermission`, and the `Box<dyn AjUi>` impls go with it.
-- The `aj` binary's `AjCli` becomes a small `Renderer` struct
-  (`pub struct AjCli { common: AjCliCommon, history: Arc<Mutex<…>> }`)
-  with plain rendering methods. No trait.
-
-Commit: `aj-ui: delete; replace AjCli with a plain renderer struct`.
-
-End state of Phase 0:
-
-- `aj` binary still works exactly as it does today.
-- `aj-agent` exposes a clean event-driven API.
-- All tools return structured details.
-- The workspace is ready for `aj-next` without any throwaway bridge.
+End state of Phase 0: `aj` works exactly as today; each crate has a
+single job; tools return structured details; the workspace is ready
+for `aj-next` without throwaway bridges.
 
 ---
 
 ## 3. Conversation log migration
 
-The existing log writes `UserOutput` entries as JSONL lines. The new
-log writes `ToolDetails` plus a few new `AgentEvent`-derived entries.
+`UserOutput` today carries three unrelated kinds of payload:
 
-Approach: rename `UserOutput` → `ToolDetails` with a `#[serde(rename
-= "UserOutput")]` shim on the persistence side for one release, and
-ship a one-shot migration walker that rewrites old logs in
-`~/.aj/threads/` to the new shape. The variant names stay close
-enough that the rename is the bulk of the diff.
+| Old `UserOutput` variant | New home |
+|---|---|
+| `ToolResult`, `ToolResultDiff`, `ToolError` | `ToolDetails` (persisted alongside the tool-result message in `aj-session`) |
+| `Notice`, `Error` | transient `AgentEvent::{Notice,Error}` — not persisted |
+| `TokenUsage`, `TokenUsageSummary` | recomputed from `AssistantMessage.usage` per `models-spec.md` §1.2; not persisted as a standalone entry |
 
-If the on-disk shape is messier than expected, we add a
-`schema_version` field at the log header and gate the migration on it.
-Defer the decision until we look at actual log files in §2.0.
+So `ToolDetails` only replaces the tool-result subset of
+`UserOutput`. The rest become events or live on the wire `Message`.
+Tool details ride on `ToolResultMessage.details` (see `models-spec.md`
+§1.2), notices/errors are transient, usage rides on each assistant
+message.
+
+**Migration walker.** `aj-session` ships
+`migrate::walk_threads_dir(path)` that runs on first launch of the
+new binary against `~/.aj/threads/`:
+
+- `ConversationEntryKind::UserOutput(ToolResult/Diff/Error)` →
+  `ConversationEntryKind::ToolDetails(...)` keyed by the most recent
+  preceding tool_use id.
+- `ConversationEntryKind::UserOutput(Notice/Error)` → discarded
+  (they were always presentational).
+- `ConversationEntryKind::UserOutput(TokenUsage*)` → discarded
+  (recomputed from `AssistantMessage.usage`).
+- `MessageParam` content blocks → unified `Message` per
+  `models-spec.md` (this part runs as a separate one-shot pass
+  alongside the `aj-models` rewrite).
+
+Each migrated file gets a `.bak` sibling. Migration is one-way; no
+downgrade. If a `schema_version` field becomes warranted after the
+§2.0 reconnaissance, add it at the log header and gate the walker
+on it.
 
 ---
 
 ## 4. `aj-next` (Phase 1)
 
-Same crate layout as the previous plan, but the `ui_bridge.rs`
-disappears — there's nothing to bridge anymore.
+Crate layout:
 
 ```
 src/aj-next/
@@ -487,6 +587,7 @@ src/aj-next/
       keybindings.rs
       theme.rs
       slash_commands.rs
+    persistence.rs           # registers a persistence listener via Agent::subscribe
     modes/
       mod.rs
       print.rs
@@ -511,30 +612,38 @@ src/aj-next/
         editor_ext.rs
 ```
 
-`InteractiveMode::run` is a `tokio::select!` over:
+Dependencies: `aj-agent`, `aj-tools`, `aj-session`, `aj-tui`,
+`aj-conf`, `aj-models`.
 
-- `tui.next_event()` for keyboard / mouse / render-throttle ticks.
-- `agent_events.recv()` for `AgentEvent`s.
-- `footer_data.tick()` for git-branch refreshes.
+`InteractiveMode::run` is a `tokio::select!` over: `tui.next_event()`
+for keyboard / mouse / render-throttle ticks; the event-pump receiver
+from `agent.subscribe_channel()`; `footer_data.tick()` for
+git-branch refreshes.
+
+On startup, `InteractiveMode` opens or creates a `ConversationLog`
+through `aj-session`, registers a synchronous persistence listener
+on the agent (`agent.subscribe(persistence_handler)`), drives
+`log.replay()` through the same event pump that handles live
+events, then calls `agent.seed_messages(log.messages())` before
+entering the main select loop.
 
 When the editor submits, `InteractiveMode` calls
-`agent.prompt(&mut log, line).await` on a spawned task and observes
-events as they flow.
+`agent.prompt(message)` on a spawned task and observes events as
+they flow.
 
 ### 4.1 Sub-agent rendering
 
-The event pump groups events by `agent_id`. For `Sub(n)` events that
-arrive between `SubAgentStart` and `SubAgentEnd`, the pump routes them
-into the parent's `ToolExecutionComponent` (the `agent` tool's
-component is now itself a transcript fragment). Collapsible by
-default, expand with `Ctrl+O`.
+The event pump groups events by `agent_id`. Events arriving between
+`SubAgentStart` and `SubAgentEnd` for `Sub(n)` are routed into the
+parent's `ToolExecutionComponent`. Collapsible by default, expand
+with `Ctrl+O`.
 
 ### 4.2 Print mode
 
-Same `aj-next` binary, no TUI. Subscribes to the same bus and writes a
-plain-text rendering to stdout. With `--json`, dumps each event as a
-JSONL line. This is the same code that lets us script the agent or
-embed it in a parent process.
+Same `aj-next` binary, no TUI. Subscribes to the same bus, writes
+plain text to stdout. With `--json`, dumps each event as a JSONL
+line. Same code path lets us script the agent or embed it in a
+parent process.
 
 ---
 
@@ -543,37 +652,88 @@ embed it in a parent process.
 1. Verify `aj-next` reaches behavioral parity for the daily flow:
    `aj` (no args), `aj continue [id]`, `aj list-threads`, replay,
    sub-agents, model switching.
-2. Rename the binary `aj-next` → `aj`. Delete the `aj` crate.
+2. Rename the binary `aj-next` → `aj`. Delete the old `aj` crate.
 3. Drop `rustyline`, `termimad`, `console` from the workspace.
 4. Remove `AjCli`, `AjCliCommon`, `cli_sub_agent`, `prompt_history`
-   (the latter ports its history-bootstrap logic into `aj-next`'s
-   editor wiring).
+   (port history bootstrap into `aj-next`'s editor wiring).
 5. Update `README.md` and `AGENTS.md` to point at `aj-next` paths.
+
+`aj-session` survives the cutover unchanged.
 
 ---
 
 ## 6. Decisions in effect
 
-- **Crate rename**: `aj-ui` is deleted. Contract types (events, tool
-  trait, tool outcome, usage) move to `aj-agent`. Tool implementations
-  in `aj-tools` start depending on `aj-agent`.
-- **Permission system**: dropped entirely. No `before_tool_call` hook,
-  no confirm dialog, no permission channel. A tool that wants to
-  refuse returns `is_error: true`.
-- **Event bus delivery**: per-subscriber unbounded `mpsc`. Each
-  subscriber gets its own receiver; the bus prunes closed senders on
-  emit. Back-pressure is handled inside each listener (the TUI's
-  render throttle coalesces frames).
-- **Tool-update streaming**: `emit_update` lands in §2.2 with only
-  `bash` actually using it; the other 10 tools return a single final
-  `ToolOutcome`. Cumulative snapshots, not deltas.
-- **Log-format migration**: serde rename + one-shot walker that
-  rewrites old logs in `~/.aj/threads/` to the new shape. Add a
-  schema_version header only if the rename alone proves insufficient
-  once we look at real on-disk files in §2.0.
-- **User-facing notices**: agent-side notices become
-  `AgentEvent::Notice` / `Warning` events. The TUI renders them as
-  small banner components; the legacy CLI bridge prints them via
-  `display_notice` / `display_warning`.
-- **Sub-agents**: share the parent's event bus. Events carry
-  `AgentId::Sub(n)`. Listeners group nested transcripts by id.
+- **Crate split:** `aj-ui` deleted; contract types live in
+  `aj-agent`; persistence in `aj-session`; `aj-models` is wire-only
+  (per `models-spec.md`).
+- **No persistence dependency in `aj-agent`:** `Agent::prompt`
+  takes no log argument. The binary registers a listener via
+  `agent.subscribe(...)`.
+- **Single subscription mechanism:** `subscribe(listener)` with
+  awaited async listeners in registration order. A listener
+  returning `Err` fails the run. Channel-based subscribers are
+  built on top via `subscribe_channel`. Persistence is just one
+  listener — its inline-and-fail semantics give us the same
+  "at-most one event behind reality" guarantee today's code has.
+- **Hooks now (single-slot, `Option<Box<...>>`):** `set_after_tool_call`.
+  Reserved for later: `set_before_tool_call`, `set_should_stop_after_turn`.
+- **Permissions:** dropped. Tools return `is_error: true` to refuse.
+- **Tool execution:** parallel by default; per-tool opt-out
+  (`Sequential` for `bash`, `write_file`, `edit_file`,
+  `edit_file_multi`). A batch with any sequential tool runs serially.
+- **Tool-update streaming:** `ctx.emit_update` lands in §2.2 with
+  only `bash` actually using it; cumulative snapshots, not deltas;
+  ~100ms leading-edge debounce; bounded buffers with temp-file
+  spillover for unbounded output.
+- **Persistence policy:** the persistence listener writes only
+  terminal events: user messages, finalized assistant messages,
+  tool-result messages with their `ToolDetails`, frozen system
+  prompt. Streaming `MessageUpdate` and `ToolExecutionUpdate`
+  events flow on the bus but never hit disk. UI listeners see all
+  events.
+- **Log-format migration:** owned by `aj-session`. Three-way split
+  of old `UserOutput` (tool details / transient / per-message
+  usage), one-shot walker, `.bak` per file. One-way; no downgrade.
+- **Sub-agents:** share the parent's bus tagged with `AgentId::Sub(n)`.
+  Cancellation is hierarchical via `child_token()`. Persistence
+  listener writes them under `ThreadKind::Subagent` framing in the
+  same JSONL file.
+- **Steering and follow-up queues:** default `"one-at-a-time"`
+  drain mode; `"all"` available via `AgentOptions`.
+  `QueueUpdate` events carry full snapshots.
+- **Continuation:** `Agent::continue_run()` resumes from the
+  current transcript when the last message is a user or tool-result
+  message. Used after recoverable errors or aborts to retry without
+  re-injecting a prompt.
+
+---
+
+## 7. Deferred capabilities
+
+Capabilities we deliberately skip in v1, listed so their absence is
+intentional rather than accidental:
+
+- **`shouldStopAfterTurn` hook.** "Stop after this turn, e.g.
+  before the context window fills up." API shape reserved as
+  `Agent::set_should_stop_after_turn`.
+- **`beforeToolCall` hook.** Pre-execute gating (permission /
+  policy). API shape reserved as `Agent::set_before_tool_call`.
+- **`transformContext` / `convertToLlm` hooks.** Host-supplied
+  rewrites of the `AgentMessage[]` → `Message[]` projection. We
+  bake the projection into the agent (matches our single binary).
+  If context-window-aware truncation lands later it can become a
+  hook.
+- **Per-call `getApiKey` resolver.** Resolving the provider key
+  per inference so OAuth tokens can refresh during long tool
+  executions. Today our model handle holds the key. Worth wiring
+  through `aj-models`' auth layer once the OAuth flows from
+  `models-spec.md` §9 land.
+- **Session forking (`fork(entry_id)`).** Branching a thread at an
+  entry. `aj-session`'s on-disk format already keys entries by
+  `EntryId` and tracks `parent_id`, so nothing here precludes
+  forking later.
+- **Extension framework.** A plugin surface that lets third parties
+  inject tools and event handlers. Out of scope; the closed
+  `ToolDetails` enum is the explicit constraint that motivates
+  this.
