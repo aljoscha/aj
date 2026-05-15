@@ -17,7 +17,6 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-anthropic-sdk = "0.1.5"
 anyhow = "1.0"
 async-stream = "0.3.6"
 async-trait = "0.1"

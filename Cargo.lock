@@ -120,7 +120,6 @@ version = "0.1.0"
 dependencies = [
  "aj-agent",
  "aj-models",
- "anthropic-sdk",
  "anyhow",
  "chrono",
  "futures",
@@ -233,16 +232,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "dotenv",
  "eventsource-stream",
  "futures",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

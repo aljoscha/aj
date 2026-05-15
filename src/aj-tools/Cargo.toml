@@ -16,7 +16,6 @@ name = "ls"
 path = "src/bin/ls.rs"
 
 [dependencies]
-anthropic-sdk = { path = "../anthropic-sdk/" }
 aj-agent = { path = "../aj-agent/" }
 aj-models = { path = "../aj-models/" }
 
