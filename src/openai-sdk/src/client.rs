@@ -6,12 +6,12 @@ use futures::{Stream, StreamExt};
 use reqwest::{Client as ReqwestClient, StatusCode};
 use thiserror::Error;
 
+use crate::types::chat_completions::{
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+};
+use crate::types::common::{ApiError, ApiErrorResponse};
 use crate::types::responses::{
     CreateResponseRequest, Response as ResponsesResponse, ResponseStreamEvent,
-};
-use crate::types::{
-    ApiError, ApiErrorResponse, CreateChatCompletionRequest, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse,
 };
 
 const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
