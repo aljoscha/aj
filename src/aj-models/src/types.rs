@@ -346,6 +346,16 @@ pub enum CacheRetention {
     Long,
 }
 
+/// Inference speed mode. Maps onto Anthropic's `fast-mode-2026-02-01`
+/// beta header today; other providers ignore it. Set on the binary's
+/// `--speed` flag or `speed = "fast"` in `config.toml`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Speed {
+    Standard,
+    Fast,
+}
+
 /// Service tier override for OpenAI Responses requests. Ignored by
 /// non-Responses providers. See `docs/models-spec.md` §7.3 for cost
 /// multipliers.
