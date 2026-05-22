@@ -564,8 +564,10 @@ impl InteractiveMode {
                                         Arc::clone(&agent),
                                         Arc::clone(&model_catalog),
                                         Arc::clone(&current_model_key),
-                                        Arc::clone(&log),
-                                        conversation_persistence.clone(),
+                                        &mut log,
+                                        &mut persistence_handle,
+                                        &mut pump,
+                                        &conversation_persistence,
                                         &theme,
                                         &trimmed,
                                     ).await {
@@ -857,8 +859,10 @@ async fn handle_slash_command(
     agent: Arc<TokioMutex<Agent>>,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
-    log: Arc<TokioMutex<ConversationLog>>,
-    conversation_persistence: ConversationPersistence,
+    log: &mut Arc<TokioMutex<ConversationLog>>,
+    persistence_handle: &mut SubscriptionHandle,
+    pump: &mut EventPump,
+    conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
     text: &str,
 ) -> SlashHandled {
@@ -996,6 +1000,30 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
+        SlashAction::Clear => match perform_clear_thread(
+            tui,
+            Arc::clone(&agent),
+            log,
+            persistence_handle,
+            pump,
+            conversation_persistence,
+            theme,
+        )
+        .await
+        {
+            Ok(thread_id) => SlashHandled::Continue {
+                selector: None,
+                notice: Some(format!("Started a fresh thread ({thread_id}).")),
+            },
+            Err(err) => SlashHandled::Continue {
+                selector: None,
+                notice: Some(format!("Failed to start a fresh thread: {err}")),
+            },
+        },
+        SlashAction::Help => SlashHandled::Continue {
+            selector: None,
+            notice: Some(format_help_notice()),
+        },
         SlashAction::NotYetImplemented { message, .. } => SlashHandled::Continue {
             selector: None,
             notice: Some(message.to_string()),
@@ -1314,6 +1342,109 @@ async fn perform_thread_swap(
     Ok(())
 }
 
+/// Start a fresh thread.
+///
+/// Symmetric to [`perform_thread_swap`] but creates instead of
+/// resuming: mint a new [`ConversationLog`], freeze a fresh
+/// system prompt onto it, swap it into the shared `log` slot,
+/// rebind the persistence subscription, clear the chat, and
+/// refresh the header. The previous thread is preserved on disk
+/// untouched.
+///
+/// Returns the new thread id on success so the caller can surface
+/// it in a status notice.
+async fn perform_clear_thread(
+    tui: &mut Tui,
+    agent: Arc<TokioMutex<Agent>>,
+    log: &mut Arc<TokioMutex<ConversationLog>>,
+    persistence_handle: &mut SubscriptionHandle,
+    pump: &mut EventPump,
+    conversation_persistence: &ConversationPersistence,
+    theme: &ThemeHandle,
+) -> Result<String> {
+    // 1. Mint a new log on disk.
+    let mut new_log = ConversationLog::create(conversation_persistence)
+        .context("failed to create a fresh conversation log")?;
+    let new_thread_id = new_log.thread_id().to_string();
+
+    // 2. Assemble a system prompt from the agent's env and freeze
+    //    it onto the new log so a future resume picks it up.
+    let prompt = {
+        let a = agent.lock().await;
+        a.assemble_system_prompt()
+    };
+    new_log
+        .set_system_prompt(prompt.clone())
+        .context("failed to persist system prompt on new thread")?;
+
+    // 3. Reset the agent's in-memory state: empty transcript, the
+    //    freshly-assembled system prompt, sub-agent counter back
+    //    to zero (no persisted subtrees on this new log).
+    {
+        let mut a = agent.lock().await;
+        a.seed_messages(Vec::new());
+        a.set_assembled_system_prompt(prompt);
+        a.seed_sub_agent_counter(0);
+    }
+
+    // 4. Swap the shared log and persistence handle. Same ordering
+    //    rule as [`perform_thread_swap`]: build the new subscription
+    //    before dropping the old one so a stray bus event can't
+    //    arrive without a listener. The editor's `disable_submit`
+    //    flag means we can't be mid-turn here, but the ordering
+    //    keeps the invariant honest.
+    let new_log_arc = Arc::new(TokioMutex::new(new_log));
+    let new_handle = {
+        let a = agent.lock().await;
+        a.subscribe(persistence_listener(Arc::clone(&new_log_arc)))
+    };
+    *persistence_handle = new_handle;
+    *log = new_log_arc;
+
+    // 5. Clear the chat container and rebuild the event pump so any
+    //    in-flight assistant/tool-execution components don't leak
+    //    into the fresh thread. Carry `hide_thinking_block` across
+    //    so a prior `Ctrl+T` toggle stays in effect.
+    if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
+        chat.clear();
+    }
+    let hide_thinking_block = pump.hide_thinking_block();
+    *pump = EventPump::new(chat_theme(theme), hide_thinking_block);
+
+    // 6. Refresh the header with the new thread id and a friendly
+    //    notice so the user sees the swap in the top bar.
+    if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
+        header.set_thread_id(Some(new_thread_id.clone()));
+        header.set_notice(Some("Fresh thread".to_string()));
+    }
+
+    tui.request_render();
+    Ok(new_thread_id)
+}
+
+/// Build the `/help` notice body listing every entry in
+/// [`BUILTIN_COMMANDS`].
+///
+/// Format: one line per command as `/<name> <argument_hint?> —
+/// <description>`. Lines are joined with `\n`; the chat renderer
+/// surfaces the result as a multi-line dim block.
+fn format_help_notice() -> String {
+    use crate::config::slash_commands::BUILTIN_COMMANDS;
+
+    let mut out = String::from("Available slash commands:");
+    for cmd in BUILTIN_COMMANDS {
+        out.push_str("\n  /");
+        out.push_str(cmd.name);
+        if let Some(hint) = cmd.argument_hint {
+            out.push(' ');
+            out.push_str(hint);
+        }
+        out.push_str(" \u{2014} ");
+        out.push_str(cmd.description);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1437,6 +1568,27 @@ mod tests {
                 assert_eq!(text, SANDBOX_WARNING);
             }
             other => panic!("expected Warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_help_notice_lists_every_builtin_command() {
+        use crate::config::slash_commands::BUILTIN_COMMANDS;
+
+        let notice = format_help_notice();
+        assert!(notice.starts_with("Available slash commands:"));
+        for cmd in BUILTIN_COMMANDS {
+            let needle = format!("/{}", cmd.name);
+            assert!(
+                notice.contains(&needle),
+                "help notice missing /{}: {notice:?}",
+                cmd.name,
+            );
+            assert!(
+                notice.contains(cmd.description),
+                "help notice missing description for /{}: {notice:?}",
+                cmd.name,
+            );
         }
     }
 }

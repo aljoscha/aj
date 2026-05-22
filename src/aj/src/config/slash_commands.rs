@@ -219,9 +219,18 @@ pub enum SlashAction {
     /// chosen thread, `Esc` cancels. `initial_query` pre-fills the
     /// search box so `/session fix bug` opens already filtered.
     OpenSessionSelector { initial_query: Option<String> },
+    /// Start a fresh thread. The current thread is preserved on
+    /// disk; the host creates a new [`ConversationLog`], swaps it
+    /// in, seeds the agent's transcript empty, and clears the
+    /// scrollback.
+    Clear,
+    /// Show the slash-command reference. The host renders a
+    /// multi-line notice listing every entry in [`BUILTIN_COMMANDS`].
+    Help,
     /// User typed a recognised command whose UI lives in a
-    /// follow-up commit. The host renders the embedded message as
-    /// a notice and clears the editor.
+    /// follow-up commit. No builtin command maps here today; the
+    /// variant is preserved so future deferred commands can land
+    /// without re-introducing the type.
     NotYetImplemented {
         command: &'static str,
         message: &'static str,
@@ -282,14 +291,8 @@ pub fn dispatch(input: &str) -> SlashAction {
                 Some(rest.to_string())
             },
         },
-        "clear" => SlashAction::NotYetImplemented {
-            command: "clear",
-            message: "/clear: not yet implemented; restart `aj` to begin a fresh thread.",
-        },
-        "help" => SlashAction::NotYetImplemented {
-            command: "help",
-            message: "/help: try /thinking. Other commands land in follow-up commits.",
-        },
+        "clear" => SlashAction::Clear,
+        "help" => SlashAction::Help,
         "quit" => SlashAction::Quit,
         _ => SlashAction::Unknown {
             input: raw.to_string(),
@@ -441,15 +444,19 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_deferred_commands_return_not_yet_implemented() {
-        for (input, expected_command) in [("/clear", "clear"), ("/help", "help")] {
-            match dispatch(input) {
-                SlashAction::NotYetImplemented { command, .. } => {
-                    assert_eq!(command, expected_command);
-                }
-                other => panic!("expected NotYetImplemented for {input}, got {other:?}"),
-            }
-        }
+    fn dispatch_clear_returns_clear_action() {
+        assert_eq!(dispatch("/clear"), SlashAction::Clear);
+        // Trailing whitespace and arguments are ignored — `/clear`
+        // takes no arguments and any trailing tokens are dropped.
+        assert_eq!(dispatch("  /clear  "), SlashAction::Clear);
+        assert_eq!(dispatch("/clear extra"), SlashAction::Clear);
+    }
+
+    #[test]
+    fn dispatch_help_returns_help_action() {
+        assert_eq!(dispatch("/help"), SlashAction::Help);
+        assert_eq!(dispatch("  /help  "), SlashAction::Help);
+        assert_eq!(dispatch("/help thinking"), SlashAction::Help);
     }
 
     #[test]
