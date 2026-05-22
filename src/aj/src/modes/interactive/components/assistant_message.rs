@@ -50,11 +50,19 @@ const PADDING_Y: usize = 0;
 /// components.
 const PADDING_X: usize = 1;
 
-/// Placeholder line shown in collapsed thinking mode. A single
-/// italic line in the `thinkingText` palette colour stands in for
-/// the entire streamed reasoning prose so users who don't want
-/// the verbose reasoning above every answer can still see at a
-/// glance that the model thought before responding.
+/// Placeholder line shown in place of the full thinking widget.
+/// A single italic line in the `thinkingText` palette colour stands
+/// in for the streamed reasoning prose. Used in two cases:
+///
+/// * Collapsed mode (`hide_thinking_block = true`) — users who
+///   don't want the verbose reasoning above every answer can still
+///   see at a glance that the model thought before responding.
+/// * Body-less thinking blocks — extended-thinking models routinely
+///   emit a signed-but-empty thinking block ahead of tool-use
+///   turns, and some provider thinking-output configurations
+///   withhold the transcript entirely. In both cases the agent
+///   *did* think; we surface the placeholder so the turn doesn't
+///   silently look like it skipped the reasoning channel.
 const HIDDEN_THINKING_LABEL: &str = "Thinking…";
 
 /// Inline prefix prepended to the expanded thinking widget's body
@@ -239,13 +247,26 @@ impl AssistantMessageComponent {
         }
     }
 
-    /// Whether the component has any visible content yet. The
-    /// event pump uses this to decide whether to drop a freshly-
-    /// created assistant container that turned out to carry only
-    /// tool calls — those have no text or thinking blocks of their
-    /// own and would render as a blank gap in the chat scrollback.
+    /// Whether the component has any visible content yet.
+    ///
+    /// A *thinking* block always counts as content, even with an
+    /// empty body, because the renderer surfaces a `Thinking…`
+    /// placeholder for it (extended-thinking models routinely emit
+    /// signed-but-empty thinking blocks ahead of tool-use turns,
+    /// and we want to acknowledge that the model thought rather
+    /// than silently swallow the channel). A *text* block only
+    /// counts once it has bytes, so an aborted Text Start doesn't
+    /// keep an otherwise-empty assistant slot alive.
+    ///
+    /// The event pump consults this on `MessageEnd` to decide
+    /// whether to synthesize blocks from the finalized payload
+    /// (replay path): when live streaming has already produced any
+    /// content, the synthesis is skipped to avoid duplicating it.
     pub fn is_empty(&self) -> bool {
-        self.blocks.iter().all(|b| b.body.is_empty())
+        self.blocks.iter().all(|b| match b.kind {
+            BlockKind::Thinking => false,
+            BlockKind::Text => b.body.is_empty(),
+        })
     }
 
     /// (Re)build the markdown widget for the most recently
@@ -275,8 +296,12 @@ impl AssistantMessageComponent {
         thinking_text: &Arc<dyn Fn(&str) -> String>,
         hide_thinking_block: bool,
     ) {
-        let collapsed = matches!(block.kind, BlockKind::Thinking) && hide_thinking_block;
-        if block.body.is_empty() || collapsed {
+        // Thinking blocks render through the placeholder path when
+        // collapsed *or* when the body is empty (signed-but-empty
+        // thinking from the provider); no markdown widget needed.
+        let placeholder = matches!(block.kind, BlockKind::Thinking)
+            && (hide_thinking_block || block.body.is_empty());
+        if block.body.is_empty() || placeholder {
             block.widget = None;
             return;
         }
@@ -285,8 +310,14 @@ impl AssistantMessageComponent {
             // stage rather than mutating `body` so the buffer stays
             // a clean transcript of what the model sent — `is_empty()`
             // and the collapsed-mode placeholder logic both want the
-            // unadorned form.
-            BlockKind::Thinking => format!("{EXPANDED_THINKING_PREFIX}{}", block.body),
+            // unadorned form. Strip leading whitespace from the body
+            // before concatenating: Anthropic's summarized thinking
+            // stream tends to start with a leading space, which
+            // would otherwise render as `Thinking:  foo` (double
+            // space) against our prefix's single trailing space.
+            BlockKind::Thinking => {
+                format!("{EXPANDED_THINKING_PREFIX}{}", block.body.trim_start())
+            }
             BlockKind::Text => block.body.clone(),
         };
         let style = match block.kind {
@@ -336,7 +367,13 @@ impl Component for AssistantMessageComponent {
         // `self.blocks` mutably below.
         let collapsed_thinking = self.render_collapsed_thinking(width);
         for block in self.blocks.iter_mut() {
-            if block.body.is_empty() {
+            // A thinking block always renders *something* (the
+            // placeholder, if collapsed or body-less); text blocks
+            // are skipped when empty so an aborted/empty Text Start
+            // doesn't leave a stray blank row.
+            let render_placeholder = matches!(block.kind, BlockKind::Thinking)
+                && (self.hide_thinking_block || block.body.is_empty());
+            if block.body.is_empty() && !render_placeholder {
                 continue;
             }
             // Separate consecutive blocks with a single blank row.
@@ -347,15 +384,10 @@ impl Component for AssistantMessageComponent {
             if !lines.is_empty() {
                 lines.push(String::new());
             }
-            match block.kind {
-                BlockKind::Thinking if self.hide_thinking_block => {
-                    lines.extend(collapsed_thinking.iter().cloned());
-                }
-                _ => {
-                    if let Some(w) = block.widget.as_mut() {
-                        lines.extend(w.render(width));
-                    }
-                }
+            if render_placeholder {
+                lines.extend(collapsed_thinking.iter().cloned());
+            } else if let Some(w) = block.widget.as_mut() {
+                lines.extend(w.render(width));
             }
         }
         lines
@@ -387,6 +419,42 @@ mod tests {
 
     fn theme() -> ChatTheme {
         chat_theme(&ThemeHandle::new(Theme::bundled_dark()))
+    }
+
+    #[test]
+    fn empty_thinking_block_renders_placeholder_in_expanded_mode() {
+        // Extended-thinking models routinely emit a signed-but-empty
+        // thinking block ahead of tool-use turns. Even in expanded
+        // mode (no `hide_thinking_block`) we surface the placeholder
+        // so the user can see the model did engage the reasoning
+        // channel; otherwise the empty block silently vanishes.
+        let mut c = AssistantMessageComponent::new(&theme(), false);
+        c.open_block(BlockKind::Thinking, String::new());
+        c.close_block(BlockKind::Thinking, None);
+        // `is_empty()` treats any thinking block as content so the
+        // replay-synthesis guard in `handle_message_end` won't try
+        // to re-populate from the finalized payload.
+        assert!(!c.is_empty());
+        let lines = c.render(80);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].contains(HIDDEN_THINKING_LABEL));
+    }
+
+    #[test]
+    fn empty_thinking_then_text_renders_placeholder_blank_and_text() {
+        // The common Anthropic shape on extended-thinking tool-use
+        // turns: an empty thinking block followed by the user-facing
+        // text. The placeholder, the intra-message blank separator,
+        // and the text body should all be present.
+        let mut c = AssistantMessageComponent::new(&theme(), false);
+        c.open_block(BlockKind::Thinking, String::new());
+        c.close_block(BlockKind::Thinking, None);
+        c.open_block(BlockKind::Text, "Hello!".to_string());
+        let lines = c.render(80);
+        assert!(lines.len() >= 3, "got {lines:?}");
+        assert!(lines[0].contains(HIDDEN_THINKING_LABEL));
+        assert!(lines[1].trim().is_empty(), "expected blank separator");
+        assert!(lines[2..].iter().any(|l| l.contains("Hello!")));
     }
 
     #[test]
@@ -498,6 +566,31 @@ mod tests {
             joined.contains("the model's reasoning here"),
             "expected the thinking body to still be rendered alongside the prefix; got {lines:?}"
         );
+    }
+
+    #[test]
+    fn expanded_thinking_strips_leading_whitespace_against_prefix() {
+        // Anthropic's summarized thinking stream commonly starts
+        // with a leading space; the prefix already ends in one, so
+        // a naive concatenation would render `Thinking:  foo` with
+        // a double space. The renderer trims leading whitespace
+        // from the body before concatenating; the buffer itself
+        // stays untouched so the on-disk transcript is faithful.
+        let mut c = AssistantMessageComponent::new(&theme(), false);
+        c.open_block(BlockKind::Thinking, " leading space".to_string());
+        let lines = c.render(80);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Thinking: leading space"),
+            "expected single space between prefix and body; got {lines:?}"
+        );
+        assert!(
+            !joined.contains("Thinking:  "),
+            "expected no double space after prefix; got {lines:?}"
+        );
+        // Buffer remains the unadorned (untrimmed) form so it's a
+        // clean transcript of what the model sent.
+        assert_eq!(c.blocks[0].body, " leading space");
     }
 
     #[test]
