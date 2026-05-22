@@ -8,6 +8,7 @@
 // readline loop, log management, and history display.
 pub mod bus;
 pub mod events;
+pub mod hooks;
 pub mod message;
 mod projection;
 pub mod tool;
@@ -114,6 +115,20 @@ pub struct Agent {
     /// resumes it on startup, and seeds the transcript via
     /// [`Agent::seed_messages`] before the first turn.
     transcript: Vec<MessageParam>,
+    /// Optional hook fired before every tool call. Set via
+    /// [`Agent::set_before_tool_call`]; `None` means "skip the
+    /// hook" — the tool's own `execute` runs unconditionally with
+    /// the model-supplied arguments.
+    before_tool_call: Option<hooks::BeforeToolCallHook>,
+    /// Optional hook fired after every tool call returns. Set via
+    /// [`Agent::set_after_tool_call`]; can rewrite the outcome's
+    /// `content`, `details`, or `is_error` before the bus event
+    /// and the wire projection fire.
+    after_tool_call: Option<hooks::AfterToolCallHook>,
+    /// Optional hook consulted after every assistant turn finishes
+    /// its tool batch. Set via [`Agent::set_should_stop_after_turn`];
+    /// returning `true` ends the turn without a follow-up inference.
+    should_stop_after_turn: Option<hooks::ShouldStopAfterTurnHook>,
 }
 
 impl Agent {
@@ -184,6 +199,9 @@ impl Agent {
             bus: EventBus::new(),
             cancellation: CancellationToken::new(),
             transcript: Vec::new(),
+            before_tool_call: None,
+            after_tool_call: None,
+            should_stop_after_turn: None,
         }
     }
 
@@ -303,6 +321,36 @@ impl Agent {
     /// sub-agent subtrees already persisted in the log.
     pub fn seed_sub_agent_counter(&mut self, value: usize) {
         self.session_state.seed_sub_agent_counter(value);
+    }
+
+    /// Install a hook fired before every tool call, replacing any
+    /// previous hook. Passing the closure inside `Some(...)` enables
+    /// the hook; passing `None` clears it. See
+    /// [`hooks::BeforeToolCallHook`] for the contract and
+    /// [`hooks::BeforeToolCallOutcome`] for the supported decisions
+    /// (proceed with mutated args, or short-circuit the call with a
+    /// pre-baked outcome).
+    pub fn set_before_tool_call(&mut self, hook: Option<hooks::BeforeToolCallHook>) {
+        self.before_tool_call = hook;
+    }
+
+    /// Install a hook fired after every tool call returns, replacing
+    /// any previous hook. The hook may mutate the [`ToolOutcome`] in
+    /// place before [`crate::events::AgentEvent::ToolExecutionEnd`]
+    /// fires and the wire `tool_result` block is built. See
+    /// [`hooks::AfterToolCallHook`] for the contract; typical use is
+    /// redaction, auto-truncation, or rewriting `is_error`.
+    pub fn set_after_tool_call(&mut self, hook: Option<hooks::AfterToolCallHook>) {
+        self.after_tool_call = hook;
+    }
+
+    /// Install a hook consulted after each assistant turn completes
+    /// its tool batch, replacing any previous hook. Returning `true`
+    /// short-circuits the turn — the agent emits no follow-up
+    /// inference and returns control to the caller. Use case:
+    /// context-window guards, per-turn budget enforcement.
+    pub fn set_should_stop_after_turn(&mut self, hook: Option<hooks::ShouldStopAfterTurnHook>) {
+        self.should_stop_after_turn = hook;
     }
 
     /// Provide the freshly-assembled (or persisted) system prompt
@@ -900,7 +948,32 @@ impl Agent {
                         .await
                         .map_err(TurnError::Fatal)?;
 
-                    // Run the tool. Success and recoverable error
+                    // Consult the before-tool-call hook (if installed).
+                    // The hook can rewrite `tool_input` or short-circuit
+                    // the call with a pre-baked outcome (permission
+                    // denial, policy block). We clone the `Arc` here so
+                    // the borrow doesn't conflict with the `&mut self`
+                    // `execute_tool` call below; closures are cheap to
+                    // clone since they ride behind `Arc`.
+                    let before_hook = self.before_tool_call.clone();
+                    let (tool_input, short_circuit_outcome) = match before_hook {
+                        Some(hook) => {
+                            let ctx = hooks::ToolCallContext {
+                                call_id: &tool_id,
+                                tool_name: &tool_name,
+                            };
+                            match hook(ctx, tool_input.clone()).await {
+                                hooks::BeforeToolCallOutcome::Proceed { args } => (args, None),
+                                hooks::BeforeToolCallOutcome::ShortCircuit { outcome } => {
+                                    (tool_input, Some(outcome))
+                                }
+                            }
+                        }
+                        None => (tool_input, None),
+                    };
+
+                    // Run the tool unless the before-hook short-
+                    // circuited it. Success and recoverable error
                     // both come back as a [`ToolOutcome`] the rest
                     // of the loop projects onto the wire
                     // `tool_result` block (text-flattened `content`)
@@ -917,37 +990,55 @@ impl Agent {
                     // mirrors the legacy on-disk shape regardless of
                     // whether the failure was a wire parse error or
                     // a per-tool validation rejection.
-                    let outcome = match self
-                        .execute_tool(&tool_id, &tool_name, tool_input.clone())
-                        .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(err) => {
-                            self.bus
-                                .emit(AgentEvent::MessagePersisted {
-                                    agent_id: self.agent_id,
-                                    kind: PersistedMessageKind::UserOutput {
-                                        output: UserOutput::ToolError {
-                                            tool_name: tool_name.clone(),
-                                            input: tool_input.to_string(),
-                                            error: err.to_string(),
+                    let mut outcome = if let Some(outcome) = short_circuit_outcome {
+                        outcome
+                    } else {
+                        match self
+                            .execute_tool(&tool_id, &tool_name, tool_input.clone())
+                            .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                self.bus
+                                    .emit(AgentEvent::MessagePersisted {
+                                        agent_id: self.agent_id,
+                                        kind: PersistedMessageKind::UserOutput {
+                                            output: UserOutput::ToolError {
+                                                tool_name: tool_name.clone(),
+                                                input: tool_input.to_string(),
+                                                error: err.to_string(),
+                                            },
                                         },
-                                    },
-                                })
-                                .await
-                                .map_err(TurnError::Fatal)?;
+                                    })
+                                    .await
+                                    .map_err(TurnError::Fatal)?;
 
-                            let body = err.to_string();
-                            ToolOutcome {
-                                content: vec![UserContent::text(format!("{err}"))],
-                                details: ToolDetails::Text {
-                                    summary: format!("{tool_name}: error"),
-                                    body,
-                                },
-                                is_error: true,
+                                let body = err.to_string();
+                                ToolOutcome {
+                                    content: vec![UserContent::text(format!("{err}"))],
+                                    details: ToolDetails::Text {
+                                        summary: format!("{tool_name}: error"),
+                                        body,
+                                    },
+                                    is_error: true,
+                                }
                             }
                         }
                     };
+
+                    // Consult the after-tool-call hook (if installed).
+                    // The hook can rewrite `outcome.content`,
+                    // `outcome.details`, or `outcome.is_error` before
+                    // the bus event and the wire projection fire.
+                    // Same `Arc` clone dance as the before-hook so the
+                    // `&mut outcome` borrow stays clean.
+                    if let Some(hook) = self.after_tool_call.clone() {
+                        let ctx = hooks::ToolCallContext {
+                            call_id: &tool_id,
+                            tool_name: &tool_name,
+                        };
+                        hook(ctx, &mut outcome).await;
+                    }
 
                     // Project the structured `content` onto the
                     // legacy text-only `ToolResultContent::Text`
@@ -1009,6 +1100,17 @@ impl Agent {
                         })
                         .await
                         .map_err(TurnError::Fatal)?;
+                }
+
+                // Consult the should-stop-after-turn hook (if
+                // installed). Returning `true` ends the turn here
+                // with no follow-up inference, even though tool
+                // calls completed successfully. Typical use:
+                // context-window guards, per-turn budget caps.
+                if let Some(hook) = self.should_stop_after_turn.clone() {
+                    if hook().await {
+                        break;
+                    }
                 }
 
                 // Continue the conversation loop to get the model's
@@ -2256,5 +2358,250 @@ mod event_protocol_tests {
             },
         ]));
         assert!(super::scan_dangling_tool_uses(&transcript_with_resolution).is_empty());
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_hook_can_mutate_tool_input() {
+        // The hook flips the tool's input from `{}` to `{"flag": true}`;
+        // a tool that records its input in its outcome body proves the
+        // mutated args reached `execute`.
+        use std::sync::Arc;
+
+        use crate::hooks::{BeforeToolCallHook, BeforeToolCallOutcome, ToolCallContext};
+
+        #[derive(Clone)]
+        struct EchoTool;
+
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct EchoInput {
+            #[serde(default)]
+            flag: bool,
+        }
+
+        impl ToolDefinition for EchoTool {
+            type Input = EchoInput;
+            fn name(&self) -> &'static str {
+                "echo"
+            }
+            fn description(&self) -> &'static str {
+                "Test tool that echoes its flag input"
+            }
+            async fn execute(
+                &self,
+                _ctx: &mut dyn ToolContext,
+                input: EchoInput,
+            ) -> anyhow::Result<ToolOutcome> {
+                Ok(ToolOutcome {
+                    content: vec![aj_models::types::UserContent::text(format!(
+                        "flag={}",
+                        input.flag
+                    ))],
+                    details: ToolDetails::Text {
+                        summary: "echo".to_string(),
+                        body: format!("flag={}", input.flag),
+                    },
+                    is_error: false,
+                })
+            }
+        }
+
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "echo")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![EchoTool.into()]);
+
+        let hook: BeforeToolCallHook = Arc::new(|_ctx: ToolCallContext, _args| {
+            Box::pin(async move {
+                BeforeToolCallOutcome::Proceed {
+                    args: serde_json::json!({ "flag": true }),
+                }
+            })
+        });
+        agent.set_before_tool_call(Some(hook));
+
+        // Capture every `ToolExecutionEnd` so we can assert the
+        // mutated args reached the tool's execute body.
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies_clone = bodies.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::ToolExecutionEnd {
+                result: ToolDetails::Text { body, .. },
+                ..
+            } = event
+            {
+                bodies_clone.lock().unwrap().push(body.clone());
+            }
+        }));
+
+        agent
+            .run_single_turn("run echo".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let recorded = bodies.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["flag=true"],
+            "before-tool hook should have flipped the flag on the tool's input",
+        );
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_hook_can_short_circuit() {
+        // The hook returns `ShortCircuit` so the tool's `execute`
+        // never runs; the synthesized outcome flows through the rest
+        // of the loop normally.
+        use std::sync::Arc;
+
+        use crate::hooks::{BeforeToolCallHook, BeforeToolCallOutcome, ToolCallContext};
+
+        #[derive(Clone)]
+        struct ShouldNotRunTool;
+
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct EmptyInput {}
+
+        impl ToolDefinition for ShouldNotRunTool {
+            type Input = EmptyInput;
+            fn name(&self) -> &'static str {
+                "denied"
+            }
+            fn description(&self) -> &'static str {
+                "Tool the before-hook is expected to deny"
+            }
+            async fn execute(
+                &self,
+                _ctx: &mut dyn ToolContext,
+                _input: EmptyInput,
+            ) -> anyhow::Result<ToolOutcome> {
+                panic!("execute should not run when the before-hook short-circuits");
+            }
+        }
+
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "denied")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![ShouldNotRunTool.into()]);
+
+        let hook: BeforeToolCallHook = Arc::new(|_ctx: ToolCallContext, _args| {
+            Box::pin(async move {
+                BeforeToolCallOutcome::ShortCircuit {
+                    outcome: ToolOutcome {
+                        content: vec![aj_models::types::UserContent::text("blocked".to_string())],
+                        details: ToolDetails::Text {
+                            summary: "denied: blocked by policy".to_string(),
+                            body: "blocked".to_string(),
+                        },
+                        is_error: true,
+                    },
+                }
+            })
+        });
+        agent.set_before_tool_call(Some(hook));
+
+        let outcomes: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let outcomes_clone = outcomes.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::ToolExecutionEnd {
+                result: ToolDetails::Text { summary, .. },
+                is_error,
+                ..
+            } = event
+            {
+                outcomes_clone
+                    .lock()
+                    .unwrap()
+                    .push((summary.clone(), *is_error));
+            }
+        }));
+
+        agent
+            .run_single_turn("attempt denied".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let recorded = outcomes.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![("denied: blocked by policy".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn after_tool_call_hook_can_rewrite_outcome() {
+        // The hook flips `is_error` from `false` to `true` and
+        // rewrites the body — the ping tool would have returned a
+        // success outcome, but the after-hook overrides it.
+        use std::sync::Arc;
+
+        use crate::hooks::{AfterToolCallHook, ToolCallContext};
+
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "ping")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![PingTool.into()]);
+
+        let hook: AfterToolCallHook = Arc::new(|_ctx: ToolCallContext, outcome| {
+            Box::pin(async move {
+                outcome.is_error = true;
+                if let ToolDetails::Text { body, .. } = &mut outcome.details {
+                    *body = "[redacted]".to_string();
+                }
+            })
+        });
+        agent.set_after_tool_call(Some(hook));
+
+        let outcomes: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let outcomes_clone = outcomes.clone();
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::ToolExecutionEnd {
+                result: ToolDetails::Text { body, .. },
+                is_error,
+                ..
+            } = event
+            {
+                outcomes_clone
+                    .lock()
+                    .unwrap()
+                    .push((body.clone(), *is_error));
+            }
+        }));
+
+        agent
+            .run_single_turn("run ping".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let recorded = outcomes.lock().unwrap().clone();
+        assert_eq!(recorded, vec![("[redacted]".to_string(), true)]);
+    }
+
+    #[tokio::test]
+    async fn should_stop_after_turn_hook_ends_turn_before_next_inference() {
+        // The hook returns `true` so the agent breaks out of the
+        // turn loop after the first tool batch — no second
+        // inference is run, and the strict-mode scripted provider
+        // would panic if a second inference were attempted.
+        use std::sync::Arc;
+
+        use crate::hooks::ShouldStopAfterTurnHook;
+
+        // Only one script: the tool_use. If the hook fails to
+        // short-circuit, the loop would call `stream_simple` a
+        // second time and the strict-mode provider panics.
+        let scripts = vec![finalize_script(finalize_tool_use("tu-1", "ping"))];
+        let mut agent = build_agent(scripts, vec![PingTool.into()]);
+
+        let hook: ShouldStopAfterTurnHook = Arc::new(|| Box::pin(async { true }));
+        agent.set_should_stop_after_turn(Some(hook));
+
+        // Sanity check: the run completes without panicking.
+        agent
+            .run_single_turn("run ping".to_string())
+            .await
+            .expect("run_single_turn");
     }
 }
