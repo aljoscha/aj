@@ -448,7 +448,7 @@ impl Agent {
     /// session.
     ///
     /// Used by the interactive `/thinking` selector to retune the
-    /// reasoning budget without restarting the session. Takes
+    /// thinking effort without restarting the session. Takes
     /// effect on the next inference; in-flight turns continue with
     /// whatever they were already configured for.
     pub fn set_default_thinking(&mut self, level: Option<ThinkingConfig>) {
@@ -1086,7 +1086,7 @@ impl Agent {
     fn run_inference_streaming(&self) -> AssistantMessageEventStream {
         let thinking = self.determine_thinking();
 
-        tracing::debug!(?thinking, "thinking budget");
+        tracing::debug!(?thinking, "thinking effort");
 
         let system_prompt = self
             .assembled_system_prompt
@@ -1531,7 +1531,7 @@ impl From<anyhow::Error> for TurnError {
 ///
 /// `ThinkingConfig::Max` collapses onto `ThinkingLevel::XHigh`
 /// because the unified protocol caps at XHigh — providers that
-/// support a higher reasoning budget than XHigh treat the
+/// support a higher thinking effort than XHigh treat the
 /// "Max" rung as a synonym for XHigh.
 fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
     match level {

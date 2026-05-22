@@ -941,7 +941,7 @@ async fn handle_slash_command(
             let name = thinking_level_name(&level);
             SlashHandled::Continue {
                 selector: None,
-                notice: Some(format!("Thinking level set to {name}.")),
+                notice: Some(format!("Thinking effort set to {name}.")),
             }
         }
         SlashAction::OpenModelSelector { initial_query } => {
@@ -1130,7 +1130,7 @@ async fn handle_selector_outcome(
                     refresh_footer_model(tui, &model_id, &level);
                     let name = thinking_level_name(&level);
                     SelectorPollOutcome::Closed {
-                        notice: Some(format!("Thinking level set to {name}.")),
+                        notice: Some(format!("Thinking effort set to {name}.")),
                     }
                 }
                 Some(ThinkingSelectorOutcome::Cancelled) => {

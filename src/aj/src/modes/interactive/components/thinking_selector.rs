@@ -1,9 +1,9 @@
-//! Thinking-budget selector overlay (`/thinking`).
+//! Thinking-effort selector overlay (`/thinking`).
 //!
 //! Wraps an [`aj_tui::components::select_list::SelectList`] with a
 //! shared-state outcome handle so the host can poll the result
 //! after each input event. The overlay renders a one-line title
-//! row above the list ("Thinking budget") and the list itself,
+//! row above the list ("Thinking effort") and the list itself,
 //! with the current level pre-selected so `Enter` re-applies the
 //! same setting (a no-op confirm).
 //!
@@ -96,7 +96,7 @@ impl ThinkingSelectorComponent {
         Self {
             inner,
             outcome,
-            title: "Thinking budget — Enter to apply, Esc to cancel".to_string(),
+            title: "Thinking effort — Enter to apply, Esc to cancel".to_string(),
         }
     }
 

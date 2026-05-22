@@ -49,7 +49,7 @@ pub struct BuiltinCommand {
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "thinking",
-        description: "Set the default reasoning budget (off / low / medium / high / xhigh / max).",
+        description: "Set the default thinking effort (off / low / medium / high / xhigh / max).",
         argument_hint: Some("[level]"),
     },
     BuiltinCommand {
@@ -203,7 +203,7 @@ fn thinking_argument_completions(partial: &str) -> Vec<AutocompleteItem> {
 /// user sees a clear "soon, not silently dropped" message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashAction {
-    /// Open the thinking-budget selector overlay. The current
+    /// Open the thinking-effort selector overlay. The current
     /// level is highlighted; `Esc` cancels, `Enter` applies.
     OpenThinkingSelector,
     /// Apply the supplied thinking level inline (no overlay) and
@@ -342,27 +342,27 @@ pub const THINKING_LEVELS: &[ThinkingLevel] = &[
     },
     ThinkingLevel {
         name: "low",
-        description: "Light reasoning budget",
+        description: "Light thinking effort",
         config: Some(ThinkingConfig::Low),
     },
     ThinkingLevel {
         name: "medium",
-        description: "Moderate reasoning budget",
+        description: "Moderate thinking effort",
         config: Some(ThinkingConfig::Medium),
     },
     ThinkingLevel {
         name: "high",
-        description: "Deep reasoning budget",
+        description: "Deep thinking effort",
         config: Some(ThinkingConfig::High),
     },
     ThinkingLevel {
         name: "xhigh",
-        description: "Extended-deep reasoning budget",
+        description: "Extended-deep thinking effort",
         config: Some(ThinkingConfig::XHigh),
     },
     ThinkingLevel {
         name: "max",
-        description: "Maximum reasoning budget",
+        description: "Maximum thinking effort",
         config: Some(ThinkingConfig::Max),
     },
 ];

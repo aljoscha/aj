@@ -16,7 +16,7 @@
 //! by the wire layer. It carries the materialized [`AgentMessage`]
 //! entries (filtered through a [`ThreadFilter`]) plus a small set of
 //! helpers (`last_message`, `messages`, etc.) the binary uses to
-//! decide thinking budgets and resume state.
+//! decide thinking efforts and resume state.
 
 use aj_agent::message::AgentMessage;
 use aj_models::types::Message;
