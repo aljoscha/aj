@@ -97,7 +97,7 @@ impl EventPump {
     }
 
     /// Current thinking-block render mode. Exposed so the host's
-    /// `Ctrl+T` handler can flip the state without first reading
+    /// `aj.thinking.toggle` handler can flip the state without first reading
     /// it back through a separate getter.
     pub fn hide_thinking_block(&self) -> bool {
         self.hide_thinking_block

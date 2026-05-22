@@ -130,7 +130,7 @@ pub struct AssistantMessageComponent {
     /// Whether to render the thinking channel as a single
     /// `Thinking…` placeholder line (collapsed mode) instead of
     /// the full italic markdown widget. Flipped at runtime by the
-    /// `Ctrl+T` keybinding via
+    /// `aj.thinking.toggle` keybinding via
     /// [`Self::set_hide_thinking_block`]; see
     /// `docs/aj-next-plan.md` §4.4.
     hide_thinking_block: bool,
@@ -145,7 +145,7 @@ impl AssistantMessageComponent {
     /// arrives. `hide_thinking_block` carries the session-wide
     /// preference at the moment of construction — the host may
     /// flip it later via [`Self::set_hide_thinking_block`] in
-    /// response to the `Ctrl+T` toggle.
+    /// response to the `aj.thinking.toggle` toggle.
     pub fn new(chat_theme: &ChatTheme, hide_thinking_block: bool) -> Self {
         Self {
             markdown_theme: chat_theme.markdown.clone(),
@@ -221,7 +221,7 @@ impl AssistantMessageComponent {
     /// Swap the thinking-block render mode for this message.
     ///
     /// The event pump walks every assistant message in the chat
-    /// container on a `Ctrl+T` toggle and calls this; the next
+    /// container on a `aj.thinking.toggle` toggle and calls this; the next
     /// render then shows the new mode for both finalized and
     /// in-flight messages. A no-op when the mode hasn't actually
     /// changed so we don't tear down a streaming markdown widget
@@ -347,12 +347,25 @@ impl AssistantMessageComponent {
     /// horizontally padded to match the markdown widget's
     /// `PADDING_X = 1` so the gutter is visually consistent
     /// regardless of mode.
+    ///
+    /// When the `aj.thinking.toggle` action has a configured key the
+    /// label is suffixed with `" (<key> to expand)"` so users can
+    /// discover the toggle without remembering the keybinding. The
+    /// hint is omitted if the action is unbound.
     fn render_collapsed_thinking(&self, width: usize) -> Vec<String> {
         if width <= PADDING_X {
             return Vec::new();
         }
         let gutter = " ".repeat(PADDING_X);
-        let styled = (self.thinking_text)(&aj_tui::style::italic(HIDDEN_THINKING_LABEL));
+        let label = {
+            let kb = aj_tui::keybindings::get();
+            let keys = kb.get_keys(crate::config::keybindings::ACTION_THINKING_TOGGLE);
+            match keys.first() {
+                Some(key) => format!("{HIDDEN_THINKING_LABEL} ({key} to expand)"),
+                None => HIDDEN_THINKING_LABEL.to_string(),
+            }
+        };
+        let styled = (self.thinking_text)(&aj_tui::style::italic(&label));
         vec![format!("{gutter}{styled}")]
     }
 }

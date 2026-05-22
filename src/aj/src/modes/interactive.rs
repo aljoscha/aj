@@ -102,6 +102,12 @@ impl InteractiveMode {
             Config::default()
         });
 
+        // Install the `tui.*` + `aj.*` keybindings registry before any
+        // component looks up a key. Currently no user overrides are
+        // loaded from `config.toml`; defaults supply `alt+t` for
+        // `aj.thinking.toggle`, etc.
+        crate::config::keybindings::install_global_manager_defaults();
+
         let speed = match self.args.speed.as_deref() {
             Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
             None => config.speed,
@@ -494,24 +500,28 @@ impl InteractiveMode {
                             if input.is_ctrl('c') || input.is_ctrl('d') {
                                 break;
                             }
-                            // Ctrl+T toggles the thinking-block
-                            // render mode for the session.
-                            // Intercepted before `tui.handle_input`
-                            // so the editor never sees the keystroke
-                            // — it isn't bound there, but the early
-                            // intercept also avoids a stray render
-                            // pass on the editor side. See
-                            // `docs/aj-next-plan.md` §4.4.
-                            if input.is_ctrl('t') {
-                                let new_value = !pump.hide_thinking_block();
-                                pump.set_hide_thinking_block(&mut tui, new_value);
-                                let notice = if new_value {
-                                    "Thinking blocks: hidden"
-                                } else {
-                                    "Thinking blocks: visible"
-                                };
-                                pump.handle(&mut tui, &notice_event(notice));
-                                continue;
+                            // Toggle the thinking-block render mode for
+                            // the session. Bound via `aj.thinking.toggle`
+                            // (default `alt+t`); intercepted before
+                            // `tui.handle_input` so the editor never sees
+                            // the keystroke. See `docs/aj-next-plan.md` §4.4.
+                            {
+                                let kb = aj_tui::keybindings::get();
+                                if kb.matches(
+                                    &input,
+                                    crate::config::keybindings::ACTION_THINKING_TOGGLE,
+                                ) {
+                                    drop(kb);
+                                    let new_value = !pump.hide_thinking_block();
+                                    pump.set_hide_thinking_block(&mut tui, new_value);
+                                    let notice = if new_value {
+                                        "Thinking blocks: hidden"
+                                    } else {
+                                        "Thinking blocks: visible"
+                                    };
+                                    pump.handle(&mut tui, &notice_event(notice));
+                                    continue;
+                                }
                             }
                             tui.handle_input(&input);
 
@@ -1323,7 +1333,7 @@ async fn perform_thread_swap(
     //    through a fresh event pump so the user sees the swapped
     //    transcript in the scrollback. Carry the current
     //    `hide_thinking_block` mode across the swap so a
-    //    `Ctrl+T` toggle the user pressed before the swap is
+    //    `aj.thinking.toggle` toggle the user pressed before the swap is
     //    still in effect afterwards.
     if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
         chat.clear();
@@ -1410,7 +1420,7 @@ async fn perform_clear_thread(
     // 5. Clear the chat container and rebuild the event pump so any
     //    in-flight assistant/tool-execution components don't leak
     //    into the fresh thread. Carry `hide_thinking_block` across
-    //    so a prior `Ctrl+T` toggle stays in effect.
+    //    so a prior `aj.thinking.toggle` toggle stays in effect.
     if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
         chat.clear();
     }
