@@ -517,12 +517,9 @@ impl InteractiveMode {
                                     drop(kb);
                                     let new_value = !pump.hide_thinking_block();
                                     pump.set_hide_thinking_block(&mut tui, new_value);
-                                    let notice = if new_value {
-                                        "Thinking blocks: hidden"
-                                    } else {
-                                        "Thinking blocks: visible"
-                                    };
-                                    pump.handle(&mut tui, &notice_event(notice));
+                                    // Don't post a "hidden/visible"
+                                    // notice — the transcript above
+                                    // already shows the new state.
                                     continue;
                                 }
                             }

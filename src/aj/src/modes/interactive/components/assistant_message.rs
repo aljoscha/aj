@@ -348,22 +348,27 @@ impl AssistantMessageComponent {
     /// `PADDING_X = 1` so the gutter is visually consistent
     /// regardless of mode.
     ///
-    /// When the `aj.thinking.toggle` action has a configured key the
-    /// label is suffixed with `" (<key> to expand)"` so users can
-    /// discover the toggle without remembering the keybinding. The
-    /// hint is omitted if the action is unbound.
-    fn render_collapsed_thinking(&self, width: usize) -> Vec<String> {
+    /// When `show_expand_hint` is set and the `aj.thinking.toggle`
+    /// action has a configured key, the label is suffixed with
+    /// `" (<key> to expand)"` so users can discover the toggle
+    /// without remembering the keybinding. The hint is omitted
+    /// when there's no body to expand (signed-but-empty thinking
+    /// blocks, or providers configured to omit the transcript) —
+    /// otherwise we'd advertise a toggle that reveals nothing.
+    fn render_collapsed_thinking(&self, width: usize, show_expand_hint: bool) -> Vec<String> {
         if width <= PADDING_X {
             return Vec::new();
         }
         let gutter = " ".repeat(PADDING_X);
-        let label = {
+        let label = if show_expand_hint {
             let kb = aj_tui::keybindings::get();
             let keys = kb.get_keys(crate::config::keybindings::ACTION_THINKING_TOGGLE);
             match keys.first() {
                 Some(key) => format!("{HIDDEN_THINKING_LABEL} ({key} to expand)"),
                 None => HIDDEN_THINKING_LABEL.to_string(),
             }
+        } else {
+            HIDDEN_THINKING_LABEL.to_string()
         };
         let styled = (self.thinking_text)(&aj_tui::style::italic(&label));
         vec![format!("{gutter}{styled}")]
@@ -375,10 +380,15 @@ impl Component for AssistantMessageComponent {
 
     fn render(&mut self, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
-        // Pre-compute the collapsed-thinking placeholder once so
-        // we don't need to re-borrow `self` while iterating
-        // `self.blocks` mutably below.
-        let collapsed_thinking = self.render_collapsed_thinking(width);
+        // Pre-compute both placeholder variants once so we don't
+        // need to re-borrow `self` while iterating `self.blocks`
+        // mutably below. The `with_hint` variant is used when the
+        // block has a body that an `alt+t` press would reveal;
+        // `without_hint` covers body-less thinking (extended
+        // thinking with the transcript omitted) where there's
+        // nothing to expand.
+        let collapsed_with_hint = self.render_collapsed_thinking(width, true);
+        let collapsed_without_hint = self.render_collapsed_thinking(width, false);
         for block in self.blocks.iter_mut() {
             // A thinking block always renders *something* (the
             // placeholder, if collapsed or body-less); text blocks
@@ -398,7 +408,17 @@ impl Component for AssistantMessageComponent {
                 lines.push(String::new());
             }
             if render_placeholder {
-                lines.extend(collapsed_thinking.iter().cloned());
+                // Body-less thinking blocks (signed-but-empty, or
+                // providers that omit the transcript entirely) have
+                // nothing to reveal — skip the "(<key> to expand)"
+                // hint in that case so we don't promise a toggle
+                // that produces no new content.
+                let placeholder = if block.body.is_empty() {
+                    &collapsed_without_hint
+                } else {
+                    &collapsed_with_hint
+                };
+                lines.extend(placeholder.iter().cloned());
             } else if let Some(w) = block.widget.as_mut() {
                 lines.extend(w.render(width));
             }
@@ -451,6 +471,33 @@ mod tests {
         let lines = c.render(80);
         assert_eq!(lines.len(), 1, "got {lines:?}");
         assert!(lines[0].contains(HIDDEN_THINKING_LABEL));
+        // Body-less thinking has nothing to reveal, so the "expand"
+        // hint must not be advertised — otherwise the user presses
+        // `alt+t` and gets the same empty placeholder back, just
+        // without the hint.
+        assert!(
+            !lines[0].contains("to expand"),
+            "body-less placeholder should not advertise expand hint; got {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn collapsed_thinking_with_body_advertises_expand_hint() {
+        // When the user folds a non-empty thinking block, the
+        // placeholder should mention the configured key so they can
+        // discover how to unfold it again.
+        crate::config::keybindings::install_global_manager_defaults();
+        let mut c = AssistantMessageComponent::new(&theme(), true);
+        c.open_block(BlockKind::Thinking, "first thought".to_string());
+        c.close_block(BlockKind::Thinking, None);
+        let lines = c.render(80);
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(
+            lines[0].contains("alt+t") && lines[0].contains("to expand"),
+            "expected expand hint mentioning the key; got {:?}",
+            lines[0]
+        );
     }
 
     #[test]
