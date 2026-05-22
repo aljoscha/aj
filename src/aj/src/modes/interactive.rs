@@ -369,7 +369,10 @@ impl InteractiveMode {
         }
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
             let info = agent.model_info();
-            footer.set_model(Some(format!("{} @ {}", info.id, info.base_url)));
+            footer.set_model(Some(format_footer_model(
+                &info.id,
+                &agent.default_thinking(),
+            )));
             footer.set_cwd(Some(format!("{}", agent.env().working_directory.display())));
         }
 
@@ -866,6 +869,27 @@ fn apply_editor_border_for_thinking(
     }
 }
 
+/// Format the footer's model field as `"<model-id> @ <thinking-effort>"`.
+///
+/// The thinking effort (e.g. `"off"`, `"medium"`, `"max"`) is more
+/// useful to surface persistently than the base URL — the URL is
+/// stable per provider, while the effort changes per session.
+fn format_footer_model(model_id: &str, thinking: &Option<aj_models::ThinkingConfig>) -> String {
+    format!("{} @ {}", model_id, thinking_level_name(thinking))
+}
+
+/// Refresh the footer's model line so it reflects the agent's current
+/// `(model id, thinking effort)`. No-op if the footer slot is missing.
+fn refresh_footer_model(
+    tui: &mut Tui,
+    model_id: &str,
+    thinking: &Option<aj_models::ThinkingConfig>,
+) {
+    if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
+        footer.set_model(Some(format_footer_model(model_id, thinking)));
+    }
+}
+
 /// Dispatch a freshly-submitted slash-prefixed line.
 #[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
@@ -907,6 +931,13 @@ async fn handle_slash_command(
             // Mirror the change onto the editor's border tint so
             // the visual cue tracks the active reasoning mode.
             apply_editor_border_for_thinking(tui, theme, level.as_ref());
+            // Footer surfaces the active thinking effort; refresh it
+            // so the change is visible without waiting for a turn.
+            let model_id = {
+                let a = agent.lock().await;
+                a.model_info().id.clone()
+            };
+            refresh_footer_model(tui, &model_id, &level);
             let name = thinking_level_name(&level);
             SlashHandled::Continue {
                 selector: None,
@@ -1089,6 +1120,14 @@ async fn handle_selector_outcome(
                     // tint so the visual cue tracks the active
                     // reasoning mode.
                     apply_editor_border_for_thinking(tui, theme, level.as_ref());
+                    // Footer surfaces the active thinking effort;
+                    // refresh it so the change is visible without
+                    // waiting for a turn.
+                    let model_id = {
+                        let a = agent.lock().await;
+                        a.model_info().id.clone()
+                    };
+                    refresh_footer_model(tui, &model_id, &level);
                     let name = thinking_level_name(&level);
                     SelectorPollOutcome::Closed {
                         notice: Some(format!("Thinking level set to {name}.")),
@@ -1120,7 +1159,6 @@ async fn handle_selector_outcome(
                             stream_options,
                         }) => {
                             let new_id = model_info.id.clone();
-                            let new_url = model_info.base_url.clone();
                             {
                                 let mut a = agent.lock().await;
                                 a.set_provider(
@@ -1141,11 +1179,14 @@ async fn handle_selector_outcome(
                             // Refresh the footer's model line so
                             // the user has visual confirmation of
                             // the swap without waiting for the next
-                            // turn boundary.
-                            if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx())
-                            {
-                                footer.set_model(Some(format!("{} @ {}", new_id, new_url)));
-                            }
+                            // turn boundary. Thinking effort is
+                            // preserved across the swap; read it
+                            // back from the agent for the format.
+                            let current_thinking = {
+                                let a = agent.lock().await;
+                                a.default_thinking()
+                            };
+                            refresh_footer_model(tui, &new_id, &current_thinking);
                             SelectorPollOutcome::Closed {
                                 notice: Some(format!(
                                     "Model set to {} ({}/{}).",
