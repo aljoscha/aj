@@ -326,28 +326,76 @@ impl EventPump {
         self.push_chat_child(tui, Box::new(component));
     }
 
-    /// Handle [`AgentEvent::MessageStart`] for a freshly-opened
-    /// message. The assistant case opens an in-flight
-    /// [`AssistantMessageComponent`] slot so subsequent
-    /// `MessageUpdate` events can paint into it; user / tool-result
-    /// messages are no-ops on Start (the matching `MessageEnd`
-    /// carries the authoritative payload).
-    fn handle_message_start(&mut self, tui: &mut Tui, message: &AgentMessage) {
-        if let AgentMessageKind::Wire(Message::Assistant(_)) = &message.kind {
-            // Reserve the assistant slot up front so the first
-            // `MessageUpdate` doesn't have to materialise it. This
-            // mirrors the legacy `StreamChunk(Text, Start)` shape
-            // where the first event opens the component with an
-            // empty buffer.
-            self.ensure_assistant_message(tui);
-        }
-    }
+    /// Handle [`AgentEvent::MessageStart`].
+    ///
+    /// All variants are no-ops on the TUI surface:
+    ///
+    /// * User / tool-result: the authoritative payload lands on
+    ///   the matching [`AgentEvent::MessageEnd`], which is where
+    ///   the rendering happens.
+    /// * Assistant: the [`AssistantMessageComponent`] slot is
+    ///   materialised lazily — by the first painting
+    ///   `MessageUpdate` (`TextStart` / `ThinkingStart`) on the
+    ///   live path, or by [`Self::handle_message_end`] on the
+    ///   replay path (which emits `MessageStart` + `MessageEnd`
+    ///   with no `MessageUpdate` in between).
+    ///
+    /// Earlier versions of this method pre-created the assistant
+    /// component here so the first `MessageUpdate` didn't have to
+    /// materialise it. That left an orphan empty component in the
+    /// chat container on tool-use-only turns (the model called a
+    /// tool without emitting any text / thinking first): the
+    /// component rendered zero lines, but the leading
+    /// [`Spacer`] inserted by [`Self::push_chat_child`] stuck
+    /// around and doubled up with the next chat row's leading
+    /// spacer, producing two visible blank rows where one was
+    /// intended. Deferring creation to the first event that
+    /// actually paints into the component removes the orphan
+    /// without changing visible behaviour for turns that DO paint
+    /// into the slot.
+    ///
+    /// The function is retained (rather than collapsing the
+    /// dispatch arm to an inline no-op) so the design rationale
+    /// has somewhere to live and a future hook for Start-time
+    /// work has an obvious home. The `&mut self` / `&mut Tui`
+    /// signature is preserved for the same reason: future Start-
+    /// time work will almost certainly need both.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn handle_message_start(&mut self, _tui: &mut Tui, _message: &AgentMessage) {}
 
     /// Handle [`AgentEvent::MessageUpdate`] for an assistant
     /// streaming inference. Drives the in-flight
     /// [`AssistantMessageComponent`] off the embedded
     /// [`AssistantMessageEvent`].
     fn handle_message_update(&mut self, tui: &mut Tui, event: &AssistantMessageEvent) {
+        // Early-out for events that don't paint into the assistant
+        // component, BEFORE calling `ensure_assistant_message`:
+        //
+        // * `ToolCall{Start,Delta,End}` — tool calls render through
+        //   the dedicated `ToolExecutionStart` / `ToolExecutionEnd`
+        //   events, not through this component (the agent collects
+        //   them off the finalized `Done { message }` payload and
+        //   brackets them with their own events).
+        // * `Start` / `Done` / `Error` — agent-side lifecycle
+        //   markers; the matching `MessageStart` / `MessageEnd`
+        //   are the authoritative bookends.
+        //
+        // Returning here is what keeps tool-use-only turns from
+        // materialising an empty assistant slot whose leading
+        // auto-spacer would orphan into the next row's gap. See
+        // [`Self::handle_message_start`] for the full rationale.
+        if !matches!(
+            event,
+            AssistantMessageEvent::TextStart { .. }
+                | AssistantMessageEvent::TextDelta { .. }
+                | AssistantMessageEvent::TextEnd { .. }
+                | AssistantMessageEvent::ThinkingStart { .. }
+                | AssistantMessageEvent::ThinkingDelta { .. }
+                | AssistantMessageEvent::ThinkingEnd { .. }
+        ) {
+            return;
+        }
+
         let idx = self.ensure_assistant_message(tui);
         let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) else {
             return;
@@ -383,25 +431,15 @@ impl EventPump {
                 };
                 c.close_block(BlockKind::Thinking, payload);
             }
-            // The agent collects tool calls off the finalized
-            // `Done { message }` payload and brackets them with
-            // dedicated `ToolExecutionStart` / `ToolExecutionEnd`
-            // events; the streaming tool-call deltas don't drive
-            // a separate rendering target. Ignored here so the
-            // arm stays explicit for future tool-argument live
-            // echo.
+            // All non-painting variants returned early above.
             AssistantMessageEvent::ToolCallStart { .. }
             | AssistantMessageEvent::ToolCallDelta { .. }
-            | AssistantMessageEvent::ToolCallEnd { .. } => {}
-            // `Start` is the agent-side opening event; the
-            // assistant slot was already created by
-            // `handle_message_start`. `Done` / `Error` are
-            // terminal; the matching `MessageEnd` is where the
-            // finalized payload lands. Both are no-ops in this
-            // path.
-            AssistantMessageEvent::Start { .. }
+            | AssistantMessageEvent::ToolCallEnd { .. }
+            | AssistantMessageEvent::Start { .. }
             | AssistantMessageEvent::Done { .. }
-            | AssistantMessageEvent::Error { .. } => {}
+            | AssistantMessageEvent::Error { .. } => {
+                unreachable!("non-painting AssistantMessageEvent variants are filtered above")
+            }
         }
     }
 
@@ -416,44 +454,66 @@ impl EventPump {
                 self.append_user_message(tui, &u.content);
             }
             AgentMessageKind::Wire(Message::Assistant(a)) => {
-                // Live streaming already painted the content; the
-                // finalized event just unbinds the streaming target
-                // so the next turn starts fresh. On resume there's
-                // no prior streaming, so we need to render the
-                // assistant content here from scratch by emitting
-                // synthetic open/close pairs against the slot
-                // `MessageStart` reserved. Detect "fresh resume"
-                // by checking whether the slot is empty.
-                if let Some(idx) = self.current_assistant
-                    && let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx())
-                    && let Some(c) = chat.get_mut_as::<AssistantMessageComponent>(idx)
-                    && c.is_empty()
-                {
-                    // Replay path: synthesize the per-block open/
-                    // close pairs off the finalized content so the
-                    // component lands in the same shape live
-                    // streaming would have produced.
-                    for block in &a.content {
-                        match block {
-                            AssistantContent::Thinking(t) => {
-                                c.open_block(BlockKind::Thinking, String::new());
-                                c.close_block(
-                                    BlockKind::Thinking,
-                                    Some(if t.redacted {
-                                        format!("[Redacted thinking: {}]", t.thinking)
-                                    } else {
-                                        t.thinking.clone()
-                                    }),
-                                );
-                            }
-                            AssistantContent::Text(t) => {
-                                c.open_block(BlockKind::Text, String::new());
-                                c.close_block(BlockKind::Text, Some(t.text.clone()));
-                            }
-                            AssistantContent::ToolCall(_) => {
-                                // Tool calls surface as
-                                // ToolExecutionStart/End in
-                                // replay; nothing to render here.
+                // Two cases share this arm:
+                //
+                // 1. Live streaming has already painted the content
+                //    through `handle_message_update`; the finalized
+                //    event just unbinds the streaming target so the
+                //    next turn starts fresh.
+                //
+                // 2. Replay emits `MessageStart` + `MessageEnd` with
+                //    no `MessageUpdate` in between (see
+                //    `aj_session::replay`), so the slot was never
+                //    materialised by a painting event. We have to
+                //    create it here and synthesize per-block
+                //    open/close pairs from the finalized content so
+                //    the component lands in the same shape live
+                //    streaming would have produced.
+                //
+                // We only materialise the slot when the finalized
+                // payload carries at least one Text / Thinking
+                // block. Tool-use-only turns render entirely
+                // through the [`ToolExecutionComponent`]; creating
+                // an empty assistant slot for them would leave an
+                // orphan component whose leading auto-spacer
+                // doubles the gap to the next row (see
+                // [`Self::handle_message_start`] for the full
+                // rationale).
+                let has_renderable = a.content.iter().any(|b| {
+                    matches!(b, AssistantContent::Text(_) | AssistantContent::Thinking(_))
+                });
+                if has_renderable {
+                    let idx = self.ensure_assistant_message(tui);
+                    if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx())
+                        && let Some(c) = chat.get_mut_as::<AssistantMessageComponent>(idx)
+                        && c.is_empty()
+                    {
+                        // Replay synthesis. Live streaming has
+                        // already populated the blocks, so this
+                        // branch is a no-op when `c.is_empty()` is
+                        // false.
+                        for block in &a.content {
+                            match block {
+                                AssistantContent::Thinking(t) => {
+                                    c.open_block(BlockKind::Thinking, String::new());
+                                    c.close_block(
+                                        BlockKind::Thinking,
+                                        Some(if t.redacted {
+                                            format!("[Redacted thinking: {}]", t.thinking)
+                                        } else {
+                                            t.thinking.clone()
+                                        }),
+                                    );
+                                }
+                                AssistantContent::Text(t) => {
+                                    c.open_block(BlockKind::Text, String::new());
+                                    c.close_block(BlockKind::Text, Some(t.text.clone()));
+                                }
+                                AssistantContent::ToolCall(_) => {
+                                    // Tool calls surface as
+                                    // ToolExecutionStart/End in
+                                    // replay; nothing to render here.
+                                }
                             }
                         }
                     }
@@ -934,6 +994,127 @@ mod tests {
             tool_idx.is_some(),
             "expected a ToolExecutionComponent before the final \
              assistant message; got chat layout with {total} children",
+        );
+    }
+
+    #[test]
+    fn tool_use_only_turn_does_not_leave_an_empty_assistant_slot() {
+        // Regression: a turn where the model emitted only a
+        // `tool_use` block (no text, no thinking) used to leave
+        // an empty `AssistantMessageComponent` in the chat
+        // container. The component rendered zero lines but the
+        // leading auto-spacer that `push_chat_child` inserts
+        // before every new child stuck around and doubled up
+        // with the next sibling's leading spacer, producing two
+        // visible blank rows where one was intended.
+        //
+        // The lifecycle below mirrors what the agent actually
+        // emits for a tool-use-only turn: `MessageStart{Assistant}`
+        // → `ToolCallStart/Delta/End` `MessageUpdate`s →
+        // `MessageEnd{Assistant}` carrying a single `ToolCall`
+        // block → `ToolExecutionStart` → `ToolExecutionEnd`. None
+        // of those events should materialise an
+        // `AssistantMessageComponent`.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        pump.handle(&mut tui, &user_message_end_event("please run a tool"));
+        pump.handle(&mut tui, &assistant_message_start_event());
+
+        // Tool-call deltas; none of these paint into the assistant
+        // component, so the slot must NOT be materialised here.
+        pump.handle(
+            &mut tui,
+            &message_update_event(AssistantMessageEvent::ToolCallStart {
+                content_index: 0,
+                partial: empty_assistant_partial(),
+            }),
+        );
+        pump.handle(
+            &mut tui,
+            &message_update_event(AssistantMessageEvent::ToolCallDelta {
+                content_index: 0,
+                delta: "{\"cmd\":\"ls\"}".into(),
+                partial: empty_assistant_partial(),
+            }),
+        );
+        pump.handle(
+            &mut tui,
+            &message_update_event(AssistantMessageEvent::ToolCallEnd {
+                content_index: 0,
+                tool_call: aj_models::types::ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"cmd": "ls"}),
+                },
+                partial: empty_assistant_partial(),
+            }),
+        );
+
+        // `MessageEnd` carrying a tool-only assistant payload. The
+        // replay-synthesis branch must skip slot materialisation
+        // because there's no Text / Thinking content to paint.
+        let assistant_tool_only = aj_models::types::AssistantMessage {
+            content: vec![AssistantContent::ToolCall(aj_models::types::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"cmd": "ls"}),
+            })],
+            api: "scripted".into(),
+            provider: "scripted".into(),
+            model: "scripted".into(),
+            response_id: None,
+            usage: aj_models::types::Usage::default(),
+            stop_reason: aj_models::types::StopReason::ToolUse,
+            error: None,
+            timestamp: 0,
+        };
+        pump.handle(
+            &mut tui,
+            &AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::Assistant(assistant_tool_only)),
+            },
+        );
+
+        // Tool runs.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: "call-1".into(),
+                tool: "bash".into(),
+                args: serde_json::json!({"cmd": "ls"}),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "call-1".into(),
+                tool: "bash".into(),
+                result: aj_agent::tool::ToolDetails::Text {
+                    summary: "bash".into(),
+                    body: "ok".into(),
+                },
+                is_error: false,
+            },
+        );
+
+        // No `AssistantMessageComponent` anywhere in the chat
+        // container — the regression would put an empty one
+        // between the user message and the tool execution.
+        let chat = tui
+            .get_mut_as::<Container>(SlotIndex::Chat.idx())
+            .expect("chat slot");
+        let assistant_count = (0..chat.len())
+            .filter(|&i| chat.get_mut_as::<AssistantMessageComponent>(i).is_some())
+            .count();
+        assert_eq!(
+            assistant_count,
+            0,
+            "tool-use-only turn must not leave an AssistantMessageComponent in chat; \
+             chat has {} children",
+            chat.len(),
         );
     }
 
