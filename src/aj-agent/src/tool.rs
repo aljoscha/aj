@@ -60,7 +60,7 @@ impl Default for ExecutionMode {
 ///
 /// `ToolDetails` is intentionally a closed enum with one variant per
 /// **rendering shape**, not per tool. Multiple tools may map onto the
-/// same variant (e.g. `read_file`, `ls`, `glob`, `grep` all render as
+/// same variant (e.g. `read_file` and `agent` both render as
 /// [`ToolDetails::Text`]). The closed shape makes persistence cheap
 /// (round-trips through JSONL without per-tool deserialization) and
 /// keeps event listeners decoupled from concrete tool implementations.
@@ -72,8 +72,8 @@ impl Default for ExecutionMode {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolDetails {
     /// Default rendering: a one-line summary plus optional body.
-    /// Used by `read_file`, `ls`, `glob`, `grep`, plain `agent`
-    /// text replies, and anything without a dedicated variant.
+    /// Used by `read_file`, plain `agent` text replies, and anything
+    /// without a dedicated variant.
     Text {
         /// Short headline displayed in collapsed views.
         summary: String,

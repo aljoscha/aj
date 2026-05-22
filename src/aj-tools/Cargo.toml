@@ -3,28 +3,12 @@ name = "aj-tools"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "glob"
-path = "src/bin/glob.rs"
-
-[[bin]]
-name = "grep"
-path = "src/bin/grep.rs"
-
-[[bin]]
-name = "ls"
-path = "src/bin/ls.rs"
-
 [dependencies]
 aj-agent = { path = "../aj-agent/" }
 aj-models = { path = "../aj-models/" }
 
 anyhow = { workspace = true }
-chrono = { workspace = true }
 futures = { workspace = true }
-globset = { workspace = true }
-grep = { workspace = true }
-ignore = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

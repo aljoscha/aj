@@ -24,9 +24,6 @@ pub use tools::agent::AgentTool;
 pub use tools::bash::BashTool;
 pub use tools::edit_file::EditFileTool;
 pub use tools::edit_file_multi::EditFileMultiTool;
-pub use tools::glob::GlobTool;
-pub use tools::grep::GrepTool;
-pub use tools::ls::LsTool;
 pub use tools::read_file::ReadFileTool;
 pub use tools::todo::{TodoReadTool, TodoWriteTool};
 pub use tools::write_file::WriteFileTool;
@@ -45,9 +42,6 @@ pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
         WriteFileTool.into(),
         EditFileTool.into(),
         EditFileMultiTool.into(),
-        LsTool.into(),
-        GlobTool.into(),
-        GrepTool.into(),
         TodoReadTool.into(),
         TodoWriteTool.into(),
     ]

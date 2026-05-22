@@ -61,8 +61,9 @@ working directory of the agent session.
 - Commands have a configurable timeout to prevent hanging (default: 30s).
 - Output is truncated to 35000 characters to prevent excessive output.
 - The command is passed to `bash -c`, so pipes, redirects, and shell features work.
-- IMPORTANT: Don't use search commands like find and grep. Instead use the grep and glob tools. Also don't use commands like cat and ls, instead use the read_file and ls tools.
-- If you absolutely must use a grep-like tool, use ripgrep (rg).
+- For file search, prefer `rg` (ripgrep) over `grep`/`find` — it's faster and
+  respects `.gitignore` by default. Use `read_file` for reading file contents
+  rather than `cat`.
 "#;
 
 /// Maximum bytes preserved per stream in the in-memory tail. Each of

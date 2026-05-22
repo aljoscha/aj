@@ -89,7 +89,7 @@ aj-models  ←  aj-agent  ←  aj-tools
   tool trait, and `ToolDetails` for structured tool rendering.
 - `aj-session` — on-disk thread format, `ConversationLog`, replay.
 - `aj-tools` — the builtin tool implementations
-  (`read_file`, `ls`, `glob`, `grep`, `bash`, `write_file`, `edit_file`,
+  (`read_file`, `bash`, `write_file`, `edit_file`,
   `edit_file_multi`, `agent`, `todo_read`, `todo_write`).
 - `aj-tui` — in-process text-UI framework (layout, components, theming).
 - `aj-conf` — `~/.aj/config.toml` loader and path helpers.

@@ -3,7 +3,8 @@ structure, implementing features, fixing bugs, and maintaining code quality.
 
 # Guidelines
 
-- Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)
+- For file exploration, use `bash` with ripgrep (`rg`) — it's fast and respects
+  `.gitignore` by default. Use `read_file` for reading file contents.
 - Don't use emoji, unless the user asks you to
 - Be concise but friendly
 
