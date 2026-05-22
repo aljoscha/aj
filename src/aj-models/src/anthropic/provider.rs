@@ -128,13 +128,10 @@ async fn run_stream_inner(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> Result<(), AssistantError> {
-    let api_key = options.api_key.clone().ok_or_else(|| {
+    let api_key = options.resolve_api_key().await.map_err(|err| {
         // Missing credentials before any HTTP call: surface as Auth so
         // callers and the agent's retry layer see the right category.
-        AssistantError::new(
-            ErrorCategory::Auth,
-            "anthropic provider requires StreamOptions.api_key",
-        )
+        AssistantError::new(ErrorCategory::Auth, format!("anthropic provider: {err}"))
     })?;
 
     let client = build_client(model, api_key, reasoning, options);

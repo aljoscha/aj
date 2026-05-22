@@ -421,6 +421,55 @@ impl std::fmt::Debug for OnPayload {
     }
 }
 
+/// Resolver for the provider API key.
+///
+/// Providers call [`StreamOptions::resolve_api_key`] before each
+/// streaming HTTP request to obtain the credential they should pass
+/// to the upstream API. The default resolver returns the static
+/// [`StreamOptions::api_key`] value; callers that need to refresh
+/// an OAuth token *between* inferences (e.g. a long-running tool
+/// outlived the access-token expiry) replace it via
+/// [`StreamOptions::set_api_key_resolver`] with a closure that
+/// reads from their auth store on every call.
+///
+/// The closure returns a boxed future so the resolver can perform
+/// asynchronous work (an HTTP refresh, a disk read with a file
+/// lock). Wrapped in an [`Arc`] so cloning the [`StreamOptions`]
+/// (the agent does this per inference) only bumps a refcount.
+#[derive(Clone)]
+pub struct ApiKeyResolver(
+    pub  Arc<
+        dyn Fn() -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+            > + Send
+            + Sync,
+    >,
+);
+
+impl ApiKeyResolver {
+    /// Wrap an async closure as an [`ApiKeyResolver`].
+    pub fn new<F, Fut>(f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        Self(Arc::new(move || Box::pin(f())))
+    }
+
+    /// Invoke the resolver. Returns the resolved key or an error
+    /// message the provider surfaces as an [`Auth`]-category
+    /// [`crate::errors::AssistantError`].
+    pub async fn call(&self) -> Result<String, String> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for ApiKeyResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyResolver").finish_non_exhaustive()
+    }
+}
+
 /// Options passed to any streaming call.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct StreamOptions {
@@ -428,8 +477,22 @@ pub struct StreamOptions {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Static API key. Used when [`StreamOptions::api_key_resolver`]
+    /// is `None`. Callers that want per-call resolution (OAuth
+    /// refresh, dynamic credential rotation) should install a
+    /// resolver via [`StreamOptions::set_api_key_resolver`] instead
+    /// of mutating this field. Providers go through
+    /// [`StreamOptions::resolve_api_key`] which prefers the resolver
+    /// over the static value when both are set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Per-call API key resolver. Skipped in serde — closures aren't
+    /// serializable, and persisting them across runs would be
+    /// meaningless. When set, providers call this on every inference
+    /// instead of reading [`StreamOptions::api_key`]; see
+    /// [`StreamOptions::resolve_api_key`].
+    #[serde(skip)]
+    pub api_key_resolver: Option<ApiKeyResolver>,
     /// Prompt cache retention preference.
     pub cache_retention: CacheRetention,
     /// Session ID for providers that support session-based caching.
@@ -468,6 +531,34 @@ pub struct SimpleStreamOptions {
     pub base: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ThinkingLevel>,
+}
+
+impl StreamOptions {
+    /// Install a per-call API key resolver. Replaces any previous
+    /// resolver; passing `None` clears it so providers fall back to
+    /// the static [`StreamOptions::api_key`] value on the next
+    /// inference. See [`ApiKeyResolver`] for the contract.
+    pub fn set_api_key_resolver(&mut self, resolver: Option<ApiKeyResolver>) {
+        self.api_key_resolver = resolver;
+    }
+
+    /// Resolve the API key the provider should use for this request.
+    ///
+    /// Order of preference:
+    /// 1. [`StreamOptions::api_key_resolver`] if set — invoked
+    ///    every call so OAuth refresh-on-demand works.
+    /// 2. [`StreamOptions::api_key`] if set — used as the static
+    ///    fallback.
+    /// 3. `Err` if neither is set; the provider surfaces this as an
+    ///    [`crate::errors::ErrorCategory::Auth`] failure.
+    pub async fn resolve_api_key(&self) -> Result<String, String> {
+        if let Some(resolver) = &self.api_key_resolver {
+            return resolver.call().await;
+        }
+        self.api_key
+            .clone()
+            .ok_or_else(|| "missing api_key and no api_key_resolver installed".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -851,5 +942,93 @@ mod tests {
         );
         assert!(ctx.messages.is_empty());
         assert!(ctx.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_api_key_prefers_resolver_when_set() {
+        let opts = StreamOptions {
+            api_key: Some("static-key".to_string()),
+            api_key_resolver: Some(ApiKeyResolver::new(|| async {
+                Ok("resolved-key".to_string())
+            })),
+            ..Default::default()
+        };
+        let resolved = opts.resolve_api_key().await.unwrap();
+        assert_eq!(resolved, "resolved-key");
+    }
+
+    #[tokio::test]
+    async fn resolve_api_key_falls_back_to_static_when_no_resolver() {
+        let opts = StreamOptions {
+            api_key: Some("static-key".to_string()),
+            ..Default::default()
+        };
+        let resolved = opts.resolve_api_key().await.unwrap();
+        assert_eq!(resolved, "static-key");
+    }
+
+    #[tokio::test]
+    async fn resolve_api_key_errors_when_neither_is_set() {
+        let opts = StreamOptions::default();
+        let err = opts.resolve_api_key().await.unwrap_err();
+        assert!(err.contains("missing api_key"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_api_key_surfaces_resolver_error_verbatim() {
+        let opts = StreamOptions {
+            api_key_resolver: Some(ApiKeyResolver::new(|| async {
+                Err("token refresh failed: 401".to_string())
+            })),
+            ..Default::default()
+        };
+        let err = opts.resolve_api_key().await.unwrap_err();
+        assert_eq!(err, "token refresh failed: 401");
+    }
+
+    #[tokio::test]
+    async fn api_key_resolver_is_invoked_per_call() {
+        // A resolver that increments a shared counter on every call
+        // proves the provider goes through the resolver on each
+        // inference rather than caching the first value.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let opts = StreamOptions {
+            api_key_resolver: Some(ApiKeyResolver::new(move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(format!("call-{n}"))
+                }
+            })),
+            ..Default::default()
+        };
+
+        let first = opts.resolve_api_key().await.unwrap();
+        let second = opts.resolve_api_key().await.unwrap();
+        let third = opts.resolve_api_key().await.unwrap();
+        assert_eq!(first, "call-1");
+        assert_eq!(second, "call-2");
+        assert_eq!(third, "call-3");
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn api_key_resolver_field_is_skipped_in_serde() {
+        let opts = StreamOptions {
+            api_key: Some("k".to_string()),
+            api_key_resolver: Some(ApiKeyResolver::new(|| async { Ok("ignored".into()) })),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        // The resolver field is skipped entirely; the static key
+        // survives so a serialized->deserialized round-trip keeps
+        // the auth path working off the static fallback.
+        assert!(!json.contains("api_key_resolver"));
+        let back: StreamOptions = serde_json::from_str(&json).unwrap();
+        assert!(back.api_key_resolver.is_none());
+        assert_eq!(back.api_key.as_deref(), Some("k"));
     }
 }

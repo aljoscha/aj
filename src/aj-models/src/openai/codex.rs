@@ -157,11 +157,13 @@ async fn run_stream_inner(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> Result<(), AssistantError> {
-    let access_token = options.api_key.clone().ok_or_else(|| {
+    let access_token = options.resolve_api_key().await.map_err(|err| {
         AssistantError::new(
             ErrorCategory::Auth,
-            "openai-codex-responses provider requires StreamOptions.api_key \
-             (set to the OAuth access token JWT)",
+            format!(
+                "openai-codex-responses provider: {err} \
+                 (set api_key or api_key_resolver to the OAuth access token JWT)"
+            ),
         )
     })?;
 

@@ -217,10 +217,10 @@ async fn run_stream_inner(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> Result<(), AssistantError> {
-    let api_key = options.api_key.clone().ok_or_else(|| {
+    let api_key = options.resolve_api_key().await.map_err(|err| {
         AssistantError::new(
             ErrorCategory::Auth,
-            "openai-responses provider requires StreamOptions.api_key",
+            format!("openai-responses provider: {err}"),
         )
     })?;
 
