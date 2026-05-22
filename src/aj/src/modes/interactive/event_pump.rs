@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind};
+use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::types::TokenUsage;
 use aj_models::streaming::AssistantMessageEvent;
@@ -214,24 +214,6 @@ impl EventPump {
             AgentEvent::MessageEnd { message, .. } => {
                 self.handle_message_end(tui, message);
             }
-
-            // ---- Persisted messages: bookkeeping only. ----
-            AgentEvent::MessagePersisted { kind, .. } => match kind {
-                PersistedMessageKind::User { .. }
-                | PersistedMessageKind::Assistant { .. }
-                | PersistedMessageKind::ToolResult { .. }
-                | PersistedMessageKind::UserOutput { .. } => {
-                    // The rendering pathway is the unified
-                    // `MessageStart` / `MessageEnd` pair (for user
-                    // and assistant turns) and `ToolExecutionEnd`
-                    // (for tool results); the persistence event is
-                    // for the persistence listener's eyes only.
-                    // Free-standing `UserOutput::ToolError` records
-                    // are surfaced as `ToolExecutionEnd { is_error:
-                    // true }` by the agent loop, so there's no
-                    // additional rendering to do here either.
-                }
-            },
 
             // ---- Tool execution: header + result. ----
             AgentEvent::ToolExecutionStart {
@@ -677,8 +659,7 @@ fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
     };
     let input_str = format_tokens(usage.accumulated_input, usage.turn_input);
     let output_str = format_tokens(usage.accumulated_output, usage.turn_output);
-    let cache_creation_str =
-        format_tokens(usage.accumulated_cache_creation, usage.turn_cache_creation);
+    let cache_creation_str = format_tokens(usage.accumulated_cache_write, usage.turn_cache_write);
     let cache_read_str = format_tokens(usage.accumulated_cache_read, usage.turn_cache_read);
     let body = format!(
         "Token Usage - Input: {input_str} | Output: {output_str} | Cache Creation: {cache_creation_str} | Cache Read: {cache_read_str}",
@@ -727,8 +708,8 @@ mod tests {
             turn_input: turn[0],
             accumulated_output: already[1] + turn[1],
             turn_output: turn[1],
-            accumulated_cache_creation: already[2] + turn[2],
-            turn_cache_creation: turn[2],
+            accumulated_cache_write: already[2] + turn[2],
+            turn_cache_write: turn[2],
             accumulated_cache_read: already[3] + turn[3],
             turn_cache_read: turn[3],
         }

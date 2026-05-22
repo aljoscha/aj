@@ -13,18 +13,16 @@
 //!
 //! See `docs/aj-next-plan.md` §1.1.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantMessage, ToolResultMessage};
-use aj_models::wire::ContentBlockParam;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::message::AgentMessage;
 use crate::tool::ToolDetails;
-use crate::types::{TokenUsage, UserOutput};
+use crate::types::TokenUsage;
 
 /// Identifier for the agent emitting an event.
 ///
@@ -44,59 +42,6 @@ pub enum AgentId {
     Main,
     /// A sub-agent identified by its assignment index.
     Sub(usize),
-}
-
-/// What the persistence listener should append to the log when it
-/// observes an [`AgentEvent::MessagePersisted`].
-///
-/// Each variant maps directly onto a single
-/// `aj_session::ConversationView` write the persistence listener
-/// performs in response. Carrying the payload on the event keeps
-/// the listener stateless (it doesn't need to know anything about
-/// turn structure — it just appends what it's told). Folds into
-/// the per-message [`AgentEvent::MessageEnd`] payload in §2.4 when
-/// the on-disk format switches to typed messages.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PersistedMessageKind {
-    /// Append a user-role message carrying typed user input — the
-    /// readline loop's prompt for the top-level agent, or a
-    /// sub-agent's spawning task. Maps onto
-    /// `aj_session::ConversationView::add_user_message`.
-    User { content: Vec<ContentBlockParam> },
-    /// Append an assistant message with the given content blocks.
-    /// Maps onto `aj_session::ConversationView::add_assistant_message`.
-    Assistant { content: Vec<ContentBlockParam> },
-    /// Append a user-role message carrying one or more
-    /// `tool_result` content blocks. Synthesized by the agent at
-    /// the end of every tool batch so the next inference sees the
-    /// model's tool calls answered. Maps onto
-    /// `aj_session::ConversationView::add_user_message`.
-    ///
-    /// `details` carries the structured per-call [`ToolDetails`]
-    /// payload the agent emitted alongside the wire content, keyed
-    /// by `tool_use_id`. Every entry in `content` that is a
-    /// `ContentBlockParam::ToolResultBlock` has a matching entry
-    /// here; persistence rides both halves on the same on-disk
-    /// record so a resumed session can rehydrate the structured
-    /// renderer state (diffs, todo snapshots, bash exit codes,
-    /// sub-agent reports) instead of falling back to the wire
-    /// text-only projection. The map is `skip_serializing_if`
-    /// empty so legacy emitters and the rare details-less batch
-    /// don't pollute the JSON-on-the-wire shape.
-    ToolResult {
-        content: Vec<ContentBlockParam>,
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        details: HashMap<String, ToolDetails>,
-    },
-    /// Append a freestanding [`UserOutput`] entry. Today only
-    /// emitted for the synthesized [`UserOutput::ToolError`]
-    /// records the agent writes when a tool-call's `input` JSON
-    /// fails to parse or the tool's `execute` itself returns an
-    /// `Err`. Folds into the structured [`ToolDetails`] entry shape
-    /// in §2.4 (see `docs/aj-next-plan.md` §3 — log-format
-    /// migration).
-    UserOutput { output: UserOutput },
 }
 
 /// Bus event emitted by the agent runtime.
@@ -139,6 +84,11 @@ pub enum AgentEvent {
     /// fires once at the top of the streaming inference (with an
     /// empty content vector); the user / tool-result cases fire
     /// when the message is appended to the transcript.
+    ///
+    /// This event is also the persistence trigger: the persistence
+    /// listener subscribed on the bus writes one
+    /// [`aj_session::ConversationEntry`] per finalized message off
+    /// [`AgentEvent::MessageEnd`].
     MessageStart {
         agent_id: AgentId,
         message: AgentMessage,
@@ -157,6 +107,14 @@ pub enum AgentEvent {
     /// authoritative final form; renderers / persistence listeners
     /// should treat any in-flight state from `MessageUpdate` as
     /// stale once this fires.
+    ///
+    /// Persistence subscribes to this event directly: every
+    /// [`AgentEvent::MessageEnd`] becomes one
+    /// [`aj_session::ConversationEntry`] appended to the log. The
+    /// agent emits one [`AgentEvent::MessageEnd`] per finalized
+    /// message — assistant turns, the user prompt at the top of
+    /// every run, and one event per tool-result message in a tool
+    /// batch.
     MessageEnd {
         agent_id: AgentId,
         message: AgentMessage,
@@ -229,39 +187,10 @@ pub enum AgentEvent {
     /// Per-turn token usage snapshot. Bridging variant emitted at the
     /// end of each assistant turn so renderers can show a one-line
     /// usage indicator without having to re-aggregate from
-    /// [`AgentEvent::MessageEnd`] payloads. Folds into the
-    /// `AssistantMessage.usage` ride-along on
-    /// [`AgentEvent::MessageEnd`] in §2.4.
+    /// [`AgentEvent::MessageEnd`] payloads.
     TurnUsage {
         agent_id: AgentId,
         usage: TokenUsage,
-    },
-
-    /// Persistence write request for a finalized turn entry.
-    ///
-    /// Emitted by the agent every time an in-flight turn produces a
-    /// payload that must hit disk: the assistant message itself, the
-    /// synthesized user message carrying tool-result content blocks,
-    /// or one of the freestanding [`UserOutput`] entries written for
-    /// tool-call parse failures and tool-execution errors. The
-    /// persistence listener responds by appending one
-    /// [`aj_session::ConversationEntry`] to the log; the bus's
-    /// awaited-inline listener semantics give us the same "log is
-    /// never more than one event behind reality" durability
-    /// guarantee the previous direct `view.add_*_message` calls had,
-    /// and a listener that returns `Err` (e.g. on a disk-write
-    /// failure) aborts the run via [`crate::TurnError::Fatal`].
-    ///
-    /// Bridging shape: the agent's in-memory transcript still uses
-    /// the wire-shaped [`MessageParam`](aj_models::wire::MessageParam)
-    /// rather than the tagged-union
-    /// [`aj_models::types::Message`], so this event carries the wire
-    /// shape directly. A future migration may swap both the
-    /// transcript and the on-disk format onto the typed shape; this
-    /// variant folds into [`AgentEvent::MessageEnd`] then.
-    MessagePersisted {
-        agent_id: AgentId,
-        kind: PersistedMessageKind,
     },
 
     // --- Queue snapshots ---------------------------------------------------
@@ -298,7 +227,6 @@ impl AgentEvent {
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
             | Self::TurnUsage { agent_id, .. }
-            | Self::MessagePersisted { agent_id, .. }
             | Self::QueueUpdate { agent_id, .. } => *agent_id,
             Self::SubAgentStart { parent, .. } | Self::SubAgentEnd { parent, .. } => *parent,
         }
@@ -339,10 +267,9 @@ mod tests {
     /// JSONL writer; tomorrow any RPC bridge) rely on this contract,
     /// so we lock the discriminator key (`"type"`), the `snake_case`
     /// renaming of variant names, and the in-tagged shape of nested
-    /// enums (`AgentId`, `AssistantMessageEvent`,
-    /// `PersistedMessageKind`). Adding a new event or renaming a field
-    /// shows up here as a test breakage instead of silently changing
-    /// the consumer-facing shape.
+    /// enums (`AgentId`, `AssistantMessageEvent`). Adding a new event
+    /// or renaming a field shows up here as a test breakage instead
+    /// of silently changing the consumer-facing shape.
     #[test]
     fn agent_event_serializes_with_internally_tagged_snake_case_shape() {
         let evt = AgentEvent::Notice {
@@ -395,56 +322,5 @@ mod tests {
         assert_eq!(json["event"]["type"], "text_delta");
         assert_eq!(json["event"]["delta"], "abc");
         assert_eq!(json["event"]["content_index"], 0);
-
-        let persisted = AgentEvent::MessagePersisted {
-            agent_id: AgentId::Main,
-            kind: PersistedMessageKind::User { content: vec![] },
-        };
-        let json = serde_json::to_value(&persisted).expect("persisted serializes");
-        assert_eq!(json["type"], "message_persisted");
-        assert_eq!(json["kind"]["kind"], "user");
-        assert!(json["kind"]["content"].is_array());
-
-        // The `ToolResult` variant carries an additional `details`
-        // map keyed by `tool_use_id`. Empty maps are skipped so the
-        // common case (an empty / legacy details payload) stays
-        // identical to the pre-widening wire shape; a populated map
-        // surfaces as a JSON object whose values are the
-        // internally-tagged `ToolDetails` shape.
-        let persisted_empty = AgentEvent::MessagePersisted {
-            agent_id: AgentId::Main,
-            kind: PersistedMessageKind::ToolResult {
-                content: vec![],
-                details: HashMap::new(),
-            },
-        };
-        let json = serde_json::to_value(&persisted_empty).expect("empty tool-result serializes");
-        assert_eq!(json["kind"]["kind"], "tool_result");
-        assert!(json["kind"]["content"].is_array());
-        assert!(
-            json["kind"].get("details").is_none(),
-            "empty details map should be skipped on serialize: {json}"
-        );
-
-        let mut details = HashMap::new();
-        details.insert(
-            "tu-1".to_string(),
-            ToolDetails::Text {
-                summary: "ping".to_string(),
-                body: "pong".to_string(),
-            },
-        );
-        let persisted_with_details = AgentEvent::MessagePersisted {
-            agent_id: AgentId::Main,
-            kind: PersistedMessageKind::ToolResult {
-                content: vec![],
-                details,
-            },
-        };
-        let json = serde_json::to_value(&persisted_with_details)
-            .expect("tool-result with details serializes");
-        assert_eq!(json["kind"]["details"]["tu-1"]["kind"], "text");
-        assert_eq!(json["kind"]["details"]["tu-1"]["summary"], "ping");
-        assert_eq!(json["kind"]["details"]["tu-1"]["body"], "pong");
     }
 }

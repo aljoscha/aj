@@ -4,7 +4,7 @@
 //! `docs/models-spec.md`, the [`Provider`](provider::Provider) trait
 //! that concrete API integrations implement, the
 //! [`ModelRegistry`](registry::ModelRegistry) that ships the catalog
-//! of available models, and the wire-shaped types in [`wire`] used by
+//! of available models, and the runtime types in [`types`] used by
 //! `aj-session` for on-disk persistence and by `aj-agent` for the
 //! in-memory transcript.
 //!
@@ -25,7 +25,6 @@ pub mod streaming;
 pub mod tools;
 pub mod transform;
 pub mod types;
-pub mod wire;
 
 /// Thinking-policy enum used by the agent and the binary's UI to
 /// describe the user's preferred reasoning depth.

@@ -56,7 +56,7 @@ use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
 use aj_models::registry::ModelRegistry;
-use aj_models::wire::{ContentBlockParam, Role, Speed};
+use aj_models::types::Speed;
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
@@ -262,7 +262,7 @@ pub async fn run(args: Args) -> Result<()> {
             .latest_leaf(ThreadFilter::USER)
             .expect("post-repair head exists when pre-repair head did");
         let conversation = log.linearize(&head, ThreadFilter::USER);
-        let messages: Vec<_> = conversation.messages();
+        let messages: Vec<_> = conversation.agent_messages();
         agent.seed_messages(messages);
 
         if matches!(args.format, PrintFormat::Json) {
@@ -406,17 +406,12 @@ fn json_event_listener() -> Listener {
 /// through `Agent::prompt`.
 fn print_final_assistant_text(agent: &Agent) -> Result<()> {
     let messages = agent.messages();
-    let last_assistant = messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, Role::Assistant));
+    let last_assistant = messages.iter().rev().find_map(|m| match m.as_wire() {
+        Some(aj_models::types::Message::Assistant(a)) => Some(a),
+        _ => None,
+    });
 
     let Some(message) = last_assistant else {
-        // Reaching this branch means the prompt ran to completion
-        // without producing an assistant message — typically a
-        // protocol error caught after the user message was already
-        // appended. Surface a clear error so scripts can tell the
-        // run failed even though `Agent::prompt` returned `Ok`.
         return Err(anyhow!(
             "agent produced no assistant message; nothing to print"
         ));
@@ -424,8 +419,8 @@ fn print_final_assistant_text(agent: &Agent) -> Result<()> {
 
     let mut stdout = io::stdout().lock();
     for block in &message.content {
-        if let ContentBlockParam::TextBlock { text, .. } = block {
-            writeln!(stdout, "{text}").context("failed to write assistant text to stdout")?;
+        if let aj_models::types::AssistantContent::Text(t) = block {
+            writeln!(stdout, "{}", t.text).context("failed to write assistant text to stdout")?;
         }
     }
     stdout.flush().ok();

@@ -17,7 +17,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use aj_models::wire::{ContentBlockParam, MessageParam, Role};
+use aj_agent::message::{AgentMessage, AgentMessageKind};
+use aj_models::types::{Message, UserContent};
 use aj_session::{ConversationEntry, ConversationEntryKind, ConversationPersistence, ThreadKind};
 use aj_tui::components::editor::Editor;
 
@@ -155,7 +156,7 @@ impl PromptHistory {
             if !matches!(entry.thread, ThreadKind::User) {
                 continue;
             }
-            if let ConversationEntryKind::Message(msg) = entry.entry
+            if let ConversationEntryKind::Message { message: msg } = entry.entry
                 && let Some(text) = extract_user_prompt_text(&msg)
             {
                 self.push_internal(text);
@@ -212,17 +213,20 @@ impl PromptHistory {
 
 /// Pull text-block content out of a user message, joining multiple
 /// text blocks with a newline. Returns `None` if there is no text
-/// content (e.g. a tool-result-only user message).
-fn extract_user_prompt_text(msg: &MessageParam) -> Option<String> {
-    if !matches!(msg.role, Role::User) {
-        return None;
-    }
-    let mut parts: Vec<&str> = Vec::new();
-    for block in &msg.content {
-        if let ContentBlockParam::TextBlock { text, .. } = block {
-            parts.push(text.as_str());
-        }
-    }
+/// content (e.g. a tool-result message or an assistant message).
+fn extract_user_prompt_text(msg: &AgentMessage) -> Option<String> {
+    let user = match &msg.kind {
+        AgentMessageKind::Wire(Message::User(u)) => u,
+        _ => return None,
+    };
+    let parts: Vec<&str> = user
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            UserContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
     if parts.is_empty() {
         None
     } else {
@@ -265,14 +269,16 @@ mod tests {
     }
 
     fn user_message_line(text: &str, id: &str) -> String {
-        // Build an entry by hand to keep the test tied to the
-        // on-disk shape rather than the in-memory builder.
         let payload = serde_json::json!({
             "id": id,
             "thread": "user",
             "type": "message",
-            "role": "user",
-            "content": [{"type": "text", "text": text}],
+            "message": {
+                "kind": "wire",
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+                "timestamp": 0,
+            },
         });
         serde_json::to_string(&payload).unwrap()
     }
@@ -282,8 +288,24 @@ mod tests {
             "id": id,
             "thread": "user",
             "type": "message",
-            "role": "assistant",
-            "content": [{"type": "text", "text": text}],
+            "message": {
+                "kind": "wire",
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "api": "scripted",
+                "provider": "scripted",
+                "model": "scripted",
+                "usage": {
+                    "input": 0,
+                    "output": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "total_tokens": 0,
+                    "cost": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "total": 0.0},
+                },
+                "stop_reason": "Stop",
+                "timestamp": 0,
+            },
         });
         serde_json::to_string(&payload).unwrap()
     }
@@ -294,8 +316,12 @@ mod tests {
             "thread": "subagent",
             "agent_id": 1,
             "type": "message",
-            "role": "user",
-            "content": [{"type": "text", "text": text}],
+            "message": {
+                "kind": "wire",
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+                "timestamp": 0,
+            },
         });
         serde_json::to_string(&payload).unwrap()
     }
@@ -447,19 +473,20 @@ mod tests {
     #[test]
     fn bootstrap_ignores_assistant_messages_and_tool_results() {
         let dir = scratch_dir("assistant");
-        // A user message whose content is only a tool_result block
-        // — not a typed prompt.
+        // A tool_result message (not a user prompt).
         let tool_result_only = serde_json::to_string(&serde_json::json!({
             "id": "5",
             "thread": "user",
             "type": "message",
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "tu_1",
-                "content": "ok",
+            "message": {
+                "kind": "wire",
+                "role": "tool_result",
+                "tool_call_id": "tu_1",
+                "tool_name": "ping",
+                "content": [{"type": "text", "text": "ok"}],
                 "is_error": false,
-            }],
+                "timestamp": 0,
+            },
         }))
         .unwrap();
 

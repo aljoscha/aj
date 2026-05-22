@@ -17,8 +17,8 @@ use std::sync::Arc;
 use aj_models::auth::{find_env_keys, get_env_api_key};
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
+use aj_models::types::Speed;
 use aj_models::types::StreamOptions;
-use aj_models::wire::Speed;
 use anyhow::{Result, anyhow, bail};
 
 /// Beta header value that opts an Anthropic request into the

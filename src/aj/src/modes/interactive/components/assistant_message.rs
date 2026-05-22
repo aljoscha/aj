@@ -1,15 +1,15 @@
 //! Assistant-message component.
 //!
 //! Renders an in-flight or finalized assistant turn. While the
-//! agent is streaming (`StreamChunk` events flow on the bus), the
+//! agent is streaming (`MessageUpdate` events flow on the bus), the
 //! component owns mutable [`aj_tui::components::markdown::Markdown`]
 //! widgets — one per assistant content block (thinking or text) in
 //! the order the model produced them — and re-renders them as
 //! bytes arrive. Once the assistant message is finalized
-//! (`MessagePersisted::Assistant` for the live path, or a replay
-//! event for resumed history), the component switches to read-only:
-//! the same widgets keep painting, but the event pump no longer
-//! pushes updates into them.
+//! (`MessageEnd` for the live path, or a replay event for resumed
+//! history), the component switches to read-only: the same widgets
+//! keep painting, but the event pump no longer pushes updates into
+//! them.
 //!
 //! A single assistant turn can carry several alternating thinking
 //! and text blocks (the wire format allows it; the renderer must

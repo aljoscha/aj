@@ -26,21 +26,18 @@ use aj_models::tools::Tool;
 use aj_models::types::{
     AssistantContent, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
     StopReason, StreamOptions, ThinkingLevel, ToolCall, ToolDefinition as UnifiedToolDefinition,
-    UserContent, UserMessage,
+    ToolResultMessage, Usage, UserContent, UserMessage,
 };
-use aj_models::wire::{ContentBlockParam, MessageParam, Role, Usage};
 use aj_models::ThinkingConfig;
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
-use crate::events::{AgentEvent, AgentId, PersistedMessageKind};
+use crate::events::{AgentEvent, AgentId};
 use crate::message::AgentMessage;
-use crate::projection::{
-    assistant_message_to_message_param, transcript_to_messages, usage_unified_to_legacy,
-};
+use crate::projection::transcript_to_messages;
 use crate::tool::{
     ErasedToolDefinition, SpawnedAgent, TodoItem, ToolContext, ToolDetails, ToolOutcome,
 };
-use crate::types::{TokenUsage, UserOutput};
+use crate::types::TokenUsage;
 use anyhow::anyhow;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -110,13 +107,13 @@ pub struct Agent {
     /// parent's per `docs/aj-next-plan.md` §1.6 so a single
     /// eventual `cancel()` call reaches the whole hierarchy.
     cancellation: CancellationToken,
-    /// In-memory transcript: every wire-level [`MessageParam`] this
-    /// agent has seen, in append order. Replaces the agent's reach
-    /// into [`aj_session::ConversationLog`] (per
-    /// `docs/aj-next-plan.md` §2.4b): the binary owns the log,
-    /// resumes it on startup, and seeds the transcript via
-    /// [`Agent::seed_messages`] before the first turn.
-    transcript: Vec<MessageParam>,
+    /// In-memory transcript: every [`AgentMessage`] this agent has
+    /// seen, in append order. Replaces the agent's reach into
+    /// [`aj_session::ConversationLog`] (per `docs/aj-next-plan.md`
+    /// §2.4b): the binary owns the log, resumes it on startup, and
+    /// seeds the transcript via [`Agent::seed_messages`] before the
+    /// first turn.
+    transcript: Vec<AgentMessage>,
     /// Optional hook fired before every tool call. Set via
     /// [`Agent::set_before_tool_call`]; `None` means "skip the
     /// hook" — the tool's own `execute` runs unconditionally with
@@ -305,15 +302,15 @@ impl Agent {
     /// each loop iteration to decide whether to ask for input
     /// (depending on whether the last message is from the
     /// assistant).
-    pub fn messages(&self) -> &[MessageParam] {
+    pub fn messages(&self) -> &[AgentMessage] {
         &self.transcript
     }
 
     /// Replace the in-memory transcript with `messages`. Used on
     /// resume: the binary opens the log, linearizes the user
-    /// thread, and pushes the resulting `Vec<MessageParam>` into
+    /// thread, and pushes the resulting `Vec<AgentMessage>` into
     /// the agent so the next turn sees the prior conversation.
-    pub fn seed_messages(&mut self, messages: Vec<MessageParam>) {
+    pub fn seed_messages(&mut self, messages: Vec<AgentMessage>) {
         self.transcript = messages;
     }
 
@@ -461,7 +458,8 @@ impl Agent {
     /// Append `message` as a user-role text input to the transcript
     /// and run one assistant turn against it.
     ///
-    /// Emits [`AgentEvent::MessagePersisted::User`] before driving
+    /// Emits [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`]
+    /// for the user message before driving
     /// the assistant turn loop so the persistence listener writes
     /// the user's input to disk. The turn loop runs one inference,
     /// processes any tool calls the assistant emits (each with its
@@ -490,13 +488,14 @@ impl Agent {
     /// Like [`Agent::prompt`], the call is bracketed by
     /// [`AgentEvent::AgentStart`] / [`AgentEvent::AgentEnd`] events.
     pub async fn continue_run(&mut self) -> Result<(), TurnError> {
-        match self.transcript.last() {
-            Some(msg) if matches!(msg.role, Role::User) => {}
-            _ => {
-                return Err(TurnError::Fatal(anyhow!(
-                    "continue_run requires the transcript to end in a user-role message"
-                )));
-            }
+        let last_is_user_or_tool_result = matches!(
+            self.transcript.last().and_then(|m| m.as_wire()),
+            Some(Message::User(_)) | Some(Message::ToolResult(_))
+        );
+        if !last_is_user_or_tool_result {
+            return Err(TurnError::Fatal(anyhow!(
+                "continue_run requires the transcript to end in a user-role message"
+            )));
         }
         self.run_top_level_turn(None).await
     }
@@ -538,23 +537,13 @@ impl Agent {
     async fn run_top_level_turn_inner(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
         if let Some(text) = prompt {
             // Append the user message to the in-memory transcript
-            // and emit a `MessagePersisted::User` event for the
-            // persistence listener. The transcript update happens
-            // unconditionally — even if the listener errors out we
-            // still want the in-memory state to reflect the
-            // intent, so the bus call is at-most one event behind
-            // the transcript (per `docs/aj-next-plan.md` §1.4).
-            let content = vec![ContentBlockParam::new_text_block(text.clone())];
-            self.transcript
-                .push(MessageParam::new_user_message(content.clone()));
-            // Bracket the user message with `MessageStart` /
-            // `MessageEnd` so renderers and event-tape consumers see
-            // a complete lifecycle for every message kind, not just
-            // the assistant streaming flow. The `MessagePersisted`
-            // event continues to drive the persistence listener;
-            // the two-event surface is intentional per
-            // `docs/aj-next-plan.md` §1.1.
+            // and emit a `MessageStart` / `MessageEnd` pair so
+            // listeners (renderers + the persistence listener) see
+            // a complete lifecycle for the user input. The
+            // transcript update happens before the bus emits so
+            // the in-memory state can never trail the bus.
             let user_message = AgentMessage::wire(Message::User(UserMessage::text(text)));
+            self.transcript.push(user_message.clone());
             self.bus
                 .emit(AgentEvent::MessageStart {
                     agent_id: self.agent_id,
@@ -566,13 +555,6 @@ impl Agent {
                 .emit(AgentEvent::MessageEnd {
                     agent_id: self.agent_id,
                     message: user_message,
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
-            self.bus
-                .emit(AgentEvent::MessagePersisted {
-                    agent_id: self.agent_id,
-                    kind: PersistedMessageKind::User { content },
                 })
                 .await
                 .map_err(TurnError::Fatal)?;
@@ -617,14 +599,8 @@ impl Agent {
         // parent's spawning assistant message via the
         // `SubAgentStart` hook (see
         // `aj_session::listener::persistence_listener`).
-        let content = vec![ContentBlockParam::new_text_block(prompt.clone())];
-        self.transcript
-            .push(MessageParam::new_user_message(content.clone()));
-        // Same Start/End/Persisted triplet as the top-level path,
-        // per `docs/aj-next-plan.md` §1.1. Sub-agent listeners group
-        // by `agent_id` so the bracketing fires under `Sub(n)` and
-        // the parent's renderer routes correctly.
         let user_message = AgentMessage::wire(Message::User(UserMessage::text(prompt)));
+        self.transcript.push(user_message.clone());
         self.bus
             .emit(AgentEvent::MessageStart {
                 agent_id: self.agent_id,
@@ -637,29 +613,26 @@ impl Agent {
                 message: user_message,
             })
             .await?;
-        self.bus
-            .emit(AgentEvent::MessagePersisted {
-                agent_id: self.agent_id,
-                kind: PersistedMessageKind::User { content },
-            })
-            .await?;
 
         self.execute_turn().await?;
 
         // Extract the last assistant message text from the
         // sub-agent's own transcript.
-        let last_msg = self
+        let last_assistant = self
             .transcript
             .iter()
             .rev()
-            .find(|m| matches!(m.role, Role::Assistant))
+            .find_map(|m| match m.as_wire() {
+                Some(Message::Assistant(a)) => Some(a),
+                _ => None,
+            })
             .ok_or_else(|| anyhow!("sub-agent produced no assistant text output"))?;
 
-        let last_assistant_text: String = last_msg
+        let last_assistant_text: String = last_assistant
             .content
             .iter()
-            .filter_map(|block| match block {
-                ContentBlockParam::TextBlock { text, .. } => Some(text.as_str()),
+            .filter_map(|c| match c {
+                AssistantContent::Text(t) => Some(t.text.as_str()),
                 _ => None,
             })
             .collect();
@@ -674,7 +647,7 @@ impl Agent {
     ///
     /// The turn's writes (assistant message, per-tool user
     /// outputs, tool-result user message) flow out as
-    /// [`AgentEvent::MessagePersisted`] events. The persistence
+    /// [`AgentEvent::MessageEnd`] events. The persistence
     /// listener subscribed on the bus translates them into
     /// `aj_session::ConversationView` appends, one JSONL line per
     /// event, so the on-disk state stays at-most one event behind
@@ -749,7 +722,7 @@ impl Agent {
                 // `AssistantMessageEvent` directly (drives text /
                 // thinking / tool-call blocks); persistence listeners
                 // can ignore these since the finalized
-                // `MessagePersisted::Assistant` event fires below
+                // `MessageEnd` event below carries the finalized
                 // after the stream terminates.
                 let partial = event.partial().clone();
                 self.bus
@@ -857,14 +830,10 @@ impl Agent {
             retry_attempt = 0;
 
             let response = final_message;
-            let turn_usage_unified = response.usage.clone();
-            let turn_usage = usage_unified_to_legacy(&turn_usage_unified);
+            let turn_usage = response.usage.clone();
 
             // Collect tool calls off the finalized assistant
-            // content. The unified `AssistantContent::ToolCall`
-            // variant carries `(id, name, arguments)` directly; we
-            // mirror the legacy tuple shape so the rest of the loop
-            // can stay byte-for-byte identical to the pre-flip flow.
+            // content.
             let tool_calls: Vec<(String, String, serde_json::Value)> = response
                 .content
                 .iter()
@@ -879,42 +848,24 @@ impl Agent {
                 .collect();
             let has_tool_use = !tool_calls.is_empty();
 
-            // Re-project the finalized unified assistant message
-            // onto the agent's transcript shape (flat
-            // [`ContentBlockParam`] content). The bus emit happens
-            // after the transcript update so a listener that errors
-            // out can't leave the transcript ahead of the log (the
-            // listener failure is fatal anyway — see
-            // [`TurnError::Fatal`]).
-            let message_param = assistant_message_to_message_param(&response);
-            self.transcript.push(message_param.clone());
-            self.bus
-                .emit(AgentEvent::MessagePersisted {
-                    agent_id: self.agent_id,
-                    kind: PersistedMessageKind::Assistant {
-                        content: message_param.content,
-                    },
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
+            // Append the finalized assistant message to the
+            // transcript. Persistence listeners subscribe to the
+            // matching [`AgentEvent::MessageEnd`] event emitted
+            // above before the loop body resumed (see the
+            // bracketing earlier in this function) so the on-disk
+            // record lands without a separate persistence event.
+            self.transcript
+                .push(AgentMessage::wire(Message::Assistant(response.clone())));
 
             let usage = TokenUsage {
-                accumulated_input: self.session_state.accumulated_usage.input_tokens,
-                turn_input: turn_usage.input_tokens,
-                accumulated_output: self.session_state.accumulated_usage.output_tokens,
-                turn_output: turn_usage.output_tokens,
-                accumulated_cache_creation: self
-                    .session_state
-                    .accumulated_usage
-                    .cache_creation_input_tokens
-                    .unwrap_or(0),
-                turn_cache_creation: turn_usage.cache_creation_input_tokens.unwrap_or(0),
-                accumulated_cache_read: self
-                    .session_state
-                    .accumulated_usage
-                    .cache_read_input_tokens
-                    .unwrap_or(0),
-                turn_cache_read: turn_usage.cache_read_input_tokens.unwrap_or(0),
+                accumulated_input: self.session_state.accumulated_usage.input,
+                turn_input: turn_usage.input,
+                accumulated_output: self.session_state.accumulated_usage.output,
+                turn_output: turn_usage.output,
+                accumulated_cache_write: self.session_state.accumulated_usage.cache_write,
+                turn_cache_write: turn_usage.cache_write,
+                accumulated_cache_read: self.session_state.accumulated_usage.cache_read,
+                turn_cache_read: turn_usage.cache_read,
             };
             self.bus
                 .emit(AgentEvent::TurnUsage {
@@ -924,22 +875,10 @@ impl Agent {
                 .await
                 .map_err(TurnError::Fatal)?;
 
-            self.session_state.accumulated_usage.add_usage(&turn_usage);
+            accumulate_usage(&mut self.session_state.accumulated_usage, &turn_usage);
 
             // Execute tool calls if any
             if has_tool_use {
-                let mut tool_result_contents = Vec::new();
-                // Mirror of `tool_result_contents` for the
-                // structured renderer payload: each loop iteration
-                // pushes one wire block and one matching
-                // `(tool_use_id, ToolDetails)` entry here, so the
-                // batched `MessagePersisted::ToolResult` event at
-                // the end of the loop can persist both halves on
-                // the same record. Keyed by `tool_use_id` so the
-                // persistence layer can correlate without scanning
-                // the content vector.
-                let mut tool_result_details: HashMap<String, ToolDetails> = HashMap::new();
-
                 for (tool_id, tool_name, tool_input) in tool_calls {
                     // Mirror the start of every tool invocation on the
                     // bus before we do any work — listeners that render
@@ -982,21 +921,18 @@ impl Agent {
                     // Run the tool unless the before-hook short-
                     // circuited it. Success and recoverable error
                     // both come back as a [`ToolOutcome`] the rest
-                    // of the loop projects onto the wire
-                    // `tool_result` block (text-flattened `content`)
-                    // and the bus [`AgentEvent::ToolExecutionEnd`]
-                    // event (structured `details` + `is_error`).
+                    // of the loop projects onto the unified
+                    // `Message::ToolResult` shape.
                     //
-                    // Tool-input parse failures in the unified
-                    // streaming protocol surface as a
+                    // Tool-input parse failures surface as a
                     // [`AssistantContent::ToolCall`] with
                     // `arguments == Value::Null`; the tool's own
-                    // deserializer rejects the payload, the call
-                    // bubbles up here as an `Err`, and the synthetic
-                    // `UserOutput::ToolError` persistence event
-                    // mirrors the legacy on-disk shape regardless of
-                    // whether the failure was a wire parse error or
-                    // a per-tool validation rejection.
+                    // deserializer rejects the payload and the call
+                    // bubbles up here as an `Err`. We fold that
+                    // into a synthesized `ToolOutcome` with
+                    // `is_error: true` so the failure rides on the
+                    // same `Message::ToolResult` shape every other
+                    // tool error does.
                     let mut outcome = if let Some(outcome) = short_circuit_outcome {
                         outcome
                     } else {
@@ -1006,20 +942,6 @@ impl Agent {
                         {
                             Ok(outcome) => outcome,
                             Err(err) => {
-                                self.bus
-                                    .emit(AgentEvent::MessagePersisted {
-                                        agent_id: self.agent_id,
-                                        kind: PersistedMessageKind::UserOutput {
-                                            output: UserOutput::ToolError {
-                                                tool_name: tool_name.clone(),
-                                                input: tool_input.to_string(),
-                                                error: err.to_string(),
-                                            },
-                                        },
-                                    })
-                                    .await
-                                    .map_err(TurnError::Fatal)?;
-
                                 let body = err.to_string();
                                 ToolOutcome {
                                     content: vec![UserContent::text(format!("{err}"))],
@@ -1047,37 +969,42 @@ impl Agent {
                         hook(ctx, &mut outcome).await;
                     }
 
-                    // Project the structured `content` onto the
-                    // legacy text-only `ToolResultContent::Text`
-                    // shape for the wire. The structured `details`
-                    // ride twice: once on the per-call
+                    // Project the outcome onto a unified
+                    // [`Message::ToolResult`] entry. The structured
+                    // `details` ride twice: once on the per-call
                     // [`AgentEvent::ToolExecutionEnd`] event below
-                    // (for live renderers), and once into
-                    // `tool_result_details` (keyed by `tool_use_id`)
-                    // so the batched [`PersistedMessageKind::ToolResult`]
-                    // event at the end of the loop carries the same
-                    // per-call payload through to persistence —
-                    // letting a resumed session rehydrate the
-                    // structured renderer state instead of falling
-                    // back to the wire text-only projection.
-                    let return_value: String = outcome
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            UserContent::Text(t) => Some(t.text.as_str()),
-                            UserContent::Image(_) => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
-
-                    let result_content_block = ContentBlockParam::ToolResultBlock {
-                        tool_use_id: tool_id.to_owned(),
-                        content: return_value.into(),
+                    // (for live renderers) and once as the
+                    // `details: Option<Value>` field on the
+                    // [`ToolResultMessage`] we append to the
+                    // transcript and emit through `MessageEnd` (for
+                    // resumed sessions and persistence). The latter
+                    // is serialized via `serde_json::to_value` so
+                    // it survives the on-disk JSONL round-trip.
+                    let details_value = serde_json::to_value(&outcome.details).ok();
+                    let tool_result = ToolResultMessage {
+                        tool_call_id: tool_id.clone(),
+                        tool_name: tool_name.clone(),
+                        content: outcome.content.clone(),
+                        details: details_value,
                         is_error: outcome.is_error,
+                        timestamp: 0,
                     };
-
-                    tool_result_contents.push(result_content_block);
-                    tool_result_details.insert(tool_id.clone(), outcome.details.clone());
+                    let tool_result_message = AgentMessage::wire(Message::ToolResult(tool_result));
+                    self.transcript.push(tool_result_message.clone());
+                    self.bus
+                        .emit(AgentEvent::MessageStart {
+                            agent_id: self.agent_id,
+                            message: tool_result_message.clone(),
+                        })
+                        .await
+                        .map_err(TurnError::Fatal)?;
+                    self.bus
+                        .emit(AgentEvent::MessageEnd {
+                            agent_id: self.agent_id,
+                            message: tool_result_message,
+                        })
+                        .await
+                        .map_err(TurnError::Fatal)?;
 
                     self.bus
                         .emit(AgentEvent::ToolExecutionEnd {
@@ -1086,24 +1013,6 @@ impl Agent {
                             tool: tool_name.clone(),
                             result: outcome.details,
                             is_error: outcome.is_error,
-                        })
-                        .await
-                        .map_err(TurnError::Fatal)?;
-                }
-
-                if !tool_result_contents.is_empty() {
-                    // Append the synthesized user-role
-                    // tool_result message to the transcript and
-                    // mirror it on the bus.
-                    self.transcript
-                        .push(MessageParam::new_user_message(tool_result_contents.clone()));
-                    self.bus
-                        .emit(AgentEvent::MessagePersisted {
-                            agent_id: self.agent_id,
-                            kind: PersistedMessageKind::ToolResult {
-                                content: tool_result_contents,
-                                details: tool_result_details,
-                            },
                         })
                         .await
                         .map_err(TurnError::Fatal)?;
@@ -1165,7 +1074,7 @@ impl Agent {
     /// in-memory transcript and return the resulting
     /// [`AssistantMessageEventStream`].
     ///
-    /// Projects the legacy [`MessageParam`] transcript onto the
+    /// Projects the agent's [`AgentMessage`] transcript onto the
     /// unified [`aj_models::types::Message`] sequence the
     /// [`Provider`] trait expects, projects the agent's
     /// `Vec<Tool>` onto the unified
@@ -1220,21 +1129,18 @@ impl Agent {
     fn determine_thinking(&self) -> Option<ThinkingConfig> {
         // Walk back through the transcript for the most recent
         // user-role message that contained any text content.
-        // (Tool-result-only user messages don't count: they're
-        // synthesized after a tool batch and shouldn't influence
-        // thinking budget for the follow-up inference.)
+        // (Tool-result entries don't count: they're synthesized
+        // after a tool batch and shouldn't influence thinking
+        // budget for the follow-up inference.)
         let last_user_text = self
             .transcript
             .iter()
             .rev()
-            .find_map(|message| match message.role {
-                Role::User => {
-                    let has_text_input = message
-                        .content
-                        .iter()
-                        .any(|c| matches!(c, ContentBlockParam::TextBlock { .. }));
-                    if has_text_input {
-                        Some(message)
+            .find_map(|m| match m.as_wire() {
+                Some(Message::User(u)) => {
+                    let has_text = u.content.iter().any(|c| matches!(c, UserContent::Text(_)));
+                    if has_text {
+                        Some(u)
                     } else {
                         None
                     }
@@ -1243,16 +1149,12 @@ impl Agent {
             });
 
         if let Some(message) = last_user_text {
-            // Extract text content from the message
             let text_content = message
                 .content
                 .iter()
-                .filter_map(|content| {
-                    if let ContentBlockParam::TextBlock { text, .. } = content {
-                        Some(text.as_str())
-                    } else {
-                        None
-                    }
+                .filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -1566,7 +1468,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
     }
 }
 
-/// Inspect a freshly-seeded transcript for `tool_use` blocks that
+/// Inspect a freshly-seeded transcript for `tool_call` blocks that
 /// never received a matching `tool_result`. This is the in-memory
 /// counterpart of `aj_session::repair_interrupted_tool_uses`: the
 /// binary calls the session-side helper to write recovery entries
@@ -1575,25 +1477,22 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
 /// invariant violation here. Used by the agent's tests; not part
 /// of the run-time path.
 #[cfg(test)]
-fn scan_dangling_tool_uses(transcript: &[MessageParam]) -> std::collections::HashSet<String> {
+fn scan_dangling_tool_uses(transcript: &[AgentMessage]) -> std::collections::HashSet<String> {
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
     for msg in transcript {
-        match msg.role {
-            Role::Assistant => {
-                for block in &msg.content {
-                    if let ContentBlockParam::ToolUseBlock { id, .. } = block {
-                        used.insert(id.clone());
+        match msg.as_wire() {
+            Some(Message::Assistant(a)) => {
+                for c in &a.content {
+                    if let AssistantContent::ToolCall(tc) = c {
+                        used.insert(tc.id.clone());
                     }
                 }
             }
-            Role::User => {
-                for block in &msg.content {
-                    if let ContentBlockParam::ToolResultBlock { tool_use_id, .. } = block {
-                        resolved.insert(tool_use_id.clone());
-                    }
-                }
+            Some(Message::ToolResult(tr)) => {
+                resolved.insert(tr.tool_call_id.clone());
             }
+            _ => {}
         }
     }
     used.difference(&resolved).cloned().collect()
@@ -1643,6 +1542,23 @@ fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
     }
 }
 
+/// Sum `other` into `acc`. Counters are added; the cost subfield
+/// is summed dimension-by-dimension. `total_tokens` is recomputed
+/// off the per-dimension counters so it stays internally
+/// consistent with `input + output + cache_read + cache_write`.
+fn accumulate_usage(acc: &mut Usage, other: &Usage) {
+    acc.input += other.input;
+    acc.output += other.output;
+    acc.cache_read += other.cache_read;
+    acc.cache_write += other.cache_write;
+    acc.total_tokens += other.total_tokens;
+    acc.cost.input += other.cost.input;
+    acc.cost.output += other.cost.output;
+    acc.cost.cache_read += other.cost.cache_read;
+    acc.cost.cache_write += other.cost.cache_write;
+    acc.cost.total += other.cost.total;
+}
+
 #[cfg(test)]
 mod event_protocol_tests {
     //! Snapshot the event protocol the agent emits on its bus.
@@ -1664,13 +1580,13 @@ mod event_protocol_tests {
     use aj_models::streaming::{AssistantMessageEvent, DoneReason};
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, StopReason, StreamOptions, TextContent,
-        ToolCall,
+        ToolCall, UserMessage,
     };
-    use aj_models::wire::ContentBlockParam;
     use std::sync::Arc;
 
     use crate::bus::listener_from_sync;
-    use crate::events::{AgentEvent, AgentId, PersistedMessageKind};
+    use crate::events::{AgentEvent, AgentId};
+    use crate::message::AgentMessage;
     use crate::tool::{
         ErasedToolDefinition, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
     };
@@ -1863,14 +1779,6 @@ mod event_protocol_tests {
             event_kind: &'static str,
         },
         TurnUsage(AgentId),
-        /// Persistence write request. The label captures only the
-        /// kind discriminator (User / Assistant / ToolResult /
-        /// UserOutput) so test assertions don't have to care
-        /// about the exact content blocks the event carries.
-        MessagePersisted {
-            agent_id: AgentId,
-            kind: &'static str,
-        },
         Other(&'static str),
     }
 
@@ -1929,18 +1837,6 @@ mod event_protocol_tests {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),
             AgentEvent::TurnUsage { agent_id, .. } => EventLabel::TurnUsage(*agent_id),
-            AgentEvent::MessagePersisted { agent_id, kind } => {
-                let kind = match kind {
-                    PersistedMessageKind::User { .. } => "User",
-                    PersistedMessageKind::Assistant { .. } => "Assistant",
-                    PersistedMessageKind::ToolResult { .. } => "ToolResult",
-                    PersistedMessageKind::UserOutput { .. } => "UserOutput",
-                };
-                EventLabel::MessagePersisted {
-                    agent_id: *agent_id,
-                    kind,
-                }
-            }
             AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
             AgentEvent::MessageStart { agent_id, message } => EventLabel::Message {
                 agent_id: *agent_id,
@@ -2071,8 +1967,8 @@ mod event_protocol_tests {
             EventLabel::AgentStart(AgentId::Sub(1)),
             // The sub-agent's user prompt brackets with
             // MessageStart/End around the User wire-message; the
-            // MessagePersisted event is what the persistence
-            // listener anchors against the parent's spawning entry.
+            // persistence listener subscribes to MessageEnd
+            // directly.
             EventLabel::Message {
                 agent_id: AgentId::Sub(1),
                 phase: "start",
@@ -2083,17 +1979,13 @@ mod event_protocol_tests {
                 phase: "end",
                 kind: "User",
             },
-            EventLabel::MessagePersisted {
-                agent_id: AgentId::Sub(1),
-                kind: "User",
-            },
             EventLabel::TurnStart(AgentId::Sub(1)),
             // First inference: MessageStart opens the assistant
             // slot, the streaming protocol's Start event flows
             // through MessageUpdate (script step 0 emits Start
             // + Done), then MessageEnd carries the finalized
-            // tool-use message before MessagePersisted::Assistant
-            // hits disk.
+            // tool-use message (persistence subscribes to
+            // MessageEnd directly).
             EventLabel::Message {
                 agent_id: AgentId::Sub(1),
                 phase: "start",
@@ -2112,15 +2004,24 @@ mod event_protocol_tests {
                 phase: "end",
                 kind: "Assistant",
             },
-            EventLabel::MessagePersisted {
-                agent_id: AgentId::Sub(1),
-                kind: "Assistant",
-            },
             EventLabel::TurnUsage(AgentId::Sub(1)),
             EventLabel::ToolExecutionStart {
                 agent_id: AgentId::Sub(1),
                 call_id: "tu-1".to_string(),
                 tool: "ping".to_string(),
+            },
+            // After each tool call: MessageStart/End around the
+            // ToolResult wire-message, then ToolExecutionEnd with
+            // the structured renderer payload.
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "start",
+                kind: "ToolResult",
+            },
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "end",
+                kind: "ToolResult",
             },
             EventLabel::ToolExecutionEnd {
                 agent_id: AgentId::Sub(1),
@@ -2129,13 +2030,6 @@ mod event_protocol_tests {
                 summary: "ping".to_string(),
                 body: "pong".to_string(),
                 is_error: false,
-            },
-            // After the tool batch finishes, one
-            // `MessagePersisted::ToolResult` event for the
-            // synthesized user-role tool_result message.
-            EventLabel::MessagePersisted {
-                agent_id: AgentId::Sub(1),
-                kind: "ToolResult",
             },
             // Second inference: same Start/stream/End bracket as
             // the first; the model returned plain text this time.
@@ -2157,10 +2051,6 @@ mod event_protocol_tests {
                 phase: "end",
                 kind: "Assistant",
             },
-            EventLabel::MessagePersisted {
-                agent_id: AgentId::Sub(1),
-                kind: "Assistant",
-            },
             EventLabel::TurnUsage(AgentId::Sub(1)),
             EventLabel::AgentEnd(AgentId::Sub(1)),
         ];
@@ -2169,15 +2059,16 @@ mod event_protocol_tests {
 
     #[tokio::test]
     async fn tool_result_persistence_event_carries_structured_details_by_id() {
-        // The agent's batched [`PersistedMessageKind::ToolResult`]
-        // event must carry the per-call structured `details` keyed
-        // by `tool_use_id`, alongside the wire `content`. A
+        // Every tool call produces a `MessageEnd { ToolResult }`
+        // event whose `details` field carries the structured
+        // [`ToolDetails`] payload serialized to `Value`. A
         // downstream persistence listener relies on this so the
-        // on-disk record can pin both the LLM-facing text (used by
-        // the next inference) and the renderer payload (used by
+        // on-disk record can pin both the LLM-facing content (used
+        // by the next inference) and the renderer payload (used by
         // resumed sessions to rehydrate diffs / todo snapshots /
         // bash exit codes / sub-agent reports without re-running
         // the tool).
+        use crate::message::AgentMessageKind;
         let scripts = vec![
             finalize_script(finalize_tool_use("tu-only", "ping")),
             finalize_script(finalize_text("done")),
@@ -2187,16 +2078,17 @@ mod event_protocol_tests {
         agent.set_agent_id(AgentId::Sub(42));
 
         let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_clone = captured.clone();
+        let captured_clone = Arc::clone(&captured);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
-            // Stash full events (not just labels) so the test can
-            // inspect the `details` map contents.
-            if let AgentEvent::MessagePersisted {
-                kind: PersistedMessageKind::ToolResult { .. },
-                ..
-            } = event
-            {
-                captured_clone.lock().unwrap().push(event.clone());
+            // Capture every `MessageEnd` carrying a `ToolResult`
+            // so the test can assert on the rich payload.
+            if let AgentEvent::MessageEnd { message, .. } = event {
+                if matches!(
+                    &message.kind,
+                    AgentMessageKind::Wire(Message::ToolResult(_))
+                ) {
+                    captured_clone.lock().unwrap().push(event.clone());
+                }
             }
         }));
 
@@ -2209,40 +2101,29 @@ mod event_protocol_tests {
         assert_eq!(
             events.len(),
             1,
-            "expected exactly one ToolResult persistence event: {events:#?}"
+            "expected exactly one ToolResult MessageEnd event: {events:#?}"
         );
 
-        let AgentEvent::MessagePersisted {
-            kind: PersistedMessageKind::ToolResult { content, details },
-            ..
-        } = &events[0]
-        else {
-            panic!("captured non-ToolResult event: {:#?}", events[0]);
+        let AgentEvent::MessageEnd { message, .. } = &events[0] else {
+            panic!("captured non-MessageEnd event: {:#?}", events[0]);
+        };
+        let AgentMessageKind::Wire(Message::ToolResult(tr)) = &message.kind else {
+            panic!("captured MessageEnd with non-ToolResult body: {message:#?}");
         };
 
-        // Wire content carries exactly one tool_result block, with
-        // the same id the model's `tool_use` block had.
-        assert_eq!(content.len(), 1);
-        match &content[0] {
-            ContentBlockParam::ToolResultBlock {
-                tool_use_id,
-                is_error,
-                ..
-            } => {
-                assert_eq!(tool_use_id, "tu-only");
-                assert!(!is_error);
-            }
-            other => panic!("expected ToolResultBlock, got {other:#?}"),
-        }
+        assert_eq!(tr.tool_call_id, "tu-only");
+        assert_eq!(tr.tool_name, "ping");
+        assert!(!tr.is_error);
 
-        // The details map has a matching entry keyed by the same
-        // `tool_use_id`, carrying the structured `ToolDetails`
-        // [`PingTool`] returned (the test fixture emits a
-        // `Text { summary: "ping", body: "pong" }` outcome).
-        assert_eq!(details.len(), 1, "details: {details:#?}");
-        let payload = details
-            .get("tu-only")
-            .expect("details keyed by tool_use_id");
+        // The details field carries the structured `ToolDetails`
+        // serialized to JSON; deserializing it back gets us the
+        // original payload the tool returned.
+        let details_value = tr
+            .details
+            .as_ref()
+            .expect("details Value present on ToolResult");
+        let payload: ToolDetails = serde_json::from_value(details_value.clone())
+            .expect("details deserialize back to ToolDetails");
         match payload {
             ToolDetails::Text { summary, body } => {
                 assert_eq!(summary, "ping");
@@ -2289,10 +2170,6 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "User",
                 },
-                EventLabel::MessagePersisted {
-                    agent_id: AgentId::Sub(7),
-                    kind: "User",
-                },
                 EventLabel::TurnStart(AgentId::Sub(7)),
                 EventLabel::Message {
                     agent_id: AgentId::Sub(7),
@@ -2312,10 +2189,6 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "Assistant",
                 },
-                EventLabel::MessagePersisted {
-                    agent_id: AgentId::Sub(7),
-                    kind: "Assistant",
-                },
                 EventLabel::TurnUsage(AgentId::Sub(7)),
                 EventLabel::AgentEnd(AgentId::Sub(7)),
             ],
@@ -2324,18 +2197,18 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
-    async fn prompt_emits_user_message_persisted_event() {
+    async fn prompt_emits_user_message_lifecycle_events() {
         // The top-level entry point appends the user prompt to the
-        // transcript and emits a `MessagePersisted::User` event
-        // before the assistant turn loop begins. This is the
-        // contract the binary's persistence listener relies on
-        // to write the user's typed input to disk.
+        // transcript and emits a `MessageStart` / `MessageEnd` pair
+        // for it before the assistant turn loop begins. This is the
+        // contract the binary's persistence listener relies on to
+        // write the user's typed input to disk.
         let scripts = vec![finalize_script(finalize_text("done"))];
 
         let mut agent = build_agent(scripts, Vec::new());
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded_clone = recorded.clone();
+        let recorded_clone = Arc::clone(&recorded);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             recorded_clone.lock().unwrap().push(label(event));
         }));
@@ -2360,10 +2233,6 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "User",
                 },
-                EventLabel::MessagePersisted {
-                    agent_id: AgentId::Main,
-                    kind: "User",
-                },
                 EventLabel::TurnStart(AgentId::Main),
                 EventLabel::Message {
                     agent_id: AgentId::Main,
@@ -2381,10 +2250,6 @@ mod event_protocol_tests {
                 EventLabel::Message {
                     agent_id: AgentId::Main,
                     phase: "end",
-                    kind: "Assistant",
-                },
-                EventLabel::MessagePersisted {
-                    agent_id: AgentId::Main,
                     kind: "Assistant",
                 },
                 EventLabel::TurnUsage(AgentId::Main),
@@ -2403,25 +2268,23 @@ mod event_protocol_tests {
         // `continue_run` is the recovery / continuation entry point:
         // the binary uses it after a recoverable error to retry
         // inference against the user message that's already on the
-        // transcript, without re-emitting a `MessagePersisted::User`
-        // (the prior `prompt` call already wrote it). Here we seed
-        // a transcript ending in a user-role message and verify
-        // `continue_run` drives one assistant turn without firing
-        // any extra User persistence event.
-        use aj_models::wire::ContentBlockParam;
-
+        // transcript, without re-emitting a `MessageStart`/`MessageEnd`
+        // for the user prompt (the prior `prompt` call already wrote
+        // it). Here we seed a transcript ending in a user-role
+        // message and verify `continue_run` drives one assistant
+        // turn without firing any extra User message events.
         let scripts = vec![finalize_script(finalize_text("retried"))];
 
         let mut agent = build_agent(scripts, Vec::new());
         // Seed a user-role last message — typically the prompt the
         // user already submitted before the previous turn errored
         // out.
-        agent.seed_messages(vec![aj_models::wire::MessageParam::new_user_message(vec![
-            ContentBlockParam::new_text_block("retry me".into()),
-        ])]);
+        agent.seed_messages(vec![AgentMessage::wire(Message::User(UserMessage::text(
+            "retry me",
+        )))]);
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded_clone = recorded.clone();
+        let recorded_clone = Arc::clone(&recorded);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             recorded_clone.lock().unwrap().push(label(event));
         }));
@@ -2435,7 +2298,7 @@ mod event_protocol_tests {
                 EventLabel::AgentStart(AgentId::Main),
                 // No User-message bracketing here — that's the
                 // distinguishing feature of `continue_run` vs
-                // `prompt`. No `MessagePersisted::User` either.
+                // `prompt`.
                 EventLabel::TurnStart(AgentId::Main),
                 EventLabel::Message {
                     agent_id: AgentId::Main,
@@ -2455,10 +2318,6 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "Assistant",
                 },
-                EventLabel::MessagePersisted {
-                    agent_id: AgentId::Main,
-                    kind: "Assistant",
-                },
                 EventLabel::TurnUsage(AgentId::Main),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
@@ -2473,23 +2332,21 @@ mod event_protocol_tests {
     #[tokio::test]
     async fn continue_run_rejects_assistant_role_last_message() {
         // The wire layer requires the transcript to end in a
-        // user-role message before inference. `continue_run`
-        // enforces that precondition with a fatal error rather
-        // than letting the model API surface an obscure 4xx.
-        use aj_models::wire::{ContentBlockParam, MessageParam, Role};
-
-        // No scripts queued: if the precondition check is missing
-        // and the agent runs an inference, the `ScriptedProvider`
-        // panics ("ScriptedProvider exhausted"). That'd produce a
-        // different failure than the `Fatal` we're checking for —
-        // so a successful test here implies the check fired
-        // *before* any inference attempt.
+        // user-role (or tool-result) message before inference.
+        // `continue_run` enforces that precondition with a fatal
+        // error rather than letting the model API surface an
+        // obscure 4xx.
         let mut agent = build_agent(Vec::new(), Vec::new());
         // Seed an assistant-role last message.
-        agent.seed_messages(vec![MessageParam {
-            role: Role::Assistant,
-            content: vec![ContentBlockParam::new_text_block("hi".into())],
-        }]);
+        agent.seed_messages(vec![AgentMessage::wire(Message::Assistant(
+            AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: "hi".into(),
+                    text_signature: None,
+                })],
+                ..AssistantMessage::empty()
+            },
+        ))]);
 
         let err = agent
             .continue_run()
@@ -2521,33 +2378,28 @@ mod event_protocol_tests {
     #[test]
     fn scan_dangling_tool_uses_finds_unmatched_ids() {
         // Sanity check on the test-only helper: a transcript
-        // ending in an assistant tool_use without a matching
+        // ending in an assistant tool_call without a matching
         // tool_result reports the dangling id.
-        use aj_models::wire::{ContentBlockParam, MessageParam, Role};
+        use aj_models::types::ToolResultMessage;
 
         let transcript = vec![
-            MessageParam::new_user_message(vec![ContentBlockParam::new_text_block("hi".into())]),
-            MessageParam {
-                role: Role::Assistant,
-                content: vec![ContentBlockParam::ToolUseBlock {
+            AgentMessage::wire(Message::User(UserMessage::text("hi"))),
+            AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall(ToolCall {
                     id: "tu-1".to_string(),
                     name: "ping".to_string(),
-                    input: serde_json::json!({}),
-                    caller: None,
-                }],
-            },
+                    arguments: serde_json::json!({}),
+                })],
+                ..AssistantMessage::empty()
+            })),
         ];
         let dangling = super::scan_dangling_tool_uses(&transcript);
         assert!(dangling.contains("tu-1"));
 
         let mut transcript_with_resolution = transcript.clone();
-        transcript_with_resolution.push(MessageParam::new_user_message(vec![
-            ContentBlockParam::ToolResultBlock {
-                tool_use_id: "tu-1".to_string(),
-                content: "done".to_string().into(),
-                is_error: false,
-            },
-        ]));
+        transcript_with_resolution.push(AgentMessage::wire(Message::ToolResult(
+            ToolResultMessage::text("tu-1", "ping", "done", false),
+        )));
         assert!(super::scan_dangling_tool_uses(&transcript_with_resolution).is_empty());
     }
 

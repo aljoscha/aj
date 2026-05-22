@@ -5,7 +5,7 @@
 //! `aj continue`) and resolves a thread id to its on-disk path so
 //! [`crate::log::ConversationLog`] can open / create the right file.
 
-use aj_models::wire::{ContentBlockParam, Role};
+use aj_models::types::{Message, UserContent};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -252,10 +252,9 @@ pub struct ThreadPreview {
     /// `fs::metadata` we already had to call.
     pub size_bytes: u64,
     /// Number of [`ConversationEntryKind::Message`] entries in the
-    /// log. User and assistant messages both contribute; tool
-    /// results are projected on the wire as user-role messages so
-    /// they count too. Non-message entries (`SystemPrompt`,
-    /// `UserOutput`) are skipped.
+    /// log. User, assistant, and tool_result messages all
+    /// contribute; non-message entries (`SystemPrompt`) are
+    /// skipped.
     pub message_count: usize,
     /// First user-role textual content block in the file, if any.
     /// `None` for a freshly-minted thread that hasn't yet seen a
@@ -342,33 +341,16 @@ fn read_thread_preview_file(
         let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line) else {
             continue;
         };
-        // Both the legacy [`ConversationEntryKind::Message`] entries
-        // and the structured [`ConversationEntryKind::ToolResult`]
-        // entries (introduced by the §3 work — see
-        // `docs/aj-next-progress.md`) carry wire-level messages that
-        // count toward the thread's user-visible message count and
-        // its `last_message_at` recency bucket. The preview only
-        // ever needs the user's first text — which lives on a
-        // [`Message`] entry — for the row label, so the
-        // `first_user_message` capture stays on the
-        // [`Message`]-only path.
         match &entry.entry {
-            ConversationEntryKind::Message(msg) => {
+            ConversationEntryKind::Message { message: msg } => {
                 message_count += 1;
-                if first_user_message.is_none() && matches!(msg.role, Role::User) {
-                    if let Some(text) = first_text_block(&msg.content) {
-                        first_user_message = Some(text);
+                if let Some(Message::User(u)) = msg.as_wire() {
+                    if first_user_message.is_none() {
+                        if let Some(text) = first_user_text(&u.content) {
+                            first_user_message = Some(text);
+                        }
                     }
                 }
-                if let Some(ts) = entry.timestamp {
-                    last_message_at = Some(match last_message_at {
-                        Some(prev) if prev >= ts => prev,
-                        _ => ts,
-                    });
-                }
-            }
-            ConversationEntryKind::ToolResult { .. } => {
-                message_count += 1;
                 if let Some(ts) = entry.timestamp {
                     last_message_at = Some(match last_message_at {
                         Some(prev) if prev >= ts => prev,
@@ -436,14 +418,13 @@ fn parse_thread_id_created_at(thread_id: &str) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
-/// Return the text from the first [`ContentBlockParam::TextBlock`]
-/// in `content`, if any. Used by [`read_thread_preview_file`] to
-/// capture the user-input preview without dragging tool-result
-/// content into it (tool result wire messages are user-role).
-fn first_text_block(content: &[ContentBlockParam]) -> Option<String> {
+/// Return the text from the first [`UserContent::Text`] block in
+/// `content`, if any. Used by [`read_thread_preview_file`] to
+/// capture the user-input preview.
+fn first_user_text(content: &[UserContent]) -> Option<String> {
     content.iter().find_map(|b| match b {
-        ContentBlockParam::TextBlock { text, .. } => {
-            let trimmed = text.trim();
+        UserContent::Text(t) => {
+            let trimmed = t.text.trim();
             if trimmed.is_empty() {
                 None
             } else {
@@ -458,11 +439,15 @@ fn first_text_block(content: &[ContentBlockParam]) -> Option<String> {
 mod tests {
     use std::cell::RefCell;
 
-    use aj_models::wire::{ContentBlockParam, MessageParam, Role};
+    use aj_agent::message::AgentMessage;
+    use aj_models::types::{
+        AssistantContent, AssistantMessage, Message, TextContent, ToolCall, ToolResultMessage,
+        UserMessage,
+    };
     use tempfile::TempDir;
 
     use super::*;
-    use crate::log::{ConversationLog, ThreadKind};
+    use crate::log::{ConversationLog, ConversationView, ThreadKind};
 
     /// Build a `ConversationPersistence` against a fresh temp dir.
     fn fixture() -> (TempDir, ConversationPersistence) {
@@ -471,45 +456,27 @@ mod tests {
         (dir, persistence)
     }
 
-    /// Append one user-text message and one assistant-text message to
-    /// `log`, returning the new tail id. Used by the preview tests so
-    /// the JSONL contains exactly the entries we want to assert on.
-    fn append_user_then_assistant(
-        log: &mut ConversationLog,
-        user_text: &str,
-        assistant_text: &str,
-    ) {
-        let user_msg = MessageParam {
-            role: Role::User,
-            content: vec![ContentBlockParam::TextBlock {
-                text: user_text.to_string(),
-                citations: None,
-                signature: None,
-            }],
-        };
-        let user_id = log
-            .append(
-                None,
-                ThreadKind::User,
-                None,
-                ConversationEntryKind::Message(user_msg),
-            )
-            .expect("append user");
-        let assistant_msg = MessageParam {
-            role: Role::Assistant,
-            content: vec![ContentBlockParam::TextBlock {
-                text: assistant_text.to_string(),
-                citations: None,
-                signature: None,
-            }],
-        };
-        log.append(
-            Some(user_id),
-            ThreadKind::User,
-            None,
-            ConversationEntryKind::Message(assistant_msg),
-        )
-        .expect("append assistant");
+    fn user_msg(text: &str) -> AgentMessage {
+        AgentMessage::wire(Message::User(UserMessage::text(text)))
+    }
+
+    fn assistant_text(text: &str) -> AgentMessage {
+        AgentMessage::wire(Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            })],
+            ..AssistantMessage::empty()
+        }))
+    }
+
+    /// Append one user-text message and one assistant-text message
+    /// via the high-level [`ConversationView::add_message`] path.
+    fn append_user_then_assistant(log: &mut ConversationLog, u: &str, a: &str) {
+        let mut view = ConversationView::user(log, None);
+        view.add_message(user_msg(u)).expect("append user");
+        view.add_message(assistant_text(a))
+            .expect("append assistant");
     }
 
     #[test]
@@ -532,21 +499,9 @@ mod tests {
         let head = log
             .latest_leaf(crate::ThreadFilter::USER)
             .expect("head exists");
-        let user_msg2 = MessageParam {
-            role: Role::User,
-            content: vec![ContentBlockParam::TextBlock {
-                text: "follow-up".to_string(),
-                citations: None,
-                signature: None,
-            }],
-        };
-        log.append(
-            Some(head),
-            ThreadKind::User,
-            None,
-            ConversationEntryKind::Message(user_msg2),
-        )
-        .expect("append second user");
+        let mut view = ConversationView::user(&mut log, Some(head));
+        view.add_message(user_msg("follow-up"))
+            .expect("append second user");
 
         let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
@@ -560,14 +515,11 @@ mod tests {
     #[test]
     fn list_thread_previews_emits_progress_callback_per_file() {
         let (_dir, persistence) = fixture();
-        // Three separate thread files.
         for i in 0..3 {
             let mut log = ConversationLog::create(&persistence).expect("create");
             append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
             // Tiny sleep so the millisecond-resolution mint sees a
-            // fresh timestamp for each file — otherwise `_N` suffix
-            // collisions still produce distinct files but ordering
-            // becomes a function of suffix rather than time.
+            // fresh timestamp for each file.
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
 
@@ -577,31 +529,19 @@ mod tests {
             .expect("list");
         assert_eq!(previews.len(), 3);
         let p = progress.into_inner();
-        // One callback per file, total is the candidate count.
         assert_eq!(p, vec![(1, 3), (2, 3), (3, 3)]);
     }
 
     #[test]
-    fn list_thread_previews_ignores_first_text_when_empty() {
+    fn list_thread_previews_ignores_non_user_first_messages() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
-        // First user message with no text block (e.g. only tool
-        // results). The preview should leave `first_user_message`
-        // at `None`.
-        let tool_only = MessageParam {
-            role: Role::User,
-            content: vec![ContentBlockParam::ToolResultBlock {
-                tool_use_id: "x".into(),
-                content: String::from("ok").into(),
-                is_error: false,
-            }],
-        };
-        log.append(
-            None,
-            ThreadKind::User,
-            None,
-            ConversationEntryKind::Message(tool_only),
-        )
+        // First message is a tool_result (not a user prompt). The
+        // preview should leave `first_user_message` at `None`.
+        let mut view = ConversationView::user(&mut log, None);
+        view.add_message(AgentMessage::wire(Message::ToolResult(
+            ToolResultMessage::text("x", "ping", "ok", false),
+        )))
         .expect("append");
 
         let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
@@ -613,7 +553,6 @@ mod tests {
     #[test]
     fn list_thread_previews_skips_pre_refactor_files() {
         let (_dir, persistence) = fixture();
-        // Drop a bogus .jsonl that won't parse as the new format.
         let bogus = persistence.threads_dir.join("old.jsonl");
         std::fs::write(&bogus, "not json at all\n").expect("write");
 
@@ -623,11 +562,8 @@ mod tests {
 
     #[test]
     fn parse_thread_id_created_at_round_trips_minted_id() {
-        // The mint format is `%Y-%m-%d-%H-%M-%S-%3f`; parsing a known
-        // stem should give back the corresponding UTC instant.
         let parsed = super::parse_thread_id_created_at("2025-05-11-14-22-03-512")
             .expect("known-good stem parses");
-        // Build the same instant from components and compare.
         let expected = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
             .unwrap()
             .and_hms_milli_opt(14, 22, 3, 512)
@@ -638,9 +574,6 @@ mod tests {
 
     #[test]
     fn parse_thread_id_created_at_strips_collision_suffix() {
-        // `_<digits>` suffix marks an intra-millisecond collision —
-        // strip it before parsing. The result should be the same as
-        // the suffix-less id.
         let suffix = super::parse_thread_id_created_at("2025-05-11-14-22-03-512_3")
             .expect("suffixed stem parses");
         let bare =
@@ -650,12 +583,8 @@ mod tests {
 
     #[test]
     fn parse_thread_id_created_at_returns_none_for_unrecognised_stem() {
-        // Hand-renamed files, placeholder ids, or future formats
-        // should produce `None` so the caller can fall back to
-        // file-mtime.
         assert!(super::parse_thread_id_created_at("custom-name").is_none());
         assert!(super::parse_thread_id_created_at("").is_none());
-        // Underscore with non-digit suffix isn't a collision marker.
         assert!(super::parse_thread_id_created_at("2025-05-11-14-22-03-512_abc").is_none());
     }
 
@@ -669,76 +598,50 @@ mod tests {
         let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         let p = &previews[0];
-        // The id was minted from `Utc::now()` at create-time, so the
-        // parsed `created_at` should land within a few seconds of
-        // when the test ran. We assert it parses back to the same
-        // instant the id encodes by re-parsing the stem ourselves.
         let expected =
             super::parse_thread_id_created_at(&thread_id).expect("freshly-minted id parses");
         assert_eq!(p.created_at, expected);
     }
 
     #[test]
-    fn list_thread_previews_counts_structured_tool_result_entries_as_messages() {
-        // The persistence preview's `message_count` and
-        // `last_message_at` must include the structured
-        // [`ConversationEntryKind::ToolResult`] entries written
-        // through [`ConversationView::add_tool_result`], not just
-        // the legacy [`ConversationEntryKind::Message`] entries.
-        // Otherwise a session that only used the new variant for
-        // its tool results would underreport its message count and
-        // surface an artificially-old `last_message_at` in the
-        // selector overlay.
+    fn list_thread_previews_counts_tool_result_entries() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
-        // Seed a user / assistant exchange via the high-level view
-        // so each line lands with a real timestamp.
         {
-            let mut view = crate::log::ConversationView::user(&mut log, None);
-            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
-                .expect("u");
-            view.add_assistant_message(vec![ContentBlockParam::ToolUseBlock {
-                id: "tu-1".to_string(),
-                name: "ping".to_string(),
-                input: serde_json::json!({}),
-                caller: None,
-            }])
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: "tu-1".into(),
+                    name: "ping".into(),
+                    arguments: serde_json::json!({}),
+                })],
+                ..AssistantMessage::empty()
+            })))
             .expect("a");
-            view.add_tool_result(
-                vec![ContentBlockParam::ToolResultBlock {
-                    tool_use_id: "tu-1".to_string(),
-                    content: "ok".to_string().into(),
-                    is_error: false,
-                }],
-                std::collections::HashMap::new(),
-            )
-            .expect("tool result");
+            view.add_message(AgentMessage::wire(Message::ToolResult(
+                ToolResultMessage::text("tu-1", "ping", "ok", false),
+            )))
+            .expect("tr");
         }
 
         let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
-        let p = &previews[0];
-        // Three wire-level messages: user prompt, assistant tool-use
-        // turn, structured tool result.
-        assert_eq!(p.message_count, 3);
+        // Three wire-level messages: user, assistant, tool_result.
+        assert_eq!(previews[0].message_count, 3);
     }
 
     #[test]
-    fn list_thread_previews_falls_back_to_modified_for_last_message_at_when_no_entries() {
+    fn list_thread_previews_falls_back_to_modified_when_no_message_entries() {
         let (_dir, persistence) = fixture();
-        // Create a log but don't append anything — the file stays
-        // empty so there are zero message-kind entries.
         let _log = ConversationLog::create(&persistence).expect("create");
-        // The file is created lazily on first append; we need an
-        // on-disk file for `list_thread_previews` to see it, so
-        // append a single SystemPrompt entry (not a Message-kind
-        // entry, so it shouldn't bump `last_message_at`).
         let mut log = _log;
+        // Append a SystemPrompt entry (not a Message-kind entry).
         log.append(
             None,
             ThreadKind::Meta,
             None,
-            ConversationEntryKind::SystemPrompt {
+            crate::log::ConversationEntryKind::SystemPrompt {
                 text: "test".to_string(),
             },
         )
@@ -748,8 +651,6 @@ mod tests {
         assert_eq!(previews.len(), 1);
         let p = &previews[0];
         assert_eq!(p.message_count, 0);
-        // No message-kind entry was appended → `last_message_at`
-        // falls back to the file mtime.
         assert_eq!(p.last_message_at, p.modified);
     }
 
@@ -757,38 +658,18 @@ mod tests {
     fn list_thread_previews_uses_largest_message_timestamp() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
-        // Append two messages with a real time gap so each line gets
-        // a distinct timestamp.
         append_user_then_assistant(&mut log, "hello", "world");
         std::thread::sleep(std::time::Duration::from_millis(20));
         let head = log
             .latest_leaf(crate::ThreadFilter::USER)
             .expect("head exists");
-        let user2 = MessageParam {
-            role: Role::User,
-            content: vec![ContentBlockParam::TextBlock {
-                text: "follow-up".to_string(),
-                citations: None,
-                signature: None,
-            }],
-        };
-        log.append(
-            Some(head),
-            ThreadKind::User,
-            None,
-            ConversationEntryKind::Message(user2),
-        )
-        .expect("append user2");
+        let mut view = ConversationView::user(&mut log, Some(head));
+        view.add_message(user_msg("follow-up"))
+            .expect("append user2");
 
         let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         let p = &previews[0];
-        // The last appended message is the latest in this case, so
-        // `last_message_at` should match its timestamp. We can't
-        // assert the exact instant (the test doesn't know it) but
-        // it must be strictly after the first message's timestamp
-        // window — we sanity-check by requiring `last_message_at`
-        // to be no earlier than `created_at` + 10ms.
         let min_expected = p.created_at + chrono::Duration::milliseconds(10);
         assert!(
             p.last_message_at >= min_expected,

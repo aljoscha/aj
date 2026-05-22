@@ -30,7 +30,7 @@ use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
 use aj_models::registry::ModelRegistry;
-use aj_models::wire::Speed;
+use aj_models::types::Speed;
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
@@ -278,7 +278,7 @@ impl InteractiveMode {
                 .latest_leaf(ThreadFilter::USER)
                 .expect("post-repair head exists when pre-repair head did");
             let conversation = log.linearize(&head, ThreadFilter::USER);
-            let messages: Vec<_> = conversation.messages();
+            let messages: Vec<_> = conversation.agent_messages();
             agent.seed_messages(messages);
         }
 
@@ -1262,7 +1262,9 @@ async fn perform_thread_swap(
     //    minted ids in this session don't collide with any
     //    sub-agent subtrees already on the log.
     let messages: Vec<_> = if let Some(head) = new_log.latest_leaf(ThreadFilter::USER) {
-        new_log.linearize(&head, ThreadFilter::USER).messages()
+        new_log
+            .linearize(&head, ThreadFilter::USER)
+            .agent_messages()
     } else {
         Vec::new()
     };

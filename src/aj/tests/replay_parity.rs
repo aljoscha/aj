@@ -49,7 +49,7 @@ use aj::config::theme::{Theme, ThemeHandle, chat_theme};
 use aj::modes::interactive::event_pump::EventPump;
 use aj::modes::interactive::layout::{SlotIndex, build_layout};
 use aj_agent::bus::{Listener, listener_from_sync};
-use aj_agent::events::{AgentEvent, PersistedMessageKind};
+use aj_agent::events::AgentEvent;
 use aj_agent::tool::ErasedToolDefinition;
 use aj_agent::{Agent, TurnError};
 use aj_conf::AgentEnv;
@@ -218,19 +218,14 @@ fn render_chat(tui: &mut Tui) -> Vec<String> {
 }
 
 /// Build a kill-switch [`Listener`] that returns `Err` the first
-/// time it sees `MessagePersisted::ToolResult`. Earlier listeners
-/// in the bus's registration order have already observed the
-/// event before this one runs, so persistence and event capture
-/// both complete for that final event before the error propagates.
+/// time it sees a `ToolExecutionEnd` event. Earlier listeners in
+/// the bus's registration order have already observed the
+/// preceding `MessageEnd { ToolResult }` (so persistence wrote it
+/// and the capture buffer saw it) before this one fires, mirroring
+/// a crash between tool-result persistence and the next inference.
 fn kill_switch_listener() -> Listener {
     Arc::new(|event: &AgentEvent| {
-        if matches!(
-            event,
-            AgentEvent::MessagePersisted {
-                kind: PersistedMessageKind::ToolResult { .. },
-                ..
-            }
-        ) {
+        if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
             Box::pin(async { Err(anyhow!("kill switch: stop before next inference")) })
         } else {
             Box::pin(async { Ok(()) })

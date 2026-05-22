@@ -1,15 +1,14 @@
 //! Bus listener that drives the conversation log off of
-//! [`AgentEvent::MessagePersisted`].
+//! [`AgentEvent::MessageEnd`].
 //!
-//! Per `docs/aj-next-plan.md` §2.3b and §2.4b, the agent emits a
-//! typed [`AgentEvent::MessagePersisted`] for every payload that
-//! needs to hit disk: the user's typed prompt, the assistant
-//! message, the synthesized user-role message carrying tool-result
-//! content blocks, and the freestanding [`UserOutput`] entries
-//! written for tool-call parse failures and tool-execution errors.
-//! A persistence listener subscribed to the agent's bus owns the
-//! [`ConversationLog`] handle and translates each event into one
-//! [`ConversationView`] append.
+//! Per `docs/aj-next-plan.md` §2.4b, the agent emits a typed
+//! [`AgentEvent::MessageEnd`] for every payload that needs to hit
+//! disk: the user's typed prompt, the assistant message at the end
+//! of every inference, and one tool_result message per tool call in
+//! a tool batch. A persistence listener subscribed to the agent's
+//! bus owns the [`ConversationLog`] handle and translates each
+//! [`MessageEnd`] event into one [`ConversationView::add_message`]
+//! call.
 //!
 //! Because the bus awaits each listener inline (`docs/aj-next-plan.md`
 //! §1.4 — "Hook vs subscriber pattern"), the listener returning
@@ -20,7 +19,7 @@
 //! Sub-agent first-entry anchoring (per `docs/aj-next-plan.md` §1.6)
 //! is the listener's responsibility too: when the agent emits
 //! [`AgentEvent::SubAgentStart`] the listener captures the parent
-//! thread's current head; the next [`AgentEvent::MessagePersisted`]
+//! thread's current head; the next [`AgentEvent::MessageEnd`]
 //! tagged with the spawned `Sub(n)` agent id (whose own thread is
 //! still empty) anchors at that captured head. Subsequent
 //! sub-agent writes follow the chain via
@@ -35,14 +34,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aj_agent::bus::Listener;
-use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind};
+use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::message::AgentMessage;
 use anyhow::{Result, anyhow};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::log::{ConversationLog, ConversationView, EntryId, ThreadFilter};
 
-/// Build a [`Listener`] that writes every
-/// [`AgentEvent::MessagePersisted`] to the given log handle.
+/// Build a [`Listener`] that writes every finalized
+/// [`AgentEvent::MessageEnd`] to the given log handle.
 ///
 /// Other event variants are intentional no-ops here, with one
 /// exception: [`AgentEvent::SubAgentStart`] populates an internal
@@ -54,28 +54,20 @@ use crate::log::{ConversationLog, ConversationView, EntryId, ThreadFilter};
 pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
     // `Sub(n)` ↦ parent's `latest_leaf` at spawn time. Populated by
     // [`AgentEvent::SubAgentStart`], drained by the first
-    // [`AgentEvent::MessagePersisted`] tagged with `Sub(n)`. A
-    // tokio mutex keeps the access points async-friendly even
-    // though the map itself is touched only briefly.
+    // [`AgentEvent::MessageEnd`] tagged with `Sub(n)`. A tokio mutex
+    // keeps the access points async-friendly even though the map
+    // itself is touched only briefly.
     let pending_anchors: Arc<TokioMutex<HashMap<usize, EntryId>>> =
         Arc::new(TokioMutex::new(HashMap::new()));
 
     Arc::new(move |event: &AgentEvent| {
         let log = Arc::clone(&log);
         let anchors = Arc::clone(&pending_anchors);
-        // Capture the event by value so the returned future doesn't
-        // borrow from the bus's snapshot. `AgentEvent` is `Clone`
-        // (cheap field clones) so this is fine for our event volume.
         let event = event.clone();
         Box::pin(async move {
             match event {
                 AgentEvent::SubAgentStart { parent, child, .. } => {
                     let AgentId::Sub(child_n) = child else {
-                        // The agent only ever spawns sub-agents
-                        // (`Main` is reserved for the top-level
-                        // instance), so this branch should never
-                        // fire; treating it as an error guards the
-                        // invariant.
                         return Err(anyhow!("SubAgentStart with non-Sub child {child:?}"));
                     };
                     let parent_filter = filter_for(parent);
@@ -88,10 +80,10 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
                     drop(log_guard);
                     anchors.lock().await.insert(child_n, parent_head);
                 }
-                AgentEvent::MessagePersisted { agent_id, kind } => {
+                AgentEvent::MessageEnd { agent_id, message } => {
                     let mut log_guard = log.lock().await;
                     let mut anchors_guard = anchors.lock().await;
-                    persist(&mut log_guard, &mut anchors_guard, agent_id, kind)?;
+                    persist(&mut log_guard, &mut anchors_guard, agent_id, message)?;
                 }
                 _ => {}
             }
@@ -100,7 +92,7 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
     })
 }
 
-/// Append one entry to the log on behalf of `agent_id`.
+/// Append one finalized message to the log on behalf of `agent_id`.
 ///
 /// For [`AgentId::Main`] the parent for the new entry is the user
 /// thread's current `latest_leaf` (or `None`, anchoring at the
@@ -113,7 +105,7 @@ fn persist(
     log: &mut ConversationLog,
     pending_anchors: &mut HashMap<usize, EntryId>,
     agent_id: AgentId,
-    kind: PersistedMessageKind,
+    message: AgentMessage,
 ) -> Result<()> {
     let mut view = match agent_id {
         AgentId::Main => {
@@ -141,31 +133,7 @@ fn persist(
         }
     };
 
-    match kind {
-        PersistedMessageKind::User { content } => {
-            view.add_user_message(content)?;
-        }
-        PersistedMessageKind::Assistant { content } => {
-            view.add_assistant_message(content)?;
-        }
-        PersistedMessageKind::ToolResult { content, details } => {
-            // Ride the structured per-call [`ToolDetails`] payload
-            // alongside the wire `tool_result` blocks on a single
-            // [`ConversationEntryKind::ToolResult`] entry, so a
-            // resumed session can rehydrate the renderer state
-            // (diffs, todo snapshots, bash exit codes, sub-agent
-            // reports) instead of falling back to the wire
-            // text-only projection. The wire projection in
-            // [`Conversation::messages`] still surfaces the entry
-            // as one user-role message per tool batch, so the
-            // model continues to see the same shape on the next
-            // inference.
-            view.add_tool_result(content, details)?;
-        }
-        PersistedMessageKind::UserOutput { output } => {
-            view.add_user_output(output)?;
-        }
-    }
+    view.add_message(message)?;
     Ok(())
 }
 
@@ -180,14 +148,14 @@ fn filter_for(agent_id: AgentId) -> ThreadFilter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use aj_agent::bus::EventBus;
-    use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind};
-    use aj_agent::tool::ToolDetails;
-    use aj_agent::types::UserOutput;
-    use aj_models::wire::{ContentBlockParam, Role, ToolResultContent};
+    use aj_agent::events::{AgentEvent, AgentId};
+    use aj_agent::message::AgentMessage;
+    use aj_models::types::{
+        AssistantContent, AssistantMessage, Message, TextContent, ToolResultMessage, UserMessage,
+    };
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -206,19 +174,37 @@ mod tests {
         (dir, Arc::new(TokioMutex::new(log)))
     }
 
+    fn user_msg(text: &str) -> AgentMessage {
+        AgentMessage::wire(Message::User(UserMessage::text(text)))
+    }
+
+    fn assistant_text(text: &str) -> AgentMessage {
+        AgentMessage::wire(Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            })],
+            ..AssistantMessage::empty()
+        }))
+    }
+
+    fn tool_result(id: &str, name: &str, body: &str) -> AgentMessage {
+        AgentMessage::wire(Message::ToolResult(ToolResultMessage::text(
+            id, name, body, false,
+        )))
+    }
+
     #[tokio::test]
-    async fn user_kind_appends_to_empty_user_thread() {
+    async fn user_message_appends_to_empty_user_thread() {
         // First user message on a fresh thread anchors at the
         // SystemPrompt root entry.
         let (_dir, log) = fresh_log();
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
-        bus.emit(AgentEvent::MessagePersisted {
+        bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
-            kind: PersistedMessageKind::User {
-                content: vec![ContentBlockParam::new_text_block("hi".into())],
-            },
+            message: user_msg("hi"),
         })
         .await
         .expect("emit");
@@ -228,36 +214,25 @@ mod tests {
             .latest_leaf(ThreadFilter::USER)
             .expect("user-thread head exists after emit");
         let convo = log_guard.linearize(&head, ThreadFilter::USER);
-        let last = convo
-            .last_message()
-            .expect("conversation has at least one message");
-        assert!(matches!(last.role, Role::User));
-        assert_eq!(last.content.len(), 1);
+        let last = convo.last_message().expect("at least one message");
+        assert!(matches!(last, Message::User(_)));
     }
 
     #[tokio::test]
-    async fn assistant_kind_appends_user_thread_assistant_message() {
+    async fn assistant_message_appends_to_user_thread() {
         let (_dir, log) = fresh_log();
-        // Seed a user message so the assistant message has a parent
-        // in the user thread; without this the listener would error
-        // ("thread has no head entry") because the system-prompt
-        // root is a Meta entry, not a User-thread one.
         {
             let mut log_guard = log.lock().await;
             let mut view = ConversationView::user(&mut log_guard, None);
-            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
-                .expect("user msg");
+            view.add_message(user_msg("hi")).expect("user msg");
         }
 
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
-        let assistant_content = vec![ContentBlockParam::new_text_block("hello".into())];
-        bus.emit(AgentEvent::MessagePersisted {
+        bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
-            kind: PersistedMessageKind::Assistant {
-                content: assistant_content.clone(),
-            },
+            message: assistant_text("hello"),
         })
         .await
         .expect("emit");
@@ -267,169 +242,65 @@ mod tests {
             .latest_leaf(ThreadFilter::USER)
             .expect("user-thread head exists");
         let convo = log_guard.linearize(&head, ThreadFilter::USER);
-        let last = convo
-            .last_message()
-            .expect("conversation has at least one message");
-        assert!(matches!(last.role, Role::Assistant));
-        assert_eq!(last.content.len(), assistant_content.len());
+        let last = convo.last_message().expect("at least one message");
+        assert!(matches!(last, Message::Assistant(_)));
     }
 
     #[tokio::test]
-    async fn user_output_kind_appends_freestanding_entry() {
+    async fn tool_result_message_appends_to_user_thread() {
         let (_dir, log) = fresh_log();
         {
             let mut log_guard = log.lock().await;
             let mut view = ConversationView::user(&mut log_guard, None);
-            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
-                .expect("user msg");
+            view.add_message(user_msg("hi")).expect("u");
+            // Assistant turn carrying a tool call.
+            let assistant = AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall(aj_models::types::ToolCall {
+                    id: "tu-1".into(),
+                    name: "ping".into(),
+                    arguments: serde_json::json!({}),
+                })],
+                ..AssistantMessage::empty()
+            }));
+            view.add_message(assistant).expect("a");
         }
 
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
-        bus.emit(AgentEvent::MessagePersisted {
+        bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
-            kind: PersistedMessageKind::UserOutput {
-                output: UserOutput::ToolError {
-                    tool_name: "ping".into(),
-                    input: "{}".into(),
-                    error: "boom".into(),
-                },
-            },
-        })
-        .await
-        .expect("emit");
-
-        // The new entry shows up as a freestanding `UserOutput`
-        // entry on the user thread (matching the legacy on-disk
-        // shape; see the §2.0 reconnaissance findings in
-        // `docs/aj-next-progress.md`).
-        let log_guard = log.lock().await;
-        let head = log_guard
-            .latest_leaf(ThreadFilter::USER)
-            .expect("latest user-thread leaf exists");
-        let entries: Vec<_> = log_guard.entries_in_order().into_iter().cloned().collect();
-        let last = entries.last().expect("log has entries");
-        assert_eq!(&last.id, &head);
-        assert!(matches!(
-            last.entry,
-            ConversationEntryKind::UserOutput(UserOutput::ToolError { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn tool_result_kind_writes_structured_tool_result_entry() {
-        // The listener routes `PersistedMessageKind::ToolResult`
-        // through [`ConversationView::add_tool_result`] so the
-        // structured per-call [`ToolDetails`] payload lands on disk
-        // alongside the wire `tool_result` content blocks. On resume
-        // the entry deserializes back to
-        // [`ConversationEntryKind::ToolResult`] with the same
-        // `tool_use_id ↦ ToolDetails` mapping, so the renderer can
-        // rehydrate the structured body (here a `ToolDetails::Text`
-        // for [`PingTool`]-style fixtures) instead of falling back
-        // to the text-only wire projection.
-        let (_dir, log) = fresh_log();
-        // Seed a user/assistant turn so the tool-result entry has a
-        // non-empty pre-existing thread to attach to (matches the
-        // production sequence: a `ToolResult` only ever follows an
-        // assistant turn carrying `tool_use` blocks).
-        {
-            let mut log_guard = log.lock().await;
-            let mut view = ConversationView::user(&mut log_guard, None);
-            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
-                .expect("user msg");
-            view.add_assistant_message(vec![ContentBlockParam::ToolUseBlock {
-                id: "tu-1".into(),
-                name: "ping".into(),
-                input: serde_json::json!({}),
-                caller: None,
-            }])
-            .expect("assistant msg");
-        }
-
-        let bus = EventBus::new();
-        let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
-
-        let mut details = HashMap::new();
-        details.insert(
-            "tu-1".to_string(),
-            ToolDetails::Text {
-                summary: "ping".to_string(),
-                body: "pong".to_string(),
-            },
-        );
-        bus.emit(AgentEvent::MessagePersisted {
-            agent_id: AgentId::Main,
-            kind: PersistedMessageKind::ToolResult {
-                content: vec![ContentBlockParam::ToolResultBlock {
-                    tool_use_id: "tu-1".into(),
-                    content: ToolResultContent::Text("pong".into()),
-                    is_error: false,
-                }],
-                details,
-            },
+            message: tool_result("tu-1", "ping", "pong"),
         })
         .await
         .expect("emit tool result");
 
-        // The freshly-appended entry on the user thread must be a
-        // structured `ToolResult` carrying both halves — wire
-        // content for the model and structured details for the
-        // renderer.
         let log_guard = log.lock().await;
         let entries: Vec<_> = log_guard.entries_in_order().into_iter().cloned().collect();
         let last = entries.last().expect("log has entries");
         match &last.entry {
-            ConversationEntryKind::ToolResult { content, details } => {
-                assert_eq!(content.len(), 1);
-                let stored = details
-                    .get("tu-1")
-                    .expect("details map keyed by tool_use_id");
-                match stored {
-                    ToolDetails::Text { summary, body } => {
-                        assert_eq!(summary, "ping");
-                        assert_eq!(body, "pong");
-                    }
-                    other => panic!("expected Text details, got {other:?}"),
+            ConversationEntryKind::Message { message: m } => match m.as_wire() {
+                Some(Message::ToolResult(tr)) => {
+                    assert_eq!(tr.tool_call_id, "tu-1");
+                    assert!(!tr.is_error);
                 }
-            }
-            other => panic!("expected ToolResult entry, got {other:?}"),
+                other => panic!("expected ToolResult wire message, got {other:?}"),
+            },
+            other => panic!("expected Message entry, got {other:?}"),
         }
-
-        // The wire projection still surfaces the entry as one
-        // user-role message per tool batch so the model continues
-        // to see the same shape on the next inference.
-        let head = log_guard
-            .latest_leaf(ThreadFilter::USER)
-            .expect("user-thread head exists");
-        let convo = log_guard.linearize(&head, ThreadFilter::USER);
-        let projected = convo.last_message().expect("at least one message");
-        assert!(matches!(projected.role, Role::User));
-        assert!(matches!(
-            projected.content[0],
-            ContentBlockParam::ToolResultBlock { .. }
-        ));
     }
 
     #[tokio::test]
-    async fn sub_agent_first_entry_anchors_at_parent_head() {
+    async fn sub_agent_first_message_anchors_at_parent_head() {
         // The persistence listener must capture the parent's
         // `latest_leaf` from `SubAgentStart` and use it as the
-        // anchor for the sub-agent's first `MessagePersisted`
-        // event. Subsequent writes follow the sub-agent thread's
-        // own leaf.
+        // anchor for the sub-agent's first `MessageEnd` event.
         let (_dir, log) = fresh_log();
-        // Seed an assistant message on the parent thread to act as
-        // the spawning anchor — that's where the parent's
-        // `tool_use` block would live in production.
         let parent_anchor = {
             let mut log_guard = log.lock().await;
             let mut view = ConversationView::user(&mut log_guard, None);
-            view.add_user_message(vec![ContentBlockParam::new_text_block("hi".into())])
-                .expect("user msg");
-            view.add_assistant_message(vec![ContentBlockParam::new_text_block("ack".into())])
-                .expect("assistant msg");
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_text("ack")).expect("a");
             log_guard
                 .latest_leaf(ThreadFilter::USER)
                 .expect("parent anchor exists")
@@ -438,7 +309,6 @@ mod tests {
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
-        // Spawn announcement → captures parent_anchor for Sub(1).
         bus.emit(AgentEvent::SubAgentStart {
             parent: AgentId::Main,
             child: AgentId::Sub(1),
@@ -447,24 +317,16 @@ mod tests {
         .await
         .expect("emit start");
 
-        // Sub-agent's first write is its user-prompt message.
-        bus.emit(AgentEvent::MessagePersisted {
+        bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Sub(1),
-            kind: PersistedMessageKind::User {
-                content: vec![ContentBlockParam::new_text_block("do it".into())],
-            },
+            message: user_msg("do it"),
         })
         .await
         .expect("emit user");
 
-        // Sub-agent's second write is its assistant reply; this
-        // one should chain off the freshly-appended sub-agent leaf
-        // (no parent_anchor lookup needed).
-        bus.emit(AgentEvent::MessagePersisted {
+        bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Sub(1),
-            kind: PersistedMessageKind::Assistant {
-                content: vec![ContentBlockParam::new_text_block("done".into())],
-            },
+            message: assistant_text("done"),
         })
         .await
         .expect("emit assistant");
@@ -474,32 +336,25 @@ mod tests {
             .latest_leaf(ThreadFilter::subagent(1))
             .expect("sub-agent thread head exists");
         let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
-        // 2 messages: User + Assistant, in source order.
         let entries: Vec<_> = convo.entries().to_vec();
         assert_eq!(entries.len(), 2, "got entries: {entries:#?}");
-        // The first sub-agent entry must be parented at the
-        // parent's anchor.
         let first = &entries[0];
         assert_eq!(first.parent_id.as_ref(), Some(&parent_anchor));
     }
 
     #[tokio::test]
     async fn sub_agent_assistant_without_anchor_returns_error() {
-        // The listener treats a missing thread head as a hard error
-        // for sub-agent writes when no `SubAgentStart` was observed
-        // beforehand: there's no captured anchor and the sub-agent
-        // thread has no leaf yet. The bus surfaces the error back
-        // to the caller of `emit`.
+        // No `SubAgentStart` captured beforehand: the sub-agent
+        // thread has no leaf and no anchor, so the bus call should
+        // fail.
         let (_dir, log) = fresh_log();
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
         let err = bus
-            .emit(AgentEvent::MessagePersisted {
+            .emit(AgentEvent::MessageEnd {
                 agent_id: AgentId::Sub(2),
-                kind: PersistedMessageKind::Assistant {
-                    content: Vec::new(),
-                },
+                message: assistant_text("done"),
             })
             .await
             .expect_err("emit should fail when sub-agent thread is empty");
@@ -507,8 +362,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_persistence_events_do_nothing() {
-        // Other event variants (notices, warnings, lifecycle markers)
+    async fn non_message_end_events_do_nothing() {
+        // MessageStart / MessageUpdate / notices / lifecycle markers
         // flow through the listener as no-ops. The log stays at
         // exactly one entry (the system prompt).
         let (_dir, log) = fresh_log();
@@ -518,6 +373,12 @@ mod tests {
         bus.emit(AgentEvent::Notice {
             agent_id: AgentId::Main,
             text: "ignored".into(),
+        })
+        .await
+        .expect("emit");
+        bus.emit(AgentEvent::MessageStart {
+            agent_id: AgentId::Main,
+            message: user_msg("ignored too"),
         })
         .await
         .expect("emit");
