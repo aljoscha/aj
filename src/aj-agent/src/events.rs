@@ -46,55 +46,6 @@ pub enum AgentId {
     Sub(usize),
 }
 
-/// Channel for streaming content. Routed by listeners onto distinct
-/// UI components — visible text vs. extended thinking vs. replayed
-/// user input — so renderers can style them differently and
-/// persistence can decide whether each is worth keeping (today: only
-/// the finalized message is persisted; streaming is transient).
-///
-/// [`StreamChannel::User`] is used exclusively by replay (see
-/// [`aj_session::replay`]): live user input arrives via the readline
-/// loop and never flows through the bus, but resuming a thread
-/// projects each persisted user-role text message as a Start/Stop
-/// pair on the user channel so the renderer can repaint the prior
-/// turns through the same path it uses for live streaming.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamChannel {
-    /// Visible assistant text.
-    Text,
-    /// Extended thinking ("reasoning") content.
-    Thinking,
-    /// Replayed user input. Only emitted during conversation replay;
-    /// live user prompts are echoed by the terminal directly.
-    User,
-}
-
-/// Streaming progress action for an in-flight assistant content block.
-///
-/// `Start` opens a new block with its initial snapshot, `Update`
-/// reports incremental deltas as the model streams more tokens, and
-/// `Stop` finalizes the block with its complete content. Renderers
-/// that miss intermediate `Update`s can repaint cleanly off the
-/// `Stop` snapshot. Once the agent migrates to unified streaming
-/// (`AssistantMessageEvent`) in §2.4 of `docs/aj-next-plan.md`, this
-/// enum and the [`AgentEvent::StreamChunk`] variant fold into
-/// [`AgentEvent::MessageUpdate`].
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StreamAction {
-    /// First fragment of a new block. `snapshot` is the initial chunk
-    /// the renderer should display.
-    Start { snapshot: String },
-    /// Incremental delta. `delta` is the bytes appended since the last
-    /// event on this channel.
-    Update { delta: String },
-    /// Block finalized. `snapshot` is the final, complete content of
-    /// the block; renderers that drop intermediate `Update`s can fall
-    /// back on this for the full text.
-    Stop { snapshot: String },
-}
-
 /// What the persistence listener should append to the log when it
 /// observes an [`AgentEvent::MessagePersisted`].
 ///
@@ -157,15 +108,9 @@ pub enum PersistedMessageKind {
 /// Serialization shape (used by `aj --format json` and any other
 /// listener that ships events out-of-process): an internally tagged
 /// JSON object with the variant discriminator under `"type"` and the
-/// payload fields lifted to the top level. The three message-
-/// lifecycle variants ([`AgentEvent::MessageStart`],
-/// [`AgentEvent::MessageUpdate`], [`AgentEvent::MessageEnd`]) are
-/// `#[serde(skip)]`-marked: they carry an [`AssistantMessageEvent`]
-/// payload that doesn't yet derive [`Serialize`], and the agent does
-/// not emit them today (they fold into the unified streaming
-/// protocol in §2.4 of `docs/aj-next-plan.md`, at which point the
-/// skip drops). Attempting to serialize one will fail loudly rather
-/// than ship malformed JSONL.
+/// payload fields lifted to the top level. Every variant that the
+/// agent actually emits is fully serializable; round-tripping
+/// through JSONL is part of the print-mode contract.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -190,25 +135,28 @@ pub enum AgentEvent {
 
     // --- Message lifecycle -------------------------------------------------
     /// A message has been added to the transcript. Fired for user,
-    /// assistant, and tool-result messages alike.
-    #[serde(skip)]
+    /// assistant, and tool-result messages alike. The assistant case
+    /// fires once at the top of the streaming inference (with an
+    /// empty content vector); the user / tool-result cases fire
+    /// when the message is appended to the transcript.
     MessageStart {
         agent_id: AgentId,
         message: AgentMessage,
     },
     /// Streaming update for an assistant message in flight. Carries
-    /// the underlying provider [`AssistantMessageEvent`] so listeners
-    /// can drive incremental rendering, plus the partial
-    /// [`AgentMessage`] snapshot for callers that just want the
-    /// running text/thinking/tool-call state.
-    #[serde(skip)]
+    /// the underlying provider [`AssistantMessageEvent`] (with its
+    /// own `partial: AssistantMessage` snapshot) so listeners can
+    /// drive incremental rendering. Only fires between
+    /// [`MessageStart`] and [`MessageEnd`] for assistant messages.
     MessageUpdate {
         agent_id: AgentId,
         message: AgentMessage,
         event: AssistantMessageEvent,
     },
-    /// A message has been finalized.
-    #[serde(skip)]
+    /// A message has been finalized. The `message` field is the
+    /// authoritative final form; renderers / persistence listeners
+    /// should treat any in-flight state from `MessageUpdate` as
+    /// stale once this fires.
     MessageEnd {
         agent_id: AgentId,
         message: AgentMessage,
@@ -276,23 +224,6 @@ pub enum AgentEvent {
         attempt: u32,
         delay: Duration,
         error: String,
-    },
-
-    // --- Streaming bridge (§2.3 → §2.4) -----------------------------------
-    /// Streaming progress for an in-flight assistant content block.
-    ///
-    /// Bridging shape: the agent re-emits each provider
-    /// [`AssistantMessageEvent`] as a coarser-grained
-    /// `(channel, action)` pair so frontends can render text and
-    /// thinking deltas without learning the unified protocol's
-    /// per-block-index bookkeeping. In a future iteration this folds
-    /// into [`AgentEvent::MessageUpdate`] carrying the raw
-    /// [`AssistantMessageEvent`]; until then, [`StreamChannel`] +
-    /// [`StreamAction`] cover what the CLI / TUI renderer needs.
-    StreamChunk {
-        agent_id: AgentId,
-        channel: StreamChannel,
-        action: StreamAction,
     },
 
     /// Per-turn token usage snapshot. Bridging variant emitted at the
@@ -366,7 +297,6 @@ impl AgentEvent {
             | Self::Warning { agent_id, .. }
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
-            | Self::StreamChunk { agent_id, .. }
             | Self::TurnUsage { agent_id, .. }
             | Self::MessagePersisted { agent_id, .. }
             | Self::QueueUpdate { agent_id, .. } => *agent_id,
@@ -409,7 +339,7 @@ mod tests {
     /// JSONL writer; tomorrow any RPC bridge) rely on this contract,
     /// so we lock the discriminator key (`"type"`), the `snake_case`
     /// renaming of variant names, and the in-tagged shape of nested
-    /// enums (`AgentId`, `StreamChannel`, `StreamAction`,
+    /// enums (`AgentId`, `AssistantMessageEvent`,
     /// `PersistedMessageKind`). Adding a new event or renaming a field
     /// shows up here as a test breakage instead of silently changing
     /// the consumer-facing shape.
@@ -433,19 +363,38 @@ mod tests {
         // listener can pattern-match on the discriminator key cheaply.
         assert_eq!(json["agent_id"]["sub"], 7);
 
-        let chunk = AgentEvent::StreamChunk {
+        // Round-trip an assistant MessageUpdate carrying a TextDelta
+        // event so the in-tagged AssistantMessageEvent shape lands
+        // verbatim on the wire — the streaming protocol's discriminator
+        // ("type": "text_delta") and the per-block index both reach
+        // out-of-process consumers without any custom serializer.
+        use aj_models::streaming::AssistantMessageEvent;
+        use aj_models::types::AssistantMessage;
+        let partial = AssistantMessage {
+            content: vec![],
+            api: "scripted".into(),
+            provider: "scripted".into(),
+            model: "scripted".into(),
+            response_id: None,
+            usage: Default::default(),
+            stop_reason: aj_models::types::StopReason::Stop,
+            error: None,
+            timestamp: 0,
+        };
+        let update = AgentEvent::MessageUpdate {
             agent_id: AgentId::Main,
-            channel: StreamChannel::Text,
-            action: StreamAction::Update {
+            message: AgentMessage::wire(aj_models::types::Message::Assistant(partial.clone())),
+            event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
                 delta: "abc".into(),
+                partial,
             },
         };
-        let json = serde_json::to_value(&chunk).expect("stream chunk serializes");
-        assert_eq!(json["type"], "stream_chunk");
-        assert_eq!(json["channel"], "text");
-        // The action is a `tag = "kind"` enum: discriminator + payload.
-        assert_eq!(json["action"]["kind"], "update");
-        assert_eq!(json["action"]["delta"], "abc");
+        let json = serde_json::to_value(&update).expect("MessageUpdate serializes");
+        assert_eq!(json["type"], "message_update");
+        assert_eq!(json["event"]["type"], "text_delta");
+        assert_eq!(json["event"]["delta"], "abc");
+        assert_eq!(json["event"]["content_index"], 0);
 
         let persisted = AgentEvent::MessagePersisted {
             agent_id: AgentId::Main,

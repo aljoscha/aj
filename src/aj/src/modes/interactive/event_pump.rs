@@ -17,9 +17,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
+use aj_agent::events::{AgentEvent, AgentId, PersistedMessageKind};
+use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::types::TokenUsage;
-use aj_models::wire::ContentBlockParam;
+use aj_models::streaming::AssistantMessageEvent;
+use aj_models::types::{AssistantContent, Message, UserContent};
 use aj_tui::components::editor::Editor;
 use aj_tui::components::spacer::Spacer;
 use aj_tui::components::text::Text;
@@ -192,33 +194,42 @@ impl EventPump {
                 self.current_assistant = None;
             }
 
-            // ---- Streaming: assistant text and thinking. ----
-            AgentEvent::StreamChunk {
-                channel, action, ..
-            } => self.handle_stream_chunk(tui, *channel, action),
+            // ---- Streaming: unified message lifecycle. ----
+            //
+            // The agent emits a `MessageStart` / `MessageEnd` pair
+            // around every message (user, assistant, tool-result)
+            // and, for assistant streaming, one `MessageUpdate` per
+            // provider [`AssistantMessageEvent`]. Renderers consume
+            // the embedded event directly to drive in-flight text /
+            // thinking / tool-call blocks; the finalized payload on
+            // `MessageEnd` is the authoritative snapshot, used for
+            // resume (which has no deltas) and to confirm streaming
+            // results.
+            AgentEvent::MessageStart { message, .. } => {
+                self.handle_message_start(tui, message);
+            }
+            AgentEvent::MessageUpdate { event, .. } => {
+                self.handle_message_update(tui, event);
+            }
+            AgentEvent::MessageEnd { message, .. } => {
+                self.handle_message_end(tui, message);
+            }
 
-            // ---- Persisted messages: user and assistant turn finals. ----
+            // ---- Persisted messages: bookkeeping only. ----
             AgentEvent::MessagePersisted { kind, .. } => match kind {
-                PersistedMessageKind::User { content } => {
-                    self.append_user_message(tui, content);
-                }
-                PersistedMessageKind::Assistant { .. } => {
-                    // Streaming already painted the assistant
-                    // content; finalising just unbinds the
-                    // streaming target so the next turn starts a
-                    // fresh component.
-                    self.current_assistant = None;
-                }
-                PersistedMessageKind::ToolResult { .. }
+                PersistedMessageKind::User { .. }
+                | PersistedMessageKind::Assistant { .. }
+                | PersistedMessageKind::ToolResult { .. }
                 | PersistedMessageKind::UserOutput { .. } => {
-                    // Tool-result content is rendered through
-                    // `ToolExecutionEnd` (which carries the
-                    // structured `ToolDetails`); the persisted
-                    // record is the wire-side projection. Free-
-                    // standing `UserOutput::ToolError` records
-                    // similarly already came through as a
-                    // `ToolExecutionEnd { is_error: true }`. No
-                    // visible work here.
+                    // The rendering pathway is the unified
+                    // `MessageStart` / `MessageEnd` pair (for user
+                    // and assistant turns) and `ToolExecutionEnd`
+                    // (for tool results); the persistence event is
+                    // for the persistence listener's eyes only.
+                    // Free-standing `UserOutput::ToolError` records
+                    // are surfaced as `ToolExecutionEnd { is_error:
+                    // true }` by the agent loop, so there's no
+                    // additional rendering to do here either.
                 }
             },
 
@@ -276,13 +287,9 @@ impl EventPump {
             AgentEvent::SubAgentStart { .. }
             | AgentEvent::SubAgentEnd { .. }
             | AgentEvent::TurnEnd { .. }
-            | AgentEvent::QueueUpdate { .. }
-            | AgentEvent::MessageStart { .. }
-            | AgentEvent::MessageUpdate { .. }
-            | AgentEvent::MessageEnd { .. } => {
+            | AgentEvent::QueueUpdate { .. } => {
                 // Sub-agent grouping, queue indicators, and the
-                // unified message-event variants (which the agent
-                // doesn't emit yet) all land in follow-up commits.
+                // `TurnEnd` summary all land in follow-up commits.
                 // Holding the arms here keeps the exhaustiveness
                 // check active so a newly-emitted event variant
                 // shows up as a compile error.
@@ -312,12 +319,21 @@ impl EventPump {
     /// every textual block into one rendered message — sub-second
     /// latency is more important than perfect block separation
     /// for live user prompts.
-    fn append_user_message(&self, tui: &mut Tui, content: &[ContentBlockParam]) {
+    /// Append a `UserMessageComponent` for a user message that
+    /// landed on the bus. Used by the live readline path (via the
+    /// agent's `MessageEnd { User }` event) and the resume path
+    /// (via the same event synthesized by `aj_session::replay`).
+    /// Multiple [`UserContent::Text`] blocks are joined with `\n`
+    /// so legacy multi-block user messages collapse into one
+    /// rendered component — live user prompts are always
+    /// single-block, but resumed threads may carry multi-block
+    /// shapes from older formats.
+    fn append_user_message(&self, tui: &mut Tui, content: &[UserContent]) {
         let text = content
             .iter()
             .filter_map(|b| match b {
-                ContentBlockParam::TextBlock { text, .. } => Some(text.as_str()),
-                _ => None,
+                UserContent::Text(t) => Some(t.text.as_str()),
+                UserContent::Image(_) => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -328,71 +344,145 @@ impl EventPump {
         self.push_chat_child(tui, Box::new(component));
     }
 
-    /// Route a `StreamChunk` to the in-flight assistant message
-    /// component, creating one if necessary.
-    fn handle_stream_chunk(
-        &mut self,
-        tui: &mut Tui,
-        channel: StreamChannel,
-        action: &StreamAction,
-    ) {
-        match channel {
-            StreamChannel::Text | StreamChannel::Thinking => {
-                let idx = self.ensure_assistant_message(tui);
-                let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) else {
-                    return;
-                };
-                let Some(c) = chat.get_mut_as::<AssistantMessageComponent>(idx) else {
-                    return;
-                };
-                match (channel, action) {
-                    (StreamChannel::Text, StreamAction::Start { snapshot }) => {
-                        c.open_block(BlockKind::Text, snapshot.clone());
-                    }
-                    (StreamChannel::Text, StreamAction::Update { delta }) => {
-                        c.append_delta(BlockKind::Text, delta);
-                    }
-                    (StreamChannel::Text, StreamAction::Stop { snapshot }) => {
-                        // Text channel carries a canonical final snapshot;
-                        // pass it through so the block matches the
-                        // model's authoritative bytes even if individual
-                        // deltas got dropped.
-                        c.close_block(BlockKind::Text, Some(snapshot.clone()));
-                    }
-                    (StreamChannel::Thinking, StreamAction::Start { snapshot }) => {
-                        c.open_block(BlockKind::Thinking, snapshot.clone());
-                    }
-                    (StreamChannel::Thinking, StreamAction::Update { delta }) => {
-                        c.append_delta(BlockKind::Thinking, delta);
-                    }
-                    (StreamChannel::Thinking, StreamAction::Stop { snapshot }) => {
-                        // `ThinkingStop` from the agent is documented as
-                        // a "flush" signal: the streaming layer doesn't
-                        // accumulate a canonical thinking snapshot, so
-                        // the agent emits an empty string here. Pass
-                        // `None` in that case so we keep what deltas
-                        // built up; a future provider that does send a
-                        // non-empty payload is still honoured.
-                        let payload = if snapshot.is_empty() {
-                            None
-                        } else {
-                            Some(snapshot.clone())
-                        };
-                        c.close_block(BlockKind::Thinking, payload);
-                    }
-                    (StreamChannel::User, _) => unreachable!("guarded above"),
-                }
+    /// Handle [`AgentEvent::MessageStart`] for a freshly-opened
+    /// message. The assistant case opens an in-flight
+    /// [`AssistantMessageComponent`] slot so subsequent
+    /// `MessageUpdate` events can paint into it; user / tool-result
+    /// messages are no-ops on Start (the matching `MessageEnd`
+    /// carries the authoritative payload).
+    fn handle_message_start(&mut self, tui: &mut Tui, message: &AgentMessage) {
+        if let AgentMessageKind::Wire(Message::Assistant(_)) = &message.kind {
+            // Reserve the assistant slot up front so the first
+            // `MessageUpdate` doesn't have to materialise it. This
+            // mirrors the legacy `StreamChunk(Text, Start)` shape
+            // where the first event opens the component with an
+            // empty buffer.
+            self.ensure_assistant_message(tui);
+        }
+    }
+
+    /// Handle [`AgentEvent::MessageUpdate`] for an assistant
+    /// streaming inference. Drives the in-flight
+    /// [`AssistantMessageComponent`] off the embedded
+    /// [`AssistantMessageEvent`].
+    fn handle_message_update(&mut self, tui: &mut Tui, event: &AssistantMessageEvent) {
+        let idx = self.ensure_assistant_message(tui);
+        let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) else {
+            return;
+        };
+        let Some(c) = chat.get_mut_as::<AssistantMessageComponent>(idx) else {
+            return;
+        };
+        match event {
+            AssistantMessageEvent::TextStart { .. } => {
+                c.open_block(BlockKind::Text, String::new());
             }
-            StreamChannel::User => {
-                // Replay path: a persisted user-thread message was
-                // surfaced as Start/Update/Stop. We only consume the
-                // `Stop` because that's the variant carrying the full
-                // snapshot; intermediate updates would just be partial
-                // copies of the same text.
-                if let StreamAction::Stop { snapshot } = action {
-                    let component = UserMessageComponent::new(snapshot, &self.theme);
-                    self.push_chat_child(tui, Box::new(component));
+            AssistantMessageEvent::TextDelta { delta, .. } => {
+                c.append_delta(BlockKind::Text, delta);
+            }
+            AssistantMessageEvent::TextEnd { content, .. } => {
+                // The text block's canonical final bytes; pass
+                // through so the block matches the model's
+                // authoritative content even if individual deltas
+                // got dropped.
+                c.close_block(BlockKind::Text, Some(content.clone()));
+            }
+            AssistantMessageEvent::ThinkingStart { .. } => {
+                c.open_block(BlockKind::Thinking, String::new());
+            }
+            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                c.append_delta(BlockKind::Thinking, delta);
+            }
+            AssistantMessageEvent::ThinkingEnd { content, .. } => {
+                let payload = if content.is_empty() {
+                    None
+                } else {
+                    Some(content.clone())
+                };
+                c.close_block(BlockKind::Thinking, payload);
+            }
+            // The agent collects tool calls off the finalized
+            // `Done { message }` payload and brackets them with
+            // dedicated `ToolExecutionStart` / `ToolExecutionEnd`
+            // events; the streaming tool-call deltas don't drive
+            // a separate rendering target. Ignored here so the
+            // arm stays explicit for future tool-argument live
+            // echo.
+            AssistantMessageEvent::ToolCallStart { .. }
+            | AssistantMessageEvent::ToolCallDelta { .. }
+            | AssistantMessageEvent::ToolCallEnd { .. } => {}
+            // `Start` is the agent-side opening event; the
+            // assistant slot was already created by
+            // `handle_message_start`. `Done` / `Error` are
+            // terminal; the matching `MessageEnd` is where the
+            // finalized payload lands. Both are no-ops in this
+            // path.
+            AssistantMessageEvent::Start { .. }
+            | AssistantMessageEvent::Done { .. }
+            | AssistantMessageEvent::Error { .. } => {}
+        }
+    }
+
+    /// Handle [`AgentEvent::MessageEnd`]. Assistant messages
+    /// finalize their in-flight component (next turn opens a fresh
+    /// one); user / tool-result messages append a fresh component
+    /// from the authoritative payload — this is the rendering path
+    /// for both live user prompts and replayed user threads.
+    fn handle_message_end(&mut self, tui: &mut Tui, message: &AgentMessage) {
+        match &message.kind {
+            AgentMessageKind::Wire(Message::User(u)) => {
+                self.append_user_message(tui, &u.content);
+            }
+            AgentMessageKind::Wire(Message::Assistant(a)) => {
+                // Live streaming already painted the content; the
+                // finalized event just unbinds the streaming target
+                // so the next turn starts fresh. On resume there's
+                // no prior streaming, so we need to render the
+                // assistant content here from scratch by emitting
+                // synthetic open/close pairs against the slot
+                // `MessageStart` reserved. Detect "fresh resume"
+                // by checking whether the slot is empty.
+                if let Some(idx) = self.current_assistant
+                    && let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx())
+                    && let Some(c) = chat.get_mut_as::<AssistantMessageComponent>(idx)
+                    && c.is_empty()
+                {
+                    // Replay path: synthesize the per-block open/
+                    // close pairs off the finalized content so the
+                    // component lands in the same shape live
+                    // streaming would have produced.
+                    for block in &a.content {
+                        match block {
+                            AssistantContent::Thinking(t) => {
+                                c.open_block(BlockKind::Thinking, String::new());
+                                c.close_block(
+                                    BlockKind::Thinking,
+                                    Some(if t.redacted {
+                                        format!("[Redacted thinking: {}]", t.thinking)
+                                    } else {
+                                        t.thinking.clone()
+                                    }),
+                                );
+                            }
+                            AssistantContent::Text(t) => {
+                                c.open_block(BlockKind::Text, String::new());
+                                c.close_block(BlockKind::Text, Some(t.text.clone()));
+                            }
+                            AssistantContent::ToolCall(_) => {
+                                // Tool calls surface as
+                                // ToolExecutionStart/End in
+                                // replay; nothing to render here.
+                            }
+                        }
+                    }
                 }
+                self.current_assistant = None;
+            }
+            AgentMessageKind::Wire(Message::ToolResult(_)) => {
+                // Tool results render through the dedicated
+                // `ToolExecutionEnd` event (which carries the
+                // structured `ToolDetails`). The unified
+                // `MessageEnd { ToolResult }` is structural framing.
             }
         }
     }
@@ -644,6 +734,54 @@ mod tests {
         }
     }
 
+    /// Build a synthetic `AssistantMessage` partial with the
+    /// scripted-provider identity stamped onto it. Used by the
+    /// tests below to construct `AssistantMessageEvent` payloads
+    /// that drive the pump's message-update path.
+    fn empty_assistant_partial() -> aj_models::types::AssistantMessage {
+        aj_models::types::AssistantMessage {
+            content: Vec::new(),
+            api: "scripted".into(),
+            provider: "scripted".into(),
+            model: "scripted".into(),
+            response_id: None,
+            usage: aj_models::types::Usage::default(),
+            stop_reason: aj_models::types::StopReason::Stop,
+            error: None,
+            timestamp: 0,
+        }
+    }
+
+    /// Build an `AgentEvent::MessageUpdate` carrying the given
+    /// streaming-protocol event. Threading an empty partial through
+    /// keeps each call site short.
+    fn message_update_event(event: AssistantMessageEvent) -> AgentEvent {
+        AgentEvent::MessageUpdate {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::Assistant(empty_assistant_partial())),
+            event,
+        }
+    }
+
+    /// Build an `AgentEvent::MessageStart` for an assistant turn.
+    fn assistant_message_start_event() -> AgentEvent {
+        AgentEvent::MessageStart {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::Assistant(empty_assistant_partial())),
+        }
+    }
+
+    /// Build an `AgentEvent::MessageEnd` carrying a user message
+    /// with the given text. Mirrors what the agent emits for a
+    /// freshly-submitted readline prompt and what
+    /// `aj_session::replay` synthesizes for a resumed user thread.
+    fn user_message_end_event(text: &str) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::User(aj_models::types::UserMessage::text(text))),
+        }
+    }
+
     #[test]
     fn format_turn_usage_line_emits_acc_plus_turn_for_main_agent() {
         // First turn: accumulated == turn. Each `acc+turn` field
@@ -724,38 +862,26 @@ mod tests {
         let chat_baseline = chat_len(&mut tui);
 
         // User prompt → user message component.
-        pump.handle(
-            &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::User,
-                action: StreamAction::Stop {
-                    snapshot: "please run a tool".into(),
-                },
-            },
-        );
+        pump.handle(&mut tui, &user_message_end_event("please run a tool"));
 
-        // Assistant thinking block → assistant message component
-        // appended next (current_assistant points at it).
+        // Assistant message lifecycle: MessageStart opens the slot.
+        pump.handle(&mut tui, &assistant_message_start_event());
+
+        // Assistant thinking block → drives the slot.
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Start {
-                    snapshot: String::new(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: empty_assistant_partial(),
+            }),
         );
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Stop {
-                    snapshot: "let me think".into(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::ThinkingEnd {
+                content_index: 0,
+                content: "let me think".into(),
+                partial: empty_assistant_partial(),
+            }),
         );
 
         // Tool result lands without a preceding ToolExecutionStart
@@ -780,25 +906,21 @@ mod tests {
         // component appended *after* the tool component, not
         // reuse the thinking-block component that was appended
         // before the tool.
+        pump.handle(&mut tui, &assistant_message_start_event());
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Text,
-                action: StreamAction::Start {
-                    snapshot: String::new(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::TextStart {
+                content_index: 0,
+                partial: empty_assistant_partial(),
+            }),
         );
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Text,
-                action: StreamAction::Stop {
-                    snapshot: "Done. Anything specific?".into(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::TextEnd {
+                content_index: 0,
+                content: "Done. Anything specific?".into(),
+                partial: empty_assistant_partial(),
+            }),
         );
 
         // Walk the chat container and verify (a) the last child
@@ -851,46 +973,38 @@ mod tests {
         // Open a thinking stream and append a non-trivial body.
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Start {
-                    snapshot: String::new(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::ThinkingStart {
+                content_index: 0,
+                partial: empty_assistant_partial(),
+            }),
         );
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Update {
-                    delta: "first let me reason about the".to_string(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "first let me reason about the".to_string(),
+                partial: empty_assistant_partial(),
+            }),
         );
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Update {
-                    delta: " inputs carefully".to_string(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: " inputs carefully".to_string(),
+                partial: empty_assistant_partial(),
+            }),
         );
-        // The empty-snapshot Stop is the exact shape the agent
-        // emits when the provider finalizes a thinking block. With
-        // the regression in place this wiped the buffer.
+        // The empty-content ThinkingEnd is the exact shape the
+        // agent emits when the provider finalizes a thinking block
+        // without an authoritative snapshot. With the regression in
+        // place this wiped the buffer.
         pump.handle(
             &mut tui,
-            &AgentEvent::StreamChunk {
-                agent_id: AgentId::Main,
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Stop {
-                    snapshot: String::new(),
-                },
-            },
+            &message_update_event(AssistantMessageEvent::ThinkingEnd {
+                content_index: 0,
+                content: String::new(),
+                partial: empty_assistant_partial(),
+            }),
         );
 
         let chat = tui

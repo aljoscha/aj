@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -25,7 +26,8 @@ use crate::types::{AssistantError, AssistantMessage, ErrorCategory, StopReason, 
 ///
 /// Mirrors the spec constraint that successful terminations are limited to
 /// `Stop`, `Length`, or `ToolUse`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DoneReason {
     Stop,
     Length,
@@ -43,7 +45,8 @@ impl From<DoneReason> for StopReason {
 }
 
 /// Subset of [`StopReason`] valid on an [`AssistantMessageEvent::Error`] event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorReason {
     /// Provider returned an error before/during streaming.
     Error,
@@ -70,7 +73,8 @@ impl From<ErrorReason> for StopReason {
 /// The stream is terminated by exactly one of [`Done`](Self::Done) or
 /// [`Error`](Self::Error); after either is pushed, no further events may be
 /// emitted (see [`AssistantMessageEventStream::push`]).
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantMessageEvent {
     /// Stream has started; partial message has been initialized with the
     /// provider/model/api fields populated.

@@ -22,18 +22,22 @@
 //! - [`ConversationEntryKind::SystemPrompt`]: model-facing metadata,
 //!   not user-visible. No event.
 //! - [`ConversationEntryKind::Message`] (assistant role): one
-//!   [`AgentEvent::StreamChunk`] `Start`/`Stop` pair on
-//!   [`StreamChannel::Thinking`] for each `ThinkingBlock` /
-//!   `RedactedThinkingBlock`, then one pair on
-//!   [`StreamChannel::Text`] for the joined visible text. Each
+//!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair
+//!   wrapping the projected [`AssistantMessage`]. Renderers walk the
+//!   finalized content blocks on `MessageEnd` to paint
+//!   text/thinking/tool-call blocks; no per-block streaming events
+//!   are synthesized (replay has no deltas to stream). Each
 //!   `ToolUseBlock` updates an internal `tool_use_id ↦ tool_name`
 //!   map used to label the matching `ToolResultBlock` later.
-//! - [`ConversationEntryKind::Message`] (user role): one
-//!   [`AgentEvent::ToolExecutionEnd`] for each `ToolResultBlock`
-//!   keyed by `tool_use_id` (with the tool name looked up from the
-//!   prior assistant turn) and, if the message also carried free
-//!   text, a [`StreamChannel::User`] `Start`/`Stop` pair so the
-//!   renderer paints the user input pane.
+//! - [`ConversationEntryKind::Message`] (user role) and
+//!   [`ConversationEntryKind::ToolResult`]: one
+//!   [`AgentEvent::ToolExecutionStart`] / [`ToolExecutionEnd`] pair
+//!   per `ToolResultBlock` (the structured variant pulls
+//!   per-`tool_use_id` payloads from `details`; legacy logs fall
+//!   back to a text-only [`ToolDetails::Text`] synthesis), plus, if
+//!   the message also carried free user text, a
+//!   [`MessageStart`] / [`MessageEnd`] pair wrapping a synthesized
+//!   [`UserMessage`].
 //! - [`ConversationEntryKind::UserOutput`]: each variant maps onto
 //!   the closest matching live event ([`AgentEvent::Notice`] /
 //!   [`AgentEvent::Error`] for textual notices,
@@ -43,17 +47,23 @@
 //!   are end-of-session presentational entries that the binary
 //!   renders separately on shutdown, so they are skipped here.
 //!
-//! The mapping is deliberately conservative: replay produces only
-//! events the live agent already emits today, so the bridge
-//! listener doesn't need any replay-only handling beyond the new
-//! [`StreamChannel::User`] case.
+//! The mapping aligns with the unified event protocol per
+//! `docs/aj-next-plan.md` §1.1: a `MessageStart`/`MessageEnd` pair
+//! brackets every user, assistant, and tool-result message, with
+//! `MessageUpdate` skipped because replay carries no deltas to
+//! stream. Renderers that handle live streaming work seamlessly on
+//! replayed content by reading the finalized message off
+//! `MessageEnd`.
 
 use std::collections::HashMap;
 
-use aj_agent::events::{AgentEvent, AgentId, StreamAction, StreamChannel};
+use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::message::AgentMessage;
+use aj_agent::projection::transcript_to_messages;
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::UserOutput;
-use aj_models::wire::{ContentBlockParam, Role};
+use aj_models::types::{Message, UserContent, UserMessage};
+use aj_models::wire::{ContentBlockParam, MessageParam, Role};
 use serde_json::Value;
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationLog, ThreadKind};
@@ -136,41 +146,66 @@ impl ReplayState {
         }
     }
 
-    /// Project an assistant-role message's content blocks. Order
-    /// follows the legacy CLI's history rendering: thinking first,
-    /// then text. Tool-use blocks update the tracking map but emit
-    /// nothing on their own — the matching `tool_result` block in a
-    /// subsequent user message is what triggers the
-    /// [`AgentEvent::ToolExecutionEnd`].
+    /// Project an assistant-role message's content blocks. Replays
+    /// the finalized assistant message as a [`MessageStart`] /
+    /// [`MessageEnd`] pair carrying the projected
+    /// [`AssistantMessage`]; renderers walk the message's content
+    /// blocks on `MessageEnd` to paint text/thinking/tool-call
+    /// blocks. No per-block streaming events are synthesized.
     fn project_assistant(
         &mut self,
         agent_id: AgentId,
         content: &[ContentBlockParam],
         out: &mut Vec<AgentEvent>,
     ) {
-        for block in content {
-            match block {
-                ContentBlockParam::ThinkingBlock { thinking, .. } => {
-                    push_stream_pair(out, agent_id, StreamChannel::Thinking, thinking);
-                }
-                ContentBlockParam::RedactedThinkingBlock { data } => {
-                    let snapshot = format!("[Redacted thinking: {data}]");
-                    push_stream_pair(out, agent_id, StreamChannel::Thinking, &snapshot);
-                }
-                _ => {}
-            }
-        }
+        // Reuse the agent's wire-to-unified projection so the
+        // renderer sees the same `AssistantMessage` shape it would
+        // on a live `MessageEnd`. Wrapping the param in a single-
+        // entry transcript is the simplest way to drive
+        // `transcript_to_messages`; the helper returns one
+        // `Message::Assistant` element in this case.
+        let param = MessageParam {
+            role: Role::Assistant,
+            content: content.to_vec(),
+        };
+        let mut projected = transcript_to_messages(&[param]);
+        let assistant = match projected.pop() {
+            Some(Message::Assistant(m)) => m,
+            // Empty assistant content projects to nothing; skip the
+            // entry entirely rather than emit a malformed pair.
+            _ => return,
+        };
 
-        let text = collect_text(content);
-        if !text.is_empty() {
-            push_stream_pair(out, agent_id, StreamChannel::Text, &text);
-        }
+        // MessageStart carries an empty placeholder (with identity
+        // stamped from the projected message) so renderers can open
+        // their assistant slot without seeing the full content
+        // twice; MessageEnd is the authoritative finalized snapshot.
+        // This mirrors the live-streaming shape where MessageStart
+        // fires before any content arrives.
+        let empty_start = aj_models::types::AssistantMessage {
+            content: Vec::new(),
+            api: assistant.api.clone(),
+            provider: assistant.provider.clone(),
+            model: assistant.model.clone(),
+            response_id: assistant.response_id.clone(),
+            usage: assistant.usage.clone(),
+            stop_reason: assistant.stop_reason.clone(),
+            error: assistant.error.clone(),
+            timestamp: assistant.timestamp,
+        };
+        out.push(AgentEvent::MessageStart {
+            agent_id,
+            message: AgentMessage::wire(Message::Assistant(empty_start)),
+        });
+        out.push(AgentEvent::MessageEnd {
+            agent_id,
+            message: AgentMessage::wire(Message::Assistant(assistant)),
+        });
 
         // Track tool_use blocks so subsequent tool_result blocks
-        // can synthesize a `ToolExecutionStart` (with args) followed
-        // by a `ToolExecutionEnd`. We do this last so any
-        // thinking/text replay precedes the synthesized tool events
-        // that live on the next user-role message.
+        // can synthesize a matching `ToolExecutionStart` (with
+        // captured args) and `ToolExecutionEnd`. We do this after
+        // the pair so any in-pair ordering invariants stay clear.
         for block in content {
             if let ContentBlockParam::ToolUseBlock {
                 id, name, input, ..
@@ -183,11 +218,11 @@ impl ReplayState {
     }
 
     /// Project a user-role message's content blocks. Tool results
-    /// produce synthesized `ToolExecutionEnd` events; free text
-    /// produces a single `StreamChannel::User` Start/Stop pair so
-    /// the renderer can paint the user-input pane. Anything else
-    /// (images, documents) is currently not user-rendered on
-    /// resume.
+    /// produce synthesized `ToolExecutionStart` / `ToolExecutionEnd`
+    /// events; free text produces a [`MessageStart`] /
+    /// [`MessageEnd`] pair wrapping a [`UserMessage`] so renderers
+    /// can paint the user-input pane the same way they handle live
+    /// user prompts.
     ///
     /// `details` is `Some` for structured
     /// [`ConversationEntryKind::ToolResult`] entries and `None` for
@@ -263,7 +298,18 @@ impl ReplayState {
 
         let text = collect_text(content);
         if !text.is_empty() {
-            push_stream_pair(out, agent_id, StreamChannel::User, &text);
+            let user_message = AgentMessage::wire(Message::User(UserMessage {
+                content: vec![UserContent::text(text)],
+                timestamp: 0,
+            }));
+            out.push(AgentEvent::MessageStart {
+                agent_id,
+                message: user_message.clone(),
+            });
+            out.push(AgentEvent::MessageEnd {
+                agent_id,
+                message: user_message,
+            });
         }
     }
 }
@@ -388,32 +434,6 @@ fn collect_text(content: &[ContentBlockParam]) -> String {
         .join(" ")
 }
 
-/// Emit a Start/Stop streaming pair for the given snapshot. Mirrors
-/// the legacy CLI's two-call rendering pattern (`*_start("")` then
-/// `*_stop(text)`) so persisted text round-trips through the same
-/// helpers used for live streaming.
-fn push_stream_pair(
-    out: &mut Vec<AgentEvent>,
-    agent_id: AgentId,
-    channel: StreamChannel,
-    snapshot: &str,
-) {
-    out.push(AgentEvent::StreamChunk {
-        agent_id,
-        channel,
-        action: StreamAction::Start {
-            snapshot: String::new(),
-        },
-    });
-    out.push(AgentEvent::StreamChunk {
-        agent_id,
-        channel,
-        action: StreamAction::Stop {
-            snapshot: snapshot.to_string(),
-        },
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,79 +498,89 @@ mod tests {
     #[test]
     fn replay_projects_assistant_thinking_text_and_tool_results() {
         // The replay walker must emit, in order, the seeded user
-        // input, the assistant thinking + text Start/Stop pairs,
-        // and the synthesized tool_result event keyed off the
-        // earlier tool_use block.
+        // input, the assistant message (Start/End wrapping the
+        // projected AssistantMessage with thinking + text + tool_use
+        // blocks), and the synthesized tool_result event keyed off
+        // the earlier tool_use block.
         let (_dir, log) = seeded_log();
         let events: Vec<AgentEvent> = replay(&log).collect();
 
         // Expected order:
-        //   StreamChunk(User, Start)
-        //   StreamChunk(User, Stop "hi")
-        //   StreamChunk(Thinking, Start)
-        //   StreamChunk(Thinking, Stop "let me think")
-        //   StreamChunk(Text, Start)
-        //   StreamChunk(Text, Stop "hello")
+        //   MessageStart(User "hi")
+        //   MessageEnd(User "hi")
+        //   MessageStart(Assistant empty)
+        //   MessageEnd(Assistant {thinking, text, tool_use})
         //   ToolExecutionStart { tool: "read_file", call_id: "call-1", args }
         //   ToolExecutionEnd   { tool: "read_file", call_id: "call-1" }
-        assert_eq!(events.len(), 8, "got events: {events:#?}");
+        assert_eq!(events.len(), 6, "got events: {events:#?}");
 
-        // First user message → StreamChannel::User pair.
+        // First user message → MessageStart/MessageEnd pair carrying
+        // a UserMessage with the seeded text.
         match &events[0] {
-            AgentEvent::StreamChunk {
-                channel: StreamChannel::User,
-                action: StreamAction::Start { snapshot },
-                ..
-            } => assert!(snapshot.is_empty()),
-            other => panic!("expected user Start, got {other:?}"),
+            AgentEvent::MessageStart { message, .. } => match message.as_wire() {
+                Some(Message::User(u)) => {
+                    assert_eq!(u.content.len(), 1);
+                    match &u.content[0] {
+                        UserContent::Text(t) => assert_eq!(t.text, "hi"),
+                        other => panic!("expected text content, got {other:?}"),
+                    }
+                }
+                other => panic!("expected user message, got {other:?}"),
+            },
+            other => panic!("expected user MessageStart, got {other:?}"),
         }
         match &events[1] {
-            AgentEvent::StreamChunk {
-                channel: StreamChannel::User,
-                action: StreamAction::Stop { snapshot },
-                ..
-            } => assert_eq!(snapshot, "hi"),
-            other => panic!("expected user Stop with text, got {other:?}"),
+            AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                Some(Message::User(_)) => {}
+                other => panic!("expected user message, got {other:?}"),
+            },
+            other => panic!("expected user MessageEnd, got {other:?}"),
         }
 
-        // Assistant thinking pair.
+        // Assistant message → MessageStart with empty content,
+        // MessageEnd carrying the finalized content blocks.
         match &events[2] {
-            AgentEvent::StreamChunk {
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Start { .. },
-                ..
-            } => {}
-            other => panic!("expected thinking Start, got {other:?}"),
+            AgentEvent::MessageStart { message, .. } => match message.as_wire() {
+                Some(Message::Assistant(a)) => assert!(a.content.is_empty()),
+                other => panic!("expected assistant message, got {other:?}"),
+            },
+            other => panic!("expected assistant MessageStart, got {other:?}"),
         }
         match &events[3] {
-            AgentEvent::StreamChunk {
-                channel: StreamChannel::Thinking,
-                action: StreamAction::Stop { snapshot },
-                ..
-            } => assert_eq!(snapshot, "let me think"),
-            other => panic!("expected thinking Stop, got {other:?}"),
-        }
-
-        // Assistant text pair.
-        match &events[4] {
-            AgentEvent::StreamChunk {
-                channel: StreamChannel::Text,
-                action: StreamAction::Start { .. },
-                ..
-            } => {}
-            other => panic!("expected text Start, got {other:?}"),
-        }
-        match &events[5] {
-            AgentEvent::StreamChunk {
-                channel: StreamChannel::Text,
-                action: StreamAction::Stop { snapshot },
-                ..
-            } => assert_eq!(snapshot, "hello"),
-            other => panic!("expected text Stop, got {other:?}"),
+            AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                Some(Message::Assistant(a)) => {
+                    // The projected message must carry both the
+                    // thinking text and the visible text. Tool calls
+                    // are surfaced on the next event pair, not
+                    // inline in the assistant content (though they
+                    // do appear on the AssistantMessage itself for
+                    // anyone inspecting it directly).
+                    let thinking_count = a
+                        .content
+                        .iter()
+                        .filter(|c| matches!(c, aj_models::types::AssistantContent::Thinking(_)))
+                        .count();
+                    let text_count = a
+                        .content
+                        .iter()
+                        .filter(|c| matches!(c, aj_models::types::AssistantContent::Text(_)))
+                        .count();
+                    let tool_call_count = a
+                        .content
+                        .iter()
+                        .filter(|c| matches!(c, aj_models::types::AssistantContent::ToolCall(_)))
+                        .count();
+                    assert_eq!(thinking_count, 1);
+                    assert_eq!(text_count, 1);
+                    assert_eq!(tool_call_count, 1);
+                }
+                other => panic!("expected assistant message, got {other:?}"),
+            },
+            other => panic!("expected assistant MessageEnd, got {other:?}"),
         }
 
         // Tool start event with the captured input args.
-        match &events[6] {
+        match &events[4] {
             AgentEvent::ToolExecutionStart {
                 agent_id,
                 call_id,
@@ -570,7 +600,7 @@ mod tests {
         }
 
         // Tool result event keyed off the prior tool_use block.
-        match &events[7] {
+        match &events[5] {
             AgentEvent::ToolExecutionEnd {
                 agent_id,
                 call_id,

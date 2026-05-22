@@ -50,7 +50,7 @@ use aj_models::wire::{
 ///   within the source message (text-then-tool-result and
 ///   tool-result-then-text both survive, even though the agent
 ///   itself never produces that mix today).
-pub(crate) fn transcript_to_messages(transcript: &[MessageParam]) -> Vec<Message> {
+pub fn transcript_to_messages(transcript: &[MessageParam]) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(transcript.len());
     for entry in transcript {
         match entry.role {

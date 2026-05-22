@@ -10,7 +10,7 @@ pub mod bus;
 pub mod events;
 pub mod hooks;
 pub mod message;
-mod projection;
+pub mod projection;
 pub mod tool;
 pub mod types;
 
@@ -24,14 +24,16 @@ use aj_models::registry::ModelInfo;
 use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use aj_models::tools::Tool;
 use aj_models::types::{
-    AssistantContent, AssistantMessage, Context, ErrorCategory, SimpleStreamOptions, StreamOptions,
-    ThinkingLevel, ToolCall, ToolDefinition as UnifiedToolDefinition, UserContent,
+    AssistantContent, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
+    StopReason, StreamOptions, ThinkingLevel, ToolCall, ToolDefinition as UnifiedToolDefinition,
+    UserContent, UserMessage,
 };
 use aj_models::wire::{ContentBlockParam, MessageParam, Role, Usage};
 use aj_models::ThinkingConfig;
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
-use crate::events::{AgentEvent, AgentId, PersistedMessageKind, StreamAction, StreamChannel};
+use crate::events::{AgentEvent, AgentId, PersistedMessageKind};
+use crate::message::AgentMessage;
 use crate::projection::{
     assistant_message_to_message_param, transcript_to_messages, usage_unified_to_legacy,
 };
@@ -542,9 +544,31 @@ impl Agent {
             // still want the in-memory state to reflect the
             // intent, so the bus call is at-most one event behind
             // the transcript (per `docs/aj-next-plan.md` §1.4).
-            let content = vec![ContentBlockParam::new_text_block(text)];
+            let content = vec![ContentBlockParam::new_text_block(text.clone())];
             self.transcript
                 .push(MessageParam::new_user_message(content.clone()));
+            // Bracket the user message with `MessageStart` /
+            // `MessageEnd` so renderers and event-tape consumers see
+            // a complete lifecycle for every message kind, not just
+            // the assistant streaming flow. The `MessagePersisted`
+            // event continues to drive the persistence listener;
+            // the two-event surface is intentional per
+            // `docs/aj-next-plan.md` §1.1.
+            let user_message = AgentMessage::wire(Message::User(UserMessage::text(text)));
+            self.bus
+                .emit(AgentEvent::MessageStart {
+                    agent_id: self.agent_id,
+                    message: user_message.clone(),
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
+            self.bus
+                .emit(AgentEvent::MessageEnd {
+                    agent_id: self.agent_id,
+                    message: user_message,
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
             self.bus
                 .emit(AgentEvent::MessagePersisted {
                     agent_id: self.agent_id,
@@ -593,9 +617,26 @@ impl Agent {
         // parent's spawning assistant message via the
         // `SubAgentStart` hook (see
         // `aj_session::listener::persistence_listener`).
-        let content = vec![ContentBlockParam::new_text_block(prompt)];
+        let content = vec![ContentBlockParam::new_text_block(prompt.clone())];
         self.transcript
             .push(MessageParam::new_user_message(content.clone()));
+        // Same Start/End/Persisted triplet as the top-level path,
+        // per `docs/aj-next-plan.md` §1.1. Sub-agent listeners group
+        // by `agent_id` so the bracketing fires under `Sub(n)` and
+        // the parent's renderer routes correctly.
+        let user_message = AgentMessage::wire(Message::User(UserMessage::text(prompt)));
+        self.bus
+            .emit(AgentEvent::MessageStart {
+                agent_id: self.agent_id,
+                message: user_message.clone(),
+            })
+            .await?;
+        self.bus
+            .emit(AgentEvent::MessageEnd {
+                agent_id: self.agent_id,
+                message: user_message,
+            })
+            .await?;
         self.bus
             .emit(AgentEvent::MessagePersisted {
                 agent_id: self.agent_id,
@@ -662,6 +703,21 @@ impl Agent {
         'outer: loop {
             let mut response_stream = self.run_inference_streaming();
 
+            // Bracket the streaming inference with `MessageStart` /
+            // `MessageEnd` per `docs/aj-next-plan.md` §1.1.
+            // `MessageStart` carries an identity-stamped empty
+            // assistant message so renderers can open their assistant
+            // slot before the first content event arrives; the
+            // matching `MessageEnd` fires after the stream terminates
+            // and carries the finalized message.
+            self.bus
+                .emit(AgentEvent::MessageStart {
+                    agent_id: self.agent_id,
+                    message: AgentMessage::wire(Message::Assistant(self.empty_assistant_message())),
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
+
             // Terminal `AssistantMessage` captured from the stream's
             // `Done` (success) or `Error` (failure) event. The
             // unified streaming protocol guarantees exactly one
@@ -671,107 +727,45 @@ impl Agent {
             let mut final_was_error = false;
 
             while let Some(event) = response_stream.next().await {
-                match event {
-                    AssistantMessageEvent::Start { .. } => {
-                        // The leading `Start` event carries the
-                        // identity-stamped empty partial; no
-                        // listener-facing emit is required (the
-                        // renderer opens its assistant slot once the
-                        // first content block arrives below).
-                    }
-                    AssistantMessageEvent::TextStart { .. } => {
-                        // Open the text slot for the renderer with an
-                        // empty snapshot. The unified protocol carries
-                        // initial text on a follow-up `TextDelta`
-                        // rather than on `TextStart` itself, so the
-                        // renderer appends as it goes.
-                        self.bus
-                            .emit(AgentEvent::StreamChunk {
-                                agent_id: self.agent_id,
-                                channel: StreamChannel::Text,
-                                action: StreamAction::Start {
-                                    snapshot: String::new(),
-                                },
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
-                    }
-                    AssistantMessageEvent::TextDelta { delta, .. } => {
-                        self.bus
-                            .emit(AgentEvent::StreamChunk {
-                                agent_id: self.agent_id,
-                                channel: StreamChannel::Text,
-                                action: StreamAction::Update { delta },
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
-                    }
-                    AssistantMessageEvent::TextEnd { content, .. } => {
-                        self.bus
-                            .emit(AgentEvent::StreamChunk {
-                                agent_id: self.agent_id,
-                                channel: StreamChannel::Text,
-                                action: StreamAction::Stop { snapshot: content },
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
-                    }
-                    AssistantMessageEvent::ThinkingStart { .. } => {
-                        self.bus
-                            .emit(AgentEvent::StreamChunk {
-                                agent_id: self.agent_id,
-                                channel: StreamChannel::Thinking,
-                                action: StreamAction::Start {
-                                    snapshot: String::new(),
-                                },
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
-                    }
-                    AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                        self.bus
-                            .emit(AgentEvent::StreamChunk {
-                                agent_id: self.agent_id,
-                                channel: StreamChannel::Thinking,
-                                action: StreamAction::Update { delta },
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
-                    }
-                    AssistantMessageEvent::ThinkingEnd { content, .. } => {
-                        self.bus
-                            .emit(AgentEvent::StreamChunk {
-                                agent_id: self.agent_id,
-                                channel: StreamChannel::Thinking,
-                                action: StreamAction::Stop { snapshot: content },
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
-                    }
-                    AssistantMessageEvent::ToolCallStart { .. }
-                    | AssistantMessageEvent::ToolCallDelta { .. }
-                    | AssistantMessageEvent::ToolCallEnd { .. } => {
-                        // Argument-echo deltas during streaming are
-                        // not surfaced as events today: the agent
-                        // collects tool calls off the finalized
-                        // `Done { message }` payload below, then
-                        // brackets each invocation with its own
-                        // `ToolExecutionStart` / `ToolExecutionEnd`
-                        // pair. Live tool-argument echo can be added
-                        // by emitting `ToolExecutionUpdate` here once
-                        // a renderer needs it.
-                    }
+                // Capture the terminal frames before forwarding so we
+                // can break out of the loop with the finalized
+                // message. The forwarded `MessageUpdate` still flows
+                // through for every event so listeners see the
+                // complete streaming protocol per the spec.
+                match &event {
                     AssistantMessageEvent::Done { message, .. } => {
-                        final_message = Some(message);
+                        final_message = Some(message.clone());
                         final_was_error = false;
-                        break;
                     }
-                    AssistantMessageEvent::Error { reason, error } => {
-                        let _ = reason;
-                        final_message = Some(error);
+                    AssistantMessageEvent::Error { error, .. } => {
+                        final_message = Some(error.clone());
                         final_was_error = true;
-                        break;
                     }
+                    _ => {}
+                }
+
+                // Forward the provider event as a `MessageUpdate` on
+                // the bus. Renderers consume the inner
+                // `AssistantMessageEvent` directly (drives text /
+                // thinking / tool-call blocks); persistence listeners
+                // can ignore these since the finalized
+                // `MessagePersisted::Assistant` event fires below
+                // after the stream terminates.
+                let partial = event.partial().clone();
+                self.bus
+                    .emit(AgentEvent::MessageUpdate {
+                        agent_id: self.agent_id,
+                        message: AgentMessage::wire(Message::Assistant(partial)),
+                        event: event.clone(),
+                    })
+                    .await
+                    .map_err(TurnError::Fatal)?;
+
+                if matches!(
+                    event,
+                    AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
+                ) {
+                    break;
                 }
             }
 
@@ -792,6 +786,19 @@ impl Agent {
                 }
             };
             drop(response_stream);
+
+            // Emit `MessageEnd` so renderers can finalize their
+            // assistant slot (close in-flight blocks, mark the turn
+            // complete). Fires for both success and error
+            // terminations; the wire-level error / retry handling
+            // below decides whether to consume the message or retry.
+            self.bus
+                .emit(AgentEvent::MessageEnd {
+                    agent_id: self.agent_id,
+                    message: AgentMessage::wire(Message::Assistant(final_message.clone())),
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
 
             if final_was_error {
                 let assistant_err = final_message.error.clone();
@@ -1133,6 +1140,25 @@ impl Agent {
             .max_delay(Duration::from_secs(2))
             .take(10)
             .map(jitter)
+    }
+
+    /// Build an empty [`AssistantMessage`] stamped with the agent's
+    /// active provider / api / model identity. Used as the
+    /// `MessageStart` payload before any provider event arrives, so
+    /// renderers can open their assistant slot with a structurally
+    /// complete message even though the content is empty.
+    fn empty_assistant_message(&self) -> AssistantMessage {
+        AssistantMessage {
+            content: Vec::new(),
+            api: self.model_info.api.clone(),
+            provider: self.model_info.provider.clone(),
+            model: self.model_info.id.clone(),
+            response_id: None,
+            usage: aj_models::types::Usage::default(),
+            stop_reason: StopReason::Stop,
+            error: None,
+            timestamp: 0,
+        }
     }
 
     /// Run a single streaming inference against the agent's
@@ -1637,7 +1663,8 @@ mod event_protocol_tests {
     use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
     use aj_models::streaming::{AssistantMessageEvent, DoneReason};
     use aj_models::types::{
-        AssistantContent, AssistantMessage, StopReason, StreamOptions, TextContent, ToolCall,
+        AssistantContent, AssistantMessage, Message, StopReason, StreamOptions, TextContent,
+        ToolCall,
     };
     use aj_models::wire::ContentBlockParam;
     use std::sync::Arc;
@@ -1819,10 +1846,21 @@ mod event_protocol_tests {
             child: AgentId,
         },
         StreamRetry(AgentId, u32),
-        StreamChunk {
+        /// Unified message lifecycle event. `kind` records the
+        /// inner wire-message variant (`User` / `Assistant` /
+        /// `ToolResult`) so test assertions stay legible.
+        Message {
             agent_id: AgentId,
-            channel: &'static str,
-            action: &'static str,
+            phase: &'static str,
+            kind: &'static str,
+        },
+        /// `MessageUpdate` carrying an `AssistantMessageEvent`. The
+        /// inner event kind (`text_delta`, `thinking_start`, …) is
+        /// captured as a `&'static str` so the locked sequence
+        /// remains comparable.
+        MessageStream {
+            agent_id: AgentId,
+            event_kind: &'static str,
         },
         TurnUsage(AgentId),
         /// Persistence write request. The label captures only the
@@ -1890,27 +1928,6 @@ mod event_protocol_tests {
             AgentEvent::StreamRetry {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),
-            AgentEvent::StreamChunk {
-                agent_id,
-                channel,
-                action,
-            } => {
-                let channel = match channel {
-                    crate::events::StreamChannel::Text => "text",
-                    crate::events::StreamChannel::Thinking => "thinking",
-                    crate::events::StreamChannel::User => "user",
-                };
-                let action = match action {
-                    crate::events::StreamAction::Start { .. } => "start",
-                    crate::events::StreamAction::Update { .. } => "update",
-                    crate::events::StreamAction::Stop { .. } => "stop",
-                };
-                EventLabel::StreamChunk {
-                    agent_id: *agent_id,
-                    channel,
-                    action,
-                }
-            }
             AgentEvent::TurnUsage { agent_id, .. } => EventLabel::TurnUsage(*agent_id),
             AgentEvent::MessagePersisted { agent_id, kind } => {
                 let kind = match kind {
@@ -1925,11 +1942,57 @@ mod event_protocol_tests {
                 }
             }
             AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
-            AgentEvent::MessageStart { .. } => EventLabel::Other("MessageStart"),
-            AgentEvent::MessageUpdate { .. } => EventLabel::Other("MessageUpdate"),
-            AgentEvent::MessageEnd { .. } => EventLabel::Other("MessageEnd"),
+            AgentEvent::MessageStart { agent_id, message } => EventLabel::Message {
+                agent_id: *agent_id,
+                phase: "start",
+                kind: agent_message_kind_label(message),
+            },
+            AgentEvent::MessageUpdate {
+                agent_id, event, ..
+            } => EventLabel::MessageStream {
+                agent_id: *agent_id,
+                event_kind: assistant_event_kind_label(event),
+            },
+            AgentEvent::MessageEnd { agent_id, message } => EventLabel::Message {
+                agent_id: *agent_id,
+                phase: "end",
+                kind: agent_message_kind_label(message),
+            },
             AgentEvent::ToolExecutionUpdate { .. } => EventLabel::Other("ToolExecutionUpdate"),
             AgentEvent::QueueUpdate { .. } => EventLabel::Other("QueueUpdate"),
+        }
+    }
+
+    /// Return a stable `&'static str` for the wire-message kind
+    /// inside an [`AgentMessage`] so the test labels stay readable.
+    fn agent_message_kind_label(message: &crate::message::AgentMessage) -> &'static str {
+        use crate::message::AgentMessageKind;
+        match &message.kind {
+            AgentMessageKind::Wire(Message::User(_)) => "User",
+            AgentMessageKind::Wire(Message::Assistant(_)) => "Assistant",
+            AgentMessageKind::Wire(Message::ToolResult(_)) => "ToolResult",
+        }
+    }
+
+    /// Return a stable `&'static str` for an `AssistantMessageEvent`
+    /// variant.
+    fn assistant_event_kind_label(
+        event: &aj_models::streaming::AssistantMessageEvent,
+    ) -> &'static str {
+        use aj_models::streaming::AssistantMessageEvent::*;
+        match event {
+            Start { .. } => "start",
+            TextStart { .. } => "text_start",
+            TextDelta { .. } => "text_delta",
+            TextEnd { .. } => "text_end",
+            ThinkingStart { .. } => "thinking_start",
+            ThinkingDelta { .. } => "thinking_delta",
+            ThinkingEnd { .. } => "thinking_end",
+            ToolCallStart { .. } => "tool_call_start",
+            ToolCallDelta { .. } => "tool_call_delta",
+            ToolCallEnd { .. } => "tool_call_end",
+            Done { .. } => "done",
+            Error { .. } => "error",
         }
     }
 
@@ -2006,15 +2069,49 @@ mod event_protocol_tests {
         let events = recorded.lock().unwrap().clone();
         let expected = vec![
             EventLabel::AgentStart(AgentId::Sub(1)),
-            // The sub-agent's first persistence event is the
-            // user-prompt message (the persistence listener uses
-            // this to anchor at the parent's spawning entry).
+            // The sub-agent's user prompt brackets with
+            // MessageStart/End around the User wire-message; the
+            // MessagePersisted event is what the persistence
+            // listener anchors against the parent's spawning entry.
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "start",
+                kind: "User",
+            },
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "end",
+                kind: "User",
+            },
             EventLabel::MessagePersisted {
                 agent_id: AgentId::Sub(1),
                 kind: "User",
             },
             EventLabel::TurnStart(AgentId::Sub(1)),
-            // First inference: the model returned a tool_use.
+            // First inference: MessageStart opens the assistant
+            // slot, the streaming protocol's Start event flows
+            // through MessageUpdate (script step 0 emits Start
+            // + Done), then MessageEnd carries the finalized
+            // tool-use message before MessagePersisted::Assistant
+            // hits disk.
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "start",
+                kind: "Assistant",
+            },
+            EventLabel::MessageStream {
+                agent_id: AgentId::Sub(1),
+                event_kind: "start",
+            },
+            EventLabel::MessageStream {
+                agent_id: AgentId::Sub(1),
+                event_kind: "done",
+            },
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "end",
+                kind: "Assistant",
+            },
             EventLabel::MessagePersisted {
                 agent_id: AgentId::Sub(1),
                 kind: "Assistant",
@@ -2040,7 +2137,26 @@ mod event_protocol_tests {
                 agent_id: AgentId::Sub(1),
                 kind: "ToolResult",
             },
-            // Second inference: the model returned plain text.
+            // Second inference: same Start/stream/End bracket as
+            // the first; the model returned plain text this time.
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "start",
+                kind: "Assistant",
+            },
+            EventLabel::MessageStream {
+                agent_id: AgentId::Sub(1),
+                event_kind: "start",
+            },
+            EventLabel::MessageStream {
+                agent_id: AgentId::Sub(1),
+                event_kind: "done",
+            },
+            EventLabel::Message {
+                agent_id: AgentId::Sub(1),
+                phase: "end",
+                kind: "Assistant",
+            },
             EventLabel::MessagePersisted {
                 agent_id: AgentId::Sub(1),
                 kind: "Assistant",
@@ -2163,11 +2279,39 @@ mod event_protocol_tests {
             events,
             vec![
                 EventLabel::AgentStart(AgentId::Sub(7)),
+                EventLabel::Message {
+                    agent_id: AgentId::Sub(7),
+                    phase: "start",
+                    kind: "User",
+                },
+                EventLabel::Message {
+                    agent_id: AgentId::Sub(7),
+                    phase: "end",
+                    kind: "User",
+                },
                 EventLabel::MessagePersisted {
                     agent_id: AgentId::Sub(7),
                     kind: "User",
                 },
                 EventLabel::TurnStart(AgentId::Sub(7)),
+                EventLabel::Message {
+                    agent_id: AgentId::Sub(7),
+                    phase: "start",
+                    kind: "Assistant",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Sub(7),
+                    event_kind: "start",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Sub(7),
+                    event_kind: "done",
+                },
+                EventLabel::Message {
+                    agent_id: AgentId::Sub(7),
+                    phase: "end",
+                    kind: "Assistant",
+                },
                 EventLabel::MessagePersisted {
                     agent_id: AgentId::Sub(7),
                     kind: "Assistant",
@@ -2206,11 +2350,39 @@ mod event_protocol_tests {
             events,
             vec![
                 EventLabel::AgentStart(AgentId::Main),
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "start",
+                    kind: "User",
+                },
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "end",
+                    kind: "User",
+                },
                 EventLabel::MessagePersisted {
                     agent_id: AgentId::Main,
                     kind: "User",
                 },
                 EventLabel::TurnStart(AgentId::Main),
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "start",
+                    kind: "Assistant",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Main,
+                    event_kind: "start",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Main,
+                    event_kind: "done",
+                },
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "end",
+                    kind: "Assistant",
+                },
                 EventLabel::MessagePersisted {
                     agent_id: AgentId::Main,
                     kind: "Assistant",
@@ -2261,9 +2433,28 @@ mod event_protocol_tests {
             events,
             vec![
                 EventLabel::AgentStart(AgentId::Main),
-                // No `MessagePersisted::User` here — that's the
-                // distinguishing feature of `continue_run` vs `prompt`.
+                // No User-message bracketing here — that's the
+                // distinguishing feature of `continue_run` vs
+                // `prompt`. No `MessagePersisted::User` either.
                 EventLabel::TurnStart(AgentId::Main),
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "start",
+                    kind: "Assistant",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Main,
+                    event_kind: "start",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Main,
+                    event_kind: "done",
+                },
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "end",
+                    kind: "Assistant",
+                },
                 EventLabel::MessagePersisted {
                     agent_id: AgentId::Main,
                     kind: "Assistant",
