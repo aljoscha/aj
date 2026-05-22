@@ -14,11 +14,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aj_conf::ConfigThinkingDisplay;
 use aj_models::auth::{find_env_keys, get_env_api_key};
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
-use aj_models::types::Speed;
-use aj_models::types::StreamOptions;
+use aj_models::types::{ReasoningSummary, Speed, StreamOptions, ThinkingDisplay};
 use anyhow::{Result, anyhow, bail};
 
 /// Beta header value that opts an Anthropic request into the
@@ -203,6 +203,48 @@ fn apply_speed_headers(options: &mut StreamOptions, model: &ModelInfo, speed: Op
     }
 }
 
+/// Fan the configured [`ConfigThinkingDisplay`] (if any) out onto
+/// both provider-specific wire fields on [`StreamOptions`]: Anthropic
+/// consumes `thinking_display`, OpenAI Responses consumes
+/// `reasoning_summary`, and each ignores the other. The mapping
+/// table lives on [`ConfigThinkingDisplay`]'s doc comment.
+///
+/// This single helper preserves a one-knob user experience while
+/// keeping the wire layer's two-field separation — the latter is
+/// load-bearing because the two providers' reasoning APIs are
+/// genuinely different axes (visibility vs. verbosity), and merging
+/// them at the wire level would lose information.
+pub fn apply_thinking_display(options: &mut StreamOptions, display: Option<ConfigThinkingDisplay>) {
+    let Some(display) = display else {
+        options.thinking_display = None;
+        options.reasoning_summary = None;
+        return;
+    };
+    let (anthropic, openai) = match display {
+        ConfigThinkingDisplay::Summarized => (
+            Some(ThinkingDisplay::Summarized),
+            Some(ReasoningSummary::Concise),
+        ),
+        ConfigThinkingDisplay::Detailed => (
+            // Anthropic adaptive has no Detailed variant; degrade to
+            // Summarized so the user still gets *some* visible
+            // reasoning rather than a silent fallback to the
+            // provider default.
+            Some(ThinkingDisplay::Summarized),
+            Some(ReasoningSummary::Detailed),
+        ),
+        ConfigThinkingDisplay::Omitted => (
+            Some(ThinkingDisplay::Omitted),
+            // OpenAI Responses has no "must suppress" knob — leaving
+            // `reasoning_summary` unset means we don't request a
+            // summary, which is the closest analogue.
+            None,
+        ),
+    };
+    options.thinking_display = anthropic;
+    options.reasoning_summary = openai;
+}
+
 /// Append `value` to a comma-separated `name` header in `headers`
 /// without duplicating it. If the header isn't set yet, create it.
 ///
@@ -373,5 +415,66 @@ mod tests {
             headers.get("anthropic-beta").map(String::as_str),
             Some("alpha-1,beta-2"),
         );
+    }
+
+    #[test]
+    fn apply_thinking_display_unset_clears_both_wire_fields() {
+        // Pre-seed both fields to make sure the helper actively
+        // clears them, not just leaves an unset default alone.
+        let mut opts = StreamOptions {
+            thinking_display: Some(ThinkingDisplay::Summarized),
+            reasoning_summary: Some(ReasoningSummary::Concise),
+            ..StreamOptions::default()
+        };
+        apply_thinking_display(&mut opts, None);
+        assert!(opts.thinking_display.is_none());
+        assert!(opts.reasoning_summary.is_none());
+    }
+
+    #[test]
+    fn apply_thinking_display_summarized_fans_out_to_both_providers() {
+        let mut opts = StreamOptions::default();
+        apply_thinking_display(&mut opts, Some(ConfigThinkingDisplay::Summarized));
+        assert!(matches!(
+            opts.thinking_display,
+            Some(ThinkingDisplay::Summarized)
+        ));
+        assert!(matches!(
+            opts.reasoning_summary,
+            Some(ReasoningSummary::Concise)
+        ));
+    }
+
+    #[test]
+    fn apply_thinking_display_detailed_degrades_anthropic_to_summarized() {
+        // Anthropic adaptive has no Detailed variant; the user
+        // still gets a visible summary instead of falling back to
+        // the provider default.
+        let mut opts = StreamOptions::default();
+        apply_thinking_display(&mut opts, Some(ConfigThinkingDisplay::Detailed));
+        assert!(matches!(
+            opts.thinking_display,
+            Some(ThinkingDisplay::Summarized)
+        ));
+        assert!(matches!(
+            opts.reasoning_summary,
+            Some(ReasoningSummary::Detailed)
+        ));
+    }
+
+    #[test]
+    fn apply_thinking_display_omitted_clears_openai_summary() {
+        // OpenAI Responses has no "must suppress" knob; the
+        // closest analogue is to not request a summary at all.
+        let mut opts = StreamOptions {
+            reasoning_summary: Some(ReasoningSummary::Auto),
+            ..StreamOptions::default()
+        };
+        apply_thinking_display(&mut opts, Some(ConfigThinkingDisplay::Omitted));
+        assert!(matches!(
+            opts.thinking_display,
+            Some(ThinkingDisplay::Omitted)
+        ));
+        assert!(opts.reasoning_summary.is_none());
     }
 }

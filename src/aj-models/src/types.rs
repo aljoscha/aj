@@ -382,6 +382,37 @@ pub enum ReasoningSummary {
     Concise,
 }
 
+/// How the assistant's reasoning channel should be surfaced to the
+/// client.
+///
+/// Anthropic-only knob today: maps onto the `display` field of
+/// `thinking: {type: "adaptive"}` / `thinking: {type: "enabled"}`
+/// (see Anthropic SDK [`anthropic_sdk::messages::ThinkingDisplay`]).
+/// Adaptive thinking returns no streamed `thinking_delta` text by
+/// default — the model's raw chain-of-thought stays private and only
+/// a signed placeholder rides along for replay verification. Setting
+/// this to [`Self::Summarized`] asks the API to stream a
+/// model-generated summary of the reasoning so users can see *what*
+/// the model thought, even when the raw transcript is withheld.
+///
+/// Other providers ignore this field. OpenAI Responses callers
+/// should reach for [`StreamOptions::reasoning_summary`] instead;
+/// the two knobs are deliberately separate because their wire-level
+/// semantics aren't isomorphic (Responses lets the caller pick
+/// summary verbosity but never fully omits the channel).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    /// Stream a model-generated summary of the reasoning. The
+    /// `thinking` field on emitted thinking blocks carries the
+    /// summary text.
+    Summarized,
+    /// Suppress the reasoning channel entirely. The signed
+    /// placeholder still rides for replay; no `thinking` text is
+    /// streamed.
+    Omitted,
+}
+
 /// Controls whether the model must, may, or must not use tools.
 ///
 /// When [`StreamOptions::tool_choice`] is `None`, providers apply
@@ -528,6 +559,14 @@ pub struct StreamOptions {
     /// when reasoning is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
+    /// Anthropic-only: how the reasoning channel is surfaced to the
+    /// client (raw vs summarized vs omitted). Mapped onto the
+    /// `display` field of the request's `thinking` config. Ignored
+    /// by non-Anthropic providers. See [`ThinkingDisplay`] for the
+    /// rationale on why this is separate from
+    /// [`Self::reasoning_summary`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<ThinkingDisplay>,
     /// Controls whether/how the model uses tools. When `None`, the
     /// provider default applies (typically [`ToolChoice::Auto`]).
     #[serde(skip_serializing_if = "Option::is_none")]

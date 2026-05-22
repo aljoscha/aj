@@ -146,6 +146,8 @@ impl InteractiveMode {
                 tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
             }
             let env = AgentEnv::new();
+            let mut stream_options = aj_models::types::StreamOptions::default();
+            crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
             agent = Agent::with_provider(
                 env,
                 SYSTEM_PROMPT,
@@ -153,7 +155,7 @@ impl InteractiveMode {
                 config.disabled_tools.clone(),
                 provider,
                 model_info,
-                aj_models::types::StreamOptions::default(),
+                stream_options,
                 config.thinking,
             );
         } else {
@@ -195,6 +197,8 @@ impl InteractiveMode {
                 model_info,
                 stream_options,
             } = resolved;
+            let mut stream_options = stream_options;
+            crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
             agent = Agent::with_provider(
                 env,
                 SYSTEM_PROMPT,

@@ -12,8 +12,9 @@ use anthropic_sdk::messages::{
     CacheControl, ContentBlock as AContentBlock, ContentBlockDelta as AContentBlockDelta,
     ContentBlockParam, ImageSource as AImageSource, MessageParam, Messages as AMessages, Metadata,
     OutputConfig, OutputEffort, Role as ARole, ServerSentEvent, StopDetails as AStopDetails,
-    StopReason as AStopReason, Thinking as AThinking, ToolChoice as ATC, ToolResultContent as ATRC,
-    ToolUnion, Usage as AUsage, UsageDelta as AUsageDelta,
+    StopReason as AStopReason, Thinking as AThinking, ThinkingDisplay as AThinkingDisplay,
+    ToolChoice as ATC, ToolResultContent as ATRC, ToolUnion, Usage as AUsage,
+    UsageDelta as AUsageDelta,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -31,8 +32,8 @@ use crate::transform::transform_messages;
 use crate::types::{
     AssistantContent, AssistantError, AssistantMessage, CacheRetention, Context, ErrorCategory,
     Message, SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent,
-    ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolResultMessage, Usage, UserContent,
-    UserMessage,
+    ThinkingDisplay, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolResultMessage, Usage,
+    UserContent, UserMessage,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
@@ -286,7 +287,8 @@ fn build_request(
         options.temperature
     };
 
-    let (thinking, output_config) = build_thinking(model, reasoning);
+    let (thinking, output_config) =
+        build_thinking(model, reasoning, options.thinking_display.as_ref());
 
     let metadata = build_metadata(options);
 
@@ -689,6 +691,7 @@ fn to_anthropic_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Opt
 fn build_thinking(
     model: &ModelInfo,
     reasoning: Option<&ThinkingLevel>,
+    display: Option<&ThinkingDisplay>,
 ) -> (Option<AThinking>, Option<OutputConfig>) {
     let Some(level) = reasoning else {
         return (Some(AThinking::Disabled), None);
@@ -699,10 +702,11 @@ fn build_thinking(
         // ThinkingLevel rather than rejecting the request.
         return (Some(AThinking::Disabled), None);
     }
+    let display = display.map(to_anthropic_display);
     if supports_adaptive_thinking(model) {
         let effort = adaptive_effort_for(level, model);
         (
-            Some(AThinking::Adaptive { display: None }),
+            Some(AThinking::Adaptive { display }),
             Some(OutputConfig {
                 effort: Some(effort),
                 format: None,
@@ -713,10 +717,20 @@ fn build_thinking(
         (
             Some(AThinking::Enabled {
                 budget_tokens: budget_for(level),
-                display: None,
+                display,
             }),
             None,
         )
+    }
+}
+
+/// Map the unified [`ThinkingDisplay`] onto the Anthropic SDK's
+/// wire enum. Kept as a dedicated helper so the variant set stays
+/// obvious if either side grows new cases.
+fn to_anthropic_display(display: &ThinkingDisplay) -> AThinkingDisplay {
+    match display {
+        ThinkingDisplay::Summarized => AThinkingDisplay::Summarized,
+        ThinkingDisplay::Omitted => AThinkingDisplay::Omitted,
     }
 }
 
@@ -1365,12 +1379,12 @@ mod tests {
 
     #[test]
     fn build_thinking_adaptive_vs_budget() {
-        let (think, oc) = build_thinking(&fake_model(), Some(&ThinkingLevel::High));
+        let (think, oc) = build_thinking(&fake_model(), Some(&ThinkingLevel::High), None);
         assert!(matches!(think, Some(AThinking::Adaptive { .. })));
         let oc = oc.unwrap();
         assert!(matches!(oc.effort, Some(OutputEffort::High)));
 
-        let (think, oc) = build_thinking(&budget_model(), Some(&ThinkingLevel::Medium));
+        let (think, oc) = build_thinking(&budget_model(), Some(&ThinkingLevel::Medium), None);
         assert!(matches!(
             think,
             Some(AThinking::Enabled {
@@ -1381,20 +1395,58 @@ mod tests {
         assert!(oc.is_none());
 
         // No reasoning + reasoning-capable model → disabled.
-        let (think, oc) = build_thinking(&fake_model(), None);
+        let (think, oc) = build_thinking(&fake_model(), None, None);
         assert!(matches!(think, Some(AThinking::Disabled)));
         assert!(oc.is_none());
+    }
+
+    #[test]
+    fn build_thinking_threads_display_flag_through_both_shapes() {
+        // Adaptive thinking: the `display` field rides on the
+        // `Adaptive` variant directly.
+        let (think, _oc) = build_thinking(
+            &fake_model(),
+            Some(&ThinkingLevel::High),
+            Some(&ThinkingDisplay::Summarized),
+        );
+        match think {
+            Some(AThinking::Adaptive { display }) => {
+                assert!(matches!(display, Some(AThinkingDisplay::Summarized)));
+            }
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
+
+        // Budget thinking: same field on the `Enabled` variant.
+        let (think, _oc) = build_thinking(
+            &budget_model(),
+            Some(&ThinkingLevel::Medium),
+            Some(&ThinkingDisplay::Omitted),
+        );
+        match think {
+            Some(AThinking::Enabled { display, .. }) => {
+                assert!(matches!(display, Some(AThinkingDisplay::Omitted)));
+            }
+            other => panic!("expected Enabled, got {other:?}"),
+        }
+
+        // No display configured → wire field stays None so we
+        // don't pin the model into a specific mode.
+        let (think, _oc) = build_thinking(&fake_model(), Some(&ThinkingLevel::High), None);
+        match think {
+            Some(AThinking::Adaptive { display }) => assert!(display.is_none()),
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
     }
 
     #[test]
     fn xhigh_falls_back_to_high_when_unsupported() {
         let mut m = fake_model();
         m.supports_xhigh = false;
-        let (_think, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh));
+        let (_think, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh), None);
         assert!(matches!(oc.unwrap().effort, Some(OutputEffort::High)));
 
         m.supports_xhigh = true;
-        let (_think, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh));
+        let (_think, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh), None);
         assert!(matches!(oc.unwrap().effort, Some(OutputEffort::Max)));
     }
 

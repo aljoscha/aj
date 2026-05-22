@@ -152,6 +152,8 @@ pub async fn run(args: Args) -> Result<()> {
             provider,
             model_info,
         } = crate::scripted::resolve_or_explain(name)?;
+        let mut stream_options = aj_models::types::StreamOptions::default();
+        crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
         Agent::with_provider(
             env,
             SYSTEM_PROMPT,
@@ -159,7 +161,7 @@ pub async fn run(args: Args) -> Result<()> {
             config.disabled_tools.clone(),
             provider,
             model_info,
-            aj_models::types::StreamOptions::default(),
+            stream_options,
             config.thinking,
         )
     } else {
@@ -176,6 +178,8 @@ pub async fn run(args: Args) -> Result<()> {
             speed,
         )
         .context("failed to resolve model from registry")?;
+        let mut stream_options = stream_options;
+        crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
         Agent::with_provider(
             env,
             SYSTEM_PROMPT,

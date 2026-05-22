@@ -53,6 +53,75 @@ impl FromStr for ConfigThinkingLevel {
     }
 }
 
+/// How the assistant's reasoning channel is surfaced in
+/// `config.toml`. Mirrors [`aj_models::types::ThinkingDisplay`] —
+/// the field name matches the Anthropic SDK's `display` knob so
+/// users who've read the upstream docs find the same vocabulary
+/// here.
+///
+/// How much of the assistant's reasoning channel to surface to the
+/// user. A single knob that fans out to both provider-specific wire
+/// fields:
+///
+/// | Variant       | Anthropic `thinking.display` | OpenAI Responses `reasoning.summary` |
+/// |---------------|------------------------------|--------------------------------------|
+/// | `Summarized`  | `Summarized`                 | `Concise`                            |
+/// | `Detailed`    | `Summarized`*                | `Detailed`                           |
+/// | `Omitted`     | `Omitted`                    | (no summary requested)               |
+///
+/// *Anthropic has no "detailed" mode for adaptive thinking — it
+/// degrades to `Summarized` and the user gets the verbose
+/// counterpart only on OpenAI Responses. Leaving the config key
+/// unset is the cross-provider default ("provider default behavior")
+/// and is generally what produces a `Thinking…` placeholder with no
+/// streamed body on adaptive Anthropic models, and no reasoning
+/// summary on OpenAI Responses.
+///
+/// Providers that don't have a reasoning channel knob at all (e.g.
+/// Chat Completions) see both wire fields populated by the mapping
+/// and ignore them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigThinkingDisplay {
+    /// Stream a terse model-generated summary of the reasoning.
+    /// Maps onto Anthropic `Summarized` and OpenAI `Concise`.
+    Summarized,
+    /// Stream a verbose model-generated summary of the reasoning.
+    /// Maps onto Anthropic `Summarized` (no Detailed variant) and
+    /// OpenAI `Detailed`.
+    Detailed,
+    /// Suppress the reasoning channel entirely. Maps onto
+    /// Anthropic `Omitted`; on OpenAI Responses this is achieved by
+    /// not requesting a summary (equivalent to leaving the key
+    /// unset on that provider).
+    Omitted,
+}
+
+impl fmt::Display for ConfigThinkingDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigThinkingDisplay::Summarized => write!(f, "summarized"),
+            ConfigThinkingDisplay::Detailed => write!(f, "detailed"),
+            ConfigThinkingDisplay::Omitted => write!(f, "omitted"),
+        }
+    }
+}
+
+impl FromStr for ConfigThinkingDisplay {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "summarized" => Ok(ConfigThinkingDisplay::Summarized),
+            "detailed" => Ok(ConfigThinkingDisplay::Detailed),
+            "omitted" => Ok(ConfigThinkingDisplay::Omitted),
+            _ => Err(format!(
+                "invalid thinking_display '{s}': expected summarized, detailed, or omitted"
+            )),
+        }
+    }
+}
+
 /// Prefix for project-level AGENTS.md instructions injected into the system
 /// prompt.
 pub const AGENTS_MD_PREFIX: &str = r#"
@@ -254,6 +323,7 @@ pub enum ConfigError {
 /// model_name = "claude-sonnet-4-20250514"
 /// model_url = "https://api.anthropic.com"
 /// thinking = "low"
+/// thinking_display = "summarized"
 /// theme = "dark"
 /// disabled_tools = ["todo_read", "todo_write"]
 /// hide_thinking_block = false
@@ -268,6 +338,13 @@ pub struct Config {
     pub model_name: Option<String>,
     /// Default thinking level used when no trigger word is present.
     pub thinking: Option<ConfigThinkingLevel>,
+    /// How much of the assistant's reasoning channel to surface to
+    /// the user. Defaults to `None`, which leaves both providers'
+    /// upstream defaults in place — that's typically a `Thinking…`
+    /// placeholder with no streamed body on adaptive Anthropic
+    /// models, and no reasoning summary on OpenAI Responses.
+    /// See [`ConfigThinkingDisplay`] for the per-variant mapping.
+    pub thinking_display: Option<ConfigThinkingDisplay>,
     /// Inference speed mode (Anthropic only). `fast` enables higher
     /// output-tokens-per-second at some quality cost.
     pub speed: Option<ConfigSpeed>,
@@ -477,6 +554,48 @@ thinking = "medium"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.thinking, Some(ConfigThinkingLevel::Medium));
+    }
+
+    #[test]
+    fn test_config_deserialize_thinking_display() {
+        // Unset → None so the binary leaves both providers'
+        // upstream defaults in place.
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.thinking_display.is_none());
+
+        let cases = [
+            ("summarized", ConfigThinkingDisplay::Summarized),
+            ("detailed", ConfigThinkingDisplay::Detailed),
+            ("omitted", ConfigThinkingDisplay::Omitted),
+        ];
+        for (input, expected) in cases {
+            let toml_str = format!("thinking_display = \"{input}\"");
+            let config: Config = toml::from_str(&toml_str).unwrap();
+            assert_eq!(
+                config.thinking_display,
+                Some(expected),
+                "failed for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_thinking_display_from_str_round_trips() {
+        for variant in [
+            ConfigThinkingDisplay::Summarized,
+            ConfigThinkingDisplay::Detailed,
+            ConfigThinkingDisplay::Omitted,
+        ] {
+            let s = variant.to_string();
+            assert_eq!(s.parse::<ConfigThinkingDisplay>().unwrap(), variant);
+        }
+        // Case-insensitive parse, matching the
+        // `ConfigThinkingLevel` precedent.
+        assert_eq!(
+            "SUMMARIZED".parse::<ConfigThinkingDisplay>().unwrap(),
+            ConfigThinkingDisplay::Summarized,
+        );
+        assert!("nope".parse::<ConfigThinkingDisplay>().is_err());
     }
 
     #[test]
