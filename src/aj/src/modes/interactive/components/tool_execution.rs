@@ -71,6 +71,65 @@ const PADDING_X: usize = 1;
 /// auto-spacer drops a plain blank line between them.
 const PADDING_Y: usize = 1;
 
+/// Maximum body lines rendered for a head-truncated tool output
+/// (`Text` / `SubAgentReport` variants) when collapsed. Sized to
+/// give a quick at-a-glance preview without flooding the
+/// scrollback; revealing the rest is one `aj.tools.expand`
+/// keystroke away.
+const TEXT_COLLAPSED_LINES: usize = 10;
+
+/// Maximum body lines rendered for a head-truncated
+/// `SubAgentReport` body when collapsed. Aliased to
+/// [`TEXT_COLLAPSED_LINES`] for parallelism but kept as its own
+/// constant so a future divergence is a one-line change.
+const REPORT_COLLAPSED_LINES: usize = TEXT_COLLAPSED_LINES;
+
+/// Whether the user-visible hint that names the expansion key
+/// should be styled to describe head- or tail-truncated content.
+/// The phrasing (`N more lines` vs `N earlier lines`) keeps the
+/// hint honest about which end of the stream got dropped.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HintKind {
+    /// Body was truncated to its head; the hidden lines come after
+    /// the visible ones (`Text`, `SubAgentReport`).
+    More,
+    /// Body was truncated to its tail; the hidden lines come
+    /// before the visible ones (`Bash` per-stream).
+    Earlier,
+}
+
+/// Format the `… (N <kind> lines, <key> to expand)` hint line
+/// that signals a collapsed tool body has more content. The key is
+/// resolved at call time through the global keybindings registry;
+/// when no key is bound to [`crate::config::keybindings::ACTION_TOOLS_EXPAND`]
+/// the hint omits the parenthetical key reference rather than
+/// advertising an action the user can't trigger. The returned
+/// string is `style::dim`-wrapped so it reads as muted next to the
+/// surrounding body content.
+pub(crate) fn expand_hint(more: usize, kind: HintKind) -> String {
+    let kb = aj_tui::keybindings::get();
+    let keys = kb.get_keys(crate::config::keybindings::ACTION_TOOLS_EXPAND);
+    style::dim(&format_expand_hint(
+        more,
+        kind,
+        keys.first().map(String::as_str),
+    ))
+}
+
+/// Pure formatting half of [`expand_hint`]; takes the resolved key
+/// (or `None` for the no-binding fallback) so it stays unit-testable
+/// without touching the process-wide keybindings registry.
+fn format_expand_hint(more: usize, kind: HintKind, key: Option<&str>) -> String {
+    let word = match kind {
+        HintKind::More => "more",
+        HintKind::Earlier => "earlier",
+    };
+    match key {
+        Some(key) => format!("… ({more} {word} lines, {key} to expand)"),
+        None => format!("… ({more} {word} lines)"),
+    }
+}
+
 /// Minimum total render width at which the bubble framing kicks
 /// in. Below this we fall back to a plain header+body listing so
 /// the bg-padding pipeline (which assumes at least two cells of
@@ -124,6 +183,22 @@ pub struct ToolExecutionComponent {
     /// `ToolDetails` variant on every `ToolExecutionUpdate` and
     /// finalized on `ToolExecutionEnd`.
     body: Vec<String>,
+    /// Most recent details payload passed to [`Self::update_partial`]
+    /// or [`Self::update_result`]. Retained so [`Self::set_expanded`]
+    /// can re-run [`render_details_body`] with the new expansion
+    /// state without needing the event-pump to replay the original
+    /// event. `None` between construction and the first update.
+    last_details: Option<ToolDetails>,
+    /// `is_error` value paired with [`Self::last_details`]; only
+    /// meaningful when `last_details` was set by
+    /// [`Self::update_result`]. Used so re-rendering the body for
+    /// an expansion toggle doesn't accidentally flip the status
+    /// back to `Started`.
+    last_is_error: bool,
+    /// Whether the body renders in expanded form (full content) or
+    /// the compact head/tail-truncated form. Toggled globally by
+    /// the event pump in response to `aj.tools.expand`.
+    expanded: bool,
     /// Bg-paint closure for the in-flight state. Stored once at
     /// construction so the render path never has to rebuild the
     /// closure.
@@ -156,12 +231,15 @@ impl ToolExecutionComponent {
     /// and paints with the `tool_pending_bg` tint until the agent
     /// emits a result; [`Self::update_partial`] / [`Self::update_result`]
     /// flip the status and the matching bg.
-    pub fn new(tool_name: String, args: &Value, theme: &ChatTheme) -> Self {
+    pub fn new(tool_name: String, args: &Value, theme: &ChatTheme, expanded: bool) -> Self {
         let mut me = Self {
             tool_name,
             args_pretty: format_args(args),
             status: Status::Started,
             body: Vec::new(),
+            last_details: None,
+            last_is_error: false,
+            expanded,
             bg_pending: Arc::clone(&theme.tool_pending_bg),
             bg_success: Arc::clone(&theme.tool_success_bg),
             bg_error: Arc::clone(&theme.tool_error_bg),
@@ -177,14 +255,18 @@ impl ToolExecutionComponent {
     /// [`aj_agent::events::AgentEvent::ToolExecutionUpdate`] (today
     /// only `bash` emits these).
     pub fn update_partial(&mut self, details: &ToolDetails) {
-        self.body = render_details_body(details);
+        self.body = render_details_body(details, self.expanded);
+        self.last_details = Some(details.clone());
+        self.last_is_error = false;
         self.rebuild_children();
     }
 
     /// Finalize the component with the tool's result. Called from
     /// [`aj_agent::events::AgentEvent::ToolExecutionEnd`].
     pub fn update_result(&mut self, details: &ToolDetails, is_error: bool) {
-        self.body = render_details_body(details);
+        self.body = render_details_body(details, self.expanded);
+        self.last_details = Some(details.clone());
+        self.last_is_error = is_error;
         self.status = derive_status(details, is_error);
         // The status flip pulls a different bg closure into the
         // box. `set_bg_fn` doesn't invalidate the cache itself;
@@ -194,6 +276,29 @@ impl ToolExecutionComponent {
         // the children are unchanged.
         self.bubble.set_bg_fn(self.make_bg_box());
         self.rebuild_children();
+    }
+
+    /// Swap the body render mode between collapsed and expanded.
+    ///
+    /// The event pump walks every tool component in the chat
+    /// container on a `aj.tools.expand` toggle and calls this; the
+    /// next render then reflects the new mode for both finalized
+    /// and in-flight tool executions. A no-op when the mode hasn't
+    /// changed so a redundant toggle doesn't churn the cached
+    /// `Text` / `TextBox` children. Components that have not yet
+    /// received a partial or final payload (`last_details: None`)
+    /// just update the flag and let the next
+    /// [`Self::update_partial`] / [`Self::update_result`] render
+    /// with the new mode.
+    pub fn set_expanded(&mut self, expanded: bool) {
+        if self.expanded == expanded {
+            return;
+        }
+        self.expanded = expanded;
+        if let Some(details) = self.last_details.clone() {
+            self.body = render_details_body(&details, self.expanded);
+            self.rebuild_children();
+        }
     }
 
     /// Render the header line (`status tool(args)`). Kept private
@@ -396,7 +501,7 @@ fn quote_for_summary(s: &str) -> String {
 /// renderer's width math (and produce a ragged right edge on the
 /// surrounding bubble) or clobber adjacent cells via cursor moves
 /// or erase-in-line side effects.
-fn render_details_body(details: &ToolDetails) -> Vec<String> {
+fn render_details_body(details: &ToolDetails, expanded: bool) -> Vec<String> {
     match details {
         ToolDetails::Text { summary, body } => {
             let summary = sanitize_terminal_output(summary);
@@ -405,14 +510,20 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
             if !summary.is_empty() {
                 lines.push(style::dim(&summary));
             }
-            for line in body.split('\n') {
-                lines.push(line.to_string());
-            }
+            let mut body_lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
             // Trim a trailing empty line introduced by a body that
             // ended in `\n`; the surrounding bubble's bottom pad
             // already handles the vertical separation.
-            if lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
+            if body_lines.last().is_some_and(|l| l.is_empty()) {
+                body_lines.pop();
+            }
+            if !expanded && body_lines.len() > TEXT_COLLAPSED_LINES {
+                let more = body_lines.len() - TEXT_COLLAPSED_LINES;
+                body_lines.truncate(TEXT_COLLAPSED_LINES);
+                lines.extend(body_lines);
+                lines.push(expand_hint(more, HintKind::More));
+            } else {
+                lines.extend(body_lines);
             }
             lines
         }
@@ -451,6 +562,7 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
                 full_output_path.as_ref(),
                 stdout_truncation.as_ref(),
                 stderr_truncation.as_ref(),
+                expanded,
             ));
             lines
         }
@@ -462,8 +574,17 @@ fn render_details_body(details: &ToolDetails) -> Vec<String> {
             let task = sanitize_terminal_output(task);
             let report = sanitize_terminal_output(report);
             let mut lines = vec![style::dim(&format!("sub-agent {agent_id}: {task}"))];
-            for line in report.split('\n') {
-                lines.push(line.to_string());
+            let mut report_lines: Vec<String> = report.split('\n').map(|s| s.to_string()).collect();
+            if report_lines.last().is_some_and(|l| l.is_empty()) {
+                report_lines.pop();
+            }
+            if !expanded && report_lines.len() > REPORT_COLLAPSED_LINES {
+                let more = report_lines.len() - REPORT_COLLAPSED_LINES;
+                report_lines.truncate(REPORT_COLLAPSED_LINES);
+                lines.extend(report_lines);
+                lines.push(expand_hint(more, HintKind::More));
+            } else {
+                lines.extend(report_lines);
             }
             lines
         }
@@ -528,7 +649,7 @@ mod tests {
     #[test]
     fn header_includes_tool_name_and_args_summary() {
         let args = serde_json::json!({"path": "/tmp/foo.txt"});
-        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme());
+        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), true);
         let lines = c.render(80);
         // First and last rows are bg-painted blank padding.
         assert!(is_blank_row(&lines[0]));
@@ -545,8 +666,12 @@ mod tests {
 
     #[test]
     fn finalizing_with_text_body_renders_summary_and_body_inside_the_bubble() {
-        let mut c =
-            ToolExecutionComponent::new("read_file".to_string(), &serde_json::json!({}), &theme());
+        let mut c = ToolExecutionComponent::new(
+            "read_file".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            true,
+        );
         c.update_result(
             &ToolDetails::Text {
                 summary: "/tmp/foo.txt".into(),
@@ -576,7 +701,7 @@ mod tests {
     #[test]
     fn error_status_renders_a_red_cross_in_the_header() {
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
         c.update_result(
             &ToolDetails::Text {
                 summary: "boom".into(),
@@ -597,7 +722,7 @@ mod tests {
         // N]` footer. Verify the bubble paints with the failure
         // glyph in that case.
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
         c.update_result(
             &ToolDetails::Bash {
                 command: "exit 1".into(),
@@ -623,7 +748,7 @@ mod tests {
         // Don't regress the happy path: a zero exit must keep the
         // green check even though we now look at exit_code.
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
         c.update_result(
             &ToolDetails::Bash {
                 command: "echo hi".into(),
@@ -652,7 +777,7 @@ mod tests {
         // path; with the flag clear we don't second-guess the
         // tool and keep the success styling.
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
         c.update_result(
             &ToolDetails::Bash {
                 command: "true".into(),
@@ -692,7 +817,7 @@ mod tests {
         // component must wrap them so the strict line-width check
         // in `Tui::render` doesn't panic on the next frame.
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
         let long_line = "x".repeat(300);
         c.update_result(
             &ToolDetails::Text {
@@ -721,7 +846,7 @@ mod tests {
             "command": "echo hi",
             "description": "x".repeat(200),
         });
-        let mut c = ToolExecutionComponent::new("bash".to_string(), &args, &theme());
+        let mut c = ToolExecutionComponent::new("bash".to_string(), &args, &theme(), true);
         let width = 60;
         let lines = c.render(width);
         for (i, line) in lines.iter().enumerate() {
@@ -742,7 +867,7 @@ mod tests {
         // not the bubble tint. Grab the bg-paint prefix off the
         // first row of each render and verify they're identical.
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
 
         let bg_sample = |c: &mut ToolExecutionComponent| -> String {
             let lines = c.render(40);
@@ -798,8 +923,12 @@ mod tests {
             .map(|i| format!("line {i:02}: lorem ipsum dolor sit amet"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut c =
-            ToolExecutionComponent::new("read_file".to_string(), &serde_json::json!({}), &theme());
+        let mut c = ToolExecutionComponent::new(
+            "read_file".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            true,
+        );
         c.update_result(
             &ToolDetails::Text {
                 summary: "/tmp/big.txt".into(),
@@ -828,7 +957,7 @@ mod tests {
         // they reach the wrap path, so every row of the bubble lands
         // at exactly the render width.
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
         // Progress-style overprint, an SGR-reset followed by an
         // erase-in-line (the canonical "ragged right edge"
         // pattern), and a control byte (`\x08`) for good measure.
@@ -873,7 +1002,7 @@ mod tests {
         // styled `$ <command>` header line must still render flush
         // to width and contain only the visible command text.
         let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme());
+            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
         c.update_result(
             &ToolDetails::Bash {
                 command: "echo \x1b[31mboom\x1b[0m\rmore".into(),
@@ -902,6 +1031,134 @@ mod tests {
         assert!(
             plain.iter().any(|l| l.contains("echo boommore")),
             "{plain:#?}",
+        );
+    }
+
+    /// Make sure the global keybinding registry is populated for
+    /// tests that rely on the `aj.tools.expand` lookup inside
+    /// `expand_hint`. Idempotent — installing repeatedly just
+    /// re-points the global at an equivalent manager.
+    fn install_default_keybindings() {
+        crate::config::keybindings::install_global_manager_defaults();
+    }
+
+    #[test]
+    fn text_body_collapses_to_ten_lines_with_alt_o_hint() {
+        install_default_keybindings();
+        let body = (1..=30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut c = ToolExecutionComponent::new(
+            "read_file".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            false,
+        );
+        c.update_result(
+            &ToolDetails::Text {
+                summary: String::new(),
+                body: body.clone(),
+            },
+            false,
+        );
+        // First ten lines are visible plus a hint line.
+        let plain: Vec<String> = c.body.iter().map(|l| strip_ansi(l)).collect();
+        for i in 1..=10 {
+            assert!(
+                plain.iter().any(|l| l == &format!("line {i}")),
+                "missing line {i}: {plain:#?}",
+            );
+        }
+        assert!(
+            !plain.iter().any(|l| l == "line 11"),
+            "line 11 should be hidden in collapsed mode: {plain:#?}",
+        );
+        let hint = plain
+            .iter()
+            .find(|l| l.contains("more lines"))
+            .expect("hint present");
+        assert!(hint.contains("alt+o"), "hint missing key: {hint:?}");
+        assert!(hint.contains("20"), "hint missing count: {hint:?}");
+
+        // Expand → all 30 lines visible, hint gone.
+        c.set_expanded(true);
+        let plain: Vec<String> = c.body.iter().map(|l| strip_ansi(l)).collect();
+        for i in 1..=30 {
+            assert!(
+                plain.iter().any(|l| l == &format!("line {i}")),
+                "expanded: missing line {i}: {plain:#?}",
+            );
+        }
+        assert!(
+            !plain.iter().any(|l| l.contains("more lines")),
+            "hint should be gone after expand: {plain:#?}",
+        );
+    }
+
+    #[test]
+    fn bash_stdout_tail_compacts_to_five_lines_with_earlier_hint() {
+        install_default_keybindings();
+        let stdout = (1..=20)
+            .map(|i| format!("out {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            false,
+        );
+        c.update_result(
+            &ToolDetails::Bash {
+                command: "seq 20".into(),
+                stdout: stdout.clone(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                truncated: false,
+                full_output_path: None,
+                stdout_truncation: None,
+                stderr_truncation: None,
+            },
+            false,
+        );
+        let plain: Vec<String> = c.body.iter().map(|l| strip_ansi(l)).collect();
+        // Last five lines visible.
+        for i in 16..=20 {
+            assert!(
+                plain.iter().any(|l| l == &format!("out {i}")),
+                "missing tail line {i}: {plain:#?}",
+            );
+        }
+        // Earlier lines hidden.
+        assert!(
+            !plain.iter().any(|l| l == "out 15"),
+            "out 15 should be hidden: {plain:#?}",
+        );
+        let hint = plain
+            .iter()
+            .find(|l| l.contains("earlier lines"))
+            .expect("hint present");
+        assert!(hint.contains("alt+o"), "hint missing key: {hint:?}");
+        assert!(hint.contains("15"), "hint missing count: {hint:?}");
+    }
+
+    #[test]
+    fn expand_hint_drops_key_when_no_binding_is_registered() {
+        // Test the pure formatter directly so we don't have to
+        // mutate the process-wide keybindings manager (which is
+        // shared with sibling tests running in parallel).
+        assert_eq!(
+            format_expand_hint(7, HintKind::More, None),
+            "… (7 more lines)",
+        );
+        assert_eq!(
+            format_expand_hint(3, HintKind::Earlier, None),
+            "… (3 earlier lines)",
+        );
+        assert_eq!(
+            format_expand_hint(2, HintKind::More, Some("alt+o")),
+            "… (2 more lines, alt+o to expand)",
         );
     }
 }

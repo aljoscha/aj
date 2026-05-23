@@ -2,9 +2,9 @@
 //!
 //! The TUI crate ships generic editor / input / selection bindings via
 //! [`aj_tui::keybindings::tui_keybindings`]. This module adds the
-//! `aj.*` actions the interactive binary needs (currently just the
-//! thinking-block toggle) and installs the combined registry into the
-//! process-wide manager.
+//! `aj.*` actions the interactive binary needs (the thinking-block
+//! toggle, the tool-output expansion toggle) and installs the
+//! combined registry into the process-wide manager.
 //!
 //! Callers look up bindings through `aj_tui::keybindings::get()` and
 //! match keys against the action ID (`"aj.thinking.toggle"` etc.), so
@@ -19,16 +19,33 @@ use aj_tui::keybindings::{
 /// Action ID for the "fold / unfold thinking blocks" toggle.
 pub const ACTION_THINKING_TOGGLE: &str = "aj.thinking.toggle";
 
+/// Action ID for the "expand / collapse tool output" global toggle.
+///
+/// Bound by default to `alt+o`. Flipping it walks every
+/// `ToolExecutionComponent` in the chat scrollback and switches
+/// between the compact (head- or tail-truncated body) and the full
+/// rendering. Tool outputs default to compact; the keybinding is
+/// the only way to reveal the full body, so the action ID is also
+/// surfaced in the on-screen hint line so users can discover it
+/// without consulting docs.
+pub const ACTION_TOOLS_EXPAND: &str = "aj.tools.expand";
+
 /// Built-in `aj`-level keybinding definitions.
 ///
 /// Returned as a fresh `Vec` so callers can extend or filter before
 /// handing it to a [`KeybindingsManager`].
 pub fn aj_keybindings() -> KeybindingDefinitions {
     use KeybindingDefinition as K;
-    vec![(
-        ACTION_THINKING_TOGGLE.to_string(),
-        K::new("alt+t", "Toggle visibility of assistant thinking blocks"),
-    )]
+    vec![
+        (
+            ACTION_THINKING_TOGGLE.to_string(),
+            K::new("alt+t", "Toggle visibility of assistant thinking blocks"),
+        ),
+        (
+            ACTION_TOOLS_EXPAND.to_string(),
+            K::new("alt+o", "Toggle expanded tool output"),
+        ),
+    ]
 }
 
 /// Combined definitions: every `tui.*` action followed by every
@@ -72,6 +89,12 @@ mod tests {
     fn aj_thinking_toggle_defaults_to_alt_t() {
         let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
         assert_eq!(kbm.get_keys(ACTION_THINKING_TOGGLE), &["alt+t".to_string()]);
+    }
+
+    #[test]
+    fn aj_tools_expand_defaults_to_alt_o() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(kbm.get_keys(ACTION_TOOLS_EXPAND), &["alt+o".to_string()]);
     }
 
     #[test]

@@ -24,6 +24,14 @@ use aj_agent::tool::BashStreamTruncation;
 use aj_tools::tools::bash::stream_marker;
 use aj_tui::style;
 
+use crate::modes::interactive::components::tool_execution::{HintKind, expand_hint};
+
+/// Number of trailing lines kept per stream when rendering a
+/// collapsed bash body. Mirrors `tool_execution::BASH_COLLAPSED_LINES`;
+/// duplicated as a local constant rather than re-exported so the
+/// callsite stays a single number to grep for.
+const BASH_COLLAPSED_LINES: usize = 5;
+
 /// Render a [`aj_agent::tool::ToolDetails::Bash`] payload to a
 /// list of styled lines. The lines are append-ready: each one is
 /// a complete row (no embedded newlines) carrying inline ANSI
@@ -45,16 +53,12 @@ pub fn render_bash_body(
     full_output_path: Option<&PathBuf>,
     stdout_truncation: Option<&BashStreamTruncation>,
     stderr_truncation: Option<&BashStreamTruncation>,
+    expanded: bool,
 ) -> Vec<String> {
     let mut lines = Vec::new();
 
     if !stdout.is_empty() {
-        for line in stdout.split('\n') {
-            // Trailing newlines surface as a single empty trailing
-            // line; preserve it so the spacing between channels is
-            // predictable.
-            lines.push(line.to_string());
-        }
+        push_stream_lines(&mut lines, stdout, expanded);
     }
     if let Some(t) = stdout_truncation {
         lines.push(style::dim(&stream_marker(
@@ -68,9 +72,7 @@ pub fn render_bash_body(
         // Dim header so the eye notices the channel switch
         // without it competing with the actual error text.
         lines.push(style::dim("STDERR:"));
-        for line in stderr.split('\n') {
-            lines.push(line.to_string());
-        }
+        push_stream_lines(&mut lines, stderr, expanded);
     }
     if let Some(t) = stderr_truncation {
         lines.push(style::dim(&stream_marker(
@@ -103,6 +105,35 @@ pub fn render_bash_body(
     lines
 }
 
+/// Push a stream's lines (`stdout` or `stderr`) into `out`,
+/// applying tail compaction when `expanded` is false. The hint
+/// describing the dropped lines is inserted before the visible
+/// tail so the hint reads in the same reading direction as the
+/// remaining content.
+///
+/// A single trailing empty element produced by `split('\n')` on a
+/// stream ending in `\n` is popped first so the visible tail never
+/// ends in a stray blank row and the "N earlier lines" count
+/// reflects real lines. Matches the equivalent trim in
+/// `render_details_body`'s `Text` / `SubAgentReport` arms.
+fn push_stream_lines(out: &mut Vec<String>, stream: &str, expanded: bool) {
+    let mut all_lines: Vec<&str> = stream.split('\n').collect();
+    if all_lines.last().is_some_and(|l| l.is_empty()) {
+        all_lines.pop();
+    }
+    if expanded || all_lines.len() <= BASH_COLLAPSED_LINES {
+        for line in all_lines {
+            out.push(line.to_string());
+        }
+        return;
+    }
+    let earlier = all_lines.len() - BASH_COLLAPSED_LINES;
+    out.push(expand_hint(earlier, HintKind::Earlier));
+    for line in &all_lines[all_lines.len() - BASH_COLLAPSED_LINES..] {
+        out.push((*line).to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +162,16 @@ mod tests {
 
     #[test]
     fn renders_stdout_then_stderr_then_exit_marker() {
-        let lines = render_bash_body("hello\nworld", "uh oh", Some(0), false, None, None, None);
+        let lines = render_bash_body(
+            "hello\nworld",
+            "uh oh",
+            Some(0),
+            false,
+            None,
+            None,
+            None,
+            true,
+        );
         let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
         assert_eq!(
             plain,
@@ -144,7 +184,7 @@ mod tests {
     #[test]
     fn surfaces_a_truncation_path_via_legacy_fallback() {
         let p = PathBuf::from("/tmp/aj-bash-xyz.log");
-        let lines = render_bash_body("partial", "", Some(0), true, Some(&p), None, None);
+        let lines = render_bash_body("partial", "", Some(0), true, Some(&p), None, None, true);
         let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
         assert!(
             plain.last().unwrap().contains("/tmp/aj-bash-xyz.log"),
@@ -181,6 +221,7 @@ mod tests {
             Some(&p),
             Some(&trunc),
             None,
+            true,
         );
         let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
         // Marker appears between the stdout content and the exit line.
@@ -214,8 +255,35 @@ mod tests {
         // timed-out run; the wire `content` already explains the
         // failure to the model, so the rendered body just shows
         // whatever the child produced before being killed.
-        let lines = render_bash_body("partial output", "", None, false, None, None, None);
+        let lines = render_bash_body("partial output", "", None, false, None, None, None, true);
         let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
         assert_eq!(plain, vec!["partial output"]);
+    }
+
+    /// Collapsed bash with a trailing-newline-bearing stdout (the
+    /// normal shape of `echo`-style output): the synthetic empty
+    /// trailing element from `split('\n')` must be popped before
+    /// counting so the hint reports real lines and the visible
+    /// tail doesn't end on a stray blank row.
+    #[test]
+    fn collapsed_bash_pops_trailing_newline_before_counting() {
+        crate::config::keybindings::install_global_manager_defaults();
+        // 6 real lines + trailing newline. With BASH_COLLAPSED_LINES = 5
+        // we want hint = "1 earlier" and visible tail = lines 2-6.
+        let stdout = "a\nb\nc\nd\ne\nf\n";
+        let lines = render_bash_body(stdout, "", Some(0), false, None, None, None, false);
+        let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
+        assert_eq!(
+            plain,
+            vec![
+                "… (1 earlier lines, alt+o to expand)".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+                "f".to_string(),
+                "[exit 0]".to_string(),
+            ]
+        );
     }
 }

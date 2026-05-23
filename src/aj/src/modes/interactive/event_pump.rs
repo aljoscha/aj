@@ -76,6 +76,13 @@ pub struct EventPump {
     /// [`Self::set_hide_thinking_block`]; see
     /// `docs/aj-next-plan.md` §4.4.
     hide_thinking_block: bool,
+    /// Whether new and existing tool-execution components should
+    /// render their bodies fully (`true`) or in the compact head/
+    /// tail-truncated form (`false`). Toggled at runtime by
+    /// [`Self::set_tools_expanded`] in response to the
+    /// `aj.tools.expand` keybinding; defaults to `false` so the
+    /// scrollback stays compact across long sessions.
+    tools_expanded: bool,
 }
 
 impl EventPump {
@@ -85,14 +92,18 @@ impl EventPump {
     /// initial mode for the thinking channel; the host loads it
     /// from `~/.aj/config.toml` (`hide_thinking_block` key) on
     /// startup and can flip it at runtime via
-    /// [`Self::set_hide_thinking_block`].
-    pub fn new(theme: ChatTheme, hide_thinking_block: bool) -> Self {
+    /// [`Self::set_hide_thinking_block`]. `tools_expanded` is the
+    /// initial mode for tool-output bubbles; today the host
+    /// always starts collapsed and the user flips it at runtime
+    /// via [`Self::set_tools_expanded`].
+    pub fn new(theme: ChatTheme, hide_thinking_block: bool, tools_expanded: bool) -> Self {
         Self {
             theme,
             current_assistant: None,
             tool_index: HashMap::new(),
             running_agents: HashSet::new(),
             hide_thinking_block,
+            tools_expanded,
         }
     }
 
@@ -124,6 +135,39 @@ impl EventPump {
             for i in 0..chat.len() {
                 if let Some(msg) = chat.get_mut_as::<AssistantMessageComponent>(i) {
                     msg.set_hide_thinking_block(hide);
+                }
+            }
+        }
+        tui.invalidate();
+        tui.request_render();
+    }
+
+    /// Current tool-output render mode. Exposed so the host's
+    /// `aj.tools.expand` handler can flip the state without first
+    /// reading it back through a separate getter.
+    pub fn tools_expanded(&self) -> bool {
+        self.tools_expanded
+    }
+
+    /// Update the tool-output render mode for this session.
+    ///
+    /// Updates the pump's own flag so freshly-created tool
+    /// components pick up the new mode, then walks every existing
+    /// child of the chat container and calls
+    /// [`ToolExecutionComponent::set_expanded`] on each one so the
+    /// next render reflects the new mode for both finalized
+    /// history and any in-flight streaming tool. Finally
+    /// invalidates the TUI's cached render output so the next
+    /// paint actually picks the change up.
+    pub fn set_tools_expanded(&mut self, tui: &mut Tui, expanded: bool) {
+        if self.tools_expanded == expanded {
+            return;
+        }
+        self.tools_expanded = expanded;
+        if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
+            for i in 0..chat.len() {
+                if let Some(tool) = chat.get_mut_as::<ToolExecutionComponent>(i) {
+                    tool.set_expanded(expanded);
                 }
             }
         }
@@ -554,7 +598,8 @@ impl EventPump {
         tool: &str,
         args: &serde_json::Value,
     ) {
-        let component = ToolExecutionComponent::new(tool.to_string(), args, &self.theme);
+        let component =
+            ToolExecutionComponent::new(tool.to_string(), args, &self.theme, self.tools_expanded);
         let idx = self.push_chat_child(tui, Box::new(component));
         self.tool_index.insert(call_id.to_string(), idx);
         // A tool call that arrives mid-turn means the assistant
@@ -616,6 +661,7 @@ impl EventPump {
                     tool.to_string(),
                     &serde_json::json!({}),
                     &self.theme,
+                    self.tools_expanded,
                 );
                 let idx = self.push_chat_child(tui, Box::new(component));
                 self.tool_index.insert(call_id.to_string(), idx);
@@ -871,7 +917,7 @@ mod tests {
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
         build_layout(&mut tui, &theme);
         let chat = chat_theme(&theme);
-        let pump = EventPump::new(chat.clone(), false);
+        let pump = EventPump::new(chat.clone(), false, false);
         (tui, pump, chat)
     }
 
@@ -1651,5 +1697,87 @@ mod tests {
             window.as_millis() / 16,
             16,
         );
+    }
+
+    #[test]
+    fn set_tools_expanded_flips_every_existing_tool_component() {
+        // The pump starts in collapsed mode; appending two
+        // finalized tool executions should give us two collapsed
+        // components. Flipping the pump must walk the chat
+        // container and expand each one.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        assert!(!pump.tools_expanded());
+
+        // Drive two finished tool calls into the chat slot.
+        for (i, body_line_count) in [(0usize, 30usize), (1, 25)] {
+            let body = (0..body_line_count)
+                .map(|n| format!("tool-{i} line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            pump.handle(
+                &mut tui,
+                &AgentEvent::ToolExecutionStart {
+                    agent_id: AgentId::Main,
+                    call_id: format!("call-{i}"),
+                    tool: "read_file".into(),
+                    args: serde_json::json!({}),
+                },
+            );
+            pump.handle(
+                &mut tui,
+                &AgentEvent::ToolExecutionEnd {
+                    agent_id: AgentId::Main,
+                    call_id: format!("call-{i}"),
+                    tool: "read_file".into(),
+                    result: aj_agent::tool::ToolDetails::Text {
+                        summary: String::new(),
+                        body,
+                    },
+                    is_error: false,
+                },
+            );
+        }
+
+        // Helper: count tool components in the chat slot whose
+        // rendered body contains the line that's *only* visible in
+        // expanded mode (line index >= TEXT_COLLAPSED_LINES = 10).
+        let count_expanded = |tui: &mut Tui| -> usize {
+            let chat = tui
+                .get_mut_as::<Container>(SlotIndex::Chat.idx())
+                .expect("chat slot");
+            let mut n = 0;
+            for i in 0..chat.len() {
+                if let Some(tool) = chat.get_mut_as::<ToolExecutionComponent>(i) {
+                    let lines = tool.render(80);
+                    let has_late_line = lines
+                        .iter()
+                        .any(|l| l.contains("line 20") || l.contains("line 24"));
+                    if has_late_line {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // Sanity: collapsed, no late lines visible.
+        assert_eq!(count_expanded(&mut tui), 0);
+
+        pump.set_tools_expanded(&mut tui, true);
+        assert!(pump.tools_expanded());
+        assert_eq!(
+            count_expanded(&mut tui),
+            2,
+            "both tool components should expose their hidden tail after expand",
+        );
+
+        // A redundant set is a no-op (no panic, no rebuild churn).
+        pump.set_tools_expanded(&mut tui, true);
+        assert!(pump.tools_expanded());
+
+        // And we can flip back.
+        pump.set_tools_expanded(&mut tui, false);
+        assert!(!pump.tools_expanded());
+        assert_eq!(count_expanded(&mut tui), 0);
     }
 }

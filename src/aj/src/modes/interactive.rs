@@ -380,7 +380,7 @@ impl InteractiveMode {
         // Drive replay events through the pump (post-layout so the
         // chat container has a slot to receive them). Replay never
         // hits the bus, so persistence isn't double-written.
-        let mut pump = EventPump::new(chat_theme(&theme), config.hide_thinking_block);
+        let mut pump = EventPump::new(chat_theme(&theme), config.hide_thinking_block, false);
         for event in replay(&log) {
             pump.handle(&mut tui, &event);
         }
@@ -532,6 +532,23 @@ impl InteractiveMode {
                                     // Don't post a "hidden/visible"
                                     // notice — the transcript above
                                     // already shows the new state.
+                                    continue;
+                                }
+                            }
+                            // Toggle the tool-output render mode for the
+                            // session. Bound via `aj.tools.expand`
+                            // (default `alt+o`); intercepted before
+                            // `tui.handle_input` so the editor never sees
+                            // the keystroke.
+                            {
+                                let kb = aj_tui::keybindings::get();
+                                if kb.matches(
+                                    &input,
+                                    crate::config::keybindings::ACTION_TOOLS_EXPAND,
+                                ) {
+                                    drop(kb);
+                                    let new_value = !pump.tools_expanded();
+                                    pump.set_tools_expanded(&mut tui, new_value);
                                     continue;
                                 }
                             }
@@ -1401,7 +1418,7 @@ async fn perform_thread_swap(
         chat.clear();
     }
     let hide_thinking_block = pump.hide_thinking_block();
-    *pump = EventPump::new(chat_theme(theme), hide_thinking_block);
+    *pump = EventPump::new(chat_theme(theme), hide_thinking_block, false);
     {
         let l = log.lock().await;
         for event in replay(&l) {
@@ -1487,7 +1504,7 @@ async fn perform_clear_thread(
         chat.clear();
     }
     let hide_thinking_block = pump.hide_thinking_block();
-    *pump = EventPump::new(chat_theme(theme), hide_thinking_block);
+    *pump = EventPump::new(chat_theme(theme), hide_thinking_block, false);
 
     // 6. Refresh the header with the new thread id and a friendly
     //    notice so the user sees the swap in the top bar.
