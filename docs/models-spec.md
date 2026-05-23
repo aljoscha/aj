@@ -1439,7 +1439,6 @@ the next turn carries no real state, so the chain-of-thought is
 lost even if the server accepts the request. This is why the
 reasoning-enabled branch of §7.3.2 always sets `include`, and it's
 a prerequisite for the §1.10 round-trip invariant on this provider.
-pi-mono does the same thing unconditionally.
 
 #### 7.3.4 Text Signatures
 
