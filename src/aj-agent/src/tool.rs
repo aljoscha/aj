@@ -94,7 +94,13 @@ pub enum ToolDetails {
     /// Command-output rendering for `bash`. `stdout`/`stderr` carry a
     /// bounded rolling tail; if either stream exceeded the cap the
     /// implementation spills the full output to a temp file and
-    /// surfaces its path through `full_output_path`.
+    /// surfaces its path through `full_output_path`. The optional
+    /// `stdout_truncation` / `stderr_truncation` payloads carry
+    /// per-stream truncation summaries (total / output line and byte
+    /// counts, which budget fired, partial-trailing-line flag) that
+    /// renderers use to compose informative markers; absent fields on
+    /// older persisted sessions fall back to the legacy
+    /// `[Output truncated]` marker.
     Bash {
         /// The exact command line executed.
         command: String,
@@ -112,6 +118,17 @@ pub enum ToolDetails {
         /// when truncation occurred.
         #[serde(skip_serializing_if = "Option::is_none")]
         full_output_path: Option<PathBuf>,
+        /// Structured truncation summary for `stdout` when that stream
+        /// exceeded the cap. Renderers and the wire-content footer
+        /// consume this to build informative markers. Default `None`
+        /// keeps the serialized form stable for sessions captured
+        /// before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout_truncation: Option<BashStreamTruncation>,
+        /// Structured truncation summary for `stderr`. Same contract as
+        /// `stdout_truncation`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stderr_truncation: Option<BashStreamTruncation>,
     },
     /// Sub-agent run report — emitted by the `agent` tool when it
     /// runs as a child agent and returns a final report.
@@ -135,6 +152,60 @@ pub enum ToolDetails {
     /// New tools start here and graduate to a dedicated variant once
     /// a rendering pattern repeats.
     Json(Value),
+}
+
+// ---------------------------------------------------------------------------
+// Bash truncation summary
+// ---------------------------------------------------------------------------
+
+/// Per-stream truncation summary attached to [`ToolDetails::Bash`].
+///
+/// Trimmed to the fields downstream renderers actually consume. The
+/// type is intentionally serializable so it round-trips through the
+/// JSONL session log alongside the rest of `ToolDetails`; older logs
+/// that lack the field deserialize cleanly thanks to `#[serde(default)]`
+/// on the enclosing `Option`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BashStreamTruncation {
+    /// Line count of the original (un-truncated) source stream. A
+    /// single trailing newline is consumed and does not add a phantom
+    /// empty line.
+    pub total_lines: u64,
+    /// Byte length of the original source stream.
+    pub total_bytes: u64,
+    /// Line count of the kept tail content present in `stdout` /
+    /// `stderr`. When `last_line_partial` is set this is `1` — a
+    /// single partial line counts as one output line.
+    pub output_lines: u64,
+    /// Byte length of the kept tail content.
+    pub output_bytes: u64,
+    /// Which budget triggered truncation.
+    pub truncated_by: TruncationCause,
+    /// True iff the kept tail starts mid-line because the source's
+    /// trailing line alone exceeded the byte budget. Renderers use
+    /// this to switch to the `[Showing last <bytes> of line N (line
+    /// is <size>)]` marker variant.
+    #[serde(default)]
+    pub last_line_partial: bool,
+    /// Size in bytes of the source's trailing line, meaningful when
+    /// `last_line_partial` is `true`.
+    #[serde(default)]
+    pub last_line_bytes: u64,
+}
+
+/// Which budget triggered a tool-output truncation.
+///
+/// Serialized as `"lines"` or `"bytes"`. Lives alongside
+/// [`BashStreamTruncation`] in `aj-agent` because the persisted schema
+/// is the source of truth for tool-result rendering; the truncation
+/// algorithm in `aj-tools::truncate` imports it from here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TruncationCause {
+    /// Hit the line cap.
+    Lines,
+    /// Hit the byte cap.
+    Bytes,
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +485,8 @@ mod tests {
                 exit_code: Some(0),
                 truncated: false,
                 full_output_path: None,
+                stdout_truncation: None,
+                stderr_truncation: None,
             },
             ToolDetails::SubAgentReport {
                 agent_id: 1,

@@ -4,21 +4,29 @@
 //! `docs/aj-next-plan.md` §2.2. Returns a [`ToolOutcome`] whose
 //! `details` is [`ToolDetails::Bash`] on completion, carrying a
 //! bounded rolling tail of `stdout` / `stderr`, the process exit code,
-//! a `truncated` flag, and an optional `full_output_path` pointing at
-//! a temp file with the complete (un-truncated) capture. The wire
-//! `content` keeps the legacy text shape (`<stdout>` then `STDERR:` then
-//! `Command failed with exit code: N`) so the model reads the same
-//! transcript it always has.
+//! a `truncated` flag, an optional `full_output_path` pointing at a
+//! temp file with the complete (un-truncated) capture, and per-stream
+//! [`BashStreamTruncation`] summaries with the line/byte totals
+//! renderers use to compose `[Showing lines X-Y of TOTAL ...]`
+//! markers. The wire `content` keeps the legacy text shape
+//! (`<stdout>` then `STDERR:` then `Command failed with exit code: N`)
+//! so the model reads the same transcript it always has, with each
+//! affected stream's marker inserted right after its content when
+//! truncation occurred.
 //!
 //! Per `docs/aj-next-plan.md` §1.2 / §1.8 / §6:
 //!
-//! - **Bounded tail.** Each stream is capped at [`STREAM_CAP_BYTES`]
-//!   in memory; bytes beyond that get evicted from the in-memory tail
-//!   but still land in the spill file. The first time a stream
-//!   overflows, `truncated` flips to `true` and the spill path is
-//!   surfaced in the structured payload so the user (and a future TUI)
-//!   can open the full transcript on demand.
-//! - **Spill file.** A `tempfile::NamedTempFile` is created up-front
+//! - **Bounded tail.** Each stream is capped at
+//!   [`crate::truncate::BASH_MAX_BYTES`] / [`crate::truncate::BASH_MAX_LINES`]
+//!   for what the model sees; in memory we keep a rolling window up to
+//!   [`ROLLING_CAP_BYTES`] (2× the byte cap) and lazily trim it back
+//!   whenever it crosses [`TRIM_TRIGGER_BYTES`] (4× the byte cap).
+//!   Bytes beyond that get evicted from the in-memory tail but still
+//!   land in the spill file. The first time the source overflows
+//!   either cap, `truncated` flips to `true` and the spill path is
+//!   surfaced in the structured payload so the user (and the TUI) can
+//!   open the full transcript on demand.
+//! - **Spill file.** A [`tempfile::NamedTempFile`] is created up-front
 //!   with prefix `aj-bash-` and suffix `.log`; both reader tasks tee
 //!   into it as bytes flow. If no truncation occurred at completion the
 //!   `NamedTempFile` is dropped (cleaning up the file). Otherwise
@@ -27,7 +35,9 @@
 //!   self-throttles `ToolContext::emit_update` to one snapshot per
 //!   [`UPDATE_DEBOUNCE`] (~10/s) using a leading-edge fire so the first
 //!   byte of output lights up the UI without waiting for the next
-//!   tick.
+//!   tick. Live snapshots carry the boolean `truncated` flag but not
+//!   the structured per-stream summary (that's only meaningful once
+//!   the stream has closed).
 //! - **Cancellation / timeout.** The child is launched in a fresh
 //!   process group (`process_group(0)`) so we can SIGKILL the entire
 //!   tree on cancel or timeout. Plain `Child::kill()` only terminates
@@ -43,7 +53,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aj_agent::tool::{ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
+use aj_agent::tool::{
+    BashStreamTruncation, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,6 +64,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::Instant;
 
+use crate::truncate::{BASH_MAX_BYTES, BASH_MAX_LINES, TruncatedBy, format_size, truncate_tail};
+
 const DESCRIPTION: &str = r#"
 Execute a command in the system shell (bash). The command will be run in the
 working directory of the agent session.
@@ -59,25 +73,26 @@ working directory of the agent session.
 - There are no permissions checks or sandboxing. You are free to run any command
   you consider reasonable and safe.
 - Commands have a configurable timeout to prevent hanging (default: 30s).
-- Output is truncated to 35000 characters to prevent excessive output.
+- Output is truncated to the last 2000 lines or 50KB per stream (whichever
+  fires first). When truncated, the full output is saved to a temp file and
+  the marker points at it.
 - The command is passed to `bash -c`, so pipes, redirects, and shell features work.
 - For file search, prefer `rg` (ripgrep) over `grep`/`find` — it's faster and
   respects `.gitignore` by default. Use `read_file` for reading file contents
   rather than `cat`.
 "#;
 
-/// Maximum bytes preserved per stream in the in-memory tail. Each of
-/// `stdout` / `stderr` keeps a rolling window at most this large; once
-/// either exceeds the cap the structured payload's `truncated` flag is
-/// set and the temp-file spill becomes the source of truth for the
-/// full output.
-const STREAM_CAP_BYTES: usize = 16 * 1024;
-
-/// Hard upper bound on the textual wire content the model receives.
-/// Mirrors the legacy 35 000-char ceiling so existing prompts keep
-/// behaving the same way; in practice the per-stream cap above keeps us
-/// well under this.
-const WIRE_CAP_BYTES: usize = 35_000;
+/// Maximum bytes preserved per stream in the in-memory rolling tail
+/// after a trim. Twice the byte cap so the post-trim window always
+/// contains the full last `BASH_MAX_BYTES` of the stream plus a
+/// buffer for the next chunk, which keeps the truncate-tail finaliser
+/// free to drop a leading partial line without losing visible bytes.
+const ROLLING_CAP_BYTES: usize = BASH_MAX_BYTES * 2;
+/// Trim trigger. We trim the rolling tail back to [`ROLLING_CAP_BYTES`]
+/// once its size crosses this threshold; in between trims the tail is
+/// allowed to grow up to this size, amortising the cost of shifting
+/// bytes out of the front of a `Vec<u8>`.
+const TRIM_TRIGGER_BYTES: usize = ROLLING_CAP_BYTES * 2;
 
 /// Minimum spacing between `emit_update` snapshots. ~10 events per
 /// second, with a leading-edge fire so the very first chunk of output
@@ -178,8 +193,8 @@ impl ToolDefinition for BashTool {
         // surface the path through the structured payload.
         let spill = Arc::new(Mutex::new(SpillState::new()?));
 
-        let stdout_state = Arc::new(Mutex::new(StreamState::default()));
-        let stderr_state = Arc::new(Mutex::new(StreamState::default()));
+        let stdout_state = Arc::new(Mutex::new(StreamState::new()));
+        let stderr_state = Arc::new(Mutex::new(StreamState::new()));
 
         let stdout_reader = tokio::spawn(read_stream(
             stdout,
@@ -199,8 +214,6 @@ impl ToolDefinition for BashTool {
         let mut last_update = Instant::now() - UPDATE_DEBOUNCE;
 
         let outcome_kind = loop {
-            // Leading-edge debounce: emit a snapshot whenever the
-            // backoff window has elapsed since the last emission.
             let now = Instant::now();
             if now.duration_since(last_update) >= UPDATE_DEBOUNCE {
                 let snapshot = snapshot_partial(&command, &stdout_state, &stderr_state);
@@ -242,14 +255,20 @@ impl ToolDefinition for BashTool {
         let _ = stdout_reader.await;
         let _ = stderr_reader.await;
 
-        // Pull the captured bytes out of the shared state.
-        let stdout_data = std::mem::take(&mut stdout_state.lock().unwrap().tail);
-        let stderr_data = std::mem::take(&mut stderr_state.lock().unwrap().tail);
-        let stdout_truncated = stdout_state.lock().unwrap().truncated;
-        let stderr_truncated = stderr_state.lock().unwrap().truncated;
-        let truncated = stdout_truncated || stderr_truncated;
-        let stdout_str = decode_stream_output(stdout_data);
-        let stderr_str = decode_stream_output(stderr_data);
+        // Finalize per-stream: apply truncate_tail to the rolling tail
+        // (after dropping any leading partial line) and produce the
+        // model-facing stdout/stderr strings plus optional structured
+        // truncation summaries.
+        let (stdout_str, stdout_truncation) = {
+            let mut s = stdout_state.lock().unwrap();
+            finalize_stream(&mut s)
+        };
+        let (stderr_str, stderr_truncation) = {
+            let mut s = stderr_state.lock().unwrap();
+            finalize_stream(&mut s)
+        };
+
+        let truncated = stdout_truncation.is_some() || stderr_truncation.is_some();
 
         // Persist the spill file iff we actually truncated; otherwise
         // drop it (NamedTempFile's Drop unlinks the file).
@@ -270,10 +289,11 @@ impl ToolDefinition for BashTool {
         let wire = build_wire_content(
             &stdout_str,
             &stderr_str,
+            stdout_truncation.as_ref(),
+            stderr_truncation.as_ref(),
             &outcome_kind,
             exit_code,
             input.timeout,
-            truncated,
             full_output_path.as_deref(),
         );
 
@@ -292,6 +312,8 @@ impl ToolDefinition for BashTool {
                 exit_code,
                 truncated,
                 full_output_path,
+                stdout_truncation,
+                stderr_truncation,
             },
             is_error,
         })
@@ -312,13 +334,95 @@ enum ChildExit {
 }
 
 /// Per-stream rolling-tail state shared with the reader task.
-#[derive(Default)]
+///
+/// Tracks both the in-memory rolling tail and the source-stream
+/// totals (line and byte counts) needed to build the truncation
+/// markers. The rolling tail is allowed to grow up to
+/// [`TRIM_TRIGGER_BYTES`] between trims and is shrunk back to
+/// [`ROLLING_CAP_BYTES`] whenever it crosses that threshold.
 struct StreamState {
-    /// Bytes captured so far, capped at [`STREAM_CAP_BYTES`].
+    /// Rolling buffer of recent source bytes.
     tail: Vec<u8>,
-    /// True iff at least one byte has been evicted from the front of
-    /// `tail` because the cap was exceeded.
-    truncated: bool,
+    /// True iff `tail[0]` sits at a line boundary in the source — i.e.
+    /// the byte preceding it in the original stream was `\n`, or
+    /// `tail[0]` is the first byte of the source. Used at snapshot
+    /// time to decide whether to drop a leading partial line before
+    /// running [`truncate_tail`].
+    tail_starts_at_boundary: bool,
+    /// Total bytes that flowed through this stream (including any
+    /// that have been trimmed out of `tail`).
+    total_bytes_seen: u64,
+    /// Number of `\n` bytes seen in the source so far.
+    newlines_seen: u64,
+    /// Bytes since the most recent `\n` (or since stream start). Equals
+    /// the size of the source's trailing partial line at end-of-stream.
+    current_line_bytes: u64,
+    /// True iff the most recent source byte was `\n`. Initialised to
+    /// `true` so an empty stream is treated as ending on a (vacuous)
+    /// boundary.
+    ends_with_newline: bool,
+}
+
+impl StreamState {
+    fn new() -> Self {
+        Self {
+            tail: Vec::new(),
+            tail_starts_at_boundary: true,
+            total_bytes_seen: 0,
+            newlines_seen: 0,
+            current_line_bytes: 0,
+            ends_with_newline: true,
+        }
+    }
+
+    /// Source line count. The empty stream has zero lines; a stream
+    /// ending in `\n` does not get a phantom trailing empty line;
+    /// otherwise we add one for the unterminated trailing line.
+    fn total_lines(&self) -> u64 {
+        if self.total_bytes_seen == 0 {
+            return 0;
+        }
+        self.newlines_seen + u64::from(!self.ends_with_newline)
+    }
+
+    /// Apply a chunk: update the rolling tail and the source-totals
+    /// bookkeeping. The chunk is appended verbatim; we trim back to
+    /// [`ROLLING_CAP_BYTES`] once the tail crosses
+    /// [`TRIM_TRIGGER_BYTES`].
+    #[allow(clippy::as_conversions)]
+    fn append_chunk(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.total_bytes_seen += chunk.len() as u64;
+        for &b in chunk {
+            if b == b'\n' {
+                self.newlines_seen += 1;
+                self.current_line_bytes = 0;
+                self.ends_with_newline = true;
+            } else {
+                self.current_line_bytes += 1;
+                self.ends_with_newline = false;
+            }
+        }
+        self.tail.extend_from_slice(chunk);
+        if self.tail.len() > TRIM_TRIGGER_BYTES {
+            self.trim_to(ROLLING_CAP_BYTES);
+        }
+    }
+
+    fn trim_to(&mut self, target: usize) {
+        if self.tail.len() <= target {
+            return;
+        }
+        let drop_n = self.tail.len() - target;
+        // `drop_n > 0` here, so `tail[drop_n - 1]` is the last byte
+        // we're about to evict. Whether it's `\n` decides whether the
+        // new tail starts on a fresh line.
+        let preceding = self.tail[drop_n - 1];
+        self.tail.drain(..drop_n);
+        self.tail_starts_at_boundary = preceding == b'\n';
+    }
 }
 
 /// Spill-file state: a `NamedTempFile` we tee both streams into. When
@@ -358,7 +462,7 @@ impl SpillState {
     }
 }
 
-/// Drain `reader` into the shared tail buffer, teeing every byte into
+/// Drain `reader` into the shared stream state, teeing every byte into
 /// the spill file as it arrives. Terminates when the pipe closes.
 async fn read_stream<R>(
     mut reader: R,
@@ -374,20 +478,15 @@ async fn read_stream<R>(
             Ok(0) => return,
             Ok(n) => {
                 let chunk = &buf[..n];
-                // The spill file always sees every byte; the tail
-                // buffer is what gets surfaced to the model and the UI.
+                // The spill file always sees every byte; the rolling
+                // tail is what gets surfaced to the model and the UI.
                 {
                     let mut spill = spill.lock().unwrap();
                     let _ = spill.write_all(chunk);
                 }
                 {
                     let mut s = state.lock().unwrap();
-                    s.tail.extend_from_slice(chunk);
-                    if s.tail.len() > STREAM_CAP_BYTES {
-                        let drop_n = s.tail.len() - STREAM_CAP_BYTES;
-                        s.tail.drain(..drop_n);
-                        s.truncated = true;
-                    }
+                    s.append_chunk(chunk);
                 }
             }
             // A read error before EOF (rare) — treat it the same as
@@ -397,19 +496,86 @@ async fn read_stream<R>(
     }
 }
 
+/// Resolve a stream's rolling tail into a (possibly-truncated)
+/// display string plus an optional structured truncation summary.
+/// When the source overflowed either cap we drop any leading partial
+/// line from the rolling tail and then apply [`truncate_tail`] to fit
+/// the per-stream byte/line cap exactly.
+#[allow(clippy::as_conversions)]
+fn finalize_stream(state: &mut StreamState) -> (String, Option<BashStreamTruncation>) {
+    let total_lines = state.total_lines();
+    let total_bytes = state.total_bytes_seen;
+
+    let tail_decoded = decode_stream_output(std::mem::take(&mut state.tail));
+
+    let overflowed = total_lines > BASH_MAX_LINES as u64 || total_bytes > BASH_MAX_BYTES as u64;
+    if !overflowed {
+        return (tail_decoded, None);
+    }
+
+    // Drop a leading partial line so `truncate_tail` always operates
+    // on whole-line boundaries when the rolling buffer happened to be
+    // trimmed in the middle of a line. The exception is when the
+    // tail contains no newlines at all: in that case the whole tail
+    // belongs to a single source line that's bigger than the byte
+    // budget, so we keep it and let `truncate_tail` flag the result
+    // as `last_line_partial`.
+    let snapshot_text: String = if state.tail_starts_at_boundary {
+        tail_decoded
+    } else {
+        match tail_decoded.find('\n') {
+            None => tail_decoded,
+            Some(idx) => tail_decoded[idx + 1..].to_string(),
+        }
+    };
+
+    let tt = truncate_tail(&snapshot_text, BASH_MAX_LINES, BASH_MAX_BYTES);
+
+    // `truncate_tail` flags its own cap-fire; when the snapshot
+    // already fit (we trimmed it small upstream) fall back to whichever
+    // global budget the source overflowed.
+    let truncated_by = tt.truncated_by.unwrap_or({
+        if total_bytes > BASH_MAX_BYTES as u64 {
+            TruncatedBy::Bytes
+        } else {
+            TruncatedBy::Lines
+        }
+    });
+
+    let summary = BashStreamTruncation {
+        total_lines,
+        total_bytes,
+        output_lines: tt.output_lines as u64,
+        output_bytes: tt.output_bytes as u64,
+        truncated_by,
+        last_line_partial: tt.last_line_partial,
+        last_line_bytes: state.current_line_bytes,
+    };
+
+    (tt.content, Some(summary))
+}
+
 /// Build a [`ToolDetails::Bash`] partial from the in-flight state. Used
-/// for `emit_update` snapshots while the child is running. `exit_code`,
-/// `truncated`, and `full_output_path` are filled in only on the final
-/// outcome.
+/// for `emit_update` snapshots while the child is running. The
+/// structured per-stream summaries are intentionally left `None` —
+/// they only become meaningful once the stream has closed and we can
+/// run `truncate_tail` on the final rolling tail. The boolean
+/// `truncated` flag is updated live so the UI can show a "truncated"
+/// badge as soon as the source crosses the cap.
+#[allow(clippy::as_conversions)]
 fn snapshot_partial(
     command: &str,
     stdout_state: &Arc<Mutex<StreamState>>,
     stderr_state: &Arc<Mutex<StreamState>>,
 ) -> ToolDetails {
-    let stdout_data = stdout_state.lock().unwrap().tail.clone();
-    let stderr_data = stderr_state.lock().unwrap().tail.clone();
-    let truncated =
-        stdout_state.lock().unwrap().truncated || stderr_state.lock().unwrap().truncated;
+    let stdout_state = stdout_state.lock().unwrap();
+    let stderr_state = stderr_state.lock().unwrap();
+    let stdout_data = stdout_state.tail.clone();
+    let stderr_data = stderr_state.tail.clone();
+    let truncated = stdout_state.total_lines() > BASH_MAX_LINES as u64
+        || stdout_state.total_bytes_seen > BASH_MAX_BYTES as u64
+        || stderr_state.total_lines() > BASH_MAX_LINES as u64
+        || stderr_state.total_bytes_seen > BASH_MAX_BYTES as u64;
     ToolDetails::Bash {
         command: command.to_string(),
         stdout: decode_stream_output(stdout_data),
@@ -417,24 +583,34 @@ fn snapshot_partial(
         exit_code: None,
         truncated,
         full_output_path: None,
+        stdout_truncation: None,
+        stderr_truncation: None,
     }
 }
 
-/// Build the wire content the model sees. Mirrors the legacy text
-/// format: stdout, then a `STDERR:` block, then exit-status / cancel /
-/// timeout / truncation trailers.
+/// Build the wire content the model sees. Per-stream truncation
+/// markers (`[Showing lines X-Y of TOTAL ...]`) are inserted right
+/// after each affected stream's content so the model reads the
+/// elision context next to the truncated text. The trailing
+/// exit-status / cancel / timeout block stays last.
+#[allow(clippy::too_many_arguments)]
 fn build_wire_content(
     stdout: &str,
     stderr: &str,
+    stdout_truncation: Option<&BashStreamTruncation>,
+    stderr_truncation: Option<&BashStreamTruncation>,
     outcome: &ChildExit,
     exit_code: Option<i32>,
     timeout_secs: u64,
-    truncated: bool,
     full_output_path: Option<&std::path::Path>,
 ) -> String {
     let mut wire = String::new();
+
     if !stdout.is_empty() {
         wire.push_str(stdout);
+    }
+    if let Some(t) = stdout_truncation {
+        push_marker(&mut wire, &stream_marker("stdout", t, full_output_path));
     }
     if !stderr.is_empty() {
         if !wire.is_empty() && !wire.ends_with('\n') {
@@ -442,6 +618,9 @@ fn build_wire_content(
         }
         wire.push_str("STDERR:\n");
         wire.push_str(stderr);
+    }
+    if let Some(t) = stderr_truncation {
+        push_marker(&mut wire, &stream_marker("stderr", t, full_output_path));
     }
     match outcome {
         ChildExit::Exited(_) => {
@@ -474,26 +653,64 @@ fn build_wire_content(
             wire.push_str(&format!("Command timed out after {} seconds", timeout_secs));
         }
     }
-    if truncated {
-        if !wire.is_empty() && !wire.ends_with('\n') {
-            wire.push('\n');
-        }
-        if let Some(path) = full_output_path {
-            wire.push_str(&format!(
-                "[Output truncated; full output at {}]",
-                path.display()
-            ));
-        } else {
-            wire.push_str("[Output truncated]");
-        }
-    }
-    // Final-mile cap to honor the legacy 35 000-char wire ceiling. In
-    // practice the per-stream caps keep us comfortably under this.
-    if wire.len() > WIRE_CAP_BYTES {
-        wire.truncate(WIRE_CAP_BYTES);
-        wire.push_str("\n[Wire content capped]");
-    }
     wire
+}
+
+/// Append `marker` to `wire` on its own line, inserting a separating
+/// newline only when one isn't already there.
+fn push_marker(wire: &mut String, marker: &str) {
+    if !wire.is_empty() && !wire.ends_with('\n') {
+        wire.push('\n');
+    }
+    wire.push_str(marker);
+}
+
+/// Render a single stream's truncation marker.
+///
+/// - `last_line_partial`: `[Showing last <bytes> of <stream> line N (line is <size>). Full output at <path>]`
+/// - line cap fired: `[Showing lines X-Y of TOTAL of <stream>. Full output at <path>]`
+/// - byte cap fired: `[Showing lines X-Y of TOTAL of <stream> (50.0KB limit). Full output at <path>]`
+///
+/// `full_output_path` is shared across both streams (we tee both into
+/// one spill file); a missing path falls back to a path-less form so
+/// the marker still tells the model what was dropped.
+#[allow(clippy::as_conversions)]
+pub fn stream_marker(
+    stream: &str,
+    t: &BashStreamTruncation,
+    full_output_path: Option<&std::path::Path>,
+) -> String {
+    let suffix = match full_output_path {
+        Some(p) => format!(". Full output at {}", p.display()),
+        None => String::new(),
+    };
+    if t.last_line_partial {
+        return format!(
+            "[Showing last {} of {} line {} (line is {}){}]",
+            format_size(t.output_bytes as usize),
+            stream,
+            t.total_lines,
+            format_size(t.last_line_bytes as usize),
+            suffix,
+        );
+    }
+    let start = t.total_lines.saturating_sub(t.output_lines) + 1;
+    let end = t.total_lines;
+    match t.truncated_by {
+        TruncatedBy::Lines => format!(
+            "[Showing lines {}-{} of {} of {}{}]",
+            start, end, t.total_lines, stream, suffix,
+        ),
+        TruncatedBy::Bytes => format!(
+            "[Showing lines {}-{} of {} of {} ({} limit){}]",
+            start,
+            end,
+            t.total_lines,
+            stream,
+            format_size(BASH_MAX_BYTES),
+            suffix,
+        ),
+    }
 }
 
 /// Build a recoverable-error outcome for the spawn-failure path.
@@ -510,6 +727,8 @@ fn spawn_error_outcome(command: &str, error: String) -> ToolOutcome {
             exit_code: None,
             truncated: false,
             full_output_path: None,
+            stdout_truncation: None,
+            stderr_truncation: None,
         },
         is_error: true,
     }
@@ -658,6 +877,8 @@ mod tests {
                 exit_code,
                 truncated,
                 full_output_path,
+                stdout_truncation,
+                stderr_truncation,
             } => {
                 assert_eq!(command, "echo hello");
                 assert_eq!(stdout, "hello\n");
@@ -665,6 +886,8 @@ mod tests {
                 assert_eq!(*exit_code, Some(0));
                 assert!(!*truncated);
                 assert!(full_output_path.is_none());
+                assert!(stdout_truncation.is_none());
+                assert!(stderr_truncation.is_none());
             }
             other => panic!("expected Bash details, got {other:?}"),
         }
@@ -738,20 +961,22 @@ mod tests {
 
     /// Output exceeding the per-stream cap is truncated in the
     /// structured payload but the spill file retains the full output;
-    /// `truncated = true` and `full_output_path` is populated. The wire
-    /// content also picks up the truncation marker pointing at the
-    /// spill path.
+    /// `truncated = true`, the structured per-stream summary is set,
+    /// and `full_output_path` is populated. The wire content picks up
+    /// the `[Showing lines X-Y of TOTAL ...]` marker.
+    #[allow(clippy::as_conversions)]
     #[tokio::test]
     async fn large_output_truncates_and_spills_to_temp_file() {
         let mut ctx = DummyToolContext::default();
-        // Print enough bytes to overflow the 16 KiB per-stream cap.
+        // Print enough bytes to overflow the 50 KiB per-stream cap.
         // `yes` would be unbounded; bound it with `head -c` so the
-        // command terminates naturally.
+        // command terminates naturally. Each "ABCDEFGH\n" is 9 bytes,
+        // so 200 KB ≈ 22_756 lines — well over the 2000-line cap too.
         let outcome = BashTool
             .execute(
                 &mut ctx,
                 BashInput {
-                    command: "yes ABCDEFGH | head -c 50000".to_string(),
+                    command: "yes ABCDEFGH | head -c 200000".to_string(),
                     timeout: 30,
                     description: "test truncation".to_string(),
                 },
@@ -765,31 +990,104 @@ mod tests {
                 stdout,
                 truncated,
                 full_output_path,
+                stdout_truncation,
+                stderr_truncation,
                 ..
             } => {
                 assert!(*truncated, "expected truncation");
-                assert_eq!(
-                    stdout.len(),
-                    STREAM_CAP_BYTES,
-                    "in-memory tail should be capped"
-                );
                 let path = full_output_path.as_ref().expect("spill path on truncation");
                 let on_disk = std::fs::read_to_string(path).expect("read spill");
                 assert!(
-                    on_disk.len() >= 50_000,
+                    on_disk.len() >= 200_000,
                     "spill should hold the full output, got {} bytes",
                     on_disk.len()
                 );
-                // Clean up the persisted spill file.
-                let _ = std::fs::remove_file(path);
+                assert!(stderr_truncation.is_none(), "stderr did not overflow");
+                let t = stdout_truncation
+                    .as_ref()
+                    .expect("stdout_truncation should be set");
+                assert!(t.total_bytes >= 200_000, "total_bytes: {}", t.total_bytes);
+                assert!(t.total_lines > 2000, "total_lines: {}", t.total_lines);
+                // Output is capped: either at the line cap or the
+                // byte cap, whichever fired first.
+                assert!(t.output_lines <= 2000);
+                assert!(t.output_bytes <= 50 * 1024);
+                assert!(!t.last_line_partial, "uniform-line output is not partial");
+                // The captured stdout matches what the structured
+                // summary describes.
+                assert_eq!(
+                    stdout.len() as u64,
+                    t.output_bytes,
+                    "stdout length should equal output_bytes"
+                );
+                std::fs::remove_file(path).ok();
             }
             other => panic!("expected Bash details, got {other:?}"),
         }
         let wire = extract_text(&outcome.content);
         assert!(
-            wire.contains("[Output truncated"),
-            "wire should mention truncation: {wire:?}"
+            wire.contains("[Showing lines "),
+            "wire should mention truncation: {:?}",
+            &wire[wire.len().saturating_sub(200)..]
         );
+        assert!(
+            wire.contains(" of stdout"),
+            "marker should name the stream: {:?}",
+            &wire[wire.len().saturating_sub(200)..]
+        );
+    }
+
+    /// A single line bigger than the byte cap triggers the
+    /// `last_line_partial` path: the marker switches to the
+    /// `[Showing last <output> of <stream> line N (line is <full>)...]`
+    /// form, and `stdout` carries only the tail of the line.
+    #[tokio::test]
+    async fn single_huge_line_emits_last_line_partial_marker() {
+        let mut ctx = DummyToolContext::default();
+        // One ~120 KB line with no internal newlines, no trailing
+        // newline. Exceeds the 50 KB byte cap; line cap is irrelevant
+        // (one line total).
+        let outcome = BashTool
+            .execute(
+                &mut ctx,
+                BashInput {
+                    command: "head -c 120000 /dev/zero | tr '\\0' 'x'".to_string(),
+                    timeout: 30,
+                    description: "test last_line_partial".to_string(),
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error);
+        let wire = extract_text(&outcome.content);
+        match &outcome.details {
+            ToolDetails::Bash {
+                stdout,
+                stdout_truncation,
+                ..
+            } => {
+                let t = stdout_truncation
+                    .as_ref()
+                    .expect("partial-line case should populate truncation");
+                assert!(t.last_line_partial, "expected last_line_partial");
+                assert_eq!(t.output_lines, 1);
+                assert!(t.last_line_bytes >= 120_000);
+                assert!(stdout.len() <= 50 * 1024 + 16);
+                // Verify the marker uses the partial-line phrasing.
+                assert!(
+                    wire.contains("[Showing last "),
+                    "wire tail: {:?}",
+                    &wire[wire.len().saturating_sub(200)..]
+                );
+                assert!(
+                    wire.contains("(line is "),
+                    "wire tail: {:?}",
+                    &wire[wire.len().saturating_sub(200)..]
+                );
+            }
+            other => panic!("expected Bash details, got {other:?}"),
+        }
     }
 
     /// Cancellation kills the process and surfaces an `is_error: true`
@@ -872,7 +1170,8 @@ mod tests {
     }
 
     /// `emit_update` is invoked at least once during execution; the
-    /// snapshot carries the same `command` the caller passed.
+    /// snapshot carries the same `command` the caller passed, no
+    /// structured truncation summary, and an unset exit code.
     #[tokio::test]
     async fn emit_update_fires_during_execution() {
         let (mut ctx, updates) = RecordingCtx::new();
@@ -900,16 +1199,19 @@ mod tests {
                     command,
                     exit_code,
                     full_output_path,
+                    stdout_truncation,
+                    stderr_truncation,
                     ..
                 } => {
                     assert_eq!(command, "echo hi; sleep 0.3; echo bye");
-                    // Partial snapshots leave exit_code and the spill
-                    // path unset — those only get filled in on the
-                    // final outcome.
                     assert!(exit_code.is_none(), "partial should not carry exit_code");
                     assert!(
                         full_output_path.is_none(),
                         "partial should not carry spill path"
+                    );
+                    assert!(
+                        stdout_truncation.is_none() && stderr_truncation.is_none(),
+                        "partial should not carry final truncation summary"
                     );
                 }
                 other => panic!("expected Bash partial, got {other:?}"),
@@ -977,5 +1279,56 @@ mod tests {
         let got_line = wire.trim();
         let got = std::fs::canonicalize(Path::new(got_line)).unwrap_or_else(|_| got_line.into());
         assert_eq!(got, want, "wire: {wire:?}");
+    }
+
+    /// Unit-test the marker formatter against a synthesised summary
+    /// to lock in the exact phrasing for all three variants.
+    #[test]
+    fn stream_marker_phrasings() {
+        let path = PathBuf::from("/tmp/aj-bash-xyz.log");
+        let lines_only = BashStreamTruncation {
+            total_lines: 5000,
+            total_bytes: 5000 * 8,
+            output_lines: 2000,
+            output_bytes: 2000 * 8,
+            truncated_by: TruncatedBy::Lines,
+            last_line_partial: false,
+            last_line_bytes: 0,
+        };
+        let m = stream_marker("stdout", &lines_only, Some(&path));
+        assert_eq!(
+            m,
+            "[Showing lines 3001-5000 of 5000 of stdout. Full output at /tmp/aj-bash-xyz.log]"
+        );
+
+        let bytes_only = BashStreamTruncation {
+            total_lines: 60,
+            total_bytes: 100 * 1024,
+            output_lines: 30,
+            output_bytes: 50 * 1024,
+            truncated_by: TruncatedBy::Bytes,
+            last_line_partial: false,
+            last_line_bytes: 0,
+        };
+        let m = stream_marker("stderr", &bytes_only, Some(&path));
+        assert_eq!(
+            m,
+            "[Showing lines 31-60 of 60 of stderr (50.0KB limit). Full output at /tmp/aj-bash-xyz.log]"
+        );
+
+        let partial = BashStreamTruncation {
+            total_lines: 1,
+            total_bytes: 200 * 1024,
+            output_lines: 1,
+            output_bytes: 50 * 1024,
+            truncated_by: TruncatedBy::Bytes,
+            last_line_partial: true,
+            last_line_bytes: 200 * 1024,
+        };
+        let m = stream_marker("stdout", &partial, Some(&path));
+        assert_eq!(
+            m,
+            "[Showing last 50.0KB of stdout line 1 (line is 200.0KB). Full output at /tmp/aj-bash-xyz.log]"
+        );
     }
 }

@@ -7,19 +7,21 @@
 //! the component appends to its scrollback.
 //!
 //! Today the formatting is text-only: each non-empty channel
-//! (`stdout`, `stderr`) renders under a one-line dim header, and
-//! the exit code / truncation marker tail goes underneath. Live
-//! streaming (the `ToolExecutionUpdate` path that drives a 100ms
-//! debounced partial snapshot) is wired through the generic
-//! component too — this helper is called for every snapshot, so
-//! the on-screen body stays consistent with the agent's view of
-//! the running command.
+//! (`stdout`, `stderr`) renders under a one-line dim header, the
+//! per-stream truncation marker (when present) follows the affected
+//! stream, and the exit code goes underneath. Live streaming (the
+//! `ToolExecutionUpdate` path that drives a 100ms debounced partial
+//! snapshot) is wired through the generic component too — this helper
+//! is called for every snapshot, so the on-screen body stays
+//! consistent with the agent's view of the running command.
 //!
 //! See `docs/aj-next-plan.md` §1.2 (`Bash` variant) and §1.3
 //! (tool-update streaming).
 
 use std::path::PathBuf;
 
+use aj_agent::tool::BashStreamTruncation;
+use aj_tools::tools::bash::stream_marker;
 use aj_tui::style;
 
 /// Render a [`aj_agent::tool::ToolDetails::Bash`] payload to a
@@ -27,12 +29,13 @@ use aj_tui::style;
 /// a complete row (no embedded newlines) carrying inline ANSI
 /// escapes for any styling.
 ///
-/// The layout matches the legacy CLI's `display_tool_result`
-/// output verbatim where it can — same `stdout`-then-`stderr`
-/// ordering, same trailing exit-code marker, same `[Output
-/// truncated; full output at <path>]` notice — so users moving
-/// between the two binaries don't have to re-learn how to read
-/// the output.
+/// The layout matches the wire content the model sees: each stream's
+/// content is followed by its truncation marker when present, the
+/// exit-status indicator comes last, and a final fallback
+/// `[Output truncated; full output at <path>]` line is appended only
+/// when `truncated` is set without either per-stream summary — i.e.
+/// when the result was persisted by an older session that lacked the
+/// structured fields.
 #[allow(clippy::too_many_arguments)]
 pub fn render_bash_body(
     stdout: &str,
@@ -40,6 +43,8 @@ pub fn render_bash_body(
     exit_code: Option<i32>,
     truncated: bool,
     full_output_path: Option<&PathBuf>,
+    stdout_truncation: Option<&BashStreamTruncation>,
+    stderr_truncation: Option<&BashStreamTruncation>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -51,6 +56,13 @@ pub fn render_bash_body(
             lines.push(line.to_string());
         }
     }
+    if let Some(t) = stdout_truncation {
+        lines.push(style::dim(&stream_marker(
+            "stdout",
+            t,
+            full_output_path.map(|p| p.as_path()),
+        )));
+    }
 
     if !stderr.is_empty() {
         // Dim header so the eye notices the channel switch
@@ -59,6 +71,13 @@ pub fn render_bash_body(
         for line in stderr.split('\n') {
             lines.push(line.to_string());
         }
+    }
+    if let Some(t) = stderr_truncation {
+        lines.push(style::dim(&stream_marker(
+            "stderr",
+            t,
+            full_output_path.map(|p| p.as_path()),
+        )));
     }
 
     if let Some(code) = exit_code {
@@ -70,7 +89,10 @@ pub fn render_bash_body(
         lines.push(label);
     }
 
-    if truncated {
+    // Legacy fallback marker: only when `truncated` is set but neither
+    // structured per-stream summary is — typical of sessions captured
+    // before the per-stream fields existed.
+    if truncated && stdout_truncation.is_none() && stderr_truncation.is_none() {
         let marker = match full_output_path {
             Some(path) => format!("[Output truncated; full output at {}]", path.display()),
             None => "[Output truncated]".to_string(),
@@ -84,6 +106,7 @@ pub fn render_bash_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aj_agent::tool::TruncationCause;
 
     fn strip_ansi(s: &str) -> String {
         let mut out: Vec<u8> = Vec::with_capacity(s.len());
@@ -108,7 +131,7 @@ mod tests {
 
     #[test]
     fn renders_stdout_then_stderr_then_exit_marker() {
-        let lines = render_bash_body("hello\nworld", "uh oh", Some(0), false, None);
+        let lines = render_bash_body("hello\nworld", "uh oh", Some(0), false, None, None, None);
         let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
         assert_eq!(
             plain,
@@ -116,15 +139,72 @@ mod tests {
         );
     }
 
+    /// Legacy fallback path: `truncated` set without per-stream
+    /// summaries (older sessions) still surfaces the path.
     #[test]
-    fn surfaces_a_truncation_path() {
+    fn surfaces_a_truncation_path_via_legacy_fallback() {
         let p = PathBuf::from("/tmp/aj-bash-xyz.log");
-        let lines = render_bash_body("partial", "", Some(0), true, Some(&p));
+        let lines = render_bash_body("partial", "", Some(0), true, Some(&p), None, None);
         let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
         assert!(
             plain.last().unwrap().contains("/tmp/aj-bash-xyz.log"),
             "got {:?}",
             plain
+        );
+        assert!(
+            plain.last().unwrap().contains("Output truncated"),
+            "got {:?}",
+            plain
+        );
+    }
+
+    /// Modern path: per-stream structured truncation produces the
+    /// `[Showing lines ...]` marker placed right after the stream's
+    /// content.
+    #[test]
+    fn renders_marker_for_stdout_truncation() {
+        let p = PathBuf::from("/tmp/aj-bash-zzz.log");
+        let trunc = BashStreamTruncation {
+            total_lines: 5000,
+            total_bytes: 5000 * 8,
+            output_lines: 2000,
+            output_bytes: 2000 * 8,
+            truncated_by: TruncationCause::Lines,
+            last_line_partial: false,
+            last_line_bytes: 0,
+        };
+        let lines = render_bash_body(
+            "line1\nline2",
+            "",
+            Some(0),
+            true,
+            Some(&p),
+            Some(&trunc),
+            None,
+        );
+        let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
+        // Marker appears between the stdout content and the exit line.
+        let marker_idx = plain
+            .iter()
+            .position(|l| l.starts_with("[Showing lines"))
+            .expect("marker present");
+        let exit_idx = plain
+            .iter()
+            .position(|l| l.starts_with("[exit "))
+            .expect("exit present");
+        assert!(
+            marker_idx < exit_idx,
+            "marker should precede exit: {plain:?}"
+        );
+        assert!(
+            plain[marker_idx].contains("3001-5000 of 5000"),
+            "marker line: {:?}",
+            plain[marker_idx]
+        );
+        assert!(
+            plain[marker_idx].contains("stdout"),
+            "marker should name the stream: {:?}",
+            plain[marker_idx]
         );
     }
 
@@ -134,7 +214,7 @@ mod tests {
         // timed-out run; the wire `content` already explains the
         // failure to the model, so the rendered body just shows
         // whatever the child produced before being killed.
-        let lines = render_bash_body("partial output", "", None, false, None);
+        let lines = render_bash_body("partial output", "", None, false, None, None, None);
         let plain: Vec<_> = lines.iter().map(|s| strip_ansi(s)).collect();
         assert_eq!(plain, vec!["partial output"]);
     }

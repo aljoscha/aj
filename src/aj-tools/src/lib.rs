@@ -15,6 +15,7 @@
 pub mod sanitize;
 pub mod testing;
 pub mod tools;
+pub mod truncate;
 
 pub use sanitize::sanitize_terminal_output;
 
