@@ -447,7 +447,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::log::{ConversationLog, ConversationView, ThreadKind};
+    use crate::log::{ConversationLog, ConversationView};
 
     /// Build a `ConversationPersistence` against a fresh temp dir.
     fn fixture() -> (TempDir, ConversationPersistence) {
@@ -633,19 +633,28 @@ mod tests {
 
     #[test]
     fn list_thread_previews_falls_back_to_modified_when_no_message_entries() {
+        // Legacy on-disk shape: a thread file containing only a
+        // SystemPrompt entry, with no `Message` entries. New code
+        // can't produce this layout (the system prompt buffers and
+        // never flushes alone), but files written by older builds
+        // still exist on users' disks and the preview walk must
+        // render them gracefully. The fallback under test:
+        // `last_message_at` defaults to the file mtime when no
+        // Message-kind entry contributed a timestamp.
         let (_dir, persistence) = fixture();
-        let _log = ConversationLog::create(&persistence).expect("create");
-        let mut log = _log;
-        // Append a SystemPrompt entry (not a Message-kind entry).
-        log.append(
-            None,
-            ThreadKind::Meta,
-            None,
-            crate::log::ConversationEntryKind::SystemPrompt {
-                text: "test".to_string(),
-            },
-        )
-        .expect("append system prompt");
+        let threads_dir = persistence.threads_dir().to_path_buf();
+        std::fs::create_dir_all(&threads_dir).expect("threads dir");
+
+        let thread_id = "2024-01-01-00-00-00-000";
+        let path = threads_dir.join(format!("{thread_id}.jsonl"));
+        let line = serde_json::json!({
+            "id": "00000000",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "thread": "meta",
+            "type": "system_prompt",
+            "text": "legacy abandoned-session prompt",
+        });
+        std::fs::write(&path, format!("{line}\n")).expect("write legacy file");
 
         let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);

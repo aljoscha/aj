@@ -118,6 +118,28 @@ pub enum ConversationEntryKind {
     SystemPrompt { text: String },
 }
 
+impl ConversationEntryKind {
+    /// Whether appending this kind triggers a flush of the log's
+    /// pending-write buffer to disk.
+    ///
+    /// Punctuation entries represent real interaction (a user prompt,
+    /// an assistant turn, a tool result) — anything we want durable
+    /// per-line as the agent loop runs, and anything whose existence
+    /// proves the session is worth keeping. Non-punctuation entries
+    /// are meta (currently only the system prompt) and buffer
+    /// in-memory until a punctuation flushes them.
+    ///
+    /// Net effect: a session the user opens but abandons before
+    /// submitting anything leaves no file on disk; the system prompt
+    /// alone is not enough to materialize one.
+    pub fn is_punctuation(&self) -> bool {
+        match self {
+            Self::Message { .. } => true,
+            Self::SystemPrompt { .. } => false,
+        }
+    }
+}
+
 /// A filter specifying which entries of a [ConversationLog] to walk over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadFilter {
@@ -264,18 +286,30 @@ pub struct ConversationLog {
     /// Per-log counter, used to mint new entry ids. Survives resumes.
     next_counter: u64,
     /// Lazily opened: `None` for a freshly-[ConversationLog::create]'d log
-    /// that has never been appended to, `Some` once we've committed an
-    /// entry (or for a [ConversationLog::resume]'d log from the outset).
-    /// Keeping creation lazy means abandoned sessions (user quits before
-    /// typing anything) don't leave 0-byte files in the threads directory.
+    /// that has never had a real ("punctuation") entry appended, `Some`
+    /// once we've committed one (or for a [ConversationLog::resume]'d log
+    /// from the outset). Keeping creation lazy means a session the user
+    /// abandons before typing anything leaves no file in the threads
+    /// directory.
     file: Option<File>,
+    /// Pre-serialized lines for entries that have been [Self::append]ed
+    /// in memory but whose persistence is deferred until the next
+    /// "punctuation" append (see [`ConversationEntryKind::is_punctuation`]).
+    /// Drained in order — followed by the punctuation line itself —
+    /// on the next punctuation append. Resume initialises this empty:
+    /// anything on disk is already committed, by definition.
+    pending_writes: Vec<String>,
 }
 
 impl ConversationLog {
     /// Reserve a fresh thread id and backing path, but don't touch disk
     /// yet. The file is created lazily on the first [ConversationLog::append]
-    /// so a session the user abandons before typing anything leaves no
-    /// 0-byte file behind.
+    /// of a punctuation entry (see
+    /// [`ConversationEntryKind::is_punctuation`]) so a session the user
+    /// abandons before that point — typically: launches the TUI, never
+    /// submits a message — leaves no file on disk. The system prompt
+    /// alone is not enough; it buffers in memory and is flushed
+    /// alongside the first punctuation entry.
     pub fn create(
         persistence: &crate::persistence::ConversationPersistence,
     ) -> Result<Self, ConversationError> {
@@ -297,6 +331,7 @@ impl ConversationLog {
             order: Vec::new(),
             next_counter: 0,
             file: None,
+            pending_writes: Vec::new(),
         })
     }
 
@@ -389,6 +424,8 @@ impl ConversationLog {
             order,
             next_counter,
             file: Some(file),
+            // Anything on disk is by definition already committed.
+            pending_writes: Vec::new(),
         })
     }
 
@@ -397,9 +434,30 @@ impl ConversationLog {
         &self.thread_id
     }
 
-    /// Append one entry to the log. Serializes and writes to disk before
-    /// inserting into the in-memory maps so a failed write never leaves
-    /// the two diverging. Returns the new entry's id.
+    /// Append one entry to the log. Returns the new entry's id.
+    ///
+    /// Durability depends on the entry's kind (see
+    /// [`ConversationEntryKind::is_punctuation`]):
+    ///
+    /// - For a **punctuation** entry, this drains any buffered
+    ///   non-punctuation lines into the file (creating it on first
+    ///   use) and then writes the new entry's line, in order, before
+    ///   returning. After `Ok(_)`, the entry and everything that
+    ///   preceded it are durable. This preserves the per-line
+    ///   durability the agent loop relies on for `repair_interrupted_tool_uses`.
+    /// - For a **non-punctuation** entry, this serializes the line
+    ///   and queues it in `pending_writes` without touching disk.
+    ///   It becomes durable only when a subsequent punctuation
+    ///   append flushes the buffer. A log that only ever sees
+    ///   non-punctuation appends never creates a file on disk —
+    ///   that's the property that prevents accumulating empty
+    ///   sessions (where the user opens the TUI but never submits
+    ///   a message).
+    ///
+    /// The in-memory state (`entries`, `order`, `next_counter`) is
+    /// updated identically for both paths, so all read-side queries
+    /// (`latest_leaf`, `system_prompt_id`, `linearize`, …) behave the
+    /// same way regardless of whether the entry has been flushed yet.
     pub fn append(
         &mut self,
         parent_id: Option<EntryId>,
@@ -450,18 +508,35 @@ impl ConversationLog {
         };
 
         let json = serde_json::to_string(&record)?;
-        let file = self.ensure_open()?;
-        writeln!(file, "{json}")?;
+
+        if record.entry.is_punctuation() {
+            // Drain any buffered lines first so they hit disk before
+            // this punctuation, matching in-memory `order` exactly.
+            // The buffer is only non-empty for `create`'d logs that
+            // have seen a non-punctuation append (today: a system
+            // prompt) and not yet a punctuation; `resume`'d logs
+            // initialise it empty.
+            let queued: Vec<String> = self.pending_writes.drain(..).collect();
+            let file = self.ensure_open()?;
+            for line in &queued {
+                writeln!(file, "{line}")?;
+            }
+            writeln!(file, "{json}")?;
+        } else {
+            self.pending_writes.push(json);
+        }
 
         self.order.push(id.clone());
         self.entries.insert(id.clone(), record);
         Ok(id)
     }
 
-    /// Open the backing file on first use (lazy init for `create`'d logs)
-    /// and return a mutable reference to it. `resume` always returns a
-    /// `Some`-initialized file, so this only opens on the first append
-    /// after `create`.
+    /// Open the backing file on first use (lazy init for `create`'d
+    /// logs) and return a mutable reference to it. Only ever called
+    /// from [`Self::append`] on a punctuation entry, so the file is
+    /// created exactly when there's real content to write — never
+    /// for a session that only saw a deferred system-prompt append.
+    /// `resume`'d logs always return a `Some`-initialized file.
     fn ensure_open(&mut self) -> Result<&mut File, ConversationError> {
         if self.file.is_none() {
             let f = OpenOptions::new()
@@ -574,10 +649,19 @@ impl ConversationLog {
         self.system_prompt_entry().map(|e| &e.id)
     }
 
-    /// Persist the assembled system prompt as the root [ThreadKind::Meta]
+    /// Record the assembled system prompt as the root [ThreadKind::Meta]
     /// entry of this log. May only be called on an empty log; once the
     /// thread has any other entries the system prompt is fixed for its
     /// lifetime. Returns the id of the new entry.
+    ///
+    /// Disk semantics: the system prompt is a non-punctuation entry
+    /// (see [`ConversationEntryKind::is_punctuation`]), so this call
+    /// updates only the in-memory state — `system_prompt()`,
+    /// `system_prompt_id()`, and `parent_for_next_append` work
+    /// immediately — and queues the serialized line in
+    /// `pending_writes`. The line hits disk alongside the first
+    /// punctuation append (typically the first user message). A log
+    /// that never sees a punctuation append leaves no file behind.
     pub fn set_system_prompt(&mut self, text: String) -> Result<EntryId, ConversationError> {
         if !self.order.is_empty() {
             return Err(ConversationError::InvalidAppend(
@@ -742,7 +826,13 @@ mod tests {
     }
 
     #[test]
-    fn set_system_prompt_writes_root_entry_and_is_readable() {
+    fn set_system_prompt_records_root_entry_in_memory() {
+        // In-memory contract: after `set_system_prompt` the entry is
+        // immediately visible to all read-side queries
+        // (`system_prompt`, `system_prompt_id`, `len`, `entries`).
+        // The deferred-disk-write behaviour is exercised separately
+        // by [`set_system_prompt_alone_does_not_create_file`] and
+        // [`first_punctuation_append_flushes_buffered_system_prompt`].
         let dir = fresh_threads_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -761,6 +851,66 @@ mod tests {
         assert!(matches!(
             entry.entry,
             ConversationEntryKind::SystemPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn set_system_prompt_alone_does_not_create_file() {
+        // A session that only sees a system-prompt append must leave
+        // no file in the threads directory — that's the property
+        // that prevents accumulating empty sessions when the user
+        // opens the TUI and quits before submitting anything.
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".to_string()).expect("set sp");
+
+        let path = persistence.thread_path(log.thread_id());
+        assert!(
+            !path.exists(),
+            "system-prompt-only log must not materialise a file on disk; found {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn first_punctuation_append_flushes_buffered_system_prompt() {
+        // Sequencing contract: the buffered system-prompt line hits
+        // disk *before* the punctuation line that flushes it, so the
+        // on-disk order matches the in-memory `order` exactly. We
+        // resume from disk and check both entries are present in the
+        // right order.
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+
+        let thread_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("the prompt".to_string())
+                .expect("set sp");
+
+            let path = persistence.thread_path(log.thread_id());
+            assert!(!path.exists(), "file must not exist before flush");
+
+            {
+                let mut view = ConversationView::user(&mut log, None);
+                view.add_message(user_text("hi"))
+                    .expect("first user message");
+            }
+
+            assert!(path.exists(), "file must exist after first punctuation");
+            log.thread_id().to_string()
+        };
+
+        let resumed = ConversationLog::resume(&persistence, &thread_id).expect("resume");
+        let entries = resumed.entries_in_order();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            entries[0].entry,
+            ConversationEntryKind::SystemPrompt { .. }
+        ));
+        assert!(matches!(
+            entries[1].entry,
+            ConversationEntryKind::Message { .. }
         ));
     }
 
