@@ -20,12 +20,21 @@ use serde::{Deserialize, Serialize};
 
 /// A single entry in the agent's transcript.
 ///
-/// Wire format is transparent: `AgentMessage` serializes exactly as
-/// its inner [`AgentMessageKind`], so the on-disk shape is the
-/// classifier shape directly (e.g. `{"kind": "wire", ...wire message
-/// fields...}`). The struct exists so callers can talk about
-/// `AgentMessage` as the public type while the classifier is
-/// reserved for the variant tag.
+/// On-disk shape is the inner [`AgentMessageKind`] flattened: the
+/// transparent struct wrapper plus `#[serde(untagged)]` on the enum
+/// mean a `Wire(Message)` value serializes as bare wire-message JSON
+/// (`{"role": "user", ...}`), with no extra `kind` discriminator on
+/// the line. This matches the shape an LLM SDK expects when the
+/// `message` field of a session entry is read back.
+///
+/// The wrapper exists as a forward-compat seam: when we add agent-only
+/// transcript content that isn't a wire message (e.g. compaction
+/// summaries, sub-agent result summaries, UI-only annotations), they
+/// land as additional [`AgentMessageKind`] variants. Disambiguation
+/// stays implicit in the payload shape — each new variant must be
+/// distinguishable from `Message` by its own discriminator field
+/// (typically a distinct `role` value), so `untagged` deserialization
+/// can pick the right variant without an outer tag.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AgentMessage {
@@ -54,10 +63,20 @@ impl AgentMessage {
 
 /// Variants of an [`AgentMessage`].
 ///
-/// `#[serde(tag = "kind", rename_all = "snake_case")]` keeps the
-/// on-disk format human-readable and stable across additions.
+/// `#[serde(untagged)]` keeps the on-disk shape flat: each variant
+/// writes its own payload directly with no outer discriminator. Today
+/// the only variant is [`AgentMessageKind::Wire`], which serializes as
+/// a bare wire [`Message`] (`{"role": "user", ...}`). When a second
+/// variant is added it must carry its own discriminator inside the
+/// payload so `untagged` deserialization can disambiguate — typically
+/// a `role` value distinct from `user` / `assistant` / `tool_result`.
+///
+/// Backward compatibility: legacy lines written before this format
+/// change carry a stray `"kind": "wire"` field. `Message` has no
+/// `#[serde(deny_unknown_fields)]`, so the extra field is silently
+/// ignored on read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum AgentMessageKind {
     /// A wire-level message — user, assistant, or tool result.
     /// Projects directly onto the LLM context.
@@ -77,9 +96,11 @@ mod tests {
 
     #[test]
     fn agent_message_round_trips_through_json() {
-        // Lock the on-disk shape the upcoming `aj-session` log relies
-        // on: `{"kind": "wire", ...}` framing with the wire `Message`
-        // payload nested inside.
+        // Lock the on-disk shape `aj-session` writes: a bare wire
+        // [`Message`] payload nested under the entry's `message` key,
+        // with no outer `kind` discriminator. The transparent struct
+        // wrapper + `#[serde(untagged)]` on the kind enum together
+        // flatten the wire variant down to its inner JSON.
         let msg = AgentMessage::from(Message::User(UserMessage {
             content: vec![UserContent::Text(TextContent {
                 text: "hi".to_string(),
@@ -89,10 +110,39 @@ mod tests {
         }));
 
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["kind"], "wire");
+        assert_eq!(json["role"], "user");
+        assert!(
+            json.get("kind").is_none(),
+            "wire variant must not emit a 'kind' tag: {json}"
+        );
 
         let round_tripped: AgentMessage = serde_json::from_value(json).unwrap();
         match round_tripped.kind {
+            AgentMessageKind::Wire(Message::User(u)) => {
+                assert_eq!(u.timestamp, 42);
+                assert_eq!(u.content.len(), 1);
+            }
+            other => panic!("expected Wire(User), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_message_deserialize_tolerates_legacy_kind_tag() {
+        // Lines written before the flattening change carry a stray
+        // `"kind": "wire"` field. `Message` doesn't deny unknown
+        // fields, so untagged deserialization sees the `role` tag,
+        // picks `Wire(Message::User)`, and silently drops the extra
+        // `kind` field. Persistence reads of pre-change thread files
+        // depend on this.
+        let legacy = serde_json::json!({
+            "kind": "wire",
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}],
+            "timestamp": 42,
+        });
+
+        let msg: AgentMessage = serde_json::from_value(legacy).expect("legacy line parses");
+        match msg.kind {
             AgentMessageKind::Wire(Message::User(u)) => {
                 assert_eq!(u.timestamp, 42);
                 assert_eq!(u.content.len(), 1);

@@ -274,7 +274,6 @@ mod tests {
             "thread": "user",
             "type": "message",
             "message": {
-                "kind": "wire",
                 "role": "user",
                 "content": [{"type": "text", "text": text}],
                 "timestamp": 0,
@@ -289,7 +288,6 @@ mod tests {
             "thread": "user",
             "type": "message",
             "message": {
-                "kind": "wire",
                 "role": "assistant",
                 "content": [{"type": "text", "text": text}],
                 "api": "scripted",
@@ -317,7 +315,6 @@ mod tests {
             "agent_id": 1,
             "type": "message",
             "message": {
-                "kind": "wire",
                 "role": "user",
                 "content": [{"type": "text", "text": text}],
                 "timestamp": 0,
@@ -479,7 +476,6 @@ mod tests {
             "thread": "user",
             "type": "message",
             "message": {
-                "kind": "wire",
                 "role": "tool_result",
                 "tool_call_id": "tu_1",
                 "tool_name": "ping",
