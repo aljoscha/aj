@@ -416,6 +416,101 @@ impl fmt::Display for ConfigDiagnostic {
     }
 }
 
+/// Kind of value a [`ConfigOption`] accepts. Drives help text and
+/// (eventually) tab completion in the settings command — the file
+/// parser uses the option's `apply_toml_fn` directly and doesn't
+/// need to branch on this.
+#[derive(Debug, Clone, Copy)]
+pub enum ValueKind {
+    /// A free-form string (stored as `Option<String>` on `Config`).
+    String,
+    /// A boolean.
+    Bool,
+    /// One of a fixed set of variants. The slice lists every
+    /// accepted value in its canonical (lowercase) form, in the
+    /// order they should be shown to the user.
+    Enum(&'static [&'static str]),
+    /// A list of strings.
+    StringList,
+}
+
+impl fmt::Display for ValueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValueKind::String => write!(f, "string"),
+            ValueKind::Bool => write!(f, "bool"),
+            ValueKind::Enum(variants) => write!(f, "{}", variants.join(" | ")),
+            ValueKind::StringList => write!(f, "list of strings"),
+        }
+    }
+}
+
+/// Schema entry for a single key in `~/.aj/config.toml`.
+///
+/// The full table is [`Config::OPTIONS`] — that's the single source
+/// of truth the file parser, the unknown-key suggester, and the
+/// settings command all walk. To add a new config option: add a
+/// field to [`Config`], then add a matching entry to
+/// [`Config::OPTIONS`]. The `test_options_table_matches_config_fields`
+/// test catches drift.
+///
+/// The two `fn` pointers are intentionally private — callers go
+/// through [`Self::apply_toml`] / [`Self::display`] so the schema
+/// stays the only place that touches `Config` fields by name.
+pub struct ConfigOption {
+    /// Key as it appears in `config.toml` and on the CLI.
+    pub name: &'static str,
+    /// One-line user-facing description, suitable for `aj settings show`.
+    pub description: &'static str,
+    /// What the option accepts. Used for help text and (future) tab
+    /// completion.
+    pub kind: ValueKind,
+    /// Parse `value` and write it into the matching field of `config`.
+    /// Returns the toml error verbatim on failure so the parser can
+    /// wrap it in [`ConfigDiagnostic::InvalidValue`].
+    apply_toml_fn: fn(toml::Value, &mut Config) -> Result<(), toml::de::Error>,
+    /// Render the field's current value, distinguishing unset
+    /// (`<unset>`) from set values.
+    display_fn: fn(&Config) -> String,
+}
+
+impl ConfigOption {
+    /// Apply a parsed TOML value to `config`.
+    pub fn apply_toml(
+        &self,
+        value: toml::Value,
+        config: &mut Config,
+    ) -> Result<(), toml::de::Error> {
+        (self.apply_toml_fn)(value, config)
+    }
+
+    /// Render the field's current value for display.
+    pub fn display(&self, config: &Config) -> String {
+        (self.display_fn)(config)
+    }
+}
+
+/// Display helper for `Option<T: Display>` fields. Returns the
+/// inner value's `Display` form when set, or the literal string
+/// `<unset>` otherwise.
+fn display_opt<T: fmt::Display>(value: &Option<T>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "<unset>".to_string(),
+    }
+}
+
+/// Display helper for `Vec<String>` list fields. Renders as
+/// `["a", "b"]`, or `<empty>` when the list has no entries.
+fn display_string_list(value: &[String]) -> String {
+    if value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        let items: Vec<String> = value.iter().map(|s| format!("\"{s}\"")).collect();
+        format!("[{}]", items.join(", "))
+    }
+}
+
 /// Application configuration loaded from `~/.aj/config.toml`.
 ///
 /// All fields are optional. Missing fields use application defaults. The
@@ -433,7 +528,7 @@ impl fmt::Display for ConfigDiagnostic {
 /// disabled_tools = ["todo_read", "todo_write"]
 /// hide_thinking_block = false
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Model API backend (e.g., "anthropic", "openai").
     pub model_api: Option<String>,
@@ -459,13 +554,11 @@ pub struct Config {
     pub theme: Option<String>,
     /// List of builtin tool names to disable. Tools in this list will not be
     /// available to the agent.
-    #[serde(default)]
     pub disabled_tools: Vec<String>,
     /// Replace expanded thinking blocks with a single italic
     /// "Thinking…" placeholder line in the interactive TUI.
     /// Defaults to `false` (expanded). Toggled at runtime with
     /// `Ctrl+T`; see `docs/aj-next-plan.md` §4.4.
-    #[serde(default)]
     pub hide_thinking_block: bool,
 }
 
@@ -499,20 +592,113 @@ impl FromStr for ConfigSpeed {
 }
 
 impl Config {
-    /// Top-level keys this `Config` recognizes. Used to flag typos in
-    /// `config.toml` as [`ConfigDiagnostic::UnknownKey`] warnings.
-    /// Keep in sync with the fields of [`Config`].
-    pub const KNOWN_KEYS: &'static [&'static str] = &[
-        "model_api",
-        "model_url",
-        "model_name",
-        "thinking",
-        "thinking_display",
-        "speed",
-        "theme",
-        "disabled_tools",
-        "hide_thinking_block",
+    /// Schema for every option this binary understands. The file
+    /// parser, the unknown-key suggester, and (eventually) the
+    /// `settings` command all walk this table — there is no other
+    /// source of truth for what `~/.aj/config.toml` accepts.
+    ///
+    /// Each entry's `description` is the user-facing one-liner shown
+    /// by the settings command; the field-level doc comments on
+    /// [`Config`] are the developer-facing reference. Keep them
+    /// roughly consistent but they don't need to match verbatim.
+    pub const OPTIONS: &'static [ConfigOption] = &[
+        ConfigOption {
+            name: "model_api",
+            description: "Model API backend (e.g. \"anthropic\", \"openai\").",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.model_api = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.model_api),
+        },
+        ConfigOption {
+            name: "model_url",
+            description: "Custom model endpoint URL.",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.model_url = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.model_url),
+        },
+        ConfigOption {
+            name: "model_name",
+            description: "Model name override.",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.model_name = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.model_name),
+        },
+        ConfigOption {
+            name: "thinking",
+            description: "Default thinking level used when no trigger word is present.",
+            kind: ValueKind::Enum(&["off", "low", "medium", "high", "xhigh", "max"]),
+            apply_toml_fn: |v, c| {
+                c.thinking = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.thinking),
+        },
+        ConfigOption {
+            name: "thinking_display",
+            description: "How much of the assistant's reasoning channel to surface to the user.",
+            kind: ValueKind::Enum(&["summarized", "detailed", "omitted"]),
+            apply_toml_fn: |v, c| {
+                c.thinking_display = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.thinking_display),
+        },
+        ConfigOption {
+            name: "speed",
+            description: "Inference speed mode (Anthropic only).",
+            kind: ValueKind::Enum(&["standard", "fast"]),
+            apply_toml_fn: |v, c| {
+                c.speed = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.speed),
+        },
+        ConfigOption {
+            name: "theme",
+            description: "Interactive TUI theme name (built-ins: dark, light).",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.theme = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.theme),
+        },
+        ConfigOption {
+            name: "disabled_tools",
+            description: "Builtin tool names to hide from the agent.",
+            kind: ValueKind::StringList,
+            apply_toml_fn: |v, c| {
+                c.disabled_tools = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_string_list(&c.disabled_tools),
+        },
+        ConfigOption {
+            name: "hide_thinking_block",
+            description: "Collapse expanded thinking blocks to a placeholder in the TUI.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.hide_thinking_block = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.hide_thinking_block.to_string(),
+        },
     ];
+
+    /// Look up an option by its config key, if any. Returns `None`
+    /// for unknown keys.
+    pub fn option(name: &str) -> Option<&'static ConfigOption> {
+        Self::OPTIONS.iter().find(|o| o.name == name)
+    }
 
     /// Load configuration from `~/.aj/config.toml`.
     ///
@@ -623,13 +809,13 @@ fn find_git_root(start_path: &Path) -> Option<PathBuf> {
 /// of [`ConfigDiagnostic`]s describing any non-fatal issues. The
 /// `path` is only used for diagnostic messages — it isn't read.
 ///
-/// Per-field leniency: we deserialize each top-level key
-/// independently against its destination type. A bad value for
+/// Per-field leniency: each top-level key is dispatched against
+/// [`Config::OPTIONS`] and applied independently. A bad value for
 /// `thinking` doesn't prevent `model_api` and friends from taking
 /// effect — only the offending field is dropped (and reported as
 /// [`ConfigDiagnostic::InvalidValue`]). Wholesale fallback to
-/// defaults only happens when the TOML is so broken it doesn't even
-/// parse into a [`toml::Table`] ([`ConfigDiagnostic::ParseFailed`]).
+/// defaults only happens when the file isn't valid TOML at all
+/// ([`ConfigDiagnostic::ParseFailed`]).
 fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
     let table = match content.parse::<toml::Table>() {
         Ok(t) => t,
@@ -648,40 +834,17 @@ fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
     let mut diagnostics = Vec::new();
 
     for (key, value) in table {
-        // Per-key dispatch: extract into the matching field's type.
-        // Keep this match arm-for-arm aligned with `Config::KNOWN_KEYS`
-        // and the `Config` struct fields.
-        match key.as_str() {
-            "model_api" => apply_field(&mut config.model_api, value, &key, path, &mut diagnostics),
-            "model_url" => apply_field(&mut config.model_url, value, &key, path, &mut diagnostics),
-            "model_name" => {
-                apply_field(&mut config.model_name, value, &key, path, &mut diagnostics)
+        match Config::option(&key) {
+            Some(option) => {
+                if let Err(e) = option.apply_toml(value, &mut config) {
+                    diagnostics.push(ConfigDiagnostic::InvalidValue {
+                        path: path.to_path_buf(),
+                        key,
+                        error: e.to_string(),
+                    });
+                }
             }
-            "thinking" => apply_field(&mut config.thinking, value, &key, path, &mut diagnostics),
-            "thinking_display" => apply_field(
-                &mut config.thinking_display,
-                value,
-                &key,
-                path,
-                &mut diagnostics,
-            ),
-            "speed" => apply_field(&mut config.speed, value, &key, path, &mut diagnostics),
-            "theme" => apply_field(&mut config.theme, value, &key, path, &mut diagnostics),
-            "disabled_tools" => apply_field(
-                &mut config.disabled_tools,
-                value,
-                &key,
-                path,
-                &mut diagnostics,
-            ),
-            "hide_thinking_block" => apply_field(
-                &mut config.hide_thinking_block,
-                value,
-                &key,
-                path,
-                &mut diagnostics,
-            ),
-            _ => diagnostics.push(ConfigDiagnostic::UnknownKey {
+            None => diagnostics.push(ConfigDiagnostic::UnknownKey {
                 path: path.to_path_buf(),
                 suggestion: suggest_key(&key),
                 key,
@@ -690,26 +853,6 @@ fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
     }
 
     (config, diagnostics)
-}
-
-/// Try to deserialize `value` into the type of `dest` and assign it
-/// on success. On failure, push an [`ConfigDiagnostic::InvalidValue`]
-/// and leave `dest` untouched (so it keeps its default).
-fn apply_field<T: serde::de::DeserializeOwned>(
-    dest: &mut T,
-    value: toml::Value,
-    key: &str,
-    path: &Path,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
-) {
-    match value.try_into::<T>() {
-        Ok(v) => *dest = v,
-        Err(e) => diagnostics.push(ConfigDiagnostic::InvalidValue {
-            path: path.to_path_buf(),
-            key: key.to_string(),
-            error: e.to_string(),
-        }),
-    }
 }
 
 /// Return the closest known key to `unknown` if it's within
@@ -722,9 +865,9 @@ fn apply_field<T: serde::de::DeserializeOwned>(
 /// `completely_unrelated` from matching anything.
 fn suggest_key(unknown: &str) -> Option<&'static str> {
     let max_distance = (unknown.len() / 2).min(3).max(1);
-    Config::KNOWN_KEYS
+    Config::OPTIONS
         .iter()
-        .map(|&k| (k, strsim::levenshtein(unknown, k)))
+        .map(|o| (o.name, strsim::levenshtein(unknown, o.name)))
         .filter(|(_, d)| *d <= max_distance)
         .min_by_key(|(_, d)| *d)
         .map(|(k, _)| k)
@@ -783,36 +926,11 @@ mod tests {
     }
 
     #[test]
-    fn test_config_deserialize() {
-        let toml_str = r#"
-model_api = "anthropic"
-model_name = "claude-sonnet-4-20250514"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
-        assert_eq!(
-            config.model_name.as_deref(),
-            Some("claude-sonnet-4-20250514")
-        );
-        assert!(config.model_url.is_none());
-        assert!(config.thinking.is_none());
-    }
-
-    #[test]
-    fn test_config_deserialize_with_thinking() {
-        let toml_str = r#"
-model_api = "anthropic"
-thinking = "medium"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.thinking, Some(ConfigThinkingLevel::Medium));
-    }
-
-    #[test]
     fn test_config_deserialize_thinking_display() {
-        // Unset → None so the binary leaves both providers'
-        // upstream defaults in place.
-        let config: Config = toml::from_str("").unwrap();
+        // Unset → None so the binary leaves both providers' upstream
+        // defaults in place.
+        let (config, diag) = parse_config("", Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty());
         assert!(config.thinking_display.is_none());
 
         let cases = [
@@ -822,7 +940,8 @@ thinking = "medium"
         ];
         for (input, expected) in cases {
             let toml_str = format!("thinking_display = \"{input}\"");
-            let config: Config = toml::from_str(&toml_str).unwrap();
+            let (config, diag) = parse_config(&toml_str, Path::new("/tmp/config.toml"));
+            assert!(diag.is_empty(), "failed for {input}: {diag:?}");
             assert_eq!(
                 config.thinking_display,
                 Some(expected),
@@ -861,7 +980,8 @@ thinking = "medium"
             ("max", ConfigThinkingLevel::Max),
         ] {
             let toml_str = format!("thinking = \"{input}\"");
-            let config: Config = toml::from_str(&toml_str).unwrap();
+            let (config, diag) = parse_config(&toml_str, Path::new("/tmp/config.toml"));
+            assert!(diag.is_empty(), "failed for {input}: {diag:?}");
             assert_eq!(config.thinking, Some(expected), "failed for input: {input}");
         }
     }
@@ -891,38 +1011,6 @@ thinking = "medium"
         assert_eq!(ConfigThinkingLevel::High.to_string(), "high");
         assert_eq!(ConfigThinkingLevel::XHigh.to_string(), "xhigh");
         assert_eq!(ConfigThinkingLevel::Max.to_string(), "max");
-    }
-
-    #[test]
-    fn test_config_deserialize_empty() {
-        let config: Config = toml::from_str("").unwrap();
-        assert!(config.model_api.is_none());
-        assert!(config.disabled_tools.is_empty());
-    }
-
-    #[test]
-    fn test_config_deserialize_disabled_tools() {
-        let toml_str = r#"
-disabled_tools = ["todo_read", "todo_write"]
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.disabled_tools, vec!["todo_read", "todo_write"]);
-    }
-
-    #[test]
-    fn test_config_deserialize_hide_thinking_block_default() {
-        let config: Config = toml::from_str("").unwrap();
-        // Defaults to `false` so a user with no entry in their
-        // `config.toml` keeps seeing the verbose expanded thinking
-        // blocks they get today.
-        assert!(!config.hide_thinking_block);
-    }
-
-    #[test]
-    fn test_config_deserialize_hide_thinking_block_explicit() {
-        let toml_str = "hide_thinking_block = true\n";
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.hide_thinking_block);
     }
 
     #[test]
@@ -1141,11 +1229,11 @@ theme = "dark"
     }
 
     #[test]
-    fn test_known_keys_match_config_fields() {
-        // Spot-check that every known key actually deserializes
-        // without producing an unknown-key diagnostic; this guards
-        // against drift between the `KNOWN_KEYS` slice and the
-        // `Config` struct.
+    fn test_options_table_matches_config_fields() {
+        // Spot-check that every entry in `Config::OPTIONS` accepts a
+        // sensible value for its kind and actually assigns it to the
+        // matching field. The values here cover every variant of
+        // `ValueKind` we use.
         let toml_str = r#"
 model_api = "anthropic"
 model_url = "https://example.test"
@@ -1154,11 +1242,97 @@ thinking = "low"
 thinking_display = "summarized"
 speed = "fast"
 theme = "dark"
-disabled_tools = []
+disabled_tools = ["bash"]
 hide_thinking_block = true
 "#;
-        let (_config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
         assert!(diagnostics.is_empty(), "got drift: {diagnostics:?}");
+
+        // Every option's apply_toml_fn actually wrote to its field.
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(config.model_url.as_deref(), Some("https://example.test"));
+        assert_eq!(config.model_name.as_deref(), Some("x"));
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::Low));
+        assert_eq!(
+            config.thinking_display,
+            Some(ConfigThinkingDisplay::Summarized)
+        );
+        assert_eq!(config.speed, Some(ConfigSpeed::Fast));
+        assert_eq!(config.theme.as_deref(), Some("dark"));
+        assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
+        assert!(config.hide_thinking_block);
+    }
+
+    #[test]
+    fn test_options_table_has_no_duplicates() {
+        // Sanity-check that no two options share a name; the parser's
+        // `find` would silently prefer the first match.
+        let mut names: Vec<&str> = Config::OPTIONS.iter().map(|o| o.name).collect();
+        names.sort();
+        let original_len = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            original_len,
+            "duplicate option name(s) in Config::OPTIONS"
+        );
+    }
+
+    #[test]
+    fn test_config_option_lookup() {
+        assert!(Config::option("model_api").is_some());
+        assert_eq!(Config::option("model_api").unwrap().name, "model_api");
+        assert!(Config::option("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_config_option_display_unset_and_set() {
+        let mut config = Config::default();
+        let theme = Config::option("theme").unwrap();
+        assert_eq!(theme.display(&config), "<unset>");
+
+        config.theme = Some("dark".to_string());
+        assert_eq!(theme.display(&config), "dark");
+    }
+
+    #[test]
+    fn test_config_option_display_bool() {
+        let mut config = Config::default();
+        let opt = Config::option("hide_thinking_block").unwrap();
+        assert_eq!(opt.display(&config), "false");
+        config.hide_thinking_block = true;
+        assert_eq!(opt.display(&config), "true");
+    }
+
+    #[test]
+    fn test_config_option_display_string_list() {
+        let mut config = Config::default();
+        let opt = Config::option("disabled_tools").unwrap();
+        assert_eq!(opt.display(&config), "<empty>");
+        config.disabled_tools = vec!["bash".into(), "grep".into()];
+        assert_eq!(opt.display(&config), r#"["bash", "grep"]"#);
+    }
+
+    #[test]
+    fn test_config_option_display_enum() {
+        let mut config = Config::default();
+        let opt = Config::option("thinking").unwrap();
+        assert_eq!(opt.display(&config), "<unset>");
+        config.thinking = Some(ConfigThinkingLevel::Medium);
+        assert_eq!(opt.display(&config), "medium");
+    }
+
+    #[test]
+    fn test_value_kind_display() {
+        // Each option's kind renders sensibly for help text.
+        for option in Config::OPTIONS {
+            let rendered = option.kind.to_string();
+            assert!(!rendered.is_empty(), "empty kind for {}", option.name);
+        }
+        assert_eq!(ValueKind::String.to_string(), "string");
+        assert_eq!(ValueKind::Bool.to_string(), "bool");
+        assert_eq!(ValueKind::StringList.to_string(), "list of strings");
+        assert_eq!(ValueKind::Enum(&["a", "b", "c"]).to_string(), "a | b | c");
     }
 
     #[test]
