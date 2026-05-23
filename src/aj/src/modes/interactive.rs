@@ -28,7 +28,7 @@ use std::sync::Arc;
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
-use aj_conf::{AgentEnv, Config, ConfigSpeed, display_path};
+use aj_conf::{AgentEnv, Config, ConfigSpeed, Severity, display_path};
 use aj_models::registry::ModelRegistry;
 use aj_models::types::Speed;
 use aj_session::{
@@ -96,11 +96,12 @@ impl InteractiveMode {
         // ---- Configuration & model setup -----------------------------
         // Mirrors `print::run` so a user moving between `--print`
         // and the interactive shell sees the same precedence
-        // (CLI > env > config.toml > defaults).
-        let config = Config::load().unwrap_or_else(|e| {
-            tracing::warn!("failed to load config.toml: {e}");
-            Config::default()
-        });
+        // (CLI > env > config.toml > defaults). Any config-load
+        // diagnostics (parse errors, unknown keys) are stashed here
+        // and pumped onto the chat scrollback once the TUI is built;
+        // we can't `eprintln!` them like print mode does because the
+        // alternate screen will eat them.
+        let (config, config_diagnostics) = Config::load();
 
         // Install the `tui.*` + `aj.*` keybindings registry before any
         // component looks up a key. Currently no user overrides are
@@ -384,15 +385,26 @@ impl InteractiveMode {
             pump.handle(&mut tui, &event);
         }
 
-        // Startup notices: list the AGENTS.md / CLAUDE.md files
-        // stitched into the system prompt, then (unless suppressed)
-        // print the sandbox warning. Both flow through the pump's
-        // existing `Notice` / `Warning` arms so they appear as dim
+        // Startup notices: surface config-load diagnostics (parse
+        // errors, unknown keys) first so a user with a broken
+        // `config.toml` sees that before any other chrome, then
+        // list the AGENTS.md / CLAUDE.md files stitched into the
+        // system prompt, then (unless suppressed) print the sandbox
+        // warning. All flow through the pump's existing
+        // `Notice` / `Warning` / `Error` arms so they appear as dim
         // chat-scrollback rows just above the editor — close enough
         // to where the user starts typing that they're hard to
         // miss, but out of the way of replayed history or the
         // header/footer status panes. Placed *after* replay so a
         // resumed thread's historical content stays on top.
+        for d in &config_diagnostics {
+            let text = d.to_string();
+            let event = match d.severity() {
+                Severity::Warning => warning_event(&text),
+                Severity::Error => error_event(&text),
+            };
+            pump.handle(&mut tui, &event);
+        }
         pump.handle(&mut tui, &notice_event(&build_context_notice(agent.env())));
         if sandbox_warning_enabled() {
             pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
@@ -801,6 +813,18 @@ fn notice_event(text: &str) -> AgentEvent {
 /// text row in the chat scrollback).
 fn warning_event(text: &str) -> AgentEvent {
     AgentEvent::Warning {
+        agent_id: aj_agent::events::AgentId::Main,
+        text: text.to_string(),
+    }
+}
+
+/// Wrap an error string in the [`AgentEvent::Error`] shape so the
+/// event pump renders it with the error style (red dim text row in
+/// the chat scrollback). Used for startup diagnostics that mean a
+/// user-supplied input was rejected wholesale (e.g. an unparseable
+/// `config.toml`).
+fn error_event(text: &str) -> AgentEvent {
+    AgentEvent::Error {
         agent_id: aj_agent::events::AgentId::Main,
         text: text.to_string(),
     }

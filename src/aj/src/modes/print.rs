@@ -54,7 +54,7 @@ use aj_agent::Agent;
 use aj_agent::TurnError;
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
-use aj_conf::{AgentEnv, Config, ConfigSpeed};
+use aj_conf::{AgentEnv, Config, ConfigSpeed, Severity};
 use aj_models::registry::ModelRegistry;
 use aj_models::types::Speed;
 use aj_session::{
@@ -110,11 +110,17 @@ pub async fn run(args: Args) -> Result<()> {
 
     // Load config.toml first (lowest priority). Missing or invalid
     // config falls back to defaults so a one-shot `aj --print`
-    // works in a freshly-cloned checkout without any setup.
-    let config = Config::load().unwrap_or_else(|e| {
-        tracing::warn!("failed to load config.toml: {e}");
-        Config::default()
-    });
+    // works in a freshly-cloned checkout without any setup; any
+    // diagnostics (parse errors, unknown keys) are surfaced to
+    // stderr so the user knows their file wasn't applied as-is.
+    let (config, config_diagnostics) = Config::load();
+    for d in &config_diagnostics {
+        let label = match d.severity() {
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        };
+        eprintln!("aj: {label}: {d}");
+    }
 
     // Resolve model args with the same precedence the legacy binary
     // uses: CLI flags > env vars > config.toml > defaults. The CLI
