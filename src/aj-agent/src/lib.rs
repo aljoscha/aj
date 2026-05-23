@@ -1952,7 +1952,7 @@ mod event_protocol_tests {
         agent.set_agent_id(AgentId::Sub(1));
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded_clone = recorded.clone();
+        let recorded_clone = Arc::clone(&recorded);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             recorded_clone.lock().unwrap().push(label(event));
         }));
@@ -2145,7 +2145,7 @@ mod event_protocol_tests {
         agent.set_agent_id(AgentId::Sub(7));
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded_clone = recorded.clone();
+        let recorded_clone = Arc::clone(&recorded);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             recorded_clone.lock().unwrap().push(label(event));
         }));
@@ -2466,7 +2466,7 @@ mod event_protocol_tests {
         // Capture every `ToolExecutionEnd` so we can assert the
         // mutated args reached the tool's execute body.
         let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let bodies_clone = bodies.clone();
+        let bodies_clone = Arc::clone(&bodies);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             if let AgentEvent::ToolExecutionEnd {
                 result: ToolDetails::Text { body, .. },
@@ -2545,7 +2545,7 @@ mod event_protocol_tests {
         agent.set_before_tool_call(Some(hook));
 
         let outcomes: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
-        let outcomes_clone = outcomes.clone();
+        let outcomes_clone = Arc::clone(&outcomes);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             if let AgentEvent::ToolExecutionEnd {
                 result: ToolDetails::Text { summary, .. },
@@ -2598,7 +2598,7 @@ mod event_protocol_tests {
         agent.set_after_tool_call(Some(hook));
 
         let outcomes: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
-        let outcomes_clone = outcomes.clone();
+        let outcomes_clone = Arc::clone(&outcomes);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             if let AgentEvent::ToolExecutionEnd {
                 result: ToolDetails::Text { body, .. },

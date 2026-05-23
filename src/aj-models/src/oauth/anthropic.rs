@@ -1047,8 +1047,8 @@ mod tests {
             let counter = Arc::new(AtomicUsize::new(0));
 
             {
-                let captured = captured.clone();
-                let counter = counter.clone();
+                let captured = Arc::clone(&captured);
+                let counter = Arc::clone(&counter);
                 tokio::spawn(async move {
                     loop {
                         let (mut stream, _) = match listener.accept().await {

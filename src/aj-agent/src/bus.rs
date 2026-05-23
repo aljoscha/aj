@@ -120,7 +120,7 @@ impl EventBus {
             .lock()
             .expect("event bus listeners mutex poisoned")
             .iter()
-            .map(|slot| slot.listener.clone())
+            .map(|slot| Arc::clone(&slot.listener))
             .collect();
         for listener in listeners {
             listener(&event).await?;
@@ -185,7 +185,7 @@ where
 {
     let f = Arc::new(Mutex::new(move |event: &AgentEvent| f(event)));
     Arc::new(move |event: &AgentEvent| {
-        let f = f.clone();
+        let f = Arc::clone(&f);
         // Run the synchronous body before yielding so subscribers
         // that observe events purely for their side effects do not
         // need to schedule themselves on the runtime.
@@ -203,7 +203,7 @@ mod tests {
 
     fn record() -> (Listener, Arc<Mutex<Vec<String>>>) {
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let log_clone = log.clone();
+        let log_clone = Arc::clone(&log);
         let listener = listener_from_sync(move |event| match event {
             AgentEvent::Notice { text, .. } => {
                 log_clone
@@ -222,11 +222,11 @@ mod tests {
 
         let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let order_a = order.clone();
+        let order_a = Arc::clone(&order);
         let _h1 = bus.subscribe(listener_from_sync(move |_| {
             order_a.lock().unwrap().push(1);
         }));
-        let order_b = order.clone();
+        let order_b = Arc::clone(&order);
         let _h2 = bus.subscribe(listener_from_sync(move |_| {
             order_b.lock().unwrap().push(2);
         }));
@@ -276,7 +276,7 @@ mod tests {
         let _h1 = bus.subscribe(Arc::new(|_event| {
             Box::pin(async { Err(anyhow::anyhow!("boom")) })
         }));
-        let later = later_called.clone();
+        let later = Arc::clone(&later_called);
         let _h2 = bus.subscribe(listener_from_sync(move |_| {
             *later.lock().unwrap() = true;
         }));

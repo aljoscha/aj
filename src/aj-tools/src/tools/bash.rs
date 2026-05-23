@@ -570,7 +570,7 @@ mod tests {
             let updates = Arc::new(StdMutex::new(Vec::new()));
             let ctx = Self {
                 inner: DummyToolContext::default(),
-                updates: updates.clone(),
+                updates: Arc::clone(&updates),
             };
             (ctx, updates)
         }
