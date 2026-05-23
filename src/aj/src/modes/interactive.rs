@@ -866,13 +866,13 @@ fn apply_editor_border_for_thinking(
     }
 }
 
-/// Format the footer's model field as `"<model-id> @ <thinking-effort>"`.
+/// Format the footer's model field as `"<model-id> <thinking-effort>"`.
 ///
 /// The thinking effort (e.g. `"off"`, `"medium"`, `"max"`) is more
 /// useful to surface persistently than the base URL — the URL is
 /// stable per provider, while the effort changes per session.
 fn format_footer_model(model_id: &str, thinking: &Option<aj_models::ThinkingConfig>) -> String {
-    format!("{} @ {}", model_id, thinking_level_name(thinking))
+    format!("{} {}", model_id, thinking_level_name(thinking))
 }
 
 /// Refresh the footer's model line so it reflects the agent's current
