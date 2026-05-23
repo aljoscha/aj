@@ -31,8 +31,8 @@ fn does_not_evict_cursor_bindings_when_another_action_reuses_the_same_key() {
     let kbm = KeybindingsManager::new(tui_keybindings(), [("tui.select.up", vec!["up", "ctrl+p"])]);
 
     assert_eq!(kbm.get_keys("tui.select.up"), &["up", "ctrl+p"]);
-    // `tui.editor.cursorUp` still defaults to `up`.
-    assert_eq!(kbm.get_keys("tui.editor.cursorUp"), &["up"]);
+    // `tui.editor.cursorUp` still defaults to `up` + `ctrl+p`.
+    assert_eq!(kbm.get_keys("tui.editor.cursorUp"), &["up", "ctrl+p"]);
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn resolved_bindings_list_every_action_in_definition_order() {
 
     // First few definitions in order.
     assert_eq!(resolved[0].0, "tui.editor.cursorUp");
-    assert_eq!(resolved[0].1, vec!["up"]);
+    assert_eq!(resolved[0].1, vec!["up", "ctrl+p"]);
     assert_eq!(resolved[1].0, "tui.editor.cursorDown");
     assert_eq!(resolved[2].0, "tui.editor.cursorLeft");
     assert_eq!(resolved[2].1, vec!["left", "ctrl+b"]);

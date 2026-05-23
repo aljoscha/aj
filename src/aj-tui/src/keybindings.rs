@@ -279,13 +279,16 @@ pub fn tui_keybindings() -> KeybindingDefinitions {
     use KeybindingDefinition as K;
     vec![
         // Editor navigation and editing
+        // Up/Down also navigate prompt history when the cursor is on
+        // the first/last visual line of the editor; `ctrl+p` / `ctrl+n`
+        // are the readline-style aliases for the same action.
         (
             "tui.editor.cursorUp".to_string(),
-            K::new("up", "Move cursor up"),
+            K::new(["up", "ctrl+p"], "Move cursor up"),
         ),
         (
             "tui.editor.cursorDown".to_string(),
-            K::new("down", "Move cursor down"),
+            K::new(["down", "ctrl+n"], "Move cursor down"),
         ),
         (
             "tui.editor.cursorLeft".to_string(),
