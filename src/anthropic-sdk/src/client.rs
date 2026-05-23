@@ -12,7 +12,6 @@ use crate::stealth::{
     CLAUDE_CODE_VERSION, apply_request_transformations, collect_caller_tool_names,
     reverse_map_event, reverse_map_message,
 };
-use crate::streaming::{StreamProcessor, StreamingEvent};
 
 const BASE_URL: &str = "https://api.anthropic.com";
 
@@ -241,7 +240,13 @@ impl Client {
         }
     }
 
-    pub async fn messages_stream_raw(
+    /// Stream the raw server-sent events from `POST /v1/messages`.
+    /// The returned stream yields one [`ServerSentEvent`] per parseable
+    /// SSE frame; unparseable frames are logged at `warn` and dropped
+    /// so a future API version that adds new event types doesn't crash
+    /// the stream. OAuth stealth-mode reverse-mapping of tool names is
+    /// applied per-event before yielding.
+    pub async fn messages_stream(
         &self,
         mut messages: Messages,
     ) -> Result<Pin<Box<dyn Stream<Item = ServerSentEvent> + Send>>, ClientError> {
@@ -319,14 +324,6 @@ impl Client {
             )))
         }
     }
-
-    pub async fn messages_stream(
-        &self,
-        messages: Messages,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>, ClientError> {
-        let stream = self.messages_stream_raw(messages).await?;
-        Ok(create_high_level_stream(stream))
-    }
 }
 
 #[derive(Debug, Error)]
@@ -366,14 +363,6 @@ impl ClientError {
             _ => None,
         }
     }
-}
-
-fn create_high_level_stream<S>(stream: S) -> Pin<Box<dyn Stream<Item = StreamingEvent> + Send>>
-where
-    S: Stream<Item = ServerSentEvent> + Send + 'static,
-{
-    let processor = StreamProcessor::new();
-    processor.process_stream(stream)
 }
 
 #[cfg(test)]

@@ -146,7 +146,7 @@ async fn run_stream_inner(
     }
 
     let mut sse = client
-        .messages_stream_raw(request)
+        .messages_stream(request)
         .await
         .map_err(|err| classify_client_error(&err))?;
 

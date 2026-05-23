@@ -3218,14 +3218,12 @@ session notes for the planning commit.
        `aj/src/modes/interactive/event_pump.rs`, or
        `aj/src/model.rs`.
 
-       **Out-of-scope follow-up.** The Anthropic SDK still ships
-       its own legacy `streaming::StreamingEvent` enum and
-       `client.create_high_level_stream` helper used to feed the
-       deleted `aj-models::anthropic::legacy.rs`. They're now dead
-       code inside `anthropic-sdk` itself (`rg "anthropic_sdk::streaming"`
-       returns no out-of-crate matches), but the SDK cleanup
-       wasn't in 6.9's scope and is left for a future tidying
-       pass.
+       **Out-of-scope follow-up — now landed in 6.10 below.** The
+       Anthropic SDK shipped its own legacy `streaming::StreamingEvent`
+       enum and `client.create_high_level_stream` helper used to feed
+       the deleted `aj-models::anthropic::legacy.rs`. They were dead
+       code inside `anthropic-sdk` itself after 6.9; the SDK cleanup
+       wasn't in 6.9's scope and is recorded as step 6.10.
 
        `cargo build --workspace`, `cargo test --workspace`,
        `cargo fmt --all`, and `cargo clippy --workspace --all-targets`
@@ -3240,6 +3238,60 @@ session notes for the planning commit.
        With this step landed, `models-progress.md` steps 16/17/18
        can be ticked off too — see the bridge note at the top of
        Phase 6.
+
+- [x] **6.10: Anthropic SDK legacy cleanup.** The Phase 6.9
+       "out-of-scope follow-up" landed: `anthropic-sdk` no longer
+       ships the legacy high-level streaming surface.
+
+       **Files deleted.** `src/anthropic-sdk/src/streaming.rs` in
+       full (465 lines: the `StreamingEvent` enum, the
+       `StreamProcessor` state machine, the `Default` impl). The
+       module had zero out-of-crate references after 6.9 deleted
+       `aj-models::anthropic::legacy.rs`.
+
+       **`anthropic-sdk::lib`.** `pub mod streaming;` removed from
+       `src/anthropic-sdk/src/lib.rs`; the remaining surface is
+       [`client`], [`messages`], and the private [`stealth`]
+       helper module.
+
+       **`anthropic-sdk::client`.** Three changes: the
+       `use crate::streaming::{StreamProcessor, StreamingEvent};`
+       import dropped; the legacy `Client::messages_stream`
+       wrapper that delegated through `create_high_level_stream`
+       dropped; the private `create_high_level_stream` helper
+       dropped. The raw SSE entry point that the
+       `aj-models::anthropic::provider` actually consumes —
+       previously named `messages_stream_raw` — was renamed to
+       `messages_stream` now that the `_raw` qualifier is
+       meaningless (the only streaming surface left is the raw
+       one, mirroring `openai-sdk`'s `chat_completions_stream` /
+       `responses_stream` / `codex_responses_stream` naming).
+       Picked up a doc comment describing the returned-stream
+       shape so the contract is in place at the call site.
+
+       **`anthropic-sdk/Cargo.toml`.** `async-stream` dropped
+       from the per-crate dependency list (it was used only by
+       the deleted `streaming.rs`). The workspace declaration
+       stays — `openai-sdk` and `aj-models` still depend on it.
+
+       **Single call site update.** `aj-models::anthropic::provider`'s
+       lone `client.messages_stream_raw(request)` call
+       (`src/aj-models/src/anthropic/provider.rs:149`) renamed to
+       `client.messages_stream(request)`.
+
+       The `anthropic-sdk` and `openai-sdk` crates now expose
+       symmetric streaming surfaces — raw, typed SSE events
+       only. No high-level event converters live inside either
+       SDK; the unified-event protocol from `models-spec.md` §2
+       is built entirely inside `aj-models`'s provider modules,
+       which is the layering boundary `docs/models-spec.md`
+       prescribes.
+
+       `cargo build --workspace`, `cargo test --workspace`,
+       `cargo fmt --all`, and `cargo clippy --workspace
+       --all-targets` all pass clean (only the pre-existing
+       `clone_on_ref_ptr` warnings in `aj-agent`, `aj-models`,
+       and `aj-tools` remain — none in the touched files).
 
 ### Architectural choices (decided up front)
 
