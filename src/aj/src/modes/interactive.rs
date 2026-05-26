@@ -1083,7 +1083,7 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::Clear => match perform_clear_thread(
+        SlashAction::NewThread => match perform_new_thread(
             tui,
             Arc::clone(&agent),
             log,
@@ -1448,7 +1448,7 @@ async fn perform_thread_swap(
 ///
 /// Returns the new thread id on success so the caller can surface
 /// it in a status notice.
-async fn perform_clear_thread(
+async fn perform_new_thread(
     tui: &mut Tui,
     agent: Arc<TokioMutex<Agent>>,
     log: &mut Arc<TokioMutex<ConversationLog>>,

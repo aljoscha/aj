@@ -63,8 +63,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("[search]"),
     },
     BuiltinCommand {
-        name: "clear",
+        name: "new",
         description: "Start a fresh thread (the current one is preserved on disk).",
+        argument_hint: None,
+    },
+    BuiltinCommand {
+        name: "clear",
+        description: "Alias for /new.",
         argument_hint: None,
     },
     BuiltinCommand {
@@ -223,7 +228,7 @@ pub enum SlashAction {
     /// disk; the host creates a new [`ConversationLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the
     /// scrollback.
-    Clear,
+    NewThread,
     /// Show the slash-command reference. The host renders a
     /// multi-line notice listing every entry in [`BUILTIN_COMMANDS`].
     Help,
@@ -291,7 +296,7 @@ pub fn dispatch(input: &str) -> SlashAction {
                 Some(rest.to_string())
             },
         },
-        "clear" => SlashAction::Clear,
+        "new" | "clear" => SlashAction::NewThread,
         "help" => SlashAction::Help,
         "quit" => SlashAction::Quit,
         _ => SlashAction::Unknown {
@@ -444,12 +449,21 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_clear_returns_clear_action() {
-        assert_eq!(dispatch("/clear"), SlashAction::Clear);
-        // Trailing whitespace and arguments are ignored — `/clear`
+    fn dispatch_new_returns_new_thread_action() {
+        assert_eq!(dispatch("/new"), SlashAction::NewThread);
+        // Trailing whitespace and arguments are ignored — `/new`
         // takes no arguments and any trailing tokens are dropped.
-        assert_eq!(dispatch("  /clear  "), SlashAction::Clear);
-        assert_eq!(dispatch("/clear extra"), SlashAction::Clear);
+        assert_eq!(dispatch("  /new  "), SlashAction::NewThread);
+        assert_eq!(dispatch("/new extra"), SlashAction::NewThread);
+    }
+
+    #[test]
+    fn dispatch_clear_alias_returns_new_thread_action() {
+        // `/clear` is retained as an alias for `/new` so muscle
+        // memory keeps working; same parsing rules apply.
+        assert_eq!(dispatch("/clear"), SlashAction::NewThread);
+        assert_eq!(dispatch("  /clear  "), SlashAction::NewThread);
+        assert_eq!(dispatch("/clear extra"), SlashAction::NewThread);
     }
 
     #[test]
