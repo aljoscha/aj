@@ -1,10 +1,10 @@
-//! Session-selector overlay (`/session`).
+//! Session-selector overlay (`/sessions`).
 //!
 //! Pairs a [`aj_tui::components::text_input::TextInput`] for live
 //! fuzzy filtering with a [`aj_tui::components::select_list::SelectList`]
 //! that shows the matching entries from a snapshotted list of
 //! [`aj_session::ThreadPreview`]s. The host opens this overlay from
-//! `/session` (no args, full catalog) or `/session <query>` (pre-
+//! `/sessions` (no args, full catalog) or `/sessions <query>` (pre-
 //! filled search); `Enter` commits the highlighted thread, `Esc`
 //! cancels.
 //!
@@ -117,7 +117,7 @@ impl SessionSelectorComponent {
     /// returns latest-first already). `current_thread_id` is the
     /// agent's active thread — used to pre-select the matching row
     /// and mark it `(current)`. `initial_query` pre-fills the
-    /// search box (used by `/session <query>`). `theme` styles the
+    /// search box (used by `/sessions <query>`). `theme` styles the
     /// underlying [`SelectList`].
     pub fn new(
         theme: SelectListTheme,

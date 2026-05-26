@@ -58,7 +58,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("[search]"),
     },
     BuiltinCommand {
-        name: "session",
+        name: "sessions",
         description: "Resume a different conversation thread.",
         argument_hint: Some("[search]"),
     },
@@ -222,7 +222,7 @@ pub enum SlashAction {
     /// Open the session selector overlay. The currently-active
     /// thread is pre-selected; `Enter` swaps the agent over to the
     /// chosen thread, `Esc` cancels. `initial_query` pre-fills the
-    /// search box so `/session fix bug` opens already filtered.
+    /// search box so `/sessions fix bug` opens already filtered.
     OpenSessionSelector { initial_query: Option<String> },
     /// Start a fresh thread. The current thread is preserved on
     /// disk; the host creates a new [`ConversationLog`], swaps it
@@ -289,7 +289,7 @@ pub fn dispatch(input: &str) -> SlashAction {
                 Some(rest.to_string())
             },
         },
-        "session" => SlashAction::OpenSessionSelector {
+        "sessions" => SlashAction::OpenSessionSelector {
             initial_query: if rest.is_empty() {
                 None
             } else {
@@ -474,15 +474,15 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_session_no_arg_opens_selector() {
+    fn dispatch_sessions_no_arg_opens_selector() {
         assert_eq!(
-            dispatch("/session"),
+            dispatch("/sessions"),
             SlashAction::OpenSessionSelector {
                 initial_query: None
             }
         );
         assert_eq!(
-            dispatch("  /session  "),
+            dispatch("  /sessions  "),
             SlashAction::OpenSessionSelector {
                 initial_query: None
             }
@@ -490,9 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_session_with_query_pre_fills_search() {
+    fn dispatch_sessions_with_query_pre_fills_search() {
         assert_eq!(
-            dispatch("/session fix bug"),
+            dispatch("/sessions fix bug"),
             SlashAction::OpenSessionSelector {
                 initial_query: Some("fix bug".to_string())
             }
