@@ -14,11 +14,21 @@ use serde::{Deserialize, Serialize};
 ///
 /// The accumulator semantics match what the agent maintains in
 /// [`crate::Agent::accumulated_usage`]: every successful turn adds
-/// its [`aj_models::types::Usage`] into the accumulator, and the
-/// snapshot here is taken *after* that add, so `accumulated_*`
-/// already includes the current turn's contribution. Field names
-/// mirror the unified usage shape (`input`, `output`, `cache_read`,
-/// `cache_write`) per `docs/models-spec.md` §1.3.
+/// its [`aj_models::types::Usage`] into the accumulator. The
+/// snapshot here is taken *before* that add, so `accumulated_*`
+/// reflects the running total **observed before this turn was
+/// folded in**. Together with `turn_*`, a single event answers the
+/// question "what was there before, and what is this turn adding"
+/// — the running total after the turn is exactly
+/// `accumulated_* + turn_*`. Field names mirror the unified usage
+/// shape (`input`, `output`, `cache_read`, `cache_write`) per
+/// `docs/models-spec.md` §1.3.
+///
+/// Polling [`crate::Agent::accumulated_usage`] *between* turns
+/// returns the post-add total (i.e. the next `TurnUsage` event's
+/// `accumulated_* + turn_*`), so a consumer that needs the
+/// "current running total at any instant" can either read the
+/// getter or maintain its own sum off the bus events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub accumulated_input: u64,

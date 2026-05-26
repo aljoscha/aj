@@ -85,20 +85,21 @@ impl FooterData {
 mod tests {
     use super::*;
 
-    /// Build a `TokenUsage` with the given turn-level deltas;
-    /// accumulated fields are filled in to match so the struct is
-    /// self-consistent (the snapshot only reads `turn_*` fields,
-    /// but the contract on `TokenUsage` keeps the two sides
-    /// aligned).
+    /// Build a `TokenUsage` snapshot carrying the supplied
+    /// per-turn deltas. The `accumulated_*` fields are zeroed —
+    /// matching the wire-level pre-add semantic for an agent that
+    /// hasn't run any prior turns — but `FooterData::record_turn_usage`
+    /// only reads `turn_*`, so the accumulator value is irrelevant
+    /// to the tests below and we keep it constant for clarity.
     fn token_usage(input: u64, output: u64, cache_write: u64, cache_read: u64) -> TokenUsage {
         TokenUsage {
-            accumulated_input: input,
+            accumulated_input: 0,
             turn_input: input,
-            accumulated_output: output,
+            accumulated_output: 0,
             turn_output: output,
-            accumulated_cache_write: cache_write,
+            accumulated_cache_write: 0,
             turn_cache_write: cache_write,
-            accumulated_cache_read: cache_read,
+            accumulated_cache_read: 0,
             turn_cache_read: cache_read,
         }
     }

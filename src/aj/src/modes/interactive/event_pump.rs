@@ -855,19 +855,22 @@ mod tests {
     use crate::config::theme::{ChatTheme, ThemeHandle, chat_theme};
     use crate::modes::interactive::layout::build_layout;
 
-    /// Build a TokenUsage with the supplied turn deltas and the
-    /// accumulated totals set to `turn + already`, so the resulting
-    /// snapshot looks like an agent that ran one prior turn worth
-    /// `already` plus this turn's contribution.
+    /// Build a TokenUsage carrying the supplied per-turn deltas
+    /// and the running accumulator state observed *before* this
+    /// turn was folded in (`already`). Matches the wire semantic
+    /// on [`aj_agent::events::AgentEvent::TurnUsage`]: each
+    /// `accumulated_*` field is the running total before this
+    /// turn, and `turn_*` is the delta the turn is contributing
+    /// on top.
     fn token_usage(turn: [u64; 4], already: [u64; 4]) -> TokenUsage {
         TokenUsage {
-            accumulated_input: already[0] + turn[0],
+            accumulated_input: already[0],
             turn_input: turn[0],
-            accumulated_output: already[1] + turn[1],
+            accumulated_output: already[1],
             turn_output: turn[1],
-            accumulated_cache_write: already[2] + turn[2],
+            accumulated_cache_write: already[2],
             turn_cache_write: turn[2],
-            accumulated_cache_read: already[3] + turn[3],
+            accumulated_cache_read: already[3],
             turn_cache_read: turn[3],
         }
     }
@@ -922,13 +925,14 @@ mod tests {
 
     #[test]
     fn format_turn_usage_line_emits_acc_plus_turn_for_main_agent() {
-        // First turn: accumulated == turn. Each `acc+turn` field
-        // should print `acc+turn` since the turn delta is nonzero.
+        // First turn: the accumulator is still zero, so each
+        // field prints `0+turn` — "there was nothing before, and
+        // this turn is contributing `turn`".
         let usage = token_usage([100, 50, 30, 5], [0, 0, 0, 0]);
         let line = format_turn_usage_line(AgentId::Main, &usage);
         assert_eq!(
             line,
-            "Token Usage - Input: 100+100 | Output: 50+50 | Cache Creation: 30+30 | Cache Read: 5+5",
+            "Token Usage - Input: 0+100 | Output: 0+50 | Cache Creation: 0+30 | Cache Read: 0+5",
         );
     }
 
@@ -950,12 +954,15 @@ mod tests {
     fn format_turn_usage_line_prefixes_sub_agent_id() {
         // Sub-agents share the parent's bus, so their per-turn
         // usage line is tagged with `(sub agent N)` to keep the
-        // rows distinguishable in the shared scrollback.
+        // rows distinguishable in the shared scrollback. This is
+        // the sub-agent's first turn, so the accumulator is still
+        // zero (each field prints `0+turn`); cache_read's turn
+        // delta is zero so the `+turn` suffix drops off there.
         let usage = token_usage([10, 5, 1, 0], [0, 0, 0, 0]);
         let line = format_turn_usage_line(AgentId::Sub(2), &usage);
         assert_eq!(
             line,
-            "(sub agent 2) Token Usage - Input: 10+10 | Output: 5+5 | Cache Creation: 1+1 | Cache Read: 0",
+            "(sub agent 2) Token Usage - Input: 0+10 | Output: 0+5 | Cache Creation: 0+1 | Cache Read: 0",
         );
     }
 
@@ -1417,7 +1424,7 @@ mod tests {
         let joined = lines.join("\n");
         assert!(
             joined.contains(
-                "Token Usage - Input: 42+42 | Output: 17+17 | Cache Creation: 0 | Cache Read: 3+3"
+                "Token Usage - Input: 0+42 | Output: 0+17 | Cache Creation: 0 | Cache Read: 0+3"
             ),
             "row should carry the formatted usage line, got: {joined:?}",
         );
