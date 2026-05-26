@@ -37,7 +37,8 @@ use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, supports_xhigh};
 use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
+    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
+    select_cancel,
 };
 use crate::transform::transform_messages;
 use crate::types::{
@@ -217,6 +218,15 @@ async fn run_stream_inner(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> Result<(), AssistantError> {
+    if let Some(token) = options.cancel.as_ref()
+        && token.is_cancelled()
+    {
+        producer.push(AssistantMessageEvent::aborted(empty_partial(
+            API_NAME, model,
+        )));
+        return Ok(());
+    }
+
     let api_key = options.resolve_api_key().await.map_err(|err| {
         AssistantError::new(
             ErrorCategory::Auth,
@@ -251,27 +261,51 @@ async fn run_stream_inner(
         }
     }
 
-    let mut sse = client
-        .responses_stream(request)
-        .await
-        .map_err(|err| classify_client_error(&err))?;
+    let mut sse =
+        match select_cancel(options.cancel.as_ref(), client.responses_stream(request)).await {
+            SelectOutcome::Ready(res) => res.map_err(|err| classify_client_error(&err))?,
+            SelectOutcome::Cancelled => {
+                producer.push(AssistantMessageEvent::aborted(empty_partial(
+                    API_NAME, model,
+                )));
+                return Ok(());
+            }
+        };
 
     let mut state = StreamState::new(model, options.service_tier.clone());
 
-    while let Some(event) = sse.next().await {
-        match event {
-            Ok(ev) => {
+    loop {
+        match select_cancel(options.cancel.as_ref(), sse.next()).await {
+            SelectOutcome::Ready(Some(Ok(ev))) => {
                 for out in state.process(ev) {
                     producer.push(out);
                 }
             }
-            Err(err) => return Err(classify_client_error(&err)),
+            SelectOutcome::Ready(Some(Err(err))) => return Err(classify_client_error(&err)),
+            SelectOutcome::Ready(None) => break,
+            SelectOutcome::Cancelled => {
+                producer.push(AssistantMessageEvent::aborted(state.partial().clone()));
+                return Ok(());
+            }
         }
     }
 
     let final_event = state.finalize();
     producer.push(final_event);
     Ok(())
+}
+
+/// Build a structurally-complete empty partial for `(api, model)`.
+/// Used as the abort payload when cancellation fires before the SSE
+/// state machine has accumulated anything. Shared between the
+/// Responses and Codex providers (the Codex provider's `API_NAME`
+/// differs from this module's, so callers pass it explicitly).
+pub(super) fn empty_partial(api: &str, model: &ModelInfo) -> AssistantMessage {
+    let mut partial = AssistantMessage::empty();
+    partial.api = api.to_string();
+    partial.provider = model.provider.clone();
+    partial.model = model.id.clone();
+    partial
 }
 
 pub(super) fn classify_client_error(err: &ClientError) -> AssistantError {
@@ -956,6 +990,14 @@ impl StreamState {
             api_name,
             cost_multiplier,
         }
+    }
+
+    /// Borrow the running partial message snapshot. Used by the abort
+    /// path in [`super::responses::run_stream_inner`] /
+    /// [`super::codex::run_stream_inner`] to project the current state
+    /// onto an [`AssistantMessageEvent::aborted`] event.
+    pub(super) fn partial(&self) -> &AssistantMessage {
+        &self.partial
     }
 
     pub(super) fn process(&mut self, event: ResponseStreamEvent) -> Vec<AssistantMessageEvent> {

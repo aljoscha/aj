@@ -44,6 +44,7 @@ use aj_tui::tui::{OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, Tui, 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_util::sync::CancellationToken;
 
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command};
@@ -443,7 +444,16 @@ impl InteractiveMode {
         // render events; while it's running the editor's
         // `disable_submit` flag is set so a second submission can't
         // queue up before steering/follow-up land.
+        //
+        // `current_turn_cancel` holds the per-turn cancellation
+        // handle the binary owns. It's a clone of the same
+        // `CancellationToken` we passed to `agent.prompt` —
+        // `CancellationToken` is `Arc`-backed so cloning shares
+        // cancellation state. Ctrl+C while a turn is running fires
+        // this handle, which the agent's `execute_turn` `select!`s
+        // on; Ctrl+C while idle exits the program.
         let mut running_task: Option<tokio::task::JoinHandle<Result<(), TurnError>>> = None;
+        let mut current_turn_cancel: Option<CancellationToken> = None;
         let mut run_result: Result<()> = Ok(());
 
         // Slash commands like `/thinking` open an overlay selector.
@@ -476,9 +486,20 @@ impl InteractiveMode {
                 // --- Agent run finished ---
                 join_outcome = task_done => {
                     running_task = None;
+                    current_turn_cancel = None;
                     set_editor_submit_enabled(&mut tui, true);
                     match join_outcome {
                         Ok(Ok(())) => {}
+                        Ok(Err(TurnError::Aborted)) => {
+                            // The agent has already emitted the
+                            // synthetic aborted `MessageEnd` and any
+                            // cancelled tool-result `MessageEnd`s, so
+                            // the chat scrollback is consistent.
+                            // Surface a brief notice so the user has
+                            // visible confirmation that Ctrl+C took
+                            // effect; the session stays alive.
+                            pump.handle(&mut tui, &notice_event("Turn cancelled."));
+                        }
                         Ok(Err(TurnError::Recoverable(err))) => {
                             // Surface to the user; the chat
                             // container's notice line keeps the
@@ -517,13 +538,28 @@ impl InteractiveMode {
                     match event {
                         TuiEvent::Render => tui.render(),
                         TuiEvent::Input(input) => {
-                            // Ctrl+C exits. Future commits will
-                            // bind this to "interrupt the running
-                            // turn" via the agent's
-                            // CancellationToken; for now the
-                            // simple "quit" semantics matches the
-                            // legacy `aj` binary.
-                            if input.is_ctrl('c') || input.is_ctrl('d') {
+                            // Ctrl+C: cancel a running turn if one
+                            // is in flight, otherwise exit. Ctrl+D
+                            // always exits. The terminal is in raw
+                            // mode so neither chord raises SIGINT;
+                            // both arrive here as ordinary key
+                            // events. The cancel handle is the
+                            // binary's clone of the per-turn
+                            // `CancellationToken` we passed to
+                            // `agent.prompt`; firing it propagates
+                            // to the agent's `execute_turn`
+                            // `select!`s and to every provider /
+                            // tool subscribed to the same token,
+                            // including the bash tool's process
+                            // group.
+                            if input.is_ctrl('c') {
+                                if let Some(token) = current_turn_cancel.as_ref() {
+                                    token.cancel();
+                                    continue;
+                                }
+                                break;
+                            }
+                            if input.is_ctrl('d') {
                                 break;
                             }
                             // Toggle the thinking-block render mode for
@@ -657,9 +693,20 @@ impl InteractiveMode {
                                 }
                                 set_editor_submit_enabled(&mut tui, false);
                                 let agent_for_run = Arc::clone(&agent);
+                                // Mint a fresh per-turn cancellation
+                                // token. The binary keeps one clone in
+                                // `current_turn_cancel` so the Ctrl+C
+                                // arm can fire `.cancel()` without
+                                // locking the agent mutex; the spawned
+                                // task hands its own clone to
+                                // `agent.prompt`. Both clones share
+                                // cancellation state because the inner
+                                // is `Arc`-backed.
+                                let turn_cancel = CancellationToken::new();
+                                current_turn_cancel = Some(turn_cancel.clone());
                                 running_task = Some(tokio::spawn(async move {
                                     let mut a = agent_for_run.lock().await;
-                                    a.prompt(trimmed).await
+                                    a.prompt(trimmed, turn_cancel).await
                                 }));
                             }
                         }

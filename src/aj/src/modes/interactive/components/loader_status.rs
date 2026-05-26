@@ -25,7 +25,10 @@ use aj_tui::tui::RenderHandle;
 /// Default working message — kept in sync with the legacy CLI's
 /// `display_loader` so users don't see a different status word
 /// between the two binaries during the Phase 0 → Phase 2 window.
-pub const DEFAULT_MESSAGE: &str = "Working…";
+/// The "(Ctrl+C to cancel)" suffix surfaces the cancellation
+/// affordance per `docs/aj-next-plan.md` §1.8 so users can discover
+/// it without consulting docs.
+pub const DEFAULT_MESSAGE: &str = "Working… (Ctrl+C to cancel)";
 
 /// Component wrapping an [`aj_tui::components::loader::Loader`]
 /// with a small set of agent-aware affordances:

@@ -63,6 +63,7 @@ use aj_tui::tui::Tui;
 use anyhow::anyhow;
 use tempfile::TempDir;
 use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 
 /// Fixed dimensions for the test rendering surface. The actual
 /// values are irrelevant — both the live and replay pumps use the
@@ -296,10 +297,14 @@ async fn drive_live_turn(
     //    on the trigger event before the error bubbles up.
     let _h_kill = agent.subscribe(kill_switch_listener());
 
-    match agent.prompt(prompt.to_string()).await {
+    match agent
+        .prompt(prompt.to_string(), CancellationToken::new())
+        .await
+    {
         Ok(()) => panic!("expected kill switch to abort the turn before agent end"),
         Err(TurnError::Fatal(_)) => {}
         Err(TurnError::Recoverable(e)) => panic!("unexpected recoverable error: {e:#}"),
+        Err(TurnError::Aborted) => panic!("unexpected aborted error"),
     }
 
     let events = captured

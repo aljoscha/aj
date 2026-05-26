@@ -159,6 +159,32 @@ impl AssistantMessageEvent {
         matches!(self, Self::Done { .. } | Self::Error { .. })
     }
 
+    /// Build the canonical `Error { reason: Aborted, ... }` terminal event
+    /// from a partial [`AssistantMessage`] captured at the moment a stream
+    /// was cancelled by the client.
+    ///
+    /// Stamps `stop_reason = Aborted` on the message and, when the partial
+    /// did not already carry an error payload, attaches an
+    /// [`AssistantError`] in the [`ErrorCategory::Aborted`] category so the
+    /// consumer's classification logic doesn't have to special-case the
+    /// "the stream was cancelled but no upstream error was reported" shape.
+    /// All accumulated text / thinking / tool-call deltas in the partial
+    /// are preserved verbatim; sub-agents and persistence layers see the
+    /// best-effort partial output exactly as it arrived.
+    pub fn aborted(mut partial: AssistantMessage) -> Self {
+        partial.stop_reason = StopReason::Aborted;
+        if partial.error.is_none() {
+            partial.error = Some(AssistantError::new(
+                ErrorCategory::Aborted,
+                "client cancelled the request",
+            ));
+        }
+        Self::Error {
+            reason: ErrorReason::Aborted,
+            error: partial,
+        }
+    }
+
     /// Borrow the running snapshot of the partial message.
     ///
     /// For terminal events this returns the final message (the one that will
@@ -179,6 +205,42 @@ impl AssistantMessageEvent {
             Self::Done { message, .. } => message,
             Self::Error { error, .. } => error,
         }
+    }
+}
+
+/// Outcome of [`select_cancel`].
+pub enum SelectOutcome<T> {
+    /// The future completed with `T` before the cancellation token fired.
+    Ready(T),
+    /// The cancellation token fired before the future completed; the
+    /// future has been dropped.
+    Cancelled,
+}
+
+/// Await `fut` concurrently with `token.cancelled()`. When `token` is
+/// `None` this just awaits `fut` (the cancellation path is unreachable),
+/// matching the "no cancel installed" case providers see when the
+/// caller doesn't set [`StreamOptions::cancel`](crate::types::StreamOptions).
+///
+/// Used by every provider's `run_stream_inner` to drive the streaming
+/// HTTP request inside a `select!` against the per-call cancellation
+/// token so a `cancel()` rapidly tears down both the HTTP connection
+/// (via dropping the SSE handle) and the polling task.
+pub async fn select_cancel<T, F>(
+    token: Option<&tokio_util::sync::CancellationToken>,
+    fut: F,
+) -> SelectOutcome<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(token) = token else {
+        return SelectOutcome::Ready(fut.await);
+    };
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => SelectOutcome::Cancelled,
+        value = &mut fut => SelectOutcome::Ready(value),
     }
 }
 

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // §1.1 Content Types
@@ -571,6 +572,23 @@ pub struct StreamOptions {
     /// provider default applies (typically [`ToolChoice::Auto`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// Per-call cancellation token. When set, the provider drives
+    /// its streaming HTTP request inside a `select!` against
+    /// [`CancellationToken::cancelled`]; on cancel the partial
+    /// [`AssistantMessage`] built up so far is emitted via
+    /// [`AssistantMessageEvent::Error`](crate::streaming::AssistantMessageEvent::Error)
+    /// with reason
+    /// [`Aborted`](crate::streaming::ErrorReason::Aborted) and
+    /// `error.category == ErrorCategory::Aborted`, so callers see
+    /// a normal terminal event carrying whatever text / thinking /
+    /// tool-call deltas had already arrived.
+    ///
+    /// Skipped in serde — cancellation handles aren't serializable
+    /// and persisting one across runs is meaningless. Cloning is
+    /// cheap (the token is `Arc`-backed) so this field stays
+    /// `Clone` like the rest of `StreamOptions`.
+    #[serde(skip)]
+    pub cancel: Option<CancellationToken>,
 }
 
 /// Higher-level options that include reasoning control.

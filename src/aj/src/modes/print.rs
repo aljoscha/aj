@@ -64,6 +64,7 @@ use aj_session::{
 use aj_tools::get_builtin_tools;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command, PrintFormat};
@@ -313,7 +314,7 @@ pub async fn run(args: Args) -> Result<()> {
     let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
 
     // Drive a single prompt and observe the result. Errors fall into
-    // two buckets:
+    // three buckets:
     //
     // - `Recoverable`: model errored mid-turn or returned a
     //   user-facing failure. The transcript and disk state remain
@@ -321,12 +322,34 @@ pub async fn run(args: Args) -> Result<()> {
     //   compensating tool_result entries before returning), but the
     //   run produced no useful output for the caller. Surface the
     //   error to stderr and exit non-zero.
+    // - `Aborted`: the user (or a parent process) sent SIGINT and we
+    //   tripped the agent's cancel token. Same outward behaviour as
+    //   `Recoverable` — internally-consistent state, non-zero exit.
     // - `Fatal`: a listener errored or the disk write failed. Same
     //   outward behaviour but with a fatal-flavoured error context
     //   so callers can tell them apart in scripts.
-    let prompt_result = agent.prompt(prompt_text).await;
+    //
+    // We honour SIGINT via [`tokio::signal::ctrl_c`] so a Ctrl+C at
+    // the shell aborts the in-flight turn instead of killing the
+    // process. The handler fires once: a second SIGINT exits the
+    // process via tokio's default signal behaviour (we don't re-arm
+    // the handler), which gives the user an "abort harder" escape
+    // if the first cancel didn't unstick whatever was running.
+    let turn_cancel = CancellationToken::new();
+    let cancel_for_signal = turn_cancel.clone();
+    let ctrl_c_handler = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        cancel_for_signal.cancel();
+    });
+    let prompt_result = agent.prompt(prompt_text, turn_cancel).await;
+    // Stop listening for SIGINT before we return so a stray Ctrl+C
+    // during shutdown doesn't trigger a phantom cancel.
+    ctrl_c_handler.abort();
     match prompt_result {
         Ok(()) => {}
+        Err(TurnError::Aborted) => {
+            return Err(anyhow!("agent run cancelled (sigint)"));
+        }
         Err(TurnError::Recoverable(err)) => {
             return Err(err.context("agent run failed (recoverable)"));
         }

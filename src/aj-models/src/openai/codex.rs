@@ -44,7 +44,9 @@ use crate::errors::{classify_openai_error, parse_retry_after, transport_error};
 use crate::oauth::openai::extract_account_id;
 use crate::provider::Provider;
 use crate::registry::ModelInfo;
-use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream, ErrorReason};
+use crate::streaming::{
+    AssistantMessageEvent, AssistantMessageEventStream, ErrorReason, SelectOutcome, select_cancel,
+};
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantError, AssistantMessage, Context, ErrorCategory,
@@ -53,8 +55,8 @@ use crate::types::{
 };
 
 use super::responses::{
-    CostMultiplierFn, StreamState, append_assistant_message, convert_messages, error_from_code,
-    map_reasoning_effort, map_service_tier, parse_assistant_input_items_with_api,
+    CostMultiplierFn, StreamState, append_assistant_message, convert_messages, empty_partial,
+    error_from_code, map_reasoning_effort, map_service_tier, parse_assistant_input_items_with_api,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
@@ -157,6 +159,15 @@ async fn run_stream_inner(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> Result<(), AssistantError> {
+    if let Some(token) = options.cancel.as_ref()
+        && token.is_cancelled()
+    {
+        producer.push(AssistantMessageEvent::aborted(empty_partial(
+            API_NAME, model,
+        )));
+        return Ok(());
+    }
+
     let access_token = options.resolve_api_key().await.map_err(|err| {
         AssistantError::new(
             ErrorCategory::Auth,
@@ -205,10 +216,20 @@ async fn run_stream_inner(
         }
     }
 
-    let mut sse = client
-        .codex_responses_stream(request)
-        .await
-        .map_err(|err| classify_codex_client_error(&err))?;
+    let mut sse = match select_cancel(
+        options.cancel.as_ref(),
+        client.codex_responses_stream(request),
+    )
+    .await
+    {
+        SelectOutcome::Ready(res) => res.map_err(|err| classify_codex_client_error(&err))?,
+        SelectOutcome::Cancelled => {
+            producer.push(AssistantMessageEvent::aborted(empty_partial(
+                API_NAME, model,
+            )));
+            return Ok(());
+        }
+    };
 
     let mut state = StreamState::new_with(
         API_NAME,
@@ -217,9 +238,9 @@ async fn run_stream_inner(
         CODEX_COST_MULTIPLIER,
     );
 
-    while let Some(event) = sse.next().await {
-        match event {
-            Ok(ev) => match normalize_codex_event(ev)? {
+    loop {
+        match select_cancel(options.cancel.as_ref(), sse.next()).await {
+            SelectOutcome::Ready(Some(Ok(ev))) => match normalize_codex_event(ev)? {
                 NormalizedEvent::Forward(ev) => {
                     for out in state.process(ev) {
                         producer.push(out);
@@ -236,7 +257,12 @@ async fn run_stream_inner(
                     break;
                 }
             },
-            Err(err) => return Err(classify_codex_client_error(&err)),
+            SelectOutcome::Ready(Some(Err(err))) => return Err(classify_codex_client_error(&err)),
+            SelectOutcome::Ready(None) => break,
+            SelectOutcome::Cancelled => {
+                producer.push(AssistantMessageEvent::aborted(state.partial().clone()));
+                return Ok(());
+            }
         }
     }
 

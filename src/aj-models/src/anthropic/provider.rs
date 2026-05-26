@@ -26,7 +26,8 @@ use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, supports_adaptive_thinking, supports_xhigh};
 use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
+    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
+    select_cancel,
 };
 use crate::transform::transform_messages;
 use crate::types::{
@@ -122,6 +123,13 @@ async fn run_stream(
 /// failures (so the outer task can surface them as a uniform `Error`
 /// event) and `Ok(())` once the SSE stream has been fully consumed
 /// and a terminal event has been pushed.
+///
+/// Honours [`StreamOptions::cancel`] at three checkpoints: before the
+/// HTTP handshake, around the handshake `await`, and around every
+/// `sse.next()` poll. On cancel the running [`StreamState::partial`]
+/// is projected onto an
+/// [`AssistantMessageEvent::aborted`] event so consumers see a
+/// normal terminal event carrying whatever deltas had arrived.
 async fn run_stream_inner(
     producer: &AssistantMessageEventStream,
     model: &ModelInfo,
@@ -129,6 +137,14 @@ async fn run_stream_inner(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> Result<(), AssistantError> {
+    // Fast-path: caller already cancelled before we did any work.
+    if let Some(token) = options.cancel.as_ref()
+        && token.is_cancelled()
+    {
+        producer.push(AssistantMessageEvent::aborted(empty_partial(model)));
+        return Ok(());
+    }
+
     let api_key = options.resolve_api_key().await.map_err(|err| {
         // Missing credentials before any HTTP call: surface as Auth so
         // callers and the agent's retry layer see the right category.
@@ -145,22 +161,38 @@ async fn run_stream_inner(
         }
     }
 
-    let mut sse = client
-        .messages_stream(request)
-        .await
-        .map_err(|err| classify_client_error(&err))?;
+    // HTTP handshake. Wrap in a select so a cancel during request
+    // setup tears down the connect / TLS handshake instead of
+    // waiting for it to finish.
+    let mut sse =
+        match select_cancel(options.cancel.as_ref(), client.messages_stream(request)).await {
+            SelectOutcome::Ready(res) => res.map_err(|err| classify_client_error(&err))?,
+            SelectOutcome::Cancelled => {
+                producer.push(AssistantMessageEvent::aborted(empty_partial(model)));
+                return Ok(());
+            }
+        };
 
     let mut state = StreamState::new(model);
     let mut saw_terminal = false;
 
-    while let Some(event) = sse.next().await {
-        let outcome = state.process(event);
-        for ev in outcome.events {
-            producer.push(ev);
-        }
-        if outcome.terminal {
-            saw_terminal = true;
-            break;
+    loop {
+        match select_cancel(options.cancel.as_ref(), sse.next()).await {
+            SelectOutcome::Ready(Some(event)) => {
+                let outcome = state.process(event);
+                for ev in outcome.events {
+                    producer.push(ev);
+                }
+                if outcome.terminal {
+                    saw_terminal = true;
+                    break;
+                }
+            }
+            SelectOutcome::Ready(None) => break,
+            SelectOutcome::Cancelled => {
+                producer.push(AssistantMessageEvent::aborted(state.partial.clone()));
+                return Ok(());
+            }
         }
     }
 
@@ -173,6 +205,17 @@ async fn run_stream_inner(
     let final_event = state.finalize();
     producer.push(final_event);
     Ok(())
+}
+
+/// Build a structurally-complete empty partial for this model. Used
+/// as the abort payload when cancellation fires before the SSE
+/// state machine has accumulated anything.
+fn empty_partial(model: &ModelInfo) -> AssistantMessage {
+    let mut partial = AssistantMessage::empty();
+    partial.api = API_NAME.to_string();
+    partial.provider = model.provider.clone();
+    partial.model = model.id.clone();
+    partial
 }
 
 // ---------------------------------------------------------------------------

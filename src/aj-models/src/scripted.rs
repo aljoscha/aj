@@ -41,7 +41,8 @@ pub mod demos;
 use crate::provider::Provider;
 use crate::registry::ModelInfo;
 use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
+    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
+    select_cancel,
 };
 use crate::types::{
     AssistantContent, AssistantError, AssistantMessage, Context, ErrorCategory,
@@ -210,11 +211,11 @@ impl Provider for ScriptedProvider {
         &self,
         model: &ModelInfo,
         _context: &Context,
-        _options: &StreamOptions,
+        options: &StreamOptions,
     ) -> AssistantMessageEventStream {
         let next = self.scripts.lock().unwrap().next();
         match next {
-            Some(script) => spawn_script(script, model.clone()),
+            Some(script) => spawn_script(script, model.clone(), options.cancel.clone()),
             None => match self.on_exhausted {
                 ExhaustedBehavior::Panic => {
                     panic!("ScriptedProvider exhausted: agent ran more inferences than scripted");
@@ -243,16 +244,41 @@ impl Provider for ScriptedProvider {
 
 /// Spawn a tokio task that drains `script` onto a fresh stream, honouring
 /// the per-step delays. Returns the consumer-side handle.
-fn spawn_script(script: ProviderScript, _model: ModelInfo) -> AssistantMessageEventStream {
+///
+/// When `cancel` is `Some`, the per-step sleep is `select!`-ed against
+/// the token so a `cancel()` aborts mid-delay; on cancel the task
+/// emits an [`AssistantMessageEvent::aborted`] terminal event carrying
+/// the partial captured from the last delivered step (or an empty
+/// partial when nothing has been delivered yet) before exiting.
+fn spawn_script(
+    script: ProviderScript,
+    model: ModelInfo,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
     tokio::spawn(async move {
         let mut saw_terminal = false;
+        let mut last_partial: Option<AssistantMessage> = None;
         for step in script.steps {
             if !step.delay.is_zero() {
-                tokio::time::sleep(step.delay).await;
+                match select_cancel(cancel.as_ref(), tokio::time::sleep(step.delay)).await {
+                    SelectOutcome::Ready(()) => {}
+                    SelectOutcome::Cancelled => {
+                        let partial = last_partial.clone().unwrap_or_else(|| {
+                            let mut m = AssistantMessage::empty();
+                            m.api = model.api.clone();
+                            m.provider = model.provider.clone();
+                            m.model = model.id.clone();
+                            m
+                        });
+                        producer.push(AssistantMessageEvent::aborted(partial));
+                        return;
+                    }
+                }
             }
             let is_terminal = step.event.is_terminal();
+            last_partial = Some(step.event.partial().clone());
             producer.push(step.event);
             if is_terminal {
                 saw_terminal = true;
@@ -825,6 +851,65 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], AssistantMessageEvent::Start { .. }));
         assert!(matches!(events[1], AssistantMessageEvent::Done { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_inter_event_delay_emits_aborted_terminal() {
+        // Drive a script with a long delay between Start and Done so we
+        // can cancel mid-flight and observe the aborted terminal.
+        let mut msg = AssistantMessage::empty();
+        msg.api = "scripted".into();
+        msg.provider = "scripted".into();
+        msg.model = "scripted-test".into();
+        msg.stop_reason = StopReason::Stop;
+
+        let script = ProviderScript::new()
+            .push_immediate(AssistantMessageEvent::Start {
+                partial: msg.clone(),
+            })
+            .push(
+                // Long enough that the cancel below races in well before
+                // this step gets delivered.
+                Duration::from_secs(60),
+                AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: msg.clone(),
+                },
+            );
+        let provider = ScriptedProvider::new(vec![script]);
+        let token = tokio_util::sync::CancellationToken::new();
+        let options = StreamOptions {
+            cancel: Some(token.clone()),
+            ..StreamOptions::default()
+        };
+        let stream = provider.stream(&fake_model(), &Context::new("system"), &options);
+
+        // Fire the cancel after the producer has had a chance to
+        // deliver the first (immediate) Start step and begin sleeping.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+        });
+
+        let events = collect_events(stream).await;
+        let last = events.last().expect("at least the aborted terminal");
+        assert!(
+            matches!(
+                last,
+                AssistantMessageEvent::Error {
+                    reason: ErrorReason::Aborted,
+                    ..
+                }
+            ),
+            "expected aborted terminal, got {last:?}"
+        );
+        if let AssistantMessageEvent::Error { error, .. } = last {
+            assert_eq!(error.stop_reason, StopReason::Aborted);
+            assert_eq!(
+                error.error.as_ref().map(|e| e.category),
+                Some(ErrorCategory::Aborted),
+            );
+        }
     }
 
     #[tokio::test]

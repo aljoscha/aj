@@ -229,6 +229,23 @@ impl Agent {
         self.bus = bus;
     }
 
+    /// Replace this agent's cancellation token.
+    ///
+    /// Used by [`SessionContextWrapper::spawn_agent`] to make a
+    /// sub-agent inherit a child token derived from the parent's
+    /// per `docs/aj-next-plan.md` §1.6, and by
+    /// [`Agent::prompt`] / [`Agent::continue_run`] /
+    /// [`Agent::run_single_turn`] to install the per-turn token the
+    /// binary owns and can `cancel()` from a different code path
+    /// (e.g. the TUI's Ctrl+C handler) without locking the agent.
+    ///
+    /// Idempotent. Must be called before the turn (or sub-agent
+    /// turn) starts; in-flight inferences continue with the token
+    /// they captured at the top of [`Self::execute_turn`].
+    pub fn set_cancellation(&mut self, token: CancellationToken) {
+        self.cancellation = token;
+    }
+
     /// Subscribe an async listener to the agent's internal event
     /// bus.
     ///
@@ -470,7 +487,25 @@ impl Agent {
     /// The whole call is bracketed by [`AgentEvent::AgentStart`] /
     /// [`AgentEvent::AgentEnd`] events tagged with this agent's id
     /// so listeners can scope nested transcripts.
-    pub async fn prompt(&mut self, message: String) -> Result<(), TurnError> {
+    ///
+    /// `cancel` is the per-turn [`CancellationToken`] the binary
+    /// fires from a different code path (e.g. Ctrl+C in the TUI)
+    /// to abort the in-flight turn. On cancellation `prompt`
+    /// emits a synthetic
+    /// `AssistantMessage { stop_reason: Aborted, ... }` `MessageEnd`
+    /// — plus `is_error: true` tool-result `MessageEnd`s for any
+    /// in-flight tool calls — and returns
+    /// [`TurnError::Aborted`]; the transcript is left internally
+    /// consistent so subsequent prompts work without manual repair.
+    /// Callers that don't need cancellation pass
+    /// [`CancellationToken::new()`] (a fresh token that's never
+    /// fired).
+    pub async fn prompt(
+        &mut self,
+        message: String,
+        cancel: CancellationToken,
+    ) -> Result<(), TurnError> {
+        self.cancellation = cancel;
         self.run_top_level_turn(Some(message)).await
     }
 
@@ -486,8 +521,9 @@ impl Agent {
     /// an invalid request and is treated as a fatal misuse here.
     ///
     /// Like [`Agent::prompt`], the call is bracketed by
-    /// [`AgentEvent::AgentStart`] / [`AgentEvent::AgentEnd`] events.
-    pub async fn continue_run(&mut self) -> Result<(), TurnError> {
+    /// [`AgentEvent::AgentStart`] / [`AgentEvent::AgentEnd`] events,
+    /// and `cancel` is honoured the same way.
+    pub async fn continue_run(&mut self, cancel: CancellationToken) -> Result<(), TurnError> {
         let last_is_user_or_tool_result = matches!(
             self.transcript.last().and_then(|m| m.as_wire()),
             Some(Message::User(_)) | Some(Message::ToolResult(_))
@@ -497,6 +533,7 @@ impl Agent {
                 "continue_run requires the transcript to end in a user-role message"
             )));
         }
+        self.cancellation = cancel;
         self.run_top_level_turn(None).await
     }
 
@@ -652,6 +689,28 @@ impl Agent {
     /// `aj_session::ConversationView` appends, one JSONL line per
     /// event, so the on-disk state stays at-most one event behind
     /// reality (see `docs/aj-next-plan.md` §2.3b).
+    ///
+    /// Cancellation is honoured at three checkpoints per
+    /// `docs/aj-next-plan.md` §1.8:
+    ///
+    /// 1. **Streaming inference.** The `response_stream.next()`
+    ///    poll is `select!`-ed against [`Self::cancellation`]; on
+    ///    cancel the running partial is projected onto a synthetic
+    ///    `AssistantMessage { stop_reason: Aborted }` and emitted
+    ///    through the normal `MessageUpdate` /  `MessageEnd`
+    ///    sequence so listeners see a clean shutdown.
+    /// 2. **Provider-side cancel.** The token also rides on
+    ///    [`SimpleStreamOptions::base.cancel`] so the provider's
+    ///    own SSE loop tears down the HTTP request and emits an
+    ///    `AssistantMessageEvent::Error { reason: Aborted }`
+    ///    terminal. Either path (1) or (2) wins the race; both
+    ///    end in `TurnError::Aborted`.
+    /// 3. **Tool execution.** Each `execute_tool().await` is
+    ///    `select!`-ed against the token. On cancel we synthesize
+    ///    `is_error: true` tool-result messages for the running
+    ///    tool *and* every remaining tool call in the batch so
+    ///    the transcript never carries a `tool_use` without a
+    ///    matching `tool_result`.
     async fn execute_turn(&mut self) -> Result<(), TurnError> {
         self.session_state.turn_counter += 1;
 
@@ -674,7 +733,18 @@ impl Agent {
         let mut retry_strategy = None;
 
         'outer: loop {
+            // Pre-iteration cancel check (cheap atomic). Lets us
+            // skip an inference when cancel fired between turns
+            // (e.g. while we were in the tool batch below).
+            if self.cancellation.is_cancelled() {
+                return Err(TurnError::Aborted);
+            }
+
             let mut response_stream = self.run_inference_streaming();
+            // Cheap clone — `CancellationToken` is `Arc`-backed and
+            // the same handle is shared with the provider task via
+            // `run_inference_streaming`'s `options.cancel`.
+            let cancel = self.cancellation.clone();
 
             // Bracket the streaming inference with `MessageStart` /
             // `MessageEnd` per `docs/aj-next-plan.md` §1.1.
@@ -698,73 +768,112 @@ impl Agent {
             // break out and stop polling.
             let mut final_message: Option<AssistantMessage> = None;
             let mut final_was_error = false;
+            // Running snapshot of the latest partial, used to
+            // synthesize the aborted terminal when our local
+            // `select!` wins the cancel race against the provider's
+            // own abort path.
+            let mut latest_partial = self.empty_assistant_message();
+            let mut aborted_during_stream = false;
 
-            while let Some(event) = response_stream.next().await {
-                // Capture the terminal frames before forwarding so we
-                // can break out of the loop with the finalized
-                // message. The forwarded `MessageUpdate` still flows
-                // through for every event so listeners see the
-                // complete streaming protocol per the spec.
-                match &event {
-                    AssistantMessageEvent::Done { message, .. } => {
-                        final_message = Some(message.clone());
-                        final_was_error = false;
+            loop {
+                tokio::select! {
+                    biased;
+
+                    // Cancel arm wins ties so a `cancel()` fired
+                    // between iterations always exits, even if the
+                    // provider has events queued.
+                    _ = cancel.cancelled() => {
+                        aborted_during_stream = true;
+                        break;
                     }
-                    AssistantMessageEvent::Error { error, .. } => {
-                        final_message = Some(error.clone());
-                        final_was_error = true;
+
+                    maybe_event = response_stream.next() => {
+                        let Some(event) = maybe_event else { break };
+
+                        // Capture the terminal frames before forwarding so we
+                        // can break out of the loop with the finalized
+                        // message. The forwarded `MessageUpdate` still flows
+                        // through for every event so listeners see the
+                        // complete streaming protocol per the spec.
+                        match &event {
+                            AssistantMessageEvent::Done { message, .. } => {
+                                final_message = Some(message.clone());
+                                final_was_error = false;
+                            }
+                            AssistantMessageEvent::Error { error, .. } => {
+                                final_message = Some(error.clone());
+                                final_was_error = true;
+                            }
+                            _ => {}
+                        }
+                        latest_partial = event.partial().clone();
+
+                        // Forward the provider event as a `MessageUpdate` on
+                        // the bus. Renderers consume the inner
+                        // `AssistantMessageEvent` directly (drives text /
+                        // thinking / tool-call blocks); persistence listeners
+                        // can ignore these since the finalized
+                        // `MessageEnd` event below carries the finalized
+                        // after the stream terminates.
+                        let partial = event.partial().clone();
+                        let is_terminal = event.is_terminal();
+                        self.bus
+                            .emit(AgentEvent::MessageUpdate {
+                                agent_id: self.agent_id,
+                                message: AgentMessage::wire(Message::Assistant(partial)),
+                                event,
+                            })
+                            .await
+                            .map_err(TurnError::Fatal)?;
+
+                        if is_terminal {
+                            break;
+                        }
                     }
-                    _ => {}
-                }
-
-                // Forward the provider event as a `MessageUpdate` on
-                // the bus. Renderers consume the inner
-                // `AssistantMessageEvent` directly (drives text /
-                // thinking / tool-call blocks); persistence listeners
-                // can ignore these since the finalized
-                // `MessageEnd` event below carries the finalized
-                // after the stream terminates.
-                let partial = event.partial().clone();
-                self.bus
-                    .emit(AgentEvent::MessageUpdate {
-                        agent_id: self.agent_id,
-                        message: AgentMessage::wire(Message::Assistant(partial)),
-                        event: event.clone(),
-                    })
-                    .await
-                    .map_err(TurnError::Fatal)?;
-
-                if matches!(
-                    event,
-                    AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
-                ) {
-                    break;
                 }
             }
 
-            // Drain any trailing events the producer queued after the
-            // terminal one (the stream contract drops them, but the
-            // explicit drop here frees the channel sooner) and fall
-            // back to `result()` if we never observed a terminal
-            // event in the loop above (channel closed silently —
-            // `result()` then synthesizes a transient error).
-            let final_message = match final_message {
-                Some(m) => m,
-                None => {
-                    // The stream ended without emitting Done / Error;
-                    // pull the synthesized terminal from the
-                    // side-channel.
-                    final_was_error = true;
-                    response_stream.result().await
+            // Resolve the terminal message. Three cases:
+            //
+            // 1. We saw a Done/Error event — use it directly.
+            // 2. The stream ended without a terminal (channel closed
+            //    silently) — fall back to `result()`, which
+            //    synthesizes a transient-flavoured error.
+            // 3. Our `select!` cancel arm fired — synthesize the
+            //    aborted terminal from `latest_partial` and forward
+            //    the matching `MessageUpdate` so streaming listeners
+            //    see the terminal event.
+            let final_message = if aborted_during_stream {
+                let aborted_event = AssistantMessageEvent::aborted(latest_partial.clone());
+                let aborted_message = aborted_event.partial().clone();
+                self.bus
+                    .emit(AgentEvent::MessageUpdate {
+                        agent_id: self.agent_id,
+                        message: AgentMessage::wire(Message::Assistant(aborted_message.clone())),
+                        event: aborted_event,
+                    })
+                    .await
+                    .map_err(TurnError::Fatal)?;
+                aborted_message
+            } else {
+                match final_message {
+                    Some(m) => m,
+                    None => {
+                        // The stream ended without emitting Done / Error;
+                        // pull the synthesized terminal from the
+                        // side-channel.
+                        final_was_error = true;
+                        response_stream.result().await
+                    }
                 }
             };
             drop(response_stream);
 
             // Emit `MessageEnd` so renderers can finalize their
             // assistant slot (close in-flight blocks, mark the turn
-            // complete). Fires for both success and error
-            // terminations; the wire-level error / retry handling
-            // below decides whether to consume the message or retry.
+            // complete). Fires for success, error, and abort
+            // terminations alike; the abort branches below consume
+            // the message before the retry/recoverable handling.
             self.bus
                 .emit(AgentEvent::MessageEnd {
                     agent_id: self.agent_id,
@@ -773,8 +882,36 @@ impl Agent {
                 .await
                 .map_err(TurnError::Fatal)?;
 
+            if aborted_during_stream {
+                // Push the aborted partial onto the transcript so
+                // resume sees the same shape the live session
+                // did. The wire-transform layer
+                // (`aj_models::transform::transform_messages`, rule
+                // 5) drops `stop_reason == Aborted` assistant
+                // messages — and their orphaned `tool_call` IDs —
+                // before sending the next inference, so the model
+                // never sees the half-formed turn.
+                self.transcript
+                    .push(AgentMessage::wire(Message::Assistant(final_message)));
+                return Err(TurnError::Aborted);
+            }
+
             if final_was_error {
                 let assistant_err = final_message.error.clone();
+                // Provider-side cancellation (Phase 1 in the model
+                // layer) surfaces here as a terminal `Error` event
+                // with `category == Aborted`. Route it onto the
+                // same `TurnError::Aborted` path the streaming-side
+                // `select!` uses so callers see one cancellation
+                // shape regardless of which side won the race.
+                let is_aborted_err = assistant_err
+                    .as_ref()
+                    .is_some_and(|e| e.category == ErrorCategory::Aborted);
+                if is_aborted_err {
+                    self.transcript
+                        .push(AgentMessage::wire(Message::Assistant(final_message)));
+                    return Err(TurnError::Aborted);
+                }
                 // Retry strictly on `Overloaded` to match the legacy
                 // agent's behavior; other retryable categories
                 // (RateLimit, Transient) bubble up as recoverable
@@ -811,7 +948,14 @@ impl Agent {
                             })
                             .await
                             .map_err(TurnError::Fatal)?;
-                        tokio::time::sleep(retry_sleep).await;
+                        // Retry sleep is `select!`-ed against cancel
+                        // so a Ctrl+C during the backoff window
+                        // doesn't have to wait out the timer.
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(TurnError::Aborted),
+                            _ = tokio::time::sleep(retry_sleep) => {}
+                        }
                         continue 'outer;
                     }
                 }
@@ -879,7 +1023,8 @@ impl Agent {
 
             // Execute tool calls if any
             if has_tool_use {
-                for (tool_id, tool_name, tool_input) in tool_calls {
+                let mut pending = tool_calls.into_iter();
+                while let Some((tool_id, tool_name, tool_input)) = pending.next() {
                     // Mirror the start of every tool invocation on the
                     // bus before we do any work — listeners that render
                     // a "running…" placeholder rely on seeing this
@@ -919,10 +1064,12 @@ impl Agent {
                     };
 
                     // Run the tool unless the before-hook short-
-                    // circuited it. Success and recoverable error
-                    // both come back as a [`ToolOutcome`] the rest
-                    // of the loop projects onto the unified
-                    // `Message::ToolResult` shape.
+                    // circuited it, racing against cancel. On cancel
+                    // we drop the tool future (bash tears down its
+                    // process tree; other tools just exit) and
+                    // synthesize a cancelled outcome so the
+                    // transcript still pairs `tool_use` with
+                    // `tool_result`.
                     //
                     // Tool-input parse failures surface as a
                     // [`AssistantContent::ToolCall`] with
@@ -933,27 +1080,36 @@ impl Agent {
                     // `is_error: true` so the failure rides on the
                     // same `Message::ToolResult` shape every other
                     // tool error does.
-                    let mut outcome = if let Some(outcome) = short_circuit_outcome {
-                        outcome
+                    let outcome_or_cancel: Option<ToolOutcome> = if let Some(outcome) =
+                        short_circuit_outcome
+                    {
+                        Some(outcome)
                     } else {
-                        match self
-                            .execute_tool(&tool_id, &tool_name, tool_input.clone())
-                            .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(err) => {
-                                let body = err.to_string();
-                                ToolOutcome {
-                                    content: vec![UserContent::text(format!("{err}"))],
-                                    details: ToolDetails::Text {
-                                        summary: format!("{tool_name}: error"),
-                                        body,
-                                    },
-                                    is_error: true,
-                                }
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => None,
+                            res = self.execute_tool(&tool_id, &tool_name, tool_input.clone()) => {
+                                Some(match res {
+                                    Ok(outcome) => outcome,
+                                    Err(err) => {
+                                        let body = err.to_string();
+                                        ToolOutcome {
+                                            content: vec![UserContent::text(format!("{err}"))],
+                                            details: ToolDetails::Text {
+                                                summary: format!("{tool_name}: error"),
+                                                body,
+                                            },
+                                            is_error: true,
+                                        }
+                                    }
+                                })
                             }
                         }
                     };
+
+                    let aborted_this_tool = outcome_or_cancel.is_none();
+                    let mut outcome =
+                        outcome_or_cancel.unwrap_or_else(|| cancelled_tool_outcome(&tool_name));
 
                     // Consult the after-tool-call hook (if installed).
                     // The hook can rewrite `outcome.content`,
@@ -961,61 +1117,49 @@ impl Agent {
                     // the bus event and the wire projection fire.
                     // Same `Arc` clone dance as the before-hook so the
                     // `&mut outcome` borrow stays clean.
-                    if let Some(hook) = self.after_tool_call.clone() {
-                        let ctx = hooks::ToolCallContext {
-                            call_id: &tool_id,
-                            tool_name: &tool_name,
-                        };
-                        hook(ctx, &mut outcome).await;
+                    //
+                    // We skip the hook on cancellation so a misbehaving
+                    // hook can't swallow the abort: the cancelled
+                    // outcome lands verbatim, the matching `TurnError::Aborted`
+                    // is returned below.
+                    if !aborted_this_tool {
+                        if let Some(hook) = self.after_tool_call.clone() {
+                            let ctx = hooks::ToolCallContext {
+                                call_id: &tool_id,
+                                tool_name: &tool_name,
+                            };
+                            hook(ctx, &mut outcome).await;
+                        }
                     }
 
-                    // Project the outcome onto a unified
-                    // [`Message::ToolResult`] entry. The structured
-                    // `details` ride twice: once on the per-call
-                    // [`AgentEvent::ToolExecutionEnd`] event below
-                    // (for live renderers) and once as the
-                    // `details: Option<Value>` field on the
-                    // [`ToolResultMessage`] we append to the
-                    // transcript and emit through `MessageEnd` (for
-                    // resumed sessions and persistence). The latter
-                    // is serialized via `serde_json::to_value` so
-                    // it survives the on-disk JSONL round-trip.
-                    let details_value = serde_json::to_value(&outcome.details).ok();
-                    let tool_result = ToolResultMessage {
-                        tool_call_id: tool_id.clone(),
-                        tool_name: tool_name.clone(),
-                        content: outcome.content.clone(),
-                        details: details_value,
-                        is_error: outcome.is_error,
-                        timestamp: 0,
-                    };
-                    let tool_result_message = AgentMessage::wire(Message::ToolResult(tool_result));
-                    self.transcript.push(tool_result_message.clone());
-                    self.bus
-                        .emit(AgentEvent::MessageStart {
-                            agent_id: self.agent_id,
-                            message: tool_result_message.clone(),
-                        })
-                        .await
-                        .map_err(TurnError::Fatal)?;
-                    self.bus
-                        .emit(AgentEvent::MessageEnd {
-                            agent_id: self.agent_id,
-                            message: tool_result_message,
-                        })
-                        .await
-                        .map_err(TurnError::Fatal)?;
+                    self.finalize_tool_result(&tool_id, &tool_name, outcome)
+                        .await?;
 
-                    self.bus
-                        .emit(AgentEvent::ToolExecutionEnd {
-                            agent_id: self.agent_id,
-                            call_id: tool_id.clone(),
-                            tool: tool_name.clone(),
-                            result: outcome.details,
-                            is_error: outcome.is_error,
-                        })
-                        .await
-                        .map_err(TurnError::Fatal)?;
+                    if aborted_this_tool {
+                        // Synthesize matching `tool_result` entries
+                        // for every still-pending tool call so the
+                        // transcript stays internally consistent —
+                        // no dangling `tool_use` without a matching
+                        // `tool_result`. Each emits its own
+                        // ToolExecutionStart / MessageStart /
+                        // MessageEnd / ToolExecutionEnd bracket so
+                        // listeners get a uniform shape.
+                        for (pending_id, pending_name, pending_input) in pending {
+                            self.bus
+                                .emit(AgentEvent::ToolExecutionStart {
+                                    agent_id: self.agent_id,
+                                    call_id: pending_id.clone(),
+                                    tool: pending_name.clone(),
+                                    args: pending_input,
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
+                            let cancelled = cancelled_tool_outcome(&pending_name);
+                            self.finalize_tool_result(&pending_id, &pending_name, cancelled)
+                                .await?;
+                        }
+                        return Err(TurnError::Aborted);
+                    }
                 }
 
                 // Consult the should-stop-after-turn hook (if
@@ -1040,6 +1184,68 @@ impl Agent {
             }
         }
 
+        Ok(())
+    }
+
+    /// Project a finalized [`ToolOutcome`] onto a unified
+    /// [`Message::ToolResult`] entry, append it to the transcript,
+    /// and emit the matching `MessageStart` / `MessageEnd` /
+    /// `ToolExecutionEnd` bracket on the bus. Shared between the
+    /// success and cancellation paths of [`Self::execute_turn`] so
+    /// the persisted shape is identical regardless of why the
+    /// outcome was produced.
+    async fn finalize_tool_result(
+        &mut self,
+        tool_id: &str,
+        tool_name: &str,
+        outcome: ToolOutcome,
+    ) -> Result<(), TurnError> {
+        // Project the outcome onto a unified
+        // [`Message::ToolResult`] entry. The structured `details`
+        // ride twice: once on the per-call
+        // [`AgentEvent::ToolExecutionEnd`] event below (for live
+        // renderers) and once as the `details: Option<Value>` field
+        // on the [`ToolResultMessage`] we append to the transcript
+        // and emit through `MessageEnd` (for resumed sessions and
+        // persistence). The latter is serialized via
+        // `serde_json::to_value` so it survives the on-disk JSONL
+        // round-trip.
+        let details_value = serde_json::to_value(&outcome.details).ok();
+        let tool_result = ToolResultMessage {
+            tool_call_id: tool_id.to_string(),
+            tool_name: tool_name.to_string(),
+            content: outcome.content.clone(),
+            details: details_value,
+            is_error: outcome.is_error,
+            timestamp: 0,
+        };
+        let tool_result_message = AgentMessage::wire(Message::ToolResult(tool_result));
+        self.transcript.push(tool_result_message.clone());
+        self.bus
+            .emit(AgentEvent::MessageStart {
+                agent_id: self.agent_id,
+                message: tool_result_message.clone(),
+            })
+            .await
+            .map_err(TurnError::Fatal)?;
+        self.bus
+            .emit(AgentEvent::MessageEnd {
+                agent_id: self.agent_id,
+                message: tool_result_message,
+            })
+            .await
+            .map_err(TurnError::Fatal)?;
+
+        self.bus
+            .emit(AgentEvent::ToolExecutionEnd {
+                agent_id: self.agent_id,
+                call_id: tool_id.to_string(),
+                tool: tool_name.to_string(),
+                result: outcome.details,
+                is_error: outcome.is_error,
+            })
+            .await
+            .map_err(TurnError::Fatal)?;
         Ok(())
     }
 
@@ -1110,8 +1316,20 @@ impl Agent {
             tools,
         };
 
+        // Thread the agent's per-turn cancellation token into the
+        // provider so a `cancel()` tears down the in-flight HTTP
+        // request and SSE loop instead of waiting for the response
+        // to finish. The provider emits an
+        // `AssistantMessageEvent::Error { reason: Aborted, ... }`
+        // terminal on cancel — see [`AssistantMessageEvent::aborted`].
+        // The same token is also `select!`-ed in `execute_turn` so
+        // the agent stops polling the moment cancel fires, regardless
+        // of how quickly the provider task winds down.
+        let mut base = self.stream_options.clone();
+        base.cancel = Some(self.cancellation.clone());
+
         let options = SimpleStreamOptions {
-            base: self.stream_options.clone(),
+            base,
             reasoning: thinking.as_ref().map(thinking_config_to_level),
         };
 
@@ -1413,6 +1631,12 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // own bus and the binary's bridge listener never sees
             // its activity.
             sub_agent.set_bus(self.parent_bus.clone());
+            // Share the parent's cancellation token (via a
+            // `child_token` so a future per-sub-agent cancel is
+            // possible) per `docs/aj-next-plan.md` §1.6, so a
+            // top-level `cancel()` reaches the sub-agent's
+            // streaming inference and tools.
+            sub_agent.set_cancellation(self.cancellation.child_token());
 
             let result = sub_agent.run_single_turn(task).await;
 
@@ -1506,6 +1730,10 @@ fn scan_dangling_tool_uses(transcript: &[AgentMessage]) -> std::collections::Has
 /// rephrase, rather than aborting the program. `Fatal` errors
 /// (listener-write failures, internal invariant violations) bubble
 /// out so the user gets a clean exit instead of silently looping.
+/// `Aborted` mirrors `Recoverable` from the binary's perspective —
+/// the session stays alive and the user can re-prompt — but
+/// distinguishes "the user cancelled this turn" from "the model
+/// returned an error", per `docs/aj-next-plan.md` §1.8.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
     /// An ephemeral error encountered while talking to the model.
@@ -1518,6 +1746,15 @@ pub enum TurnError {
     /// Bubble out to the top level.
     #[error(transparent)]
     Fatal(anyhow::Error),
+    /// The current turn was cancelled via the agent's
+    /// [`CancellationToken`]. Before returning the agent has already
+    /// emitted the synthetic
+    /// `AssistantMessage { stop_reason: Aborted }` `MessageEnd` and
+    /// any `is_error: true` tool-result `MessageEnd`s needed to keep
+    /// the transcript internally consistent, so callers can treat
+    /// this exactly like `Recoverable` and continue the session.
+    #[error("turn aborted by client")]
+    Aborted,
 }
 
 impl From<anyhow::Error> for TurnError {
@@ -1559,6 +1796,25 @@ fn accumulate_usage(acc: &mut Usage, other: &Usage) {
     acc.cost.total += other.cost.total;
 }
 
+/// Build the canonical `is_error: true` [`ToolOutcome`] used when a
+/// tool's `execute()` future is cancelled mid-flight, or when a
+/// later tool in the same batch never got a chance to start. The
+/// text body matches `bash`'s "Command cancelled" line so renderers
+/// don't have to special-case the agent's synth vs a tool's own
+/// cancel report; the structured `details` carry the same string
+/// for persistence.
+fn cancelled_tool_outcome(tool_name: &str) -> ToolOutcome {
+    let body = format!("{tool_name}: cancelled by user");
+    ToolOutcome {
+        content: vec![UserContent::text(body.clone())],
+        details: ToolDetails::Text {
+            summary: format!("{tool_name}: cancelled"),
+            body,
+        },
+        is_error: true,
+    }
+}
+
 #[cfg(test)]
 mod event_protocol_tests {
     //! Snapshot the event protocol the agent emits on its bus.
@@ -1591,6 +1847,7 @@ mod event_protocol_tests {
         ErasedToolDefinition, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
     };
     use crate::Agent;
+    use tokio_util::sync::CancellationToken;
 
     /// Trivial tool that returns a fixed string. Implements the
     /// [`ToolDefinition`] trait so the test exercises the same
@@ -1722,6 +1979,32 @@ mod event_protocol_tests {
                 partial: message.clone(),
             },
             AssistantMessageEvent::Done { reason, message },
+        ]
+    }
+
+    /// Build a script that simulates a provider acknowledging cancellation
+    /// by emitting an `Error { reason: Aborted, ... }` terminal carrying a
+    /// partial message with `stop_reason = Aborted` and
+    /// `error.category = Aborted`. Mirrors the actual provider behaviour
+    /// when `StreamOptions::cancel` fires mid-stream so the agent's
+    /// error-category branch in `execute_turn` sees the same shape it
+    /// does in production.
+    fn aborted_script(mut partial: AssistantMessage) -> Vec<AssistantMessageEvent> {
+        use aj_models::streaming::ErrorReason;
+        use aj_models::types::{AssistantError, ErrorCategory};
+        partial.stop_reason = StopReason::Aborted;
+        partial.error = Some(AssistantError::new(
+            ErrorCategory::Aborted,
+            "client cancelled the request",
+        ));
+        vec![
+            AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            },
+            AssistantMessageEvent::Error {
+                reason: ErrorReason::Aborted,
+                error: partial,
+            },
         ]
     }
 
@@ -2214,7 +2497,7 @@ mod event_protocol_tests {
         }));
 
         agent
-            .prompt("hello agent".to_string())
+            .prompt("hello agent".to_string(), CancellationToken::new())
             .await
             .expect("prompt");
 
@@ -2289,7 +2572,10 @@ mod event_protocol_tests {
             recorded_clone.lock().unwrap().push(label(event));
         }));
 
-        agent.continue_run().await.expect("continue_run");
+        agent
+            .continue_run(CancellationToken::new())
+            .await
+            .expect("continue_run");
 
         let events = recorded.lock().unwrap().clone();
         assert_eq!(
@@ -2349,7 +2635,7 @@ mod event_protocol_tests {
         ))]);
 
         let err = agent
-            .continue_run()
+            .continue_run(CancellationToken::new())
             .await
             .expect_err("continue_run must reject assistant-role last message");
         assert!(
@@ -2366,13 +2652,198 @@ mod event_protocol_tests {
         let mut agent = build_agent(Vec::new(), Vec::new());
 
         let err = agent
-            .continue_run()
+            .continue_run(CancellationToken::new())
             .await
             .expect_err("continue_run must reject empty transcript");
         assert!(
             matches!(err, crate::TurnError::Fatal(_)),
             "expected Fatal error, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_returns_aborted_on_provider_side_cancel() {
+        // The provider emits an `Error { reason: Aborted, ... }`
+        // terminal (mirroring what the real providers do when their
+        // own `select_cancel` arm fires). The agent should observe
+        // the `ErrorCategory::Aborted` and return `TurnError::Aborted`
+        // rather than the generic `TurnError::Recoverable` it uses
+        // for other errors.
+        //
+        // This is the "provider won the cancel race" half of the
+        // contract; the agent-side `select!` on cancel is covered
+        // separately.
+        let scripts = vec![aborted_script(finalize_text(""))];
+
+        let mut agent = build_agent(scripts, Vec::new());
+        let err = agent
+            .prompt("hello".to_string(), CancellationToken::new())
+            .await
+            .expect_err("aborted-flavoured terminal should bubble up");
+        assert!(
+            matches!(err, crate::TurnError::Aborted),
+            "expected TurnError::Aborted, got: {err:?}"
+        );
+
+        // Transcript invariant: the aborted assistant message is
+        // pushed so resume sees the same shape the live session
+        // did, even though `transform_messages` rule 5 drops it
+        // before the next inference.
+        let messages = agent.messages();
+        assert!(matches!(
+            messages.last().and_then(|m| m.as_wire()),
+            Some(Message::Assistant(a)) if a.stop_reason == StopReason::Aborted
+        ));
+    }
+
+    #[tokio::test]
+    async fn prompt_returns_aborted_when_token_fired_before_call() {
+        // Pre-cancelling the token before calling `prompt` should
+        // short-circuit through the pre-iteration check in
+        // `execute_turn` — no inference runs, no events emitted past
+        // the lifecycle bracket, the call returns `Aborted`.
+        //
+        // We script one inference defensively; if the agent ever
+        // actually polls the provider (regression: forgot to honour
+        // the pre-iteration cancel check), the scripted provider's
+        // strict mode would still let the test pass since the
+        // script exists — so we additionally assert the recorded
+        // event sequence never enters the `MessageStart Assistant`
+        // phase.
+        let scripts = vec![finalize_script(finalize_text("should not run"))];
+        let mut agent = build_agent(scripts, Vec::new());
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = agent
+            .prompt("hello".to_string(), token)
+            .await
+            .expect_err("pre-cancelled token must abort the turn");
+        assert!(
+            matches!(err, crate::TurnError::Aborted),
+            "expected TurnError::Aborted, got: {err:?}"
+        );
+
+        let events = recorded.lock().unwrap().clone();
+        let saw_assistant_start = events.iter().any(|ev| {
+            matches!(
+                ev,
+                EventLabel::Message {
+                    phase: "start",
+                    kind: "Assistant",
+                    ..
+                }
+            )
+        });
+        assert!(
+            !saw_assistant_start,
+            "pre-cancelled prompt must not open an assistant slot, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_pushes_aborted_partial_and_allows_followup() {
+        // End-to-end smoke test for the §1.8 cancellation invariant:
+        // firing the token mid-stream should leave the transcript in
+        // a shape that lets a second `prompt` call succeed without
+        // any manual repair. We use a scripted provider whose first
+        // step is an immediate `Start` and whose second step is
+        // gated by a long delay, then cancel the token shortly after
+        // launching the prompt. The follow-up turn uses a normal
+        // scripted Done so we can verify the agent is still healthy.
+        use aj_models::scripted::ProviderScript;
+
+        let mut partial = AssistantMessage::empty();
+        partial.api = SCRIPT_API.to_string();
+        partial.provider = SCRIPT_PROVIDER.to_string();
+        partial.model = SCRIPT_MODEL.to_string();
+
+        let mut final_msg = partial.clone();
+        final_msg.stop_reason = StopReason::Stop;
+
+        let slow_script = ProviderScript::new()
+            .push_immediate(AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            })
+            // Long enough that the cancel races in before this lands.
+            .push(
+                std::time::Duration::from_secs(60),
+                AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: final_msg,
+                },
+            );
+        let followup_script =
+            ProviderScript::from_events(finalize_script(finalize_text("followup ok")));
+
+        let provider: Arc<dyn Provider> = Arc::new(
+            ScriptedProvider::new(vec![slow_script, followup_script])
+                .on_exhausted(ExhaustedBehavior::Panic),
+        );
+        let model_info = Arc::new(scripted_model_info());
+        let env = empty_env(std::env::temp_dir());
+        let mut agent = Agent::with_provider(
+            env,
+            "irrelevant",
+            Vec::new(),
+            Vec::new(),
+            provider,
+            model_info,
+            StreamOptions::default(),
+            None,
+        );
+        agent.set_assembled_system_prompt("test system prompt".to_string());
+
+        let cancel = CancellationToken::new();
+        let cancel_for_fire = cancel.clone();
+        let fire_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_for_fire.cancel();
+        });
+
+        let err = agent
+            .prompt("first".to_string(), cancel)
+            .await
+            .expect_err("mid-stream cancel should abort the turn");
+        fire_handle.await.expect("cancel firer joined");
+        assert!(
+            matches!(err, crate::TurnError::Aborted),
+            "expected TurnError::Aborted, got: {err:?}"
+        );
+
+        // Transcript invariant: ends in an `Aborted`-flavoured
+        // assistant message paired with the user prompt. No
+        // dangling tool calls (the partial had none).
+        let messages = agent.messages();
+        let kinds: Vec<&'static str> = messages.iter().map(agent_message_kind_label).collect();
+        assert_eq!(
+            kinds,
+            vec!["User", "Assistant"],
+            "transcript should be [user, aborted-assistant] after cancel"
+        );
+        let last_assistant = match messages.last().and_then(|m| m.as_wire()) {
+            Some(Message::Assistant(a)) => a,
+            _ => panic!("expected trailing assistant message"),
+        };
+        assert_eq!(last_assistant.stop_reason, StopReason::Aborted);
+
+        // Follow-up prompt with a fresh (un-fired) cancel token
+        // succeeds — proves the aborted message didn't poison the
+        // agent's state. `transform_messages` rule 5 drops the
+        // aborted assistant before the next inference, so the
+        // scripted provider sees only the new user message and
+        // responds normally.
+        agent
+            .prompt("second".to_string(), CancellationToken::new())
+            .await
+            .expect("follow-up prompt should succeed");
     }
 
     #[test]
