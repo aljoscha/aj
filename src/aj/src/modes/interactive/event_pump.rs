@@ -32,9 +32,11 @@ use crate::config::theme::ChatTheme;
 use crate::modes::interactive::components::assistant_message::{
     AssistantMessageComponent, BlockKind,
 };
+use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::loader_status::LoaderStatus;
 use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
 use crate::modes::interactive::components::user_message::UserMessageComponent;
+use crate::modes::interactive::footer_data::FooterData;
 use crate::modes::interactive::layout::SlotIndex;
 
 /// Translates [`AgentEvent`]s into TUI mutations.
@@ -83,6 +85,14 @@ pub struct EventPump {
     /// `aj.tools.expand` keybinding; defaults to `false` so the
     /// scrollback stays compact across long sessions.
     tools_expanded: bool,
+    /// Snapshot fed to the [`Footer`] component's context-usage
+    /// indicator. Updated from main-agent
+    /// [`AgentEvent::TurnUsage`] events and on model swaps; the
+    /// pump pushes a fresh view into the footer after each
+    /// mutation. Sub-agent turns are tracked through the
+    /// scrollback row only and do not move the main footer (their
+    /// context windows are independent).
+    footer_data: FooterData,
 }
 
 impl EventPump {
@@ -96,7 +106,17 @@ impl EventPump {
     /// initial mode for tool-output bubbles; today the host
     /// always starts collapsed and the user flips it at runtime
     /// via [`Self::set_tools_expanded`].
-    pub fn new(theme: ChatTheme, hide_thinking_block: bool, tools_expanded: bool) -> Self {
+    ///
+    /// `context_window` seeds the footer's context-usage
+    /// denominator (in tokens). Pass `agent.model_info().context_window`;
+    /// keep it in sync across model swaps via
+    /// [`Self::set_context_window`].
+    pub fn new(
+        theme: ChatTheme,
+        hide_thinking_block: bool,
+        tools_expanded: bool,
+        context_window: u64,
+    ) -> Self {
         Self {
             theme,
             current_assistant: None,
@@ -104,7 +124,28 @@ impl EventPump {
             running_agents: HashSet::new(),
             hide_thinking_block,
             tools_expanded,
+            footer_data: FooterData::new(context_window),
         }
+    }
+
+    /// Push the current footer snapshot into the [`Footer`]
+    /// component. Called after every mutation that affects the
+    /// rendered indicator so the row stays in sync.
+    pub fn sync_footer(&self, tui: &mut Tui) {
+        let snapshot = self.footer_data.context_usage();
+        if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
+            footer.set_context_usage(Some(snapshot));
+        }
+        tui.request_render();
+    }
+
+    /// Swap the model context window used as the indicator's
+    /// denominator. Pushes the refreshed snapshot into the footer
+    /// so the user sees the change immediately rather than after
+    /// the next turn lands.
+    pub fn set_context_window(&mut self, tui: &mut Tui, context_window: u64) {
+        self.footer_data.set_context_window(context_window);
+        self.sync_footer(tui);
     }
 
     /// Current thinking-block render mode. Exposed so the host's
@@ -307,6 +348,16 @@ impl EventPump {
             // ---- Per-turn token usage. ----
             AgentEvent::TurnUsage { agent_id, usage } => {
                 self.append_turn_usage(tui, *agent_id, usage);
+                // Only main-agent turns drive the footer's
+                // context-occupancy indicator. Sub-agents run in
+                // their own context window and surface their
+                // usage through the scrollback row above; mixing
+                // their counts into the main footer would make
+                // the percentage jump unpredictably during a turn.
+                if *agent_id == AgentId::Main {
+                    self.footer_data.record_turn_usage(usage);
+                    self.sync_footer(tui);
+                }
             }
 
             // ---- Placeholders: events whose UI work isn't yet wired. ----
@@ -917,8 +968,105 @@ mod tests {
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
         build_layout(&mut tui, &theme);
         let chat = chat_theme(&theme);
-        let pump = EventPump::new(chat.clone(), false, false);
+        // Test-only: 200k matches the canonical Sonnet window so
+        // any incidental "context_window" expectations in future
+        // tests don't need to know about a synthetic value.
+        let pump = EventPump::new(chat.clone(), false, false, 200_000);
         (tui, pump, chat)
+    }
+
+    /// Render the footer and return the rendered row as a single
+    /// string, ANSI escape codes stripped. Test helper for the
+    /// context-occupancy assertions below.
+    fn rendered_footer(tui: &mut Tui) -> String {
+        use crate::modes::interactive::components::footer::Footer;
+        let footer = tui
+            .get_mut_as::<Footer>(SlotIndex::Footer.idx())
+            .expect("footer slot");
+        let lines = footer.render(120);
+        let joined = lines.join("\n");
+        // Strip the SGR escape sequences so tests assert against
+        // visible content only. Matches the pattern used elsewhere
+        // in this module ("\x1b[2m" + "\x1b[22m" dim wrap).
+        let mut s = joined;
+        for code in [
+            "\x1b[2m", "\x1b[22m", "\x1b[33m", "\x1b[31m", "\x1b[39m", "\x1b[0m",
+        ] {
+            s = s.replace(code, "");
+        }
+        s
+    }
+
+    #[test]
+    fn main_agent_turn_usage_drives_the_footer_indicator() {
+        // Sum of the prompt-side fields is the numerator:
+        // 1_000 + 200 + 50 = 1_250 tokens; window is 200k -> 0.6%.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.sync_footer(&mut tui);
+        // Before any turn lands the indicator is "?/200k".
+        assert!(rendered_footer(&mut tui).contains("?/200k"));
+
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Main,
+                usage: token_usage([1_000, 999, 50, 200], [0, 0, 0, 0]),
+            },
+        );
+
+        let line = rendered_footer(&mut tui);
+        assert!(
+            line.contains("1.2k/200k"),
+            "expected `1.2k/200k` numerator/denominator in {line:?}",
+        );
+        assert!(
+            line.contains("(0.6%)"),
+            "expected `(0.6%)` percentage in {line:?}",
+        );
+    }
+
+    #[test]
+    fn sub_agent_turn_usage_leaves_the_footer_alone() {
+        // Sub-agents share the bus but run in their own context
+        // window; their usage must not move the main footer.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.sync_footer(&mut tui);
+        let before = rendered_footer(&mut tui);
+
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Sub(1),
+                usage: token_usage([5_000, 1_000, 200, 100], [0, 0, 0, 0]),
+            },
+        );
+
+        assert_eq!(
+            rendered_footer(&mut tui),
+            before,
+            "sub-agent TurnUsage should not move the main footer indicator",
+        );
+    }
+
+    #[test]
+    fn set_context_window_repaints_with_new_denominator() {
+        // Swap the model and confirm the denominator updates
+        // immediately rather than waiting for the next turn.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Main,
+                usage: token_usage([10_000, 0, 0, 0], [0, 0, 0, 0]),
+            },
+        );
+        assert!(rendered_footer(&mut tui).contains("10k/200k"));
+
+        pump.set_context_window(&mut tui, 100_000);
+        assert!(
+            rendered_footer(&mut tui).contains("10k/100k"),
+            "denominator should follow the new context window",
+        );
     }
 
     #[test]

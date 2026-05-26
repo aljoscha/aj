@@ -23,12 +23,17 @@
 //!   not user-visible. No event.
 //! - [`ConversationEntryKind::Message`] (assistant): one
 //!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair
-//!   wrapping the projected [`AssistantMessage`]. Renderers walk the
-//!   finalized content blocks on `MessageEnd` to paint
-//!   text/thinking/tool-call blocks; no per-block streaming events
-//!   are synthesized (replay has no deltas to stream). Each tool_call
-//!   updates an internal `tool_call_id ↦ (tool_name, args)` map used
-//!   to label the matching tool result later.
+//!   wrapping the projected [`AssistantMessage`], followed by an
+//!   [`AgentEvent::TurnUsage`] carrying the per-turn `usage`
+//!   recorded on the assistant message and a running
+//!   accumulated total. Listeners (the TUI footer, end-of-session
+//!   summaries) therefore see the same shape on resume as on a
+//!   live turn. Renderers walk the finalized content blocks on
+//!   `MessageEnd` to paint text/thinking/tool-call blocks; no
+//!   per-block streaming events are synthesized (replay has no
+//!   deltas to stream). Each tool_call updates an internal
+//!   `tool_call_id ↦ (tool_name, args)` map used to label the
+//!   matching tool result later.
 //! - [`ConversationEntryKind::Message`] (user): one
 //!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair.
 //! - [`ConversationEntryKind::Message`] (tool_result): one
@@ -46,7 +51,8 @@ use std::collections::HashMap;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::AgentMessage;
 use aj_agent::tool::ToolDetails;
-use aj_models::types::{Message, UserContent};
+use aj_agent::types::TokenUsage;
+use aj_models::types::{Message, Usage, UserContent};
 use serde_json::Value;
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationLog, ThreadKind};
@@ -76,6 +82,16 @@ struct ReplayState {
     /// [`AgentEvent::ToolExecutionEnd`] for the corresponding
     /// tool result later in the log.
     tool_calls: HashMap<String, (String, Value)>,
+    /// Per-agent accumulated [`Usage`] running totals, used to
+    /// build the `accumulated_*` fields on synthesized
+    /// [`AgentEvent::TurnUsage`] events. The map starts empty and
+    /// grows on demand the first time we see an assistant message
+    /// for an [`AgentId`]; the value stored at `agent_id` is the
+    /// accumulator *as observed before* the next turn is emitted,
+    /// matching the live agent's event order (see
+    /// `aj_agent::Agent::prompt`: `TurnUsage` carries the
+    /// pre-add total, and the per-turn delta is added afterwards).
+    usage_accumulators: HashMap<AgentId, Usage>,
 }
 
 impl ReplayState {
@@ -160,6 +176,35 @@ impl ReplayState {
             agent_id,
             message: agent_msg.clone(),
         });
+
+        // Synthesize the matching `TurnUsage`. Live runs emit one
+        // per assistant turn on the bus; without this resumed
+        // threads would only paint the footer's context indicator
+        // (and any other usage listener) starting from the first
+        // post-resume turn, even though every persisted assistant
+        // message has its `usage` on disk. Ordering matches the
+        // live agent: `TurnUsage.accumulated_*` reflects the total
+        // *before* this turn is folded in, then we add the per-turn
+        // delta into the accumulator for the next emission.
+        let acc = self.usage_accumulators.entry(agent_id).or_default();
+        let turn_usage = TokenUsage {
+            accumulated_input: acc.input,
+            turn_input: assistant.usage.input,
+            accumulated_output: acc.output,
+            turn_output: assistant.usage.output,
+            accumulated_cache_write: acc.cache_write,
+            turn_cache_write: assistant.usage.cache_write,
+            accumulated_cache_read: acc.cache_read,
+            turn_cache_read: assistant.usage.cache_read,
+        };
+        out.push(AgentEvent::TurnUsage {
+            agent_id,
+            usage: turn_usage,
+        });
+        acc.input += assistant.usage.input;
+        acc.output += assistant.usage.output;
+        acc.cache_write += assistant.usage.cache_write;
+        acc.cache_read += assistant.usage.cache_read;
 
         // Track tool_call blocks so subsequent tool_result entries
         // can synthesize a matching `ToolExecutionStart` (with
@@ -353,11 +398,12 @@ mod tests {
         //   MessageEnd(User "hi")
         //   MessageStart(Assistant empty)
         //   MessageEnd(Assistant {thinking, text, tool_call})
+        //   TurnUsage(Main)
         //   ToolExecutionStart { tool: "read_file", call_id: "call-1", args }
         //   MessageStart(ToolResult)
         //   MessageEnd(ToolResult)
         //   ToolExecutionEnd   { tool: "read_file", call_id: "call-1" }
-        assert_eq!(events.len(), 8, "got events: {events:#?}");
+        assert_eq!(events.len(), 9, "got events: {events:#?}");
 
         match &events[0] {
             AgentEvent::MessageStart { message, .. } => match message.as_wire() {
@@ -381,7 +427,16 @@ mod tests {
             other => panic!("expected assistant MessageEnd, got {other:?}"),
         }
 
+        // TurnUsage immediately follows the assistant MessageEnd —
+        // same shape and ordering the live agent uses on its bus.
         match &events[4] {
+            AgentEvent::TurnUsage { agent_id, .. } => {
+                assert_eq!(*agent_id, AgentId::Main);
+            }
+            other => panic!("expected TurnUsage, got {other:?}"),
+        }
+
+        match &events[5] {
             AgentEvent::ToolExecutionStart {
                 agent_id,
                 call_id,
@@ -396,7 +451,7 @@ mod tests {
             other => panic!("expected tool execution start, got {other:?}"),
         }
 
-        match &events[7] {
+        match &events[8] {
             AgentEvent::ToolExecutionEnd {
                 call_id,
                 tool,
@@ -563,5 +618,176 @@ mod tests {
             }
             other => panic!("expected tool execution end, got {other:?}"),
         }
+    }
+
+    /// Build an assistant message whose persisted `usage` carries
+    /// the supplied per-turn token counts. The other identity
+    /// fields are left at their defaults — the replay path only
+    /// reads `content` and `usage`.
+    fn assistant_msg_with_usage(
+        content: Vec<AssistantContent>,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> AgentMessage {
+        AgentMessage::wire(Message::Assistant(AssistantMessage {
+            content,
+            usage: aj_models::types::Usage {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                ..aj_models::types::Usage::default()
+            },
+            ..AssistantMessage::empty()
+        }))
+    }
+
+    /// Two persisted main-agent assistant turns produce two
+    /// synthesized `TurnUsage` events. The first carries its
+    /// per-turn deltas against a zero accumulator; the second
+    /// carries its deltas against an accumulator equal to the
+    /// first turn's contribution (live-agent ordering: emit
+    /// before adding into the accumulator).
+    #[test]
+    fn replay_synthesizes_turn_usage_per_assistant_message() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "first".into(),
+                    text_signature: None,
+                })],
+                100,
+                50,
+                20,
+                5,
+            ))
+            .expect("turn 1");
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "second".into(),
+                    text_signature: None,
+                })],
+                200,
+                70,
+                30,
+                10,
+            ))
+            .expect("turn 2");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        let turn_usages: Vec<&aj_agent::types::TokenUsage> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnUsage {
+                    agent_id: AgentId::Main,
+                    usage,
+                } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turn_usages.len(), 2, "one TurnUsage per assistant message");
+
+        let first = turn_usages[0];
+        assert_eq!(first.turn_input, 100);
+        assert_eq!(first.turn_output, 50);
+        assert_eq!(first.turn_cache_read, 20);
+        assert_eq!(first.turn_cache_write, 5);
+        assert_eq!(first.accumulated_input, 0, "pre-add accumulator");
+        assert_eq!(first.accumulated_output, 0);
+        assert_eq!(first.accumulated_cache_read, 0);
+        assert_eq!(first.accumulated_cache_write, 0);
+
+        let second = turn_usages[1];
+        assert_eq!(second.turn_input, 200);
+        assert_eq!(second.turn_output, 70);
+        assert_eq!(second.turn_cache_read, 30);
+        assert_eq!(second.turn_cache_write, 10);
+        // After the first turn was emitted the accumulator
+        // absorbed the first turn's deltas; the second TurnUsage
+        // sees those as its `accumulated_*`.
+        assert_eq!(second.accumulated_input, 100);
+        assert_eq!(second.accumulated_output, 50);
+        assert_eq!(second.accumulated_cache_read, 20);
+        assert_eq!(second.accumulated_cache_write, 5);
+    }
+
+    /// Main and sub-agent assistants keep independent
+    /// accumulators. A main-agent turn that follows a sub-agent
+    /// turn must not inherit the sub-agent's totals (and vice
+    /// versa).
+    #[test]
+    fn replay_keeps_main_and_subagent_usage_accumulators_separate() {
+        let dir = fresh_threads_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "main".into(),
+                    text_signature: None,
+                })],
+                10,
+                5,
+                0,
+                0,
+            ))
+            .expect("main turn");
+            view.head().cloned().expect("head present")
+        };
+
+        {
+            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "sub".into(),
+                    text_signature: None,
+                })],
+                40,
+                20,
+                0,
+                0,
+            ))
+            .expect("sub turn");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        let main_turn = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::TurnUsage {
+                    agent_id: AgentId::Main,
+                    usage,
+                } => Some(usage),
+                _ => None,
+            })
+            .expect("main TurnUsage present");
+        let sub_turn = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::TurnUsage {
+                    agent_id: AgentId::Sub(1),
+                    usage,
+                } => Some(usage),
+                _ => None,
+            })
+            .expect("sub(1) TurnUsage present");
+
+        // Each agent's first turn has a zero accumulator — they
+        // don't share state.
+        assert_eq!(main_turn.accumulated_input, 0);
+        assert_eq!(main_turn.turn_input, 10);
+        assert_eq!(sub_turn.accumulated_input, 0);
+        assert_eq!(sub_turn.turn_input, 40);
     }
 }

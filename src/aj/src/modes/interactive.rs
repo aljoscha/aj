@@ -380,7 +380,18 @@ impl InteractiveMode {
         // Drive replay events through the pump (post-layout so the
         // chat container has a slot to receive them). Replay never
         // hits the bus, so persistence isn't double-written.
-        let mut pump = EventPump::new(chat_theme(&theme), config.hide_thinking_block, false);
+        let context_window = agent.model_info().context_window;
+        let mut pump = EventPump::new(
+            chat_theme(&theme),
+            config.hide_thinking_block,
+            false,
+            context_window,
+        );
+        // Push the initial `?/<window>` so the indicator is
+        // visible before any turn lands. Replay (next) may
+        // overwrite the numerator with the last persisted turn's
+        // prompt size; the denominator stays as set here.
+        pump.sync_footer(&mut tui);
         for event in replay(&log) {
             pump.handle(&mut tui, &event);
         }
@@ -1225,6 +1236,11 @@ async fn handle_selector_outcome(
                                 a.default_thinking()
                             };
                             refresh_footer_model(tui, &new_id, &current_thinking);
+                            // Same idea for the footer's context-occupancy
+                            // indicator: the new model has its own window
+                            // size, so update the denominator immediately
+                            // rather than waiting for the next turn.
+                            pump.set_context_window(tui, info.context_window);
                             SelectorPollOutcome::Closed {
                                 notice: Some(format!(
                                     "Model set to {} ({}/{}).",
@@ -1418,7 +1434,17 @@ async fn perform_thread_swap(
         chat.clear();
     }
     let hide_thinking_block = pump.hide_thinking_block();
-    *pump = EventPump::new(chat_theme(theme), hide_thinking_block, false);
+    let context_window = agent.lock().await.model_info().context_window;
+    *pump = EventPump::new(
+        chat_theme(theme),
+        hide_thinking_block,
+        false,
+        context_window,
+    );
+    // Seed the footer indicator before replay so the row shows
+    // `?/<window>` even for resumed threads where replay produces
+    // no `TurnUsage` events (e.g. a log with only a user prompt).
+    pump.sync_footer(tui);
     {
         let l = log.lock().await;
         for event in replay(&l) {
@@ -1504,7 +1530,16 @@ async fn perform_new_thread(
         chat.clear();
     }
     let hide_thinking_block = pump.hide_thinking_block();
-    *pump = EventPump::new(chat_theme(theme), hide_thinking_block, false);
+    let context_window = agent.lock().await.model_info().context_window;
+    *pump = EventPump::new(
+        chat_theme(theme),
+        hide_thinking_block,
+        false,
+        context_window,
+    );
+    // Seed the footer indicator so the row shows `?/<window>`
+    // on the fresh thread before the first turn lands.
+    pump.sync_footer(tui);
 
     // 6. Refresh the header with the new thread id and a friendly
     //    notice so the user sees the swap in the top bar.

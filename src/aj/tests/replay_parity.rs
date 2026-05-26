@@ -29,17 +29,14 @@
 //! loop with `TurnError::Fatal`, exactly mirroring a real crash
 //! between persistence and the next inference.
 //!
-//! ## Why we filter `TurnUsage`
+//! ## `TurnUsage` parity
 //!
-//! The agent emits per-turn token-usage snapshots as a bus event
-//! but does not persist them to disk today, so `replay(&log)`
-//! never re-emits a matching event. Driving the captured live
-//! `TurnUsage` events into the live pump would therefore introduce
-//! a `Token Usage - ...` row that the replay-driven pump can't
-//! reproduce — a divergence unrelated to the three tool rendering
-//! paths the test is here to guard. Filtering keeps the comparison
-//! focused; restoring usage persistence (if/when it lands) will
-//! make the filter a no-op without changing the rest of the test.
+//! Both the live agent and `replay(&log)` emit one
+//! [`aj_agent::events::AgentEvent::TurnUsage`] per assistant turn,
+//! in the same position (immediately after the assistant's
+//! `MessageEnd`). The two pumps therefore see matching event
+//! sequences without any filtering — the parity comparison runs
+//! over the captured live stream verbatim.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -199,7 +196,7 @@ fn build_tui_and_pump() -> (Tui, EventPump) {
     let mut tui = Tui::new(Box::new(StubTerminal::new()));
     let theme = ThemeHandle::new(Theme::bundled_dark());
     build_layout(&mut tui, &theme);
-    let pump = EventPump::new(chat_theme(&theme), false, false);
+    let pump = EventPump::new(chat_theme(&theme), false, false, 200_000);
     (tui, pump)
 }
 
@@ -313,14 +310,10 @@ async fn drive_live_turn(
 }
 
 /// Drive the captured `events` through a fresh event pump and
-/// return the chat container's rendered lines. `TurnUsage` is
-/// filtered out for the reason documented at the top of this file.
+/// return the chat container's rendered lines.
 fn render_live(events: &[AgentEvent]) -> Vec<String> {
     let (mut tui, mut pump) = build_tui_and_pump();
     for event in events {
-        if matches!(event, AgentEvent::TurnUsage { .. }) {
-            continue;
-        }
         pump.handle(&mut tui, event);
     }
     render_chat(&mut tui)
