@@ -15,10 +15,13 @@ aj-session = { path = "../aj-session/" }
 aj-tools = { path = "../aj-tools/" }
 aj-tui = { path = "../aj-tui/" }
 anyhow = { workspace = true }
+arboard = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }
+image = { workspace = true }
 notify = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }

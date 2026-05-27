@@ -30,6 +30,16 @@ pub const ACTION_THINKING_TOGGLE: &str = "aj.thinking.toggle";
 /// without consulting docs.
 pub const ACTION_TOOLS_EXPAND: &str = "aj.tools.expand";
 
+/// Action ID for the "paste image from system clipboard" chord.
+///
+/// Bound by default to `ctrl+v`. The interactive loop intercepts the
+/// keystroke before the editor sees it, reads the clipboard, writes
+/// any image payload to a tempfile, and inserts that file's path
+/// into the editor as plain text. On submit, the model reads the
+/// file through the `read_file` tool. A clipboard miss is a silent
+/// no-op — users expect Ctrl+V to be benign.
+pub const ACTION_CLIPBOARD_PASTE_IMAGE: &str = "aj.clipboard.paste_image";
+
 /// Built-in `aj`-level keybinding definitions.
 ///
 /// Returned as a fresh `Vec` so callers can extend or filter before
@@ -44,6 +54,10 @@ pub fn aj_keybindings() -> KeybindingDefinitions {
         (
             ACTION_TOOLS_EXPAND.to_string(),
             K::new("alt+o", "Toggle expanded tool output"),
+        ),
+        (
+            ACTION_CLIPBOARD_PASTE_IMAGE.to_string(),
+            K::new("ctrl+v", "Paste image from clipboard"),
         ),
     ]
 }
@@ -89,6 +103,15 @@ mod tests {
     fn aj_thinking_toggle_defaults_to_alt_t() {
         let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
         assert_eq!(kbm.get_keys(ACTION_THINKING_TOGGLE), &["alt+t".to_string()]);
+    }
+
+    #[test]
+    fn aj_clipboard_paste_image_defaults_to_ctrl_v() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(
+            kbm.get_keys(ACTION_CLIPBOARD_PASTE_IMAGE),
+            &["ctrl+v".to_string()]
+        );
     }
 
     #[test]

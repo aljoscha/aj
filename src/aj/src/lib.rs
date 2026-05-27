@@ -22,6 +22,7 @@
 pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
 
 pub mod cli;
+pub mod clipboard;
 pub mod config;
 pub mod model;
 pub mod modes;

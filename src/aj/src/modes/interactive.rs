@@ -599,6 +599,36 @@ impl InteractiveMode {
                                     continue;
                                 }
                             }
+                            // Clipboard image paste. Bound via
+                            // `aj.clipboard.paste_image` (default
+                            // `ctrl+v`); intercepted before the editor
+                            // sees the keystroke so it doesn't receive
+                            // a literal control byte. On a successful
+                            // clipboard image read, the temp-file path
+                            // is inserted at the cursor as plain text —
+                            // the model uses `read_file` on submit to
+                            // look at it. Any failure (no image, no
+                            // clipboard backend, etc.) is silent.
+                            {
+                                let kb = aj_tui::keybindings::get();
+                                if kb.matches(
+                                    &input,
+                                    crate::config::keybindings::ACTION_CLIPBOARD_PASTE_IMAGE,
+                                ) {
+                                    drop(kb);
+                                    if let Some(path) =
+                                        crate::clipboard::read_image_to_tempfile()
+                                        && let Some(editor) = tui.get_mut_as::<Editor>(
+                                            SlotIndex::Editor.idx(),
+                                        )
+                                    {
+                                        editor.insert_text_at_cursor(
+                                            &path.display().to_string(),
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
                             tui.handle_input(&input);
 
                             // If a selector overlay is open, the

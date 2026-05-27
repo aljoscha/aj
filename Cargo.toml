@@ -18,6 +18,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 async-stream = "0.3.6"
 async-trait = "0.1"
 base64 = "0.22"
