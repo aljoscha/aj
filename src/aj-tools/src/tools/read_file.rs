@@ -123,11 +123,12 @@ impl ToolDefinition for ReadFileTool {
                 ));
             }
             return Ok(read_image_outcome(
-                &input.path,
+                input.path.clone(),
                 display_path_bare,
                 source_mime,
                 self.auto_resize,
-            ));
+            )
+            .await);
         }
 
         let content = match fs::read_to_string(&input.path) {
@@ -302,35 +303,89 @@ fn error_outcome(path: &str, error: String) -> ToolOutcome {
 /// outcome. On a budget-exhaustion failure, returns a recoverable
 /// non-error outcome whose text annotation tells the model the
 /// attachment was dropped.
-fn read_image_outcome(
-    path: &str,
+///
+/// The FS read, image decode/resize/encode, and outcome construction
+/// all run on `tokio::task::spawn_blocking` because
+/// [`image::resize_image`] and [`image::passthrough_image`] are
+/// synchronous CPU-bound work (Lanczos3 resample + PNG/JPEG encode)
+/// that can occupy a Tokio worker for tens of milliseconds on a
+/// large source.
+async fn read_image_outcome(
+    path: String,
     display_path: String,
-    source_mime: &str,
+    source_mime: &'static str,
     auto_resize: bool,
 ) -> ToolOutcome {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return error_outcome(path, format!("Failed to read file '{path}': {e}"));
-        }
-    };
+    // Retained for the join-error arm: if the blocking closure panics,
+    // `path` was moved into it and we can't recover it from the join
+    // result.
+    let path_for_join = path.clone();
 
-    if !auto_resize {
-        // Passthrough: attach raw source bytes. Decoding only happens
-        // far enough to recover dimensions for `ToolDetails::Image`.
-        return match image::passthrough_image(&bytes, source_mime) {
-            Some(resized) => image_attachment_outcome(display_path, resized),
-            None => error_outcome(
-                path,
-                format!("Failed to decode image '{path}' for dimension metadata"),
-            ),
+    let result = tokio::task::spawn_blocking(move || {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return BlockingOutcome::Error {
+                    path,
+                    message: format!("{e}"),
+                };
+            }
         };
-    }
 
-    match image::resize_image(&bytes, source_mime, &ResizeOptions::default()) {
-        Some(resized) => image_attachment_outcome(display_path, resized),
-        None => image_omitted_outcome(display_path, source_mime),
+        if !auto_resize {
+            // Passthrough: attach raw source bytes. Decoding only happens
+            // far enough to recover dimensions for `ToolDetails::Image`.
+            return match image::passthrough_image(&bytes, source_mime) {
+                Some(resized) => {
+                    BlockingOutcome::Attachment(image_attachment_outcome(display_path, resized))
+                }
+                None => BlockingOutcome::Error {
+                    path,
+                    message: "could not decode image for dimension metadata".to_string(),
+                },
+            };
+        }
+
+        match image::resize_image(&bytes, source_mime, &ResizeOptions::default()) {
+            Some(resized) => {
+                BlockingOutcome::Attachment(image_attachment_outcome(display_path, resized))
+            }
+            None => BlockingOutcome::Omitted(image_omitted_outcome(display_path, source_mime)),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(BlockingOutcome::Attachment(outcome)) | Ok(BlockingOutcome::Omitted(outcome)) => outcome,
+        Ok(BlockingOutcome::Error { path, message }) => {
+            error_outcome(&path, format!("Failed to read file '{path}': {message}"))
+        }
+        // A panic on the blocking pool shouldn't kill the agent.
+        // Surface it as a recoverable tool error pinned to the
+        // original path.
+        Err(join_err) => error_outcome(
+            &path_for_join,
+            format!("Failed to read file '{path_for_join}': image decode task failed: {join_err}"),
+        ),
     }
+}
+
+/// Result carried back from the `spawn_blocking` closure inside
+/// [`read_image_outcome`]. Keeping this as a small enum (rather than
+/// `Result<Result<_, _>, _>`) makes the three outcomes explicit:
+/// inline attachment, recoverable omission, or hard failure that
+/// still needs the original path string to build a useful error.
+enum BlockingOutcome {
+    /// Image bytes were attached to the tool outcome successfully.
+    Attachment(ToolOutcome),
+    /// Image couldn't fit the inline-image budget; outcome carries
+    /// the textual `[Image omitted: ...]` body. Not an error.
+    Omitted(ToolOutcome),
+    /// Hard failure reading or decoding; the path is returned so the
+    /// async caller can build an `error_outcome` whose body matches
+    /// the established `"Failed to read file '{path}': {reason}"`
+    /// wording.
+    Error { path: String, message: String },
 }
 
 /// Outcome for a successful image read: the resized image rides on
@@ -959,6 +1014,24 @@ mod tests {
             !annotation.contains("Multiply coordinates"),
             "annotation should not include dimension note: {annotation:?}"
         );
+    }
+
+    /// Pin the contract that the image branch is drivable from a
+    /// single-thread Tokio runtime. `spawn_blocking` dispatches to a
+    /// dedicated blocking pool independent of the worker count, so
+    /// this is mostly a regression guard: if we ever revert to running
+    /// the resize on the worker, a current-thread runtime would still
+    /// complete, but this test documents the expected wiring.
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_branch_runs_under_current_thread_runtime() {
+        let bytes = make_png(16, 16);
+        let file = write_png_tempfile(&bytes);
+        let path = file.path().display().to_string();
+
+        let outcome = read_image_outcome(path, "test.png".to_string(), "image/png", true).await;
+
+        assert!(!outcome.is_error);
+        assert!(matches!(&outcome.details, ToolDetails::Image { .. }));
     }
 
     #[tokio::test]
