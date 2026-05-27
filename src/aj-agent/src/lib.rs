@@ -128,6 +128,15 @@ pub struct Agent {
     /// its tool batch. Set via [`Agent::set_should_stop_after_turn`];
     /// returning `true` ends the turn without a follow-up inference.
     should_stop_after_turn: Option<hooks::ShouldStopAfterTurnHook>,
+    /// Defense-in-depth gate for the `image_block` config flag.
+    /// When `true`, [`aj_models::transform::block_user_images`] is
+    /// applied to the wire-bound message vector before it reaches
+    /// the provider so the model never receives image bytes,
+    /// regardless of its declared vision capability. The on-disk
+    /// transcript is unaffected; flipping this back to `false`
+    /// later in the same thread restores image visibility for
+    /// future turns. Set via [`Agent::set_block_images`].
+    block_images: bool,
 }
 
 impl Agent {
@@ -201,6 +210,7 @@ impl Agent {
             before_tool_call: None,
             after_tool_call: None,
             should_stop_after_turn: None,
+            block_images: false,
         }
     }
 
@@ -244,6 +254,20 @@ impl Agent {
     /// they captured at the top of [`Self::execute_turn`].
     pub fn set_cancellation(&mut self, token: CancellationToken) {
         self.cancellation = token;
+    }
+
+    /// Toggle the defense-in-depth `image_block` gate.
+    ///
+    /// When `true`, [`aj_models::transform::block_user_images`] is
+    /// applied to the wire-bound message vector before every
+    /// inference so [`aj_models::types::UserContent::Image`] blocks
+    /// are replaced with a placeholder text block. The on-disk
+    /// transcript is not touched, so flipping back to `false`
+    /// later in the same thread restores image visibility for
+    /// future turns. Sub-agents inherit the parent's value at
+    /// spawn time.
+    pub fn set_block_images(&mut self, block: bool) {
+        self.block_images = block;
     }
 
     /// Subscribe an async listener to the agent's internal event
@@ -1306,6 +1330,21 @@ impl Agent {
             .expect("system prompt must be resolved before inference");
 
         let messages = transcript_to_messages(&self.transcript);
+        // Defense-in-depth `image_block` gate: scrub image bytes
+        // from the wire-bound vector before they reach the
+        // provider. Runs ahead of `transform_messages` (which the
+        // provider applies); since `block_user_images` replaces
+        // every `UserContent::Image` block with a text placeholder,
+        // the subsequent non-vision downgrade in `transform_messages`
+        // becomes a no-op on these blocks. The transcript itself is
+        // untouched so persistence and future turns retain the bytes.
+        let messages = if self.block_images {
+            let mut m = messages;
+            aj_models::transform::block_user_images(&mut m);
+            m
+        } else {
+            messages
+        };
         let tools: Vec<UnifiedToolDefinition> = self
             .tools
             .iter()
@@ -1445,6 +1484,7 @@ impl Agent {
             parent_bus: self.bus.clone(),
             parent_agent_id: self.agent_id,
             cancellation: self.cancellation.child_token(),
+            block_images: self.block_images,
         };
 
         let outcome = (tool_def.func)(&mut session_ctx_wrapper, tool_input).await?;
@@ -1556,6 +1596,9 @@ struct SessionContextWrapper<'a> {
     /// future `Agent::cancel` reaches in-flight tools and any
     /// sub-agents they spawn.
     cancellation: CancellationToken,
+    /// Parent's `image_block` setting; propagated to spawned
+    /// sub-agents so the defense-in-depth gate stays uniform.
+    block_images: bool,
 }
 
 impl<'a> ToolContext for SessionContextWrapper<'a> {
@@ -1629,6 +1672,10 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             );
             sub_agent.set_agent_id(child_id);
             sub_agent.set_assembled_system_prompt(self.assembled_system_prompt.clone());
+            // Sub-agents inherit the parent's `image_block` setting
+            // so the defense-in-depth gate stays uniform across the
+            // hierarchy.
+            sub_agent.set_block_images(self.block_images);
             // Share the parent's bus per `docs/aj-next-plan.md`
             // §1.6: every event the sub-agent emits during its
             // run reaches the listeners the binary registered on

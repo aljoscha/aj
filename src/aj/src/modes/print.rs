@@ -61,7 +61,7 @@ use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
 };
-use aj_tools::get_builtin_tools;
+use aj_tools::{BuiltinToolOptions, get_builtin_tools};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
@@ -140,7 +140,9 @@ pub async fn run(args: Args) -> Result<()> {
     // the agent never advertises them to the model; this matches the
     // legacy binary's behaviour and keeps the print/interactive
     // surfaces uniform.
-    let mut tools = get_builtin_tools();
+    let mut tools = get_builtin_tools(&BuiltinToolOptions {
+        image_auto_resize: config.image_auto_resize,
+    });
     if !config.disabled_tools.is_empty() {
         tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
         tracing::info!(disabled = ?config.disabled_tools, "filtered disabled tools");
@@ -198,6 +200,7 @@ pub async fn run(args: Args) -> Result<()> {
             config.thinking,
         )
     };
+    agent.set_block_images(config.image_block);
 
     // Resolve the [`ConversationLog`] for this run: resume an
     // existing thread (by explicit id or latest-for-project) or

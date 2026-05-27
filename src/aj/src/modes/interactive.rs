@@ -35,7 +35,7 @@ use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
 };
-use aj_tools::get_builtin_tools;
+use aj_tools::{BuiltinToolOptions, get_builtin_tools};
 use aj_tui::EditorComponent;
 use aj_tui::components::editor::Editor;
 use aj_tui::container::Container;
@@ -149,7 +149,9 @@ impl InteractiveMode {
             let current_id = model_info.id.clone();
             current_model_key = Arc::new(std::sync::Mutex::new((current_provider, current_id)));
             // ---- Tools (legacy / scripted path) -----------------------
-            let mut tools = get_builtin_tools();
+            let mut tools = get_builtin_tools(&BuiltinToolOptions {
+                image_auto_resize: config.image_auto_resize,
+            });
             if !config.disabled_tools.is_empty() {
                 tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
             }
@@ -195,7 +197,9 @@ impl InteractiveMode {
                 resolved.model_info.id.clone(),
             )));
             // ---- Tools (registry / real-provider path) ----------------
-            let mut tools = get_builtin_tools();
+            let mut tools = get_builtin_tools(&BuiltinToolOptions {
+                image_auto_resize: config.image_auto_resize,
+            });
             if !config.disabled_tools.is_empty() {
                 tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
             }
@@ -218,6 +222,7 @@ impl InteractiveMode {
                 config.thinking,
             );
         }
+        agent.set_block_images(config.image_block);
 
         // Snapshot the model catalog up-front so the `/model`
         // selector overlay and the editor's argument completer
@@ -386,6 +391,7 @@ impl InteractiveMode {
             chat_theme(&theme),
             config.hide_thinking_block,
             false,
+            config.image_show_in_terminal,
             context_window,
         );
         // Push the initial `?/<window>` so the indicator is
@@ -1511,11 +1517,13 @@ async fn perform_thread_swap(
         chat.clear();
     }
     let hide_thinking_block = pump.hide_thinking_block();
+    let show_image_in_terminal = pump.show_image_in_terminal();
     let context_window = agent.lock().await.model_info().context_window;
     *pump = EventPump::new(
         chat_theme(theme),
         hide_thinking_block,
         false,
+        show_image_in_terminal,
         context_window,
     );
     // Seed the footer indicator before replay so the row shows
@@ -1607,11 +1615,13 @@ async fn perform_new_thread(
         chat.clear();
     }
     let hide_thinking_block = pump.hide_thinking_block();
+    let show_image_in_terminal = pump.show_image_in_terminal();
     let context_window = agent.lock().await.model_info().context_window;
     *pump = EventPump::new(
         chat_theme(theme),
         hide_thinking_block,
         false,
+        show_image_in_terminal,
         context_window,
     );
     // Seed the footer indicator so the row shows `?/<window>`

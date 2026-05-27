@@ -48,7 +48,32 @@ Usage:
 "#;
 
 #[derive(Clone)]
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    /// Whether to resize images to fit the inline image budget
+    /// before attaching them to tool results. When `false`, the
+    /// raw source bytes are base64-encoded and attached as-is.
+    auto_resize: bool,
+}
+
+impl ReadFileTool {
+    /// Construct with the default policy: auto-resize enabled.
+    pub fn new() -> Self {
+        Self { auto_resize: true }
+    }
+
+    /// Construct with an explicit resize policy. `false` skips the
+    /// inline budget enforcement entirely; see
+    /// [`crate::image::passthrough_image`] for the trade-off.
+    pub fn with_auto_resize(auto_resize: bool) -> Self {
+        Self { auto_resize }
+    }
+}
+
+impl Default for ReadFileTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
 pub struct ReadFileInput {
@@ -101,6 +126,7 @@ impl ToolDefinition for ReadFileTool {
                 &input.path,
                 display_path_bare,
                 source_mime,
+                self.auto_resize,
             ));
         }
 
@@ -276,13 +302,30 @@ fn error_outcome(path: &str, error: String) -> ToolOutcome {
 /// outcome. On a budget-exhaustion failure, returns a recoverable
 /// non-error outcome whose text annotation tells the model the
 /// attachment was dropped.
-fn read_image_outcome(path: &str, display_path: String, source_mime: &str) -> ToolOutcome {
+fn read_image_outcome(
+    path: &str,
+    display_path: String,
+    source_mime: &str,
+    auto_resize: bool,
+) -> ToolOutcome {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) => {
             return error_outcome(path, format!("Failed to read file '{path}': {e}"));
         }
     };
+
+    if !auto_resize {
+        // Passthrough: attach raw source bytes. Decoding only happens
+        // far enough to recover dimensions for `ToolDetails::Image`.
+        return match image::passthrough_image(&bytes, source_mime) {
+            Some(resized) => image_attachment_outcome(display_path, resized),
+            None => error_outcome(
+                path,
+                format!("Failed to decode image '{path}' for dimension metadata"),
+            ),
+        };
+    }
 
     match image::resize_image(&bytes, source_mime, &ResizeOptions::default()) {
         Some(resized) => image_attachment_outcome(display_path, resized),
@@ -376,7 +419,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -419,7 +462,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -460,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn relative_path_returns_error_outcome() {
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -484,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn missing_file_returns_error_outcome() {
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -516,7 +559,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -559,7 +602,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -593,7 +636,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -647,7 +690,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -714,7 +757,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -770,7 +813,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -803,7 +846,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -836,7 +879,7 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
-        let outcome = ReadFileTool
+        let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
                 ReadFileInput {
@@ -858,5 +901,101 @@ mod tests {
             }
             other => panic!("expected Text details, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_image_with_auto_resize_disabled_attaches_raw_bytes() {
+        // For a small PNG the raw source already fits the budget, so
+        // resize_image's fast path also returns base64 of the source.
+        // What this test pins is the contract: when auto_resize is
+        // false we attach the source bytes verbatim, with
+        // `displayed_dimensions == original_dimensions` and no
+        // dimension annotation.
+        let bytes = make_png(64, 48);
+        let file = write_png_tempfile(&bytes);
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool::with_auto_resize(false)
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error);
+        let image_data = match &outcome.content[1] {
+            UserContent::Image(img) => img.data.clone(),
+            other => panic!("expected image content second, got {other:?}"),
+        };
+        use base64::Engine;
+        let expected = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(
+            image_data, expected,
+            "passthrough must base64-encode the raw source bytes"
+        );
+        match &outcome.details {
+            ToolDetails::Image {
+                original_dimensions,
+                displayed_dimensions,
+                ..
+            } => {
+                assert_eq!(original_dimensions, &(64, 48));
+                assert_eq!(displayed_dimensions, &(64, 48));
+            }
+            other => panic!("expected ToolDetails::Image, got {other:?}"),
+        }
+        // No dimension note when the image wasn't resized.
+        let annotation = match &outcome.content[0] {
+            UserContent::Text(t) => t.text.clone(),
+            other => panic!("expected text annotation, got {other:?}"),
+        };
+        assert!(
+            !annotation.contains("Multiply coordinates"),
+            "annotation should not include dimension note: {annotation:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_large_image_with_auto_resize_disabled_skips_omission_note() {
+        // A large solid-color PNG. With auto_resize disabled the
+        // resize ladder is bypassed entirely, so the result is an
+        // image attachment (not the "[Image omitted]" placeholder).
+        let bytes = make_solid_png(4000, 3000);
+        let file = write_png_tempfile(&bytes);
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool::with_auto_resize(false)
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error);
+        assert!(
+            matches!(&outcome.content[1], UserContent::Image(_)),
+            "expected image attachment, not omission text"
+        );
+        assert!(matches!(&outcome.details, ToolDetails::Image { .. }));
+        let annotation = match &outcome.content[0] {
+            UserContent::Text(t) => t.text.clone(),
+            other => panic!("expected text annotation, got {other:?}"),
+        };
+        assert!(
+            !annotation.contains("Image omitted"),
+            "passthrough must not emit the omission placeholder: {annotation:?}"
+        );
     }
 }

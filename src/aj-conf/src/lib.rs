@@ -528,7 +528,7 @@ fn display_string_list(value: &[String]) -> String {
 /// disabled_tools = ["todo_read", "todo_write"]
 /// hide_thinking_block = false
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Model API backend (e.g., "anthropic", "openai").
     pub model_api: Option<String>,
@@ -560,6 +560,48 @@ pub struct Config {
     /// Defaults to `false` (expanded). Toggled at runtime with
     /// `Ctrl+T`; see `docs/aj-next-plan.md` §4.4.
     pub hide_thinking_block: bool,
+    /// Whether `read_file` resizes images to fit within the inline
+    /// image budget before attaching them to tool results. Defaults
+    /// to `true`; setting to `false` attaches the raw bytes, which
+    /// is useful for full-quality images but may be rejected by the
+    /// wire layer when the source exceeds the provider's per-image
+    /// size limit.
+    pub image_auto_resize: bool,
+    /// Whether the interactive TUI renders tool-result image
+    /// attachments inline via Kitty graphics / iTerm2 OSC 1337.
+    /// Defaults to `true`. When `false`, the textual placeholder
+    /// (`[image: mime · WxH]`) is shown regardless of terminal
+    /// capability. Independent of `image_block`: this only affects
+    /// what the user sees, not what the model receives.
+    pub image_show_in_terminal: bool,
+    /// Defense-in-depth: when `true`, strip every
+    /// [`aj_models::types::UserContent::Image`] block from outgoing
+    /// wire messages (both user messages and tool result messages)
+    /// and replace each with a single text block noting the
+    /// omission. The model never sees the bytes regardless of its
+    /// declared vision capability. Defaults to `false`.
+    pub image_block: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            model_api: None,
+            model_url: None,
+            model_name: None,
+            thinking: None,
+            thinking_display: None,
+            speed: None,
+            theme: None,
+            disabled_tools: Vec::new(),
+            hide_thinking_block: false,
+            // Image features: resize and inline-render by default;
+            // blocking is opt-in.
+            image_auto_resize: true,
+            image_show_in_terminal: true,
+            image_block: false,
+        }
+    }
 }
 
 /// Inference speed mode set in `config.toml` (Anthropic only).
@@ -691,6 +733,36 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| c.hide_thinking_block.to_string(),
+        },
+        ConfigOption {
+            name: "image_auto_resize",
+            description: "Resize images attached by tools (e.g. read_file) to fit the inline image budget.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.image_auto_resize = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.image_auto_resize.to_string(),
+        },
+        ConfigOption {
+            name: "image_show_in_terminal",
+            description: "Render tool-result images inline in the TUI when the terminal supports it.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.image_show_in_terminal = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.image_show_in_terminal.to_string(),
+        },
+        ConfigOption {
+            name: "image_block",
+            description: "Strip image attachments from outgoing wire messages (defense-in-depth).",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.image_block = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.image_block.to_string(),
         },
     ];
 
@@ -1261,6 +1333,26 @@ hide_thinking_block = true
         assert_eq!(config.theme.as_deref(), Some("dark"));
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
         assert!(config.hide_thinking_block);
+    }
+
+    #[test]
+    fn test_config_image_keys_default_and_parse() {
+        // Defaults: auto_resize=true, show_in_terminal=true, block=false.
+        let cfg = Config::default();
+        assert!(cfg.image_auto_resize);
+        assert!(cfg.image_show_in_terminal);
+        assert!(!cfg.image_block);
+
+        let toml_str = r#"
+image_auto_resize = false
+image_show_in_terminal = false
+image_block = true
+"#;
+        let (cfg, diag) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert!(!cfg.image_auto_resize);
+        assert!(!cfg.image_show_in_terminal);
+        assert!(cfg.image_block);
     }
 
     #[test]

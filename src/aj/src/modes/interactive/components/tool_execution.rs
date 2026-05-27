@@ -242,6 +242,13 @@ pub struct ToolExecutionComponent {
     /// block on a multi-image result is kept — current tools
     /// (`read_file`) emit at most one image per call.
     image_payload: Option<ImagePayload>,
+    /// Whether to render an inline [`Image`] child when the
+    /// terminal advertises an image protocol. `false` falls back
+    /// to the textual placeholder `render_details_body` already
+    /// produces. Sourced from the `image_show_in_terminal` config
+    /// key. Default `true` for back-compat with existing call
+    /// sites and tests.
+    show_image_in_terminal: bool,
 }
 
 /// Snapshot of the inline image attachment to render alongside
@@ -290,10 +297,25 @@ impl ToolExecutionComponent {
             bubble: TextBox::new(PADDING_X, PADDING_Y),
             cell_pixel_size,
             image_payload: None,
+            show_image_in_terminal: true,
         };
         me.bubble.set_bg_fn(me.make_bg_box());
         me.rebuild_children();
         me
+    }
+
+    /// Override whether the component renders an inline image
+    /// attachment. Builder-style so call sites that need to flip
+    /// the flag (the event pump, threading the
+    /// `image_show_in_terminal` config knob) stay one-liners and
+    /// existing constructors keep producing the back-compat
+    /// default (`true`).
+    pub fn with_show_image_in_terminal(mut self, show: bool) -> Self {
+        if self.show_image_in_terminal != show {
+            self.show_image_in_terminal = show;
+            self.rebuild_children();
+        }
+        self
     }
 
     /// Replace the rendered body with the partial snapshot in
@@ -425,19 +447,20 @@ impl ToolExecutionComponent {
 
         // Inline image attachment. Rendered only when the tool
         // result carried a [`UserContent::Image`] block AND the
-        // host terminal advertises an image protocol. Kitty +
-        // non-PNG falls back to the textual placeholder that
+        // host terminal advertises an image protocol AND the
+        // user hasn't suppressed inline rendering via the
+        // `image_show_in_terminal` config key. Kitty + non-PNG
+        // falls back to the textual placeholder that
         // [`render_details_body`] already produces, because
-        // Kitty doesn't accept JPEG inline. TODO (Phase 5):
-        // wire a `show_in_terminal` config gate; for now we
-        // always render inline when capabilities allow.
+        // Kitty doesn't accept JPEG inline.
         if let Some(payload) = &self.image_payload {
             let caps = get_capabilities();
-            let inline_ok = match caps.images {
-                Some(ImageProtocol::Kitty) => payload.mime_type == "image/png",
-                Some(ImageProtocol::ITerm2) => true,
-                None => false,
-            };
+            let inline_ok = self.show_image_in_terminal
+                && match caps.images {
+                    Some(ImageProtocol::Kitty) => payload.mime_type == "image/png",
+                    Some(ImageProtocol::ITerm2) => true,
+                    None => false,
+                };
             if inline_ok {
                 // `max_cells` keeps a huge image from taking
                 // half the screen. Chosen to roughly match the

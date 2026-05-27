@@ -36,6 +36,16 @@ pub const NON_VISION_USER_IMAGE_PLACEHOLDER: &str =
 pub const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str =
     "(tool image omitted: model does not support images)";
 
+/// Placeholder substituted for images in [`UserMessage`]s when the
+/// `image_block` config flag is `true`. Distinct from the non-vision
+/// placeholder so consumers can tell the two failure modes apart in
+/// logs and persisted transcripts.
+pub const BLOCKED_USER_IMAGE_PLACEHOLDER: &str = "(image omitted: blocked by config)";
+
+/// Placeholder substituted for images in [`ToolResultMessage`]s when
+/// the `image_block` config flag is `true`.
+pub const BLOCKED_TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: blocked by config)";
+
 /// Synthetic error text inserted as the body of a tool result when an
 /// assistant tool call has no corresponding `ToolResultMessage` in the
 /// history (§8.1 rule 4).
@@ -398,7 +408,40 @@ fn replace_images_with_placeholder(
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Defense-in-depth: `image_block` config flag
+// ---------------------------------------------------------------------------
+
+/// Strip every [`UserContent::Image`] block from `messages` (both
+/// [`Message::User`] and [`Message::ToolResult`]) and replace each
+/// with a single placeholder text block. Defense-in-depth for the
+/// `image_block` config flag — the model never sees the image bytes
+/// regardless of its declared vision capability.
+///
+/// Adjacent placeholder runs collapse: multiple stripped images in
+/// the same message yield exactly one placeholder block, not N.
+/// Pure-image messages still get a text block so provider APIs
+/// don't reject empty content. Text blocks are untouched.
+///
+/// User messages use [`BLOCKED_USER_IMAGE_PLACEHOLDER`]; tool result
+/// messages use [`BLOCKED_TOOL_IMAGE_PLACEHOLDER`].
+pub fn block_user_images(messages: &mut Vec<Message>) {
+    for m in messages.iter_mut() {
+        match m {
+            Message::User(u) => {
+                let content = std::mem::take(&mut u.content);
+                u.content =
+                    replace_images_with_placeholder(content, BLOCKED_USER_IMAGE_PLACEHOLDER);
+            }
+            Message::ToolResult(tr) => {
+                let content = std::mem::take(&mut tr.content);
+                tr.content =
+                    replace_images_with_placeholder(content, BLOCKED_TOOL_IMAGE_PLACEHOLDER);
+            }
+            Message::Assistant(_) => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -896,5 +939,107 @@ mod tests {
         assert_eq!(short_hash("hello"), short_hash("hello"));
         assert_ne!(short_hash("hello"), short_hash("world"));
         assert_eq!(short_hash("hello").len(), 12);
+    }
+
+    // -- block_user_images (image_block config) ----------------------------
+
+    fn img(data: &str) -> UserContent {
+        UserContent::Image(ImageContent {
+            data: data.into(),
+            mime_type: "image/png".into(),
+        })
+    }
+
+    #[test]
+    fn block_user_images_collapses_adjacent_images_to_one_placeholder() {
+        let user = UserMessage {
+            content: vec![
+                UserContent::text("before"),
+                img("AAA"),
+                img("BBB"),
+                UserContent::text("after"),
+            ],
+            timestamp: 0,
+        };
+        let mut msgs = vec![Message::User(user)];
+        block_user_images(&mut msgs);
+        let Message::User(u) = &msgs[0] else { panic!() };
+        assert_eq!(u.content.len(), 3);
+        match &u.content[1] {
+            UserContent::Text(t) => assert_eq!(t.text, BLOCKED_USER_IMAGE_PLACEHOLDER),
+            _ => panic!("expected placeholder text block"),
+        }
+    }
+
+    #[test]
+    fn block_user_images_pure_image_tool_result_keeps_one_block() {
+        let tr = ToolResultMessage {
+            tool_call_id: "toolu_a".into(),
+            tool_name: "screenshot".into(),
+            content: vec![img("AAA")],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        };
+        let mut msgs = vec![Message::ToolResult(tr)];
+        block_user_images(&mut msgs);
+        let Message::ToolResult(tr) = &msgs[0] else {
+            panic!()
+        };
+        assert_eq!(tr.content.len(), 1);
+        match &tr.content[0] {
+            UserContent::Text(t) => assert_eq!(t.text, BLOCKED_TOOL_IMAGE_PLACEHOLDER),
+            _ => panic!("expected placeholder text block"),
+        }
+    }
+
+    #[test]
+    fn block_user_images_text_then_image_tool_result() {
+        let tr = ToolResultMessage {
+            tool_call_id: "toolu_a".into(),
+            tool_name: "screenshot".into(),
+            content: vec![UserContent::text("before"), img("AAA")],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        };
+        let mut msgs = vec![Message::ToolResult(tr)];
+        block_user_images(&mut msgs);
+        let Message::ToolResult(tr) = &msgs[0] else {
+            panic!()
+        };
+        assert_eq!(tr.content.len(), 2);
+        match &tr.content[1] {
+            UserContent::Text(t) => assert_eq!(t.text, BLOCKED_TOOL_IMAGE_PLACEHOLDER),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn block_user_images_text_only_messages_untouched() {
+        let user = UserMessage {
+            content: vec![UserContent::text("hello"), UserContent::text("world")],
+            timestamp: 0,
+        };
+        let mut msgs = vec![Message::User(user)];
+        block_user_images(&mut msgs);
+        let Message::User(u) = &msgs[0] else { panic!() };
+        assert_eq!(u.content.len(), 2);
+        match &u.content[0] {
+            UserContent::Text(t) => assert_eq!(t.text, "hello"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn block_user_images_empty_content_untouched() {
+        let user = UserMessage {
+            content: Vec::new(),
+            timestamp: 0,
+        };
+        let mut msgs = vec![Message::User(user)];
+        block_user_images(&mut msgs);
+        let Message::User(u) = &msgs[0] else { panic!() };
+        assert!(u.content.is_empty());
     }
 }

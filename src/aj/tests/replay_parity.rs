@@ -197,7 +197,7 @@ fn build_tui_and_pump() -> (Tui, EventPump) {
     let mut tui = Tui::new(Box::new(StubTerminal::new()));
     let theme = ThemeHandle::new(Theme::bundled_dark());
     build_layout(&mut tui, &theme);
-    let pump = EventPump::new(chat_theme(&theme), false, false, 200_000);
+    let pump = EventPump::new(chat_theme(&theme), false, false, true, 200_000);
     (tui, pump)
 }
 

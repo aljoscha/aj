@@ -30,17 +30,36 @@ pub use tools::read_file::ReadFileTool;
 pub use tools::todo::{TodoReadTool, TodoWriteTool};
 pub use tools::write_file::WriteFileTool;
 
+/// Cross-cutting settings the binary feeds into builtin tool
+/// construction. Today scopes only image-related flags; new fields
+/// will be `Default`-derived so callers can extend without churning
+/// every call site.
+#[derive(Clone)]
+pub struct BuiltinToolOptions {
+    /// Forwarded to [`ReadFileTool::with_auto_resize`]. Default
+    /// `true`; flip via `image_auto_resize` in `~/.aj/config.toml`.
+    pub image_auto_resize: bool,
+}
+
+impl Default for BuiltinToolOptions {
+    fn default() -> Self {
+        Self {
+            image_auto_resize: true,
+        }
+    }
+}
+
 /// Build the catalog of every builtin tool, ready for `Agent::with_provider`.
 ///
 /// The binary further filters this list against any tools the user
 /// has disabled before handing it to the agent. Sub-agents inherit
 /// the filtered list (minus the `agent` tool) by cloning, so this
 /// function is called exactly once per process.
-pub fn get_builtin_tools() -> Vec<ErasedToolDefinition> {
+pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefinition> {
     vec![
         AgentTool.into(),
         BashTool.into(),
-        ReadFileTool.into(),
+        ReadFileTool::with_auto_resize(options.image_auto_resize).into(),
         WriteFileTool.into(),
         EditFileTool.into(),
         EditFileMultiTool.into(),

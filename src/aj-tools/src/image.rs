@@ -305,6 +305,32 @@ pub fn resize_image(
     }
 }
 
+/// Wrap a source image's bytes into a [`ResizedImage`] without any
+/// resize or re-encoding: dimensions are decoded from the source,
+/// `data` is the source bytes base64-encoded, and `was_resized` is
+/// `false`. Returns `None` if the bytes cannot be decoded.
+///
+/// Used by `read_file` when the user disables the inline image
+/// budget via `image_auto_resize = false` in `~/.aj/config.toml`.
+/// Callers accept that the resulting attachment may exceed the
+/// provider's per-image size limit and be rejected on the wire.
+pub fn passthrough_image(bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
+    let (width, height) = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    Some(ResizedImage {
+        data: BASE64.encode(bytes),
+        mime_type: mime_type.to_string(),
+        original_width: width,
+        original_height: height,
+        width,
+        height,
+        was_resized: false,
+    })
+}
+
 /// Build the dimension annotation included alongside resized images.
 /// Returns `None` when no resize occurred; otherwise emits a fixed
 /// wording so prompt-engineered models keep behaving the same:

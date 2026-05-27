@@ -85,6 +85,12 @@ pub struct EventPump {
     /// `aj.tools.expand` keybinding; defaults to `false` so the
     /// scrollback stays compact across long sessions.
     tools_expanded: bool,
+    /// Whether tool-execution components should render their
+    /// image attachments inline. Sourced from the
+    /// `image_show_in_terminal` config key at startup; threaded
+    /// into every freshly-constructed [`ToolExecutionComponent`]
+    /// via [`ToolExecutionComponent::with_show_image_in_terminal`].
+    show_image_in_terminal: bool,
     /// Snapshot fed to the [`Footer`] component's context-usage
     /// indicator. Updated from main-agent
     /// [`AgentEvent::TurnUsage`] events and on model swaps; the
@@ -115,6 +121,7 @@ impl EventPump {
         theme: ChatTheme,
         hide_thinking_block: bool,
         tools_expanded: bool,
+        show_image_in_terminal: bool,
         context_window: u64,
     ) -> Self {
         Self {
@@ -124,6 +131,7 @@ impl EventPump {
             running_agents: HashSet::new(),
             hide_thinking_block,
             tools_expanded,
+            show_image_in_terminal,
             footer_data: FooterData::new(context_window),
         }
     }
@@ -153,6 +161,13 @@ impl EventPump {
     /// it back through a separate getter.
     pub fn hide_thinking_block(&self) -> bool {
         self.hide_thinking_block
+    }
+
+    /// Current inline-image render mode. Surface so thread-swap /
+    /// new-thread paths can preserve the user's
+    /// `image_show_in_terminal` choice across pump re-creation.
+    pub fn show_image_in_terminal(&self) -> bool {
+        self.show_image_in_terminal
     }
 
     /// Update the thinking-block render mode for this session.
@@ -660,7 +675,8 @@ impl EventPump {
             &self.theme,
             self.tools_expanded,
             cell_pixel_size,
-        );
+        )
+        .with_show_image_in_terminal(self.show_image_in_terminal);
         let idx = self.push_chat_child(tui, Box::new(component));
         self.tool_index.insert(call_id.to_string(), idx);
         // A tool call that arrives mid-turn means the assistant
@@ -727,7 +743,8 @@ impl EventPump {
                     &self.theme,
                     self.tools_expanded,
                     cell_pixel_size,
-                );
+                )
+                .with_show_image_in_terminal(self.show_image_in_terminal);
                 let idx = self.push_chat_child(tui, Box::new(component));
                 self.tool_index.insert(call_id.to_string(), idx);
                 self.current_assistant = None;
@@ -992,7 +1009,7 @@ mod tests {
         // Test-only: 200k matches the canonical Sonnet window so
         // any incidental "context_window" expectations in future
         // tests don't need to know about a synthetic value.
-        let pump = EventPump::new(chat.clone(), false, false, 200_000);
+        let pump = EventPump::new(chat.clone(), false, false, true, 200_000);
         (tui, pump, chat)
     }
 
