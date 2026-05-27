@@ -30,7 +30,7 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 globset = "0.4"
 grep = "0.3"
 ignore = "0.4"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 itertools = "0.14.0"
 notify = "8.2"
 nu-ansi-term = "0.46"
