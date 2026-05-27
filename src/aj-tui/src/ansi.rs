@@ -550,7 +550,13 @@ pub fn grapheme_width(grapheme: &str) -> usize {
 /// other components must keep using the precomposed codepoint internally so
 /// cursor positions, selections, and width math stay consistent; only the
 /// final bytes handed to the terminal go through this function.
-pub fn normalize_terminal_output(s: &str) -> String {
+///
+/// In-place to keep the render hot path allocation-free on the
+/// overwhelmingly common case (line contains no SARA AM vowel):
+/// `Tui::render` calls this on every line of every frame, and a 25k-row
+/// scrollback would otherwise see 25k `String` allocations per frame
+/// even when no normalization is needed.
+pub fn normalize_terminal_output(s: &mut String) {
     // Fast path: most strings don't contain either codepoint, and we
     // call this on every painted line of every TUI frame. Scan the
     // raw bytes for the two target UTF-8 sequences (`E0 B8 B3` for
@@ -558,7 +564,7 @@ pub fn normalize_terminal_output(s: &str) -> String {
     // `str::contains([char])`, which builds a `MultiCharEqSearcher`
     // and walks the input char by char.
     if !contains_thai_lao_am(s.as_bytes()) {
-        return s.to_string();
+        return;
     }
 
     let mut out = String::with_capacity(s.len() + 2);
@@ -575,7 +581,7 @@ pub fn normalize_terminal_output(s: &str) -> String {
             other => out.push(other),
         }
     }
-    out
+    *s = out;
 }
 
 /// True iff `bytes` contains the UTF-8 encoding of either
@@ -2136,10 +2142,20 @@ mod tests {
 
     // -- normalize_terminal_output --
 
+    /// Tiny test-only wrapper that exercises the in-place
+    /// [`normalize_terminal_output`] against an `&str` input, so each
+    /// case stays one assertion. The real hot path operates on
+    /// `&mut String` and avoids this round-trip.
+    fn normalized(input: &str) -> String {
+        let mut out = input.to_string();
+        normalize_terminal_output(&mut out);
+        out
+    }
+
     #[test]
     fn normalize_passes_ascii_through_unchanged() {
         let s = "no thai or lao here, just ASCII";
-        assert_eq!(normalize_terminal_output(s), s);
+        assert_eq!(normalized(s), s);
     }
 
     #[test]
@@ -2151,7 +2167,7 @@ mod tests {
         // continuation bytes), which the byte scan must not mistake
         // for a hit.
         let s = "héllo 你好 🇺🇸 \u{0985}\u{09BE} \u{0B85}\u{0BBE}";
-        assert_eq!(normalize_terminal_output(s), s);
+        assert_eq!(normalized(s), s);
     }
 
     #[test]
@@ -2160,7 +2176,7 @@ mod tests {
         // word so the rewrite has neighbours to keep in place.
         let input = "คำ ทดสอบ";
         let expected = "ค\u{0e4d}\u{0e32} ทดสอบ";
-        assert_eq!(normalize_terminal_output(input), expected);
+        assert_eq!(normalized(input), expected);
     }
 
     #[test]
@@ -2168,14 +2184,14 @@ mod tests {
         // U+0EB3 (`ຳ`) → U+0ECD U+0EB2 (`ໍາ`).
         let input = "ຄຳ";
         let expected = "ຄ\u{0ecd}\u{0eb2}";
-        assert_eq!(normalize_terminal_output(input), expected);
+        assert_eq!(normalized(input), expected);
     }
 
     #[test]
     fn normalize_rewrites_multiple_occurrences() {
         let input = "\u{0E33}-\u{0EB3}-\u{0E33}";
         let expected = "\u{0E4D}\u{0E32}-\u{0ECD}\u{0EB2}-\u{0E4D}\u{0E32}";
-        assert_eq!(normalize_terminal_output(input), expected);
+        assert_eq!(normalized(input), expected);
     }
 
     #[test]
@@ -2202,7 +2218,21 @@ mod tests {
         // continue past the first hit.
         let input = "\u{0985}\u{0E33}";
         let expected = "\u{0985}\u{0E4D}\u{0E32}";
-        assert_eq!(normalize_terminal_output(input), expected);
+        assert_eq!(normalized(input), expected);
+    }
+
+    #[test]
+    fn normalize_is_a_noop_on_the_fast_path() {
+        // The fast path (no SARA AM vowel) must not mutate the
+        // input — the render hot path relies on this to skip the
+        // per-line allocation for every line that doesn't carry
+        // the target codepoint.
+        let mut s = String::from("plain ASCII content with no targets");
+        let original_ptr = s.as_ptr();
+        normalize_terminal_output(&mut s);
+        assert_eq!(s, "plain ASCII content with no targets");
+        // Same heap buffer — no reallocation happened.
+        assert_eq!(s.as_ptr(), original_ptr);
     }
 
     // -- visible_width / WidthCache --

@@ -1544,7 +1544,7 @@ impl Tui {
         // editor and other components keep using the precomposed form
         // internally so cursor positions and width math don't shift.
         for line in &mut lines {
-            *line = normalize_terminal_output(line);
+            normalize_terminal_output(line);
             // Image-protocol rows carry their own self-contained
             // escape (Kitty `\x1b_G…\x1b\\` or iTerm2 OSC 1337);
             // appending `SEGMENT_RESET` would either land inside

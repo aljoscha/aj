@@ -86,16 +86,18 @@ fn visible_width_keeps_thai_and_lao_am_clusters_at_their_normal_cell_width() {
 
 #[test]
 fn normalize_terminal_output_decomposes_thai_and_lao_am_vowels() {
+    // Small helper so each assertion stays one line; the production
+    // API is in-place to avoid allocations on the render hot path.
+    fn normalized(input: &str) -> String {
+        let mut s = input.to_string();
+        normalize_terminal_output(&mut s);
+        s
+    }
+
     // Precomposed AM vowels expand to their compatibility decomposition.
-    assert_eq!(normalize_terminal_output("ำ"), "ํา");
-    assert_eq!(normalize_terminal_output("ຳ"), "ໍາ");
+    assert_eq!(normalized("ำ"), "ํา");
+    assert_eq!(normalized("ຳ"), "ໍາ");
     // Decomposed form has the same visible width as the original input.
-    assert_eq!(
-        visible_width(&normalize_terminal_output("ำabc")),
-        visible_width("ำabc"),
-    );
-    assert_eq!(
-        visible_width(&normalize_terminal_output("ຳabc")),
-        visible_width("ຳabc"),
-    );
+    assert_eq!(visible_width(&normalized("ำabc")), visible_width("ำabc"));
+    assert_eq!(visible_width(&normalized("ຳabc")), visible_width("ຳabc"));
 }
