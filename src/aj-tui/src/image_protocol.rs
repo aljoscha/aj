@@ -111,6 +111,16 @@ pub fn kitty_delete(image_id: u32) -> String {
     format!("\x1b_Ga=d,d=I,i={image_id}\x1b\\")
 }
 
+/// Build the Kitty bulk delete-by-visibility escape (`d=A`).
+/// Frees every visible Kitty placement AND the underlying image
+/// data. Unlike [`kitty_delete`], this also wipes placements we
+/// didn't make ourselves — useful when entering a "scorched
+/// earth" repaint where we can't rely on
+/// `previous_kitty_image_ids` to know about every placement.
+pub fn kitty_delete_all() -> &'static str {
+    "\x1b_Ga=d,d=A,q=2\x1b\\"
+}
+
 /// Build the iTerm2 inline-image escape (OSC 1337).
 ///
 /// iTerm2 advances the cursor `rows` lines after rendering; we
@@ -381,5 +391,14 @@ mod tests {
         let name_at = s.find(";name=").expect("name= present");
         let width_at = s.find(";width=").expect("width= present");
         assert!(name_at < width_at, "name= should precede width=: {s:?}");
+    }
+
+    #[test]
+    fn kitty_delete_all_is_protocol_correct() {
+        let s = kitty_delete_all();
+        assert!(s.starts_with("\x1b_G"));
+        assert!(s.contains("a=d"));
+        assert!(s.contains("d=A"));
+        assert!(s.ends_with("\x1b\\"));
     }
 }

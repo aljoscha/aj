@@ -1236,6 +1236,31 @@ fn force_full_render_clears_screen_on_next_render() {
 }
 
 #[test]
+fn force_full_render_emits_bulk_kitty_delete() {
+    // `force_full_render` is the "scorched earth" escape hatch:
+    // beyond the per-ID deletes the diff engine emits for tracked
+    // placements, it must also emit a Kitty bulk delete-by-visibility
+    // so any images we never recorded (e.g. printed by a parent
+    // process before we started) get cleared too.
+    let terminal = VirtualTerminal::new(20, 5);
+    let mut tui = Tui::new(Box::new(terminal.clone()));
+    tui.add_child(Box::new(MutableLines::with_lines(["alpha", "beta"])));
+
+    render_now(&mut tui);
+    terminal.clear_writes();
+
+    tui.force_full_render();
+    render_now(&mut tui);
+
+    let joined = terminal.writes_joined();
+    assert!(
+        joined.contains("\x1b_Ga=d,d=A"),
+        "force_full_render should emit the Kitty bulk delete \
+         (`\\x1b_Ga=d,d=A,...`) on the next render; writes trace:\n{joined:?}",
+    );
+}
+
+#[test]
 fn first_render_does_not_clear_so_pre_tui_shell_output_is_preserved() {
     // Complement to `force_full_render_clears_screen_on_next_render`:
     // a *genuine* first render must NOT emit the screen-clear

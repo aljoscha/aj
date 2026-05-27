@@ -941,6 +941,23 @@ pub struct Tui {
     /// a recovery render. A dedicated bool flag is friendlier than
     /// poisoning the previous-dimension fields with `-1` sentinels.
     pending_full_clear: bool,
+    /// Set by [`Tui::force_full_render`] to ask the next full-clear
+    /// branch in [`Self::full_render`] to also emit a Kitty bulk
+    /// delete-by-visibility ([`crate::image_protocol::kitty_delete_all`])
+    /// in addition to the per-ID deletes drained from
+    /// `previous_kitty_image_ids`.
+    ///
+    /// The two cover different sets: the per-ID loop frees every
+    /// placement we recorded (including ones that scrolled off-screen
+    /// but still hold image data), while the bulk delete frees every
+    /// visible placement — including any printed by a parent process
+    /// or wrapper script before we started, which our records can't
+    /// know about. A scorched-earth repaint wants both.
+    ///
+    /// Cleared once the full-clear render consumes it. Independent of
+    /// `pending_full_clear` so a non-`force_full_render` full clear
+    /// (e.g. width change) doesn't pay for the bulk-delete escape.
+    scorched_earth_pending: bool,
 
     // Observability counters (used by integration tests to assert rendering
     // strategy without scraping terminal output).
@@ -1073,6 +1090,7 @@ impl Tui {
             last_render_time: None,
             render_requested: false,
             pending_full_clear: false,
+            scorched_earth_pending: false,
             full_redraws: 0,
             total_renders: 0,
             clear_on_shrink: false,
@@ -2632,6 +2650,22 @@ impl Tui {
         }
         tail.push_str("\r\n");
         self.terminal.write(&tail);
+        // Wipe any lingering Kitty graphics placements before the
+        // shell prompt returns. The differential renderer only
+        // tracks IDs of placements it made; stale placements that
+        // scrolled off-screen are still allocated in the terminal,
+        // and leaving them behind makes the post-exit scrollback
+        // look like a bug. Gated on Kitty caps to keep the wire
+        // neutral on terminals that don't speak it (they'd ignore
+        // the escape, but emitting only when needed is precise).
+        // Emitted before `show_cursor` so any post-shutdown shell
+        // prompt isn't preceded by lingering image rows.
+        if crate::capabilities::get_capabilities().images
+            == Some(crate::capabilities::ImageProtocol::Kitty)
+        {
+            self.terminal
+                .write(crate::image_protocol::kitty_delete_all());
+        }
         self.terminal.show_cursor();
         self.terminal.flush();
         self.terminal.stop();
@@ -2656,11 +2690,15 @@ impl Tui {
         self.max_lines_rendered = 0;
         self.previous_viewport_top = 0;
         self.pending_full_clear = true;
+        self.scorched_earth_pending = true;
         // Tracked Kitty placements stay registered: the next
         // render takes the full-clear branch in [`Self::full_render`]
         // which drains the set and emits delete-by-id escapes
         // before the screen wipe. Clearing here would leak the
-        // stale placements.
+        // stale placements. The bulk-delete sibling (gated on
+        // `scorched_earth_pending`) covers any placements we never
+        // recorded — e.g. images printed by a parent process before
+        // we started.
     }
 
     // -- Private rendering methods --
@@ -2774,6 +2812,20 @@ impl Tui {
             // tracked ID before the screen wipe so a full redraw
             // doesn't leave stale images painted underneath the
             // new frame.
+            //
+            // On a scorched-earth repaint (set by
+            // [`Self::force_full_render`]) we additionally emit
+            // a bulk delete-by-visibility to wipe any placements
+            // we never recorded — typically images printed by a
+            // parent process before the TUI started. The per-ID
+            // loop and the bulk delete cover different sets, so
+            // both run together: per-ID frees image data for IDs
+            // we know about (including off-screen placements);
+            // bulk frees everything currently visible.
+            if self.scorched_earth_pending {
+                buf.push_str(crate::image_protocol::kitty_delete_all());
+                self.scorched_earth_pending = false;
+            }
             for id in self.previous_kitty_image_ids.drain() {
                 buf.push_str(&crate::image_protocol::kitty_delete(id));
             }
