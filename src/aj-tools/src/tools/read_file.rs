@@ -1,18 +1,25 @@
 //! `read_file` builtin — first tool migrated to the new
 //! [`aj_agent::tool::ToolDefinition`] surface (`docs/aj-next-plan.md` §2.2).
 //!
-//! Returns a [`ToolOutcome`] with [`ToolDetails::Text`]: the `summary`
-//! is the relative display path (with optional `start:end` line range)
-//! and the `body` is the line-numbered content the user sees. The
-//! `content` block sent back to the model preserves the original
-//! line numbers so the LLM can reference them.
+//! For text files: returns a [`ToolOutcome`] with [`ToolDetails::Text`].
+//! The `summary` is the relative display path (with optional `start:end`
+//! line range) and the `body` is the line-numbered content the user
+//! sees. The `content` block sent back to the model preserves the
+//! original line numbers so the LLM can reference them.
 //!
-//! The output is bounded by two simultaneous budgets (line count and
+//! Text output is bounded by two simultaneous budgets (line count and
 //! byte count) enforced by `truncate_head`: whichever fires first
 //! wins. When clipped, the result carries an actionable footer telling
 //! the model how to paginate; when a single line alone exceeds the
 //! byte budget the body becomes an escape pointing at a
 //! `sed | head -c` fallback.
+//!
+//! For supported image files (PNG, JPEG, GIF, WebP): returns a
+//! [`ToolOutcome`] with [`ToolDetails::Image`]. The `content` is a
+//! short text annotation followed by a [`UserContent::Image`]
+//! attachment carrying the (possibly resized) image bytes. The
+//! line-based `offset` / `limit` parameters are rejected on image
+//! paths.
 
 use aj_agent::tool::{ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
 use aj_models::types::UserContent;
@@ -21,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{fs, path::PathBuf};
 
+use crate::image::{self, ResizeOptions, ResizedImage};
 use crate::truncate::{READ_MAX_BYTES, READ_MAX_LINES, TruncatedBy, format_size, truncate_head};
 
 const DESCRIPTION: &str = r#"
@@ -30,9 +38,11 @@ an error will be returned.
 Usage:
 
 - The path parameter must be an absolute path
-- Results include line numbers, starting at 1
-- Output is capped at 2000 lines or 50KB (whichever fires first). When the
-  cap is hit, the result tells you the next offset to continue from
+- Supports text files and images (PNG, JPEG, GIF, WebP). Images are returned as
+  attachments; the offset/limit parameters do not apply to images.
+- For text files: results include line numbers, starting at 1. Output is capped
+  at 2000 lines or 50KB (whichever fires first). When the cap is hit, the
+  result tells you the next offset to continue from.
 - You can specify an offset and a limit but it's usually better to read the
   whole file. Use this for reading very big files
 "#;
@@ -76,6 +86,24 @@ impl ToolDefinition for ReadFileTool {
             ));
         }
 
+        let display_path_bare = display_relative(path, &ctx.working_directory());
+        if let Some(source_mime) = image::detect_mime_type_from_file(path) {
+            // Non-vision warning omitted: `aj_models::transform` already substitutes
+            // a placeholder when the target model can't see images, so the model
+            // never receives a broken attachment.
+            if input.offset.is_some() || input.limit.is_some() {
+                return Ok(error_outcome(
+                    &display_path_bare,
+                    "offset/limit are not supported for image files".to_string(),
+                ));
+            }
+            return Ok(read_image_outcome(
+                &input.path,
+                display_path_bare,
+                source_mime,
+            ));
+        }
+
         let content = match fs::read_to_string(&input.path) {
             Ok(content) => content,
             Err(e) => {
@@ -98,8 +126,6 @@ impl ToolDefinition for ReadFileTool {
             Some(limit) => (start_idx + limit).min(lines.len()),
             None => lines.len(),
         };
-
-        let display_path_bare = display_relative(path, &ctx.working_directory());
 
         // Out-of-range offset: keep the legacy behaviour (empty body, no
         // line-range suffix, no footer).
@@ -237,6 +263,76 @@ fn error_outcome(path: &str, error: String) -> ToolOutcome {
             body: error,
         },
         is_error: true,
+    }
+}
+
+/// Read an image file from disk, resize it under the inline image
+/// budget, and build the corresponding tool outcome.
+///
+/// Contract: `source_mime` must come from
+/// [`image::detect_mime_type_from_file`] for `path` (i.e. the caller
+/// has already confirmed this is a supported image). On a resize
+/// failure (e.g. unreadable bytes), returns a recoverable error
+/// outcome. On a budget-exhaustion failure, returns a recoverable
+/// non-error outcome whose text annotation tells the model the
+/// attachment was dropped.
+fn read_image_outcome(path: &str, display_path: String, source_mime: &str) -> ToolOutcome {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return error_outcome(path, format!("Failed to read file '{path}': {e}"));
+        }
+    };
+
+    match image::resize_image(&bytes, source_mime, &ResizeOptions::default()) {
+        Some(resized) => image_attachment_outcome(display_path, resized),
+        None => image_omitted_outcome(display_path, source_mime),
+    }
+}
+
+/// Outcome for a successful image read: the resized image rides on
+/// `content` as a [`UserContent::Image`] preceded by a text annotation
+/// (`Read image file [<mime>]` plus an optional dimension note), and
+/// [`ToolDetails::Image`] carries the metadata the TUI needs to render
+/// or fall back gracefully.
+fn image_attachment_outcome(display_path: String, resized: ResizedImage) -> ToolOutcome {
+    let mut annotation = format!("Read image file [{}]", resized.mime_type);
+    if let Some(note) = image::format_dimension_note(&resized) {
+        annotation.push('\n');
+        annotation.push_str(&note);
+    }
+    let mime_type = resized.mime_type.clone();
+    let original_dimensions = (resized.original_width, resized.original_height);
+    let displayed_dimensions = (resized.width, resized.height);
+    ToolOutcome {
+        content: vec![
+            UserContent::text(annotation),
+            UserContent::image(resized.data, resized.mime_type),
+        ],
+        details: ToolDetails::Image {
+            summary: display_path,
+            mime_type,
+            original_dimensions,
+            displayed_dimensions,
+        },
+        is_error: false,
+    }
+}
+
+/// Outcome when no encoding fits the inline image budget at any
+/// dimension. Recoverable (`is_error: false`): the model is told the
+/// attachment was dropped and can decide what to do next.
+fn image_omitted_outcome(display_path: String, source_mime: &str) -> ToolOutcome {
+    let body = format!(
+        "Read image file [{source_mime}]\n[Image omitted: could not be resized below the inline image size limit.]"
+    );
+    ToolOutcome {
+        content: vec![UserContent::text(body.clone())],
+        details: ToolDetails::Text {
+            summary: display_path,
+            body,
+        },
+        is_error: false,
     }
 }
 
@@ -566,5 +662,201 @@ mod tests {
         let wire = extract_text(&outcome.content);
         assert!(wire.starts_with("[Line 3 is "), "wire: {wire:?}");
         assert!(wire.contains("sed -n '3p'"), "wire: {wire:?}");
+    }
+
+    // -------------------------------------------------------------
+    // Image branch
+    // -------------------------------------------------------------
+
+    /// Encode a `width`x`height` PNG with a faintly varying pattern.
+    /// Mirrors the helper from `crate::image::tests::make_png` so the
+    /// test stays self-contained without making test fixtures `pub`.
+    fn make_png(width: u32, height: u32) -> Vec<u8> {
+        use ::image::{ImageFormat, Rgba, RgbaImage};
+        let mut img = RgbaImage::new(width, height);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let r = u8::try_from((x ^ y) & 0xff).unwrap_or(0);
+            *px = Rgba([r, 128, 64, 255]);
+        }
+        let mut buf = Vec::new();
+        ::image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
+            .expect("encode png");
+        buf
+    }
+
+    /// Solid-color PNG: compresses to a tiny payload regardless of
+    /// dimensions, which lets large-image tests assume "PNG fits the
+    /// budget" without doing the math.
+    fn make_solid_png(width: u32, height: u32) -> Vec<u8> {
+        use ::image::{ImageFormat, Rgba, RgbaImage};
+        let img = RgbaImage::from_pixel(width, height, Rgba([180, 200, 220, 255]));
+        let mut buf = Vec::new();
+        ::image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
+            .expect("encode png");
+        buf
+    }
+
+    fn write_png_tempfile(bytes: &[u8]) -> NamedTempFile {
+        let file = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("temp file");
+        std::fs::write(file.path(), bytes).expect("write png");
+        file
+    }
+
+    #[tokio::test]
+    async fn execute_returns_image_outcome_for_png() {
+        let bytes = make_png(64, 48);
+        let file = write_png_tempfile(&bytes);
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error);
+        assert_eq!(
+            outcome.content.len(),
+            2,
+            "expected text annotation + image block, got {:?}",
+            outcome.content.len()
+        );
+        match &outcome.content[0] {
+            UserContent::Text(t) => assert!(
+                t.text.starts_with("Read image file [image/"),
+                "annotation: {:?}",
+                t.text
+            ),
+            other => panic!("expected text annotation first, got {other:?}"),
+        }
+        let image_mime = match &outcome.content[1] {
+            UserContent::Image(img) => {
+                assert!(!img.data.is_empty(), "image data must be non-empty");
+                img.mime_type.clone()
+            }
+            other => panic!("expected image content second, got {other:?}"),
+        };
+        match &outcome.details {
+            ToolDetails::Image {
+                mime_type,
+                original_dimensions,
+                displayed_dimensions,
+                ..
+            } => {
+                assert_eq!(mime_type, &image_mime);
+                assert_eq!(original_dimensions, &(64, 48));
+                assert_eq!(displayed_dimensions, &(64, 48));
+            }
+            other => panic!("expected ToolDetails::Image, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn small_image_has_no_dimension_note() {
+        let bytes = make_png(32, 32);
+        let file = write_png_tempfile(&bytes);
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        let annotation = match &outcome.content[0] {
+            UserContent::Text(t) => t.text.clone(),
+            other => panic!("expected text annotation, got {other:?}"),
+        };
+        assert_eq!(annotation, "Read image file [image/png]");
+        assert!(
+            !annotation.contains("Multiply coordinates"),
+            "annotation should not include dimension note: {annotation:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_image_includes_dimension_note() {
+        // Solid color so PNG compresses below the budget even at
+        // 4000x3000, guaranteeing the resize path runs and the note
+        // is emitted.
+        let bytes = make_solid_png(4000, 3000);
+        let file = write_png_tempfile(&bytes);
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        let annotation = match &outcome.content[0] {
+            UserContent::Text(t) => t.text.clone(),
+            other => panic!("expected text annotation, got {other:?}"),
+        };
+        assert!(
+            annotation.starts_with("Read image file ["),
+            "annotation: {annotation:?}"
+        );
+        assert!(
+            annotation.contains("Multiply coordinates"),
+            "expected dimension note in annotation: {annotation:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offset_on_image_path_returns_error() {
+        let bytes = make_png(32, 32);
+        let file = write_png_tempfile(&bytes);
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: Some(2),
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(outcome.is_error);
+        match &outcome.details {
+            ToolDetails::Text { body, .. } => {
+                assert!(
+                    body.contains("offset/limit are not supported for image files"),
+                    "body: {body:?}"
+                );
+            }
+            other => panic!("expected Text details, got {other:?}"),
+        }
     }
 }
