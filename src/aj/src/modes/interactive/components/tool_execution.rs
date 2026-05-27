@@ -258,6 +258,12 @@ struct ImagePayload {
     base64_data: String,
     mime_type: String,
     pixels: (u32, u32),
+    /// File / source path for the inline image. Surfaced as
+    /// iTerm2's OSC 1337 `name=` field and in the textual
+    /// fallback. Sourced from `ToolDetails::Image.summary`,
+    /// which `read_file` populates with the display path of the
+    /// source image. `None` when the summary is empty.
+    filename: Option<String>,
 }
 
 impl ToolExecutionComponent {
@@ -465,13 +471,16 @@ impl ToolExecutionComponent {
                 // `max_cells` keeps a huge image from taking
                 // half the screen. Chosen to roughly match the
                 // bubble's text body height.
-                let image = Image::new(
+                let mut image = Image::new(
                     payload.base64_data.clone(),
                     payload.mime_type.clone(),
                     payload.pixels,
                     (40, 20),
                     self.cell_pixel_size,
                 );
+                if let Some(name) = &payload.filename {
+                    image = image.with_filename(name.clone());
+                }
                 self.bubble.add_child(Box::new(image));
             }
         }
@@ -609,6 +618,7 @@ fn quote_for_summary(s: &str) -> String {
 /// image inline rendering is a separate layout problem.
 fn derive_image_payload(details: &ToolDetails, content: &[UserContent]) -> Option<ImagePayload> {
     let ToolDetails::Image {
+        summary,
         original_dimensions,
         displayed_dimensions,
         ..
@@ -627,10 +637,12 @@ fn derive_image_payload(details: &ToolDetails, content: &[UserContent]) -> Optio
     // details for the textual fallback's annotation line.
     let _ = original_dimensions;
     let ImageContent { data, mime_type } = image;
+    let filename = (!summary.is_empty()).then(|| summary.clone());
     Some(ImagePayload {
         base64_data: data.clone(),
         mime_type: mime_type.clone(),
         pixels: *displayed_dimensions,
+        filename,
     })
 }
 

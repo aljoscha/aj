@@ -29,6 +29,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
 /// Per-cell pixel size used when the host terminal does not report
 /// one. Conservative default tuned for typical 9x18 monospace
 /// fonts; the terminal still scales the image to its own cell
@@ -117,14 +120,28 @@ pub fn kitty_delete(image_id: u32) -> String {
 /// writing the N-th `Vec<String>` row. When `rows == 1` no
 /// cursor-up is needed.
 ///
+/// `filename`, when `Some`, is emitted as `name=<base64>` so
+/// iTerm2 displays it in the save-image dialog and on hover.
+/// iTerm2 expects the value to be the **base64-encoded filename
+/// bytes** (not the image bytes); we base64 the UTF-8 of the
+/// caller-supplied string. Pass `None` when there is no
+/// meaningful filename (e.g. clipboard paste tempfile names);
+/// the `name=` segment is omitted entirely in that case.
+///
 /// iTerm2 accepts PNG and JPEG; no chunking required.
-pub fn iterm2_sequence(base64_data: &str, cols: u32, rows: u32) -> String {
+pub fn iterm2_sequence(base64_data: &str, cols: u32, rows: u32, filename: Option<&str>) -> String {
     let mut out = String::with_capacity(base64_data.len() + 64);
     if rows > 1 {
         out.push_str(&format!("\x1b[{}A", rows - 1));
     }
+    out.push_str("\x1b]1337;File=inline=1");
+    if let Some(name) = filename {
+        let encoded = BASE64_STANDARD.encode(name.as_bytes());
+        out.push_str(";name=");
+        out.push_str(&encoded);
+    }
     out.push_str(&format!(
-        "\x1b]1337;File=inline=1;width={cols};height={rows};preserveAspectRatio=1:",
+        ";width={cols};height={rows};preserveAspectRatio=1:",
     ));
     out.push_str(base64_data);
     out.push('\x07');
@@ -335,13 +352,34 @@ mod tests {
 
     #[test]
     fn iterm2_sequence_prepends_cursor_up_only_when_rows_gt_one() {
-        let single = iterm2_sequence("abc", 4, 1);
+        let single = iterm2_sequence("abc", 4, 1, None);
         assert!(single.starts_with("\x1b]1337;File="));
         assert!(!single.contains("\x1b[0A"));
 
-        let multi = iterm2_sequence("abc", 4, 5);
+        let multi = iterm2_sequence("abc", 4, 5, None);
         assert!(multi.starts_with("\x1b[4A"));
         assert!(multi.contains("\x1b]1337;File=inline=1;width=4;height=5"));
         assert!(multi.ends_with('\x07'));
+    }
+
+    #[test]
+    fn iterm2_sequence_omits_name_when_none() {
+        let s = iterm2_sequence("abc", 4, 1, None);
+        assert!(!s.contains(";name="), "unexpected name= segment: {s:?}");
+    }
+
+    #[test]
+    fn iterm2_sequence_includes_base64_name_when_some() {
+        // base64("photo.png") = "cGhvdG8ucG5n".
+        let s = iterm2_sequence("abc", 4, 1, Some("photo.png"));
+        assert!(
+            s.contains("name=cGhvdG8ucG5n"),
+            "missing base64 name segment: {s:?}",
+        );
+        // The name segment sits before the width/height fields so
+        // the surrounding params stay grouped after the prefix.
+        let name_at = s.find(";name=").expect("name= present");
+        let width_at = s.find(";width=").expect("width= present");
+        assert!(name_at < width_at, "name= should precede width=: {s:?}");
     }
 }

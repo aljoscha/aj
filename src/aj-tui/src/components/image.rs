@@ -44,6 +44,10 @@ pub struct Image {
     /// Allocated on first Kitty render and reused thereafter so
     /// the diff engine can match the placement across frames.
     kitty_image_id: Option<u32>,
+    /// Optional source filename. Threaded into the iTerm2
+    /// `name=<b64>` field on OSC 1337 emission, and used to enrich
+    /// the textual fallback. `None` means "no filename available".
+    filename: Option<String>,
     /// Rendered output cached for a specific `(width, protocol)`.
     /// `protocol` is part of the key because
     /// [`crate::capabilities::set_capabilities`] is callable from
@@ -84,16 +88,32 @@ impl Image {
             max_cells,
             cell_pixel,
             kitty_image_id: None,
+            filename: None,
             cached_render: None,
         }
     }
 
+    /// Attach a source filename. Threaded into OSC 1337's
+    /// `name=<b64>` field for iTerm2 (shown in the save dialog
+    /// and on hover) and used in the textual fallback when the
+    /// host terminal can't render the image inline. Returns
+    /// `self` so call sites can chain construction.
+    ///
+    /// Clears the per-render cache so a late call doesn't get
+    /// masked by a stale entry.
+    pub fn with_filename(mut self, filename: impl Into<String>) -> Self {
+        self.filename = Some(filename.into());
+        self.cached_render = None;
+        self
+    }
+
     fn fallback(&self) -> Vec<String> {
         let (w, h) = self.image_pixels;
-        vec![style::dim(&format!(
-            "[image: {} · {}x{}]",
-            self.mime_type, w, h,
-        ))]
+        let text = match &self.filename {
+            Some(name) => format!("[image: {} · {} · {}x{}]", name, self.mime_type, w, h),
+            None => format!("[image: {} · {}x{}]", self.mime_type, w, h),
+        };
+        vec![style::dim(&text)]
     }
 }
 
@@ -153,7 +173,8 @@ impl Image {
                 out
             }
             ImageProtocol::ITerm2 => {
-                let escape = iterm2_sequence(&self.base64_data, cols, rows);
+                let escape =
+                    iterm2_sequence(&self.base64_data, cols, rows, self.filename.as_deref());
                 let mut out = Vec::with_capacity(rows_usize);
                 for _ in 1..rows_usize {
                     out.push(String::new());
@@ -323,6 +344,62 @@ mod tests {
         assert_eq!(img.cached_width(), Some(80));
         let _ = img.render(120);
         assert_eq!(img.cached_width(), Some(120));
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    #[serial]
+    fn iterm2_emits_name_field_when_filename_set() {
+        set_capabilities(TerminalCapabilities {
+            hyperlinks: false,
+            true_color: false,
+            images: Some(ImageProtocol::ITerm2),
+        });
+        let mut img = make("image/png").with_filename("hello.png");
+        let lines = img.render(80);
+        let joined = lines.join("\n");
+        // base64("hello.png") = "aGVsbG8ucG5n"
+        assert!(
+            joined.contains("name=aGVsbG8ucG5n"),
+            "missing name= field in escape: {joined:?}",
+        );
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    #[serial]
+    fn fallback_includes_filename_when_set() {
+        set_capabilities(TerminalCapabilities {
+            hyperlinks: false,
+            true_color: false,
+            images: None,
+        });
+        let mut img = make("image/png").with_filename("hello.png");
+        let lines = img.render(80);
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(line.contains("hello.png"), "filename missing: {line:?}");
+        assert!(line.contains("image/png"), "mime missing: {line:?}");
+        assert!(line.contains("100x50"), "dimensions missing: {line:?}");
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    #[serial]
+    fn with_filename_clears_cache() {
+        set_capabilities(TerminalCapabilities {
+            hyperlinks: false,
+            true_color: false,
+            images: Some(ImageProtocol::Kitty),
+        });
+        let mut img = make("image/png");
+        let _ = img.render(80);
+        assert!(img.cached_width().is_some());
+        img = img.with_filename("hello.png");
+        assert!(
+            img.cached_width().is_none(),
+            "with_filename should drop the render cache",
+        );
         reset_capabilities_cache();
     }
 

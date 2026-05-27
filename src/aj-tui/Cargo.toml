@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bitflags = "2"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = { workspace = true }
