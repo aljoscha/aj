@@ -44,6 +44,21 @@ pub struct Image {
     /// Allocated on first Kitty render and reused thereafter so
     /// the diff engine can match the placement across frames.
     kitty_image_id: Option<u32>,
+    /// Rendered output cached for a specific `(width, protocol)`.
+    /// `protocol` is part of the key because
+    /// [`crate::capabilities::set_capabilities`] is callable from
+    /// tests and can flip the protocol at runtime; without the
+    /// protocol in the key, swapping from Kitty to None would
+    /// silently return a stale Kitty escape. Cache hits clone the
+    /// `Vec<String>` (the Component trait returns by value); the
+    /// memcpy is far cheaper than re-running the base64 encoder.
+    cached_render: Option<CachedRender>,
+}
+
+struct CachedRender {
+    width: usize,
+    protocol: Option<ImageProtocol>,
+    lines: Vec<String>,
 }
 
 impl Image {
@@ -69,6 +84,7 @@ impl Image {
             max_cells,
             cell_pixel,
             kitty_image_id: None,
+            cached_render: None,
         }
     }
 
@@ -86,7 +102,29 @@ impl Component for Image {
 
     fn render(&mut self, width: usize) -> Vec<String> {
         let caps = get_capabilities();
-        let Some(protocol) = caps.images else {
+        if let Some(cached) = &self.cached_render
+            && cached.width == width
+            && cached.protocol == caps.images
+        {
+            return cached.lines.clone();
+        }
+        let lines = self.render_uncached(width, caps.images);
+        self.cached_render = Some(CachedRender {
+            width,
+            protocol: caps.images,
+            lines: lines.clone(),
+        });
+        lines
+    }
+
+    fn handle_input(&mut self, _event: &InputEvent) -> bool {
+        false
+    }
+}
+
+impl Image {
+    fn render_uncached(&mut self, width: usize, protocol: Option<ImageProtocol>) -> Vec<String> {
+        let Some(protocol) = protocol else {
             return self.fallback();
         };
         let cell = self.cell_pixel.unwrap_or(DEFAULT_CELL_PIXEL_SIZE);
@@ -126,8 +164,14 @@ impl Component for Image {
         }
     }
 
-    fn handle_input(&mut self, _event: &InputEvent) -> bool {
-        false
+    #[cfg(test)]
+    fn cached_width(&self) -> Option<usize> {
+        self.cached_render.as_ref().map(|c| c.width)
+    }
+
+    #[cfg(test)]
+    fn cached_protocol(&self) -> Option<Option<ImageProtocol>> {
+        self.cached_render.as_ref().map(|c| c.protocol)
     }
 }
 
@@ -245,6 +289,65 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(!lines[0].starts_with("\x1b["));
         assert!(lines[0].starts_with("\x1b]1337;File="));
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    #[serial]
+    fn render_caches_output_for_same_width() {
+        set_capabilities(TerminalCapabilities {
+            hyperlinks: false,
+            true_color: false,
+            images: Some(ImageProtocol::Kitty),
+        });
+        let mut img = make("image/png");
+        let first = img.render(80);
+        assert_eq!(img.cached_width(), Some(80));
+        assert_eq!(img.cached_protocol(), Some(Some(ImageProtocol::Kitty)));
+        let second = img.render(80);
+        assert_eq!(first, second);
+        assert_eq!(img.cached_width(), Some(80));
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    #[serial]
+    fn render_invalidates_on_width_change() {
+        set_capabilities(TerminalCapabilities {
+            hyperlinks: false,
+            true_color: false,
+            images: Some(ImageProtocol::Kitty),
+        });
+        let mut img = make("image/png");
+        let _ = img.render(80);
+        assert_eq!(img.cached_width(), Some(80));
+        let _ = img.render(120);
+        assert_eq!(img.cached_width(), Some(120));
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    #[serial]
+    fn render_invalidates_on_protocol_change() {
+        set_capabilities(TerminalCapabilities {
+            hyperlinks: false,
+            true_color: false,
+            images: Some(ImageProtocol::Kitty),
+        });
+        let mut img = make("image/png");
+        let kitty_lines = img.render(80);
+        assert!(kitty_lines[0].contains("\x1b_G"));
+        assert_eq!(img.cached_protocol(), Some(Some(ImageProtocol::Kitty)));
+
+        set_capabilities(TerminalCapabilities {
+            hyperlinks: false,
+            true_color: false,
+            images: None,
+        });
+        let fallback_lines = img.render(80);
+        assert_eq!(fallback_lines.len(), 1);
+        assert!(fallback_lines[0].contains("[image:"));
+        assert_eq!(img.cached_protocol(), Some(None));
         reset_capabilities_cache();
     }
 }
