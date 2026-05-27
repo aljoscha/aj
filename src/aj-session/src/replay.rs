@@ -281,15 +281,30 @@ impl ReplayState {
 
 /// Build a [`ToolDetails::Text`] off the wire content. The
 /// summary is the resolved tool name; the body is the concatenation
-/// of every [`UserContent::Text`] block in the result content.
+/// of every [`UserContent::Text`] block in the result content, with
+/// a `[image: <mime>]` placeholder line appended for each
+/// [`UserContent::Image`] so replayed entries that lack a persisted
+/// structured payload still surface a hint that an image was
+/// attached.
 fn text_fallback(tool_name: &str, content: &[UserContent]) -> ToolDetails {
-    let body: String = content
-        .iter()
-        .filter_map(|c| match c {
-            UserContent::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect();
+    let mut body = String::new();
+    for block in content {
+        match block {
+            UserContent::Text(t) => body.push_str(&t.text),
+            UserContent::Image(img) => {
+                if !body.is_empty() && !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str(&format!("[image: {}]", img.mime_type));
+                body.push('\n');
+            }
+        }
+    }
+    // Trim a trailing newline introduced solely by an image
+    // placeholder; the renderer adds its own separation.
+    if body.ends_with('\n') {
+        body.pop();
+    }
     ToolDetails::Text {
         summary: tool_name.to_string(),
         body,

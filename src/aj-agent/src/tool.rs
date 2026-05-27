@@ -148,6 +148,28 @@ pub enum ToolDetails {
         /// Snapshot of the current todo list.
         items: Vec<TodoItem>,
     },
+    /// Image rendering for tools that return image content (today:
+    /// `read_file` on image MIME types). The image bytes themselves
+    /// travel in the [`ToolOutcome::content`] vec as a
+    /// [`aj_models::types::UserContent::Image`]; this struct is the
+    /// display-side metadata the TUI uses to size the inline render
+    /// or compose a textual fallback.
+    Image {
+        /// Short headline displayed in collapsed views — typically the
+        /// display path of the image file.
+        summary: String,
+        /// MIME type of the (possibly resized) image actually attached
+        /// to the tool result. Always one of `image/png`, `image/jpeg`,
+        /// `image/gif`, `image/webp`.
+        mime_type: String,
+        /// Original image dimensions in pixels (width, height) before
+        /// any resize.
+        original_dimensions: (u32, u32),
+        /// Final image dimensions actually carried in the tool result
+        /// (width, height). Equal to `original_dimensions` when no
+        /// resize occurred.
+        displayed_dimensions: (u32, u32),
+    },
     /// Escape hatch for tools that don't warrant their own variant.
     /// New tools start here and graduate to a dedicated variant once
     /// a rendering pattern repeats.
@@ -494,6 +516,12 @@ mod tests {
                 report: "done".into(),
             },
             ToolDetails::Todos { items: Vec::new() },
+            ToolDetails::Image {
+                summary: "/tmp/screenshot.png".into(),
+                mime_type: "image/png".into(),
+                original_dimensions: (1920, 1080),
+                displayed_dimensions: (800, 450),
+            },
             ToolDetails::Json(json!({"x": 1})),
         ];
         for case in cases {

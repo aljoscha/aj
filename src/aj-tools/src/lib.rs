@@ -12,6 +12,7 @@
 //! ([`AgentEvent::ToolExecutionEnd`](aj_agent::events::AgentEvent::ToolExecutionEnd)
 //! carries the structured result); `aj-tools` is wire-only.
 
+pub mod image;
 pub mod sanitize;
 pub mod testing;
 pub mod tools;

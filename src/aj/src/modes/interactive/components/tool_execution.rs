@@ -603,6 +603,23 @@ fn render_details_body(details: &ToolDetails, expanded: bool) -> Vec<String> {
                 serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
             formatted.split('\n').map(|s| s.to_string()).collect()
         }
+        ToolDetails::Image {
+            mime_type,
+            original_dimensions: (orig_w, orig_h),
+            displayed_dimensions: (disp_w, disp_h),
+            ..
+        } => {
+            // Textual fallback shown until a terminal-image protocol
+            // renderer lands. Renders the source dimensions, and the
+            // displayed dimensions when a resize occurred.
+            let mime_type = sanitize_terminal_output(mime_type);
+            let line = if (orig_w, orig_h) == (disp_w, disp_h) {
+                format!("[image: {mime_type} · {orig_w}x{orig_h}]")
+            } else {
+                format!("[image: {mime_type} · {orig_w}x{orig_h} → {disp_w}x{disp_h}]")
+            };
+            vec![style::dim(&line)]
+        }
     }
 }
 
