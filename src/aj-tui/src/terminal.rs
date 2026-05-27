@@ -211,6 +211,20 @@ pub trait Terminal {
         None
     }
 
+    /// Per-cell pixel dimensions, when the host terminal reports them.
+    ///
+    /// Used by image-protocol encoders to scale images to a cell-grid
+    /// footprint that lines up with surrounding text. Returns `None`
+    /// when the terminal doesn't expose pixel sizes — image renderers
+    /// then fall back to a hard-coded default.
+    ///
+    /// Read once at component construction; mid-session font-size
+    /// changes are not handled today. TODO: re-probe on resize when
+    /// terminals start reporting pixel sizes through SIGWINCH paths.
+    fn cell_pixel_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Whether the Kitty keyboard protocol is currently active on this
     /// terminal. Components can branch on this to know whether they will
     /// see key-release events and disambiguated modifier encodings.
@@ -562,5 +576,16 @@ impl Terminal for ProcessTerminal {
 
     fn kitty_protocol_active(&self) -> bool {
         KEYBOARD_ENHANCEMENT_ACTIVE.load(Ordering::SeqCst)
+    }
+
+    fn cell_pixel_size(&self) -> Option<(u32, u32)> {
+        let ws = crossterm::terminal::window_size().ok()?;
+        if ws.width == 0 || ws.height == 0 || ws.columns == 0 || ws.rows == 0 {
+            return None;
+        }
+        Some((
+            u32::from(ws.width) / u32::from(ws.columns),
+            u32::from(ws.height) / u32::from(ws.rows),
+        ))
     }
 }

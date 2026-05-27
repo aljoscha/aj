@@ -2,6 +2,7 @@
 
 pub mod cancellable_loader;
 pub mod editor;
+pub mod image;
 pub mod loader;
 pub mod markdown;
 pub mod select_list;

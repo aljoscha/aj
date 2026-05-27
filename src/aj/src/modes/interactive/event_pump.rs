@@ -308,18 +308,22 @@ impl EventPump {
                 ..
             } => self.append_tool_execution(tui, call_id, tool, args),
             AgentEvent::ToolExecutionUpdate {
-                call_id, partial, ..
+                call_id,
+                partial,
+                content,
+                ..
             } => {
-                self.update_tool_execution_partial(tui, call_id, partial);
+                self.update_tool_execution_partial(tui, call_id, partial, content);
             }
             AgentEvent::ToolExecutionEnd {
                 call_id,
                 tool,
                 result,
+                content,
                 is_error,
                 ..
             } => {
-                self.update_tool_execution_result(tui, call_id, tool, result, *is_error);
+                self.update_tool_execution_result(tui, call_id, tool, result, content, *is_error);
             }
 
             // ---- Notices / warnings / errors. ----
@@ -649,8 +653,14 @@ impl EventPump {
         tool: &str,
         args: &serde_json::Value,
     ) {
-        let component =
-            ToolExecutionComponent::new(tool.to_string(), args, &self.theme, self.tools_expanded);
+        let cell_pixel_size = tui.terminal().cell_pixel_size();
+        let component = ToolExecutionComponent::with_cell_pixel_size(
+            tool.to_string(),
+            args,
+            &self.theme,
+            self.tools_expanded,
+            cell_pixel_size,
+        );
         let idx = self.push_chat_child(tui, Box::new(component));
         self.tool_index.insert(call_id.to_string(), idx);
         // A tool call that arrives mid-turn means the assistant
@@ -666,6 +676,7 @@ impl EventPump {
         tui: &mut Tui,
         call_id: &str,
         partial: &aj_agent::tool::ToolDetails,
+        content: &[aj_models::types::UserContent],
     ) {
         let Some(&idx) = self.tool_index.get(call_id) else {
             return;
@@ -676,7 +687,7 @@ impl EventPump {
         let Some(c) = chat.get_mut_as::<ToolExecutionComponent>(idx) else {
             return;
         };
-        c.update_partial(partial);
+        c.update_partial(partial, content);
     }
 
     /// Finalize a tool execution with its result.
@@ -686,6 +697,7 @@ impl EventPump {
         call_id: &str,
         tool: &str,
         result: &aj_agent::tool::ToolDetails,
+        content: &[aj_models::types::UserContent],
         is_error: bool,
     ) {
         // If we never saw `ToolExecutionStart` (replay path), build
@@ -708,11 +720,13 @@ impl EventPump {
         let idx = match self.tool_index.get(call_id) {
             Some(idx) => *idx,
             None => {
-                let component = ToolExecutionComponent::new(
+                let cell_pixel_size = tui.terminal().cell_pixel_size();
+                let component = ToolExecutionComponent::with_cell_pixel_size(
                     tool.to_string(),
                     &serde_json::json!({}),
                     &self.theme,
                     self.tools_expanded,
+                    cell_pixel_size,
                 );
                 let idx = self.push_chat_child(tui, Box::new(component));
                 self.tool_index.insert(call_id.to_string(), idx);
@@ -726,7 +740,7 @@ impl EventPump {
         let Some(c) = chat.get_mut_as::<ToolExecutionComponent>(idx) else {
             return;
         };
-        c.update_result(result, is_error);
+        c.update_result(result, content, is_error);
     }
 
     /// Append a plain dim-styled notice line. The auto-spacer
@@ -1139,6 +1153,7 @@ mod tests {
                     summary: "bash".into(),
                     body: "hello from aj".into(),
                 },
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
                 is_error: false,
             },
         );
@@ -1297,6 +1312,7 @@ mod tests {
                     summary: "bash".into(),
                     body: "ok".into(),
                 },
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
                 is_error: false,
             },
         );
@@ -1686,6 +1702,7 @@ mod tests {
                     summary: "summary".into(),
                     body: "the sub-agent's report".into(),
                 },
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
                 is_error: false,
             },
         );
@@ -1888,6 +1905,7 @@ mod tests {
                         summary: String::new(),
                         body,
                     },
+                    content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
                     is_error: false,
                 },
             );

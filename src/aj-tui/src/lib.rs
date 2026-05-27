@@ -27,22 +27,19 @@
 //! [`EventStream`]: https://docs.rs/crossterm/latest/crossterm/event/struct.EventStream.html
 //! [`InputEvent`]: crate::keys::InputEvent
 //!
-//! ## Why no image rendering yet
+//! ## Inline image rendering
 //!
-//! Inline image rendering (encoder, terminal fallback path, cell-dimension
-//! probing, and an `Image` component) is intentionally deferred until aj
-//! has a concrete consumer for it. The capability-detection layer
-//! ([`crate::capabilities`]) is in place regardless: components consult
-//! it to gate optional escape sequences (OSC 8 hyperlinks, true color,
-//! image-protocol probes).
-//!
-//! Knock-on absence: the cell-size protocol response (`\x1b[6;<h>;<w>t`)
-//! is not intercepted. `Tui::handle_input_after_listeners` carries an
-//! inline note explaining the deliberate gap.
-//!
-//! Revisit when an aj surface needs to render images: add an encoder /
-//! fallback / cell-dim probe module, an `Image` component, and re-enable
-//! the cell-size response branch in the `Tui` input dispatcher.
+//! Inline images render through [`crate::image_protocol`] (Kitty
+//! graphics + iTerm2 OSC 1337 encoders, multi-row layout helpers)
+//! and [`crate::components::image::Image`]. Cell pixel size is
+//! sourced from [`crate::terminal::Terminal::cell_pixel_size`]
+//! when the host terminal reports it. The differential renderer
+//! in [`crate::tui`] is aware of image rows: it skips width
+//! validation and the per-line SGR/OSC reset on rows that carry
+//! a protocol escape, tracks placed Kitty image IDs across
+//! frames, and emits delete-by-id escapes before redrawing any
+//! row that previously held a placement (Kitty doesn't replace
+//! placements by overwriting cells).
 //!
 //! # Testing
 //!
@@ -59,6 +56,7 @@ pub mod components;
 pub mod container;
 pub mod editor_component;
 pub mod fuzzy;
+pub mod image_protocol;
 pub mod keybindings;
 pub mod keys;
 pub mod kill_ring;

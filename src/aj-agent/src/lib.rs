@@ -1211,6 +1211,11 @@ impl Agent {
         // `serde_json::to_value` so it survives the on-disk JSONL
         // round-trip.
         let details_value = serde_json::to_value(&outcome.details).ok();
+        // Snapshot the wire content as an `Arc<[UserContent]>` for the
+        // `ToolExecutionEnd` event; cloning the Arc is O(1) and keeps
+        // image-bearing results cheap to fan out across the bus.
+        let content_arc: std::sync::Arc<[UserContent]> =
+            std::sync::Arc::from(outcome.content.clone().into_boxed_slice());
         let tool_result = ToolResultMessage {
             tool_call_id: tool_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -1242,6 +1247,7 @@ impl Agent {
                 call_id: tool_id.to_string(),
                 tool: tool_name.to_string(),
                 result: outcome.details,
+                content: content_arc,
                 is_error: outcome.is_error,
             })
             .await
@@ -2088,6 +2094,7 @@ mod event_protocol_tests {
                 call_id,
                 tool,
                 result,
+                content: _,
                 is_error,
             } => {
                 let (summary, body) = match result {

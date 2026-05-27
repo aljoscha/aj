@@ -48,9 +48,12 @@ use std::any::Any;
 use std::sync::Arc;
 
 use aj_agent::tool::ToolDetails;
+use aj_models::types::{ImageContent, UserContent};
 use aj_tools::sanitize_terminal_output;
 use aj_tui::ansi::wrap_text_with_ansi;
+use aj_tui::capabilities::{ImageProtocol, get_capabilities};
 use aj_tui::component::Component;
+use aj_tui::components::image::Image;
 use aj_tui::components::text::Text;
 use aj_tui::components::text_box::TextBox;
 use aj_tui::keys::InputEvent;
@@ -223,6 +226,31 @@ pub struct ToolExecutionComponent {
     /// `(child-lines, width, bg-sample)` cache both re-populate on
     /// the next render.
     bubble: TextBox,
+    /// Per-cell pixel size sourced from
+    /// [`aj_tui::terminal::Terminal::cell_pixel_size`] at the time
+    /// the component was constructed. Threaded down to the inline
+    /// [`Image`] child so the image footprint lines up with the
+    /// surrounding cell grid. `None` means the terminal didn't
+    /// report a size; [`Image`] falls back to a sensible default.
+    cell_pixel_size: Option<(u32, u32)>,
+    /// Inline image payload (base64, mime, source pixels) when
+    /// the tool result carried a [`UserContent::Image`] block AND
+    /// the host terminal advertises an image protocol. Set by
+    /// [`Self::update_result`] / [`Self::update_partial`] and
+    /// consumed by [`Self::rebuild_children`] to drop a fresh
+    /// [`Image`] child into the bubble. Only the first image
+    /// block on a multi-image result is kept — current tools
+    /// (`read_file`) emit at most one image per call.
+    image_payload: Option<ImagePayload>,
+}
+
+/// Snapshot of the inline image attachment to render alongside
+/// the tool's body, captured from the result's wire content.
+#[derive(Clone)]
+struct ImagePayload {
+    base64_data: String,
+    mime_type: String,
+    pixels: (u32, u32),
 }
 
 impl ToolExecutionComponent {
@@ -232,6 +260,22 @@ impl ToolExecutionComponent {
     /// emits a result; [`Self::update_partial`] / [`Self::update_result`]
     /// flip the status and the matching bg.
     pub fn new(tool_name: String, args: &Value, theme: &ChatTheme, expanded: bool) -> Self {
+        Self::with_cell_pixel_size(tool_name, args, theme, expanded, None)
+    }
+
+    /// Construct a component with an explicit per-cell pixel size
+    /// for the inline [`Image`] child. Threaded through from the
+    /// event pump so the [`Tui`]'s terminal-backed cell size
+    /// flows into the image protocol's footprint math. A `None`
+    /// argument is equivalent to [`Self::new`] and means
+    /// [`Image`] should use [`aj_tui::image_protocol::DEFAULT_CELL_PIXEL_SIZE`].
+    pub fn with_cell_pixel_size(
+        tool_name: String,
+        args: &Value,
+        theme: &ChatTheme,
+        expanded: bool,
+        cell_pixel_size: Option<(u32, u32)>,
+    ) -> Self {
         let mut me = Self {
             tool_name,
             args_pretty: format_args(args),
@@ -244,6 +288,8 @@ impl ToolExecutionComponent {
             bg_success: Arc::clone(&theme.tool_success_bg),
             bg_error: Arc::clone(&theme.tool_error_bg),
             bubble: TextBox::new(PADDING_X, PADDING_Y),
+            cell_pixel_size,
+            image_payload: None,
         };
         me.bubble.set_bg_fn(me.make_bg_box());
         me.rebuild_children();
@@ -254,8 +300,9 @@ impl ToolExecutionComponent {
     /// `details`. Called from
     /// [`aj_agent::events::AgentEvent::ToolExecutionUpdate`] (today
     /// only `bash` emits these).
-    pub fn update_partial(&mut self, details: &ToolDetails) {
+    pub fn update_partial(&mut self, details: &ToolDetails, content: &[UserContent]) {
         self.body = render_details_body(details, self.expanded);
+        self.image_payload = derive_image_payload(details, content);
         self.last_details = Some(details.clone());
         self.last_is_error = false;
         self.rebuild_children();
@@ -263,8 +310,22 @@ impl ToolExecutionComponent {
 
     /// Finalize the component with the tool's result. Called from
     /// [`aj_agent::events::AgentEvent::ToolExecutionEnd`].
-    pub fn update_result(&mut self, details: &ToolDetails, is_error: bool) {
+    ///
+    /// `content` is the wire content vector from the tool result;
+    /// it is currently only consulted to decide whether an inline
+    /// image (carried as a [`aj_models::types::UserContent::Image`]
+    /// block) should be rendered. Tools that don't return images
+    /// pass an empty slice. When multiple image blocks are present
+    /// only the first is rendered for now (no current tool returns
+    /// more than one).
+    pub fn update_result(
+        &mut self,
+        details: &ToolDetails,
+        content: &[UserContent],
+        is_error: bool,
+    ) {
         self.body = render_details_body(details, self.expanded);
+        self.image_payload = derive_image_payload(details, content);
         self.last_details = Some(details.clone());
         self.last_is_error = is_error;
         self.status = derive_status(details, is_error);
@@ -360,6 +421,36 @@ impl ToolExecutionComponent {
             let body_joined = self.body.join("\n");
             let body_text = Text::new(&body_joined, 0, 0);
             self.bubble.add_child(Box::new(body_text));
+        }
+
+        // Inline image attachment. Rendered only when the tool
+        // result carried a [`UserContent::Image`] block AND the
+        // host terminal advertises an image protocol. Kitty +
+        // non-PNG falls back to the textual placeholder that
+        // [`render_details_body`] already produces, because
+        // Kitty doesn't accept JPEG inline. TODO (Phase 5):
+        // wire a `show_in_terminal` config gate; for now we
+        // always render inline when capabilities allow.
+        if let Some(payload) = &self.image_payload {
+            let caps = get_capabilities();
+            let inline_ok = match caps.images {
+                Some(ImageProtocol::Kitty) => payload.mime_type == "image/png",
+                Some(ImageProtocol::ITerm2) => true,
+                None => false,
+            };
+            if inline_ok {
+                // `max_cells` keeps a huge image from taking
+                // half the screen. Chosen to roughly match the
+                // bubble's text body height.
+                let image = Image::new(
+                    payload.base64_data.clone(),
+                    payload.mime_type.clone(),
+                    payload.pixels,
+                    (40, 20),
+                    self.cell_pixel_size,
+                );
+                self.bubble.add_child(Box::new(image));
+            }
         }
     }
 }
@@ -482,6 +573,42 @@ fn quote_for_summary(s: &str) -> String {
     } else {
         format!("\"{cleaned}\"")
     }
+}
+
+/// Pick out the first [`UserContent::Image`] block in the tool's
+/// wire content and pair it with the source pixel dimensions
+/// from the matching [`ToolDetails::Image`].
+///
+/// Returns `None` when `details` is not the `Image` variant or
+/// `content` carries no image block. Today's tools (`read_file`)
+/// emit at most one image per call; if a future tool produces
+/// more we only render the first one, intentionally — multi-
+/// image inline rendering is a separate layout problem.
+fn derive_image_payload(details: &ToolDetails, content: &[UserContent]) -> Option<ImagePayload> {
+    let ToolDetails::Image {
+        original_dimensions,
+        displayed_dimensions,
+        ..
+    } = details
+    else {
+        return None;
+    };
+    let image = content.iter().find_map(|c| match c {
+        UserContent::Image(img) => Some(img),
+        UserContent::Text(_) => None,
+    })?;
+    // `displayed_dimensions` reflects any resize the tool
+    // applied before encoding the bytes; it's the correct
+    // pixel size for the base64 payload we're about to ship
+    // to the terminal. `original_dimensions` is kept on the
+    // details for the textual fallback's annotation line.
+    let _ = original_dimensions;
+    let ImageContent { data, mime_type } = image;
+    Some(ImagePayload {
+        base64_data: data.clone(),
+        mime_type: mime_type.clone(),
+        pixels: *displayed_dimensions,
+    })
 }
 
 /// Render the body lines for a [`ToolDetails`] variant. Switching
@@ -694,6 +821,7 @@ mod tests {
                 summary: "/tmp/foo.txt".into(),
                 body: "line one\nline two".into(),
             },
+            &[],
             false,
         );
         let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
@@ -724,6 +852,7 @@ mod tests {
                 summary: "boom".into(),
                 body: String::new(),
             },
+            &[],
             true,
         );
         let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
@@ -751,6 +880,7 @@ mod tests {
                 stdout_truncation: None,
                 stderr_truncation: None,
             },
+            &[],
             false,
         );
         let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
@@ -777,6 +907,7 @@ mod tests {
                 stdout_truncation: None,
                 stderr_truncation: None,
             },
+            &[],
             false,
         );
         let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
@@ -806,6 +937,7 @@ mod tests {
                 stdout_truncation: None,
                 stderr_truncation: None,
             },
+            &[],
             false,
         );
         let lines: Vec<_> = c.render(80).iter().map(|l| strip_ansi(l)).collect();
@@ -841,6 +973,7 @@ mod tests {
                 summary: String::new(),
                 body: long_line.clone(),
             },
+            &[],
             false,
         );
         let width = 80;
@@ -902,6 +1035,7 @@ mod tests {
                 summary: String::new(),
                 body: "ok".into(),
             },
+            &[],
             false,
         );
         let succeeded = bg_sample(&mut c);
@@ -910,6 +1044,7 @@ mod tests {
                 summary: String::new(),
                 body: "boom".into(),
             },
+            &[],
             true,
         );
         let failed = bg_sample(&mut c);
@@ -951,6 +1086,7 @@ mod tests {
                 summary: "/tmp/big.txt".into(),
                 body,
             },
+            &[],
             false,
         );
         let first = c.render(80);
@@ -985,6 +1121,7 @@ mod tests {
                 summary: String::new(),
                 body,
             },
+            &[],
             false,
         );
         let width = 60;
@@ -1031,6 +1168,7 @@ mod tests {
                 stdout_truncation: None,
                 stderr_truncation: None,
             },
+            &[],
             false,
         );
         let width = 60;
@@ -1077,6 +1215,7 @@ mod tests {
                 summary: String::new(),
                 body: body.clone(),
             },
+            &[],
             false,
         );
         // First ten lines are visible plus a hint line.
@@ -1137,6 +1276,7 @@ mod tests {
                 stdout_truncation: None,
                 stderr_truncation: None,
             },
+            &[],
             false,
         );
         let plain: Vec<String> = c.body.iter().map(|l| strip_ansi(l)).collect();

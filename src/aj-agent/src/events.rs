@@ -13,16 +13,32 @@
 //!
 //! See `docs/aj-next-plan.md` §1.1.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aj_models::streaming::AssistantMessageEvent;
-use aj_models::types::{AssistantMessage, ToolResultMessage};
+use aj_models::types::{AssistantMessage, ToolResultMessage, UserContent};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::message::AgentMessage;
 use crate::tool::ToolDetails;
 use crate::types::TokenUsage;
+
+/// Serialize an `Arc<[UserContent]>` as a JSON sequence so the
+/// event's wire shape matches a plain `Vec<UserContent>` for
+/// listeners that ship events out-of-process (`aj --format json`).
+fn serialize_content_arc<S>(content: &Arc<[UserContent]>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let mut seq = serializer.serialize_seq(Some(content.len()))?;
+    for block in content.iter() {
+        seq.serialize_element(block)?;
+    }
+    seq.end()
+}
 
 /// Identifier for the agent emitting an event.
 ///
@@ -139,6 +155,13 @@ pub enum AgentEvent {
         tool: String,
         args: Value,
         partial: ToolDetails,
+        /// Cumulative partial wire content blocks. Empty for tools
+        /// that only stream [`ToolDetails`] snapshots without
+        /// surfacing partial wire content. `Arc<[…]>` keeps the
+        /// event cheap to clone across the bus when an image block
+        /// (which can be multiple megabytes of base64) is attached.
+        #[serde(serialize_with = "serialize_content_arc")]
+        content: Arc<[UserContent]>,
     },
     /// A tool call has finalized. `result` is the structured payload
     /// that flows into the persistence log; `is_error` mirrors the
@@ -148,6 +171,15 @@ pub enum AgentEvent {
         call_id: String,
         tool: String,
         result: ToolDetails,
+        /// The finalized tool-result wire content blocks. Mirrors
+        /// the `content` field on the corresponding
+        /// [`ToolResultMessage`] in the transcript; carried on the
+        /// event so live renderers (e.g. inline image display) can
+        /// reach the raw block payloads without rummaging through
+        /// the transcript. `Arc<[…]>` keeps cloning cheap for
+        /// image-bearing results.
+        #[serde(serialize_with = "serialize_content_arc")]
+        content: Arc<[UserContent]>,
         is_error: bool,
     },
 

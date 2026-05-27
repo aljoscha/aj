@@ -910,6 +910,21 @@ pub struct Tui {
     /// tracking because the TUI owns the entire viewport after every
     /// full redraw.
     previous_viewport_top: usize,
+    /// Kitty graphics image IDs placed by the most recent frame.
+    ///
+    /// Kitty does not replace placements by overwriting cells: any
+    /// row that previously held a placement must be issued a
+    /// delete-by-id escape (`\x1b_Ga=d,d=I,i=<id>\x1b\\`) before
+    /// the row is redrawn, otherwise the old image stays painted
+    /// underneath the new content. The differential renderer
+    /// walks the `previous_lines` rows it's about to repaint,
+    /// collects every placed ID via
+    /// [`crate::image_protocol::extract_kitty_image_ids`], and
+    /// emits a delete for each one before writing the diff bytes.
+    /// Full redraws delete every tracked ID before the screen
+    /// clear. Updated to the new frame's IDs at the end of every
+    /// render.
+    previous_kitty_image_ids: std::collections::HashSet<u32>,
     last_render_time: Option<StdInstant>,
     render_requested: bool,
     /// Set by [`Tui::force_full_render`] / [`Tui::request_full_render`]
@@ -1054,6 +1069,7 @@ impl Tui {
             hardware_cursor_row: 0,
             max_lines_rendered: 0,
             previous_viewport_top: 0,
+            previous_kitty_image_ids: std::collections::HashSet::new(),
             last_render_time: None,
             render_requested: false,
             pending_full_clear: false,
@@ -1488,6 +1504,18 @@ impl Tui {
         // internally so cursor positions and width math don't shift.
         for line in &mut lines {
             *line = normalize_terminal_output(line);
+            // Image-protocol rows carry their own self-contained
+            // escape (Kitty `\x1b_G…\x1b\\` or iTerm2 OSC 1337);
+            // appending `SEGMENT_RESET` would either land inside
+            // the payload (corrupting the protocol) or terminate
+            // an SGR/OSC-8 state these rows never opened. The
+            // multi-row image contract in [`crate::image_protocol`]
+            // already keeps the surrounding rows blank, so the
+            // bleed-through that `SEGMENT_RESET` defends against
+            // can't reach them.
+            if crate::image_protocol::is_image_line(line) {
+                continue;
+            }
             line.push_str(SEGMENT_RESET);
         }
 
@@ -1729,6 +1757,17 @@ impl Tui {
         self.previous_height = current_height;
         self.last_render_time = Some(StdInstant::now());
         self.render_requested = false;
+
+        // Refresh the Kitty placement registry from the frame
+        // we just committed. The next render's diff path uses
+        // this set to decide which delete-by-id escapes to emit
+        // before redrawing any image-bearing row.
+        self.previous_kitty_image_ids.clear();
+        for line in &self.previous_lines {
+            for id in crate::image_protocol::extract_kitty_image_ids(line) {
+                self.previous_kitty_image_ids.insert(id);
+            }
+        }
 
         // Flush the debug record (if enabled) after all state is
         // settled so the logged `cursor_at_after`/`max_lines_rendered_after`
@@ -2042,12 +2081,17 @@ impl Tui {
     /// exclusive access to `self.input_listeners` without conflicting
     /// borrows of the rest of the engine state.
     fn handle_input_after_listeners(&mut self, event: &InputEvent) {
-        // No cell-size response branch here by design: aj has no image
-        // rendering to consume the `\x1b[6;<h>;<w>t` reply, and bytes
-        // are already parsed into typed events by the time they reach
-        // this dispatcher — the structural drop for unrecognized
-        // sequences happens at crossterm's `Parser::advance` Err arm.
-        // See the rustdoc on `TryFrom<Event>` in `keys.rs`.
+        // No cell-size response branch here by design: the image
+        // rendering path probes per-cell pixel size through
+        // `Terminal::cell_pixel_size` (synchronous, via
+        // `crossterm::terminal::window_size`) rather than the
+        // CSI `t` query/reply round-trip, so we never need to
+        // intercept a `\x1b[6;<h>;<w>t` reply in the input stream.
+        // Bytes that *do* arrive (from a terminal that volunteers
+        // the report, or from a user pasting one) are dropped at
+        // crossterm's `Parser::advance` Err arm before they reach
+        // this dispatcher. See the rustdoc on `TryFrom<Event>` in
+        // `keys.rs`.
 
         // Handle resize events.
         if let InputEvent::Resize(_, _) = event {
@@ -2612,6 +2656,11 @@ impl Tui {
         self.max_lines_rendered = 0;
         self.previous_viewport_top = 0;
         self.pending_full_clear = true;
+        // Tracked Kitty placements stay registered: the next
+        // render takes the full-clear branch in [`Self::full_render`]
+        // which drains the set and emits delete-by-id escapes
+        // before the screen wipe. Clearing here would leak the
+        // stale placements.
     }
 
     // -- Private rendering methods --
@@ -2675,6 +2724,18 @@ impl Tui {
             if skip_unchanged && self.previous_lines.get(i).is_some_and(|prev| prev == line) {
                 continue;
             }
+            // Image-protocol rows carry long byte payloads with
+            // zero visible width; the width validator measures
+            // wide-byte payloads as zero (the escape parser
+            // strips them) but rejecting on the byte length would
+            // false-positive, and `visible_width` of the whole
+            // line is undefined for these protocols. Skip them
+            // outright — the diff engine handles their layout
+            // through the row-count contract documented on
+            // [`crate::image_protocol`].
+            if crate::image_protocol::is_image_line(line) {
+                continue;
+            }
             let w = visible_width(line);
             if w > width {
                 let header = format!(
@@ -2708,6 +2769,14 @@ impl Tui {
     /// the terminal directly. See [`Self::render`] for the assembly path.
     fn full_render(&mut self, buf: &mut String, lines: &[String], clear: bool) {
         if clear {
+            // Kitty placements survive `\x1b[2J` — the graphics
+            // layer is independent of the cell grid. Delete every
+            // tracked ID before the screen wipe so a full redraw
+            // doesn't leave stale images painted underneath the
+            // new frame.
+            for id in self.previous_kitty_image_ids.drain() {
+                buf.push_str(&crate::image_protocol::kitty_delete(id));
+            }
             match self.full_clear_mode {
                 FullClearMode::WholeScreen => {
                     // `\x1b[2J`   erase entire viewport
@@ -2810,7 +2879,37 @@ impl Tui {
         buf: &mut String,
         lines: &[String],
     ) -> Option<(usize, usize)> {
-        let (first, last) = Self::compute_diff_range(&self.previous_lines, lines)?;
+        let (first, mut last) = Self::compute_diff_range(&self.previous_lines, lines)?;
+
+        // Expand `last` to cover every previous row inside
+        // `[first..]` that held a Kitty image placement. Those
+        // rows need an explicit delete-by-id before the diff
+        // bytes go out, and the deletion-only path below also
+        // relies on `last` reaching past `lines.len()` so the
+        // pure-deletion case is selected correctly when the
+        // image rows trail the new frame.
+        for (i, prev_line) in self.previous_lines.iter().enumerate().skip(first) {
+            if !crate::image_protocol::extract_kitty_image_ids(prev_line).is_empty() {
+                last = last.max(i);
+            }
+        }
+
+        // Emit Kitty delete-by-id escapes for every image
+        // placement that previously occupied the changed range.
+        // Kitty doesn't replace placements by overwriting cells,
+        // so without the explicit delete the old image stays
+        // painted under the new content.
+        let mut deleted: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let prev_changed_end = last.min(self.previous_lines.len().saturating_sub(1));
+        if !self.previous_lines.is_empty() {
+            for prev_line in &self.previous_lines[first..=prev_changed_end] {
+                for id in crate::image_protocol::extract_kitty_image_ids(prev_line) {
+                    if deleted.insert(id) {
+                        buf.push_str(&crate::image_protocol::kitty_delete(id));
+                    }
+                }
+            }
+        }
 
         // Pure-deletion branch: every changed row is past the end of
         // the new frame. Walk a dedicated cleanup path that uses CUD

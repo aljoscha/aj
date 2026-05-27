@@ -274,6 +274,7 @@ impl ReplayState {
             call_id: tr.tool_call_id.clone(),
             tool: tool_name,
             result,
+            content: std::sync::Arc::from(tr.content.clone().into_boxed_slice()),
             is_error: tr.is_error,
         });
     }
