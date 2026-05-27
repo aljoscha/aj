@@ -615,6 +615,12 @@ impl InteractiveMode {
                             // the model uses `read_file` on submit to
                             // look at it. Any failure (no image, no
                             // clipboard backend, etc.) is silent.
+                            //
+                            // Because we bypass `tui.handle_input` for
+                            // this chord, we must request a render
+                            // ourselves; otherwise the inserted path
+                            // sits in the editor buffer until the next
+                            // keystroke happens to trigger a paint.
                             {
                                 let kb = aj_tui::keybindings::get();
                                 if kb.matches(
@@ -632,6 +638,7 @@ impl InteractiveMode {
                                             &path.display().to_string(),
                                         );
                                     }
+                                    tui.request_render();
                                     continue;
                                 }
                             }
