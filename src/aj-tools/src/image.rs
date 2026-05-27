@@ -222,15 +222,17 @@ pub fn resize_image(
     mime_type: &str,
     options: &ResizeOptions,
 ) -> Option<ResizedImage> {
-    // NOTE: EXIF orientation correction not yet implemented — phone
-    // photos may appear rotated.
-
     let decoded = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
         .decode()
         .ok()?
         .to_rgba8();
+    // Apply EXIF orientation before measuring dimensions so the
+    // budget short-circuit and the dimension-note coordinate scale
+    // both work in display-oriented coordinates.
+    let orientation = exif::read_exif_orientation(bytes, mime_type);
+    let decoded = exif::apply_exif_orientation(decoded, orientation);
     let original_width = decoded.width();
     let original_height = decoded.height();
     let source_b64_size = encoded_base64_len(bytes.len());
@@ -238,6 +240,7 @@ pub fn resize_image(
     if original_width <= options.max_width
         && original_height <= options.max_height
         && source_b64_size < options.max_bytes
+        && orientation == 1
     {
         return Some(ResizedImage {
             data: BASE64.encode(bytes),
@@ -314,6 +317,14 @@ pub fn resize_image(
 /// budget via `image_auto_resize = false` in `~/.aj/config.toml`.
 /// Callers accept that the resulting attachment may exceed the
 /// provider's per-image size limit and be rejected on the wire.
+///
+/// EXIF orientation is intentionally preserved: because the source
+/// bytes are forwarded verbatim, the Orientation tag stays attached
+/// and vision models honor it themselves. Re-encoding to "bake in"
+/// the rotation would contradict the explicit `image_auto_resize =
+/// false` opt-in. The returned `original_width`/`original_height`
+/// reflect the sensor-orientation dimensions reported by the
+/// decoder, which matches the on-wire pixel buffer.
 pub fn passthrough_image(bytes: &[u8], mime_type: &str) -> Option<ResizedImage> {
     let (width, height) = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -462,6 +473,196 @@ fn finalize_candidate(raw: &[u8], mime_type: &str) -> EncodedCandidate {
         data,
         encoded_size,
         mime_type: mime_type.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXIF orientation
+// ---------------------------------------------------------------------------
+
+mod exif {
+    use image::{RgbaImage, imageops};
+
+    /// EXIF Orientation tag value.
+    const TAG_ORIENTATION: u16 = 0x0112;
+    /// EXIF SHORT type — what Orientation is always encoded as.
+    const TYPE_SHORT: u16 = 3;
+
+    /// Read EXIF orientation tag (0x0112) from a JPEG APP1 segment or
+    /// a WebP EXIF chunk. Returns 1 (no rotation) when the tag isn't
+    /// present, the file format doesn't carry EXIF, or the metadata
+    /// is malformed. Valid return values are 1..=8 per the EXIF spec.
+    pub(super) fn read_exif_orientation(bytes: &[u8], mime_type: &str) -> u8 {
+        let raw = match mime_type {
+            "image/jpeg" => parse_jpeg(bytes),
+            "image/webp" => parse_webp(bytes),
+            _ => None,
+        };
+        match raw {
+            Some(o) if (1..=8).contains(&o) => o,
+            _ => 1,
+        }
+    }
+
+    /// Apply the geometric transform implied by EXIF orientation
+    /// `1..=8` to `image`. Orientation 1 returns the image unchanged.
+    /// Unknown values are treated as 1.
+    pub(super) fn apply_exif_orientation(image: RgbaImage, orientation: u8) -> RgbaImage {
+        match orientation {
+            2 => imageops::flip_horizontal(&image),
+            3 => imageops::rotate180(&image),
+            4 => imageops::flip_vertical(&image),
+            5 => imageops::flip_horizontal(&imageops::rotate90(&image)),
+            6 => imageops::rotate90(&image),
+            7 => imageops::flip_horizontal(&imageops::rotate270(&image)),
+            8 => imageops::rotate270(&image),
+            _ => image,
+        }
+    }
+
+    /// Walk JPEG segments looking for an APP1 segment whose payload
+    /// starts with `"Exif\0\0"`, then parse orientation from the TIFF
+    /// header that follows.
+    fn parse_jpeg(bytes: &[u8]) -> Option<u8> {
+        if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+            return None;
+        }
+        let mut offset = 2;
+        while offset + 4 <= bytes.len() {
+            if bytes[offset] != 0xFF {
+                return None;
+            }
+            // Skip stuffing / fill bytes (`0xFF 0xFF...`).
+            if bytes[offset + 1] == 0xFF {
+                offset += 1;
+                continue;
+            }
+            let marker = bytes[offset + 1];
+            // SOI/EOI/RSTn carry no length field; stop on EOI/SOS.
+            // Note: 0xD8 (SOI) is only valid at file start; 0xD9 is EOI;
+            // 0xDA (SOS) marks the start of compressed scan data and
+            // any subsequent EXIF would be unreachable.
+            if marker == 0xD9 || marker == 0xDA {
+                return None;
+            }
+            let length = usize::from(u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]));
+            if length < 2 {
+                return None;
+            }
+            let segment_start = offset + 2;
+            let payload_start = segment_start + 2;
+            let segment_end = segment_start + length;
+            if segment_end > bytes.len() {
+                return None;
+            }
+            if marker == 0xE1 {
+                let payload = &bytes[payload_start..segment_end];
+                if payload.len() >= 6 && &payload[..6] == b"Exif\0\0" {
+                    return parse_tiff(&payload[6..]);
+                }
+            }
+            offset = segment_end;
+        }
+        None
+    }
+
+    /// Walk WebP RIFF chunks looking for the `EXIF` chunk, then parse
+    /// orientation from the TIFF header it contains. Some encoders
+    /// prefix the TIFF with the JPEG-style `"Exif\0\0"` header — skip
+    /// it when present.
+    fn parse_webp(bytes: &[u8]) -> Option<u8> {
+        if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+            return None;
+        }
+        let mut offset = 12;
+        while offset + 8 <= bytes.len() {
+            let id = &bytes[offset..offset + 4];
+            let length = usize::try_from(read_u32_le(bytes, offset + 4)?).ok()?;
+            let payload_start = offset + 8;
+            let payload_end = payload_start.checked_add(length)?;
+            if payload_end > bytes.len() {
+                return None;
+            }
+            if id == b"EXIF" {
+                let mut payload = &bytes[payload_start..payload_end];
+                if payload.len() >= 6 && &payload[..6] == b"Exif\0\0" {
+                    payload = &payload[6..];
+                }
+                return parse_tiff(payload);
+            }
+            // RIFF chunks are padded to an even length.
+            let advance = length + (length & 1);
+            offset = payload_start.checked_add(advance)?;
+        }
+        None
+    }
+
+    /// Parse the Orientation tag out of a TIFF header (`tiff` starts
+    /// at the byte-order mark). Returns `None` if the header is
+    /// malformed or the tag is absent.
+    fn parse_tiff(tiff: &[u8]) -> Option<u8> {
+        if tiff.len() < 8 {
+            return None;
+        }
+        let little_endian = match &tiff[..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let magic = read_u16(tiff, 2, little_endian)?;
+        if magic != 0x002A {
+            return None;
+        }
+        let ifd_offset = usize::try_from(read_u32(tiff, 4, little_endian)?).ok()?;
+        if ifd_offset + 2 > tiff.len() {
+            return None;
+        }
+        let entry_count = usize::from(read_u16(tiff, ifd_offset, little_endian)?);
+        let entries_start = ifd_offset + 2;
+        if entries_start + entry_count * 12 > tiff.len() {
+            return None;
+        }
+        for i in 0..entry_count {
+            let e = entries_start + i * 12;
+            let tag = read_u16(tiff, e, little_endian)?;
+            if tag != TAG_ORIENTATION {
+                continue;
+            }
+            let field_type = read_u16(tiff, e + 2, little_endian)?;
+            let count = read_u32(tiff, e + 4, little_endian)?;
+            if field_type != TYPE_SHORT || count != 1 {
+                return None;
+            }
+            // SHORT count=1: value lives in the first 2 bytes of the
+            // 4-byte value field, interpreted per the TIFF byte order.
+            let value = read_u16(tiff, e + 8, little_endian)?;
+            return u8::try_from(value).ok();
+        }
+        None
+    }
+
+    fn read_u16(buf: &[u8], offset: usize, little_endian: bool) -> Option<u16> {
+        let slice = buf.get(offset..offset + 2)?;
+        let bytes = [slice[0], slice[1]];
+        Some(if little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        })
+    }
+
+    fn read_u32(buf: &[u8], offset: usize, little_endian: bool) -> Option<u32> {
+        let slice = buf.get(offset..offset + 4)?;
+        let bytes = [slice[0], slice[1], slice[2], slice[3]];
+        Some(if little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    }
+
+    fn read_u32_le(buf: &[u8], offset: usize) -> Option<u32> {
+        read_u32(buf, offset, true)
     }
 }
 
@@ -705,5 +906,155 @@ mod tests {
             note,
             "[Image: original 1920x1080, displayed at 800x450. Multiply coordinates by 2.40 to map to original image.]"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // EXIF orientation
+    // -----------------------------------------------------------------
+
+    /// Build a minimal TIFF header carrying a single Orientation tag.
+    /// `little_endian` toggles between II/MM byte order.
+    fn build_tiff_orientation(orientation: u8, little_endian: bool) -> Vec<u8> {
+        let mut t = Vec::new();
+        if little_endian {
+            t.extend_from_slice(b"II");
+            t.extend_from_slice(&0x002Au16.to_le_bytes());
+            t.extend_from_slice(&8u32.to_le_bytes());
+            t.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+            t.extend_from_slice(&0x0112u16.to_le_bytes()); // tag
+            t.extend_from_slice(&3u16.to_le_bytes()); // type SHORT
+            t.extend_from_slice(&1u32.to_le_bytes()); // count
+            // SHORT value lives in the first 2 bytes of the value field
+            // (little-endian: low byte first).
+            t.extend_from_slice(&[orientation, 0, 0, 0]);
+            t.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+        } else {
+            t.extend_from_slice(b"MM");
+            t.extend_from_slice(&0x002Au16.to_be_bytes());
+            t.extend_from_slice(&8u32.to_be_bytes());
+            t.extend_from_slice(&1u16.to_be_bytes());
+            t.extend_from_slice(&0x0112u16.to_be_bytes());
+            t.extend_from_slice(&3u16.to_be_bytes());
+            t.extend_from_slice(&1u32.to_be_bytes());
+            // Big-endian SHORT: high byte first, so the meaningful
+            // byte sits at offset+1 within the value field.
+            t.extend_from_slice(&[0, orientation, 0, 0]);
+            t.extend_from_slice(&0u32.to_be_bytes());
+        }
+        t
+    }
+
+    /// Wrap a TIFF blob in a JPEG APP1 segment and prepend an SOI.
+    /// The trailing zero bytes are not meaningful — they keep the
+    /// buffer non-empty after the segment so the segment walker can
+    /// terminate cleanly.
+    fn build_jpeg_with_exif(tiff: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        let mut app1 = vec![0xFF, 0xE1];
+        let payload_len = u16::try_from(2 + 6 + tiff.len()).unwrap();
+        app1.extend_from_slice(&payload_len.to_be_bytes());
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(tiff);
+        out.extend(app1);
+        // Trailing scan-like data — not parsed.
+        out.extend_from_slice(&[0xFF, 0xDA, 0, 0]);
+        out
+    }
+
+    /// Splice a minimal APP1 segment with the requested Orientation
+    /// directly after the SOI of an existing JPEG byte stream.
+    fn inject_exif_orientation(mut jpeg: Vec<u8>, orientation: u8) -> Vec<u8> {
+        let tiff = build_tiff_orientation(orientation, false);
+        let mut app1 = vec![0xFF, 0xE1];
+        let payload_len = u16::try_from(2 + 6 + tiff.len()).unwrap();
+        app1.extend_from_slice(&payload_len.to_be_bytes());
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+        let mut out: Vec<u8> = jpeg.drain(..2).collect();
+        out.extend(app1);
+        out.extend(jpeg);
+        out
+    }
+
+    #[test]
+    fn read_exif_orientation_returns_1_for_png() {
+        let bytes = make_png(8, 8);
+        assert_eq!(exif::read_exif_orientation(&bytes, "image/png"), 1);
+    }
+
+    #[test]
+    fn read_exif_orientation_returns_1_for_jpeg_without_exif() {
+        let bytes = jpeg_header();
+        assert_eq!(exif::read_exif_orientation(&bytes, "image/jpeg"), 1);
+    }
+
+    #[test]
+    fn read_exif_orientation_reads_jpeg_app1_orientation_6() {
+        let tiff = build_tiff_orientation(6, false);
+        let bytes = build_jpeg_with_exif(&tiff);
+        assert_eq!(exif::read_exif_orientation(&bytes, "image/jpeg"), 6);
+    }
+
+    #[test]
+    fn read_exif_orientation_handles_little_endian_jpeg() {
+        let tiff = build_tiff_orientation(6, true);
+        let bytes = build_jpeg_with_exif(&tiff);
+        assert_eq!(exif::read_exif_orientation(&bytes, "image/jpeg"), 6);
+    }
+
+    #[test]
+    fn apply_exif_orientation_identity() {
+        let img = RgbaImage::from_pixel(40, 20, Rgba([10, 20, 30, 255]));
+        let out = exif::apply_exif_orientation(img.clone(), 1);
+        assert_eq!(out.dimensions(), (40, 20));
+        assert_eq!(out.as_raw(), img.as_raw());
+    }
+
+    #[test]
+    fn apply_exif_orientation_rotate90_swaps_dimensions() {
+        let img = RgbaImage::from_pixel(100, 50, Rgba([10, 20, 30, 255]));
+        let out = exif::apply_exif_orientation(img, 6);
+        assert_eq!(out.dimensions(), (50, 100));
+    }
+
+    #[test]
+    fn apply_exif_orientation_rotate180_preserves_dimensions() {
+        let mut img = RgbaImage::from_pixel(100, 50, Rgba([0, 0, 0, 255]));
+        // Mark the top-left corner with a distinctive color.
+        img.put_pixel(0, 0, Rgba([255, 7, 11, 255]));
+        let out = exif::apply_exif_orientation(img, 3);
+        assert_eq!(out.dimensions(), (100, 50));
+        // After 180° rotation the marked pixel lands at the
+        // diagonally opposite corner.
+        assert_eq!(*out.get_pixel(99, 49), Rgba([255, 7, 11, 255]));
+        assert_eq!(*out.get_pixel(0, 0), Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn resize_image_corrects_jpeg_orientation_6() {
+        // 100×50 RGBA → JPEG → inject APP1(Orientation=6).
+        let mut img = RgbaImage::new(100, 50);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let r = u8::try_from((x ^ y) & 0xff).unwrap_or(0);
+            *px = Rgba([r, 64, 200, 255]);
+        }
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .to_rgb8()
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .expect("encode jpeg");
+        let bytes = inject_exif_orientation(jpeg, 6);
+
+        assert_eq!(exif::read_exif_orientation(&bytes, "image/jpeg"), 6);
+
+        let resized =
+            resize_image(&bytes, "image/jpeg", &ResizeOptions::default()).expect("resize result");
+        // Orientation 6 swaps width/height; corrected dimensions
+        // should be reported as (50, 100), not the sensor (100, 50).
+        assert_eq!(resized.original_width, 50);
+        assert_eq!(resized.original_height, 100);
     }
 }
