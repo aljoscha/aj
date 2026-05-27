@@ -720,17 +720,28 @@ fn resolve_anchor_col(anchor: OverlayAnchor, width: usize, avail_width: usize) -
 
 /// Composite an overlay line onto a base line at a specific column.
 ///
-/// Handles three boundary concerns beyond the naive "splice segments
+/// Handles four boundary concerns beyond the naive "splice segments
 /// together" recipe:
 ///
-/// 1. The overlay is truncated with [`slice_with_width`] (`strict = true`)
+/// 1. If `base` is an inline-image row (Kitty `\x1b_G…` or iTerm2
+///    OSC 1337, detected via [`crate::image_protocol::is_image_line`]),
+///    the function returns the base unchanged. The base64 payload
+///    looks like printable text to `extract_segments`; slicing and
+///    splicing overlay bytes into it would corrupt both the on-wire
+///    escape and the `previous_lines` byte-equality cache the diff
+///    engine relies on. Dropping the overlay on this single row is
+///    the only safe behavior — overlay rows above or below the image
+///    still composite normally. Mirrors the bypasses in the width
+///    validator and the SGR/OSC8 reset-append pass.
+///
+/// 2. The overlay is truncated with [`slice_with_width`] (`strict = true`)
 ///    before compositing. A wide grapheme whose left half fits at
 ///    `overlay_width - 1` but whose right half would extend to
 ///    `overlay_width + 1` is dropped; otherwise the composited line's
 ///    visible width would exceed the overlay's declared width and
 ///    trample the "after" segment's columns.
 ///
-/// 2. The result is padded to `total_width` via right-side
+/// 3. The result is padded to `total_width` via right-side
 ///    (`after_padding`) spaces so the composited row always has the
 ///    same visible width as the terminal. Without this, a row whose
 ///    base content stopped short of `total_width` would leave the
@@ -739,7 +750,7 @@ fn resolve_anchor_col(anchor: OverlayAnchor, width: usize, avail_width: usize) -
 ///    the short row as equal to its predecessor and skip re-emitting
 ///    it — the stale cells would persist indefinitely.
 ///
-/// 3. A post-composition width clamp truncates the final line to
+/// 4. A post-composition width clamp truncates the final line to
 ///    `total_width`. Style bytes in the input (OSC 8, SGR, etc.) can
 ///    produce enough edge cases in the segment extraction that the
 ///    combined output occasionally drifts past the terminal width by
@@ -753,6 +764,18 @@ fn composite_line_at(
     overlay_width: usize,
     total_width: usize,
 ) -> String {
+    // Image-protocol rows carry a self-contained escape (Kitty
+    // `\x1b_G…\x1b\\` or iTerm2 OSC 1337) whose base64 payload is
+    // indistinguishable from printable text to `extract_segments`.
+    // Slicing the payload at `start_col` and splicing overlay bytes
+    // into the middle would corrupt the on-wire frame and poison
+    // the diff engine's `previous_lines` byte-equality cache. Pass
+    // the row through unchanged; the overlay simply doesn't paint
+    // on this row. Other overlay rows still composite normally.
+    if crate::image_protocol::is_image_line(base) {
+        return base.to_string();
+    }
+
     let (before, before_width, after, after_width) = extract_segments(
         base,
         start_col,
