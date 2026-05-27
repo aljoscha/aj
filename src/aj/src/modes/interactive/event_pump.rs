@@ -70,6 +70,16 @@ pub struct EventPump {
     /// stops on the 1→0 transition, so the spinner is visible for
     /// the entire span between the *first* `AgentStart` and the
     /// *last* `AgentEnd`, regardless of how the events nest.
+    ///
+    /// Main's `AgentEnd` is additionally treated as authoritative:
+    /// when it fires, the set is drained and the loader stops even
+    /// if a sub-agent's `AgentEnd` was lost. This is sound because
+    /// `Agent::run_top_level_turn` only emits Main's `AgentEnd`
+    /// after every spawned sub-agent's future has been awaited (or
+    /// dropped); anything still in the set at that point is a
+    /// stale entry, not a sub-agent that's actually still running,
+    /// and waiting for its `AgentEnd` would pin the spinner
+    /// (and the render loop) forever on an idle session.
     running_agents: HashSet<AgentId>,
     /// Whether new and existing assistant-message components
     /// should render thinking blocks as a single italic
@@ -281,9 +291,28 @@ impl EventPump {
                 // `ToolExecutionEnd` for that call needs. Only
                 // the main agent's `AgentEnd` ends the turn from
                 // the chat-scrollback's perspective.
+                //
+                // Main's end is also the authoritative "agent
+                // activity has stopped" signal for the loader.
+                // Stop it unconditionally and drain the set: any
+                // sub-agent ID still in `running_agents` is a
+                // stale entry whose `AgentEnd` was dropped (most
+                // often because the parent's `spawn_agent`
+                // future was cancelled mid-await) — by the time
+                // Main's `AgentEnd` fires, every sub-agent's
+                // future has been driven to completion or
+                // dropped, so the entry doesn't correspond to a
+                // task that's still running. Without this drain
+                // the loader's animation pump keeps requesting
+                // renders every 80 ms on what is, from the
+                // user's POV, an idle session.
                 if *agent_id == AgentId::Main {
                     self.current_assistant = None;
                     self.tool_index.clear();
+                    if !self.running_agents.is_empty() {
+                        self.running_agents.clear();
+                        self.with_loader(tui, |l| l.stop());
+                    }
                 }
             }
             AgentEvent::TurnStart { .. } => {
@@ -1575,13 +1604,71 @@ mod tests {
     }
 
     #[test]
+    fn main_agent_end_drains_leaked_subagents_and_stops_loader() {
+        // Authoritative-end contract: when the main agent emits
+        // `AgentEnd`, the loader must stop even if a sub-agent's
+        // own `AgentEnd` was dropped earlier in the turn (typical
+        // cause: the parent's `spawn_agent` future was cancelled
+        // mid-await, so `Agent::run_single_turn` was dropped at
+        // `run_single_turn_inner.await` and the `AgentEnd` emit
+        // on the following line never fired).
+        //
+        // Regression for a CPU-pegging bug observed on a long
+        // idle session: a stale sub-agent ID kept `running_agents`
+        // non-empty after the main turn ended, the loader stayed
+        // active, and its animation pump kept calling
+        // `request_render` every 80 ms forever — pinning one CPU
+        // core through `Tui::render` over a ~25k-line scrollback.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        fn is_loader_active(tui: &mut Tui) -> bool {
+            tui.get_mut_as::<Container>(SlotIndex::Status.idx())
+                .expect("status slot")
+                .get_mut_as::<LoaderStatus>(0)
+                .expect("loader status")
+                .is_active()
+        }
+
+        // Main turn starts and spawns a sub-agent.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        assert!(is_loader_active(&mut tui));
+
+        // Note: no `AgentEnd(Sub(1))` — simulates the dropped emit.
+        // Main's `AgentEnd` fires.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+
+        assert!(
+            !is_loader_active(&mut tui),
+            "loader must stop on Main's AgentEnd even with a leaked \
+             sub-agent — otherwise the animation pump pegs CPU on \
+             an idle session"
+        );
+    }
+
+    #[test]
     fn second_main_turn_recovers_loader_after_a_leaked_subagent() {
-        // Defence-in-depth: even if the agent task between two
-        // main turns somehow leaves a sub-agent's `AgentEnd`
-        // unemitted (panic, future cancellation), the next
-        // top-level turn must reset cleanly. The first turn
-        // simulates the leak; the second verifies the loader
-        // start/stop cycle works as expected after.
+        // Defence-in-depth: even with the authoritative-end fix,
+        // exercise the next-turn path so a future regression that
+        // weakens the AgentEnd handler is still caught by the
+        // top-level resync at AgentStart{Main} (which clears the
+        // stale set unconditionally).
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
 
         fn is_loader_active(tui: &mut Tui) -> bool {
@@ -1614,21 +1701,19 @@ mod tests {
                 messages: Vec::new(),
             },
         );
-        // The leaked sub means the set isn't empty, so the loader
-        // is still on. This is the locally-correct behaviour given
-        // the bus state — the loader doesn't lie about whether
-        // *something* is running. The resync happens on the next
-        // top-level start.
+        // Main's `AgentEnd` is authoritative: even with the leaked
+        // sub still in the set when it fires, the loader stops.
         assert!(
-            is_loader_active(&mut tui),
-            "loader stays active when the sub's End leaks, until \
-             the next top-level start resyncs",
+            !is_loader_active(&mut tui),
+            "loader stops on Main's AgentEnd; the leaked sub's stale \
+             entry is drained as part of that handler"
         );
 
-        // Turn 2: a fresh `AgentStart(Main)` is the resync point.
-        // The stale Sub(3) is dropped from the set, the new turn
-        // is the only one in flight, and the loader's start /
-        // stop cycle transitions cleanly through it.
+        // Turn 2: a fresh `AgentStart(Main)` is also a resync point.
+        // The `running_agents.clear()` on Main's start is now a
+        // belt-and-suspenders guard (Main's End above already
+        // drained the set); the start/stop cycle of the new turn
+        // still transitions cleanly through it.
         pump.handle(
             &mut tui,
             &AgentEvent::AgentStart {
@@ -1645,9 +1730,7 @@ mod tests {
         );
         assert!(
             !is_loader_active(&mut tui),
-            "second main turn must end with the loader stopped — \
-             the previous turn's leaked sub-agent id was discarded \
-             at the new turn's AgentStart",
+            "second main turn ends with the loader stopped",
         );
     }
 
