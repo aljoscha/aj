@@ -1271,19 +1271,20 @@ fn refresh_footer_model(
     }
 }
 
-/// Inner-content row count for every full-window overlay (palette,
-/// help, model / thinking / session selectors). Total rendered height
-/// including chrome is `PALETTE_OVERLAY_INNER_ROWS + 4`. Tuned to fit
-/// comfortably on a standard 24-row terminal.
+/// Inner-content row count for the compact overlays (palette, help,
+/// model / thinking pickers). Total rendered height including chrome
+/// is `PALETTE_OVERLAY_INNER_ROWS + 4`. Tuned to fit comfortably on a
+/// standard 24-row terminal. The content-heavy overlays (session
+/// switcher, prompt history) size their rows dynamically instead — see
+/// [`large_overlay_geometry`].
 const PALETTE_OVERLAY_INNER_ROWS: usize = 17;
 
-/// Sizing/anchor used by the command palette and every full-window
-/// selector (model / thinking / session / prompt history). Centered,
-/// fills ~70% of the terminal width with a 72-col floor and an 88-col
-/// ceiling so the box doesn't stretch uncomfortably wide on large
-/// monitors. Height is fixed at `PALETTE_OVERLAY_INNER_ROWS + 4` to
-/// match the stable height the
-/// [`aj_tui::components::overlay_window::OverlayWindow`] now renders;
+/// Sizing/anchor used by the command palette and the compact pickers
+/// (model / thinking / help). Centered, fills ~70% of the terminal
+/// width with a 72-col floor and an 88-col ceiling so the box doesn't
+/// stretch uncomfortably wide on large monitors. Height is fixed at
+/// `PALETTE_OVERLAY_INNER_ROWS + 4` to match the stable height the
+/// [`aj_tui::components::overlay_window::OverlayWindow`] renders;
 /// pinning the compositor's height to the exact value keeps narrow
 /// terminals from reserving extra rows.
 fn palette_overlay_options() -> OverlayOptions {
@@ -1296,6 +1297,58 @@ fn palette_overlay_options() -> OverlayOptions {
         ..OverlayOptions::default()
     }
 }
+
+/// Floor / ceiling for the inner-content row count of a large
+/// overlay. The floor keeps the box usable on a standard 24-row
+/// terminal; the ceiling stops it from swallowing the whole screen
+/// on a very tall one.
+const LARGE_OVERLAY_MIN_INNER_ROWS: usize = 14;
+const LARGE_OVERLAY_MAX_INNER_ROWS: usize = 32;
+
+/// Resolved geometry for a large overlay: the `OverlayWindow`'s
+/// fixed inner-row budget plus the matching compositor options.
+struct LargeOverlayGeometry {
+    /// Inner-content rows the [`OverlayWindow`] renders (excludes the
+    /// 4 rows of chrome: top/bottom border + top/bottom padding).
+    inner_rows: usize,
+    options: OverlayOptions,
+}
+
+/// Sizing for the two content-heavy overlays (session switcher and
+/// prompt history). Both carry per-row metadata and benefit from far
+/// more room than the compact pickers, so they scale with the
+/// terminal rather than using the fixed palette geometry.
+///
+/// Width fills ~85% of the terminal (72-col floor, 120-col ceiling).
+/// Height scales to ~80% of `term_rows`, with the inner-row budget
+/// clamped to `[LARGE_OVERLAY_MIN_INNER_ROWS,
+/// LARGE_OVERLAY_MAX_INNER_ROWS]`. `max_height` is pinned to the
+/// resolved box height (`inner_rows + 4`) so the compositor reserves
+/// exactly the rows the [`OverlayWindow`] renders — matching the
+/// fixed-height contract the window relies on.
+fn large_overlay_geometry(term_rows: u16) -> LargeOverlayGeometry {
+    let budget = SizeValue::Percent(80.0).resolve(usize::from(term_rows));
+    let inner_rows = budget
+        .saturating_sub(OVERLAY_WINDOW_CHROME_ROWS)
+        .clamp(LARGE_OVERLAY_MIN_INNER_ROWS, LARGE_OVERLAY_MAX_INNER_ROWS);
+    let options = OverlayOptions {
+        anchor: OverlayAnchor::Center,
+        width: Some(SizeValue::Percent(85.0)),
+        min_width: Some(72),
+        max_width: Some(120),
+        max_height: Some(SizeValue::Absolute(inner_rows + OVERLAY_WINDOW_CHROME_ROWS)),
+        ..OverlayOptions::default()
+    };
+    LargeOverlayGeometry {
+        inner_rows,
+        options,
+    }
+}
+
+/// Chrome rows an [`aj_tui::components::overlay_window::OverlayWindow`]
+/// adds around its inner content: top + bottom border and top + bottom
+/// blank padding.
+const OVERLAY_WINDOW_CHROME_ROWS: usize = 4;
 
 /// Subtitle for overlays that accept a selection: `"Enter to
 /// confirm  •  Esc to close"`, with both key labels resolved from
@@ -1516,21 +1569,26 @@ async fn handle_slash_command(
                 };
             }
 
+            let geometry = large_overlay_geometry(tui.terminal().rows());
+            // Session-selector chrome above the list: search input +
+            // blank separator + the list's own scroll-info line.
+            let session_max_rows = geometry.inner_rows.saturating_sub(3).max(1);
             let inner = SessionSelectorComponent::new(
                 select_list_theme(theme),
                 previews,
                 Some(current_thread_id),
                 None,
+                session_max_rows,
             );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Resume thread",
                 Box::new(inner),
                 crate::config::theme::overlay_window_theme(theme),
-                PALETTE_OVERLAY_INNER_ROWS,
+                geometry.inner_rows,
             )
             .with_subtitle(&subtitle_confirm_close());
-            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            let handle = tui.show_overlay(Box::new(window), geometry.options);
             SlashHandled::Continue {
                 selector: Some(OpenSelector::Session {
                     handle,
@@ -1558,21 +1616,26 @@ async fn handle_slash_command(
                     }
                 })
             };
+            let geometry = large_overlay_geometry(tui.terminal().rows());
+            // Prompt-history chrome above the list: search input +
+            // scope line + blank separator + the list's scroll-info
+            // line.
+            let history_max_rows = geometry.inner_rows.saturating_sub(4).max(1);
             let inner = PromptHistorySearchComponent::new(
                 select_list_theme(theme),
                 workspace_entries,
                 all_loader,
-                14,
+                history_max_rows,
             );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Prompt history",
                 Box::new(inner),
                 crate::config::theme::overlay_window_theme(theme),
-                PALETTE_OVERLAY_INNER_ROWS,
+                geometry.inner_rows,
             )
             .with_subtitle(&subtitle_confirm_close());
-            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            let handle = tui.show_overlay(Box::new(window), geometry.options);
             SlashHandled::Continue {
                 selector: Some(OpenSelector::PromptHistory {
                     handle,

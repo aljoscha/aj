@@ -27,16 +27,6 @@ use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 use chrono::{DateTime, Utc};
 
-/// Maximum visible rows in the result list. The session picker
-/// carries more per-row metadata than the thinking or model
-/// pickers (preview prefix + creation date + last-message age),
-/// so it benefits from showing more candidates at once than the
-/// shared eight-row baseline. Thinking and model selectors stay
-/// at eight — their catalogs are small and have far lower
-/// information density per row, so the extra height there would
-/// be wasted screen real-estate.
-const MAX_VISIBLE_ROWS: usize = 14;
-
 /// Cap on how much of the first user message is rendered in the
 /// primary column. Keeps long pastes (a stack trace, a chunk of
 /// code) from blowing past the overlay width while leaving room
@@ -96,6 +86,10 @@ pub struct SessionSelectorComponent {
     /// reconstruct the underlying nucleo state on every keystroke
     /// (it allocates ~135 KB up front per `FuzzyMatcher::new`).
     matcher: FuzzyMatcher,
+    /// Maximum visible rows in the result list, sized by the host
+    /// from the overlay's resolved height so a taller box shows more
+    /// candidates at once.
+    max_visible_rows: usize,
     /// `now` snapshot taken at construction time. Used to format
     /// each row's age (`5m`, `3h`, …) without re-reading the clock
     /// on every rebuild. The selector closes within seconds in
@@ -116,12 +110,14 @@ impl SessionSelectorComponent {
     /// the search box so the overlay opens already filtered; the
     /// slash layer passes `None`, but the parameter is kept as a
     /// general capability. `theme` styles the underlying
-    /// [`SelectList`].
+    /// [`SelectList`]. `max_visible_rows` caps how many result rows
+    /// the list shows at once.
     pub fn new(
         theme: SelectListTheme,
         catalog: Vec<ThreadPreview>,
         current_thread_id: Option<String>,
         initial_query: Option<String>,
+        max_visible_rows: usize,
     ) -> Self {
         let mut search = TextInput::new("search: ");
         if let Some(q) = initial_query {
@@ -133,7 +129,7 @@ impl SessionSelectorComponent {
         // the initial filter and pre-selection.
         let list = SelectList::new(
             Vec::new(),
-            MAX_VISIBLE_ROWS,
+            max_visible_rows,
             theme.clone(),
             primary_column_layout(),
         );
@@ -147,6 +143,7 @@ impl SessionSelectorComponent {
             outcome,
             theme,
             matcher: FuzzyMatcher::new(),
+            max_visible_rows,
             now: Utc::now(),
         };
         component.rebuild_list();
@@ -204,7 +201,7 @@ impl SessionSelectorComponent {
 
         let mut list = SelectList::new(
             items,
-            MAX_VISIBLE_ROWS,
+            self.max_visible_rows,
             self.theme.clone(),
             primary_column_layout(),
         );
@@ -390,7 +387,7 @@ impl Component for SessionSelectorComponent {
         // Chrome (title + border) is provided by the surrounding
         // `OverlayWindow` at mount time; we render just the search
         // input stacked above the result list.
-        let mut lines = Vec::with_capacity(MAX_VISIBLE_ROWS + 2);
+        let mut lines = Vec::with_capacity(self.max_visible_rows + 2);
         lines.extend(self.search.render(width));
         lines.push(String::new());
         lines.extend(self.list.render(width));
@@ -454,6 +451,11 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
+
+    /// Visible-row cap used across the unit tests. The host derives
+    /// this from the overlay height at runtime; the tests just need a
+    /// fixed, generous value.
+    const TEST_MAX_VISIBLE_ROWS: usize = 14;
 
     /// Identity theme for tests — passes every closure through
     /// verbatim so renders show structural text rather than ANSI.
@@ -534,6 +536,7 @@ mod tests {
             catalog,
             Some("2025-05-09".to_string()),
             None,
+            TEST_MAX_VISIBLE_ROWS,
         );
         // Render wide enough that SelectList's primary column
         // doesn't truncate the `(current)` suffix off the label.
@@ -553,6 +556,7 @@ mod tests {
             catalog,
             Some("2025-05-10".to_string()),
             None,
+            TEST_MAX_VISIBLE_ROWS,
         );
         let outcome = sel.outcome_handle();
         // 2025-05-10 is pre-selected (current); Enter should commit
@@ -570,7 +574,13 @@ mod tests {
     #[test]
     fn esc_emits_cancelled_outcome() {
         let catalog = sample_catalog();
-        let mut sel = SessionSelectorComponent::new(identity_theme(), catalog, None, None);
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            catalog,
+            None,
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+        );
         let outcome = sel.outcome_handle();
         sel.handle_input(&escape_event());
         let result = outcome.lock().unwrap().take().expect("outcome was set");
@@ -584,7 +594,13 @@ mod tests {
     fn down_arrow_moves_to_next_row_then_enter_confirms_it() {
         let catalog = sample_catalog();
         // No current thread → first row pre-selected.
-        let mut sel = SessionSelectorComponent::new(identity_theme(), catalog, None, None);
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            catalog,
+            None,
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+        );
         let outcome = sel.outcome_handle();
         sel.handle_input(&down_event());
         sel.handle_input(&enter_event());
@@ -601,7 +617,13 @@ mod tests {
     #[test]
     fn typing_filters_the_list_and_enter_commits_top_match() {
         let catalog = sample_catalog();
-        let mut sel = SessionSelectorComponent::new(identity_theme(), catalog, None, None);
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            catalog,
+            None,
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+        );
         let outcome = sel.outcome_handle();
         // Type "stream" — only "debug the streaming protocol"
         // should remain.
@@ -629,6 +651,7 @@ mod tests {
             catalog,
             None,
             Some("refactor".to_string()),
+            TEST_MAX_VISIBLE_ROWS,
         );
         let body = sel.render(80).join("\n");
         assert!(body.contains("refactor the agent loop"), "got: {body}");
@@ -637,7 +660,13 @@ mod tests {
 
     #[test]
     fn empty_catalog_renders_no_match_placeholder() {
-        let mut sel = SessionSelectorComponent::new(identity_theme(), vec![], None, None);
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            vec![],
+            None,
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+        );
         let body = sel.render(80).join("\n");
         // SelectList renders "No matching ..." when filtered
         // indices is empty.
@@ -647,7 +676,13 @@ mod tests {
     #[test]
     fn thread_with_no_user_message_shows_placeholder_in_primary() {
         let catalog = vec![make_preview("2025-05-11", None, 0, Duration::seconds(10))];
-        let mut sel = SessionSelectorComponent::new(identity_theme(), catalog, None, None);
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            catalog,
+            None,
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+        );
         let body = sel.render(80).join("\n");
         assert!(body.contains("(no user message yet)"), "got: {body}");
     }
@@ -816,10 +851,10 @@ mod tests {
 
     #[test]
     fn pre_selected_current_thread_stays_visible_at_max_visible_rows_bump() {
-        // With the row cap bumped to 16, a catalog of 12 threads
-        // and the current thread in the middle of the list should
-        // produce a render that still includes the `(current)`
-        // marker — i.e. no off-screen scrolling required.
+        // With a generous row cap, a catalog of 12 threads and the
+        // current thread in the middle of the list should produce a
+        // render that still includes the `(current)` marker — i.e.
+        // no off-screen scrolling required.
         let mut catalog = Vec::new();
         for i in 0i64..12 {
             catalog.push(make_preview(
@@ -835,8 +870,13 @@ mod tests {
         // Pick the middle row as current. The pre-selection should
         // land in the visible window without any scroll.
         let current = catalog[6].thread_id.clone();
-        let mut sel =
-            SessionSelectorComponent::new(identity_theme(), catalog, Some(current.clone()), None);
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            catalog,
+            Some(current.clone()),
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+        );
         // Render wide so column truncation can't strip "(current)".
         let body = sel.render(200).join("\n");
         assert!(
