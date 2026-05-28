@@ -256,6 +256,7 @@ fn primary_column_layout() -> SelectListLayout {
         // " (current)" + 2-char inter-column gap that
         // `SelectList` accounts for inside this width.
         max_primary_column_width: Some(PREVIEW_MAX_CHARS + 12),
+        wrap_selection: false,
         ..SelectListLayout::default()
     }
 }

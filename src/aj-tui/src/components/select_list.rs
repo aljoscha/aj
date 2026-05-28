@@ -151,6 +151,11 @@ pub struct SelectListLayout {
     /// — used by the read-only help overlay where there is no
     /// interactive selection to highlight.
     pub show_selection_indicator: bool,
+    /// When `true` (default), Up at the first row wraps to the last row
+    /// and Down at the last row wraps to the first. When `false`,
+    /// navigation clamps at the ends so holding a key settles on the
+    /// top/bottom row.
+    pub wrap_selection: bool,
 }
 
 impl Default for SelectListLayout {
@@ -161,6 +166,7 @@ impl Default for SelectListLayout {
             truncate_primary: None,
             max_prefix_column_width: None,
             show_selection_indicator: true,
+            wrap_selection: true,
         }
     }
 }
@@ -178,8 +184,9 @@ impl Default for SelectListLayout {
 /// `max_visible` rows, so the selection floats near the center of the
 /// visible region whenever there's room and clamps to the top/bottom edge
 /// near the ends of the list. Wraparound (Up at index `0`, Down at
-/// `len - 1`) only changes `selected`; the next render naturally lands the
-/// new selection at the appropriate end.
+/// `len - 1`, enabled by [`SelectListLayout::wrap_selection`]) only
+/// changes `selected`; the next render naturally lands the new selection
+/// at the appropriate end.
 ///
 /// `set_filter` resets `selected` to `0`.
 ///
@@ -293,16 +300,31 @@ impl SelectList {
             return;
         }
         let len = self.filtered_indices.len();
+        let previous = self.selected;
         if delta < 0 {
             if self.selected == 0 {
-                self.selected = len - 1;
+                self.selected = if self.layout.wrap_selection {
+                    len - 1
+                } else {
+                    0
+                };
             } else {
                 self.selected -= 1;
             }
+        } else if self.selected + 1 < len {
+            self.selected += 1;
         } else {
-            self.selected = (self.selected + 1) % len;
+            self.selected = if self.layout.wrap_selection {
+                0
+            } else {
+                len - 1
+            };
         }
-        self.notify_selection_change();
+        // When clamping leaves the selection unchanged, there is no
+        // change to notify.
+        if self.selected != previous {
+            self.notify_selection_change();
+        }
     }
 
     fn notify_selection_change(&mut self) {
@@ -657,6 +679,7 @@ mod tests {
             truncate_primary: None,
             max_prefix_column_width: None,
             show_selection_indicator: true,
+            wrap_selection: true,
         };
         let list = SelectList::new(vec![], 5, identity_theme(), layout);
         let (min, max) = list.primary_column_bounds();
@@ -900,5 +923,51 @@ mod tests {
         list.set_filter("model");
         assert_eq!(list.render(80).len(), 1);
         assert_eq!(list.selected_item().map(|i| i.value.as_str()), Some("a"));
+    }
+
+    fn three_item_list(wrap_selection: bool) -> SelectList {
+        let items = vec![
+            SelectItem::new("a", "alpha"),
+            SelectItem::new("b", "bravo"),
+            SelectItem::new("c", "charlie"),
+        ];
+        let layout = SelectListLayout {
+            wrap_selection,
+            ..Default::default()
+        };
+        SelectList::new(items, 5, identity_theme(), layout)
+    }
+
+    /// With `wrap_selection: false`, Up at the first row stays on the
+    /// first row and Down on the last row stays on the last row.
+    #[test]
+    fn no_wrap_clamps_at_ends() {
+        let mut list = three_item_list(false);
+
+        // Up at index 0 stays at 0.
+        list.move_selection(-1);
+        assert_eq!(list.selected, 0);
+
+        // Down to the last row, then Down again clamps there.
+        list.move_selection(1);
+        list.move_selection(1);
+        assert_eq!(list.selected, 2);
+        list.move_selection(1);
+        assert_eq!(list.selected, 2);
+    }
+
+    /// The default (`wrap_selection: true`) still wraps around at both
+    /// ends.
+    #[test]
+    fn default_wraps_at_ends() {
+        let mut list = three_item_list(true);
+
+        // Up at index 0 wraps to the last row.
+        list.move_selection(-1);
+        assert_eq!(list.selected, 2);
+
+        // Down at the last row wraps back to the first.
+        list.move_selection(1);
+        assert_eq!(list.selected, 0);
     }
 }

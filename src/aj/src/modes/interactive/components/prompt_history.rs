@@ -228,6 +228,7 @@ impl PromptHistorySearchComponent {
 fn list_layout() -> SelectListLayout {
     SelectListLayout {
         max_prefix_column_width: Some(PROJECT_LABEL_MAX),
+        wrap_selection: false,
         ..Default::default()
     }
 }
