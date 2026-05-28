@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aj_tui::autocomplete::{CombinedAutocompleteProvider, SlashCommand};
+use aj_tui::autocomplete::CombinedAutocompleteProvider;
 use aj_tui::component::Component;
 use aj_tui::components::editor::{Editor, EditorTheme};
 use aj_tui::components::loader::Loader;
@@ -61,6 +61,8 @@ fn select_list_theme() -> SelectListTheme {
         description: Arc::new(style::dim),
         scroll_info: Arc::new(style::dim),
         no_match: Arc::new(style::dim),
+        prefix: Arc::new(style::dim),
+        shortcut: Arc::new(style::cyan),
     }
 }
 
@@ -201,18 +203,11 @@ async fn main() {
     let mut editor = Editor::new(tui.handle(), editor_theme());
     editor.set_focused(true);
 
-    // Wire up the slash-command autocomplete provider. Typing `/` opens
-    // the suggestion popup; `/delete` removes the last message and
-    // `/clear` removes every message.
+    // Wire up the path-completion autocomplete provider. `@filename`
+    // opens the fuzzy file picker; the demo commands `/delete` and
+    // `/clear` are dispatched at submit time without an inline
+    // completion popup.
     let provider = CombinedAutocompleteProvider::new(
-        vec![
-            SlashCommand::new("delete")
-                .with_description("Delete the last message")
-                .into(),
-            SlashCommand::new("clear")
-                .with_description("Clear all messages")
-                .into(),
-        ],
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     );
     editor.set_autocomplete_provider(std::sync::Arc::new(provider));

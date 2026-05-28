@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 use aj_models::ThinkingConfig;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
-use aj_tui::style;
 
 use crate::config::slash_commands::{THINKING_LEVELS, parse_thinking_level, thinking_level_name};
 
@@ -41,7 +40,6 @@ pub type OutcomeHandle = Arc<Mutex<Option<ThinkingSelectorOutcome>>>;
 pub struct ThinkingSelectorComponent {
     inner: SelectList,
     outcome: OutcomeHandle,
-    title: String,
 }
 
 impl ThinkingSelectorComponent {
@@ -93,11 +91,7 @@ impl ThinkingSelectorComponent {
                 Some(ThinkingSelectorOutcome::Cancelled);
         }));
 
-        Self {
-            inner,
-            outcome,
-            title: "Thinking effort — Enter to apply, Esc to cancel".to_string(),
-        }
+        Self { inner, outcome }
     }
 
     /// Hand the host a clone of the outcome slot. After each
@@ -112,8 +106,7 @@ impl aj_tui::component::Component for ThinkingSelectorComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        let mut lines = Vec::with_capacity(THINKING_LEVELS.len() + 2);
-        lines.push(style::dim(&self.title));
+        let mut lines = Vec::with_capacity(THINKING_LEVELS.len() + 1);
         lines.extend(self.inner.render(width));
         lines
     }
@@ -151,6 +144,8 @@ mod tests {
             description: Arc::new(|s| s.to_string()),
             scroll_info: Arc::new(|s| s.to_string()),
             no_match: Arc::new(|s| s.to_string()),
+            prefix: Arc::new(|s| s.to_string()),
+            shortcut: Arc::new(|s| s.to_string()),
         }
     }
 

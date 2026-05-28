@@ -1,21 +1,18 @@
-//! Autocomplete providers for path completion, slash commands, and fuzzy
-//! file search.
+//! Autocomplete providers for path completion and fuzzy file search.
 //!
 //! The primary type is [`CombinedAutocompleteProvider`]: a provider that
-//! dispatches to one of three completion modes based on the text before
+//! dispatches to one of two completion modes based on the text before
 //! the cursor:
 //!
 //! 1. **`@`-prefixed fuzzy file search** — walks the working directory (or
 //!    a scoped sub-tree) and ranks matches by filename similarity.
-//! 2. **Slash commands** — a configurable list of top-level commands and
-//!    their optional argument completers.
-//! 3. **Direct path completion** — `./`, `~/`, or absolute-path prefixes
+//! 2. **Direct path completion** — `./`, `~/`, or absolute-path prefixes
 //!    resolved against `readdir` of the parent directory.
 //!
 //! [`CombinedAutocompleteProvider::apply_completion`] takes a selected
 //! [`AutocompleteItem`] and splices it back into the input lines at the
-//! cursor, handling slash-command trailing space, directory vs. file
-//! suffixes, and closing quotes for quoted paths.
+//! cursor, handling directory vs. file suffixes and closing quotes for
+//! quoted paths.
 //!
 //! # Async & cancellation
 //!
@@ -44,8 +41,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use ignore::{WalkBuilder, WalkState};
 use tokio_util::sync::CancellationToken;
-
-use crate::fuzzy::fuzzy_filter;
 
 /// Characters that separate path-like tokens in the input line.
 ///
@@ -83,49 +78,6 @@ impl AutocompleteItem {
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
-        self
-    }
-}
-
-/// A top-level slash command registered with a provider.
-pub struct SlashCommand {
-    pub name: String,
-    pub description: Option<String>,
-    /// Optional one-line hint shown after the command name in the
-    /// suggestion list (e.g. `<file>` or `[--flag]`).
-    pub argument_hint: Option<String>,
-    /// Optional closure that produces argument-completion candidates when
-    /// the user has typed a space after the command name. `None` means the
-    /// command takes no completable arguments.
-    #[allow(clippy::type_complexity)]
-    pub get_argument_completions: Option<Box<dyn Fn(&str) -> Vec<AutocompleteItem> + Send + Sync>>,
-}
-
-impl SlashCommand {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            description: None,
-            argument_hint: None,
-            get_argument_completions: None,
-        }
-    }
-
-    pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.description = Some(description.into());
-        self
-    }
-
-    pub fn with_argument_hint(mut self, hint: impl Into<String>) -> Self {
-        self.argument_hint = Some(hint.into());
-        self
-    }
-
-    pub fn with_argument_completions<F>(mut self, completer: F) -> Self
-    where
-        F: Fn(&str) -> Vec<AutocompleteItem> + Send + Sync + 'static,
-    {
-        self.get_argument_completions = Some(Box::new(completer));
         self
     }
 }
@@ -364,54 +316,9 @@ pub struct SessionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionInvalid;
 
-/// Either a registered slash command or a plain completion item.
-///
-/// `Item` entries are rendered verbatim in the slash-command list; their
-/// `value` is treated as the command name for matching purposes.
-pub enum CommandEntry {
-    Command(SlashCommand),
-    Item(AutocompleteItem),
-}
-
-impl From<SlashCommand> for CommandEntry {
-    fn from(cmd: SlashCommand) -> Self {
-        CommandEntry::Command(cmd)
-    }
-}
-
-impl From<AutocompleteItem> for CommandEntry {
-    fn from(item: AutocompleteItem) -> Self {
-        CommandEntry::Item(item)
-    }
-}
-
-impl CommandEntry {
-    fn name(&self) -> &str {
-        match self {
-            CommandEntry::Command(c) => &c.name,
-            CommandEntry::Item(i) => &i.value,
-        }
-    }
-
-    fn description(&self) -> Option<&str> {
-        match self {
-            CommandEntry::Command(c) => c.description.as_deref(),
-            CommandEntry::Item(i) => i.description.as_deref(),
-        }
-    }
-
-    fn argument_hint(&self) -> Option<&str> {
-        match self {
-            CommandEntry::Command(c) => c.argument_hint.as_deref(),
-            CommandEntry::Item(_) => None,
-        }
-    }
-}
-
-/// The default provider: dispatches between slash commands, fuzzy `@` file
-/// search, and direct path completion.
+/// The default provider: dispatches between fuzzy `@` file search and
+/// direct path completion.
 pub struct CombinedAutocompleteProvider {
-    commands: Vec<CommandEntry>,
     fs: FsConfig,
 }
 
@@ -433,11 +340,10 @@ struct FsConfig {
 }
 
 impl CombinedAutocompleteProvider {
-    /// Create a provider with the given slash commands and working
-    /// directory.
-    pub fn new(commands: Vec<CommandEntry>, base_path: impl Into<PathBuf>) -> Self {
+    /// Create a provider rooted at `base_path` (the working directory
+    /// the `@`-fuzzy walk and direct-path completion resolve against).
+    pub fn new(base_path: impl Into<PathBuf>) -> Self {
         Self {
-            commands,
             fs: FsConfig {
                 base_path: base_path.into(),
                 walker_limit: 100,
@@ -501,49 +407,6 @@ impl CombinedAutocompleteProvider {
         }
 
         None
-    }
-
-    // -- Completion producers --
-
-    fn slash_command_suggestions(&self, prefix: &str) -> Option<AutocompleteSuggestions> {
-        let items: Vec<CommandSuggestionBuild> = self
-            .commands
-            .iter()
-            .map(|entry| CommandSuggestionBuild {
-                name: entry.name().to_string(),
-                description: entry.description().map(str::to_string),
-                argument_hint: entry.argument_hint().map(str::to_string),
-            })
-            .collect();
-
-        let filtered = fuzzy_filter(items, prefix, |item| item.name.as_str());
-        if filtered.is_empty() {
-            return None;
-        }
-
-        let items = filtered
-            .into_iter()
-            .map(|item| {
-                let description = match (item.argument_hint, item.description) {
-                    (Some(hint), Some(desc)) if !desc.is_empty() => {
-                        Some(format!("{hint} — {desc}"))
-                    }
-                    (Some(hint), _) => Some(hint),
-                    (None, Some(desc)) if !desc.is_empty() => Some(desc),
-                    _ => None,
-                };
-                AutocompleteItem {
-                    value: item.name.clone(),
-                    label: item.name,
-                    description,
-                }
-            })
-            .collect();
-
-        Some(AutocompleteSuggestions {
-            items,
-            prefix: format!("/{prefix}"),
-        })
     }
 }
 
@@ -856,45 +719,7 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
             });
         }
 
-        // 2. Slash commands and their arguments. Purely in-memory —
-        //    runs inline.
-        if !force && before.starts_with('/') {
-            let rest = &before[1..];
-            match rest.find(' ') {
-                None => {
-                    // Still typing the command name.
-                    let prefix = rest;
-                    return self.slash_command_suggestions(prefix).map(|mut s| {
-                        s.prefix = before.to_string();
-                        s
-                    });
-                }
-                Some(space_rel) => {
-                    let command_name = &rest[..space_rel];
-                    let argument = &rest[space_rel + 1..];
-                    let cmd_match = self
-                        .commands
-                        .iter()
-                        .find(|entry| entry.name() == command_name);
-                    let items = match cmd_match {
-                        Some(CommandEntry::Command(SlashCommand {
-                            get_argument_completions: Some(f),
-                            ..
-                        })) => f(argument),
-                        _ => return None,
-                    };
-                    if items.is_empty() {
-                        return None;
-                    }
-                    return Some(AutocompleteSuggestions {
-                        items,
-                        prefix: argument.to_string(),
-                    });
-                }
-            }
-        }
-
-        // 3. Direct path completion. A single `read_dir` is not usually
+        // 2. Direct path completion. A single `read_dir` is not usually
         //    a cancellation hot spot, but we still offload it to a
         //    blocking worker so we don't stall the UI on slow NFS or
         //    FUSE mounts.
@@ -960,23 +785,6 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
         Some(Box::new(session))
     }
 
-    /// Tab inside a slash-command token (`/mo<Tab>`) must not open
-    /// the file picker, otherwise the user gets a directory listing
-    /// when they were trying to complete the command name. Every
-    /// other context — `@`-attachments, command arguments, plain
-    /// path completion, empty buffer — gets the default `true`.
-    fn should_trigger_file_completion(
-        &self,
-        lines: &[String],
-        cursor_line: usize,
-        cursor_col: usize,
-    ) -> bool {
-        let current = lines.get(cursor_line).map(String::as_str).unwrap_or("");
-        let before = safe_slice(current, 0, cursor_col);
-        let trimmed = before.trim_start();
-        !(trimmed.starts_with('/') && !trimmed.contains(' '))
-    }
-
     fn apply_completion(
         &self,
         lines: &[String],
@@ -1000,20 +808,6 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
                 after_cursor_raw
             };
 
-        let is_slash_command = prefix.starts_with('/')
-            && before_prefix.trim().is_empty()
-            && !prefix[1..].contains('/');
-        if is_slash_command {
-            let new_line = format!("{before_prefix}/{} {after_cursor}", item.value);
-            let mut new_lines = lines.to_vec();
-            new_lines[cursor_line] = new_line;
-            return CompletionApplied {
-                lines: new_lines,
-                cursor_line,
-                cursor_col: before_prefix.chars().count() + item.value.chars().count() + 2,
-            };
-        }
-
         if prefix.starts_with('@') {
             let is_directory = item.label.ends_with('/');
             let suffix = if is_directory { "" } else { " " };
@@ -1030,27 +824,6 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
                 lines: new_lines,
                 cursor_line,
                 cursor_col: before_prefix.chars().count() + cursor_offset + suffix.chars().count(),
-            };
-        }
-
-        // Command-argument context: `/cmd foo|` — detect by presence of
-        // `/` and a space in the text before the cursor.
-        let text_before_cursor = safe_slice(current, 0, cursor_col);
-        if text_before_cursor.contains('/') && text_before_cursor.contains(' ') {
-            let new_line = format!("{before_prefix}{}{after_cursor}", item.value);
-            let is_directory = item.label.ends_with('/');
-            let has_trailing_quote = item.value.ends_with('"');
-            let cursor_offset = if is_directory && has_trailing_quote {
-                item.value.chars().count() - 1
-            } else {
-                item.value.chars().count()
-            };
-            let mut new_lines = lines.to_vec();
-            new_lines[cursor_line] = new_line;
-            return CompletionApplied {
-                lines: new_lines,
-                cursor_line,
-                cursor_col: before_prefix.chars().count() + cursor_offset,
             };
         }
 
@@ -1076,13 +849,6 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Intermediate item used for scoring slash commands by name.
-struct CommandSuggestionBuild {
-    name: String,
-    description: Option<String>,
-    argument_hint: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 struct Entry {

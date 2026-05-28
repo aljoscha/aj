@@ -4,8 +4,7 @@
 //! fuzzy filtering with a [`aj_tui::components::select_list::SelectList`]
 //! that shows the matching entries from a snapshotted list of
 //! [`aj_session::ThreadPreview`]s. The host opens this overlay from
-//! `/sessions` (no args, full catalog) or `/sessions <query>` (pre-
-//! filled search); `Enter` commits the highlighted thread, `Esc`
+//! `/sessions`; `Enter` commits the highlighted thread, `Esc`
 //! cancels.
 //!
 //! The component owns the catalog and rebuilds the inner
@@ -26,7 +25,6 @@ use aj_tui::components::text_input::TextInput;
 use aj_tui::fuzzy::FuzzyMatcher;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
-use aj_tui::style;
 use chrono::{DateTime, Utc};
 
 /// Maximum visible rows in the result list. The session picker
@@ -37,7 +35,7 @@ use chrono::{DateTime, Utc};
 /// at eight — their catalogs are small and have far lower
 /// information density per row, so the extra height there would
 /// be wasted screen real-estate.
-const MAX_VISIBLE_ROWS: usize = 16;
+const MAX_VISIBLE_ROWS: usize = 14;
 
 /// Cap on how much of the first user message is rendered in the
 /// primary column. Keeps long pastes (a stack trace, a chunk of
@@ -98,8 +96,6 @@ pub struct SessionSelectorComponent {
     /// reconstruct the underlying nucleo state on every keystroke
     /// (it allocates ~135 KB up front per `FuzzyMatcher::new`).
     matcher: FuzzyMatcher,
-    /// One-line title rendered above the search input.
-    title: String,
     /// `now` snapshot taken at construction time. Used to format
     /// each row's age (`5m`, `3h`, …) without re-reading the clock
     /// on every rebuild. The selector closes within seconds in
@@ -116,9 +112,11 @@ impl SessionSelectorComponent {
     /// empty; [`aj_session::ConversationPersistence::list_thread_previews`]
     /// returns latest-first already). `current_thread_id` is the
     /// agent's active thread — used to pre-select the matching row
-    /// and mark it `(current)`. `initial_query` pre-fills the
-    /// search box (used by `/sessions <query>`). `theme` styles the
-    /// underlying [`SelectList`].
+    /// and mark it `(current)`. `initial_query`, when set, pre-fills
+    /// the search box so the overlay opens already filtered; the
+    /// slash layer passes `None`, but the parameter is kept as a
+    /// general capability. `theme` styles the underlying
+    /// [`SelectList`].
     pub fn new(
         theme: SelectListTheme,
         catalog: Vec<ThreadPreview>,
@@ -149,7 +147,6 @@ impl SessionSelectorComponent {
             outcome,
             theme,
             matcher: FuzzyMatcher::new(),
-            title: "Resume thread — Enter to switch, Esc to cancel".to_string(),
             now: Utc::now(),
         };
         component.rebuild_list();
@@ -390,11 +387,12 @@ impl Component for SessionSelectorComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        // Stack: title, search input, dim separator, list.
-        let mut lines = Vec::with_capacity(MAX_VISIBLE_ROWS + 4);
-        lines.push(style::dim(&self.title));
+        // Chrome (title + border) is provided by the surrounding
+        // `OverlayWindow` at mount time; we render just the search
+        // input stacked above the result list.
+        let mut lines = Vec::with_capacity(MAX_VISIBLE_ROWS + 2);
         lines.extend(self.search.render(width));
-        lines.push(style::dim(&"─".repeat(width.min(60))));
+        lines.push(String::new());
         lines.extend(self.list.render(width));
         lines
     }
@@ -466,6 +464,8 @@ mod tests {
             description: Arc::new(|s| s.to_string()),
             scroll_info: Arc::new(|s| s.to_string()),
             no_match: Arc::new(|s| s.to_string()),
+            prefix: Arc::new(|s| s.to_string()),
+            shortcut: Arc::new(|s| s.to_string()),
         }
     }
 

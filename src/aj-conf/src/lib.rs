@@ -859,6 +859,16 @@ impl Config {
             Ok(default_threads_dir)
         }
     }
+
+    /// Path to the base directory holding every project's threads
+    /// subdirectory: `~/.aj/threads`. Each immediate subdirectory is
+    /// one project (named via [`path_to_dir_name`]); the prompt-history
+    /// "all workspaces" search walks these. Unlike
+    /// [`Self::get_threads_dir_path`] this does not create or descend
+    /// into a per-project directory \u2014 it just resolves the base path.
+    pub fn get_threads_base_dir_path() -> Result<PathBuf, ConfigError> {
+        Ok(Self::get_config_dir()?.join("threads"))
+    }
 }
 
 fn find_git_root(start_path: &Path) -> Option<PathBuf> {

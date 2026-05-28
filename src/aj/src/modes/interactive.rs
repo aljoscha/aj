@@ -24,6 +24,7 @@ pub mod layout;
 pub mod shutdown;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
@@ -49,19 +50,23 @@ use tokio_util::sync::CancellationToken;
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command};
 use crate::config::slash_commands::{
-    SlashAction, build_autocomplete_provider, dispatch as slash_dispatch, load_model_catalog,
-    thinking_level_name,
+    SlashAction, dispatch as slash_dispatch, load_model_catalog, thinking_level_name,
 };
 use crate::config::theme::{
     Theme, ThemeHandle, chat_theme, editor_border_color_for_thinking, select_list_theme,
     watch_user_theme,
 };
 use crate::model::{ResolvedModel, from_model_info};
+use crate::modes::interactive::components::command_palette::CommandPaletteOutcomeHandle;
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::model_selector::{
     ModelIdentityRef, ModelSelectorComponent, ModelSelectorOutcome,
     OutcomeHandle as ModelOutcomeHandle,
+};
+use crate::modes::interactive::components::prompt_history::{
+    PromptHistoryOutcome, PromptHistoryOutcomeHandle, PromptHistorySearchComponent,
+    all_workspaces_history, workspace_history,
 };
 use crate::modes::interactive::components::session_selector::{
     OutcomeHandle as SessionOutcomeHandle, SessionSelectorComponent, SessionSelectorOutcome,
@@ -332,15 +337,14 @@ impl InteractiveMode {
         // through the same helper on every `/thinking` change.
         apply_editor_border_for_thinking(&mut tui, &theme, agent.default_thinking().as_ref());
 
-        // Install the slash-command autocomplete provider on the
-        // editor. Every recognised command (/thinking, /model, …)
-        // pops up as a suggestion when the user types `/` at the
-        // start of the prompt; argument completion (e.g. `/thinking
-        // m` → medium) flows through the same provider.
+        // Install the path/symbol autocomplete provider on the
+        // editor. The `@filename` fuzzy file picker and direct
+        // path completion live here; slash commands no longer have
+        // an inline popup (typing `/` at the empty prompt opens
+        // the command palette overlay instead).
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
-            let provider = build_autocomplete_provider(
+            let provider = aj_tui::autocomplete::CombinedAutocompleteProvider::new(
                 agent.env().working_directory.clone(),
-                Arc::clone(&model_catalog),
             );
             editor.set_autocomplete_provider(Arc::new(provider));
         }
@@ -361,6 +365,27 @@ impl InteractiveMode {
             PromptHistory::bootstrap(&conversation_persistence, DEFAULT_MAX_ENTRIES);
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
             prompt_history.install(editor);
+        }
+
+        // Shared flag tripped by the editor's `/`-at-empty-prompt
+        // callback and by the global `Ctrl+O` chord. The main loop
+        // polls it after `tui.handle_input` and routes a synthetic
+        // `/palette` through the slash dispatcher, so all three
+        // palette-open paths (typed `/palette`, leading `/`,
+        // `Ctrl+O`) converge on the same mounting code.
+        let palette_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // Set when the user hits `aj.overlay.close_all` (default
+        // `ctrl+c`) while any overlay is up. Drained after
+        // `tui.handle_input` to tear down the entire overlay
+        // back-stack — distinct from Esc's one-level pop.
+        let close_all_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        {
+            let flag = Arc::clone(&palette_open_request);
+            if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+                editor.set_on_palette_trigger(Some(Arc::new(move || {
+                    flag.store(true, Ordering::Relaxed);
+                })));
+            }
         }
 
         // Header: thread id + resume/start banner. Footer: model +
@@ -544,26 +569,44 @@ impl InteractiveMode {
                     match event {
                         TuiEvent::Render => tui.render(),
                         TuiEvent::Input(input) => {
-                            // Ctrl+C: cancel a running turn if one
-                            // is in flight, otherwise exit. Ctrl+D
-                            // always exits. The terminal is in raw
-                            // mode so neither chord raises SIGINT;
-                            // both arrive here as ordinary key
-                            // events. The cancel handle is the
-                            // binary's clone of the per-turn
-                            // `CancellationToken` we passed to
-                            // `agent.prompt`; firing it propagates
-                            // to the agent's `execute_turn`
-                            // `select!`s and to every provider /
-                            // tool subscribed to the same token,
-                            // including the bash tool's process
-                            // group.
+                            // Ctrl+C semantics, in priority order:
+                            //
+                            // 1. Turn in flight (`current_turn_cancel`
+                            //    is `Some`): cancel the turn. The
+                            //    cancel handle is the binary's clone
+                            //    of the per-turn `CancellationToken`
+                            //    we passed to `agent.prompt`; firing
+                            //    it propagates to the agent's
+                            //    `execute_turn` `select!`s and to
+                            //    every provider / tool subscribed to
+                            //    the same token, including the bash
+                            //    tool's process group.
+                            // 2. Overlay up (`open_selector` is
+                            //    `Some`): fall through to the
+                            //    `ACTION_OVERLAY_CLOSE_ALL`
+                            //    interception below, which matches
+                            //    `ctrl+c` by default and tears the
+                            //    overlay stack down.
+                            // 3. Neither: exit the binary. This is
+                            //    the legacy behavior — Ctrl+C with
+                            //    no turn and no overlay quits.
+                            //
+                            // Ctrl+D always exits regardless. The
+                            // terminal is in raw mode so neither
+                            // chord raises SIGINT; both arrive here
+                            // as ordinary key events.
                             if input.is_ctrl('c') {
                                 if let Some(token) = current_turn_cancel.as_ref() {
                                     token.cancel();
                                     continue;
                                 }
-                                break;
+                                if open_selector.is_none() {
+                                    break;
+                                }
+                                // Overlay is up: don't break. The
+                                // overlay close-all interception
+                                // below catches the same keystroke
+                                // and tears the stack down.
                             }
                             if input.is_ctrl('d') {
                                 break;
@@ -642,7 +685,110 @@ impl InteractiveMode {
                                     continue;
                                 }
                             }
-                            tui.handle_input(&input);
+                            // Global command-palette chord. Bound via
+                            // `aj.palette.open` (default `ctrl+o`).
+                            // Intercepted before `tui.handle_input` so
+                            // no component sees the keystroke. The
+                            // actual overlay mount happens after
+                            // `tui.handle_input` via the shared
+                            // `palette_open_request` flag, so both the
+                            // editor-`/` path and this chord converge
+                            // on the same dispatcher arm. Inert while
+                            // a selector is already up so the chord
+                            // can't interrupt an open modal.
+                            //
+                            // `aj.overlay.close_all` (default `ctrl+c`)
+                            // is the symmetric tear-down chord: when
+                            // an overlay is up, intercept and consume
+                            // the event so the selector's own cancel
+                            // path doesn't also fire.
+                            let mut consume_event = false;
+                            {
+                                let kb = aj_tui::keybindings::get();
+                                if open_selector.is_some()
+                                    && kb.matches(
+                                        &input,
+                                        crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
+                                    )
+                                {
+                                    drop(kb);
+                                    close_all_request.store(true, Ordering::Relaxed);
+                                    // Consume: skip `tui.handle_input`
+                                    // entirely so the selector doesn't
+                                    // also see Ctrl+C as a cancel and
+                                    // write a cancel-outcome that would
+                                    // then drive a stale one-level
+                                    // back-stack restore underneath
+                                    // our explicit teardown.
+                                    consume_event = true;
+                                } else if open_selector.is_none()
+                                    && kb.matches(
+                                        &input,
+                                        crate::config::keybindings::ACTION_PALETTE_OPEN,
+                                    )
+                                {
+                                    drop(kb);
+                                    palette_open_request.store(true, Ordering::Relaxed);
+                                    // Fall through to the dispatcher
+                                    // arm below by letting handle_input
+                                    // run (it's a no-op for this chord
+                                    // since no component binds ctrl+o).
+                                }
+                            }
+                            if !consume_event {
+                                tui.handle_input(&input);
+                            }
+
+                            // Close-all: tear down current selector
+                            // and any parent palette in one shot.
+                            // Done before the palette-open dispatch
+                            // and the per-tick outcome poll so we
+                            // never re-enter the back-stack logic
+                            // on a unwound state.
+                            if close_all_request.swap(false, Ordering::Relaxed) {
+                                if let Some(sel) = open_selector.take() {
+                                    close_all_overlays(&mut tui, sel);
+                                }
+                                continue;
+                            }
+
+                            // Global palette open: fired either by the
+                            // editor's `/`-at-empty-prompt callback
+                            // (handled inside `tui.handle_input` above)
+                            // or by the `Ctrl+O` chord intercepted
+                            // below. Dispatched here, after routing,
+                            // so the editor's `/` swallow has already
+                            // landed and so we can `await` the slash
+                            // dispatcher. Gated on `open_selector` to
+                            // be inert while another selector is up.
+                            if palette_open_request.swap(false, Ordering::Relaxed)
+                                && open_selector.is_none()
+                            {
+                                match handle_slash_command(
+                                    &mut tui,
+                                    Arc::clone(&agent),
+                                    Arc::clone(&model_catalog),
+                                    Arc::clone(&current_model_key),
+                                    &mut log,
+                                    &mut persistence_handle,
+                                    &mut pump,
+                                    &conversation_persistence,
+                                    &theme,
+                                    "/palette",
+                                    None,
+                                ).await {
+                                    SlashHandled::Continue { selector, notice } => {
+                                        if let Some(text) = notice {
+                                            pump.handle(&mut tui, &notice_event(&text));
+                                        }
+                                        if let Some(sel) = selector {
+                                            open_selector = Some(sel);
+                                        }
+                                    }
+                                    SlashHandled::Quit => break,
+                                }
+                                continue;
+                            }
 
                             // If a selector overlay is open, the
                             // input was just routed to it. Poll
@@ -664,9 +810,42 @@ impl InteractiveMode {
                                     SelectorPollOutcome::StillOpen(reopened) => {
                                         open_selector = Some(reopened);
                                     }
-                                    SelectorPollOutcome::Closed { notice } => {
+                                    SelectorPollOutcome::Closed { notice, follow_up } => {
                                         if let Some(text) = notice {
                                             pump.handle(&mut tui, &notice_event(&text));
+                                        }
+                                        // The command palette chains into a
+                                        // real slash command by emitting a
+                                        // `follow_up`. Re-feed it through
+                                        // `handle_slash_command` so the
+                                        // dispatch path is identical to a
+                                        // user-typed `/...` line.
+                                        if let Some(follow_up) = follow_up {
+                                            match handle_slash_command(
+                                                &mut tui,
+                                                Arc::clone(&agent),
+                                                Arc::clone(&model_catalog),
+                                                Arc::clone(&current_model_key),
+                                                &mut log,
+                                                &mut persistence_handle,
+                                                &mut pump,
+                                                &conversation_persistence,
+                                                &theme,
+                                                &follow_up.input,
+                                                Some(follow_up.parent_palette),
+                                            )
+                                            .await
+                                            {
+                                                SlashHandled::Continue { selector, notice } => {
+                                                    if let Some(text) = notice {
+                                                        pump.handle(&mut tui, &notice_event(&text));
+                                                    }
+                                                    if let Some(sel) = selector {
+                                                        open_selector = Some(sel);
+                                                    }
+                                                }
+                                                SlashHandled::Quit => break,
+                                            }
                                         }
                                     }
                                 }
@@ -703,6 +882,7 @@ impl InteractiveMode {
                                         &conversation_persistence,
                                         &theme,
                                         &trimmed,
+                                        None,
                                     ).await {
                                         SlashHandled::Continue { selector, notice } => {
                                             if let Some(text) = notice {
@@ -881,15 +1061,53 @@ enum OpenSelector {
     Thinking {
         handle: OverlayHandle,
         outcome: ThinkingOutcomeHandle,
+        /// When opened via the command palette, the (hidden)
+        /// palette's handle + outcome slot. On cancel we un-hide
+        /// it and restore host-side polling so the palette stays
+        /// usable; on confirm we tear it down. `None` when the
+        /// selector was reached directly via `/thinking`.
+        parent_palette: Option<ParentPalette>,
     },
     Model {
         handle: OverlayHandle,
         outcome: ModelOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
     },
     Session {
         handle: OverlayHandle,
         outcome: SessionOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
     },
+    /// Prompt-history search overlay. `Enter` recalls the chosen
+    /// prompt into the editor; `Esc` (or back-stack pop) closes it.
+    PromptHistory {
+        handle: OverlayHandle,
+        outcome: PromptHistoryOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
+    },
+    Palette {
+        handle: OverlayHandle,
+        outcome: CommandPaletteOutcomeHandle,
+    },
+    /// Read-only `/help` overlay. Both Esc and Enter close it; if
+    /// opened via the palette, the parent palette is restored on
+    /// close so the back-stack stays coherent.
+    Help {
+        handle: OverlayHandle,
+        outcome: crate::modes::interactive::components::help_overlay::HelpOverlayOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
+    },
+}
+
+/// Snapshot of a palette pushed underneath a sub-selector. Held by
+/// each child selector so that on cancel we can both un-hide the
+/// palette and restore the host's `OpenSelector::Palette` tracking
+/// (without re-installing this, the palette becomes input-wedged
+/// because nothing polls its outcome slot).
+#[derive(Clone)]
+struct ParentPalette {
+    handle: OverlayHandle,
+    outcome: CommandPaletteOutcomeHandle,
 }
 
 /// Result of dispatching a `/...`-prefixed editor submission.
@@ -910,8 +1128,32 @@ enum SelectorPollOutcome {
     StillOpen(OpenSelector),
     /// The selector closed (confirmed or cancelled). The optional
     /// notice describes what happened so the host can render a
-    /// status line in the chat scrollback.
-    Closed { notice: Option<String> },
+    /// status line in the chat scrollback. `follow_up`, when set,
+    /// is a slash-prefixed string the main loop should re-feed
+    /// through [`handle_slash_command`] — the command palette
+    /// uses this to chain into a sub-selector (e.g. the user
+    /// picked `/model` from the palette, so the main loop now
+    /// dispatches `/model` for real). The follow-up path keeps
+    /// the recursion at the main-loop level rather than calling
+    /// `handle_slash_command` from inside
+    /// [`handle_selector_outcome`] — which would require threading
+    /// the model catalog and other slash-only dependencies
+    /// through the outcome handler.
+    Closed {
+        notice: Option<String>,
+        follow_up: Option<PaletteFollowUp>,
+    },
+}
+
+/// Deferred chain from the command palette to a real slash
+/// command. Carries the palette's (hidden) overlay handle + outcome
+/// slot so the main loop can stash both on the sub-selector for the
+/// back-stack (and so the palette stays pollable after a cancel
+/// returns to it), or tear it down if the follow-up doesn't open a
+/// sub-selector.
+struct PaletteFollowUp {
+    input: String,
+    parent_palette: ParentPalette,
 }
 
 /// Wrap a notice string in the [`AgentEvent::Notice`] shape so we
@@ -1029,6 +1271,118 @@ fn refresh_footer_model(
     }
 }
 
+/// Inner-content row count for every full-window overlay (palette,
+/// help, model / thinking / session selectors). Total rendered height
+/// including chrome is `PALETTE_OVERLAY_INNER_ROWS + 4`. Tuned to fit
+/// comfortably on a standard 24-row terminal.
+const PALETTE_OVERLAY_INNER_ROWS: usize = 17;
+
+/// Sizing/anchor used by the command palette and every full-window
+/// selector (model / thinking / session / prompt history). Centered,
+/// fills ~70% of the terminal width with a 72-col floor and an 88-col
+/// ceiling so the box doesn't stretch uncomfortably wide on large
+/// monitors. Height is fixed at `PALETTE_OVERLAY_INNER_ROWS + 4` to
+/// match the stable height the
+/// [`aj_tui::components::overlay_window::OverlayWindow`] now renders;
+/// pinning the compositor's height to the exact value keeps narrow
+/// terminals from reserving extra rows.
+fn palette_overlay_options() -> OverlayOptions {
+    OverlayOptions {
+        anchor: OverlayAnchor::Center,
+        width: Some(SizeValue::Percent(70.0)),
+        min_width: Some(72),
+        max_width: Some(88),
+        max_height: Some(SizeValue::Absolute(PALETTE_OVERLAY_INNER_ROWS + 4)),
+        ..OverlayOptions::default()
+    }
+}
+
+/// Subtitle for overlays that accept a selection: `"Enter to
+/// confirm  •  Esc to close"`, with both key labels resolved from
+/// the keybindings manager so user rebindings of
+/// `tui.input.submit` / `tui.select.cancel` flow through to the
+/// hint text. Falls back to the default labels when the actions
+/// are somehow unbound. The same wording (`close`) is used for
+/// every confirmable overlay — palette, thinking, model, session
+/// — so the visual language stays uniform.
+fn subtitle_confirm_close() -> String {
+    let confirm = aj_tui::keybindings::format_action_shortcut("tui.input.submit")
+        .unwrap_or_else(|| "Enter".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    let close_all = aj_tui::keybindings::format_action_shortcut(
+        crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
+    );
+    match close_all {
+        // Surface the close-all chord only when it differs from the
+        // cancel chord — otherwise the hint duplicates itself.
+        Some(k) if k != cancel => {
+            format!("{confirm} to confirm  \u{2022}  {cancel} back  \u{2022}  {k} close")
+        }
+        _ => format!("{confirm} to confirm  \u{2022}  {cancel} to close"),
+    }
+}
+
+/// Subtitle for read-only overlays (the help screen): just the
+/// resolved cancel key + `"to close"`.
+fn subtitle_close() -> String {
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    let close_all = aj_tui::keybindings::format_action_shortcut(
+        crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
+    );
+    match close_all {
+        Some(k) if k != cancel => format!("{cancel} back  \u{2022}  {k} close"),
+        _ => format!("{cancel} to close"),
+    }
+}
+
+/// Tear down every visible overlay: the current selector plus its
+/// parent palette (if any). Returns control to the chat editor.
+///
+/// Distinct from the per-variant Esc/cancel path in
+/// [`handle_selector_outcome`], which pops one level (sub-selector
+/// back to palette). This helper is invoked by the
+/// `aj.overlay.close_all` chord and unconditionally removes both
+/// the current overlay and its parent from the overlay stack.
+fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
+    match sel {
+        OpenSelector::Palette { handle, .. } => {
+            tui.hide_overlay(&handle);
+        }
+        OpenSelector::Thinking {
+            handle,
+            parent_palette,
+            ..
+        }
+        | OpenSelector::Model {
+            handle,
+            parent_palette,
+            ..
+        }
+        | OpenSelector::Session {
+            handle,
+            parent_palette,
+            ..
+        }
+        | OpenSelector::PromptHistory {
+            handle,
+            parent_palette,
+            ..
+        }
+        | OpenSelector::Help {
+            handle,
+            parent_palette,
+            ..
+        } => {
+            tui.hide_overlay(&handle);
+            if let Some(parent) = parent_palette {
+                tui.hide_overlay(&parent.handle);
+            }
+        }
+    }
+}
+
 /// Dispatch a freshly-submitted slash-prefixed line.
 #[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
@@ -1042,48 +1396,55 @@ async fn handle_slash_command(
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
     text: &str,
+    parent_palette: Option<ParentPalette>,
 ) -> SlashHandled {
-    match slash_dispatch(text) {
+    let result = match slash_dispatch(text) {
+        SlashAction::OpenCommandPalette => {
+            debug_assert!(
+                parent_palette.is_none(),
+                "command palette has no parent palette"
+            );
+            use crate::modes::interactive::components::command_palette::CommandPaletteComponent;
+            let inner = CommandPaletteComponent::new(select_list_theme(theme), 13);
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Command Palette",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_confirm_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::Palette { handle, outcome }),
+                notice: None,
+            }
+        }
         SlashAction::OpenThinkingSelector => {
             let current = {
                 let a = agent.lock().await;
                 a.default_thinking()
             };
-            let component = ThinkingSelectorComponent::new(select_list_theme(theme), current);
-            let outcome = component.outcome_handle();
-            let options = OverlayOptions {
-                anchor: OverlayAnchor::Center,
-                width: Some(SizeValue::Absolute(60)),
-                ..OverlayOptions::default()
-            };
-            let handle = tui.show_overlay(Box::new(component), options);
+            let inner = ThinkingSelectorComponent::new(select_list_theme(theme), current);
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Thinking effort",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_confirm_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             SlashHandled::Continue {
-                selector: Some(OpenSelector::Thinking { handle, outcome }),
+                selector: Some(OpenSelector::Thinking {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
                 notice: None,
             }
         }
-        SlashAction::SetThinking(level) => {
-            {
-                let mut a = agent.lock().await;
-                a.set_default_thinking(level.clone());
-            }
-            // Mirror the change onto the editor's border tint so
-            // the visual cue tracks the active reasoning mode.
-            apply_editor_border_for_thinking(tui, theme, level.as_ref());
-            // Footer surfaces the active thinking effort; refresh it
-            // so the change is visible without waiting for a turn.
-            let model_id = {
-                let a = agent.lock().await;
-                a.model_info().id.clone()
-            };
-            refresh_footer_model(tui, &model_id, &level);
-            let name = thinking_level_name(&level);
-            SlashHandled::Continue {
-                selector: None,
-                notice: Some(format!("Thinking effort set to {name}.")),
-            }
-        }
-        SlashAction::OpenModelSelector { initial_query } => {
+        SlashAction::OpenModelSelector => {
             // Snapshot the current (provider, id) pair so the
             // overlay can pre-select the active row. The mutex lock
             // is brief — we only need it to read the pair.
@@ -1100,28 +1461,31 @@ async fn handle_slash_command(
             // Clone the catalog into the component — the component
             // owns it for the lifetime of the overlay so we don't
             // pay an extra Arc indirection on every rebuild.
-            let component = ModelSelectorComponent::new(
+            let inner = ModelSelectorComponent::new(
                 select_list_theme(theme),
                 (*model_catalog).clone(),
                 Some(&identity),
-                initial_query,
+                None,
             );
-            let outcome = component.outcome_handle();
-            // Model picker needs more width than the thinking
-            // overlay — long ids like `claude-sonnet-4-20250514`
-            // benefit from a roomier primary column.
-            let options = OverlayOptions {
-                anchor: OverlayAnchor::Center,
-                width: Some(SizeValue::Absolute(80)),
-                ..OverlayOptions::default()
-            };
-            let handle = tui.show_overlay(Box::new(component), options);
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Select model",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_confirm_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             SlashHandled::Continue {
-                selector: Some(OpenSelector::Model { handle, outcome }),
+                selector: Some(OpenSelector::Model {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
                 notice: None,
             }
         }
-        SlashAction::OpenSessionSelector { initial_query } => {
+        SlashAction::OpenSessionSelector => 'arm: {
             // Read the current thread id so the overlay pre-selects
             // the active row.
             let current_thread_id = {
@@ -1138,7 +1502,7 @@ async fn handle_slash_command(
             let previews = match conversation_persistence.list_thread_previews(|_, _| {}) {
                 Ok(p) => p,
                 Err(err) => {
-                    return SlashHandled::Continue {
+                    break 'arm SlashHandled::Continue {
                         selector: None,
                         notice: Some(format!("Failed to list threads: {err}")),
                     };
@@ -1146,41 +1510,75 @@ async fn handle_slash_command(
             };
 
             if previews.is_empty() {
-                return SlashHandled::Continue {
+                break 'arm SlashHandled::Continue {
                     selector: None,
                     notice: Some("No threads to switch to in this project.".to_string()),
                 };
             }
 
-            let component = SessionSelectorComponent::new(
+            let inner = SessionSelectorComponent::new(
                 select_list_theme(theme),
                 previews,
                 Some(current_thread_id),
-                initial_query,
+                None,
             );
-            let outcome = component.outcome_handle();
-            // Session picker carries the richest per-row metadata
-            // (preview prefix + msg count + creation date + last-
-            // message age), so it gets the most room. 80% of the
-            // terminal width on wide terminals lets the description
-            // triplet breathe; an 80-column floor keeps the
-            // overlay readable on narrower terminals, and the
-            // 80%-of-height cap keeps the picker from spilling
-            // beyond the visible region on short terminals.
-            // `resolve_overlay_layout` clamps the resolved width
-            // to the terminal's actual width after the floor is
-            // applied, so the picker degrades gracefully when the
-            // floor exceeds the terminal width.
-            let options = OverlayOptions {
-                anchor: OverlayAnchor::Center,
-                width: Some(SizeValue::Percent(80.0)),
-                min_width: Some(80),
-                max_height: Some(SizeValue::Percent(80.0)),
-                ..OverlayOptions::default()
-            };
-            let handle = tui.show_overlay(Box::new(component), options);
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Resume thread",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_confirm_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             SlashHandled::Continue {
-                selector: Some(OpenSelector::Session { handle, outcome }),
+                selector: Some(OpenSelector::Session {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
+                notice: None,
+            }
+        }
+        SlashAction::OpenPromptHistory => {
+            // Current-workspace prompts are scanned eagerly (cheap:
+            // one project's thread files). The all-workspaces set is
+            // deferred to a loader the component invokes on first
+            // scope toggle so opening the overlay stays fast.
+            let workspace_entries = workspace_history(conversation_persistence);
+            let all_loader = {
+                let persistence = conversation_persistence.clone();
+                Box::new(move || match Config::get_threads_base_dir_path() {
+                    Ok(base) => all_workspaces_history(&base),
+                    Err(err) => {
+                        tracing::debug!("could not resolve threads base dir: {err}");
+                        // Fall back to the current workspace so the
+                        // toggle still shows something.
+                        workspace_history(&persistence)
+                    }
+                })
+            };
+            let inner = PromptHistorySearchComponent::new(
+                select_list_theme(theme),
+                workspace_entries,
+                all_loader,
+                14,
+            );
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Prompt history",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_confirm_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::PromptHistory {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
                 notice: None,
             }
         }
@@ -1204,10 +1602,27 @@ async fn handle_slash_command(
                 notice: Some(format!("Failed to start a fresh thread: {err}")),
             },
         },
-        SlashAction::Help => SlashHandled::Continue {
-            selector: None,
-            notice: Some(format_help_notice()),
-        },
+        SlashAction::Help => {
+            use crate::modes::interactive::components::help_overlay::HelpOverlayComponent;
+            let inner = HelpOverlayComponent::new(select_list_theme(theme));
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Help",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::Help {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
+                notice: None,
+            }
+        }
         SlashAction::NotYetImplemented { message, .. } => SlashHandled::Continue {
             selector: None,
             notice: Some(message.to_string()),
@@ -1219,11 +1634,34 @@ async fn handle_slash_command(
                 "Unknown command: {input}. Try /help for available commands."
             )),
         },
-        SlashAction::InvalidArgument { message, .. } => SlashHandled::Continue {
-            selector: None,
-            notice: Some(message),
-        },
+    };
+
+    // If we were dispatched as a palette follow-up, the palette
+    // is hidden on the overlay stack. The arms that mount a
+    // sub-selector consume `parent_palette` (passing it onto the
+    // new `OpenSelector`), in which case the resulting
+    // `SlashHandled::Continue` carries one of those variants.
+    // For every other arm — `NewThread`, `Quit`, errors, etc. —
+    // the palette would otherwise leak, so tear it down here.
+    if let Some(palette) = parent_palette {
+        let consumed = matches!(
+            &result,
+            SlashHandled::Continue {
+                selector: Some(
+                    OpenSelector::Thinking { .. }
+                        | OpenSelector::Model { .. }
+                        | OpenSelector::Session { .. }
+                        | OpenSelector::PromptHistory { .. }
+                        | OpenSelector::Help { .. },
+                ),
+                ..
+            },
+        );
+        if !consumed {
+            tui.hide_overlay(&palette.handle);
+        }
     }
+    result
 }
 
 /// Poll an open selector for its outcome and apply the result.
@@ -1245,12 +1683,23 @@ async fn handle_selector_outcome(
     theme: &ThemeHandle,
 ) -> SelectorPollOutcome {
     match selector {
-        OpenSelector::Thinking { handle, outcome } => {
+        OpenSelector::Thinking {
+            handle,
+            outcome,
+            parent_palette,
+        } => {
             let outcome_value = outcome.lock().expect("thinking outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Thinking { handle, outcome }),
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Thinking {
+                    handle,
+                    outcome,
+                    parent_palette,
+                }),
                 Some(ThinkingSelectorOutcome::Confirmed(level)) => {
                     tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.hide_overlay(&parent.handle);
+                    }
                     {
                         let mut a = agent.lock().await;
                         a.set_default_thinking(level.clone());
@@ -1270,20 +1719,48 @@ async fn handle_selector_outcome(
                     let name = thinking_level_name(&level);
                     SelectorPollOutcome::Closed {
                         notice: Some(format!("Thinking effort set to {name}.")),
+                        follow_up: None,
                     }
                 }
                 Some(ThinkingSelectorOutcome::Cancelled) => {
                     tui.hide_overlay(&handle);
-                    SelectorPollOutcome::Closed { notice: None }
+                    if let Some(parent) = parent_palette {
+                        // Pop back to the palette. Un-hide it on the
+                        // overlay stack and restore the host-side
+                        // `OpenSelector::Palette` tracking so its
+                        // outcome slot is polled again — without
+                        // restoring tracking the palette becomes
+                        // input-wedged.
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                    }
                 }
             }
         }
-        OpenSelector::Model { handle, outcome } => {
+        OpenSelector::Model {
+            handle,
+            outcome,
+            parent_palette,
+        } => {
             let outcome_value = outcome.lock().expect("model outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Model { handle, outcome }),
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Model {
+                    handle,
+                    outcome,
+                    parent_palette,
+                }),
                 Some(ModelSelectorOutcome::Confirmed(info)) => {
                     tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.hide_overlay(&parent.handle);
+                    }
                     // Construct a fresh provider handle from the
                     // picked catalog entry. Speed is intentionally
                     // left unset on selector-driven swaps; users who
@@ -1336,25 +1813,48 @@ async fn handle_selector_outcome(
                                     "Model set to {} ({}/{}).",
                                     info.name, info.provider, info.id
                                 )),
+                                follow_up: None,
                             }
                         }
                         Err(err) => SelectorPollOutcome::Closed {
                             notice: Some(format!("Failed to switch to {}: {err}", info.name)),
+                            follow_up: None,
                         },
                     }
                 }
                 Some(ModelSelectorOutcome::Cancelled) => {
                     tui.hide_overlay(&handle);
-                    SelectorPollOutcome::Closed { notice: None }
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                    }
                 }
             }
         }
-        OpenSelector::Session { handle, outcome } => {
+        OpenSelector::Session {
+            handle,
+            outcome,
+            parent_palette,
+        } => {
             let outcome_value = outcome.lock().expect("session outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Session { handle, outcome }),
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Session {
+                    handle,
+                    outcome,
+                    parent_palette,
+                }),
                 Some(SessionSelectorOutcome::Confirmed(preview)) => {
                     tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.hide_overlay(&parent.handle);
+                    }
                     // No-op when the user picks the row that's
                     // already active. Saves the swap dance (and
                     // the chat-container clear that would briefly
@@ -1366,6 +1866,7 @@ async fn handle_selector_outcome(
                     if is_current {
                         return SelectorPollOutcome::Closed {
                             notice: Some(format!("Already on thread {}.", preview.thread_id)),
+                            follow_up: None,
                         };
                     }
                     match perform_thread_swap(
@@ -1382,18 +1883,135 @@ async fn handle_selector_outcome(
                     {
                         Ok(()) => SelectorPollOutcome::Closed {
                             notice: Some(format!("Switched to thread {}.", preview.thread_id)),
+                            follow_up: None,
                         },
                         Err(err) => SelectorPollOutcome::Closed {
                             notice: Some(format!(
                                 "Failed to switch to thread {}: {err}",
                                 preview.thread_id
                             )),
+                            follow_up: None,
                         },
                     }
                 }
                 Some(SessionSelectorOutcome::Cancelled) => {
                     tui.hide_overlay(&handle);
-                    SelectorPollOutcome::Closed { notice: None }
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                    }
+                }
+            }
+        }
+        OpenSelector::PromptHistory {
+            handle,
+            outcome,
+            parent_palette,
+        } => match outcome.take() {
+            None => SelectorPollOutcome::StillOpen(OpenSelector::PromptHistory {
+                handle,
+                outcome,
+                parent_palette,
+            }),
+            Some(PromptHistoryOutcome::Recalled { text }) => {
+                tui.hide_overlay(&handle);
+                if let Some(parent) = parent_palette {
+                    tui.hide_overlay(&parent.handle);
+                }
+                // Recall replaces the editor buffer (it does not
+                // submit) so the user can edit before sending.
+                if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+                    editor.set_text(&text);
+                }
+                tui.request_render();
+                SelectorPollOutcome::Closed {
+                    notice: None,
+                    follow_up: None,
+                }
+            }
+            Some(PromptHistoryOutcome::Cancelled) => {
+                tui.hide_overlay(&handle);
+                if let Some(parent) = parent_palette {
+                    tui.set_overlay_hidden(&parent.handle, false);
+                    return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                        handle: parent.handle,
+                        outcome: parent.outcome,
+                    });
+                }
+                SelectorPollOutcome::Closed {
+                    notice: None,
+                    follow_up: None,
+                }
+            }
+        },
+        OpenSelector::Help {
+            handle,
+            outcome,
+            parent_palette,
+        } => {
+            use crate::modes::interactive::components::help_overlay::HelpOverlayOutcome;
+            match outcome.take() {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Help {
+                    handle,
+                    outcome,
+                    parent_palette,
+                }),
+                Some(HelpOverlayOutcome::Closed) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                    }
+                }
+            }
+        }
+        OpenSelector::Palette { handle, outcome } => {
+            use crate::modes::interactive::components::command_palette::CommandPaletteOutcome;
+            match outcome.take() {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Palette { handle, outcome }),
+                Some(CommandPaletteOutcome::Cancelled) => {
+                    tui.hide_overlay(&handle);
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                    }
+                }
+                Some(CommandPaletteOutcome::Confirmed { input }) => {
+                    // Hide (don't remove) the palette so we can
+                    // restore it if the follow-up command opens a
+                    // sub-selector and the user cancels back. If
+                    // the follow-up doesn't open a sub-selector,
+                    // `handle_slash_command` tears the palette
+                    // down once it finishes dispatching. The
+                    // outcome handle is cloned into the follow-up
+                    // so the host can re-install
+                    // `OpenSelector::Palette` after a child cancel,
+                    // keeping the palette pollable.
+                    tui.set_overlay_hidden(&handle, true);
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: Some(PaletteFollowUp {
+                            input,
+                            parent_palette: ParentPalette {
+                                handle,
+                                outcome: outcome.clone(),
+                            },
+                        }),
+                    }
                 }
             }
         }
@@ -1646,29 +2264,6 @@ async fn perform_new_thread(
     Ok(new_thread_id)
 }
 
-/// Build the `/help` notice body listing every entry in
-/// [`BUILTIN_COMMANDS`].
-///
-/// Format: one line per command as `/<name> <argument_hint?> —
-/// <description>`. Lines are joined with `\n`; the chat renderer
-/// surfaces the result as a multi-line dim block.
-fn format_help_notice() -> String {
-    use crate::config::slash_commands::BUILTIN_COMMANDS;
-
-    let mut out = String::from("Available slash commands:");
-    for cmd in BUILTIN_COMMANDS {
-        out.push_str("\n  /");
-        out.push_str(cmd.name);
-        if let Some(hint) = cmd.argument_hint {
-            out.push(' ');
-            out.push_str(hint);
-        }
-        out.push_str(" \u{2014} ");
-        out.push_str(cmd.description);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1792,27 +2387,6 @@ mod tests {
                 assert_eq!(text, SANDBOX_WARNING);
             }
             other => panic!("expected Warning, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn format_help_notice_lists_every_builtin_command() {
-        use crate::config::slash_commands::BUILTIN_COMMANDS;
-
-        let notice = format_help_notice();
-        assert!(notice.starts_with("Available slash commands:"));
-        for cmd in BUILTIN_COMMANDS {
-            let needle = format!("/{}", cmd.name);
-            assert!(
-                notice.contains(&needle),
-                "help notice missing /{}: {notice:?}",
-                cmd.name,
-            );
-            assert!(
-                notice.contains(cmd.description),
-                "help notice missing description for /{}: {notice:?}",
-                cmd.name,
-            );
         }
     }
 }

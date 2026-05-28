@@ -16,11 +16,14 @@
 
 pub mod assistant_message;
 pub mod bash_execution;
+pub mod command_palette;
 pub mod diff;
 pub mod footer;
 pub mod header;
+pub mod help_overlay;
 pub mod loader_status;
 pub mod model_selector;
+pub mod prompt_history;
 pub mod session_selector;
 pub mod thinking_selector;
 pub mod tool_execution;

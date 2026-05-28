@@ -224,6 +224,10 @@ pub struct OverlayOptions {
     pub width: Option<SizeValue>,
     /// Minimum width.
     pub min_width: Option<usize>,
+    /// Maximum width (absolute columns). Applied after `width` and
+    /// `min_width` so an overlay sized as a percentage of a very wide
+    /// terminal stays readable rather than stretching edge to edge.
+    pub max_width: Option<usize>,
     /// Maximum height.
     pub max_height: Option<SizeValue>,
     /// Anchor position (default: Center).
@@ -249,6 +253,7 @@ impl Default for OverlayOptions {
         Self {
             width: None,
             min_width: None,
+            max_width: None,
             max_height: None,
             anchor: OverlayAnchor::Center,
             offset_x: 0,
@@ -293,6 +298,12 @@ struct OverlayEntry {
 }
 
 /// Handle to control a shown overlay.
+///
+/// `Copy` because it's a thin opaque id; cloning carries no
+/// ownership semantics (the underlying overlay lives on the
+/// `Tui`'s overlay stack and is released by
+/// [`Tui::hide_overlay`]).
+#[derive(Clone, Copy)]
 pub struct OverlayHandle {
     id: u64,
 }
@@ -617,6 +628,9 @@ fn resolve_overlay_layout(
         .unwrap_or_else(|| avail_width.min(80));
     if let Some(min_w) = opts.min_width {
         width = width.max(min_w);
+    }
+    if let Some(max_w) = opts.max_width {
+        width = width.min(max_w);
     }
     width = width.min(avail_width).max(1);
 

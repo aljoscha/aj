@@ -40,6 +40,30 @@ pub const ACTION_TOOLS_EXPAND: &str = "aj.tools.expand";
 /// no-op — users expect Ctrl+V to be benign.
 pub const ACTION_CLIPBOARD_PASTE_IMAGE: &str = "aj.clipboard.paste_image";
 
+/// Action ID for the "open command palette" chord.
+///
+/// Bound by default to `ctrl+o`. The interactive loop intercepts the
+/// keystroke globally (before any component sees it) and opens the
+/// command palette overlay. When a capturing overlay is already up
+/// the listener bails out, so the chord doesn't interrupt an open
+/// selector. The same overlay can also be opened by typing `/` at
+/// an empty prompt or by submitting `/palette`.
+pub const ACTION_PALETTE_OPEN: &str = "aj.palette.open";
+
+/// Closes every open overlay in one keystroke regardless of
+/// nesting depth — used as a "bail out completely" shortcut.
+/// Default binding: `ctrl+c`. The interactive loop intercepts the
+/// keystroke before `tui.handle_input` when any overlay is open
+/// and consumes the event so the selector doesn't also run its
+/// cancel path.
+pub const ACTION_OVERLAY_CLOSE_ALL: &str = "aj.overlay.close_all";
+
+/// Toggles the prompt-history search between the current workspace
+/// and all workspaces. Default binding: `ctrl+t`. Handled inside
+/// the prompt-history overlay; the default scope is the current
+/// workspace.
+pub const ACTION_HISTORY_TOGGLE_SCOPE: &str = "aj.history.toggle_scope";
+
 /// Built-in `aj`-level keybinding definitions.
 ///
 /// Returned as a fresh `Vec` so callers can extend or filter before
@@ -58,6 +82,18 @@ pub fn aj_keybindings() -> KeybindingDefinitions {
         (
             ACTION_CLIPBOARD_PASTE_IMAGE.to_string(),
             K::new("ctrl+v", "Paste image from clipboard"),
+        ),
+        (
+            ACTION_PALETTE_OPEN.to_string(),
+            K::new("ctrl+o", "Open command palette"),
+        ),
+        (
+            ACTION_OVERLAY_CLOSE_ALL.to_string(),
+            K::new("ctrl+c", "Close all open overlays"),
+        ),
+        (
+            ACTION_HISTORY_TOGGLE_SCOPE.to_string(),
+            K::new("ctrl+t", "Toggle prompt-history scope (workspace / all)"),
         ),
     ]
 }
@@ -118,6 +154,21 @@ mod tests {
     fn aj_tools_expand_defaults_to_alt_o() {
         let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
         assert_eq!(kbm.get_keys(ACTION_TOOLS_EXPAND), &["alt+o".to_string()]);
+    }
+
+    #[test]
+    fn aj_palette_open_defaults_to_ctrl_o() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(kbm.get_keys(ACTION_PALETTE_OPEN), &["ctrl+o".to_string()]);
+    }
+
+    #[test]
+    fn aj_overlay_close_all_defaults_to_ctrl_c() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(
+            kbm.get_keys(ACTION_OVERLAY_CLOSE_ALL),
+            &["ctrl+c".to_string()]
+        );
     }
 
     #[test]

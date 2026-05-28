@@ -114,21 +114,9 @@ fn base_dir(provider_root: &TempDir, sub: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn should_trigger_file_completion_returns_false_for_top_level_slash_command() {
-    let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
-
-    let lines = vec!["/mo".to_string()];
-    assert!(
-        !provider.should_trigger_file_completion(&lines, 0, 3),
-        "Tab inside a slash-command name must not open the file picker",
-    );
-}
-
-#[test]
 fn should_trigger_file_completion_returns_true_in_normal_contexts() {
     let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     // Empty buffer.
     assert!(provider.should_trigger_file_completion(&[String::new()], 0, 0));
@@ -153,7 +141,7 @@ fn should_trigger_file_completion_returns_true_in_normal_contexts() {
 #[test]
 fn extracts_root_slash_from_hey_slash_when_forced() {
     let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "hey /", true);
     assert!(
         result.is_some(),
@@ -165,7 +153,7 @@ fn extracts_root_slash_from_hey_slash_when_forced() {
 #[test]
 fn extracts_slash_a_from_plain_slash_a_when_forced() {
     let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "/A", true);
     // "/A" may return None if nothing matches, but when it does return,
     // the prefix is exactly what was typed.
@@ -177,7 +165,7 @@ fn extracts_slash_a_from_plain_slash_a_when_forced() {
 #[test]
 fn does_not_trigger_on_slash_command_when_forced() {
     let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "/model", true);
     assert!(
         result.is_none(),
@@ -188,7 +176,7 @@ fn does_not_trigger_on_slash_command_when_forced() {
 #[test]
 fn triggers_absolute_path_inside_command_argument() {
     let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "/command /", true);
     assert!(
         result.is_some(),
@@ -213,7 +201,7 @@ fn at_prefix_returns_all_files_and_folders_for_empty_query() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@", false).expect("suggestions");
 
     assert_eq!(sorted_values(&result), vec!["@README.md", "@src/"]);
@@ -231,7 +219,7 @@ fn at_prefix_matches_file_with_extension_in_query() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@file.txt", false).expect("suggestions");
 
     assert!(values(&result).iter().any(|v| v == "@file.txt"));
@@ -249,7 +237,7 @@ fn at_prefix_filters_are_case_insensitive() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@re", false).expect("suggestions");
 
     assert_eq!(sorted_values(&result), vec!["@README.md"]);
@@ -267,7 +255,7 @@ fn at_prefix_ranks_directories_before_files() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@src", false).expect("suggestions");
 
     let vs = values(&result);
@@ -287,7 +275,7 @@ fn at_prefix_returns_nested_file_paths() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@index", false).expect("suggestions");
 
     assert!(values(&result).iter().any(|v| v == "@src/index.ts"));
@@ -308,7 +296,7 @@ fn at_prefix_matches_deeply_nested_paths() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@tui/src/auto", false).expect("suggestions");
     let vs = values(&result);
     assert!(vs.iter().any(|v| v == "@packages/tui/src/autocomplete.ts"));
@@ -330,7 +318,7 @@ fn at_prefix_matches_directory_in_middle_of_path() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@components/", false).expect("suggestions");
     let vs = values(&result);
     assert!(vs.iter().any(|v| v == "@src/components/Button.tsx"));
@@ -349,7 +337,7 @@ fn at_prefix_quotes_paths_with_spaces() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@my", false).expect("suggestions");
     let vs = values(&result);
     assert!(vs.iter().any(|v| v == "@\"my folder/\""));
@@ -371,7 +359,7 @@ fn at_prefix_includes_hidden_paths_but_excludes_dot_git() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@", false).expect("suggestions");
     let vs = values(&result);
     assert!(vs.iter().any(|v| v == "@.aj/"));
@@ -404,7 +392,7 @@ fn at_prefix_explicit_dot_git_scope_returns_no_suggestions() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@.git/HEAD", false);
     assert!(
         result.is_none(),
@@ -459,8 +447,8 @@ fn at_prefix_returns_same_suggestions_when_cwd_path_contains_the_query() {
     );
 
     let query = "@plan";
-    let normal_provider = CombinedAutocompleteProvider::new(vec![], &normal_base);
-    let query_in_path_provider = CombinedAutocompleteProvider::new(vec![], &query_in_path_base);
+    let normal_provider = CombinedAutocompleteProvider::new(&normal_base);
+    let query_in_path_provider = CombinedAutocompleteProvider::new(&query_in_path_base);
 
     let normal = suggest(&normal_provider, query, false).expect("suggestions");
     let query_in_path = suggest(&query_in_path_provider, query, false).expect("suggestions");
@@ -516,7 +504,7 @@ fn at_prefix_continues_autocomplete_inside_quoted_paths() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let line = "@\"my folder/\"";
     let cursor = line.chars().count() - 1; // inside the closing quote
     let result = suggest_at(&provider, line, cursor, false).expect("suggestions");
@@ -537,7 +525,7 @@ fn at_prefix_applies_quoted_completion_without_duplicating_closing_quote() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let line = "@\"my folder/te\"";
     let cursor = line.chars().count() - 1;
     let result = suggest_at(&provider, line, cursor, false).expect("suggestions");
@@ -572,7 +560,7 @@ fn at_prefix_scopes_fuzzy_search_to_relative_directories_recursively() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@../outside/a", false).expect("suggestions");
     let vs = values(&result);
     assert!(
@@ -614,7 +602,7 @@ fn at_prefix_follows_symlinked_directories_for_fuzzy_search() {
     );
     std::os::unix::fs::symlink("../outside", base.join("symlinked_dir")).expect("create symlink");
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@some", false).expect("suggestions");
     let vs = values(&result);
     assert!(
@@ -644,7 +632,7 @@ fn at_prefix_returns_symlinked_directories_when_matching_their_name() {
     );
     std::os::unix::fs::symlink("../outside", base.join("symlinked_dir")).expect("create symlink");
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@symlinked", false).expect("suggestions");
     let vs = values(&result);
     assert!(
@@ -670,7 +658,7 @@ fn at_prefix_returns_symlinked_files_without_requiring_type_l() {
     );
     std::os::unix::fs::symlink("original.txt", base.join("link.txt")).expect("create symlink");
 
-    let provider = CombinedAutocompleteProvider::new(vec![], &base);
+    let provider = CombinedAutocompleteProvider::new(&base);
     let result = suggest(&provider, "@link", false).expect("suggestions");
     let vs = values(&result);
     assert!(
@@ -694,7 +682,7 @@ fn dot_slash_prefix_is_preserved_when_completing_paths() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "./up", true).expect("suggestions");
     let vs = values(&result);
     assert!(
@@ -714,7 +702,7 @@ fn dot_slash_prefix_is_preserved_for_directory_completions() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "./sr", true).expect("suggestions");
     let vs = values(&result);
     assert!(
@@ -738,7 +726,7 @@ fn quotes_paths_with_spaces_for_direct_completion() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "my", true).expect("suggestions");
     let vs = values(&result);
     assert!(
@@ -761,7 +749,7 @@ fn continues_completion_inside_quoted_paths() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let line = "\"my folder/\"";
     let cursor = line.chars().count() - 1;
     let result = suggest_at(&provider, line, cursor, true).expect("suggestions");
@@ -781,7 +769,7 @@ fn applies_quoted_completion_without_duplicating_closing_quote() {
         },
     );
 
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
     let line = "\"my folder/te\"";
     let cursor = line.chars().count() - 1;
     let result = suggest_at(&provider, line, cursor, true).expect("suggestions");

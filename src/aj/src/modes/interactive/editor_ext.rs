@@ -214,7 +214,7 @@ impl PromptHistory {
 /// Pull text-block content out of a user message, joining multiple
 /// text blocks with a newline. Returns `None` if there is no text
 /// content (e.g. a tool-result message or an assistant message).
-fn extract_user_prompt_text(msg: &AgentMessage) -> Option<String> {
+pub(crate) fn extract_user_prompt_text(msg: &AgentMessage) -> Option<String> {
     let user = match &msg.kind {
         AgentMessageKind::Wire(Message::User(u)) => u,
         _ => return None,
@@ -532,6 +532,8 @@ mod tests {
                 description: Arc::new(|s: &str| s.to_string()),
                 scroll_info: Arc::new(|s: &str| s.to_string()),
                 no_match: Arc::new(|s: &str| s.to_string()),
+                prefix: Arc::new(|s: &str| s.to_string()),
+                shortcut: Arc::new(|s: &str| s.to_string()),
             },
         };
 

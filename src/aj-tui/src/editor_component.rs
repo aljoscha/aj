@@ -134,6 +134,8 @@ mod tests {
                 description: Arc::new(|s| s.to_string()),
                 scroll_info: Arc::new(|s| s.to_string()),
                 no_match: Arc::new(|s| s.to_string()),
+                prefix: Arc::new(|s| s.to_string()),
+                shortcut: Arc::new(|s| s.to_string()),
             },
         }
     }

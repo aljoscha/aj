@@ -65,6 +65,8 @@ fn editor_submenu_factory() -> SubmenuFactory {
                 description: Arc::new(style::dim),
                 scroll_info: Arc::new(style::dim),
                 no_match: Arc::new(style::dim),
+                prefix: Arc::new(style::dim),
+                shortcut: Arc::new(style::cyan),
             },
             // Default column bounds; pi-tui defaults `layout` to `{}`.
             SelectListLayout::default(),

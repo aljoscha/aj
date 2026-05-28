@@ -554,6 +554,13 @@ pub struct Editor {
     pub on_change: Option<Box<dyn FnMut(&str)>>,
     /// If true, Enter inserts a newline instead of submitting.
     pub disable_submit: bool,
+
+    /// Fired when the user types `/` at an empty start-of-message
+    /// position. When set, the `/` keystroke is swallowed (not
+    /// inserted) and the callback runs. The host wires this to open
+    /// the command palette overlay. When unset, `/` inserts normally
+    /// and the legacy inline slash-command popup may trigger.
+    on_palette_trigger: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -628,18 +635,15 @@ struct AutocompleteSnapshot {
 
 /// What should happen after the autocomplete Enter handler runs, from
 /// the perspective of the outer key dispatcher.
+///
+/// The popup is consumed by `@`-fuzzy-file completion and direct path
+/// completion today; neither continues on to message submit, so the
+/// outer dispatcher only needs the `Consumed` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnterOutcome {
     /// Completion was applied (or the popup dismissed) and no further
     /// action should be taken for this Enter keystroke.
     Consumed,
-    /// Completion was applied and the outer dispatcher should continue
-    /// on to its usual Enter-submits-the-message path. Produced only
-    /// when the completed prefix was a slash-command *name*
-    /// (`/clear`, `/delete`, etc.) so the user experience is
-    /// `type /clear → autocomplete completes it → Enter submits` in
-    /// a single keystroke.
-    FallThroughToSubmit,
 }
 
 impl Editor {
@@ -697,6 +701,7 @@ impl Editor {
             on_submit: None,
             on_change: None,
             disable_submit: false,
+            on_palette_trigger: None,
         }
     }
 
@@ -832,6 +837,13 @@ impl Editor {
     ) {
         self.cancel_autocomplete();
         self.autocomplete_provider = Some(provider);
+    }
+
+    /// Install a callback fired when the user types `/` at an empty
+    /// start-of-message position. The `/` keystroke is swallowed.
+    /// Passing `None` restores the default insert-as-text behavior.
+    pub fn set_on_palette_trigger(&mut self, cb: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.on_palette_trigger = cb;
     }
 
     /// Whether the autocomplete popup is currently visible.
@@ -2398,7 +2410,7 @@ impl Editor {
         // Construct the popup via the prefix-aware helper: build the
         // SelectList through `create_autocomplete_list`, then set the
         // best-match selection and the active mode.
-        let mut list = self.create_autocomplete_list(&self.autocomplete_prefix, items);
+        let mut list = self.create_autocomplete_list(items);
         list.set_selected_index(highlight_idx);
         self.autocomplete_list = Some(list);
         self.autocomplete_state = Some(delivery.mode);
@@ -2583,7 +2595,7 @@ impl Editor {
         // Same `create_autocomplete_list` helper as the one-shot path
         // above; routing both paths through the same helper keeps the
         // popup-construction contract symmetric.
-        let mut list = self.create_autocomplete_list(&self.autocomplete_prefix, items);
+        let mut list = self.create_autocomplete_list(items);
         list.set_selected_index(highlight_idx);
         self.autocomplete_list = Some(list);
     }
@@ -2597,46 +2609,21 @@ impl Editor {
         s
     }
 
-    /// Slash-command autocomplete popup layout. The `[12, 32]` bounds
-    /// give short commands more breathing room for the description
-    /// column without losing the cap on long names.
-    ///
-    /// A function rather than a `const` because [`SelectListLayout`] carries
-    /// an `Option<Box<dyn Fn>>` field for `truncate_primary`, which isn't
-    /// `const`-compatible.
-    fn slash_command_select_list_layout() -> SelectListLayout {
-        SelectListLayout {
-            min_primary_column_width: Some(12),
-            max_primary_column_width: Some(32),
-            truncate_primary: None,
-        }
-    }
-
-    /// Build the autocomplete popup's [`SelectList`]. Slash-command
-    /// popups get the tighter `[12, 32]` primary-column bounds via
-    /// [`Self::slash_command_select_list_layout`]; every other trigger
-    /// (`@`-style file completion, etc.) takes the layout default (a
-    /// fixed 32-cell primary column).
-    ///
-    /// The popup's theme is cloned from `self.theme.select_list`. Because
+    /// Build the autocomplete popup's [`SelectList`]. Uses the default
+    /// layout (fixed 32-cell primary column) for every trigger
+    /// (`@`-style file completion, direct path completion). The popup's
+    /// theme is cloned from `self.theme.select_list`. Because
     /// [`SelectListTheme`] derives `Clone` (its closures are
     /// `Arc<dyn Fn>`), this is a cheap refcount bump — no rebuilding of
     /// the closures and no silent drop of the agent's configured palette.
     /// Caller is responsible for any post-construction state (selected
-    /// index, autocomplete mode, etc.); this helper only constructs the
-    /// list; the caller wires up the rest of the popup state in a
-    /// separate step.
-    fn create_autocomplete_list(&self, prefix: &str, items: Vec<SelectItem>) -> SelectList {
-        let layout = if prefix.starts_with('/') {
-            Self::slash_command_select_list_layout()
-        } else {
-            SelectListLayout::default()
-        };
+    /// index, autocomplete mode, etc.).
+    fn create_autocomplete_list(&self, items: Vec<SelectItem>) -> SelectList {
         SelectList::new(
             items,
             self.autocomplete_max_visible,
             self.theme.select_list.clone(),
-            layout,
+            SelectListLayout::default(),
         )
     }
 
@@ -2741,11 +2728,8 @@ impl Editor {
             return;
         }
         let should_trigger = match c {
-            '/' => self.is_at_start_of_message(),
             '@' | '#' => self.symbol_follows_whitespace_or_start(c),
-            c if is_identifier_char(c) => {
-                self.is_in_slash_command_context() || self.is_in_symbol_context()
-            }
+            c if is_identifier_char(c) => self.is_in_symbol_context(),
             _ => false,
         };
         if should_trigger {
@@ -2766,25 +2750,19 @@ impl Editor {
             self.update_autocomplete(force);
             return;
         }
-        if self.is_in_slash_command_context() || self.is_in_symbol_context() {
+        if self.is_in_symbol_context() {
             self.update_autocomplete(false);
         }
     }
 
-    /// Slash menus only make sense on the first line of a message: when
-    /// the user is typing a prose reply across multiple lines, a `/` in
-    /// the middle of line 2 is almost certainly part of a path or a
-    /// regex, not a command.
-    fn is_slash_menu_allowed(&self) -> bool {
-        self.cursor_line == 0
-    }
-
     /// True when the cursor is positioned on a line that's empty or
     /// contains only `/`, ignoring leading/trailing whitespace. Used
-    /// to decide whether a freshly-typed `/` opens a slash-command
-    /// popup.
+    /// to decide whether a freshly-typed `/` opens the command
+    /// palette. Restricted to the first line of a message: a `/` on
+    /// line 2 of a multi-line prose reply is almost certainly part
+    /// of a path or regex, not a command trigger.
     fn is_at_start_of_message(&self) -> bool {
-        if !self.is_slash_menu_allowed() {
+        if self.cursor_line != 0 {
             return false;
         }
         let before = &self.lines[self.cursor_line][..self.cursor_col];
@@ -2810,17 +2788,6 @@ impl Editor {
         }
     }
 
-    /// True when the text before the cursor looks like a slash-command
-    /// line (`/` as the first non-whitespace character, after trimming
-    /// leading whitespace).
-    fn is_in_slash_command_context(&self) -> bool {
-        if !self.is_slash_menu_allowed() {
-            return false;
-        }
-        let before = &self.lines[self.cursor_line][..self.cursor_col];
-        before.trim_start().starts_with('/')
-    }
-
     /// True when the cursor is inside an `@`- or `#`-prefixed symbol
     /// reference: the rightmost `@` or `#` in the text before the
     /// cursor is preceded by whitespace or start-of-line, and no
@@ -2836,19 +2803,10 @@ impl Editor {
     /// Apply whichever autocomplete item the current popup resolves
     /// to for Enter. The rule: if the typed prefix is an exact match
     /// for any item, keep the typed value literally. Otherwise, apply
-    /// the first item whose value starts with the
-    /// typed prefix (the highlighted one).
-    ///
-    /// Returns [`EnterOutcome`]:
-    ///
-    /// - `Consumed` — completion applied (or popup dismissed) and the
-    ///   caller should treat the Enter as done.
-    /// - `FallThroughToSubmit` — completion applied *and* the prefix
-    ///   was a slash-command name (`/foo`), so the caller should also
-    ///   run its Enter-submits-the-message handler. This matches the
-    ///   convention where pressing Enter on `/clear` both writes the
-    ///   literal `/clear` into the buffer and immediately submits it
-    ///   as a command.
+    /// the first item whose value starts with the typed prefix (the
+    /// highlighted one). Always returns [`EnterOutcome::Consumed`]:
+    /// no current completion path needs the outer dispatcher to
+    /// continue on to message submit.
     fn accept_autocomplete_on_enter(&mut self) -> EnterOutcome {
         let Some(list) = &self.autocomplete_list else {
             return EnterOutcome::Consumed;
@@ -2863,13 +2821,6 @@ impl Editor {
         let typed_start = self.cursor_col.saturating_sub(prefix_len);
         let typed = line[typed_start..self.cursor_col].to_string();
 
-        // Whether this popup is completing a slash-command *name*
-        // (prefix like `/clear`) as opposed to a slash-command
-        // argument (prefix = the argument text), an `@`-file ref
-        // (prefix like `@src/`), or a raw path. Only the slash-
-        // command-name case triggers submit-after-accept.
-        let prefix_is_slash_command = self.autocomplete_prefix.starts_with('/');
-
         // If the typed value is exactly one of the item values, keep
         // it verbatim and just close.
         let exact = list.items().iter().any(|i| i.value == typed);
@@ -2882,12 +2833,7 @@ impl Editor {
                 description: selected.description,
             });
         }
-
-        if prefix_is_slash_command {
-            EnterOutcome::FallThroughToSubmit
-        } else {
-            EnterOutcome::Consumed
-        }
+        EnterOutcome::Consumed
     }
 }
 
@@ -3324,15 +3270,8 @@ impl Component for Editor {
                     }
                     if kb.matches(event, "tui.select.confirm") {
                         drop(kb);
-                        match self.accept_autocomplete_on_enter() {
-                            EnterOutcome::Consumed => return true,
-                            EnterOutcome::FallThroughToSubmit => {
-                                // Completion was applied for a
-                                // slash-command name; keep running
-                                // so the outer dispatcher's submit
-                                // branch fires on this same Enter.
-                            }
-                        }
+                        let EnterOutcome::Consumed = self.accept_autocomplete_on_enter();
+                        return true;
                     }
                     // Fall through to normal key handling. If an
                     // editing path runs, its
@@ -3615,6 +3554,22 @@ impl Component for Editor {
                 if let KeyCode::Char(c) = key.code
                     && (mods - KeyModifiers::SHIFT).is_empty()
                 {
+                    // Global palette trigger: `/` at an empty start
+                    // of message is hijacked to open the command
+                    // palette overlay. The keystroke is swallowed,
+                    // not inserted. The check runs pre-insertion so
+                    // `is_at_start_of_message` sees the unmodified
+                    // buffer; on an empty line the predicate is true
+                    // and the `/` never lands in the buffer.
+                    if c == '/'
+                        && self.on_palette_trigger.is_some()
+                        && self.is_at_start_of_message()
+                    {
+                        if let Some(cb) = self.on_palette_trigger.clone() {
+                            cb();
+                        }
+                        return true;
+                    }
                     self.insert_char(c);
                     return true;
                 }
@@ -3645,6 +3600,8 @@ mod tests {
                 description: Arc::new(|s| s.to_string()),
                 scroll_info: Arc::new(|s| s.to_string()),
                 no_match: Arc::new(|s| s.to_string()),
+                prefix: Arc::new(|s| s.to_string()),
+                shortcut: Arc::new(|s| s.to_string()),
             },
         }
     }
@@ -3814,53 +3771,6 @@ mod tests {
         }
     }
 
-    /// Lock in the trim-start + starts-with contract on the slash-
-    /// command context check:
-    /// `is_slash_menu_allowed() && text_before_cursor.trim_start().starts_with('/')`.
-    /// This test exercises the leading-whitespace tolerance, the
-    /// second-line gate, and the cursor-past-the-slash invariant a
-    /// future refactor could regress.
-    #[test]
-    fn is_in_slash_command_context_uses_trim_start_rule() {
-        let editor = Editor::new(RenderHandle::detached(), identity_theme());
-        assert!(!editor.is_in_slash_command_context());
-
-        // Bare leading "/" with cursor right after it: in context.
-        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
-        editor.set_text("/");
-        assert!(editor.is_in_slash_command_context());
-
-        // "/foo " with the cursor at end-of-line: the trailing space
-        // does not close the slash context (the trailing arg).
-        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
-        editor.set_text("/foo arg");
-        assert!(editor.is_in_slash_command_context());
-
-        // Leading whitespace before the slash: still in context. The
-        // `trim_start()` half of the predicate explicitly tolerates
-        // any amount of leading spaces or tabs.
-        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
-        editor.set_text("   /help");
-        assert!(editor.is_in_slash_command_context());
-
-        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
-        editor.set_text("\t/help");
-        assert!(editor.is_in_slash_command_context());
-
-        // A word before the slash takes us out of context.
-        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
-        editor.set_text("foo/bar");
-        assert!(!editor.is_in_slash_command_context());
-
-        // Slash on the second line: blocked by `is_slash_menu_allowed`,
-        // which restricts the popup to the first line of a message.
-        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
-        editor.set_text("hello\n/help");
-        // Cursor lands at end of line 1 ("/help") after `set_text`.
-        assert_eq!(editor.cursor_line, 1);
-        assert!(!editor.is_in_slash_command_context());
-    }
-
     /// Regression for the unquoted-symbol branch of the autocomplete
     /// debounce predicate. Pin both the `@` and `#` cases plus the
     /// negative branches that the regex `(?:^|[\s])[@#][^\s]*$`
@@ -3902,5 +3812,57 @@ mod tests {
         // limitation of the regex-shaped check; we only test the
         // closed form here.
         assert!(!ends_in_symbol_context("@\"foo bar\""));
+    }
+
+    fn char_key(c: char) -> InputEvent {
+        InputEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        ))
+    }
+
+    #[test]
+    fn slash_at_empty_prompt_fires_palette_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_focused(true);
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        editor.set_on_palette_trigger(Some(Arc::new(move || {
+            f.store(true, Ordering::Relaxed);
+        })));
+        let consumed = editor.handle_input(&char_key('/'));
+        assert!(consumed, "the `/` key event should be consumed");
+        assert!(fired.load(Ordering::Relaxed), "palette callback must fire");
+        assert_eq!(editor.get_text(), "", "the `/` must not land in the buffer");
+    }
+
+    #[test]
+    fn slash_at_empty_prompt_without_callback_still_inserts() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_focused(true);
+        // No callback installed.
+        editor.handle_input(&char_key('/'));
+        assert_eq!(editor.get_text(), "/");
+    }
+
+    #[test]
+    fn slash_mid_line_does_not_fire_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_focused(true);
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        editor.set_on_palette_trigger(Some(Arc::new(move || {
+            f.store(true, Ordering::Relaxed);
+        })));
+        editor.handle_input(&char_key('a'));
+        editor.handle_input(&char_key('b'));
+        editor.handle_input(&char_key('/'));
+        assert!(
+            !fired.load(Ordering::Relaxed),
+            "mid-line `/` must not fire the palette trigger"
+        );
+        assert_eq!(editor.get_text(), "ab/");
     }
 }

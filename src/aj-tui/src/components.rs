@@ -5,6 +5,7 @@ pub mod editor;
 pub mod image;
 pub mod loader;
 pub mod markdown;
+pub mod overlay_window;
 pub mod select_list;
 pub mod settings_list;
 pub mod spacer;

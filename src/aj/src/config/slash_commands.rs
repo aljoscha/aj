@@ -2,41 +2,55 @@
 //!
 //! Two responsibilities live in this module:
 //!
-//! 1. **Autocomplete catalog.** [`build_autocomplete_provider`]
-//!    constructs an [`aj_tui::autocomplete::CombinedAutocompleteProvider`]
-//!    seeded with every recognised top-level command. The
-//!    interactive editor consults this provider to populate its
-//!    pop-up suggestions while the user types a `/` prefix.
+//! 1. **Command catalog.** [`BUILTIN_COMMANDS`] enumerates every
+//!    recognised top-level slash command with its category,
+//!    description, optional argument hint, and optional keyboard
+//!    shortcut. The catalog is consumed by the command-palette
+//!    overlay (which groups by category and supports fuzzy search)
+//!    and by the help overlay (which lists every entry).
 //! 2. **Submit-time dispatch.** [`dispatch`] parses a freshly-
 //!    submitted line and returns a [`SlashAction`] describing what
-//!    the host should do — open a selector overlay, run the
-//!    inline form of a command (e.g. `/thinking high`), or surface
-//!    a "not yet implemented" notice for commands deferred to a
-//!    later commit.
+//!    the host should do — open a selector overlay, apply an
+//!    inline change (e.g. `/thinking high`), or surface a notice.
 //!
-//! The autocomplete catalog and the dispatcher are intentionally
-//! decoupled: the catalog is purely a UX hint for typing, while
-//! dispatch is a flat match over the trimmed input. Adding a new
-//! command means adding it to [`BUILTIN_COMMANDS`] *and* to the
-//! match arm in [`dispatch`]; both halves live in this file so the
-//! pairing stays honest.
+//! Adding a new command means adding it to [`BUILTIN_COMMANDS`]
+//! *and* to the match arm in [`dispatch`]; both halves live in this
+//! file so the pairing stays honest.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use aj_models::ThinkingConfig;
 use aj_models::registry::{ModelInfo, ModelRegistry};
-use aj_tui::autocomplete::{
-    AutocompleteItem, CombinedAutocompleteProvider, CommandEntry, SlashCommand,
-};
-use aj_tui::fuzzy::FuzzyMatcher;
 
 /// One entry in the static catalog. A static `&str` keeps the list
 /// declarable as a `const` and avoids per-startup allocation.
+///
+/// Field contracts:
+/// - `name`: command token (without the leading `/`). Also the
+///   dispatch key and the string the palette re-feeds through
+///   [`dispatch`] on confirm.
+/// - `title`: friendly label shown as the primary column in the
+///   command palette and help overlay. Decoupled from `name` so the
+///   UI can read cleanly (e.g. category `model` + title `switch`)
+///   without the token having to carry the whole phrase.
+/// - `category`: short label grouping commands in the palette UI;
+///   currently one of `"model"`, `"session"`, `"prompt"`, or `"aj"`.
+///   Also part of the palette's fuzzy-search key, so typing a
+///   category surfaces the whole group.
+/// - `description`: one-line human-readable summary.
+/// - `action_id`: optional action ID in the keybindings manager
+///   whose bound key globally invokes this command. When set, the
+///   palette and help UI resolve the current binding at render
+///   time and display it in the shortcut column, so rebinding the
+///   action in `~/.aj/config.toml` automatically updates the
+///   visible label. `None` means the command has no global
+///   keyboard trigger.
 pub struct BuiltinCommand {
     pub name: &'static str,
+    pub title: &'static str,
+    pub category: &'static str,
     pub description: &'static str,
-    pub argument_hint: Option<&'static str>,
+    pub action_id: Option<&'static str>,
 }
 
 /// Every recognised top-level slash command.
@@ -45,95 +59,76 @@ pub struct BuiltinCommand {
 /// [`dispatch`] decides what actually happens when the user submits
 /// it. Keeping both in this file means a stale arm shows up
 /// immediately as a "not yet implemented" branch rather than as a
-/// silent no-op in the autocomplete pop-up.
+/// silent no-op.
+///
+/// All commands are zero-argument: they either open a selector
+/// overlay or perform an inline action. The palette and help UI are
+/// the discovery surface, so there is no `/command <arg>` syntax to
+/// advertise.
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "thinking",
-        description: "Set the default thinking effort (off / low / medium / high / xhigh / max).",
-        argument_hint: Some("[level]"),
+        title: "thinking",
+        category: "model",
+        description: "Set the reasoning effort for new turns.",
+        action_id: None,
     },
     BuiltinCommand {
         name: "model",
-        description: "Switch the active model (Enter to commit; type to filter).",
-        argument_hint: Some("[search]"),
+        title: "switch",
+        category: "model",
+        description: "Switch the active model.",
+        action_id: None,
     },
     BuiltinCommand {
         name: "sessions",
+        title: "switch",
+        category: "session",
         description: "Resume a different conversation thread.",
-        argument_hint: Some("[search]"),
+        action_id: None,
     },
     BuiltinCommand {
         name: "new",
-        description: "Start a fresh thread (the current one is preserved on disk).",
-        argument_hint: None,
+        title: "new",
+        category: "session",
+        description: "Start a fresh thread (kept on disk).",
+        action_id: None,
     },
     BuiltinCommand {
-        name: "clear",
-        description: "Alias for /new.",
-        argument_hint: None,
+        name: "history",
+        title: "history",
+        category: "prompt",
+        description: "Search and recall a previous prompt.",
+        action_id: None,
     },
     BuiltinCommand {
         name: "help",
-        description: "Show the slash-command reference.",
-        argument_hint: None,
+        title: "help",
+        category: "aj",
+        description: "Show the command reference.",
+        action_id: None,
+    },
+    BuiltinCommand {
+        name: "palette",
+        title: "palette",
+        category: "aj",
+        description: "Open the command palette.",
+        action_id: Some(crate::config::keybindings::ACTION_PALETTE_OPEN),
     },
     BuiltinCommand {
         name: "quit",
+        title: "quit",
+        category: "aj",
         description: "Exit the interactive session.",
-        argument_hint: None,
+        action_id: None,
     },
 ];
 
-/// Build the autocomplete provider seeded with [`BUILTIN_COMMANDS`].
-///
-/// `working_directory` feeds the `@`-fuzzy and direct-path branches
-/// of the underlying [`CombinedAutocompleteProvider`]; the slash
-/// catalog is shared regardless of the current working directory.
-/// `models` is the catalog used by the `/model` argument completer
-/// (passed in rather than loaded here so the caller controls when
-/// the registry-load cost is paid and can share the catalog with
-/// the selector overlay).
-///
-/// `/thinking` carries an inline argument completer that fuzzy-
-/// matches against the level names so typing `/thinking m` proposes
-/// `medium` and `max` without the user opening the overlay. `/model`
-/// carries a fuzzy completer over the supplied model catalog so
-/// typing `/model sonn` proposes every model whose provider/id/name
-/// includes "sonn" as a subsequence. Other commands have no
-/// argument completer (yet) — the catalog's `argument_hint` is the
-/// only UX hint there.
-pub fn build_autocomplete_provider(
-    working_directory: PathBuf,
-    models: Arc<Vec<ModelInfo>>,
-) -> CombinedAutocompleteProvider {
-    let entries: Vec<CommandEntry> = BUILTIN_COMMANDS
-        .iter()
-        .map(|cmd| {
-            let mut sc = SlashCommand::new(cmd.name).with_description(cmd.description);
-            if let Some(hint) = cmd.argument_hint {
-                sc = sc.with_argument_hint(hint);
-            }
-            if cmd.name == "thinking" {
-                sc = sc.with_argument_completions(thinking_argument_completions);
-            }
-            if cmd.name == "model" {
-                let models_for_completer = Arc::clone(&models);
-                sc = sc.with_argument_completions(move |partial| {
-                    model_argument_completions(&models_for_completer, partial)
-                });
-            }
-            CommandEntry::Command(sc)
-        })
-        .collect();
-    CombinedAutocompleteProvider::new(entries, working_directory)
-}
-
-/// Snapshot the model catalog into a flat vector for sharing across
-/// the autocomplete provider and the [`SlashAction::OpenModelSelector`]
-/// overlay. Loads from [`ModelRegistry::load`] (bundled seed plus
-/// optional user cache, plus overrides) and flattens by provider in
-/// catalog order so the resulting list preserves the registry's
-/// intentional ordering.
+/// Snapshot the model catalog into a flat vector for sharing with
+/// the [`SlashAction::OpenModelSelector`] overlay. Loads from
+/// [`ModelRegistry::load`] (bundled seed plus optional user cache,
+/// plus overrides) and flattens by provider in catalog order so the
+/// resulting list preserves the registry's intentional ordering.
 pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
     let registry = ModelRegistry::load();
     let mut models = Vec::new();
@@ -145,61 +140,6 @@ pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
     Arc::new(models)
 }
 
-/// Argument completer for `/model`. Returns models whose searchable
-/// blob (`provider id name`) fuzzy-matches `partial`. Empty input
-/// returns the full catalog so the user can browse.
-///
-/// Items use `provider/id` as the autocomplete value (the same key
-/// the selector commits) so typing `/model an` → accepting the
-/// `anthropic/claude-...` suggestion produces an unambiguous
-/// dispatch target.
-fn model_argument_completions(models: &[ModelInfo], partial: &str) -> Vec<AutocompleteItem> {
-    if models.is_empty() {
-        return Vec::new();
-    }
-    let mut matcher = FuzzyMatcher::new();
-    let query = partial.trim();
-    let mut scored: Vec<(usize, u32)> = Vec::new();
-    if query.is_empty() {
-        scored.extend((0..models.len()).map(|i| (i, 0u32)));
-    } else {
-        for (idx, info) in models.iter().enumerate() {
-            let haystack = format!("{} {} {}", info.provider, info.id, info.name);
-            if let Some(score) = matcher.score(query, &haystack) {
-                scored.push((idx, u32::from(score)));
-            }
-        }
-        // Highest score first; tiebreak by catalog order so equally
-        // strong matches stay in the registry's intentional sequence.
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    }
-    scored
-        .into_iter()
-        .map(|(idx, _)| {
-            let info = &models[idx];
-            AutocompleteItem::new(
-                &format!("{}/{}", info.provider, info.id),
-                &format!("{}/{}", info.provider, info.id),
-            )
-            .with_description(&info.name)
-        })
-        .collect()
-}
-
-/// Argument completer for `/thinking`. Returns the levels whose
-/// names start with `partial` (case-insensitive). The matcher is
-/// deliberately a prefix match rather than fuzzy — the level list
-/// is short and predictable, and a strict prefix avoids surprising
-/// the user with `xhigh` matches when they typed `m`.
-fn thinking_argument_completions(partial: &str) -> Vec<AutocompleteItem> {
-    let needle = partial.to_lowercase();
-    THINKING_LEVELS
-        .iter()
-        .filter(|l| l.name.starts_with(&needle))
-        .map(|l| AutocompleteItem::new(l.name, l.name).with_description(l.description))
-        .collect()
-}
-
 /// Parsed outcome of a submitted slash-prefixed line.
 ///
 /// The interactive host applies the action: opening an overlay,
@@ -208,29 +148,28 @@ fn thinking_argument_completions(partial: &str) -> Vec<AutocompleteItem> {
 /// user sees a clear "soon, not silently dropped" message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashAction {
+    /// Open the global command palette overlay.
+    OpenCommandPalette,
     /// Open the thinking-effort selector overlay. The current
     /// level is highlighted; `Esc` cancels, `Enter` applies.
     OpenThinkingSelector,
-    /// Apply the supplied thinking level inline (no overlay) and
-    /// surface a status notice. Used for `/thinking <level>`.
-    SetThinking(Option<ThinkingConfig>),
     /// Open the model selector overlay. The current model is
-    /// pre-selected; `Esc` cancels, `Enter` applies. `initial_query`
-    /// pre-fills the search box so `/model sonn` opens the overlay
-    /// already filtered.
-    OpenModelSelector { initial_query: Option<String> },
+    /// pre-selected; `Esc` cancels, `Enter` applies.
+    OpenModelSelector,
     /// Open the session selector overlay. The currently-active
     /// thread is pre-selected; `Enter` swaps the agent over to the
-    /// chosen thread, `Esc` cancels. `initial_query` pre-fills the
-    /// search box so `/sessions fix bug` opens already filtered.
-    OpenSessionSelector { initial_query: Option<String> },
+    /// chosen thread, `Esc` cancels.
+    OpenSessionSelector,
+    /// Open the prompt-history search overlay. `Enter` recalls the
+    /// chosen prompt into the editor; `Esc` cancels.
+    OpenPromptHistory,
     /// Start a fresh thread. The current thread is preserved on
     /// disk; the host creates a new [`ConversationLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the
     /// scrollback.
     NewThread,
-    /// Show the slash-command reference. The host renders a
-    /// multi-line notice listing every entry in [`BUILTIN_COMMANDS`].
+    /// Show the slash-command reference. The host opens the help
+    /// overlay listing every entry in [`BUILTIN_COMMANDS`].
     Help,
     /// User typed a recognised command whose UI lives in a
     /// follow-up commit. No builtin command maps here today; the
@@ -245,13 +184,6 @@ pub enum SlashAction {
     /// User typed a slash command we don't recognise. The host
     /// renders the embedded suggestion text and clears the editor.
     Unknown { input: String },
-    /// User typed an invalid argument for a recognised command —
-    /// e.g. `/thinking nope`. Same handling as [`Self::Unknown`]
-    /// but with a more specific message.
-    InvalidArgument {
-        command: &'static str,
-        message: String,
-    },
 }
 
 /// Parse one freshly-submitted editor line and return the
@@ -261,42 +193,23 @@ pub enum SlashAction {
 /// verified that the input starts with `'/'`; this function
 /// re-asserts via a leading-slash strip so it remains safe to call
 /// on any input.
+///
+/// Commands are zero-argument: only the first whitespace-delimited
+/// token is significant, and any trailing tokens are ignored (so
+/// stray text after a command name degrades gracefully to opening
+/// the relevant selector).
 pub fn dispatch(input: &str) -> SlashAction {
     let raw = input.trim();
     let body = raw.strip_prefix('/').unwrap_or(raw);
-    // Split off the first whitespace-delimited token so `/thinking
-    // medium` and `/thinking medium  ` behave identically.
-    let (head, rest) = match body.split_once(char::is_whitespace) {
-        Some((h, r)) => (h, r.trim()),
-        None => (body, ""),
-    };
+    let head = body.split_whitespace().next().unwrap_or("");
 
     match head {
-        "thinking" => match parse_thinking_argument(rest) {
-            ThinkingArgument::None => SlashAction::OpenThinkingSelector,
-            ThinkingArgument::Set(level) => SlashAction::SetThinking(level),
-            ThinkingArgument::Invalid(name) => SlashAction::InvalidArgument {
-                command: "thinking",
-                message: format!(
-                    "unknown thinking level '{name}'; expected one of: off, low, medium, high, xhigh, max"
-                ),
-            },
-        },
-        "model" => SlashAction::OpenModelSelector {
-            initial_query: if rest.is_empty() {
-                None
-            } else {
-                Some(rest.to_string())
-            },
-        },
-        "sessions" => SlashAction::OpenSessionSelector {
-            initial_query: if rest.is_empty() {
-                None
-            } else {
-                Some(rest.to_string())
-            },
-        },
-        "new" | "clear" => SlashAction::NewThread,
+        "thinking" => SlashAction::OpenThinkingSelector,
+        "model" => SlashAction::OpenModelSelector,
+        "sessions" => SlashAction::OpenSessionSelector,
+        "history" => SlashAction::OpenPromptHistory,
+        "palette" => SlashAction::OpenCommandPalette,
+        "new" => SlashAction::NewThread,
         "help" => SlashAction::Help,
         "quit" => SlashAction::Quit,
         _ => SlashAction::Unknown {
@@ -305,31 +218,11 @@ pub fn dispatch(input: &str) -> SlashAction {
     }
 }
 
-/// Argument-parse outcome for `/thinking`.
-enum ThinkingArgument {
-    /// No argument supplied: open the selector overlay.
-    None,
-    /// Successfully parsed; `None` means "off".
-    Set(Option<ThinkingConfig>),
-    /// Argument supplied but not a recognised level.
-    Invalid(String),
-}
-
-fn parse_thinking_argument(arg: &str) -> ThinkingArgument {
-    if arg.is_empty() {
-        return ThinkingArgument::None;
-    }
-    match parse_thinking_level(arg) {
-        Some(level) => ThinkingArgument::Set(level),
-        None => ThinkingArgument::Invalid(arg.to_string()),
-    }
-}
-
 /// One row in the thinking-level catalog.
 ///
-/// Held as a static so both the autocomplete completer and the
-/// selector overlay surface the same human-readable descriptions
-/// without duplicating the table.
+/// Held as a static so the selector overlay and the status-notice
+/// formatter share the same human-readable descriptions without
+/// duplicating the table.
 pub struct ThinkingLevel {
     pub name: &'static str,
     pub description: &'static str,
@@ -412,40 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_thinking_no_arg_opens_selector() {
+    fn dispatch_thinking_opens_selector() {
         assert_eq!(dispatch("/thinking"), SlashAction::OpenThinkingSelector);
         assert_eq!(dispatch("  /thinking  "), SlashAction::OpenThinkingSelector);
-    }
-
-    #[test]
-    fn dispatch_thinking_with_valid_levels() {
-        assert_eq!(dispatch("/thinking off"), SlashAction::SetThinking(None));
+        // Trailing tokens are ignored — commands are zero-argument.
         assert_eq!(
             dispatch("/thinking high"),
-            SlashAction::SetThinking(Some(ThinkingConfig::High))
+            SlashAction::OpenThinkingSelector
         );
-        // Case-insensitive.
-        assert_eq!(
-            dispatch("/thinking HIGH"),
-            SlashAction::SetThinking(Some(ThinkingConfig::High))
-        );
-        // Trailing whitespace is fine.
-        assert_eq!(
-            dispatch("/thinking max  "),
-            SlashAction::SetThinking(Some(ThinkingConfig::Max))
-        );
-    }
-
-    #[test]
-    fn dispatch_thinking_invalid_argument() {
-        match dispatch("/thinking nope") {
-            SlashAction::InvalidArgument { command, message } => {
-                assert_eq!(command, "thinking");
-                assert!(message.contains("nope"), "got {message:?}");
-                assert!(message.contains("low"), "got {message:?}");
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
     }
 
     #[test]
@@ -458,15 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_clear_alias_returns_new_thread_action() {
-        // `/clear` is retained as an alias for `/new` so muscle
-        // memory keeps working; same parsing rules apply.
-        assert_eq!(dispatch("/clear"), SlashAction::NewThread);
-        assert_eq!(dispatch("  /clear  "), SlashAction::NewThread);
-        assert_eq!(dispatch("/clear extra"), SlashAction::NewThread);
-    }
-
-    #[test]
     fn dispatch_help_returns_help_action() {
         assert_eq!(dispatch("/help"), SlashAction::Help);
         assert_eq!(dispatch("  /help  "), SlashAction::Help);
@@ -474,63 +332,28 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_sessions_no_arg_opens_selector() {
-        assert_eq!(
-            dispatch("/sessions"),
-            SlashAction::OpenSessionSelector {
-                initial_query: None
-            }
-        );
-        assert_eq!(
-            dispatch("  /sessions  "),
-            SlashAction::OpenSessionSelector {
-                initial_query: None
-            }
-        );
+    fn dispatch_history_opens_prompt_history() {
+        assert_eq!(dispatch("/history"), SlashAction::OpenPromptHistory);
+        assert_eq!(dispatch("  /history  "), SlashAction::OpenPromptHistory);
     }
 
     #[test]
-    fn dispatch_sessions_with_query_pre_fills_search() {
+    fn dispatch_sessions_opens_selector() {
+        assert_eq!(dispatch("/sessions"), SlashAction::OpenSessionSelector);
+        assert_eq!(dispatch("  /sessions  "), SlashAction::OpenSessionSelector);
+        // Trailing tokens are ignored.
         assert_eq!(
             dispatch("/sessions fix bug"),
-            SlashAction::OpenSessionSelector {
-                initial_query: Some("fix bug".to_string())
-            }
+            SlashAction::OpenSessionSelector
         );
     }
 
     #[test]
-    fn dispatch_model_no_arg_opens_selector() {
-        assert_eq!(
-            dispatch("/model"),
-            SlashAction::OpenModelSelector {
-                initial_query: None
-            }
-        );
-        assert_eq!(
-            dispatch("  /model  "),
-            SlashAction::OpenModelSelector {
-                initial_query: None
-            }
-        );
-    }
-
-    #[test]
-    fn dispatch_model_with_query_pre_fills_search() {
-        assert_eq!(
-            dispatch("/model sonnet"),
-            SlashAction::OpenModelSelector {
-                initial_query: Some("sonnet".to_string())
-            }
-        );
-        // Multi-word queries pass through verbatim so the search
-        // box receives the same string the user typed.
-        assert_eq!(
-            dispatch("/model claude opus 4"),
-            SlashAction::OpenModelSelector {
-                initial_query: Some("claude opus 4".to_string())
-            }
-        );
+    fn dispatch_model_opens_selector() {
+        assert_eq!(dispatch("/model"), SlashAction::OpenModelSelector);
+        assert_eq!(dispatch("  /model  "), SlashAction::OpenModelSelector);
+        // Trailing tokens are ignored.
+        assert_eq!(dispatch("/model sonnet"), SlashAction::OpenModelSelector);
     }
 
     #[test]
@@ -552,101 +375,5 @@ mod tests {
         for level in THINKING_LEVELS {
             assert_eq!(thinking_level_name(&level.config), level.name);
         }
-    }
-
-    #[test]
-    fn thinking_argument_completions_prefix_matches() {
-        let items = thinking_argument_completions("m");
-        let names: Vec<_> = items.iter().map(|i| i.value.as_str()).collect();
-        assert!(names.contains(&"medium"));
-        assert!(names.contains(&"max"));
-        assert!(!names.contains(&"low"));
-
-        let exact = thinking_argument_completions("off");
-        assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].value, "off");
-
-        // Empty input returns every level.
-        let all = thinking_argument_completions("");
-        assert_eq!(all.len(), THINKING_LEVELS.len());
-    }
-
-    #[test]
-    fn build_autocomplete_provider_includes_every_builtin() {
-        // `CombinedAutocompleteProvider` doesn't expose its
-        // command list directly, but constructing one is a safe
-        // smoke test that every entry produces a valid
-        // `SlashCommand`.
-        let models = Arc::new(Vec::new());
-        let _provider = build_autocomplete_provider(PathBuf::from("/tmp"), models);
-        // Sanity-check the catalog itself: every command name is
-        // unique and non-empty.
-        let mut seen = std::collections::HashSet::new();
-        for cmd in BUILTIN_COMMANDS {
-            assert!(!cmd.name.is_empty(), "command name is empty");
-            assert!(seen.insert(cmd.name), "duplicate command name {}", cmd.name);
-        }
-    }
-
-    #[test]
-    fn model_argument_completions_fuzzy_matches_across_provider_id_name() {
-        let models = vec![
-            ModelInfo {
-                id: "claude-sonnet-4-20250514".into(),
-                name: "Claude Sonnet 4".into(),
-                api: "anthropic-messages".into(),
-                provider: "anthropic".into(),
-                base_url: "https://api.anthropic.com".into(),
-                reasoning: true,
-                supports_xhigh: false,
-                supports_adaptive_thinking: false,
-                input: vec![],
-                cost: aj_models::registry::ModelCost::default(),
-                context_window: 200000,
-                max_tokens: 8192,
-                headers: None,
-            },
-            ModelInfo {
-                id: "gpt-5".into(),
-                name: "GPT-5".into(),
-                api: "openai-responses".into(),
-                provider: "openai".into(),
-                base_url: "https://api.openai.com".into(),
-                reasoning: false,
-                supports_xhigh: false,
-                supports_adaptive_thinking: false,
-                input: vec![],
-                cost: aj_models::registry::ModelCost::default(),
-                context_window: 200000,
-                max_tokens: 8192,
-                headers: None,
-            },
-        ];
-
-        // Substring on the name matches.
-        let by_name = model_argument_completions(&models, "sonnet");
-        assert!(
-            by_name
-                .iter()
-                .any(|i| i.value == "anthropic/claude-sonnet-4-20250514"),
-            "got {by_name:?}"
-        );
-
-        // Provider name matches.
-        let by_provider = model_argument_completions(&models, "openai");
-        assert!(
-            by_provider.iter().any(|i| i.value == "openai/gpt-5"),
-            "got {by_provider:?}"
-        );
-
-        // Empty query returns the full catalog in order.
-        let all = model_argument_completions(&models, "");
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].value, "anthropic/claude-sonnet-4-20250514");
-        assert_eq!(all[1].value, "openai/gpt-5");
-
-        // Nonsense query returns nothing.
-        let none = model_argument_completions(&models, "xyzzy");
-        assert!(none.is_empty(), "got {none:?}");
     }
 }

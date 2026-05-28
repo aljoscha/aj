@@ -34,6 +34,8 @@ pub fn default_select_list_theme() -> SelectListTheme {
         description: Arc::new(style::dim),
         scroll_info: Arc::new(style::dim),
         no_match: Arc::new(style::dim),
+        prefix: Arc::new(style::dim),
+        shortcut: Arc::new(style::cyan),
     }
 }
 
@@ -84,6 +86,8 @@ pub fn identity_select_list_theme() -> SelectListTheme {
         description: Arc::new(|s| s.to_string()),
         scroll_info: Arc::new(|s| s.to_string()),
         no_match: Arc::new(|s| s.to_string()),
+        prefix: Arc::new(|s| s.to_string()),
+        shortcut: Arc::new(|s| s.to_string()),
     }
 }
 

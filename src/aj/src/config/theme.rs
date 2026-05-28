@@ -1120,6 +1120,29 @@ pub fn select_list_theme(theme: &ThemeHandle) -> SelectListTheme {
         description: theme.fg_closure(ThemeColor::Muted),
         scroll_info: theme.fg_closure(ThemeColor::Muted),
         no_match: theme.fg_closure(ThemeColor::Muted),
+        prefix: theme.fg_closure(ThemeColor::Dim),
+        shortcut: theme.fg_closure(ThemeColor::Accent),
+    }
+}
+
+/// Build the overlay-window chrome theme used by the command palette
+/// and the model / thinking / session selectors. The border picks up
+/// [`ThemeColor::BorderMuted`] (light grey, matches the editor's
+/// resting border tint); the title uses [`ThemeColor::Accent`] in
+/// bold to mirror the screenshot palette.
+pub fn overlay_window_theme(
+    theme: &ThemeHandle,
+) -> aj_tui::components::overlay_window::OverlayWindowTheme {
+    let accent = theme.fg_closure(ThemeColor::Accent);
+    // The `aj-tui` theme structs hold `Arc<dyn Fn(&str) -> String>`
+    // without `Send + Sync` bounds; match the surrounding API by
+    // using `Arc` for the composed closure as well.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let title: Arc<dyn Fn(&str) -> String> = Arc::new(move |s: &str| style::bold(&accent(s)));
+    aj_tui::components::overlay_window::OverlayWindowTheme {
+        border: theme.fg_closure(ThemeColor::BorderMuted),
+        title,
+        subtitle: theme.fg_closure(ThemeColor::Dim),
     }
 }
 

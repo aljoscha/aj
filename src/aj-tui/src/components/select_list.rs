@@ -13,6 +13,7 @@ use crate::keys::InputEvent;
 
 const DEFAULT_PRIMARY_COLUMN_WIDTH: usize = 32;
 const PRIMARY_COLUMN_GAP: usize = 2;
+const PREFIX_COLUMN_GAP: usize = 2;
 const MIN_DESCRIPTION_WIDTH: usize = 10;
 
 /// An item in a selection list.
@@ -24,6 +25,20 @@ pub struct SelectItem {
     pub label: String,
     /// Optional description shown to the right.
     pub description: Option<String>,
+    /// Optional left-side category label rendered in the dim prefix style.
+    /// When any item in the list sets this, a right-aligned prefix column
+    /// is reserved to the left of the primary column.
+    pub prefix: Option<String>,
+    /// Optional right-side accent label (e.g. a key combo). Takes the
+    /// right column slot in preference to `description`; the two never
+    /// coexist on the same row.
+    pub shortcut: Option<String>,
+    /// Optional text the fuzzy filter ([`SelectList::set_filter`])
+    /// matches against. When unset the filter matches the displayed
+    /// label. Set this when the searchable text differs from what's
+    /// shown — e.g. the command palette filters on `"<category>
+    /// <name>"` so typing a category surfaces the whole group.
+    pub filter_key: Option<String>,
 }
 
 impl SelectItem {
@@ -32,11 +47,29 @@ impl SelectItem {
             value: value.to_string(),
             label: label.to_string(),
             description: None,
+            prefix: None,
+            shortcut: None,
+            filter_key: None,
         }
     }
 
     pub fn with_description(mut self, desc: &str) -> Self {
         self.description = Some(desc.to_string());
+        self
+    }
+
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefix = Some(prefix.to_string());
+        self
+    }
+
+    pub fn with_shortcut(mut self, shortcut: &str) -> Self {
+        self.shortcut = Some(shortcut.to_string());
+        self
+    }
+
+    pub fn with_filter_key(mut self, key: &str) -> Self {
+        self.filter_key = Some(key.to_string());
         self
     }
 
@@ -46,6 +79,14 @@ impl SelectItem {
         } else {
             self.label.as_str()
         }
+    }
+
+    /// Text the fuzzy filter matches against: the explicit
+    /// [`Self::filter_key`] when set, else the displayed label.
+    fn filter_text(&self) -> &str {
+        self.filter_key
+            .as_deref()
+            .unwrap_or_else(|| self.display_value())
     }
 }
 
@@ -73,6 +114,12 @@ pub struct SelectListTheme {
     pub scroll_info: Arc<dyn Fn(&str) -> String>,
     /// Style for "no matches" text.
     pub no_match: Arc<dyn Fn(&str) -> String>,
+    /// Style for the left-side category prefix column (typically dim).
+    /// Stays in this style even when the row is selected — the selection
+    /// highlight applies to the primary label, not the metadata columns.
+    pub prefix: Arc<dyn Fn(&str) -> String>,
+    /// Style for the right-side shortcut/key-combo label (typically accent).
+    pub shortcut: Arc<dyn Fn(&str) -> String>,
 }
 
 /// Context passed to a custom [`SelectListLayout::truncate_primary`]
@@ -86,7 +133,6 @@ pub struct TruncatePrimaryContext<'a> {
 }
 
 /// Layout tuning knobs for the primary column and description alignment.
-#[derive(Default)]
 pub struct SelectListLayout {
     /// Minimum width (including the 2-char gap) of the primary column.
     pub min_primary_column_width: Option<usize>,
@@ -96,6 +142,27 @@ pub struct SelectListLayout {
     /// hard truncation with no ellipsis. Return value must fit in
     /// `context.max_width`; if it overflows, it will be re-truncated.
     pub truncate_primary: Option<Box<dyn Fn(TruncatePrimaryContext<'_>) -> String>>,
+    /// Cap on the prefix column width. Default unbounded — the column is
+    /// sized to the widest prefix across all items.
+    pub max_prefix_column_width: Option<usize>,
+    /// When `true` (the default), the selected row is prefixed with `→ `
+    /// and styled via `selected_text`. When `false`, every row gets a
+    /// uniform `  ` prefix and the `selected_text` style is suppressed
+    /// — used by the read-only help overlay where there is no
+    /// interactive selection to highlight.
+    pub show_selection_indicator: bool,
+}
+
+impl Default for SelectListLayout {
+    fn default() -> Self {
+        Self {
+            min_primary_column_width: None,
+            max_primary_column_width: None,
+            truncate_primary: None,
+            max_prefix_column_width: None,
+            show_selection_indicator: true,
+        }
+    }
 }
 
 /// A navigable selection list.
@@ -166,24 +233,27 @@ impl SelectList {
         }
     }
 
-    /// Set the filter text. Items whose value starts with the filter
-    /// (case-insensitive) are shown. Resets the selection to the first
-    /// match.
+    /// Filter the visible rows by fuzzy-matching `filter` against each
+    /// item's [`SelectItem::filter_text`] (the explicit `filter_key`
+    /// when set, else the displayed label). Matching rows are reordered
+    /// best-match-first; the selection resets to the top match.
     ///
-    /// The filter string is *not* retained between calls — each
-    /// invocation rebuilds `filtered_indices` from `items`.
+    /// An empty (or whitespace-only) `filter` restores the full list in
+    /// its original order. The filter string is *not* retained between
+    /// calls — each invocation rebuilds `filtered_indices` from `items`.
     pub fn set_filter(&mut self, filter: &str) {
-        if filter.is_empty() {
+        let query = filter.trim();
+        if query.is_empty() {
             self.filtered_indices = (0..self.items.len()).collect();
         } else {
-            let filter_lower = filter.to_lowercase();
-            self.filtered_indices = self
+            let candidates: Vec<(usize, &str)> = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, item)| item.value.to_lowercase().starts_with(&filter_lower))
-                .map(|(i, _)| i)
+                .map(|(i, item)| (i, item.filter_text()))
                 .collect();
+            let ranked = crate::fuzzy::fuzzy_filter(candidates, query, |(_, text)| *text);
+            self.filtered_indices = ranked.into_iter().map(|(i, _)| i).collect();
         }
         self.selected = 0;
     }
@@ -268,6 +338,27 @@ impl SelectList {
         (lo, hi)
     }
 
+    /// Width of the right-aligned prefix column. Returns `0` when no
+    /// item carries a `prefix` — callers must then skip both the column
+    /// and its gap.
+    ///
+    /// Width is sized to the widest prefix across **all items**, not
+    /// just the visible/filtered subset, so the label column stays in a
+    /// stable horizontal position as the user filters.
+    fn prefix_column_width(&self) -> usize {
+        let widest = self
+            .items
+            .iter()
+            .filter_map(|item| item.prefix.as_deref())
+            .map(visible_width)
+            .max()
+            .unwrap_or(0);
+        match self.layout.max_prefix_column_width {
+            Some(cap) => widest.min(cap),
+            None => widest,
+        }
+    }
+
     fn primary_column_width(&self) -> usize {
         let (min, max) = self.primary_column_bounds();
         let widest = self
@@ -301,6 +392,29 @@ impl SelectList {
         truncate_to_width(&candidate, max_width, "", false)
     }
 
+    /// Render the prefix column block (right-aligned prefix text + 2-space
+    /// gap) and return `(rendered, consumed_width)`. Returns empty when
+    /// `prefix_column_width == 0`.
+    fn render_prefix_block(
+        &self,
+        item: &SelectItem,
+        prefix_column_width: usize,
+    ) -> (String, usize) {
+        if prefix_column_width == 0 {
+            return (String::new(), 0);
+        }
+        let raw = item.prefix.as_deref().unwrap_or("");
+        let truncated = truncate_to_width(raw, prefix_column_width, "", false);
+        let pad = prefix_column_width.saturating_sub(visible_width(&truncated));
+        let padded = format!("{}{}", " ".repeat(pad), truncated);
+        let styled = (self.theme.prefix)(&padded);
+        let consumed = prefix_column_width + PREFIX_COLUMN_GAP;
+        (
+            format!("{}{}", styled, " ".repeat(PREFIX_COLUMN_GAP)),
+            consumed,
+        )
+    }
+
     fn render_item(
         &self,
         item: &SelectItem,
@@ -308,51 +422,86 @@ impl SelectList {
         width: usize,
         description_single_line: Option<&str>,
         primary_column_width: usize,
+        prefix_column_width: usize,
     ) -> String {
-        let prefix = if is_selected { "→ " } else { "  " };
-        let prefix_width = visible_width(prefix);
+        let show_indicator = self.layout.show_selection_indicator;
+        let arrow = if show_indicator && is_selected {
+            "→ "
+        } else {
+            "  "
+        };
+        let arrow_width = visible_width(arrow);
 
-        if let Some(desc) = description_single_line {
-            if width > 40 {
-                let effective_primary = primary_column_width
-                    .min(width.saturating_sub(prefix_width + 4))
-                    .max(1);
-                let max_primary = effective_primary.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
-                let truncated_value =
-                    self.truncate_primary(item, is_selected, max_primary, effective_primary);
-                let truncated_width = visible_width(&truncated_value);
-                let spacing_len = effective_primary.saturating_sub(truncated_width).max(1);
-                let spacing = " ".repeat(spacing_len);
-                let description_start = prefix_width + truncated_width + spacing_len;
-                let remaining = width.saturating_sub(description_start + 2);
+        let (prefix_block, prefix_consumed) = self.render_prefix_block(item, prefix_column_width);
+        let leading_width = arrow_width + prefix_consumed;
+        let arrow_styled = if show_indicator && is_selected {
+            (self.theme.selected_prefix)(arrow)
+        } else {
+            arrow.to_string()
+        };
+        // Suppress the selected-row styling when the indicator is
+        // hidden — there is no "focus" cue to communicate.
+        let style_as_selected = show_indicator && is_selected;
 
-                if remaining > MIN_DESCRIPTION_WIDTH {
-                    let truncated_desc = truncate_to_width(desc, remaining, "", false);
-                    return if is_selected {
-                        let styled_prefix = (self.theme.selected_prefix)(prefix);
-                        let styled_body = (self.theme.selected_text)(&format!(
-                            "{}{}{}",
-                            truncated_value, spacing, truncated_desc
-                        ));
-                        format!("{}{}", styled_prefix, styled_body)
-                    } else {
-                        let desc_text =
-                            (self.theme.description)(&format!("{}{}", spacing, truncated_desc));
-                        format!("{}{}{}", prefix, truncated_value, desc_text)
-                    };
-                }
+        // Right-column content: shortcut takes precedence over description.
+        // The two never coexist on the same row.
+        enum Right<'a> {
+            Shortcut(&'a str),
+            Description(&'a str),
+            None,
+        }
+        let right = if let Some(sc) = item.shortcut.as_deref() {
+            Right::Shortcut(sc)
+        } else if let Some(desc) = description_single_line {
+            Right::Description(desc)
+        } else {
+            Right::None
+        };
+
+        if !matches!(right, Right::None) && width > 40 {
+            let effective_primary = primary_column_width
+                .min(width.saturating_sub(leading_width + 4))
+                .max(1);
+            let max_primary = effective_primary.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
+            let truncated_value =
+                self.truncate_primary(item, style_as_selected, max_primary, effective_primary);
+            let truncated_width = visible_width(&truncated_value);
+            let spacing_len = effective_primary.saturating_sub(truncated_width).max(1);
+            let spacing = " ".repeat(spacing_len);
+            let right_start = leading_width + truncated_width + spacing_len;
+            let remaining = width.saturating_sub(right_start + 2);
+
+            if remaining > MIN_DESCRIPTION_WIDTH {
+                // A truncated description gets an ellipsis so the cut
+                // is visible; a shortcut never needs one (it's short
+                // and shouldn't be elided mid-combo).
+                let (right_text_raw, right_style, ellipsis) = match right {
+                    Right::Shortcut(s) => (s, &self.theme.shortcut, ""),
+                    Right::Description(s) => (s, &self.theme.description, "…"),
+                    Right::None => unreachable!(),
+                };
+                let truncated_right = truncate_to_width(right_text_raw, remaining, ellipsis, false);
+                let primary_text = if style_as_selected {
+                    (self.theme.selected_text)(&truncated_value)
+                } else {
+                    truncated_value
+                };
+                let right_styled = right_style(&truncated_right);
+                return format!(
+                    "{}{}{}{}{}",
+                    arrow_styled, prefix_block, primary_text, spacing, right_styled
+                );
             }
         }
 
-        let max_width = width.saturating_sub(prefix_width + 2).max(1);
-        let truncated_value = self.truncate_primary(item, is_selected, max_width, max_width);
-        if is_selected {
-            let styled_prefix = (self.theme.selected_prefix)(prefix);
-            let styled_body = (self.theme.selected_text)(&truncated_value);
-            format!("{}{}", styled_prefix, styled_body)
+        let max_width = width.saturating_sub(leading_width + 2).max(1);
+        let truncated_value = self.truncate_primary(item, style_as_selected, max_width, max_width);
+        let primary_text = if style_as_selected {
+            (self.theme.selected_text)(&truncated_value)
         } else {
-            format!("{}{}", prefix, truncated_value)
-        }
+            truncated_value
+        };
+        format!("{}{}{}", arrow_styled, prefix_block, primary_text)
     }
 }
 
@@ -387,6 +536,7 @@ impl Component for SelectList {
         }
 
         let primary_column_width = self.primary_column_width();
+        let prefix_column_width = self.prefix_column_width();
 
         // Compute the visible window from the current selection:
         // window starts at clamp(selected - max_visible / 2, 0, len - max_visible).
@@ -404,6 +554,7 @@ impl Component for SelectList {
                 width,
                 single_line.as_deref(),
                 primary_column_width,
+                prefix_column_width,
             ));
         }
 
@@ -479,6 +630,8 @@ mod tests {
             description: Arc::new(|s| s.to_string()),
             scroll_info: Arc::new(|s| s.to_string()),
             no_match: Arc::new(|s| s.to_string()),
+            prefix: Arc::new(|s| s.to_string()),
+            shortcut: Arc::new(|s| s.to_string()),
         }
     }
 
@@ -495,6 +648,8 @@ mod tests {
             min_primary_column_width: Some(20),
             max_primary_column_width: Some(12),
             truncate_primary: None,
+            max_prefix_column_width: None,
+            show_selection_indicator: true,
         };
         let list = SelectList::new(vec![], 5, identity_theme(), layout);
         let (min, max) = list.primary_column_bounds();
@@ -516,6 +671,8 @@ mod tests {
             description: Arc::new(|s| s.to_string()),
             scroll_info: Arc::new(|s| s.to_string()),
             no_match: Arc::new(|s| s.to_string()),
+            prefix: Arc::new(|s| s.to_string()),
+            shortcut: Arc::new(|s| s.to_string()),
         };
         let items = vec![SelectItem::new("a", "alpha"), SelectItem::new("b", "bravo")];
         let mut list = SelectList::new(items, 5, theme, SelectListLayout::default());
@@ -527,5 +684,214 @@ mod tests {
             first.contains("<<") && first.contains(">>"),
             "new() theme selected_prefix must be applied: got {first:?}",
         );
+    }
+
+    /// When any item carries a `prefix`, the prefix column is rendered
+    /// right-aligned within a column sized to the widest prefix. Shorter
+    /// prefixes get leading spaces so the column edges line up.
+    #[test]
+    fn prefix_column_renders_when_set() {
+        let items = vec![
+            SelectItem::new("a", "alpha").with_prefix("model"),
+            SelectItem::new("b", "bravo").with_prefix("session"),
+            SelectItem::new("c", "charlie").with_prefix("aj"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+        let lines = list.render(80);
+        assert_eq!(lines.len(), 3);
+        // Widest prefix is "session" (7). Each row must contain the
+        // prefix right-aligned in a 7-wide column, followed by the
+        // 2-space gap, followed by the label. Selected row uses "→ ",
+        // others use "  ".
+        assert!(lines[0].starts_with("→ "), "selected arrow: {:?}", lines[0]);
+        assert!(lines[0].contains("  model  alpha"), "row 0: {:?}", lines[0]);
+        assert!(lines[1].contains("session  bravo"), "row 1: {:?}", lines[1]);
+        assert!(
+            lines[2].contains("     aj  charlie"),
+            "row 2: {:?}",
+            lines[2]
+        );
+    }
+
+    /// When no item carries a prefix, the prefix column (and its gap)
+    /// disappear entirely — rendering is byte-identical to a list built
+    /// without prefixes at all.
+    #[test]
+    fn no_prefix_column_when_all_empty() {
+        let items = vec![SelectItem::new("a", "alpha"), SelectItem::new("b", "bravo")];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+        let lines = list.render(80);
+        // Selected row: arrow then label, no leading prefix gutter.
+        assert!(lines[0].starts_with("→ alpha"));
+        assert!(lines[1].starts_with("  bravo"));
+    }
+
+    /// When an item carries both `shortcut` and `description`, the
+    /// shortcut wins the right column slot.
+    #[test]
+    fn shortcut_takes_right_column_over_description() {
+        let items = vec![
+            SelectItem::new("a", "alpha")
+                .with_description("do alpha things")
+                .with_shortcut("Ctrl+A"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+        let lines = list.render(80);
+        assert!(
+            lines[0].contains("Ctrl+A"),
+            "shortcut must render: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("do alpha things"),
+            "description must be suppressed when shortcut is set: {:?}",
+            lines[0],
+        );
+    }
+
+    /// On a selected row the primary label gets the `selected_text` style,
+    /// but the prefix column stays in the dim `prefix` style. With
+    /// identity themes we can verify structurally that the prefix text
+    /// still appears verbatim on the selected line (i.e. the prefix
+    /// closure ran, not some wrapping selected-text closure).
+    #[test]
+    fn selected_row_keeps_prefix_dim() {
+        // Sentinel theme: tag selected-text with `[[...]]` and prefix
+        // with `<<...>>`. If selection wrapping leaked into the prefix
+        // column, we would see `model` inside `[[ ... ]]`.
+        let theme = SelectListTheme {
+            selected_prefix: Arc::new(|s| s.to_string()),
+            selected_text: Arc::new(|s| format!("[[{}]]", s)),
+            description: Arc::new(|s| s.to_string()),
+            scroll_info: Arc::new(|s| s.to_string()),
+            no_match: Arc::new(|s| s.to_string()),
+            prefix: Arc::new(|s| format!("<<{}>>", s)),
+            shortcut: Arc::new(|s| s.to_string()),
+        };
+        let items = vec![
+            SelectItem::new("a", "alpha").with_prefix("model"),
+            SelectItem::new("b", "bravo").with_prefix("aj"),
+        ];
+        let mut list = SelectList::new(items, 5, theme, SelectListLayout::default());
+        let lines = list.render(80);
+        // Selected row: prefix wrapped by `prefix` closure, primary by
+        // `selected_text` closure. They must not be nested.
+        let first = &lines[0];
+        assert!(
+            first.contains("<<model>>"),
+            "prefix must use prefix style: {first:?}"
+        );
+        assert!(
+            first.contains("[[alpha]]"),
+            "selected primary must use selected_text: {first:?}",
+        );
+        // The prefix text `model` must not appear inside the
+        // selected_text wrapping.
+        assert!(
+            !first.contains("[[<<model>>"),
+            "prefix must not be wrapped by selected_text: {first:?}",
+        );
+    }
+
+    #[test]
+    fn hides_selection_indicator_when_layout_says_so() {
+        let items = vec![SelectItem::new("a", "alpha"), SelectItem::new("b", "bravo")];
+        let layout = SelectListLayout {
+            show_selection_indicator: false,
+            ..Default::default()
+        };
+        let mut list = SelectList::new(items, 5, identity_theme(), layout);
+        let lines = list.render(40);
+        assert!(!lines[0].contains('→'), "row 0: {:?}", lines[0]);
+        assert!(lines[0].starts_with("  "), "row 0: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn prefix_column_stays_stable_when_filter_narrows() {
+        let items = vec![
+            SelectItem::new("a", "alpha").with_prefix("model"),
+            SelectItem::new("b", "bravo").with_prefix("session"), // widest prefix
+            SelectItem::new("c", "charlie").with_prefix("aj"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+
+        let unfiltered = list.render(80);
+        // Filter (by `value`) down to only the "aj"-prefixed row ("c" /
+        // "charlie"). `set_filter` matches item.value, not the
+        // displayed label, so we filter on "c".
+        list.set_filter("c");
+        let filtered = list.render(80);
+
+        // Both renders should place the label "alpha"/"charlie" at the
+        // same column position because the prefix column is sized to
+        // the widest prefix across ALL items (i.e. "session" = 7), not
+        // just the visible ones.
+        let unfiltered_first = unfiltered[0].clone();
+        let filtered_first = filtered[0].clone();
+
+        // Strip ANSI for the assertion if needed — identity_theme()
+        // passes through verbatim, so structural matching works on the
+        // raw strings.
+        let alpha_pos = unfiltered_first
+            .find("alpha")
+            .expect("unfiltered has alpha");
+        let charlie_pos = filtered_first
+            .find("charlie")
+            .expect("filtered has charlie");
+        assert_eq!(
+            alpha_pos, charlie_pos,
+            "label column shifted between unfiltered ({:?}) and filtered ({:?})",
+            unfiltered_first, filtered_first
+        );
+    }
+
+    /// A description too wide for its column is truncated with a
+    /// trailing ellipsis so the cut is visible; a shortcut is not.
+    #[test]
+    fn description_truncates_with_ellipsis() {
+        let items =
+            vec![SelectItem::new("a", "alpha").with_description(
+                "a fairly long description that will not fit in a narrow column",
+            )];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+        let lines = list.render(60);
+        assert!(lines[0].contains('…'), "expected ellipsis: {:?}", lines[0]);
+    }
+
+    /// Fuzzy `set_filter` narrows and reorders by match quality. A
+    /// query that fuzzy-matches a single item's label leaves only that
+    /// row; an empty query restores the full list.
+    #[test]
+    fn set_filter_fuzzy_narrows_and_restores() {
+        let items = vec![
+            SelectItem::new("a", "alpha"),
+            SelectItem::new("b", "bravo"),
+            SelectItem::new("c", "charlie"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+
+        list.set_filter("char");
+        assert_eq!(list.render(80).len(), 1);
+        assert_eq!(list.selected_item().map(|i| i.value.as_str()), Some("c"));
+
+        list.set_filter("");
+        assert_eq!(list.render(80).len(), 3);
+    }
+
+    /// `set_filter` matches `filter_key` when set, not the displayed
+    /// label — so a row can be found by hidden search text (e.g. the
+    /// command palette's `"<category> <name>"` key).
+    #[test]
+    fn set_filter_matches_filter_key_over_label() {
+        let items = vec![
+            SelectItem::new("a", "list").with_filter_key("model list"),
+            SelectItem::new("b", "switch").with_filter_key("session switch"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+        // "model" appears only in the first row's filter key, not its
+        // label, so the row is still found.
+        list.set_filter("model");
+        assert_eq!(list.render(80).len(), 1);
+        assert_eq!(list.selected_item().map(|i| i.value.as_str()), Some("a"));
     }
 }

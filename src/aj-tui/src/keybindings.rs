@@ -261,6 +261,72 @@ impl KeybindingsManager {
     }
 }
 
+/// Convert a canonical keybinding string like `"ctrl+o"` or
+/// `"alt+shift+t"` or `"escape"` into the display form
+/// `"Ctrl+O"` / `"Alt+Shift+T"` / `"Esc"` used in UI surfaces
+/// (palette shortcut column, overlay subtitles, help screens).
+///
+/// Splits on `+`, maps modifier and named-key segments to their
+/// display labels, title-cases everything else, and rejoins. The
+/// canonical form parsed here is the same form stored by
+/// [`KeybindingsManager::get_keys`].
+pub fn format_keybinding(canonical: &str) -> String {
+    canonical
+        .split('+')
+        .map(format_key_segment)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn format_key_segment(seg: &str) -> String {
+    let lower = seg.to_ascii_lowercase();
+    match lower.as_str() {
+        "ctrl" => "Ctrl".to_string(),
+        "alt" => "Alt".to_string(),
+        "shift" => "Shift".to_string(),
+        "meta" | "cmd" | "super" => "Meta".to_string(),
+        "escape" | "esc" => "Esc".to_string(),
+        "enter" | "return" => "Enter".to_string(),
+        "tab" => "Tab".to_string(),
+        "space" => "Space".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "delete" | "del" => "Del".to_string(),
+        "home" => "Home".to_string(),
+        "end" => "End".to_string(),
+        "pageup" => "PgUp".to_string(),
+        "pagedown" => "PgDn".to_string(),
+        "left" => "Left".to_string(),
+        "right" => "Right".to_string(),
+        "up" => "Up".to_string(),
+        "down" => "Down".to_string(),
+        "insert" => "Insert".to_string(),
+        _ => {
+            // Title-case: uppercase the first character, leave the
+            // rest as-is so symbol-only segments like `]` survive
+            // and function keys like `f1` become `F1`.
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// Look up the first key bound to `action` in the process-wide
+/// manager and return it formatted for display via
+/// [`format_keybinding`]. Returns `None` when the action is
+/// unknown or unbound.
+///
+/// Only the first binding is surfaced; multiple bindings get
+/// unwieldy in narrow UI columns (shortcut cells, subtitles), so
+/// callers that want all of them should use
+/// [`KeybindingsManager::get_keys`] directly.
+pub fn format_action_shortcut(action: &str) -> Option<String> {
+    let kb = get();
+    kb.get_keys(action).first().map(|k| format_keybinding(k))
+}
+
 /// Remove duplicate entries while preserving order.
 fn normalize_keys(keys: Vec<KeyId>) -> Vec<KeyId> {
     let mut seen: BTreeSet<KeyId> = BTreeSet::new();
@@ -510,6 +576,36 @@ mod tests {
             "enter".to_string(),
         ]);
         assert_eq!(out, vec!["ctrl+c", "enter", "escape"]);
+    }
+
+    #[test]
+    fn format_keybinding_handles_modifiers_and_named_keys() {
+        assert_eq!(format_keybinding("ctrl+o"), "Ctrl+O");
+        assert_eq!(format_keybinding("escape"), "Esc");
+        assert_eq!(format_keybinding("alt+shift+t"), "Alt+Shift+T");
+        assert_eq!(format_keybinding("ctrl+left"), "Ctrl+Left");
+        assert_eq!(format_keybinding("enter"), "Enter");
+        assert_eq!(format_keybinding("pageUp"), "PgUp");
+        assert_eq!(format_keybinding("ctrl+]"), "Ctrl+]");
+    }
+
+    #[test]
+    fn format_action_shortcut_reads_global_manager() {
+        // Install a manager containing a known dummy action so the
+        // test is isolated from the bundled defaults' evolution.
+        set_manager(KeybindingsManager::new(
+            vec![(
+                "test.dummy".to_string(),
+                KeybindingDefinition::new("ctrl+x", "Dummy"),
+            )],
+            Vec::<(String, Vec<KeyId>)>::new(),
+        ));
+        assert_eq!(
+            format_action_shortcut("test.dummy"),
+            Some("Ctrl+X".to_string())
+        );
+        assert_eq!(format_action_shortcut("test.unknown"), None);
+        reset();
     }
 
     #[test]

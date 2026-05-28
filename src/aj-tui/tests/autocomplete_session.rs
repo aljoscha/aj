@@ -95,7 +95,7 @@ async fn try_start_session_returns_some_on_at_context() {
             files: &["readme.md"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["@".to_string()];
     let session = provider.try_start_session(&lines, 0, 1, noop_notify());
@@ -108,7 +108,7 @@ async fn try_start_session_returns_some_on_at_context() {
 #[tokio::test]
 async fn try_start_session_returns_none_for_slash_context() {
     let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["/".to_string()];
     let session = provider.try_start_session(&lines, 0, 1, noop_notify());
@@ -121,7 +121,7 @@ async fn try_start_session_returns_none_for_slash_context() {
 #[tokio::test]
 async fn try_start_session_returns_none_for_plain_text() {
     let tmp = TempDir::new().unwrap();
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["hello world".to_string()];
     let session = provider.try_start_session(&lines, 0, 11, noop_notify());
@@ -145,7 +145,7 @@ async fn session_snapshot_populates_after_walker_finishes() {
             files: &["alpha.rs", "beta.rs", "gamma.rs"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["@a".to_string()];
     let mut session = provider
@@ -184,7 +184,7 @@ async fn session_ranks_filename_prefix_match_above_scattered_subsequence() {
             files: &["src/autocomplete.rs", "tests/support/mod.rs"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["@auto".to_string()];
     let mut session = provider
@@ -217,7 +217,7 @@ async fn update_narrows_matches_without_restarting_walker() {
             files: &["alpha.rs", "anvil.rs", "beta.rs"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     // Start with just `@` (every file matches) ...
     let lines = vec!["@".to_string()];
@@ -274,7 +274,7 @@ async fn update_keeps_session_alive_across_slash_in_prefix() {
             files: &["src/lib.rs", "README.md"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["@s".to_string()];
     let mut session = provider
@@ -298,7 +298,7 @@ async fn update_returns_invalid_when_leaving_at_context() {
             files: &["x.rs"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["@".to_string()];
     let mut session = provider
@@ -330,7 +330,7 @@ async fn session_tick_reports_running_then_quiescent() {
             files: &["a.rs", "b.rs", "c.rs"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["@".to_string()];
     let mut session = provider
@@ -360,7 +360,7 @@ async fn dropping_session_cancels_the_walker() {
             files: &["x.rs"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let lines = vec!["@".to_string()];
     let session = provider
@@ -396,7 +396,7 @@ async fn notify_fires_when_walker_pushes_items() {
             files: &["alpha.rs", "beta.rs", "gamma.rs"],
         },
     );
-    let provider = CombinedAutocompleteProvider::new(vec![], tmp.path());
+    let provider = CombinedAutocompleteProvider::new(tmp.path());
 
     let count = Arc::new(AtomicUsize::new(0));
     let count_cb = Arc::clone(&count);

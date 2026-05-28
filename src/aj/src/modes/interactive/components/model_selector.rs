@@ -4,9 +4,8 @@
 //! filtering with a [`aj_tui::components::select_list::SelectList`]
 //! that shows the matching entries from a snapshotted
 //! [`aj_models::registry::ModelRegistry`]. The host opens this
-//! overlay from `/model` (no args) or `/model <query>` (initial
-//! search pre-filled); pressing Enter commits the highlighted entry,
-//! Esc cancels.
+//! overlay from `/model`; pressing Enter commits the highlighted
+//! entry, Esc cancels.
 //!
 //! The component owns the catalog and rebuilds the inner
 //! [`SelectList`] on every text change so the visible rows track the
@@ -26,7 +25,6 @@ use aj_tui::components::text_input::TextInput;
 use aj_tui::fuzzy::FuzzyMatcher;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
-use aj_tui::style;
 
 /// Maximum visible rows in the result list. Eight matches the
 /// thinking selector's screen footprint at a 60-column overlay;
@@ -84,8 +82,6 @@ pub struct ModelSelectorComponent {
     /// reconstruct the underlying nucleo state on every keystroke
     /// (it allocates ~135 KB up front per `FuzzyMatcher::new`).
     matcher: FuzzyMatcher,
-    /// One-line title rendered above the search input.
-    title: String,
 }
 
 impl ModelSelectorComponent {
@@ -94,10 +90,11 @@ impl ModelSelectorComponent {
     /// `catalog` is the snapshotted model list to choose from (must
     /// already include any provider/override merging). `current` is
     /// the agent's active model — used to pre-select the matching
-    /// row and mark it `(current)`. `initial_query` pre-fills the
-    /// search box (used by `/model <query>` invocations) so the
-    /// overlay opens already filtered. `theme` styles the underlying
-    /// [`SelectList`].
+    /// row and mark it `(current)`. `initial_query`, when set,
+    /// pre-fills the search box so the overlay opens already
+    /// filtered; the slash layer passes `None`, but the parameter
+    /// is kept as a general capability. `theme` styles the
+    /// underlying [`SelectList`].
     pub fn new(
         theme: SelectListTheme,
         catalog: Vec<ModelInfo>,
@@ -130,7 +127,6 @@ impl ModelSelectorComponent {
             outcome,
             theme,
             matcher: FuzzyMatcher::new(),
-            title: "Select model — Enter to apply, Esc to cancel".to_string(),
         };
         component.rebuild_list();
         component
@@ -282,11 +278,12 @@ impl Component for ModelSelectorComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        // Stack: title, search input, dim separator, list.
-        let mut lines = Vec::with_capacity(MAX_VISIBLE_ROWS + 4);
-        lines.push(style::dim(&self.title));
+        // Chrome (title + border) is provided by the surrounding
+        // `OverlayWindow` at mount time; we render just the search
+        // input stacked above the result list.
+        let mut lines = Vec::with_capacity(MAX_VISIBLE_ROWS + 2);
         lines.extend(self.search.render(width));
-        lines.push(style::dim(&"─".repeat(width.min(60))));
+        lines.push(String::new());
         lines.extend(self.list.render(width));
         lines
     }
@@ -371,6 +368,8 @@ mod tests {
             description: Arc::new(|s| s.to_string()),
             scroll_info: Arc::new(|s| s.to_string()),
             no_match: Arc::new(|s| s.to_string()),
+            prefix: Arc::new(|s| s.to_string()),
+            shortcut: Arc::new(|s| s.to_string()),
         }
     }
 
