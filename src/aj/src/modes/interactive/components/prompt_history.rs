@@ -9,7 +9,7 @@
 //! `aj.history.toggle_scope` chord (default `Ctrl+T`):
 //!
 //! - **This workspace** (the default): prompts from the current
-//!   project's threads directory.
+//!   project's sessions directory.
 //! - **All workspaces**: prompts from every project under
 //!   `~/.aj/threads`, each tagged with its project label.
 //!
@@ -348,7 +348,7 @@ impl Component for PromptHistorySearchComponent {
 }
 
 // ---------------------------------------------------------------------------
-// Scanning: extract submitted prompts from on-disk thread logs.
+// Scanning: extract submitted prompts from on-disk session logs.
 // ---------------------------------------------------------------------------
 
 /// Collect the current workspace's submitted prompts, newest-first,
@@ -356,12 +356,12 @@ impl Component for PromptHistorySearchComponent {
 pub fn workspace_history(persistence: &ConversationPersistence) -> Vec<PromptHistoryEntry> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    collect_dir(persistence.threads_dir(), None, &mut seen, &mut out);
+    collect_dir(persistence.sessions_dir(), None, &mut seen, &mut out);
     out
 }
 
 /// Collect submitted prompts across every project under
-/// `threads_base` (`~/.aj/threads`), deduplicated, each entry tagged
+/// `sessions_base` (`~/.aj/threads`), deduplicated, each entry tagged
 /// with its project (subdirectory) label.
 ///
 /// Projects are visited in reverse-lexicographic directory order and
@@ -370,16 +370,16 @@ pub fn workspace_history(persistence: &ConversationPersistence) -> Vec<PromptHis
 /// directory order is unrelated to recency — it exists only to make
 /// the dedup deterministic — so the tag on a prompt shared across
 /// projects is stable but not a "most recent workspace" guarantee.
-pub fn all_workspaces_history(threads_base: &Path) -> Vec<PromptHistoryEntry> {
+pub fn all_workspaces_history(sessions_base: &Path) -> Vec<PromptHistoryEntry> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
-    let read_dir = match std::fs::read_dir(threads_base) {
+    let read_dir = match std::fs::read_dir(sessions_base) {
         Ok(rd) => rd,
         Err(e) => {
             tracing::debug!(
-                "could not read threads base {}: {e}",
-                threads_base.display()
+                "could not read sessions base {}: {e}",
+                sessions_base.display()
             );
             return out;
         }
@@ -421,7 +421,7 @@ fn collect_dir(
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
-            tracing::debug!("could not read threads dir {}: {e}", dir.display());
+            tracing::debug!("could not read sessions dir {}: {e}", dir.display());
             return;
         }
     };
@@ -454,7 +454,7 @@ fn collect_dir(
     }
 }
 
-/// Extract the user-submitted prompt texts from a single thread file,
+/// Extract the user-submitted prompt texts from a single session file,
 /// in chronological (file) order. Mirrors the failure-isolation
 /// contract of [`crate::modes::interactive::editor_ext::PromptHistory`]:
 /// non-UTF-8 lines, unparseable lines, and non-top-level entries are
@@ -463,7 +463,7 @@ fn load_file_prompts(path: &Path) -> Vec<String> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            tracing::debug!("skipping unreadable thread file {}: {e}", path.display());
+            tracing::debug!("skipping unreadable session file {}: {e}", path.display());
             return Vec::new();
         }
     };

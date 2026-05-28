@@ -3,7 +3,7 @@
 //! Loads `~/.aj/.env`, parses CLI args (see
 //! [`aj::cli::args::Args`]), and dispatches to either
 //! [`aj::modes::print`] or [`aj::modes::interactive`].
-//! Subcommands (`list-threads`, `continue`, `update-models`)
+//! Subcommands (`list-sessions`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
 use aj::cli::args::{Args, Command};
@@ -36,9 +36,9 @@ async fn main() -> Result<()> {
 
     match args.command {
         Some(Command::UpdateModels) => handle_update_models_command().await,
-        Some(Command::ListThreads) => handle_list_threads(),
+        Some(Command::ListSessions) => handle_list_sessions(),
         Some(Command::Continue {
-            thread_id: _,
+            session_id: _,
             prompt: _,
         }) => {
             // `continue` always lands in interactive mode (or
@@ -62,28 +62,28 @@ async fn dispatch_session_mode(args: Args) -> Result<()> {
     }
 }
 
-/// `aj list-threads`: list existing conversation threads
+/// `aj list-sessions`: list existing conversation sessions
 /// for the current project, latest first.
 ///
-/// Output: one row per thread, formatted as `<thread_id>
+/// Output: one row per session, formatted as `<session_id>
 /// (modified: <utc-ts>, <size>)`. The underlying iteration,
 /// pre-refactor-format filtering, and size formatting all live
-/// in [`ConversationPersistence::list_threads`] (`aj-session`);
+/// in [`ConversationPersistence::list_sessions`] (`aj-session`);
 /// this function is a thin presentation wrapper.
-fn handle_list_threads() -> Result<()> {
-    let threads_dir = Config::get_threads_dir_path()?;
-    let conversation_persistence = ConversationPersistence::new(threads_dir);
-    let threads = conversation_persistence.list_threads()?;
+fn handle_list_sessions() -> Result<()> {
+    let sessions_dir = Config::get_sessions_dir_path()?;
+    let conversation_persistence = ConversationPersistence::new(sessions_dir);
+    let sessions = conversation_persistence.list_sessions()?;
 
-    if threads.is_empty() {
-        println!("No conversation threads found for this project.");
+    if sessions.is_empty() {
+        println!("No conversation sessions found for this project.");
         return Ok(());
     }
 
-    for thread in threads {
+    for session in sessions {
         println!(
             "{} (modified: {}, {})",
-            thread.thread_id, thread.modified, thread.size_display
+            session.session_id, session.modified, session.size_display
         );
     }
 

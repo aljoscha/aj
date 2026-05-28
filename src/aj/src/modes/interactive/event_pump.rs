@@ -173,8 +173,8 @@ impl EventPump {
         self.hide_thinking_block
     }
 
-    /// Current inline-image render mode. Surface so thread-swap /
-    /// new-thread paths can preserve the user's
+    /// Current inline-image render mode. Surface so session-swap /
+    /// new-session paths can preserve the user's
     /// `image_show_in_terminal` choice across pump re-creation.
     pub fn show_image_in_terminal(&self) -> bool {
         self.show_image_in_terminal
@@ -451,7 +451,7 @@ impl EventPump {
     /// Multiple [`UserContent::Text`] blocks are joined with `\n`
     /// so legacy multi-block user messages collapse into one
     /// rendered component — live user prompts are always
-    /// single-block, but resumed threads may carry multi-block
+    /// single-block, but resumed sessions may carry multi-block
     /// shapes from older formats.
     fn append_user_message(&self, tui: &mut Tui, content: &[UserContent]) {
         let text = content
@@ -1139,7 +1139,7 @@ mod tests {
     #[test]
     fn replay_tool_result_without_start_does_not_steal_next_assistant_message() {
         // Regression for the resume-fidelity reorder bug. On a
-        // resumed thread the disk shape is:
+        // resumed session the disk shape is:
         //   user prompt -> assistant (thinking + tool_use) ->
         //   tool_result -> assistant (final text)
         // Replay walks these in append order and (today) emits a

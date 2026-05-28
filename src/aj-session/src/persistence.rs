@@ -1,8 +1,8 @@
-//! Project-level discovery of conversation thread files.
+//! Project-level discovery of conversation session files.
 //!
-//! [`ConversationPersistence`] is the owner of a project's threads
-//! directory. It lists existing threads (for `aj list-threads` and
-//! `aj continue`) and resolves a thread id to its on-disk path so
+//! [`ConversationPersistence`] is the owner of a project's sessions
+//! directory. It lists existing sessions (for `aj list-sessions` and
+//! `aj continue`) and resolves a session id to its on-disk path so
 //! [`crate::log::ConversationLog`] can open / create the right file.
 
 use aj_models::types::{Message, UserContent};
@@ -14,40 +14,40 @@ use std::path::PathBuf;
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError};
 
 /// Handles persistence operations for conversations, including listing
-/// existing thread files and resolving their paths.
+/// existing session files and resolving their paths.
 #[derive(Clone)]
 pub struct ConversationPersistence {
-    threads_dir: PathBuf,
+    sessions_dir: PathBuf,
 }
 
 impl ConversationPersistence {
     /// Create a new [ConversationPersistence] instance with the given
-    /// threads directory.
-    pub fn new(threads_dir: PathBuf) -> Self {
-        Self { threads_dir }
+    /// sessions directory.
+    pub fn new(sessions_dir: PathBuf) -> Self {
+        Self { sessions_dir }
     }
 
-    pub fn threads_dir(&self) -> &std::path::Path {
-        &self.threads_dir
+    pub fn sessions_dir(&self) -> &std::path::Path {
+        &self.sessions_dir
     }
 
-    pub(crate) fn thread_path(&self, thread_id: &str) -> PathBuf {
-        self.threads_dir.join(format!("{thread_id}.jsonl"))
+    pub(crate) fn session_path(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir.join(format!("{session_id}.jsonl"))
     }
 
-    /// Get metadata about all conversation threads, sorted by creation
+    /// Get metadata about all conversation sessions, sorted by creation
     /// time (latest first).
     ///
     /// Files whose first line does not parse as the new
-    /// [ConversationEntry] shape (e.g. pre-refactor threads) are skipped
+    /// [ConversationEntry] shape (e.g. pre-refactor sessions) are skipped
     /// with a `tracing::info!` note.
-    pub fn list_threads(&self) -> Result<Vec<ThreadMetadata>, ConversationError> {
-        if !self.threads_dir.exists() {
+    pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+        if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
 
-        let entries = fs::read_dir(&self.threads_dir)?;
-        let mut thread_files = Vec::new();
+        let entries = fs::read_dir(&self.sessions_dir)?;
+        let mut session_files = Vec::new();
 
         for entry in entries {
             let entry = entry?;
@@ -55,22 +55,22 @@ impl ConversationPersistence {
 
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
                 if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    thread_files.push(file_stem.to_string());
+                    session_files.push(file_stem.to_string());
                 }
             }
         }
 
         // Sort by filename (a timestamp), latest first.
-        thread_files.sort_by(|a, b| b.cmp(a));
+        session_files.sort_by(|a, b| b.cmp(a));
 
-        let mut threads = Vec::new();
+        let mut sessions = Vec::new();
 
-        for thread_id in thread_files {
-            let path = self.thread_path(&thread_id);
+        for session_id in session_files {
+            let path = self.session_path(&session_id);
 
             if !Self::looks_like_new_format(&path) {
                 tracing::info!(
-                    "skipping pre-refactor thread file {} (old on-disk format)",
+                    "skipping pre-refactor session file {} (old on-disk format)",
                     path.display()
                 );
                 continue;
@@ -92,14 +92,14 @@ impl ConversationPersistence {
                 format!("{}MB", file_size / (1024 * 1024))
             };
 
-            threads.push(ThreadMetadata {
-                thread_id,
+            sessions.push(SessionMetadata {
+                session_id,
                 modified: modified_str,
                 size_display,
             });
         }
 
-        Ok(threads)
+        Ok(sessions)
     }
 
     /// Empty files are considered new-format (they were just created and
@@ -126,72 +126,72 @@ impl ConversationPersistence {
         }
     }
 
-    /// Get the latest conversation thread ID, if any exist.
-    pub fn get_latest_thread_id(&self) -> Result<Option<String>, ConversationError> {
-        let threads = self.list_threads()?;
-        Ok(threads.first().map(|t| t.thread_id.clone()))
+    /// Get the latest conversation session ID, if any exist.
+    pub fn get_latest_session_id(&self) -> Result<Option<String>, ConversationError> {
+        let sessions = self.list_sessions()?;
+        Ok(sessions.first().map(|t| t.session_id.clone()))
     }
 
-    /// List threads with rich per-thread previews — first user
+    /// List sessions with rich per-session previews — first user
     /// message, message count, modified time, file size.
     ///
-    /// Walks the threads directory in the same latest-first order
-    /// as [`Self::list_threads`], but for each file opens the JSONL
+    /// Walks the sessions directory in the same latest-first order
+    /// as [`Self::list_sessions`], but for each file opens the JSONL
     /// and scans line by line to count `Message` entries and capture
     /// the first user-role textual block. `on_progress(loaded, total)`
     /// fires once per file as previews complete so a caller showing
     /// a "Loading X/Y" indicator can update incrementally. Files
     /// whose first line does not parse as the new [`ConversationEntry`]
-    /// shape are skipped (consistent with [`Self::list_threads`]).
+    /// shape are skipped (consistent with [`Self::list_sessions`]).
     ///
     /// Note on streaming: this function still returns the previews
     /// in one `Vec` after every file has been scanned. The callback
     /// is the streaming surface for progress reporting; a future
     /// extension can flip the return type to an `Iterator` / async
-    /// stream if a single project ever grows enough threads that
+    /// stream if a single project ever grows enough sessions that
     /// the cumulative scan time becomes user-visible.
-    pub fn list_thread_previews(
+    pub fn list_session_previews(
         &self,
         mut on_progress: impl FnMut(usize, usize),
-    ) -> Result<Vec<ThreadPreview>, ConversationError> {
-        if !self.threads_dir.exists() {
+    ) -> Result<Vec<SessionPreview>, ConversationError> {
+        if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
 
-        let entries = fs::read_dir(&self.threads_dir)?;
-        let mut thread_files: Vec<String> = Vec::new();
+        let entries = fs::read_dir(&self.sessions_dir)?;
+        let mut session_files: Vec<String> = Vec::new();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    thread_files.push(stem.to_string());
+                    session_files.push(stem.to_string());
                 }
             }
         }
-        thread_files.sort_by(|a, b| b.cmp(a));
+        session_files.sort_by(|a, b| b.cmp(a));
 
-        let mut previews = Vec::with_capacity(thread_files.len());
+        let mut previews = Vec::with_capacity(session_files.len());
         // Filter out pre-refactor files up-front so `total` in the
         // progress callback reflects only files we'll actually
         // surface — otherwise the bar would stall partway through.
-        let candidate_paths: Vec<(String, PathBuf)> = thread_files
+        let candidate_paths: Vec<(String, PathBuf)> = session_files
             .into_iter()
-            .map(|id| (id.clone(), self.thread_path(&id)))
+            .map(|id| (id.clone(), self.session_path(&id)))
             .filter(|(_, p)| Self::looks_like_new_format(p))
             .collect();
 
         let total = candidate_paths.len();
-        for (i, (thread_id, path)) in candidate_paths.into_iter().enumerate() {
+        for (i, (session_id, path)) in candidate_paths.into_iter().enumerate() {
             // Surface a preview even if a per-file read fails: the
             // selector should still show the entry so the user can
-            // see which thread couldn't be parsed.
-            let preview = read_thread_preview_file(&thread_id, &path).unwrap_or_else(|err| {
+            // see which session couldn't be parsed.
+            let preview = read_session_preview_file(&session_id, &path).unwrap_or_else(|err| {
                 tracing::warn!(
-                    "failed to read preview for thread {}: {err}",
+                    "failed to read preview for session {}: {err}",
                     path.display()
                 );
-                ThreadPreview::placeholder(thread_id, &path)
+                SessionPreview::placeholder(session_id, &path)
             });
             previews.push(preview);
             on_progress(i + 1, total);
@@ -201,34 +201,34 @@ impl ConversationPersistence {
     }
 }
 
-/// Metadata about a conversation thread.
+/// Metadata about a conversation session.
 #[derive(Debug, Clone)]
-pub struct ThreadMetadata {
-    pub thread_id: String,
+pub struct SessionMetadata {
+    pub session_id: String,
     pub modified: String,
     pub size_display: String,
 }
 
-/// Richer per-thread snapshot used by the interactive session
+/// Richer per-session snapshot used by the interactive session
 /// selector overlay.
 ///
-/// Unlike [`ThreadMetadata`] (which is purely a filesystem-stat
-/// payload), [`ThreadPreview`] opens the JSONL and walks far enough
+/// Unlike [`SessionMetadata`] (which is purely a filesystem-stat
+/// payload), [`SessionPreview`] opens the JSONL and walks far enough
 /// to count `Message` entries and capture the first user-role text
 /// block. Producing one preview is therefore O(file size) per
-/// thread; [`ConversationPersistence::list_thread_previews`] streams
+/// session; [`ConversationPersistence::list_session_previews`] streams
 /// progress through a callback so a UI rendering the list can show
 /// a `Loading X/Y` indicator while the walk completes.
 #[derive(Debug, Clone)]
-pub struct ThreadPreview {
-    /// Filename stem of the thread file (e.g.
+pub struct SessionPreview {
+    /// Filename stem of the session file (e.g.
     /// `2025-05-11-14-22-03-512`).
-    pub thread_id: String,
+    pub session_id: String,
     /// Modification time read from the file system. Held as a
     /// real [`DateTime`] (not a pre-formatted string) so the
     /// renderer can choose whatever date/age formatting it likes.
     pub modified: DateTime<Utc>,
-    /// Thread creation time. Parsed from `thread_id` (which is
+    /// Session creation time. Parsed from `session_id` (which is
     /// minted as a millisecond-precision UTC timestamp on
     /// [`crate::log::ConversationLog::create`]). Falls back to
     /// `modified` when the id doesn't parse — placeholder previews,
@@ -238,7 +238,7 @@ pub struct ThreadPreview {
     pub created_at: DateTime<Utc>,
     /// Time of the most recently appended message-kind entry.
     /// Captured during the JSONL walk in
-    /// [`read_thread_preview_file`] as the largest
+    /// [`read_session_preview_file`] as the largest
     /// [`ConversationEntry::timestamp`] seen on a
     /// [`ConversationEntryKind::Message`] entry, so out-of-order
     /// writes (e.g. a tool result that completes after a streaming
@@ -257,18 +257,18 @@ pub struct ThreadPreview {
     /// skipped.
     pub message_count: usize,
     /// First user-role textual content block in the file, if any.
-    /// `None` for a freshly-minted thread that hasn't yet seen a
+    /// `None` for a freshly-minted session that hasn't yet seen a
     /// user prompt. The string carries the verbatim text — the
     /// renderer applies its own truncation policy.
     pub first_user_message: Option<String>,
 }
 
-impl ThreadPreview {
+impl SessionPreview {
     /// Build a minimal preview for a file we could not parse — only
     /// the id and file-system stat fields are populated. Used as a
-    /// fall-back so a corrupt thread file still appears in the
+    /// fall-back so a corrupt session file still appears in the
     /// selector instead of silently dropping out of the listing.
-    fn placeholder(thread_id: String, path: &std::path::Path) -> Self {
+    fn placeholder(session_id: String, path: &std::path::Path) -> Self {
         let (modified, size_bytes) = match fs::metadata(path) {
             Ok(md) => {
                 let modified = md
@@ -282,9 +282,9 @@ impl ThreadPreview {
         // Parse the creation time from the filename stem; fall back
         // to `modified` so the row still has a complete metadata
         // triple to render.
-        let created_at = parse_thread_id_created_at(&thread_id).unwrap_or(modified);
+        let created_at = parse_session_id_created_at(&session_id).unwrap_or(modified);
         Self {
-            thread_id,
+            session_id,
             modified,
             created_at,
             // No message-kind entries parsed: the cheap fallback is
@@ -299,16 +299,16 @@ impl ThreadPreview {
 }
 
 /// Open `path`, walk every JSONL line, and assemble a
-/// [`ThreadPreview`].
+/// [`SessionPreview`].
 ///
 /// Lines that fail to parse are skipped (matching the resume-time
 /// tolerance for truncated trailing lines). The walk is one-pass:
 /// we read every line so `message_count` is accurate, but we stop
 /// updating `first_user_message` once we have one.
-fn read_thread_preview_file(
-    thread_id: &str,
+fn read_session_preview_file(
+    session_id: &str,
     path: &std::path::Path,
-) -> Result<ThreadPreview, ConversationError> {
+) -> Result<SessionPreview, ConversationError> {
     let metadata = fs::metadata(path)?;
     let modified = metadata
         .modified()
@@ -363,21 +363,21 @@ fn read_thread_preview_file(
     }
 
     // Creation time: derived from the filename stem rather than
-    // a per-entry timestamp so a thread with no appended messages
+    // a per-entry timestamp so a session with no appended messages
     // (a freshly-minted log) still has a meaningful "created"
     // marker for the selector. Fall back to the file mtime if the
     // stem doesn't parse.
-    let created_at = parse_thread_id_created_at(thread_id).unwrap_or(modified);
+    let created_at = parse_session_id_created_at(session_id).unwrap_or(modified);
     // `last_message_at` falls back to the file mtime for two cases:
     // logs predating the per-entry timestamping work (every entry
-    // has `timestamp: None`) and freshly-minted threads with no
+    // has `timestamp: None`) and freshly-minted sessions with no
     // message-kind entries yet. The fallback matches the value the
     // selector would have rendered as `modified` under the older
     // single-field design.
     let last_message_at = last_message_at.unwrap_or(modified);
 
-    Ok(ThreadPreview {
-        thread_id: thread_id.to_string(),
+    Ok(SessionPreview {
+        session_id: session_id.to_string(),
         modified,
         created_at,
         last_message_at,
@@ -387,7 +387,7 @@ fn read_thread_preview_file(
     })
 }
 
-/// Parse a thread id minted by [`crate::log::ConversationLog::create`]
+/// Parse a session id minted by [`crate::log::ConversationLog::create`]
 /// back into the UTC instant it represents.
 ///
 /// The mint format is `%Y-%m-%d-%H-%M-%S-%3f` with an optional
@@ -399,19 +399,19 @@ fn read_thread_preview_file(
 /// Returns `None` for any stem that doesn't conform — placeholder
 /// ids, hand-renamed files, or future format changes. The caller
 /// falls back to file mtime in that case so the row still renders.
-fn parse_thread_id_created_at(thread_id: &str) -> Option<DateTime<Utc>> {
+fn parse_session_id_created_at(session_id: &str) -> Option<DateTime<Utc>> {
     // Strip a trailing `_<digits>` collision suffix. The mint side
     // never embeds an underscore in the timestamp portion so an
     // underscore unambiguously marks the suffix boundary; we still
     // require the suffix to be all digits to avoid misclassifying
     // an unexpected stem shape as a collision.
-    let stem = match thread_id.rsplit_once('_') {
+    let stem = match session_id.rsplit_once('_') {
         Some((prefix, suffix))
             if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) =>
         {
             prefix
         }
-        _ => thread_id,
+        _ => session_id,
     };
     NaiveDateTime::parse_from_str(stem, "%Y-%m-%d-%H-%M-%S-%3f")
         .ok()
@@ -419,7 +419,7 @@ fn parse_thread_id_created_at(thread_id: &str) -> Option<DateTime<Utc>> {
 }
 
 /// Return the text from the first [`UserContent::Text`] block in
-/// `content`, if any. Used by [`read_thread_preview_file`] to
+/// `content`, if any. Used by [`read_session_preview_file`] to
 /// capture the user-input preview.
 fn first_user_text(content: &[UserContent]) -> Option<String> {
     content.iter().find_map(|b| match b {
@@ -480,22 +480,22 @@ mod tests {
     }
 
     #[test]
-    fn list_thread_previews_returns_empty_when_dir_missing() {
+    fn list_session_previews_returns_empty_when_dir_missing() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("missing");
         let persistence = ConversationPersistence::new(path);
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert!(previews.is_empty());
     }
 
     #[test]
-    fn list_thread_previews_captures_first_user_message_and_count() {
+    fn list_session_previews_captures_first_user_message_and_count() {
         let (_dir, persistence) = fixture();
 
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello world", "hi there");
 
-        // A second user-thread message so the count crosses 2.
+        // A second message on the user thread so the count crosses 2.
         let head = log
             .latest_leaf(crate::ThreadFilter::USER)
             .expect("head exists");
@@ -503,17 +503,17 @@ mod tests {
         view.add_message(user_msg("follow-up"))
             .expect("append second user");
 
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         let p = &previews[0];
-        assert_eq!(p.thread_id, log.thread_id());
+        assert_eq!(p.session_id, log.session_id());
         assert_eq!(p.message_count, 3);
         assert_eq!(p.first_user_message.as_deref(), Some("hello world"));
         assert!(p.size_bytes > 0);
     }
 
     #[test]
-    fn list_thread_previews_emits_progress_callback_per_file() {
+    fn list_session_previews_emits_progress_callback_per_file() {
         let (_dir, persistence) = fixture();
         for i in 0..3 {
             let mut log = ConversationLog::create(&persistence).expect("create");
@@ -525,7 +525,7 @@ mod tests {
 
         let progress = RefCell::new(Vec::<(usize, usize)>::new());
         let previews = persistence
-            .list_thread_previews(|loaded, total| progress.borrow_mut().push((loaded, total)))
+            .list_session_previews(|loaded, total| progress.borrow_mut().push((loaded, total)))
             .expect("list");
         assert_eq!(previews.len(), 3);
         let p = progress.into_inner();
@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn list_thread_previews_ignores_non_user_first_messages() {
+    fn list_session_previews_ignores_non_user_first_messages() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         // First message is a tool_result (not a user prompt). The
@@ -544,25 +544,25 @@ mod tests {
         )))
         .expect("append");
 
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         assert!(previews[0].first_user_message.is_none());
         assert_eq!(previews[0].message_count, 1);
     }
 
     #[test]
-    fn list_thread_previews_skips_pre_refactor_files() {
+    fn list_session_previews_skips_pre_refactor_files() {
         let (_dir, persistence) = fixture();
-        let bogus = persistence.threads_dir.join("old.jsonl");
+        let bogus = persistence.sessions_dir.join("old.jsonl");
         std::fs::write(&bogus, "not json at all\n").expect("write");
 
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert!(previews.is_empty(), "got {previews:?}");
     }
 
     #[test]
-    fn parse_thread_id_created_at_round_trips_minted_id() {
-        let parsed = super::parse_thread_id_created_at("2025-05-11-14-22-03-512")
+    fn parse_session_id_created_at_round_trips_minted_id() {
+        let parsed = super::parse_session_id_created_at("2025-05-11-14-22-03-512")
             .expect("known-good stem parses");
         let expected = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
             .unwrap()
@@ -573,38 +573,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_thread_id_created_at_strips_collision_suffix() {
-        let suffix = super::parse_thread_id_created_at("2025-05-11-14-22-03-512_3")
+    fn parse_session_id_created_at_strips_collision_suffix() {
+        let suffix = super::parse_session_id_created_at("2025-05-11-14-22-03-512_3")
             .expect("suffixed stem parses");
-        let bare =
-            super::parse_thread_id_created_at("2025-05-11-14-22-03-512").expect("bare stem parses");
+        let bare = super::parse_session_id_created_at("2025-05-11-14-22-03-512")
+            .expect("bare stem parses");
         assert_eq!(suffix, bare);
     }
 
     #[test]
-    fn parse_thread_id_created_at_returns_none_for_unrecognised_stem() {
-        assert!(super::parse_thread_id_created_at("custom-name").is_none());
-        assert!(super::parse_thread_id_created_at("").is_none());
-        assert!(super::parse_thread_id_created_at("2025-05-11-14-22-03-512_abc").is_none());
+    fn parse_session_id_created_at_returns_none_for_unrecognised_stem() {
+        assert!(super::parse_session_id_created_at("custom-name").is_none());
+        assert!(super::parse_session_id_created_at("").is_none());
+        assert!(super::parse_session_id_created_at("2025-05-11-14-22-03-512_abc").is_none());
     }
 
     #[test]
-    fn list_thread_previews_populates_created_at_from_thread_id() {
+    fn list_session_previews_populates_created_at_from_session_id() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hi", "ok");
-        let thread_id = log.thread_id().to_string();
+        let session_id = log.session_id().to_string();
 
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         let p = &previews[0];
         let expected =
-            super::parse_thread_id_created_at(&thread_id).expect("freshly-minted id parses");
+            super::parse_session_id_created_at(&session_id).expect("freshly-minted id parses");
         assert_eq!(p.created_at, expected);
     }
 
     #[test]
-    fn list_thread_previews_counts_tool_result_entries() {
+    fn list_session_previews_counts_tool_result_entries() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         {
@@ -625,15 +625,15 @@ mod tests {
             .expect("tr");
         }
 
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         // Three wire-level messages: user, assistant, tool_result.
         assert_eq!(previews[0].message_count, 3);
     }
 
     #[test]
-    fn list_thread_previews_falls_back_to_modified_when_no_message_entries() {
-        // Legacy on-disk shape: a thread file containing only a
+    fn list_session_previews_falls_back_to_modified_when_no_message_entries() {
+        // Legacy on-disk shape: a session file containing only a
         // SystemPrompt entry, with no `Message` entries. New code
         // can't produce this layout (the system prompt buffers and
         // never flushes alone), but files written by older builds
@@ -642,11 +642,11 @@ mod tests {
         // `last_message_at` defaults to the file mtime when no
         // Message-kind entry contributed a timestamp.
         let (_dir, persistence) = fixture();
-        let threads_dir = persistence.threads_dir().to_path_buf();
-        std::fs::create_dir_all(&threads_dir).expect("threads dir");
+        let sessions_dir = persistence.sessions_dir().to_path_buf();
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
 
-        let thread_id = "2024-01-01-00-00-00-000";
-        let path = threads_dir.join(format!("{thread_id}.jsonl"));
+        let session_id = "2024-01-01-00-00-00-000";
+        let path = sessions_dir.join(format!("{session_id}.jsonl"));
         let line = serde_json::json!({
             "id": "00000000",
             "timestamp": "2024-01-01T00:00:00Z",
@@ -656,7 +656,7 @@ mod tests {
         });
         std::fs::write(&path, format!("{line}\n")).expect("write legacy file");
 
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         let p = &previews[0];
         assert_eq!(p.message_count, 0);
@@ -664,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn list_thread_previews_uses_largest_message_timestamp() {
+    fn list_session_previews_uses_largest_message_timestamp() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "world");
@@ -676,7 +676,7 @@ mod tests {
         view.add_message(user_msg("follow-up"))
             .expect("append user2");
 
-        let previews = persistence.list_thread_previews(|_, _| {}).expect("list");
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert_eq!(previews.len(), 1);
         let p = &previews[0];
         let min_expected = p.created_at + chrono::Duration::milliseconds(10);

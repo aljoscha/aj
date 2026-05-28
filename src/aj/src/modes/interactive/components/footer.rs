@@ -24,7 +24,7 @@ use aj_tui::style;
 /// is. The footer renders this as `tokens/window (percent%)`,
 /// coloring the percentage by occupancy.
 ///
-/// `tokens.None` means "not yet known" — typically a fresh thread
+/// `tokens.None` means "not yet known" — typically a fresh session
 /// before the first assistant turn — and renders as `?`. A
 /// `context_window` of `0` suppresses the indicator entirely so
 /// the footer stays silent for models with no published window.

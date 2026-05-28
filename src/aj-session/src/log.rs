@@ -1,6 +1,6 @@
 //! Append-only conversation log + read-only inference view.
 //!
-//! Each thread is one `.jsonl` file under the project's threads
+//! Each session is one `.jsonl` file under the project's sessions
 //! directory. `ConversationLog` holds the in-memory image and writes
 //! every append to disk before mutating the in-memory maps, so a
 //! crashed process never leaves the two diverging beyond the last
@@ -278,7 +278,7 @@ impl Conversation {
 /// with a warning.
 pub struct ConversationLog {
     path: PathBuf,
-    thread_id: String,
+    session_id: String,
     entries: HashMap<EntryId, ConversationEntry>,
     /// Insertion order: ids in the order they were appended. Used to find
     /// the most recently written entry matching a filter.
@@ -289,7 +289,7 @@ pub struct ConversationLog {
     /// that has never had a real ("punctuation") entry appended, `Some`
     /// once we've committed one (or for a [ConversationLog::resume]'d log
     /// from the outset). Keeping creation lazy means a session the user
-    /// abandons before typing anything leaves no file in the threads
+    /// abandons before typing anything leaves no file in the sessions
     /// directory.
     file: Option<File>,
     /// Pre-serialized lines for entries that have been [Self::append]ed
@@ -302,7 +302,7 @@ pub struct ConversationLog {
 }
 
 impl ConversationLog {
-    /// Reserve a fresh thread id and backing path, but don't touch disk
+    /// Reserve a fresh session id and backing path, but don't touch disk
     /// yet. The file is created lazily on the first [ConversationLog::append]
     /// of a punctuation entry (see
     /// [`ConversationEntryKind::is_punctuation`]) so a session the user
@@ -313,20 +313,20 @@ impl ConversationLog {
     pub fn create(
         persistence: &crate::persistence::ConversationPersistence,
     ) -> Result<Self, ConversationError> {
-        let threads_dir = persistence.threads_dir();
-        if !threads_dir.exists() {
-            fs::create_dir_all(threads_dir)?;
+        let sessions_dir = persistence.sessions_dir();
+        if !sessions_dir.exists() {
+            fs::create_dir_all(sessions_dir)?;
         }
 
-        // Thread id / filename: millisecond-resolution timestamp. If a
+        // Session id / filename: millisecond-resolution timestamp. If a
         // collision somehow occurs within the same millisecond we retry
         // with `_N` suffixes.
         let base = Utc::now().format("%Y-%m-%d-%H-%M-%S-%3f").to_string();
-        let (thread_id, path) = Self::mint_unique_path(threads_dir, &base)?;
+        let (session_id, path) = Self::mint_unique_path(sessions_dir, &base)?;
 
         Ok(Self {
             path,
-            thread_id,
+            session_id,
             entries: HashMap::new(),
             order: Vec::new(),
             next_counter: 0,
@@ -336,16 +336,16 @@ impl ConversationLog {
     }
 
     fn mint_unique_path(
-        threads_dir: &std::path::Path,
+        sessions_dir: &std::path::Path,
         base: &str,
     ) -> Result<(String, PathBuf), ConversationError> {
-        let candidate = threads_dir.join(format!("{base}.jsonl"));
+        let candidate = sessions_dir.join(format!("{base}.jsonl"));
         if !candidate.exists() {
             return Ok((base.to_string(), candidate));
         }
         for n in 1..1000 {
             let stem = format!("{base}_{n}");
-            let candidate = threads_dir.join(format!("{stem}.jsonl"));
+            let candidate = sessions_dir.join(format!("{stem}.jsonl"));
             if !candidate.exists() {
                 return Ok((stem, candidate));
             }
@@ -355,7 +355,7 @@ impl ConversationLog {
         // existing `Io` variant rather than a bespoke one.
         Err(ConversationError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            format!("could not mint a unique thread filename near {base}"),
+            format!("could not mint a unique session filename near {base}"),
         )))
     }
 
@@ -367,9 +367,9 @@ impl ConversationLog {
     /// line is a real corruption and surfaces as an error.
     pub fn resume(
         persistence: &crate::persistence::ConversationPersistence,
-        thread_id: &str,
+        session_id: &str,
     ) -> Result<Self, ConversationError> {
-        let path = persistence.thread_path(thread_id);
+        let path = persistence.session_path(session_id);
 
         let reader = BufReader::new(File::open(&path)?);
         let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
@@ -419,7 +419,7 @@ impl ConversationLog {
 
         Ok(Self {
             path,
-            thread_id: thread_id.to_string(),
+            session_id: session_id.to_string(),
             entries,
             order,
             next_counter,
@@ -429,9 +429,9 @@ impl ConversationLog {
         })
     }
 
-    /// The id under which this log is listed by `aj list-threads`.
-    pub fn thread_id(&self) -> &str {
-        &self.thread_id
+    /// The id under which this log is listed by `aj list-sessions`.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Append one entry to the log. Returns the new entry's id.
@@ -583,7 +583,7 @@ impl ConversationLog {
             cursor = entry.parent_id.clone();
         }
         out.reverse();
-        Conversation::from_entries(self.thread_id.clone(), out)
+        Conversation::from_entries(self.session_id.clone(), out)
     }
 
     /// Most-recently-appended entry matching `filter`, or `None` if none
@@ -631,8 +631,8 @@ impl ConversationLog {
             .collect()
     }
 
-    /// The persisted system prompt for this thread, if one was recorded
-    /// at thread creation. Resumed threads created before system-prompt
+    /// The persisted system prompt for this session, if one was recorded
+    /// at session creation. Resumed sessions created before system-prompt
     /// persistence was added will return `None`.
     pub fn system_prompt(&self) -> Option<&str> {
         self.system_prompt_entry().map(|e| match &e.entry {
@@ -651,7 +651,7 @@ impl ConversationLog {
 
     /// Record the assembled system prompt as the root [ThreadKind::Meta]
     /// entry of this log. May only be called on an empty log; once the
-    /// thread has any other entries the system prompt is fixed for its
+    /// session has any other entries the system prompt is fixed for its
     /// lifetime. Returns the id of the new entry.
     ///
     /// Disk semantics: the system prompt is a non-punctuation entry
@@ -744,7 +744,7 @@ impl<'a> ConversationView<'a> {
         };
         match &self.head {
             Some(head) => self.log.linearize(head, filter),
-            None => Conversation::from_entries(self.log.thread_id().to_string(), Vec::new()),
+            None => Conversation::from_entries(self.log.session_id().to_string(), Vec::new()),
         }
     }
 
@@ -780,7 +780,7 @@ mod tests {
     /// Allocate a unique scratch directory for one test's persistence
     /// state. Uses the process id, the test thread id, and a nanosecond
     /// timestamp so tests running concurrently never collide.
-    fn fresh_threads_dir() -> PathBuf {
+    fn fresh_sessions_dir() -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -833,7 +833,7 @@ mod tests {
         // The deferred-disk-write behaviour is exercised separately
         // by [`set_system_prompt_alone_does_not_create_file`] and
         // [`first_punctuation_append_flushes_buffered_system_prompt`].
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
@@ -857,15 +857,15 @@ mod tests {
     #[test]
     fn set_system_prompt_alone_does_not_create_file() {
         // A session that only sees a system-prompt append must leave
-        // no file in the threads directory — that's the property
+        // no file in the sessions directory — that's the property
         // that prevents accumulating empty sessions when the user
         // opens the TUI and quits before submitting anything.
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.clone());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string()).expect("set sp");
 
-        let path = persistence.thread_path(log.thread_id());
+        let path = persistence.session_path(log.session_id());
         assert!(
             !path.exists(),
             "system-prompt-only log must not materialise a file on disk; found {}",
@@ -880,15 +880,15 @@ mod tests {
         // on-disk order matches the in-memory `order` exactly. We
         // resume from disk and check both entries are present in the
         // right order.
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
 
-        let thread_id = {
+        let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("the prompt".to_string())
                 .expect("set sp");
 
-            let path = persistence.thread_path(log.thread_id());
+            let path = persistence.session_path(log.session_id());
             assert!(!path.exists(), "file must not exist before flush");
 
             {
@@ -898,10 +898,10 @@ mod tests {
             }
 
             assert!(path.exists(), "file must exist after first punctuation");
-            log.thread_id().to_string()
+            log.session_id().to_string()
         };
 
-        let resumed = ConversationLog::resume(&persistence, &thread_id).expect("resume");
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
         let entries = resumed.entries_in_order();
         assert_eq!(entries.len(), 2);
         assert!(matches!(
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn set_system_prompt_rejects_non_empty_log() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn first_user_message_anchors_to_system_prompt_root() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
@@ -953,7 +953,7 @@ mod tests {
 
     #[test]
     fn latest_leaf_user_skips_system_prompt() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn linearize_user_walks_past_system_prompt() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string()).expect("set sp");
@@ -995,10 +995,10 @@ mod tests {
 
     #[test]
     fn resume_preserves_system_prompt() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
 
-        let thread_id = {
+        let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("persisted prompt".to_string())
                 .expect("set sp");
@@ -1006,10 +1006,10 @@ mod tests {
                 let mut view = ConversationView::user(&mut log, None);
                 view.add_message(user_text("hi")).expect("user msg");
             }
-            log.thread_id().to_string()
+            log.session_id().to_string()
         };
 
-        let resumed = ConversationLog::resume(&persistence, &thread_id).expect("resume log");
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
         assert_eq!(resumed.system_prompt(), Some("persisted prompt"));
         assert!(resumed.system_prompt_id().is_some());
         assert!(resumed.latest_leaf(ThreadFilter::USER).is_some());
@@ -1020,7 +1020,7 @@ mod tests {
         // A subagent's first message attaches to the user-thread parent
         // it was spawned from; subagent linearization only collects
         // subagent entries.
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string()).expect("set sp");
@@ -1044,7 +1044,7 @@ mod tests {
     fn add_message_tool_result_round_trips_through_resume() {
         // ToolResult messages serialize with their structured details
         // preserved on disk and rehydrate equivalently on resume.
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("set sp");
@@ -1066,9 +1066,9 @@ mod tests {
                 .expect("tool result entry");
         }
 
-        let thread_id = log.thread_id().to_string();
+        let session_id = log.session_id().to_string();
         drop(log);
-        let resumed = ConversationLog::resume(&persistence, &thread_id).expect("resume log");
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
 
         let head = resumed
             .latest_leaf(ThreadFilter::USER)
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[test]
     fn assistant_and_tool_result_count_toward_messages() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");

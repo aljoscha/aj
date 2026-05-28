@@ -163,7 +163,7 @@ mod tests {
     use crate::log::{ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter};
     use crate::persistence::ConversationPersistence;
 
-    /// Set up a temp threads dir + a fresh log with a frozen system
+    /// Set up a temp sessions dir + a fresh log with a frozen system
     /// prompt root.
     fn fresh_log() -> (TempDir, Arc<TokioMutex<ConversationLog>>) {
         let dir = TempDir::new().expect("temp dir");

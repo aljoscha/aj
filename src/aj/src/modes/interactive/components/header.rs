@@ -1,9 +1,9 @@
 //! Header — top-of-screen status banner.
 //!
 //! Renders a single dim line at the top of the chat scrollback
-//! showing the current thread id and any one-shot resume notice
+//! showing the current session id and any one-shot resume notice
 //! ("Resuming conversation …"). Stateful only via
-//! [`Header::set_thread_id`] / [`Header::set_notice`] so the
+//! [`Header::set_session_id`] / [`Header::set_notice`] so the
 //! event pump can refresh it as the session evolves.
 //!
 //! The full header (model selector, cost summary,
@@ -22,12 +22,12 @@ use aj_tui::style;
 
 /// Thin wrapper around a single dim text row.
 pub struct Header {
-    /// Optional thread id rendered on the leading edge of the
-    /// header. Absent for fresh threads where the id hasn't been
+    /// Optional session id rendered on the leading edge of the
+    /// header. Absent for fresh sessions where the id hasn't been
     /// allocated yet (it is, in practice — but the `Option`
     /// shape lets us defer rendering until we know).
-    thread_id: Option<String>,
-    /// One-line notice rendered after the thread id. Used for the
+    session_id: Option<String>,
+    /// One-line notice rendered after the session id. Used for the
     /// `Resuming conversation …` banner. Cleared after the user
     /// dismisses or starts typing.
     notice: Option<String>,
@@ -35,19 +35,19 @@ pub struct Header {
 
 impl Header {
     /// Build an empty header. The component renders nothing until
-    /// at least one of [`Self::set_thread_id`] or
+    /// at least one of [`Self::set_session_id`] or
     /// [`Self::set_notice`] is called.
     pub fn new() -> Self {
         Self {
-            thread_id: None,
+            session_id: None,
             notice: None,
         }
     }
 
-    /// Replace the thread id. `None` removes it from the rendered
+    /// Replace the session id. `None` removes it from the rendered
     /// row.
-    pub fn set_thread_id(&mut self, id: Option<String>) {
-        self.thread_id = id;
+    pub fn set_session_id(&mut self, id: Option<String>) {
+        self.session_id = id;
     }
 
     /// Replace the one-line notice. `None` removes it.
@@ -67,8 +67,8 @@ impl Component for Header {
 
     fn render(&mut self, width: usize) -> Vec<String> {
         let mut parts = Vec::new();
-        if let Some(id) = &self.thread_id {
-            parts.push(format!("thread {id}"));
+        if let Some(id) = &self.session_id {
+            parts.push(format!("session {id}"));
         }
         if let Some(n) = &self.notice {
             parts.push(n.clone());
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn rendered_lines_never_exceed_width_for_any_width() {
         let mut h = Header::new();
-        h.set_thread_id(Some("2026-05-08-13-16-48-275".into()));
+        h.set_session_id(Some("2026-05-08-13-16-48-275".into()));
         h.set_notice(Some("Chat with AJ — Ctrl+C to quit".into()));
         // Sweep across the corner cases: zero, one (just the leading
         // indent), a width where the elision marker starts to bite,
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn populated_header_renders_banner_row_with_separator_and_a_trailing_blank() {
         let mut h = Header::new();
-        h.set_thread_id(Some("abc-123".into()));
+        h.set_session_id(Some("abc-123".into()));
         h.set_notice(Some("Resuming conversation".into()));
         let lines = h.render(80);
         // Banner row + trailing blank separator before the chat.
@@ -165,7 +165,7 @@ mod tests {
         // Strip ANSI for the assertion — the `dim` wrapper adds
         // SGR codes around the visible text.
         let visible = lines[0].replace("\x1b[2m", "").replace("\x1b[22m", "");
-        assert!(visible.contains("thread abc-123"));
+        assert!(visible.contains("session abc-123"));
         assert!(visible.contains("Resuming conversation"));
         assert!(visible.contains("·"));
     }

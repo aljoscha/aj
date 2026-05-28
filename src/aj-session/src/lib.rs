@@ -1,7 +1,7 @@
-//! On-disk thread state for `aj`.
+//! On-disk session state for `aj`.
 //!
 //! `aj-session` owns the persisted conversation log: an append-only
-//! JSONL file per thread, with framing for branches and sub-agents.
+//! JSONL file per session, with framing for branches and sub-agents.
 //! Two layers split the responsibility:
 //!
 //! - [`log`] owns the in-memory `ConversationLog`, its append API
@@ -9,9 +9,9 @@
 //!   (`ConversationEntry`, `ConversationEntryKind`). It also exposes
 //!   the read-only `Conversation` view used by the wire layer to
 //!   build inference requests.
-//! - [`persistence`] discovers existing thread files in a project
+//! - [`persistence`] discovers existing session files in a project
 //!   directory (`ConversationPersistence`) and surfaces metadata for
-//!   thread listing.
+//!   session listing.
 //! - [`replay`] projects a persisted log onto the typed
 //!   [`aj_agent::events::AgentEvent`] stream so frontends can drive
 //!   the same renderer pipeline for both live and resumed sessions.
@@ -29,6 +29,6 @@ pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     ConversationView, EntryId, ThreadFilter, ThreadKind,
 };
-pub use persistence::{ConversationPersistence, ThreadMetadata, ThreadPreview};
+pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;

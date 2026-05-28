@@ -2,7 +2,7 @@
 //!
 //! The `--print` / `--json` toggles select the non-interactive
 //! print mode (§4.2); otherwise the binary runs the interactive
-//! TUI. Subcommands (`list-threads`, `continue`, `update-models`)
+//! TUI. Subcommands (`list-sessions`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -67,7 +67,7 @@ pub struct Args {
     pub scripted: Option<String>,
 
     /// Subcommand selector for the non-conversational utilities
-    /// (`list-threads`, `continue`, `update-models`).
+    /// (`list-sessions`, `continue`, `update-models`).
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -89,22 +89,22 @@ pub enum PrintFormat {
 #[derive(Subcommand, Debug)]
 #[command(flatten_help = true)]
 pub enum Command {
-    /// List existing conversation threads for this project.
-    ListThreads,
-    /// Continue a conversation thread (latest if no id given).
+    /// List existing conversation sessions for this project.
+    ListSessions,
+    /// Continue a conversation session (latest if no id given).
     ///
-    /// Accepts an optional positional prompt after the thread id:
-    /// `aj continue ID prompt words...` resumes the thread
+    /// Accepts an optional positional prompt after the session id:
+    /// `aj continue ID prompt words...` resumes the session
     /// and (in `--print` mode) runs the supplied prompt as the
-    /// next turn. With no thread id, the latest thread for the
+    /// next turn. With no session id, the latest session for the
     /// current project is resumed; supplying a prompt without a
-    /// thread id is ambiguous, so callers wanting "latest +
-    /// prompt" should pass the thread id explicitly (e.g. via
-    /// `aj list-threads`).
+    /// session id is ambiguous, so callers wanting "latest +
+    /// prompt" should pass the session id explicitly (e.g. via
+    /// `aj list-sessions`).
     Continue {
         /// Conversation ID to continue. If absent, the latest
-        /// thread for this project is resumed.
-        thread_id: Option<String>,
+        /// session for this project is resumed.
+        session_id: Option<String>,
         /// Free-form prompt for the resumed run. Only consulted
         /// in `--print` mode today; interactive mode prompts for
         /// input from the editor regardless. Multiple positional

@@ -1,7 +1,7 @@
 //! Replay a persisted [`ConversationLog`](crate::log::ConversationLog)
 //! as an iterator of typed [`AgentEvent`]s.
 //!
-//! Resuming a thread should look the same to a frontend as a live
+//! Resuming a session should look the same to a frontend as a live
 //! run: the renderer consumes a single typed event stream regardless
 //! of whether the events came from a running agent or from a
 //! previously recorded log on disk. `replay` is the bridge between
@@ -179,7 +179,7 @@ impl ReplayState {
 
         // Synthesize the matching `TurnUsage`. Live runs emit one
         // per assistant turn on the bus; without this resumed
-        // threads would only paint the footer's context indicator
+        // sessions would only paint the footer's context indicator
         // (and any other usage listener) starting from the first
         // post-resume turn, even though every persisted assistant
         // message has its `usage` on disk. Ordering matches the
@@ -335,7 +335,7 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
-    fn fresh_threads_dir() -> PathBuf {
+    fn fresh_sessions_dir() -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -374,7 +374,7 @@ mod tests {
     /// Build a seeded log exercising assistant text, thinking, tool
     /// use, and tool result with structured details.
     fn seeded_log() -> (PathBuf, ConversationLog) {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.clone());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("system prompt");
@@ -494,7 +494,7 @@ mod tests {
     fn replay_skips_system_prompt_and_handles_empty_log() {
         // A log with only the system-prompt root produces zero
         // events: meta entries are structural framing.
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into())
@@ -512,7 +512,7 @@ mod tests {
         // event so resumed sessions render diffs / bash output /
         // todo snapshots / sub-agent reports the same way live
         // runs do.
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn replay_routes_subagent_entries_to_sub_agent_id() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
@@ -608,7 +608,7 @@ mod tests {
         // tool_call_id was never seen on a preceding assistant
         // message. Replay still emits a sensible event with the
         // fallback "tool" name and an empty args object.
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
@@ -668,7 +668,7 @@ mod tests {
     /// before adding into the accumulator).
     #[test]
     fn replay_synthesizes_turn_usage_per_assistant_message() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
@@ -740,7 +740,7 @@ mod tests {
     /// versa).
     #[test]
     fn replay_keeps_main_and_subagent_usage_accumulators_separate() {
-        let dir = fresh_threads_dir();
+        let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
 

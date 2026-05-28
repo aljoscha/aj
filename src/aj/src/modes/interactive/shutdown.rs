@@ -2,7 +2,7 @@
 //! resume hint.
 //!
 //! Prints a per-agent token-usage breakdown (main + each
-//! sub-agent + grand total) followed by a `Thread: <id> (resume
+//! sub-agent + grand total) followed by a `Session: <id> (resume
 //! with: aj continue <id>)` line so the user can pick the
 //! conversation back up later.
 //!
@@ -120,14 +120,14 @@ pub fn format_usage_summary(summary: &UsageSummary) -> String {
     out
 }
 
-/// Build the resume-hint line for the given thread id.
+/// Build the resume-hint line for the given session id.
 ///
 /// Exposed as a pure formatter so tests can lock the exact shape
 /// without spawning a TUI. The runtime helper
 /// [`print_resume_hint`] wraps this in an ANSI dim style and emits
 /// it to stdout.
-pub fn format_resume_hint(thread_id: &str) -> String {
-    format!("Thread: {thread_id} (resume with: aj continue {thread_id})")
+pub fn format_resume_hint(session_id: &str) -> String {
+    format!("Session: {session_id} (resume with: aj continue {session_id})")
 }
 
 /// Print the end-of-session usage summary to stdout, dimmed and
@@ -162,16 +162,16 @@ pub fn print_usage_summary(summary: &UsageSummary) {
 }
 
 /// Print the resume hint to stdout, dimmed and indented. Called
-/// only when the thread has at least one persisted user message
-/// (otherwise the hint points at an effectively-empty thread and
+/// only when the session has at least one persisted user message
+/// (otherwise the hint points at an effectively-empty session and
 /// isn't worth surfacing).
 ///
 /// Shares the one-column left indent and trailing blank rhythm of
 /// [`print_usage_summary`] so the two banners read as a single
 /// dim end-of-session block aligned with the chat scrollback above
 /// them.
-pub fn print_resume_hint(thread_id: &str) {
-    println!(" {}", style::dim(&format_resume_hint(thread_id)));
+pub fn print_resume_hint(session_id: &str) {
+    println!(" {}", style::dim(&format_resume_hint(session_id)));
     println!();
 }
 
@@ -299,8 +299,8 @@ mod tests {
     }
 
     #[test]
-    fn format_resume_hint_round_trips_thread_id() {
+    fn format_resume_hint_round_trips_session_id() {
         let hint = format_resume_hint("abc123");
-        assert_eq!(hint, "Thread: abc123 (resume with: aj continue abc123)");
+        assert_eq!(hint, "Session: abc123 (resume with: aj continue abc123)");
     }
 }

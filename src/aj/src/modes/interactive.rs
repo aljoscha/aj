@@ -85,7 +85,7 @@ use crate::modes::interactive::shutdown::{
 
 /// Driver for a single interactive session. Owns the
 /// [`aj_tui::tui::Tui`], the registered listeners on the agent's
-/// bus, and the [`aj_session::ConversationLog`] for this thread.
+/// bus, and the [`aj_session::ConversationLog`] for this session.
 pub struct InteractiveMode {
     args: Args,
 }
@@ -236,21 +236,21 @@ impl InteractiveMode {
         let model_catalog = load_model_catalog();
 
         // ---- Conversation log: resume or create -----------------------
-        let threads_dir = Config::get_threads_dir_path()?;
-        let conversation_persistence = ConversationPersistence::new(threads_dir);
+        let sessions_dir = Config::get_sessions_dir_path()?;
+        let conversation_persistence = ConversationPersistence::new(sessions_dir);
         let resuming = matches!(self.args.command, Some(Command::Continue { .. }));
         let mut log = match self.args.command {
             Some(Command::Continue {
-                thread_id: Some(id),
+                session_id: Some(id),
                 prompt: _,
             }) => ConversationLog::resume(&conversation_persistence, &id)?,
             Some(Command::Continue {
-                thread_id: None,
+                session_id: None,
                 prompt: _,
-            }) => match conversation_persistence.get_latest_thread_id()? {
+            }) => match conversation_persistence.get_latest_session_id()? {
                 Some(latest) => ConversationLog::resume(&conversation_persistence, &latest)?,
                 None => {
-                    eprintln!("No latest conversation to resume; starting a fresh thread.");
+                    eprintln!("No latest conversation to resume; starting a fresh session.");
                     ConversationLog::create(&conversation_persistence)?
                 }
             },
@@ -350,7 +350,7 @@ impl InteractiveMode {
         }
 
         // Bootstrap the editor's prompt-history ring from every
-        // `*.jsonl` file under the project's threads directory so
+        // `*.jsonl` file under the project's sessions directory so
         // pressing Up surfaces cross-session prompts the user has
         // ever submitted in this project. Live submissions update
         // the same ring through
@@ -388,11 +388,11 @@ impl InteractiveMode {
             }
         }
 
-        // Header: thread id + resume/start banner. Footer: model +
+        // Header: session id + resume/start banner. Footer: model +
         // working directory (initial snapshot; richer state lands
         // alongside `footer_data` in a follow-up).
         if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
-            header.set_thread_id(Some(log.thread_id().to_string()));
+            header.set_session_id(Some(log.session_id().to_string()));
             header.set_notice(Some(if resuming {
                 "Resuming conversation".to_string()
             } else {
@@ -439,7 +439,7 @@ impl InteractiveMode {
         // to where the user starts typing that they're hard to
         // miss, but out of the way of replayed history or the
         // header/footer status panes. Placed *after* replay so a
-        // resumed thread's historical content stays on top.
+        // resumed session's historical content stays on top.
         for d in &config_diagnostics {
             let text = d.to_string();
             let event = match d.severity() {
@@ -455,10 +455,10 @@ impl InteractiveMode {
 
         // ---- Wrap log + agent in shared handles -----------------------
         // After replay we hand the log to the persistence listener
-        // and to any future code path that wants to read the thread
+        // and to any future code path that wants to read the session
         // id back. Both `log` and `persistence_handle` are bound
         // mutably so the `/sessions` selector can swap them out for
-        // the resumed thread without restarting the binary.
+        // the resumed session without restarting the binary.
         // The agent goes behind a TokioMutex because the
         // submit-handler spawns a task that holds it across an
         // `agent.prompt(...).await`.
@@ -987,13 +987,13 @@ impl InteractiveMode {
         tui.stop();
 
         // End-of-session banner: token-usage breakdown plus a
-        // resume hint pointing at the active thread id. Printed
+        // resume hint pointing at the active session id. Printed
         // *after* [`Tui::stop`] so the bytes land in the user's
         // regular shell scrollback rather than the alternate-screen
         // TUI buffer that gets cleared on exit. Mirrors the legacy
         // `aj` binary's shutdown output (see
         // `aj/src/main.rs::display_usage_summary` + the
-        // `Thread:` notice it emits right after).
+        // `Session:` notice it emits right after).
         //
         // Reading the agent + log behind their `TokioMutex` is
         // safe here: the running task was aborted above, the
@@ -1006,24 +1006,24 @@ impl InteractiveMode {
         };
         print_usage_summary(&summary);
 
-        // Resume hint is gated on "the thread is worth resuming",
+        // Resume hint is gated on "the session is worth resuming",
         // i.e. it has at least one persisted user-thread leaf.
-        // Fresh threads where the user quit without typing
+        // Fresh sessions where the user quit without typing
         // anything don't get a hint — there's nothing meaningful
         // to come back to. The check covers both the "user
         // submitted at least one prompt this session" and "we
-        // resumed a thread that already had content" paths in one
+        // resumed a session that already had content" paths in one
         // shot since the persistence listener writes user
         // messages inline before the run returns.
-        let (resume_eligible, thread_id) = {
+        let (resume_eligible, session_id) = {
             let l = log.lock().await;
             (
                 l.latest_leaf(ThreadFilter::USER).is_some(),
-                l.thread_id().to_string(),
+                l.session_id().to_string(),
             )
         };
         if resume_eligible {
-            print_resume_hint(&thread_id);
+            print_resume_hint(&session_id);
         }
 
         run_result
@@ -1537,25 +1537,25 @@ async fn handle_slash_command(
             }
         }
         SlashAction::OpenSessionSelector => 'arm: {
-            // Read the current thread id so the overlay pre-selects
+            // Read the current session id so the overlay pre-selects
             // the active row.
-            let current_thread_id = {
+            let current_session_id = {
                 let l = log.lock().await;
-                l.thread_id().to_string()
+                l.session_id().to_string()
             };
 
             // Load previews synchronously. At our scale (a few
-            // hundred threads per project on a busy machine) this
+            // hundred sessions per project on a busy machine) this
             // is sub-second; if/when that stops being true we'll
             // move it onto `tokio::task::spawn_blocking` with the
-            // [`ConversationPersistence::list_thread_previews`]
+            // [`ConversationPersistence::list_session_previews`]
             // progress callback wired into a header indicator.
-            let previews = match conversation_persistence.list_thread_previews(|_, _| {}) {
+            let previews = match conversation_persistence.list_session_previews(|_, _| {}) {
                 Ok(p) => p,
                 Err(err) => {
                     break 'arm SlashHandled::Continue {
                         selector: None,
-                        notice: Some(format!("Failed to list threads: {err}")),
+                        notice: Some(format!("Failed to list sessions: {err}")),
                     };
                 }
             };
@@ -1563,7 +1563,7 @@ async fn handle_slash_command(
             if previews.is_empty() {
                 break 'arm SlashHandled::Continue {
                     selector: None,
-                    notice: Some("No threads to switch to in this project.".to_string()),
+                    notice: Some("No sessions to switch to in this project.".to_string()),
                 };
             }
 
@@ -1574,13 +1574,13 @@ async fn handle_slash_command(
             let inner = SessionSelectorComponent::new(
                 select_list_theme(theme),
                 previews,
-                Some(current_thread_id),
+                Some(current_session_id),
                 None,
                 session_max_rows,
             );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
-                "Resume thread",
+                "Resume session",
                 Box::new(inner),
                 crate::config::theme::overlay_window_theme(theme),
                 initial_inner_rows,
@@ -1599,16 +1599,16 @@ async fn handle_slash_command(
         }
         SlashAction::OpenPromptHistory => {
             // Current-workspace prompts are scanned eagerly (cheap:
-            // one project's thread files). The all-workspaces set is
+            // one project's session files). The all-workspaces set is
             // deferred to a loader the component invokes on first
             // scope toggle so opening the overlay stays fast.
             let workspace_entries = workspace_history(conversation_persistence);
             let all_loader = {
                 let persistence = conversation_persistence.clone();
-                Box::new(move || match Config::get_threads_base_dir_path() {
+                Box::new(move || match Config::get_sessions_base_dir_path() {
                     Ok(base) => all_workspaces_history(&base),
                     Err(err) => {
-                        tracing::debug!("could not resolve threads base dir: {err}");
+                        tracing::debug!("could not resolve sessions base dir: {err}");
                         // Fall back to the current workspace so the
                         // toggle still shows something.
                         workspace_history(&persistence)
@@ -1645,7 +1645,7 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::NewThread => match perform_new_thread(
+        SlashAction::NewSession => match perform_new_session(
             tui,
             Arc::clone(&agent),
             log,
@@ -1656,13 +1656,13 @@ async fn handle_slash_command(
         )
         .await
         {
-            Ok(thread_id) => SlashHandled::Continue {
+            Ok(session_id) => SlashHandled::Continue {
                 selector: None,
-                notice: Some(format!("Started a fresh thread ({thread_id}).")),
+                notice: Some(format!("Started a fresh session ({session_id}).")),
             },
             Err(err) => SlashHandled::Continue {
                 selector: None,
-                notice: Some(format!("Failed to start a fresh thread: {err}")),
+                notice: Some(format!("Failed to start a fresh session: {err}")),
             },
         },
         SlashAction::Help => {
@@ -1704,7 +1704,7 @@ async fn handle_slash_command(
     // sub-selector consume `parent_palette` (passing it onto the
     // new `OpenSelector`), in which case the resulting
     // `SlashHandled::Continue` carries one of those variants.
-    // For every other arm — `NewThread`, `Quit`, errors, etc. —
+    // For every other arm — `NewSession`, `Quit`, errors, etc. —
     // the palette would otherwise leak, so tear it down here.
     if let Some(palette) = parent_palette {
         let consumed = matches!(
@@ -1924,15 +1924,15 @@ async fn handle_selector_outcome(
                     // hide the user's scrollback).
                     let is_current = {
                         let l = log.lock().await;
-                        l.thread_id() == preview.thread_id
+                        l.session_id() == preview.session_id
                     };
                     if is_current {
                         return SelectorPollOutcome::Closed {
-                            notice: Some(format!("Already on thread {}.", preview.thread_id)),
+                            notice: Some(format!("Already on session {}.", preview.session_id)),
                             follow_up: None,
                         };
                     }
-                    match perform_thread_swap(
+                    match perform_session_swap(
                         tui,
                         Arc::clone(&agent),
                         log,
@@ -1940,18 +1940,18 @@ async fn handle_selector_outcome(
                         pump,
                         conversation_persistence,
                         theme,
-                        &preview.thread_id,
+                        &preview.session_id,
                     )
                     .await
                     {
                         Ok(()) => SelectorPollOutcome::Closed {
-                            notice: Some(format!("Switched to thread {}.", preview.thread_id)),
+                            notice: Some(format!("Switched to session {}.", preview.session_id)),
                             follow_up: None,
                         },
                         Err(err) => SelectorPollOutcome::Closed {
                             notice: Some(format!(
-                                "Failed to switch to thread {}: {err}",
-                                preview.thread_id
+                                "Failed to switch to session {}: {err}",
+                                preview.session_id
                             )),
                             follow_up: None,
                         },
@@ -2081,13 +2081,13 @@ async fn handle_selector_outcome(
     }
 }
 
-/// Swap the agent + log + persistence wiring over to the thread
-/// identified by `thread_id`.
+/// Swap the agent + log + persistence wiring over to the session
+/// identified by `session_id`.
 ///
 /// This is the in-process equivalent of `aj continue <id>`:
 /// the binary stays up and the user keeps their open editor, but
 /// the agent's transcript and the persistence target both rebind
-/// to the new thread file.
+/// to the new session file.
 ///
 /// Steps:
 /// 1. Resume the new [`ConversationLog`] from disk.
@@ -2096,7 +2096,7 @@ async fn handle_selector_outcome(
 /// 3. Build a fresh `Conversation` view from the repaired log and
 ///    seed it into the agent (`seed_messages`,
 ///    `seed_sub_agent_counter`).
-/// 4. Resolve a system prompt for the new thread: reuse the one
+/// 4. Resolve a system prompt for the new session: reuse the one
 ///    persisted at the log's root if present, otherwise assemble
 ///    fresh from the current environment and freeze it onto the
 ///    log so subsequent resumes hit the same cache.
@@ -2107,7 +2107,7 @@ async fn handle_selector_outcome(
 /// 6. Clear the chat container, build a fresh [`EventPump`], and
 ///    re-replay the new log through it so the user sees the
 ///    swapped transcript.
-/// 7. Refresh the header's thread-id line.
+/// 7. Refresh the header's session-id line.
 ///
 /// Returns `Err` if any of the file-level operations fail; in
 /// that case the agent's previous bindings are left intact (we
@@ -2115,7 +2115,7 @@ async fn handle_selector_outcome(
 /// log has been built and the seed/system-prompt steps have
 /// succeeded).
 #[allow(clippy::too_many_arguments)]
-async fn perform_thread_swap(
+async fn perform_session_swap(
     tui: &mut Tui,
     agent: Arc<TokioMutex<Agent>>,
     log: &mut Arc<TokioMutex<ConversationLog>>,
@@ -2123,11 +2123,11 @@ async fn perform_thread_swap(
     pump: &mut EventPump,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
-    thread_id: &str,
+    session_id: &str,
 ) -> Result<()> {
     // 1. Resume the new log from disk.
-    let mut new_log = ConversationLog::resume(conversation_persistence, thread_id)
-        .with_context(|| format!("failed to resume thread {thread_id}"))?;
+    let mut new_log = ConversationLog::resume(conversation_persistence, session_id)
+        .with_context(|| format!("failed to resume session {session_id}"))?;
 
     // 2. Repair any interrupted tool uses so the resumed
     //    transcript ends on a user-role message — same dance the
@@ -2150,7 +2150,7 @@ async fn perform_thread_swap(
     };
     let max_agent_id = new_log.max_agent_id();
 
-    // 4. Resolve the system prompt for the new thread. If the
+    // 4. Resolve the system prompt for the new session. If the
     //    log already carries one (persisted at the root entry),
     //    reuse it verbatim to keep the model's prompt-cache warm.
     //    Otherwise assemble fresh from the agent's env and
@@ -2215,7 +2215,7 @@ async fn perform_thread_swap(
         context_window,
     );
     // Seed the footer indicator before replay so the row shows
-    // `?/<window>` even for resumed threads where replay produces
+    // `?/<window>` even for resumed sessions where replay produces
     // no `TurnUsage` events (e.g. a log with only a user prompt).
     pump.sync_footer(tui);
     {
@@ -2225,10 +2225,10 @@ async fn perform_thread_swap(
         }
     }
 
-    // 7. Refresh the header so the new thread id is visible in
+    // 7. Refresh the header so the new session id is visible in
     //    the top bar without waiting for the next turn boundary.
     if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
-        header.set_thread_id(Some(thread_id.to_string()));
+        header.set_session_id(Some(session_id.to_string()));
         header.set_notice(Some("Resumed conversation".to_string()));
     }
 
@@ -2236,18 +2236,18 @@ async fn perform_thread_swap(
     Ok(())
 }
 
-/// Start a fresh thread.
+/// Start a fresh session.
 ///
-/// Symmetric to [`perform_thread_swap`] but creates instead of
+/// Symmetric to [`perform_session_swap`] but creates instead of
 /// resuming: mint a new [`ConversationLog`], freeze a fresh
 /// system prompt onto it, swap it into the shared `log` slot,
 /// rebind the persistence subscription, clear the chat, and
-/// refresh the header. The previous thread is preserved on disk
+/// refresh the header. The previous session is preserved on disk
 /// untouched.
 ///
-/// Returns the new thread id on success so the caller can surface
+/// Returns the new session id on success so the caller can surface
 /// it in a status notice.
-async fn perform_new_thread(
+async fn perform_new_session(
     tui: &mut Tui,
     agent: Arc<TokioMutex<Agent>>,
     log: &mut Arc<TokioMutex<ConversationLog>>,
@@ -2259,7 +2259,7 @@ async fn perform_new_thread(
     // 1. Mint a new log on disk.
     let mut new_log = ConversationLog::create(conversation_persistence)
         .context("failed to create a fresh conversation log")?;
-    let new_thread_id = new_log.thread_id().to_string();
+    let new_session_id = new_log.session_id().to_string();
 
     // 2. Assemble a system prompt from the agent's env and freeze
     //    it onto the new log so a future resume picks it up.
@@ -2269,7 +2269,7 @@ async fn perform_new_thread(
     };
     new_log
         .set_system_prompt(prompt.clone())
-        .context("failed to persist system prompt on new thread")?;
+        .context("failed to persist system prompt on new session")?;
 
     // 3. Reset the agent's in-memory state: empty transcript, the
     //    freshly-assembled system prompt, sub-agent counter back
@@ -2282,7 +2282,7 @@ async fn perform_new_thread(
     }
 
     // 4. Swap the shared log and persistence handle. Same ordering
-    //    rule as [`perform_thread_swap`]: build the new subscription
+    //    rule as [`perform_session_swap`]: build the new subscription
     //    before dropping the old one so a stray bus event can't
     //    arrive without a listener. The editor's `disable_submit`
     //    flag means we can't be mid-turn here, but the ordering
@@ -2297,7 +2297,7 @@ async fn perform_new_thread(
 
     // 5. Clear the chat container and rebuild the event pump so any
     //    in-flight assistant/tool-execution components don't leak
-    //    into the fresh thread. Carry `hide_thinking_block` across
+    //    into the fresh session. Carry `hide_thinking_block` across
     //    so a prior `aj.thinking.toggle` toggle stays in effect.
     if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
         chat.clear();
@@ -2313,18 +2313,18 @@ async fn perform_new_thread(
         context_window,
     );
     // Seed the footer indicator so the row shows `?/<window>`
-    // on the fresh thread before the first turn lands.
+    // on the fresh session before the first turn lands.
     pump.sync_footer(tui);
 
-    // 6. Refresh the header with the new thread id and a friendly
+    // 6. Refresh the header with the new session id and a friendly
     //    notice so the user sees the swap in the top bar.
     if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
-        header.set_thread_id(Some(new_thread_id.clone()));
-        header.set_notice(Some("Fresh thread".to_string()));
+        header.set_session_id(Some(new_session_id.clone()));
+        header.set_notice(Some("Fresh session".to_string()));
     }
 
     tui.request_render();
-    Ok(new_thread_id)
+    Ok(new_session_id)
 }
 
 #[cfg(test)]

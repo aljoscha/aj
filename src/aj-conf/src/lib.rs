@@ -783,7 +783,7 @@ impl Config {
     ///
     /// Truly fatal conditions (no `$HOME`, can't `mkdir ~/.aj`)
     /// degrade gracefully to defaults + no diagnostics — other code
-    /// paths that actually need those directories (threads, dotenv)
+    /// paths that actually need those directories (sessions, dotenv)
     /// will surface their own errors.
     pub fn load() -> (Self, Vec<ConfigDiagnostic>) {
         let Ok(config_dir) = Self::get_config_dir() else {
@@ -829,44 +829,51 @@ impl Config {
         Ok(aj_dir.join(".env"))
     }
 
-    /// Get the threads directory path for the current project. The threads are
-    /// stored in subdirectories based on the git root directory. For example,
-    /// if the git root is /Users/user/Dev/project, the subdirectory name will
-    /// be "Dev-project".
-    pub fn get_threads_dir_path() -> Result<PathBuf, ConfigError> {
+    /// Get the sessions directory path for the current project. The sessions
+    /// are stored in subdirectories based on the git root directory. For
+    /// example, if the git root is /Users/user/Dev/project, the subdirectory
+    /// name will be "Dev-project".
+    ///
+    /// The on-disk directory is still literally named `threads` (rather than
+    /// `sessions`) so existing conversation history isn't orphaned; only the
+    /// in-code concept is now "session".
+    pub fn get_sessions_dir_path() -> Result<PathBuf, ConfigError> {
         let aj_dir = Self::get_config_dir()?;
-        let threads_base_dir = aj_dir.join("threads");
+        let sessions_base_dir = aj_dir.join("threads");
 
         // Find the git root directory.
         let working_directory = env::current_dir().map_err(ConfigError::Io)?;
         if let Some(git_root) = find_git_root(&working_directory) {
             // Convert the git root path to a directory name.
             let project_dir_name = path_to_dir_name(&git_root);
-            let project_threads_dir = threads_base_dir.join(project_dir_name);
+            let project_sessions_dir = sessions_base_dir.join(project_dir_name);
 
             // Create the directory if it doesn't exist.
-            if !project_threads_dir.exists() {
-                fs::create_dir_all(&project_threads_dir)?;
+            if !project_sessions_dir.exists() {
+                fs::create_dir_all(&project_sessions_dir)?;
             }
 
-            Ok(project_threads_dir)
+            Ok(project_sessions_dir)
         } else {
             // Fallback to a default directory if no git root is found.
-            let default_threads_dir = threads_base_dir.join("default");
-            if !default_threads_dir.exists() {
-                fs::create_dir_all(&default_threads_dir)?;
+            let default_sessions_dir = sessions_base_dir.join("default");
+            if !default_sessions_dir.exists() {
+                fs::create_dir_all(&default_sessions_dir)?;
             }
-            Ok(default_threads_dir)
+            Ok(default_sessions_dir)
         }
     }
 
-    /// Path to the base directory holding every project's threads
+    /// Path to the base directory holding every project's sessions
     /// subdirectory: `~/.aj/threads`. Each immediate subdirectory is
     /// one project (named via [`path_to_dir_name`]); the prompt-history
     /// "all workspaces" search walks these. Unlike
-    /// [`Self::get_threads_dir_path`] this does not create or descend
+    /// [`Self::get_sessions_dir_path`] this does not create or descend
     /// into a per-project directory \u2014 it just resolves the base path.
-    pub fn get_threads_base_dir_path() -> Result<PathBuf, ConfigError> {
+    ///
+    /// The on-disk directory is still literally named `threads` for
+    /// backward compatibility; only the in-code concept is now "session".
+    pub fn get_sessions_base_dir_path() -> Result<PathBuf, ConfigError> {
         Ok(Self::get_config_dir()?.join("threads"))
     }
 }

@@ -26,11 +26,11 @@
 //!
 //! Print mode opens (or for `continue`, resumes) a [`ConversationLog`]
 //! the same way interactive mode does, so a `aj --print "do X"`
-//! invocation leaves a resumable thread on disk.
+//! invocation leaves a resumable session on disk.
 //!
 //! With `aj continue --print "Q"` (optionally specifying a
-//! thread id), the resume flow does the same disk handshake as the
-//! interactive resume: open the thread, reuse the persisted system
+//! session id), the resume flow does the same disk handshake as the
+//! interactive resume: open the session, reuse the persisted system
 //! prompt, repair any interrupted tool calls, then seed the agent's
 //! in-memory transcript from the linearized user thread. In JSON
 //! output mode the persisted history is streamed through the JSONL
@@ -82,7 +82,7 @@ use crate::model::ResolvedModel;
 /// streamed every live event already (JSON mode).
 ///
 /// When invoked under the `continue` subcommand, the run resumes
-/// the requested thread (or "latest for this project") rather than
+/// the requested session (or "latest for this project") rather than
 /// creating a fresh log. On resume the persisted system prompt is
 /// reused, any dangling tool_use ids are repaired via
 /// [`repair_interrupted_tool_uses`], the agent's transcript is
@@ -93,16 +93,16 @@ use crate::model::ResolvedModel;
 pub async fn run(args: Args) -> Result<()> {
     // Validate dispatch shape early so the user sees a clear error
     // instead of a confusing failure later. `Continue` resolves to
-    // either a specific thread id or "latest for this project";
-    // `None` (the default) means "create a fresh thread".
+    // either a specific session id or "latest for this project";
+    // `None` (the default) means "create a fresh session".
     //
-    // `list-threads` and `update-models` are dispatched in `main.rs`
+    // `list-sessions` and `update-models` are dispatched in `main.rs`
     // before any session setup; reaching them here would mean
     // the dispatcher routed incorrectly.
     let resume_request: Option<Option<String>> = match &args.command {
         None => None,
-        Some(Command::Continue { thread_id, .. }) => Some(thread_id.clone()),
-        Some(Command::ListThreads) | Some(Command::UpdateModels) => {
+        Some(Command::Continue { session_id, .. }) => Some(session_id.clone()),
+        Some(Command::ListSessions) | Some(Command::UpdateModels) => {
             bail!("aj --print does not accept this subcommand");
         }
     };
@@ -203,22 +203,22 @@ pub async fn run(args: Args) -> Result<()> {
     agent.set_block_images(config.image_block);
 
     // Resolve the [`ConversationLog`] for this run: resume an
-    // existing thread (by explicit id or latest-for-project) or
+    // existing session (by explicit id or latest-for-project) or
     // create a fresh one. The log stays unwrapped until after we
     // mutate it (system-prompt freeze, repair walk); it moves
     // behind an `Arc<TokioMutex<_>>` once the persistence listener
     // takes a stake in it.
-    let threads_dir = Config::get_threads_dir_path()?;
-    let conversation_persistence = ConversationPersistence::new(threads_dir);
+    let sessions_dir = Config::get_sessions_dir_path()?;
+    let conversation_persistence = ConversationPersistence::new(sessions_dir);
     let mut log = match &resume_request {
         Some(Some(id)) => ConversationLog::resume(&conversation_persistence, id)
-            .with_context(|| format!("failed to resume thread {id}"))?,
-        Some(None) => match conversation_persistence.get_latest_thread_id()? {
+            .with_context(|| format!("failed to resume session {id}"))?,
+        Some(None) => match conversation_persistence.get_latest_session_id()? {
             Some(latest) => ConversationLog::resume(&conversation_persistence, &latest)
-                .with_context(|| format!("failed to resume latest thread {latest}"))?,
+                .with_context(|| format!("failed to resume latest session {latest}"))?,
             None => bail!(
-                "no conversation threads to resume; invoke `aj --print \"...\"` \
-                 without `continue` to start a fresh thread"
+                "no conversation sessions to resume; invoke `aj --print \"...\"` \
+                 without `continue` to start a fresh session"
             ),
         },
         None => ConversationLog::create(&conversation_persistence)?,
@@ -227,8 +227,8 @@ pub async fn run(args: Args) -> Result<()> {
     // Resolve the system prompt: reuse a persisted one on resume
     // (cache-warm — the model has the same bytes from the previous
     // run), or assemble fresh from the env and freeze it as the
-    // log's root entry on a brand-new thread. Mirrors the
-    // interactive resume path exactly so a thread looks identical
+    // log's root entry on a brand-new session. Mirrors the
+    // interactive resume path exactly so a session looks identical
     // on disk whether it was bootstrapped through `--print` or the
     // TUI.
     let system_prompt = if let Some(persisted) = log.system_prompt() {
@@ -380,7 +380,7 @@ pub async fn run(args: Args) -> Result<()> {
 /// Prompt text can come from two places depending on the dispatch
 /// shape: the top-level positional `args.prompt` (for the
 /// no-subcommand path: `aj --print "hello"`), or the
-/// `Continue.prompt` positional that lives after the thread id
+/// `Continue.prompt` positional that lives after the session id
 /// (for the resume path: `aj --print continue ID "hello"`).
 /// Clap's greedy positional consumption keeps these disjoint —
 /// once the parser sees the `continue` subcommand it routes
@@ -501,12 +501,12 @@ mod tests {
     fn collect_prompt_text_pulls_from_continue_subcommand_prompt() {
         // Top-level `args.prompt` is empty here because clap routed
         // the positionals after `continue` into the subcommand's
-        // own slots: the first into `thread_id`, the rest into
+        // own slots: the first into `session_id`, the rest into
         // `prompt`.
-        let args = parse(&["--print", "continue", "thread-abc", "hello", "world"]);
+        let args = parse(&["--print", "continue", "session-abc", "hello", "world"]);
         match &args.command {
-            Some(Command::Continue { thread_id, prompt }) => {
-                assert_eq!(thread_id.as_deref(), Some("thread-abc"));
+            Some(Command::Continue { session_id, prompt }) => {
+                assert_eq!(session_id.as_deref(), Some("session-abc"));
                 assert_eq!(prompt, &vec!["hello".to_string(), "world".to_string()]);
             }
             other => panic!("expected Continue command, got {other:?}"),
@@ -519,10 +519,10 @@ mod tests {
 
     #[test]
     fn collect_prompt_text_errors_when_continue_has_no_prompt() {
-        // `continue` with only a thread id and no trailing prompt
+        // `continue` with only a session id and no trailing prompt
         // positionals: print mode still requires a prompt, so this
         // is an error rather than a silent no-op.
-        let args = parse(&["--print", "continue", "thread-abc"]);
+        let args = parse(&["--print", "continue", "session-abc"]);
         let err = collect_prompt_text(&args).expect_err("empty continue prompt should error");
         assert!(
             err.to_string().contains("requires a prompt argument"),
@@ -531,19 +531,19 @@ mod tests {
     }
 
     #[test]
-    fn collect_prompt_text_treats_lone_continue_positional_as_thread_id() {
+    fn collect_prompt_text_treats_lone_continue_positional_as_session_id() {
         // `aj --print continue hello` is ambiguous between
-        // "resume thread `hello`" and "resume latest, run prompt
+        // "resume session `hello`" and "resume latest, run prompt
         // `hello`". Clap's greedy positional consumption picks the
         // first interpretation (single `Option<String>` slot fills
         // first), and `collect_prompt_text` falls back to the
         // top-level `args.prompt` (empty) so the "requires a prompt"
         // error fires. Users who want "latest + prompt" supply
-        // the thread id explicitly.
+        // the session id explicitly.
         let args = parse(&["--print", "continue", "hello"]);
         match &args.command {
-            Some(Command::Continue { thread_id, prompt }) => {
-                assert_eq!(thread_id.as_deref(), Some("hello"));
+            Some(Command::Continue { session_id, prompt }) => {
+                assert_eq!(session_id.as_deref(), Some("hello"));
                 assert!(prompt.is_empty());
             }
             other => panic!("expected Continue command, got {other:?}"),

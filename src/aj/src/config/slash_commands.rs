@@ -84,14 +84,14 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         name: "sessions",
         title: "switch",
         category: "session",
-        description: "Resume a different conversation thread.",
+        description: "Resume a different conversation session.",
         action_id: None,
     },
     BuiltinCommand {
         name: "new",
         title: "new",
         category: "session",
-        description: "Start a fresh thread (kept on disk).",
+        description: "Start a fresh session (kept on disk).",
         action_id: None,
     },
     BuiltinCommand {
@@ -157,17 +157,17 @@ pub enum SlashAction {
     /// pre-selected; `Esc` cancels, `Enter` applies.
     OpenModelSelector,
     /// Open the session selector overlay. The currently-active
-    /// thread is pre-selected; `Enter` swaps the agent over to the
-    /// chosen thread, `Esc` cancels.
+    /// session is pre-selected; `Enter` swaps the agent over to the
+    /// chosen session, `Esc` cancels.
     OpenSessionSelector,
     /// Open the prompt-history search overlay. `Enter` recalls the
     /// chosen prompt into the editor; `Esc` cancels.
     OpenPromptHistory,
-    /// Start a fresh thread. The current thread is preserved on
+    /// Start a fresh session. The current session is preserved on
     /// disk; the host creates a new [`ConversationLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the
     /// scrollback.
-    NewThread,
+    NewSession,
     /// Show the slash-command reference. The host opens the help
     /// overlay listing every entry in [`BUILTIN_COMMANDS`].
     Help,
@@ -209,7 +209,7 @@ pub fn dispatch(input: &str) -> SlashAction {
         "sessions" => SlashAction::OpenSessionSelector,
         "history" => SlashAction::OpenPromptHistory,
         "palette" => SlashAction::OpenCommandPalette,
-        "new" => SlashAction::NewThread,
+        "new" => SlashAction::NewSession,
         "help" => SlashAction::Help,
         "quit" => SlashAction::Quit,
         _ => SlashAction::Unknown {
@@ -316,12 +316,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_new_returns_new_thread_action() {
-        assert_eq!(dispatch("/new"), SlashAction::NewThread);
+    fn dispatch_new_returns_new_session_action() {
+        assert_eq!(dispatch("/new"), SlashAction::NewSession);
         // Trailing whitespace and arguments are ignored — `/new`
         // takes no arguments and any trailing tokens are dropped.
-        assert_eq!(dispatch("  /new  "), SlashAction::NewThread);
-        assert_eq!(dispatch("/new extra"), SlashAction::NewThread);
+        assert_eq!(dispatch("  /new  "), SlashAction::NewSession);
+        assert_eq!(dispatch("/new extra"), SlashAction::NewSession);
     }
 
     #[test]

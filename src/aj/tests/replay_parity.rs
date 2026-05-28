@@ -206,7 +206,7 @@ fn build_tui_and_pump() -> (Tui, EventPump) {
 /// The chat container is the rendering target this test compares;
 /// other slots (header, status, editor, footer) contain
 /// session-metadata text that would diverge for reasons unrelated
-/// to tool rendering (thread id timestamps, the loader's
+/// to tool rendering (session id timestamps, the loader's
 /// running-vs-idle state at the moment of capture, etc.).
 fn render_chat(tui: &mut Tui) -> Vec<String> {
     let chat = tui
@@ -232,10 +232,10 @@ fn kill_switch_listener() -> Listener {
 }
 
 /// Drive a one-tool-call turn live against `tool`. Returns the
-/// log's thread id (for resuming) and the full event sequence the
+/// log's session id (for resuming) and the full event sequence the
 /// live renderer would have seen up to the simulated kill point.
 async fn drive_live_turn(
-    threads_dir: &Path,
+    sessions_dir: &Path,
     working_dir: &Path,
     tool: ErasedToolDefinition,
     tool_use_id: &str,
@@ -245,11 +245,11 @@ async fn drive_live_turn(
 ) -> (String, Vec<AgentEvent>) {
     // Persistence first so the file holds every event the kill
     // switch is about to abort on.
-    let persistence = ConversationPersistence::new(threads_dir.to_path_buf());
+    let persistence = ConversationPersistence::new(sessions_dir.to_path_buf());
     let mut log = ConversationLog::create(&persistence).expect("create log");
     log.set_system_prompt("test prompt".to_string())
         .expect("frozen system prompt");
-    let thread_id = log.thread_id().to_string();
+    let session_id = log.session_id().to_string();
     let log_handle = Arc::new(TokioMutex::new(log));
 
     let message = one_tool_use_message(tool_use_id, tool_name, tool_input);
@@ -311,7 +311,7 @@ async fn drive_live_turn(
         .lock()
         .expect("captured events mutex poisoned")
         .clone();
-    (thread_id, events)
+    (session_id, events)
 }
 
 /// Drive the captured `events` through a fresh event pump and
@@ -326,9 +326,9 @@ fn render_live(events: &[AgentEvent]) -> Vec<String> {
 
 /// Replay the on-disk log into a fresh event pump and return the
 /// chat container's rendered lines.
-fn render_replay(threads_dir: &Path, thread_id: &str) -> Vec<String> {
-    let persistence = ConversationPersistence::new(threads_dir.to_path_buf());
-    let log = ConversationLog::resume(&persistence, thread_id).expect("resume log");
+fn render_replay(sessions_dir: &Path, session_id: &str) -> Vec<String> {
+    let persistence = ConversationPersistence::new(sessions_dir.to_path_buf());
+    let log = ConversationLog::resume(&persistence, session_id).expect("resume log");
     let (mut tui, mut pump) = build_tui_and_pump();
     for event in replay(&log) {
         pump.handle(&mut tui, &event);
@@ -367,11 +367,11 @@ async fn assert_live_matches_replay(
     tool_input: serde_json::Value,
     prompt: &str,
 ) {
-    let threads_dir = TempDir::new().expect("threads tempdir");
+    let sessions_dir = TempDir::new().expect("sessions tempdir");
     let working_dir = TempDir::new().expect("working tempdir");
 
-    let (thread_id, live_events) = drive_live_turn(
-        threads_dir.path(),
+    let (session_id, live_events) = drive_live_turn(
+        sessions_dir.path(),
         working_dir.path(),
         tool,
         tool_use_id,
@@ -382,7 +382,7 @@ async fn assert_live_matches_replay(
     .await;
 
     let live = render_live(&live_events);
-    let replay_lines = render_replay(threads_dir.path(), &thread_id);
+    let replay_lines = render_replay(sessions_dir.path(), &session_id);
 
     assert!(
         live == replay_lines,
@@ -423,7 +423,7 @@ async fn replay_renders_edit_file_tool_identically_to_live() {
     // and feed its absolute path to the model. The resulting
     // `ToolDetails::Diff { before, after, path }` payload exercises
     // the unified-diff rendering path.
-    let threads_dir = TempDir::new().expect("threads tempdir");
+    let sessions_dir = TempDir::new().expect("sessions tempdir");
     let working_dir = TempDir::new().expect("working tempdir");
     let sample_path = working_dir.path().join("sample.txt");
     std::fs::write(&sample_path, "hello world\n").expect("seed sample.txt");
@@ -434,8 +434,8 @@ async fn replay_renders_edit_file_tool_identically_to_live() {
         "new_string": "goodbye",
     });
 
-    let (thread_id, live_events) = drive_live_turn(
-        threads_dir.path(),
+    let (session_id, live_events) = drive_live_turn(
+        sessions_dir.path(),
         working_dir.path(),
         EditFileTool.into(),
         "tu-edit",
@@ -446,7 +446,7 @@ async fn replay_renders_edit_file_tool_identically_to_live() {
     .await;
 
     let live = render_live(&live_events);
-    let replay_lines = render_replay(threads_dir.path(), &thread_id);
+    let replay_lines = render_replay(sessions_dir.path(), &session_id);
     assert!(
         live == replay_lines,
         "{}",

@@ -11,7 +11,7 @@
 //!
 //! | Slot | Content |
 //! |---|---|
-//! | `Header` | one-line dim banner with thread id + transient notices |
+//! | `Header` | one-line dim banner with session id + transient notices |
 //! | `Chat` | `Container` with assistant / user / tool components, in turn order |
 //! | `Status` | `Container` holding the [`super::components::loader_status::LoaderStatus`] (idle = empty) |
 //! | `Editor` | the prompt editor (focused) |

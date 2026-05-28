@@ -7,7 +7,7 @@
 //!
 //! Today this module owns the [`PromptHistory`] type, which
 //! bootstraps an in-memory prompt history from the project's JSONL
-//! thread logs and installs it into a freshly-built editor. Live
+//! session logs and installs it into a freshly-built editor. Live
 //! submissions are recorded by the host's submit handler via
 //! [`aj_tui::components::editor::Editor::add_to_history`] directly,
 //! so no separate "record" path lives here.
@@ -29,7 +29,7 @@ use aj_tui::components::editor::Editor;
 /// keep only the most recent entries automatically.
 pub const DEFAULT_MAX_ENTRIES: usize = 200;
 
-/// In-memory prompt history extracted from on-disk thread logs.
+/// In-memory prompt history extracted from on-disk session logs.
 ///
 /// Newest entry is at the back of the queue. [`install`] pushes
 /// entries into an [`Editor`] in oldest-first order so that pressing
@@ -49,7 +49,7 @@ pub const DEFAULT_MAX_ENTRIES: usize = 200;
 ///
 /// The conversation log we already maintain is JSONL: every line
 /// is independently parseable, arbitrary bytes round-trip via
-/// `serde_json` escaping, and each thread file is owned by exactly
+/// `serde_json` escaping, and each session file is owned by exactly
 /// one running process. It is therefore the natural source of truth
 /// for "prompts the user has ever submitted in this project".
 ///
@@ -69,7 +69,7 @@ impl PromptHistory {
         }
     }
 
-    /// Walk every `*.jsonl` file in the project's threads directory,
+    /// Walk every `*.jsonl` file in the project's sessions directory,
     /// extract user-text prompts in chronological order, and load
     /// them into a fresh [`PromptHistory`].
     ///
@@ -88,7 +88,7 @@ impl PromptHistory {
     ///   nothing.
     pub fn bootstrap(persistence: &ConversationPersistence, max: usize) -> Self {
         let mut history = Self::new(max);
-        let dir = persistence.threads_dir();
+        let dir = persistence.sessions_dir();
 
         if !dir.exists() {
             return history;
@@ -97,7 +97,7 @@ impl PromptHistory {
         let read_dir = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(e) => {
-                tracing::debug!("could not read threads dir {}: {e}", dir.display());
+                tracing::debug!("could not read sessions dir {}: {e}", dir.display());
                 return history;
             }
         };
@@ -124,7 +124,7 @@ impl PromptHistory {
         let file = match File::open(path) {
             Ok(f) => f,
             Err(e) => {
-                tracing::debug!("skipping unreadable thread file {}: {e}", path.display());
+                tracing::debug!("skipping unreadable session file {}: {e}", path.display());
                 return;
             }
         };

@@ -3,13 +3,13 @@
 //! Pairs a [`aj_tui::components::text_input::TextInput`] for live
 //! fuzzy filtering with a [`aj_tui::components::select_list::SelectList`]
 //! that shows the matching entries from a snapshotted list of
-//! [`aj_session::ThreadPreview`]s. The host opens this overlay from
-//! `/sessions`; `Enter` commits the highlighted thread, `Esc`
+//! [`aj_session::SessionPreview`]s. The host opens this overlay from
+//! `/sessions`; `Enter` commits the highlighted session, `Esc`
 //! cancels.
 //!
 //! The component owns the catalog and rebuilds the inner
 //! [`SelectList`] on every text change via a reusable
-//! [`aj_tui::fuzzy::FuzzyMatcher`]. The currently-active thread is
+//! [`aj_tui::fuzzy::FuzzyMatcher`]. The currently-active session is
 //! pre-selected on open and tagged `(current)` so a no-op confirm is
 //! visually obvious — the user can verify "yes, I'm staying on this
 //! one" without scanning the file id.
@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use aj_session::ThreadPreview;
+use aj_session::SessionPreview;
 use aj_tui::component::Component;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
 use aj_tui::components::text_input::TextInput;
@@ -37,14 +37,14 @@ const PREVIEW_MAX_CHARS: usize = 60;
 
 /// Outcome of a single overlay session.
 ///
-/// `Confirmed(preview)` carries the chosen [`ThreadPreview`]
+/// `Confirmed(preview)` carries the chosen [`SessionPreview`]
 /// (cloned so the host can open the matching log without
 /// borrowing the catalog); `Cancelled` is the user pressing `Esc`.
 /// The host treats both as "close the overlay"; only the former
-/// triggers the swap-thread flow.
+/// triggers the swap-session flow.
 #[derive(Debug, Clone)]
 pub enum SessionSelectorOutcome {
-    Confirmed(ThreadPreview),
+    Confirmed(SessionPreview),
     Cancelled,
 }
 
@@ -70,11 +70,11 @@ pub struct SessionSelectorComponent {
     /// Full unfiltered catalog. The component clones the entry it
     /// emits on confirm; keeping the source of truth here avoids
     /// any chance of drift between filter and confirm.
-    catalog: Vec<ThreadPreview>,
-    /// Thread id of the agent's currently-active log. Used to
+    catalog: Vec<SessionPreview>,
+    /// Session id of the agent's currently-active log. Used to
     /// pre-select that row on open and mark it `(current)` so a
     /// no-op confirm is obvious.
-    current_thread_id: Option<String>,
+    current_session_id: Option<String>,
     /// Shared outcome slot. The host clones this handle once at
     /// construction and polls it after every input event.
     outcome: OutcomeHandle,
@@ -103,9 +103,9 @@ impl SessionSelectorComponent {
     ///
     /// `catalog` is the snapshotted preview list (must already be
     /// sorted in the order the user should see when the query is
-    /// empty; [`aj_session::ConversationPersistence::list_thread_previews`]
-    /// returns latest-first already). `current_thread_id` is the
-    /// agent's active thread — used to pre-select the matching row
+    /// empty; [`aj_session::ConversationPersistence::list_session_previews`]
+    /// returns latest-first already). `current_session_id` is the
+    /// agent's active session — used to pre-select the matching row
     /// and mark it `(current)`. `initial_query`, when set, pre-fills
     /// the search box so the overlay opens already filtered; the
     /// slash layer passes `None`, but the parameter is kept as a
@@ -114,8 +114,8 @@ impl SessionSelectorComponent {
     /// the list shows at once.
     pub fn new(
         theme: SelectListTheme,
-        catalog: Vec<ThreadPreview>,
-        current_thread_id: Option<String>,
+        catalog: Vec<SessionPreview>,
+        current_session_id: Option<String>,
         initial_query: Option<String>,
         max_visible_rows: usize,
     ) -> Self {
@@ -139,7 +139,7 @@ impl SessionSelectorComponent {
             search,
             list,
             catalog,
-            current_thread_id,
+            current_session_id,
             outcome,
             theme,
             matcher: FuzzyMatcher::new(),
@@ -163,7 +163,7 @@ impl SessionSelectorComponent {
     /// Score policy: empty query returns the full catalog in its
     /// supplied order (the loader already sorts latest-first); a
     /// non-empty query fuzzy-scores against the preview's
-    /// searchable blob (first user message + thread id) and sorts
+    /// searchable blob (first user message + session id) and sorts
     /// highest-score-first with catalog-order tiebreak.
     fn rebuild_list(&mut self) {
         let query = self.search.value().trim().to_string();
@@ -187,15 +187,15 @@ impl SessionSelectorComponent {
             .map(|(row, (idx, _))| {
                 let info = &self.catalog[*idx];
                 let is_current = self
-                    .current_thread_id
+                    .current_session_id
                     .as_ref()
-                    .is_some_and(|tid| tid == &info.thread_id);
+                    .is_some_and(|tid| tid == &info.session_id);
                 if is_current {
                     selected_index = row;
                 }
                 let primary = format_primary(info, is_current);
                 let secondary = format_secondary(info, self.now);
-                SelectItem::new(&info.thread_id, &primary).with_description(&secondary)
+                SelectItem::new(&info.session_id, &primary).with_description(&secondary)
             })
             .collect();
 
@@ -211,8 +211,8 @@ impl SessionSelectorComponent {
     }
 
     /// Commit the currently-highlighted list entry into the outcome
-    /// slot. Looks the entry up in `catalog` by its `thread_id` to
-    /// recover the full [`ThreadPreview`].
+    /// slot. Looks the entry up in `catalog` by its `session_id` to
+    /// recover the full [`SessionPreview`].
     fn commit_selection(&self) {
         let Some(item) = self.list.selected_item().cloned() else {
             return;
@@ -220,7 +220,7 @@ impl SessionSelectorComponent {
         let Some(info) = self
             .catalog
             .iter()
-            .find(|p| p.thread_id == item.value)
+            .find(|p| p.session_id == item.value)
             .cloned()
         else {
             return;
@@ -237,11 +237,11 @@ impl SessionSelectorComponent {
 }
 
 /// Searchable text for `preview`. Joins the first user message
-/// (when present) and the thread id so typing either a substring
+/// (when present) and the session id so typing either a substring
 /// of the prompt or part of the timestamp finds the row.
-fn haystack_for(preview: &ThreadPreview) -> String {
+fn haystack_for(preview: &SessionPreview) -> String {
     let first = preview.first_user_message.as_deref().unwrap_or("");
-    format!("{} {}", first, preview.thread_id)
+    format!("{} {}", first, preview.session_id)
 }
 
 /// Build the layout used for the inner [`SelectList`].
@@ -262,10 +262,10 @@ fn primary_column_layout() -> SelectListLayout {
 }
 
 /// Build the primary (left) column for one row. The first user
-/// message is the most recognisable handle; thread id falls back
+/// message is the most recognisable handle; session id falls back
 /// when none is captured. Truncated to keep long pastes from
 /// blowing past the overlay width.
-fn format_primary(preview: &ThreadPreview, is_current: bool) -> String {
+fn format_primary(preview: &SessionPreview, is_current: bool) -> String {
     let raw = preview
         .first_user_message
         .as_deref()
@@ -280,9 +280,9 @@ fn format_primary(preview: &ThreadPreview, is_current: bool) -> String {
 }
 
 /// Build the secondary (right / description) column for one row.
-/// Carries thread metadata as a triplet: message count, creation
+/// Carries session metadata as a triplet: message count, creation
 /// date (adaptive absolute), and time since the last message
-/// (coarse buckets relative to `now`). The thread id itself is
+/// (coarse buckets relative to `now`). The session id itself is
 /// omitted — it's already the row's unique value and would
 /// dominate the column width without adding much.
 ///
@@ -291,7 +291,7 @@ fn format_primary(preview: &ThreadPreview, is_current: bool) -> String {
 /// If a too-narrow terminal can't fit the full triplet,
 /// [`SelectList`]'s existing description-end truncation kicks in
 /// — we don't build a custom collapse strategy.
-fn format_secondary(preview: &ThreadPreview, now: DateTime<Utc>) -> String {
+fn format_secondary(preview: &SessionPreview, now: DateTime<Utc>) -> String {
     let count = preview.message_count;
     let msg_word = if count == 1 { "msg" } else { "msgs" };
     let created = format_created(now, preview.created_at);
@@ -337,7 +337,7 @@ fn format_age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
 /// - **Same calendar day** as `now`: clock-only (`14:22`). The
 ///   surrounding `last <age>` field already captures recency
 ///   coarsely, so the absolute clock time is the value-add for
-///   threads created earlier today.
+///   sessions created earlier today.
 /// - **Same calendar year** as `now`: month + day (`May 8`). Year
 ///   is implied; trimming it keeps the description tight.
 /// - **Older**: month + day + year (`May 8 2024`). The year
@@ -346,7 +346,7 @@ fn format_age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
 /// Both arguments are UTC `DateTime`s; the comparison is therefore
 /// UTC-local rather than wall-clock-local. That's a deliberate
 /// trade-off: the rest of the selector renders ages in UTC too
-/// (the `thread_id` mint format is `%Y-%m-%d-%H-%M-%S-%3f` UTC),
+/// (the `session_id` mint format is `%Y-%m-%d-%H-%M-%S-%3f` UTC),
 /// and switching one cell to wall-clock would make the row
 /// internally inconsistent. A future per-user locale toggle could
 /// flip everything together.
@@ -480,11 +480,11 @@ mod tests {
     }
 
     fn make_preview(
-        thread_id: &str,
+        session_id: &str,
         first_user: Option<&str>,
         message_count: usize,
         age: Duration,
-    ) -> ThreadPreview {
+    ) -> SessionPreview {
         let now = Utc::now();
         // Default test policy: `last_message_at` mirrors `age` (the
         // recency we care about), `created_at` is treated as roughly
@@ -492,8 +492,8 @@ mod tests {
         // distinction and the few that do override both fields
         // directly after constructing the preview.
         let last = now - age;
-        ThreadPreview {
-            thread_id: thread_id.to_string(),
+        SessionPreview {
+            session_id: session_id.to_string(),
             modified: last,
             created_at: last,
             last_message_at: last,
@@ -503,7 +503,7 @@ mod tests {
         }
     }
 
-    fn sample_catalog() -> Vec<ThreadPreview> {
+    fn sample_catalog() -> Vec<SessionPreview> {
         vec![
             make_preview(
                 "2025-05-10",
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn highlights_current_thread_on_open() {
+    fn highlights_current_session_on_open() {
         let catalog = sample_catalog();
         let mut sel = SessionSelectorComponent::new(
             identity_theme(),
@@ -573,7 +573,7 @@ mod tests {
         let result = outcome.lock().unwrap().take().expect("outcome was set");
         match result {
             SessionSelectorOutcome::Confirmed(p) => {
-                assert_eq!(p.thread_id, "2025-05-10");
+                assert_eq!(p.session_id, "2025-05-10");
             }
             other => panic!("expected Confirmed, got {other:?}"),
         }
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn down_arrow_moves_to_next_row_then_enter_confirms_it() {
         let catalog = sample_catalog();
-        // No current thread → first row pre-selected.
+        // No current session → first row pre-selected.
         let mut sel = SessionSelectorComponent::new(
             identity_theme(),
             catalog,
@@ -616,7 +616,7 @@ mod tests {
         match result {
             SessionSelectorOutcome::Confirmed(p) => {
                 // First row is 2025-05-10, second is 2025-05-09.
-                assert_eq!(p.thread_id, "2025-05-09");
+                assert_eq!(p.session_id, "2025-05-09");
             }
             other => panic!("expected Confirmed, got {other:?}"),
         }
@@ -645,7 +645,7 @@ mod tests {
         let result = outcome.lock().unwrap().take().expect("outcome was set");
         match result {
             SessionSelectorOutcome::Confirmed(p) => {
-                assert_eq!(p.thread_id, "2025-05-09");
+                assert_eq!(p.session_id, "2025-05-09");
             }
             other => panic!("expected Confirmed, got {other:?}"),
         }
@@ -682,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_with_no_user_message_shows_placeholder_in_primary() {
+    fn session_with_no_user_message_shows_placeholder_in_primary() {
         let catalog = vec![make_preview("2025-05-11", None, 0, Duration::seconds(10))];
         let mut sel = SessionSelectorComponent::new(
             identity_theme(),
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn format_created_uses_year_for_older_threads() {
+    fn format_created_uses_year_for_older_sessions() {
         // Different calendar year → `Mon D YYYY`.
         let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
             .unwrap()
@@ -781,8 +781,8 @@ mod tests {
             .and_hms_opt(20, 0, 0)
             .unwrap()
             .and_utc();
-        let p = ThreadPreview {
-            thread_id: "2025-05-11-13-22-00-000".to_string(),
+        let p = SessionPreview {
+            session_id: "2025-05-11-13-22-00-000".to_string(),
             // `last_message_at` and `created_at` separated by hours
             // so the rendered fields are visually distinct.
             modified: now - Duration::hours(2),
@@ -808,8 +808,8 @@ mod tests {
             .and_hms_opt(20, 0, 0)
             .unwrap()
             .and_utc();
-        let p = ThreadPreview {
-            thread_id: "2025-05-11-13-22-00-000".into(),
+        let p = SessionPreview {
+            session_id: "2025-05-11-13-22-00-000".into(),
             modified: now,
             created_at: chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
                 .unwrap()
@@ -835,8 +835,8 @@ mod tests {
             .and_hms_opt(20, 0, 0)
             .unwrap()
             .and_utc();
-        let p = ThreadPreview {
-            thread_id: "2025-05-11-13-22-00-000".into(),
+        let p = SessionPreview {
+            session_id: "2025-05-11-13-22-00-000".into(),
             // File was touched seconds ago (e.g. a vacuum / rename
             // / fsync), but the last actual message landed 3h ago.
             modified: now - Duration::seconds(5),
@@ -858,16 +858,16 @@ mod tests {
     }
 
     #[test]
-    fn pre_selected_current_thread_stays_visible_at_max_visible_rows_bump() {
-        // With a generous row cap, a catalog of 12 threads and the
-        // current thread in the middle of the list should produce a
+    fn pre_selected_current_session_stays_visible_at_max_visible_rows_bump() {
+        // With a generous row cap, a catalog of 12 sessions and the
+        // current session in the middle of the list should produce a
         // render that still includes the `(current)` marker — i.e.
         // no off-screen scrolling required.
         let mut catalog = Vec::new();
         for i in 0i64..12 {
             catalog.push(make_preview(
                 &format!("2025-05-{:02}", 11 - i),
-                Some(&format!("thread {i}")),
+                Some(&format!("session {i}")),
                 // Test-only count: small numeric, so a lossless
                 // cast through a typed temporary keeps the strict
                 // `clippy::as-conversions` lint satisfied.
@@ -877,7 +877,7 @@ mod tests {
         }
         // Pick the middle row as current. The pre-selection should
         // land in the visible window without any scroll.
-        let current = catalog[6].thread_id.clone();
+        let current = catalog[6].session_id.clone();
         let mut sel = SessionSelectorComponent::new(
             identity_theme(),
             catalog,
@@ -888,7 +888,7 @@ mod tests {
         // Render wide so column truncation can't strip "(current)".
         let body = sel.render(200).join("\n");
         assert!(
-            body.contains("thread 6 (current)"),
+            body.contains("session 6 (current)"),
             "expected the current row to be visible: {body}"
         );
     }
