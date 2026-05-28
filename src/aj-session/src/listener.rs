@@ -167,7 +167,7 @@ mod tests {
     /// prompt root.
     fn fresh_log() -> (TempDir, Arc<TokioMutex<ConversationLog>>) {
         let dir = TempDir::new().expect("temp dir");
-        let persistence = ConversationPersistence::new(dir.path().join("threads"));
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("test system prompt".to_string())
             .expect("set system prompt");

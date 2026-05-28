@@ -11,7 +11,7 @@
 //! - **This workspace** (the default): prompts from the current
 //!   project's sessions directory.
 //! - **All workspaces**: prompts from every project under
-//!   `~/.aj/threads`, each tagged with its project label.
+//!   `~/.aj/sessions`, each tagged with its project label.
 //!
 //! The all-workspaces set is loaded lazily on first toggle via the
 //! `all_loader` closure so opening the overlay stays cheap when the
@@ -54,7 +54,7 @@ const PROJECT_LABEL_MAX: usize = 18;
 pub struct PromptHistoryEntry {
     /// The full prompt text. Recalled verbatim into the editor.
     pub text: String,
-    /// Project label (the `~/.aj/threads` subdirectory name). `None`
+    /// Project label (the `~/.aj/sessions` subdirectory name). `None`
     /// for the current-workspace scope, where the project is implicit.
     pub project: Option<String>,
 }
@@ -361,7 +361,7 @@ pub fn workspace_history(persistence: &ConversationPersistence) -> Vec<PromptHis
 }
 
 /// Collect submitted prompts across every project under
-/// `sessions_base` (`~/.aj/threads`), deduplicated, each entry tagged
+/// `sessions_base` (`~/.aj/sessions`), deduplicated, each entry tagged
 /// with its project (subdirectory) label.
 ///
 /// Projects are visited in reverse-lexicographic directory order and

@@ -833,13 +833,9 @@ impl Config {
     /// are stored in subdirectories based on the git root directory. For
     /// example, if the git root is /Users/user/Dev/project, the subdirectory
     /// name will be "Dev-project".
-    ///
-    /// The on-disk directory is still literally named `threads` (rather than
-    /// `sessions`) so existing conversation history isn't orphaned; only the
-    /// in-code concept is now "session".
     pub fn get_sessions_dir_path() -> Result<PathBuf, ConfigError> {
         let aj_dir = Self::get_config_dir()?;
-        let sessions_base_dir = aj_dir.join("threads");
+        let sessions_base_dir = aj_dir.join("sessions");
 
         // Find the git root directory.
         let working_directory = env::current_dir().map_err(ConfigError::Io)?;
@@ -865,16 +861,13 @@ impl Config {
     }
 
     /// Path to the base directory holding every project's sessions
-    /// subdirectory: `~/.aj/threads`. Each immediate subdirectory is
+    /// subdirectory: `~/.aj/sessions`. Each immediate subdirectory is
     /// one project (named via [`path_to_dir_name`]); the prompt-history
     /// "all workspaces" search walks these. Unlike
     /// [`Self::get_sessions_dir_path`] this does not create or descend
     /// into a per-project directory \u2014 it just resolves the base path.
-    ///
-    /// The on-disk directory is still literally named `threads` for
-    /// backward compatibility; only the in-code concept is now "session".
     pub fn get_sessions_base_dir_path() -> Result<PathBuf, ConfigError> {
-        Ok(Self::get_config_dir()?.join("threads"))
+        Ok(Self::get_config_dir()?.join("sessions"))
     }
 }
 
