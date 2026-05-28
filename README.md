@@ -38,7 +38,7 @@ Non-conversational subcommands short-circuit before mode dispatch:
 $ aj list-threads               # threads for the current project
 $ aj continue                   # resume the most recent thread
 $ aj continue <thread-id>       # resume a specific thread
-$ aj models update              # refresh ~/.aj/models.json from models.dev
+$ aj update-models              # refresh ~/.aj/models.json from models.dev
 ```
 
 Inside the TUI, slash commands open inline selectors:
@@ -60,7 +60,7 @@ Persistent state lives under `~/.aj/`:
 - `config.toml` — defaults (model, thinking level, speed, theme, disabled
   tools). CLI flags and env vars override.
 - `models.json` — model catalog consumed by the `/model` selector.
-  Refreshed by `aj models update`.
+  Refreshed by `aj update-models`.
 - `themes/<name>.json` — optional user-supplied themes layered on top of
   the bundled `dark` / `light` palettes. The active theme hot-reloads on
   file changes.

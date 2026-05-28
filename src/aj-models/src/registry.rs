@@ -302,7 +302,7 @@ impl ModelRegistry {
         let age_days = age_ms / (1000 * 60 * 60 * 24);
         if age_days > STALENESS_THRESHOLD_DAYS {
             tracing::warn!(
-                "model catalog ({}) is {} days old; run `aj models update` to refresh",
+                "model catalog ({}) is {} days old; run `aj update-models` to refresh",
                 self.source_label,
                 age_days
             );

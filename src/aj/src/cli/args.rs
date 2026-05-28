@@ -2,7 +2,7 @@
 //!
 //! The `--print` / `--json` toggles select the non-interactive
 //! print mode (§4.2); otherwise the binary runs the interactive
-//! TUI. Subcommands (`list-threads`, `continue`, `models`)
+//! TUI. Subcommands (`list-threads`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -67,7 +67,7 @@ pub struct Args {
     pub scripted: Option<String>,
 
     /// Subcommand selector for the non-conversational utilities
-    /// (`list-threads`, `continue`, `models`).
+    /// (`list-threads`, `continue`, `update-models`).
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -112,18 +112,7 @@ pub enum Command {
         /// expanded by [`crate::cli::file_args`].
         prompt: Vec<String>,
     },
-    /// Manage the bundled model catalog at `~/.aj/models.json`.
-    Models {
-        #[command(subcommand)]
-        command: ModelsCommand,
-    },
-}
-
-/// `aj models <subcommand>` dispatch.
-#[derive(Subcommand, Debug)]
-#[command(flatten_help = true)]
-pub enum ModelsCommand {
     /// Refresh the user model catalog at `~/.aj/models.json` from
     /// `https://models.dev/api.json`.
-    Update,
+    UpdateModels,
 }

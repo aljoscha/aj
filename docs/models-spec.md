@@ -687,7 +687,7 @@ generated Rust. Two sources feed the registry, in priority order:
 
 1. **User cache** (`~/.aj/models.json`): if present and parseable,
    this is the authoritative catalog for the current run. Populated
-   by `aj models update` (§3.4.5).
+   by `aj update-models` (§3.4.5).
 2. **Bundled seed** (`src/aj-models/data/models.json`, included via
    `include_str!`): compile-time fallback. Always present; guarantees
    the registry loads on first run, offline, or when models.dev is
@@ -746,7 +746,7 @@ committing). It drives the staleness warning in §3.4.6.
 
 #### 3.4.2 Fetching from models.dev
 
-`aj models update` fetches `https://models.dev/api.json` natively
+`aj update-models` fetches `https://models.dev/api.json` natively
 (reqwest + serde — no Python dependency), filters to tool-calling
 models on `anthropic` + `openai` providers, maps fields per the
 table below, fills provider-specific fixed values (§3.4.3), applies
@@ -832,7 +832,7 @@ so our authored corrections survive refreshes.
 #### 3.4.5 Refresh CLI
 
 ```
-aj models update
+aj update-models
 ```
 
 Fetches models.dev, applies overrides, writes `~/.aj/models.json`.
@@ -844,7 +844,7 @@ leave the existing cache intact.
 
 On registry load, if the active catalog's `updated_at` is more than
 90 days old, the registry logs a one-line warning recommending
-`aj models update`. The 90-day threshold is a compromise — pricing
+`aj update-models`. The 90-day threshold is a compromise — pricing
 changes on the order of months, new models ship every few weeks; a
 tighter threshold would warn too often on stable catalogs. Tunable.
 

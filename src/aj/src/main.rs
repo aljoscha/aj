@@ -3,10 +3,10 @@
 //! Loads `~/.aj/.env`, parses CLI args (see
 //! [`aj::cli::args::Args`]), and dispatches to either
 //! [`aj::modes::print`] or [`aj::modes::interactive`].
-//! Subcommands (`list-threads`, `continue`, `models update`)
+//! Subcommands (`list-threads`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
-use aj::cli::args::{Args, Command, ModelsCommand};
+use aj::cli::args::{Args, Command};
 use aj::modes::{interactive::InteractiveMode, print};
 use aj_conf::Config;
 use aj_session::ConversationPersistence;
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Some(Command::Models { command }) => handle_models_command(command).await,
+        Some(Command::UpdateModels) => handle_update_models_command().await,
         Some(Command::ListThreads) => handle_list_threads(),
         Some(Command::Continue {
             thread_id: _,
@@ -90,24 +90,17 @@ fn handle_list_threads() -> Result<()> {
     Ok(())
 }
 
-/// `aj models <subcommand>`: catalog-management utilities.
-///
-/// Today only `update` is wired, which refreshes the on-disk model
-/// catalog at `~/.aj/models.json` from `models.dev`. The
-/// `/model` selector overlay reads that catalog at startup, so
-/// running this command is how users surface freshly-released
-/// models to the picker without restarting from a different
-/// catalog source.
+/// `aj update-models`: refresh the on-disk model catalog at
+/// `~/.aj/models.json` from `models.dev`. The `/model` selector
+/// overlay reads that catalog at startup, so running this command
+/// is how users surface freshly-released models to the picker
+/// without restarting from a different catalog source.
 ///
 /// The output is a one-line summary (added / removed /
 /// price-changes counts plus total + destination path) suitable
 /// for scripting.
-async fn handle_models_command(command: ModelsCommand) -> Result<()> {
-    match command {
-        ModelsCommand::Update => {
-            let summary = aj_models::refresh::refresh_user_cache().await?;
-            println!("{}", summary.one_line());
-            Ok(())
-        }
-    }
+async fn handle_update_models_command() -> Result<()> {
+    let summary = aj_models::refresh::refresh_user_cache().await?;
+    println!("{}", summary.one_line());
+    Ok(())
 }

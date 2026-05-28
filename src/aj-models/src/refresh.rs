@@ -1,6 +1,6 @@
 //! Catalog refresh: fetch models.dev, normalize, write the user cache.
 //!
-//! Implements the `aj models update` flow described in
+//! Implements the `aj update-models` flow described in
 //! `docs/models-spec.md` §3.4.2 and §3.4.5: pull
 //! `https://models.dev/api.json`, filter to tool-capable Anthropic and
 //! OpenAI models, fill provider-specific fixed values, apply the bundled

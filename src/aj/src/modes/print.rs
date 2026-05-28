@@ -96,13 +96,13 @@ pub async fn run(args: Args) -> Result<()> {
     // either a specific thread id or "latest for this project";
     // `None` (the default) means "create a fresh thread".
     //
-    // `list-threads` and `models` are dispatched in `main.rs`
+    // `list-threads` and `update-models` are dispatched in `main.rs`
     // before any session setup; reaching them here would mean
     // the dispatcher routed incorrectly.
     let resume_request: Option<Option<String>> = match &args.command {
         None => None,
         Some(Command::Continue { thread_id, .. }) => Some(thread_id.clone()),
-        Some(Command::ListThreads) | Some(Command::Models { .. }) => {
+        Some(Command::ListThreads) | Some(Command::UpdateModels) => {
             bail!("aj --print does not accept this subcommand");
         }
     };
