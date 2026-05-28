@@ -1,5 +1,5 @@
 {
-  "updated_at": 1778168672877,
+  "updated_at": 1779957987957,
   "source": "models.dev",
   "models": [
     {
@@ -399,6 +399,28 @@
       "max_tokens": 128000
     },
     {
+      "id": "claude-opus-4-8",
+      "name": "Claude Opus 4.8",
+      "api": "anthropic-messages",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "reasoning": true,
+      "supports_xhigh": false,
+      "supports_adaptive_thinking": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25
+      },
+      "context_window": 1000000,
+      "max_tokens": 128000
+    },
+    {
       "id": "claude-sonnet-4-0",
       "name": "Claude Sonnet 4 (latest)",
       "api": "anthropic-messages",
@@ -611,7 +633,7 @@
       "cost": {
         "input": 0.1,
         "output": 0.4,
-        "cache_read": 0.03,
+        "cache_read": 0.025,
         "cache_write": 0.0
       },
       "context_window": 1047576,
@@ -721,7 +743,7 @@
       "cost": {
         "input": 0.15,
         "output": 0.6,
-        "cache_read": 0.08,
+        "cache_read": 0.075,
         "cache_write": 0.0
       },
       "context_window": 128000,
@@ -853,7 +875,7 @@
       "cost": {
         "input": 1.25,
         "output": 10.0,
-        "cache_read": 0.13,
+        "cache_read": 0.125,
         "cache_write": 0.0
       },
       "context_window": 400000,
@@ -1380,7 +1402,7 @@
       "cost": {
         "input": 1.1,
         "output": 4.4,
-        "cache_read": 0.28,
+        "cache_read": 0.275,
         "cache_write": 0.0
       },
       "context_window": 200000,
