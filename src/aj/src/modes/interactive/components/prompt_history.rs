@@ -331,6 +331,16 @@ impl Component for PromptHistorySearchComponent {
         self.list.set_focused(focused);
     }
 
+    fn set_available_height(&mut self, rows: usize) {
+        // Chrome above the list: search input + scope line + blank
+        // separator + the list's scroll-info line.
+        self.max_visible_rows = rows.saturating_sub(4).max(1);
+        // The list is rebuilt with `max_visible_rows` on scope toggle
+        // (see `toggle_scope`), so the new budget flows through there
+        // too; this keeps the current list in sync without a rebuild.
+        self.list.set_max_visible(self.max_visible_rows);
+    }
+
     fn is_focused(&self) -> bool {
         self.search.is_focused()
     }

@@ -10,6 +10,7 @@ use crate::ansi::{truncate_to_width, visible_width};
 use crate::component::Component;
 use crate::impl_component_any;
 use crate::keys::InputEvent;
+use crate::tui::RenderHandle;
 
 /// A titled, bordered overlay container. Wraps any child component
 /// with a rounded box border and delegates input/focus to the child.
@@ -23,6 +24,12 @@ use crate::keys::InputEvent;
 /// command palette narrowing its filtered list as the user types).
 /// Total rendered height is always `inner_rows + 4`:
 /// `top_border + top_padding + inner_rows + bottom_padding + bottom_border`.
+///
+/// `inner_rows` is either fixed at construction or recomputed each frame
+/// from the live terminal height (see [`InnerHeight`]); either way the
+/// child is told the resolved height via
+/// [`Component::set_available_height`] before it renders, then its
+/// output is padded/truncated to match.
 pub struct OverlayWindow {
     title: String,
     /// Optional bottom-border subtitle (e.g. a key-hint). Right-aligned
@@ -30,7 +37,21 @@ pub struct OverlayWindow {
     subtitle: Option<String>,
     child: Box<dyn Component>,
     theme: OverlayWindowTheme,
-    inner_rows: usize,
+    height: InnerHeight,
+}
+
+/// How the [`OverlayWindow`]'s inner content height is determined.
+enum InnerHeight {
+    /// Constant row budget set at construction.
+    Fixed(usize),
+    /// Recomputed each frame as `policy(handle.terminal_rows())`, so the
+    /// box tracks terminal resizes. The window stays policy-agnostic:
+    /// the height rule (percentages, clamps, chrome accounting) lives
+    /// entirely in the injected closure.
+    Dynamic {
+        handle: RenderHandle,
+        policy: Box<dyn Fn(usize) -> usize>,
+    },
 }
 
 /// Theme closures for the overlay frame. Assembled by the agent layer
@@ -66,7 +87,31 @@ impl OverlayWindow {
             subtitle: None,
             child,
             theme,
-            inner_rows,
+            height: InnerHeight::Fixed(inner_rows),
+        }
+    }
+
+    /// Switch the inner-row budget to dynamic mode: each frame the
+    /// budget is `policy(handle.terminal_rows())`, so the box grows and
+    /// shrinks with the terminal. The window applies the policy verbatim
+    /// — clamps and chrome accounting belong in the caller's closure.
+    pub fn with_dynamic_height(
+        mut self,
+        handle: RenderHandle,
+        policy: impl Fn(usize) -> usize + 'static,
+    ) -> Self {
+        self.height = InnerHeight::Dynamic {
+            handle,
+            policy: Box::new(policy),
+        };
+        self
+    }
+
+    /// Resolve this frame's inner-row budget from the current height mode.
+    fn inner_rows(&self) -> usize {
+        match &self.height {
+            InnerHeight::Fixed(n) => *n,
+            InnerHeight::Dynamic { handle, policy } => policy(usize::from(handle.terminal_rows())),
         }
     }
 
@@ -185,24 +230,28 @@ impl Component for OverlayWindow {
             return vec!["".to_string()];
         }
         let inner_width = width - 4;
+        let inner_rows = self.inner_rows();
+        // Push the resolved budget down before rendering so the child can
+        // size its scroll regions to match.
+        self.child.set_available_height(inner_rows);
         let mut child_lines = self.child.render(inner_width);
 
         // Stabilize child output to exactly `inner_rows` rows: pad
         // short children with blanks; clip oversized children (callers
         // should tune `max_visible` so this branch is dead).
-        if child_lines.len() > self.inner_rows {
-            child_lines.truncate(self.inner_rows);
+        if child_lines.len() > inner_rows {
+            child_lines.truncate(inner_rows);
         }
 
         let blank = " ".repeat(inner_width);
-        let mut out = Vec::with_capacity(self.inner_rows + 4);
+        let mut out = Vec::with_capacity(inner_rows + 4);
         out.push(self.render_top(width));
         out.push(self.wrap_inner(&blank, inner_width));
         let rendered = child_lines.len();
         for line in &child_lines {
             out.push(self.wrap_inner(line, inner_width));
         }
-        for _ in rendered..self.inner_rows {
+        for _ in rendered..inner_rows {
             out.push(self.wrap_inner(&blank, inner_width));
         }
         out.push(self.wrap_inner(&blank, inner_width));
@@ -251,6 +300,7 @@ mod tests {
         input_count: usize,
         focused: bool,
         last_width: usize,
+        last_available_height: Option<usize>,
     }
 
     impl MockChild {
@@ -260,6 +310,7 @@ mod tests {
                 input_count: 0,
                 focused: false,
                 last_width: 0,
+                last_available_height: None,
             }
         }
     }
@@ -272,6 +323,9 @@ mod tests {
         fn handle_input(&mut self, _event: &InputEvent) -> bool {
             self.input_count += 1;
             true
+        }
+        fn set_available_height(&mut self, rows: usize) {
+            self.last_available_height = Some(rows);
         }
         fn set_focused(&mut self, focused: bool) {
             self.focused = focused;
@@ -386,5 +440,58 @@ mod tests {
         assert!(bottom.starts_with('╰'), "bottom: {bottom:?}");
         assert!(bottom.ends_with('╯'), "bottom: {bottom:?}");
         assert_eq!(visible_width(bottom), 40);
+    }
+
+    #[test]
+    fn available_height_is_forwarded_to_child_before_render() {
+        let child = Box::new(MockChild::new(vec!["x"]));
+        let mut ov = OverlayWindow::new("T", child, identity_theme(), 7);
+        ov.render(40);
+        let mc = ov
+            .child
+            .as_any()
+            .downcast_ref::<MockChild>()
+            .expect("downcast");
+        assert_eq!(mc.last_available_height, Some(7));
+    }
+
+    #[test]
+    fn dynamic_height_tracks_terminal_rows() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU16, Ordering};
+
+        use crate::tui::RenderHandle;
+
+        // Policy: inner_rows = term_rows / 2. Drive `term_rows` via the
+        // shared atomic the handle reads, re-render, and assert both the
+        // total box height and the value pushed to the child track it.
+        let rows = Arc::new(AtomicU16::new(20));
+        let handle = RenderHandle::detached_with_shared_rows(Arc::clone(&rows));
+        let child = Box::new(MockChild::new(vec!["a"]));
+        let mut ov = OverlayWindow::new("T", child, identity_theme(), 5)
+            .with_dynamic_height(handle, |term_rows| term_rows / 2);
+
+        let tall = ov.render(40);
+        // 20 rows -> 10 inner -> 14 total (10 inner + 4 chrome).
+        assert_eq!(tall.len(), 14);
+        let pushed = ov
+            .child
+            .as_any()
+            .downcast_ref::<MockChild>()
+            .expect("downcast")
+            .last_available_height;
+        assert_eq!(pushed, Some(10));
+
+        rows.store(40, Ordering::Relaxed);
+        let taller = ov.render(40);
+        // 40 rows -> 20 inner -> 24 total.
+        assert_eq!(taller.len(), 24);
+        let pushed = ov
+            .child
+            .as_any()
+            .downcast_ref::<MockChild>()
+            .expect("downcast")
+            .last_available_height;
+        assert_eq!(pushed, Some(20));
     }
 }

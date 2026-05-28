@@ -437,6 +437,13 @@ impl Component for SessionSelectorComponent {
         self.list.set_focused(focused);
     }
 
+    fn set_available_height(&mut self, rows: usize) {
+        // Chrome above the list: search input + blank separator + the
+        // list's own scroll-info line.
+        self.max_visible_rows = rows.saturating_sub(3).max(1);
+        self.list.set_max_visible(self.max_visible_rows);
+    }
+
     fn is_focused(&self) -> bool {
         self.search.is_focused()
     }

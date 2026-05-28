@@ -272,6 +272,13 @@ impl SelectList {
         &self.items
     }
 
+    /// Update the maximum number of rows shown at once. The next render
+    /// uses the new window size; the selection is re-clamped on the next
+    /// render. Floored at 1 so the list always shows at least one row.
+    pub fn set_max_visible(&mut self, max_visible: usize) {
+        self.max_visible = max_visible.max(1);
+    }
+
     /// Set the highlighted index directly, clamped to the valid range.
     pub fn set_selected_index(&mut self, index: usize) {
         if self.filtered_indices.is_empty() {

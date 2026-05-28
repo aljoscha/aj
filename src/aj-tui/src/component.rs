@@ -56,6 +56,14 @@ pub trait Component: Any {
     /// resizes, or other external state invalidates the cached output.
     fn invalidate(&mut self) {}
 
+    /// Inform the component of the inner content height (rows) it will be
+    /// rendered into this frame, before [`Component::render`] is called.
+    /// Containers that impose a height (e.g.
+    /// [`OverlayWindow`][crate::components::overlay_window::OverlayWindow])
+    /// call this so the child can size internal scroll regions to match.
+    /// Default: ignore.
+    fn set_available_height(&mut self, _rows: usize) {}
+
     /// Notify the component that its keyboard focus state changed.
     /// Components that care about focus (text inputs, editors, lists)
     /// should override this to toggle cursor visibility, input routing,

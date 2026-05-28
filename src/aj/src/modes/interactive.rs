@@ -1276,7 +1276,7 @@ fn refresh_footer_model(
 /// is `PALETTE_OVERLAY_INNER_ROWS + 4`. Tuned to fit comfortably on a
 /// standard 24-row terminal. The content-heavy overlays (session
 /// switcher, prompt history) size their rows dynamically instead — see
-/// [`large_overlay_geometry`].
+/// [`large_overlay_inner_rows`].
 const PALETTE_OVERLAY_INNER_ROWS: usize = 17;
 
 /// Sizing/anchor used by the command palette and the compact pickers
@@ -1305,43 +1305,41 @@ fn palette_overlay_options() -> OverlayOptions {
 const LARGE_OVERLAY_MIN_INNER_ROWS: usize = 14;
 const LARGE_OVERLAY_MAX_INNER_ROWS: usize = 32;
 
-/// Resolved geometry for a large overlay: the `OverlayWindow`'s
-/// fixed inner-row budget plus the matching compositor options.
-struct LargeOverlayGeometry {
-    /// Inner-content rows the [`OverlayWindow`] renders (excludes the
-    /// 4 rows of chrome: top/bottom border + top/bottom padding).
-    inner_rows: usize,
-    options: OverlayOptions,
+/// Height policy for the two content-heavy overlays (session switcher
+/// and prompt history): the inner-content row budget the
+/// [`aj_tui::components::overlay_window::OverlayWindow`] renders, given
+/// the live terminal height. Plugged into the window via
+/// [`aj_tui::components::overlay_window::OverlayWindow::with_dynamic_height`]
+/// so the box height tracks terminal resizes.
+///
+/// Scales to ~80% of `term_rows`, subtracts the window chrome, and
+/// clamps the result to `[LARGE_OVERLAY_MIN_INNER_ROWS,
+/// LARGE_OVERLAY_MAX_INNER_ROWS]` so the box stays usable on a 24-row
+/// terminal without swallowing a very tall one.
+fn large_overlay_inner_rows(term_rows: usize) -> usize {
+    SizeValue::Percent(80.0)
+        .resolve(term_rows)
+        .saturating_sub(OVERLAY_WINDOW_CHROME_ROWS)
+        .clamp(LARGE_OVERLAY_MIN_INNER_ROWS, LARGE_OVERLAY_MAX_INNER_ROWS)
 }
 
-/// Sizing for the two content-heavy overlays (session switcher and
-/// prompt history). Both carry per-row metadata and benefit from far
-/// more room than the compact pickers, so they scale with the
-/// terminal rather than using the fixed palette geometry.
+/// Compositor options for the two content-heavy overlays.
 ///
 /// Width fills ~85% of the terminal (72-col floor, 120-col ceiling).
-/// Height scales to ~80% of `term_rows`, with the inner-row budget
-/// clamped to `[LARGE_OVERLAY_MIN_INNER_ROWS,
-/// LARGE_OVERLAY_MAX_INNER_ROWS]`. `max_height` is pinned to the
-/// resolved box height (`inner_rows + 4`) so the compositor reserves
-/// exactly the rows the [`OverlayWindow`] renders — matching the
-/// fixed-height contract the window relies on.
-fn large_overlay_geometry(term_rows: u16) -> LargeOverlayGeometry {
-    let budget = SizeValue::Percent(80.0).resolve(usize::from(term_rows));
-    let inner_rows = budget
-        .saturating_sub(OVERLAY_WINDOW_CHROME_ROWS)
-        .clamp(LARGE_OVERLAY_MIN_INNER_ROWS, LARGE_OVERLAY_MAX_INNER_ROWS);
-    let options = OverlayOptions {
+/// The [`OverlayWindow`] sizes its own height reactively via
+/// [`large_overlay_inner_rows`], so `max_height` here is only a safety
+/// net: `Percent(100)` resolves to the available terminal height, which
+/// clamps (truncates) the box on a terminal too short to hold it while
+/// never capping it on a roomy one. A frozen `Absolute` would instead
+/// truncate the box on a terminal that grew after the overlay opened.
+fn large_overlay_options() -> OverlayOptions {
+    OverlayOptions {
         anchor: OverlayAnchor::Center,
         width: Some(SizeValue::Percent(85.0)),
         min_width: Some(72),
         max_width: Some(120),
-        max_height: Some(SizeValue::Absolute(inner_rows + OVERLAY_WINDOW_CHROME_ROWS)),
+        max_height: Some(SizeValue::Percent(100.0)),
         ..OverlayOptions::default()
-    };
-    LargeOverlayGeometry {
-        inner_rows,
-        options,
     }
 }
 
@@ -1569,10 +1567,10 @@ async fn handle_slash_command(
                 };
             }
 
-            let geometry = large_overlay_geometry(tui.terminal().rows());
+            let initial_inner_rows = large_overlay_inner_rows(usize::from(tui.terminal().rows()));
             // Session-selector chrome above the list: search input +
             // blank separator + the list's own scroll-info line.
-            let session_max_rows = geometry.inner_rows.saturating_sub(3).max(1);
+            let session_max_rows = initial_inner_rows.saturating_sub(3).max(1);
             let inner = SessionSelectorComponent::new(
                 select_list_theme(theme),
                 previews,
@@ -1585,10 +1583,11 @@ async fn handle_slash_command(
                 "Resume thread",
                 Box::new(inner),
                 crate::config::theme::overlay_window_theme(theme),
-                geometry.inner_rows,
+                initial_inner_rows,
             )
+            .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
             .with_subtitle(&subtitle_confirm_close());
-            let handle = tui.show_overlay(Box::new(window), geometry.options);
+            let handle = tui.show_overlay(Box::new(window), large_overlay_options());
             SlashHandled::Continue {
                 selector: Some(OpenSelector::Session {
                     handle,
@@ -1616,11 +1615,11 @@ async fn handle_slash_command(
                     }
                 })
             };
-            let geometry = large_overlay_geometry(tui.terminal().rows());
+            let initial_inner_rows = large_overlay_inner_rows(usize::from(tui.terminal().rows()));
             // Prompt-history chrome above the list: search input +
             // scope line + blank separator + the list's scroll-info
             // line.
-            let history_max_rows = geometry.inner_rows.saturating_sub(4).max(1);
+            let history_max_rows = initial_inner_rows.saturating_sub(4).max(1);
             let inner = PromptHistorySearchComponent::new(
                 select_list_theme(theme),
                 workspace_entries,
@@ -1632,10 +1631,11 @@ async fn handle_slash_command(
                 "Prompt history",
                 Box::new(inner),
                 crate::config::theme::overlay_window_theme(theme),
-                geometry.inner_rows,
+                initial_inner_rows,
             )
+            .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
             .with_subtitle(&subtitle_confirm_close());
-            let handle = tui.show_overlay(Box::new(window), geometry.options);
+            let handle = tui.show_overlay(Box::new(window), large_overlay_options());
             SlashHandled::Continue {
                 selector: Some(OpenSelector::PromptHistory {
                     handle,

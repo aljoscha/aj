@@ -144,6 +144,20 @@ impl RenderHandle {
     pub fn terminal_columns(&self) -> u16 {
         self.term_cols.load(Ordering::Relaxed)
     }
+
+    /// Build a detached handle whose `terminal_rows` reads back the
+    /// supplied shared atomic, so a test can drive resize-reactive
+    /// components without a running [`Tui`]. The returned handle's
+    /// `request_render` is a no-op (the receiver is dropped immediately).
+    #[cfg(test)]
+    pub(crate) fn detached_with_shared_rows(rows: Arc<AtomicU16>) -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel::<()>();
+        Self {
+            tx,
+            term_rows: rows,
+            term_cols: Arc::new(AtomicU16::new(0)),
+        }
+    }
 }
 
 /// Environments where a height change is a frequent, nuisance event (e.g.
