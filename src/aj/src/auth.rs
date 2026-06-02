@@ -217,18 +217,24 @@ pub fn open_browser(url: &str) {
 /// - the system clipboard through `arboard` — works locally on
 ///   macOS / Windows / X11; and
 /// - an OSC 52 terminal escape written to stdout, which many terminals
-///   honor *over SSH* (iTerm2, kitty, wezterm, tmux with
-///   `set-clipboard on`), covering the headless/remote case where
-///   `arboard` can't reach a clipboard.
+///   honor *over SSH* (iTerm2, kitty, wezterm, Alacritty), covering the
+///   headless/remote case where `arboard` can only reach the *remote*
+///   machine's clipboard (or no clipboard at all).
 ///
 /// Nota bene: must be called on the UI thread. The OSC 52 write targets
 /// the same stdout the TUI renders to, so issuing it off-thread could
 /// interleave with a frame and corrupt the display.
 ///
-/// On X11 the `arboard` selection is dropped as soon as this returns
-/// (X11 clipboard ownership is process-bound), so on a plain X11
-/// terminal without OSC 52 support the copy may not outlive a paste
-/// attempt — the always-visible URL line remains the final fallback.
+/// Caveats worth knowing when this "doesn't work":
+/// - The *outer* terminal must support OSC 52. macOS Terminal.app does
+///   not; iTerm2 / kitty / wezterm / Alacritty do.
+/// - Inside tmux the escape is also emitted in tmux's passthrough
+///   wrapper (see [`osc52_payload`]); tmux still needs `set-clipboard`
+///   on (to consume the bare form) or `allow-passthrough` on (to
+///   forward the wrapped form) to relay it to the outer terminal.
+/// - On X11 the `arboard` selection is dropped as soon as this returns
+///   (ownership is process-bound). The always-visible URL line remains
+///   the final fallback.
 pub fn copy_to_clipboard(text: &str) {
     if let Err(err) = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
         tracing::debug!("clipboard: arboard set_text failed: {err}");
@@ -236,17 +242,38 @@ pub fn copy_to_clipboard(text: &str) {
     emit_osc52(text);
 }
 
-/// Write an OSC 52 "set clipboard" escape for `text` to stdout.
+/// Write the OSC 52 clipboard payload for `text` to stdout, wrapping
+/// for tmux when `$TMUX` is set.
 fn emit_osc52(text: &str) {
-    use base64::Engine;
     use std::io::Write;
 
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    // OSC 52 ; c ; <base64> BEL — `c` selects the clipboard buffer.
-    let seq = format!("\x1b]52;c;{encoded}\x07");
+    let payload = osc52_payload(text, std::env::var_os("TMUX").is_some());
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(seq.as_bytes());
+    let _ = out.write_all(payload.as_bytes());
     let _ = out.flush();
+}
+
+/// Build the OSC 52 "set clipboard" byte sequence(s) for `text`.
+///
+/// Always includes the bare `OSC 52 ; c ; <base64> BEL` form. When
+/// `in_tmux`, also appends a tmux passthrough-wrapped copy
+/// (`DCS tmux ; <payload-with-ESCs-doubled> ST`) so the escape reaches
+/// the outer terminal regardless of whether the user's tmux is set up
+/// to consume the bare form (`set-clipboard on`) or to forward the
+/// wrapped form (`allow-passthrough on`). Setting the clipboard twice
+/// when both apply is harmless.
+fn osc52_payload(text: &str, in_tmux: bool) -> String {
+    use base64::Engine;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let bare = format!("\x1b]52;c;{encoded}\x07");
+    if in_tmux {
+        // tmux passthrough: DCS tmux ; <data with every ESC doubled> ST
+        let escaped = bare.replace('\x1b', "\x1b\x1b");
+        format!("{bare}\x1bPtmux;{escaped}\x1b\\")
+    } else {
+        bare
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +297,24 @@ mod tests {
             format_remaining(now + (26 * 3600) * 1000, now),
             "expires in 1d 2h"
         );
+    }
+
+    #[test]
+    fn osc52_bare_outside_tmux() {
+        let payload = osc52_payload("hello", false);
+        // base64("hello") == "aGVsbG8="
+        assert_eq!(payload, "\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_adds_tmux_passthrough_wrapper() {
+        let payload = osc52_payload("hello", true);
+        let bare = "\x1b]52;c;aGVsbG8=\x07";
+        // Still starts with the bare form (for `set-clipboard`)...
+        assert!(payload.starts_with(bare), "{payload:?}");
+        // ...followed by the passthrough-wrapped form (for
+        // `allow-passthrough`) with ESCs doubled and a ST terminator.
+        let escaped = bare.replace('\x1b', "\x1b\x1b");
+        assert_eq!(payload, format!("{bare}\x1bPtmux;{escaped}\x1b\\"));
     }
 }
