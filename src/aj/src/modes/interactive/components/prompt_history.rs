@@ -34,7 +34,9 @@ use std::sync::{Arc, Mutex};
 
 use aj_session::{ConversationEntry, ConversationEntryKind, ConversationPersistence, ThreadKind};
 use aj_tui::component::Component;
-use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
+use aj_tui::components::select_list::{
+    FilterMode, SelectItem, SelectList, SelectListLayout, SelectListTheme,
+};
 use aj_tui::components::text_input::TextInput;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
@@ -332,10 +334,17 @@ impl PromptHistorySearchComponent {
 /// Layout for the prompt list. A capped prefix column holds the
 /// project label (all-workspaces scope only); the prompt itself fills
 /// the remaining width since no right-hand column competes for space.
+///
+/// Prompt bodies are long and multi-line, so fuzzy subsequence matching
+/// is far too permissive here (almost everything matches a multi-word
+/// query). Use a substring "contains all words" filter over the whole
+/// prompt instead.
 fn list_layout() -> SelectListLayout {
     SelectListLayout {
         max_prefix_column_width: Some(PROJECT_LABEL_MAX),
         wrap_selection: false,
+        filter_mode: FilterMode::SubstringAllTokens,
+        empty_message: "No matching prompts".to_string(),
         ..Default::default()
     }
 }

@@ -132,6 +132,25 @@ pub struct TruncatePrimaryContext<'a> {
     pub is_selected: bool,
 }
 
+/// How a query is matched against items to produce the visible subset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FilterMode {
+    /// Fuzzy subsequence ranking via nucleo. Each whitespace-separated
+    /// query token must subsequence-match the item text; results are
+    /// reordered best-match-first. Suited to short labels (command
+    /// palette, session list) where typing a few characters should
+    /// surface the closest entries.
+    #[default]
+    Fuzzy,
+    /// Case-insensitive "contains all tokens": each whitespace-separated
+    /// query token must appear as a literal substring of the item text.
+    /// Matching items keep their original order (no re-ranking). Suited
+    /// to searching long bodies (prompt history) where subsequence
+    /// matching is too permissive and the user expects "the entries
+    /// that contain these words".
+    SubstringAllTokens,
+}
+
 /// Layout tuning knobs for the primary column and description alignment.
 pub struct SelectListLayout {
     /// Minimum width (including the 2-char gap) of the primary column.
@@ -156,6 +175,12 @@ pub struct SelectListLayout {
     /// navigation clamps at the ends so holding a key settles on the
     /// top/bottom row.
     pub wrap_selection: bool,
+    /// Strategy used by [`SelectList::set_filter`]. Defaults to
+    /// [`FilterMode::Fuzzy`].
+    pub filter_mode: FilterMode,
+    /// Message shown (in the `no_match` style) when the filter excludes
+    /// every item. Defaults to `"No matching commands"`.
+    pub empty_message: String,
 }
 
 impl Default for SelectListLayout {
@@ -167,6 +192,8 @@ impl Default for SelectListLayout {
             max_prefix_column_width: None,
             show_selection_indicator: true,
             wrap_selection: true,
+            filter_mode: FilterMode::Fuzzy,
+            empty_message: "No matching commands".to_string(),
         }
     }
 }
@@ -264,20 +291,43 @@ impl SelectList {
     }
 
     /// Recompute `filtered_indices` from the current items and the
-    /// retained [`Self::filter`]. Leaves `selected` untouched (callers
-    /// reset or restore it as appropriate).
+    /// retained [`Self::filter`], per the configured
+    /// [`SelectListLayout::filter_mode`]. Leaves `selected` untouched
+    /// (callers reset or restore it as appropriate).
     fn apply_filter(&mut self) {
         if self.filter.is_empty() {
             self.filtered_indices = (0..self.items.len()).collect();
-        } else {
-            let candidates: Vec<(usize, &str)> = self
-                .items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| (i, item.filter_text()))
-                .collect();
-            let ranked = crate::fuzzy::fuzzy_filter(candidates, &self.filter, |(_, text)| *text);
-            self.filtered_indices = ranked.into_iter().map(|(i, _)| i).collect();
+            return;
+        }
+        match self.layout.filter_mode {
+            FilterMode::Fuzzy => {
+                let candidates: Vec<(usize, &str)> = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| (i, item.filter_text()))
+                    .collect();
+                let ranked =
+                    crate::fuzzy::fuzzy_filter(candidates, &self.filter, |(_, text)| *text);
+                self.filtered_indices = ranked.into_iter().map(|(i, _)| i).collect();
+            }
+            FilterMode::SubstringAllTokens => {
+                // Keep items in their original order; an entry is visible
+                // when every whitespace-separated query token appears as a
+                // case-insensitive substring of its text.
+                let needle = self.filter.to_lowercase();
+                let tokens: Vec<&str> = needle.split_whitespace().collect();
+                self.filtered_indices = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        let hay = item.filter_text().to_lowercase();
+                        tokens.iter().all(|token| hay.contains(token))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+            }
         }
     }
 
@@ -624,7 +674,10 @@ impl Component for SelectList {
         let mut lines = Vec::new();
 
         if self.filtered_indices.is_empty() {
-            lines.push((self.theme.no_match)("  No matching commands"));
+            lines.push((self.theme.no_match)(&format!(
+                "  {}",
+                self.layout.empty_message
+            )));
             return lines;
         }
 
@@ -729,6 +782,44 @@ mod tests {
     }
 
     #[test]
+    fn substring_all_tokens_requires_every_token_and_keeps_order() {
+        let layout = SelectListLayout {
+            filter_mode: FilterMode::SubstringAllTokens,
+            ..Default::default()
+        };
+        let items = vec![
+            SelectItem::new("0", "fix the parser bug"),
+            SelectItem::new("1", "add a parser test"),
+            SelectItem::new("2", "refactor the bug report"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), layout);
+
+        // Every token must appear as a substring; matches keep their
+        // input order (not re-ranked).
+        list.set_filter("parser bug");
+        let visible: Vec<&str> = list
+            .filtered_indices
+            .iter()
+            .map(|&i| list.items[i].value.as_str())
+            .collect();
+        assert_eq!(visible, vec!["0"]);
+
+        // Case-insensitive.
+        list.set_filter("PARSER");
+        let visible: Vec<&str> = list
+            .filtered_indices
+            .iter()
+            .map(|&i| list.items[i].value.as_str())
+            .collect();
+        assert_eq!(visible, vec!["0", "1"]);
+
+        // "prsr" is a subsequence of "parser" but not a substring, so it
+        // matches nothing here (it would under fuzzy mode).
+        list.set_filter("prsr");
+        assert!(list.filtered_indices.is_empty());
+    }
+
+    #[test]
     fn extend_items_unfiltered_appends_and_keeps_selection() {
         let items = vec![SelectItem::new("a", "alpha"), SelectItem::new("b", "bravo")];
         let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
@@ -819,6 +910,7 @@ mod tests {
             max_prefix_column_width: None,
             show_selection_indicator: true,
             wrap_selection: true,
+            ..Default::default()
         };
         let list = SelectList::new(vec![], 5, identity_theme(), layout);
         let (min, max) = list.primary_column_bounds();

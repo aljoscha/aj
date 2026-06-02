@@ -81,6 +81,7 @@ fn uses_the_configured_minimum_primary_column_width() {
             max_prefix_column_width: None,
             show_selection_indicator: true,
             wrap_selection: true,
+            ..Default::default()
         },
     );
     let rendered = list.render(80);
@@ -110,6 +111,7 @@ fn uses_the_configured_maximum_primary_column_width() {
             max_prefix_column_width: None,
             show_selection_indicator: true,
             wrap_selection: true,
+            ..Default::default()
         },
     );
     let rendered = list.render(80);
@@ -147,6 +149,7 @@ fn allows_overriding_primary_truncation_while_preserving_description_alignment()
             max_prefix_column_width: None,
             show_selection_indicator: true,
             wrap_selection: true,
+            ..Default::default()
         },
     );
     let rendered = list.render(80);
