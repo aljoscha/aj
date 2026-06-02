@@ -1644,14 +1644,17 @@ async fn handle_slash_command(
             }
         }
         SlashAction::OpenPromptHistory => {
-            // Current-workspace prompts are scanned eagerly (cheap:
-            // one project's session files). The all-workspaces set is
-            // deferred to a loader the component invokes on first
-            // scope toggle so opening the overlay stays fast.
-            let workspace_entries = workspace_history(conversation_persistence);
+            // Both scans run on a blocking thread so the overlay opens
+            // immediately. The current-workspace scan starts on
+            // construction; the all-workspaces scan is deferred to the
+            // first scope toggle.
+            let workspace_loader = {
+                let persistence = conversation_persistence.clone();
+                move || workspace_history(&persistence)
+            };
             let all_loader = {
                 let persistence = conversation_persistence.clone();
-                Box::new(move || match Config::get_sessions_base_dir_path() {
+                move || match Config::get_sessions_base_dir_path() {
                     Ok(base) => all_workspaces_history(&base),
                     Err(err) => {
                         tracing::debug!("could not resolve sessions base dir: {err}");
@@ -1659,7 +1662,7 @@ async fn handle_slash_command(
                         // toggle still shows something.
                         workspace_history(&persistence)
                     }
-                })
+                }
             };
             let initial_inner_rows = large_overlay_inner_rows(usize::from(tui.terminal().rows()));
             // Prompt-history chrome above the list: search input +
@@ -1668,9 +1671,10 @@ async fn handle_slash_command(
             let history_max_rows = initial_inner_rows.saturating_sub(4).max(1);
             let inner = PromptHistorySearchComponent::new(
                 select_list_theme(theme),
-                workspace_entries,
-                all_loader,
                 history_max_rows,
+                tui.handle(),
+                workspace_loader,
+                all_loader,
             );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(

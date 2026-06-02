@@ -13,9 +13,13 @@
 //! - **All workspaces**: prompts from every project under
 //!   `~/.aj/sessions`, each tagged with its project label.
 //!
-//! The all-workspaces set is loaded lazily on first toggle via the
-//! `all_loader` closure so opening the overlay stays cheap when the
-//! user never leaves the workspace scope.
+//! Both scopes are scanned on a blocking thread, not on the TUI event
+//! loop: the overlay opens immediately (showing a loading indicator)
+//! and the list is populated when a scan delivers its result through
+//! an internal channel drained at the top of `render`. The
+//! current-workspace scan starts as soon as the overlay is built; the
+//! all-workspaces scan is deferred until the first toggle so it costs
+//! nothing when the user never leaves the workspace scope.
 //!
 //! Like the command palette, the list is built once per scope and
 //! filtered via [`SelectList::set_filter`] on each keystroke rather
@@ -33,6 +37,8 @@ use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, 
 use aj_tui::components::text_input::TextInput;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
+use aj_tui::tui::RenderHandle;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::config::keybindings::ACTION_HISTORY_TOGGLE_SCOPE;
 use crate::modes::interactive::editor_ext::extract_user_prompt_text;
@@ -100,10 +106,18 @@ impl PromptHistoryOutcomeHandle {
     }
 }
 
-/// Lazy loader for the all-workspaces scope. Invoked at most once
-/// (the result is cached) the first time the user toggles to that
-/// scope.
-type AllLoader = Box<dyn Fn() -> Vec<PromptHistoryEntry>>;
+/// Loader for the all-workspaces scope. Invoked at most once (on the
+/// first toggle to that scope) on a blocking thread; the result is
+/// cached.
+type AllLoader = Arc<dyn Fn() -> Vec<PromptHistoryEntry> + Send + Sync>;
+
+/// Result of a background scan, delivered to the live overlay. The
+/// component drains these at the top of `render` and rebuilds the list
+/// when the result targets the visible scope.
+enum PromptHistoryLoad {
+    Workspace(Vec<PromptHistoryEntry>),
+    All(Vec<PromptHistoryEntry>),
+}
 
 /// Prompt-history search component.
 pub struct PromptHistorySearchComponent {
@@ -113,32 +127,50 @@ pub struct PromptHistorySearchComponent {
     max_visible_rows: usize,
     scope: Scope,
     workspace_entries: Vec<PromptHistoryEntry>,
-    /// Cached all-workspaces entries; `None` until the first toggle.
+    /// Cached all-workspaces entries; `None` until the first toggle's
+    /// scan completes.
     all_entries: Option<Vec<PromptHistoryEntry>>,
+    /// Whether each scope's background scan is still in flight. Used to
+    /// show a loading indicator rather than an empty list.
+    workspace_loading: bool,
+    all_loading: bool,
+    /// Set once the all-workspaces scan has been kicked off so toggling
+    /// back and forth doesn't re-scan.
+    all_requested: bool,
     all_loader: AllLoader,
+    /// Inbound scan results, drained in `render`.
+    loads_tx: UnboundedSender<PromptHistoryLoad>,
+    loads_rx: UnboundedReceiver<PromptHistoryLoad>,
+    render_handle: RenderHandle,
     outcome: PromptHistoryOutcomeHandle,
 }
 
 impl PromptHistorySearchComponent {
-    /// Build the overlay over `workspace_entries` (the current-project
-    /// prompts, newest-first). `all_loader` produces the
-    /// all-workspaces set on demand.
+    /// Build the overlay and kick off the current-workspace scan on a
+    /// blocking thread. The list starts empty (showing a loading
+    /// indicator) and is populated when the scan delivers its result.
+    /// `all_loader` produces the all-workspaces set on demand, scanned
+    /// the first time the user toggles to that scope.
     pub fn new(
         theme: SelectListTheme,
-        workspace_entries: Vec<PromptHistoryEntry>,
-        all_loader: AllLoader,
         max_visible_rows: usize,
+        render_handle: RenderHandle,
+        workspace_loader: impl FnOnce() -> Vec<PromptHistoryEntry> + Send + 'static,
+        all_loader: impl Fn() -> Vec<PromptHistoryEntry> + Send + Sync + 'static,
     ) -> Self {
         let mut search = TextInput::new("search: ");
         search.set_focused(true);
 
-        let mut list = SelectList::new(
-            build_items(&workspace_entries),
-            max_visible_rows,
-            theme.clone(),
-            list_layout(),
-        );
+        let mut list = SelectList::new(Vec::new(), max_visible_rows, theme.clone(), list_layout());
         list.set_focused(true);
+
+        let (loads_tx, loads_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_load(
+            workspace_loader,
+            loads_tx.clone(),
+            render_handle.clone(),
+            PromptHistoryLoad::Workspace,
+        );
 
         Self {
             search,
@@ -146,9 +178,15 @@ impl PromptHistorySearchComponent {
             theme,
             max_visible_rows,
             scope: Scope::Workspace,
-            workspace_entries,
+            workspace_entries: Vec::new(),
             all_entries: None,
-            all_loader,
+            workspace_loading: true,
+            all_loading: false,
+            all_requested: false,
+            all_loader: Arc::new(all_loader),
+            loads_tx,
+            loads_rx,
+            render_handle,
             outcome: PromptHistoryOutcomeHandle::new(),
         }
     }
@@ -158,33 +196,51 @@ impl PromptHistorySearchComponent {
         PromptHistoryOutcomeHandle(Arc::clone(&self.outcome.0))
     }
 
-    /// Entries backing the currently-selected scope.
+    /// Entries backing the currently-selected scope. The all-workspaces
+    /// scope returns an empty slice until its scan completes (the
+    /// loading indicator covers that window).
     fn current_entries(&self) -> &[PromptHistoryEntry] {
         match self.scope {
             Scope::Workspace => &self.workspace_entries,
-            // `all_entries` is always populated before `scope` flips
-            // to `All` (see `toggle_scope`).
-            Scope::All => self
-                .all_entries
-                .as_deref()
-                .unwrap_or(&self.workspace_entries),
+            Scope::All => self.all_entries.as_deref().unwrap_or(&[]),
         }
     }
 
-    /// Flip the scope, lazily loading the all-workspaces set the first
-    /// time it's needed, then rebuild the list for the new scope and
-    /// re-apply the current search filter.
-    fn toggle_scope(&mut self) {
-        self.scope = match self.scope {
-            Scope::Workspace => {
-                if self.all_entries.is_none() {
-                    self.all_entries = Some((self.all_loader)());
-                }
-                Scope::All
-            }
-            Scope::All => Scope::Workspace,
-        };
+    /// Whether the visible scope's background scan is still running.
+    fn is_current_loading(&self) -> bool {
+        match self.scope {
+            Scope::Workspace => self.workspace_loading,
+            Scope::All => self.all_loading,
+        }
+    }
 
+    /// Apply scan results delivered since the last render, rebuilding
+    /// the list when a result targets the visible scope.
+    fn drain_loads(&mut self) {
+        let mut visible_changed = false;
+        while let Ok(load) = self.loads_rx.try_recv() {
+            match load {
+                PromptHistoryLoad::Workspace(entries) => {
+                    self.workspace_entries = entries;
+                    self.workspace_loading = false;
+                    visible_changed |= self.scope == Scope::Workspace;
+                }
+                PromptHistoryLoad::All(entries) => {
+                    self.all_entries = Some(entries);
+                    self.all_loading = false;
+                    visible_changed |= self.scope == Scope::All;
+                }
+            }
+        }
+        if visible_changed {
+            self.rebuild_list();
+        }
+    }
+
+    /// Rebuild the list for the current scope and re-apply the active
+    /// search filter. Used on scope toggle and whenever a scan delivers
+    /// results for the visible scope.
+    fn rebuild_list(&mut self) {
         let items = build_items(self.current_entries());
         let mut list = SelectList::new(
             items,
@@ -195,6 +251,37 @@ impl PromptHistorySearchComponent {
         list.set_focused(true);
         self.list = list;
         self.list.set_filter(self.search.value());
+    }
+
+    /// Flip the scope, kicking off the all-workspaces scan the first
+    /// time it's needed, then rebuild the list for the new scope.
+    fn toggle_scope(&mut self) {
+        self.scope = match self.scope {
+            Scope::Workspace => {
+                self.request_all_load();
+                Scope::All
+            }
+            Scope::All => Scope::Workspace,
+        };
+        self.rebuild_list();
+    }
+
+    /// Kick off the all-workspaces scan on a blocking thread the first
+    /// time the scope is toggled. The result is cached, so repeated
+    /// toggles never re-scan.
+    fn request_all_load(&mut self) {
+        if self.all_requested {
+            return;
+        }
+        self.all_requested = true;
+        self.all_loading = true;
+        let loader = Arc::clone(&self.all_loader);
+        spawn_load(
+            move || loader(),
+            self.loads_tx.clone(),
+            self.render_handle.clone(),
+            PromptHistoryLoad::All,
+        );
     }
 
     fn commit_selection(&self) {
@@ -281,15 +368,21 @@ impl Component for PromptHistorySearchComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
+        self.drain_loads();
         let mut lines = Vec::with_capacity(self.max_visible_rows + 3);
         lines.extend(self.search.render(width));
         lines.push(self.scope_line());
         lines.push(String::new());
-        lines.extend(self.list.render(width));
+        if self.is_current_loading() && self.current_entries().is_empty() {
+            lines.push((self.theme.description)("Loading prompt history…"));
+        } else {
+            lines.extend(self.list.render(width));
+        }
         lines
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
+        self.drain_loads();
         let kb = keybindings::get();
 
         if kb.matches(event, ACTION_HISTORY_TOGGLE_SCOPE) {
@@ -350,6 +443,28 @@ impl Component for PromptHistorySearchComponent {
 // ---------------------------------------------------------------------------
 // Scanning: extract submitted prompts from on-disk session logs.
 // ---------------------------------------------------------------------------
+
+/// Run `load` on a blocking thread, deliver the result (wrapped by
+/// `wrap`) to the overlay's channel, and wake the TUI. Outside a Tokio
+/// runtime (unit tests) the load runs inline so results are delivered
+/// synchronously.
+fn spawn_load(
+    load: impl FnOnce() -> Vec<PromptHistoryEntry> + Send + 'static,
+    tx: UnboundedSender<PromptHistoryLoad>,
+    render_handle: RenderHandle,
+    wrap: fn(Vec<PromptHistoryEntry>) -> PromptHistoryLoad,
+) {
+    let run = move || {
+        let _ = tx.send(wrap(load()));
+        render_handle.request_render();
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            tokio::task::spawn_blocking(run);
+        }
+        Err(_) => run(),
+    }
+}
 
 /// Collect the current workspace's submitted prompts, newest-first,
 /// deduplicated.
@@ -528,9 +643,10 @@ mod tests {
     ) -> PromptHistorySearchComponent {
         PromptHistorySearchComponent::new(
             identity_theme(),
-            workspace,
-            Box::new(move || all.clone()),
             10,
+            RenderHandle::detached(),
+            move || workspace,
+            move || all.clone(),
         )
     }
 
@@ -588,12 +704,13 @@ mod tests {
         let calls_for_loader = Arc::clone(&calls);
         let mut c = PromptHistorySearchComponent::new(
             identity_theme(),
-            vec![entry("workspace prompt", None)],
-            Box::new(move || {
+            10,
+            RenderHandle::detached(),
+            || vec![entry("workspace prompt", None)],
+            move || {
                 calls_for_loader.fetch_add(1, Ordering::Relaxed);
                 vec![entry("other workspace prompt", Some("other-proj"))]
-            }),
-            10,
+            },
         );
 
         // Workspace scope only shows the workspace prompt.
