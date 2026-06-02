@@ -144,16 +144,60 @@ impl ConversationPersistence {
     /// whose first line does not parse as the new [`ConversationEntry`]
     /// shape are skipped (consistent with [`Self::list_sessions`]).
     ///
-    /// Note on streaming: this function still returns the previews
-    /// in one `Vec` after every file has been scanned. The callback
-    /// is the streaming surface for progress reporting; a future
-    /// extension can flip the return type to an `Iterator` / async
-    /// stream if a single project ever grows enough sessions that
-    /// the cumulative scan time becomes user-visible.
+    /// Note on streaming: this function returns the previews in one
+    /// `Vec` after every file has been scanned. The callback is the
+    /// streaming surface for progress reporting; callers that want to
+    /// render rows as they are scanned (rather than blocking on the
+    /// full walk) use [`Self::list_session_previews_streaming`]
+    /// instead.
     pub fn list_session_previews(
         &self,
         mut on_progress: impl FnMut(usize, usize),
     ) -> Result<Vec<SessionPreview>, ConversationError> {
+        let candidates = self.preview_candidates()?;
+        let total = candidates.len();
+        let mut previews = Vec::with_capacity(total);
+        for (i, (session_id, path)) in candidates.into_iter().enumerate() {
+            previews.push(read_preview_or_placeholder(session_id, &path));
+            on_progress(i + 1, total);
+        }
+        Ok(previews)
+    }
+
+    /// Stream per-session previews to `emit`, one file's preview per
+    /// call, in the same latest-first order as
+    /// [`Self::list_session_previews`]. Each call carries a
+    /// single-element batch so a UI rendering the list incrementally
+    /// can append rows as the scan progresses rather than blocking on
+    /// the whole walk.
+    ///
+    /// Mirrors the failure tolerance of [`Self::list_session_previews`]:
+    /// a per-file read error yields a placeholder preview (so the row
+    /// still appears), and a missing or unreadable sessions directory
+    /// emits nothing.
+    pub fn list_session_previews_streaming(&self, emit: &mut dyn FnMut(Vec<SessionPreview>)) {
+        let candidates = match self.preview_candidates() {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::debug!(
+                    "could not enumerate sessions dir {}: {err}",
+                    self.sessions_dir.display()
+                );
+                return;
+            }
+        };
+        for (session_id, path) in candidates {
+            emit(vec![read_preview_or_placeholder(session_id, &path)]);
+        }
+    }
+
+    /// Enumerate the session files worth previewing, newest-first.
+    ///
+    /// Pre-refactor files (whose first line does not parse as the
+    /// current [`ConversationEntry`] shape) are filtered out up-front so
+    /// the count reflects only files we'll actually surface — otherwise
+    /// a progress bar driven off it would stall partway through.
+    fn preview_candidates(&self) -> Result<Vec<(String, PathBuf)>, ConversationError> {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
@@ -169,36 +213,28 @@ impl ConversationPersistence {
                 }
             }
         }
+        // Filenames are timestamps; reverse-lexicographic = newest-first.
         session_files.sort_by(|a, b| b.cmp(a));
 
-        let mut previews = Vec::with_capacity(session_files.len());
-        // Filter out pre-refactor files up-front so `total` in the
-        // progress callback reflects only files we'll actually
-        // surface — otherwise the bar would stall partway through.
-        let candidate_paths: Vec<(String, PathBuf)> = session_files
+        Ok(session_files
             .into_iter()
             .map(|id| (id.clone(), self.session_path(&id)))
             .filter(|(_, p)| Self::looks_like_new_format(p))
-            .collect();
-
-        let total = candidate_paths.len();
-        for (i, (session_id, path)) in candidate_paths.into_iter().enumerate() {
-            // Surface a preview even if a per-file read fails: the
-            // selector should still show the entry so the user can
-            // see which session couldn't be parsed.
-            let preview = read_session_preview_file(&session_id, &path).unwrap_or_else(|err| {
-                tracing::warn!(
-                    "failed to read preview for session {}: {err}",
-                    path.display()
-                );
-                SessionPreview::placeholder(session_id, &path)
-            });
-            previews.push(preview);
-            on_progress(i + 1, total);
-        }
-
-        Ok(previews)
+            .collect())
     }
+}
+
+/// Read a preview for `path`, falling back to a placeholder on error so
+/// a corrupt or unreadable session file still appears in the selector
+/// instead of dropping out of the listing.
+fn read_preview_or_placeholder(session_id: String, path: &std::path::Path) -> SessionPreview {
+    read_session_preview_file(&session_id, path).unwrap_or_else(|err| {
+        tracing::warn!(
+            "failed to read preview for session {}: {err}",
+            path.display()
+        );
+        SessionPreview::placeholder(session_id, path)
+    })
 }
 
 /// Metadata about a conversation session.
@@ -530,6 +566,47 @@ mod tests {
         assert_eq!(previews.len(), 3);
         let p = progress.into_inner();
         assert_eq!(p, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[test]
+    fn list_session_previews_streaming_matches_batched_order() {
+        let (_dir, persistence) = fixture();
+        for i in 0..3 {
+            let mut log = ConversationLog::create(&persistence).expect("create");
+            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // Each emit carries exactly one file's preview, in the same
+        // newest-first order the batched listing produces.
+        let mut batches = Vec::new();
+        persistence.list_session_previews_streaming(&mut |b| batches.push(b));
+        assert!(
+            batches.iter().all(|b| b.len() == 1),
+            "expected one preview per batch, got {:?}",
+            batches.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        let streamed: Vec<String> = batches
+            .into_iter()
+            .flatten()
+            .map(|p| p.session_id)
+            .collect();
+        let batched: Vec<String> = persistence
+            .list_session_previews(|_, _| {})
+            .expect("list")
+            .into_iter()
+            .map(|p| p.session_id)
+            .collect();
+        assert_eq!(streamed, batched);
+    }
+
+    #[test]
+    fn list_session_previews_streaming_missing_dir_emits_nothing() {
+        let dir = TempDir::new().unwrap();
+        let persistence = ConversationPersistence::new(dir.path().join("missing"));
+        let mut batches = Vec::new();
+        persistence.list_session_previews_streaming(&mut |b| batches.push(b));
+        assert!(batches.is_empty());
     }
 
     #[test]

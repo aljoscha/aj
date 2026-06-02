@@ -1,18 +1,26 @@
 //! Session-selector overlay (`/sessions`).
 //!
 //! Pairs a [`aj_tui::components::text_input::TextInput`] for live
-//! fuzzy filtering with a [`aj_tui::components::select_list::SelectList`]
-//! that shows the matching entries from a snapshotted list of
+//! substring filtering with a
+//! [`aj_tui::components::select_list::SelectList`] of
 //! [`aj_session::SessionPreview`]s. The host opens this overlay from
 //! `/sessions`; `Enter` commits the highlighted session, `Esc`
 //! cancels.
 //!
-//! The component owns the catalog and rebuilds the inner
-//! [`SelectList`] on every text change via a reusable
-//! [`aj_tui::fuzzy::FuzzyMatcher`]. The currently-active session is
-//! pre-selected on open and tagged `(current)` so a no-op confirm is
-//! visually obvious — the user can verify "yes, I'm staying on this
-//! one" without scanning the file id.
+//! The previews are scanned on a blocking thread, not on the TUI event
+//! loop: the overlay opens immediately (showing a loading indicator)
+//! and the list fills in incrementally as the scan streams batches (one
+//! per session file, newest-first) through an internal channel drained
+//! at the top of `render`. Like the command palette, the list is built
+//! once and filtered via [`SelectList::set_filter`] on each keystroke
+//! rather than rebuilt; arriving batches are appended in place with
+//! [`SelectList::extend_items`].
+//!
+//! The currently-active session is pre-selected once its row streams in
+//! and tagged `(current)` so a no-op confirm is visually obvious — the
+//! user can verify "yes, I'm staying on this one" without scanning the
+//! file id. The pre-selection yields the moment the user starts
+//! navigating or filtering so streaming results never yank the cursor.
 //!
 //! See `docs/aj-next-plan.md` Phase 1 §4 "Selectors and theming".
 
@@ -20,12 +28,15 @@ use std::sync::{Arc, Mutex};
 
 use aj_session::SessionPreview;
 use aj_tui::component::Component;
-use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
+use aj_tui::components::select_list::{
+    FilterMode, SelectItem, SelectList, SelectListLayout, SelectListTheme,
+};
 use aj_tui::components::text_input::TextInput;
-use aj_tui::fuzzy::FuzzyMatcher;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
+use aj_tui::tui::RenderHandle;
 use chrono::{DateTime, Utc};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Cap on how much of the first user message is rendered in the
 /// primary column. Keeps long pastes (a stack trace, a chunk of
@@ -39,7 +50,8 @@ const PREVIEW_MAX_CHARS: usize = 60;
 ///
 /// `Confirmed(preview)` carries the chosen [`SessionPreview`]
 /// (cloned so the host can open the matching log without
-/// borrowing the catalog); `Cancelled` is the user pressing `Esc`.
+/// borrowing the selector's entries); `Cancelled` is the user
+/// pressing `Esc`.
 /// The host treats both as "close the overlay"; only the former
 /// triggers the swap-session flow.
 #[derive(Debug, Clone)]
@@ -52,102 +64,126 @@ pub enum SessionSelectorOutcome {
 /// overlay component writes into.
 pub type OutcomeHandle = Arc<Mutex<Option<SessionSelectorOutcome>>>;
 
+/// Result of the background scan, delivered to the live overlay. The
+/// component drains these at the top of `render`, appending batches and
+/// clearing the loading indicator on `Done`.
+enum SessionLoad {
+    /// A batch of previews, appended in arrival (newest-first) order.
+    Batch(Vec<SessionPreview>),
+    /// The scan finished; clears the loading indicator.
+    Done,
+}
+
 /// The overlay's top-level component.
 ///
 /// Owns the search input (`search`), the inner [`SelectList`]
-/// (`list`), the cached catalog (`catalog`), and the outcome slot
-/// (`outcome`). The host keeps another clone of `outcome` and polls
-/// it after every input event to decide whether to close the
-/// overlay.
+/// (`list`), the previews accumulated from the background scan
+/// (`entries`), and the outcome slot (`outcome`). The host keeps
+/// another clone of `outcome` and polls it after every input event to
+/// decide whether to close the overlay.
 pub struct SessionSelectorComponent {
-    /// Search box at the top of the overlay. Typing into it
-    /// rebuilds `list`; Enter is intercepted at the component
-    /// level so it commits the highlighted list item.
+    /// Search box at the top of the overlay. Typing into it filters
+    /// `list`; Enter is intercepted at the component level so it
+    /// commits the highlighted list item.
     search: TextInput,
-    /// Result list. Rebuilt every time `search` changes so the
-    /// fuzzy-filtered entries reflect the current query.
+    /// Result list. Built empty and filled by appending streamed
+    /// batches; filtered in place via [`SelectList::set_filter`] on
+    /// each keystroke.
     list: SelectList,
-    /// Full unfiltered catalog. The component clones the entry it
-    /// emits on confirm; keeping the source of truth here avoids
-    /// any chance of drift between filter and confirm.
-    catalog: Vec<SessionPreview>,
+    /// Previews accumulated from the background scan, in arrival
+    /// (newest-first) order. The component clones the entry it emits on
+    /// confirm; keeping the source of truth here avoids any chance of
+    /// drift between filter and confirm.
+    entries: Vec<SessionPreview>,
     /// Session id of the agent's currently-active log. Used to
-    /// pre-select that row on open and mark it `(current)` so a
-    /// no-op confirm is obvious.
+    /// pre-select that row once it streams in and mark it `(current)`
+    /// so a no-op confirm is obvious.
     current_session_id: Option<String>,
+    /// Whether the current session's row still needs to be selected.
+    /// Set when `current_session_id` is present; cleared once the row
+    /// is found and selected, or as soon as the user navigates / filters
+    /// (so streaming never yanks the cursor away from the user).
+    select_current_pending: bool,
+    /// Whether the background scan is still running. Drives the loading
+    /// indicator shown while the list is empty.
+    loading: bool,
+    /// Inbound scan results, drained in `render` and `handle_input`.
+    loads_rx: UnboundedReceiver<SessionLoad>,
     /// Shared outcome slot. The host clones this handle once at
     /// construction and polls it after every input event.
     outcome: OutcomeHandle,
-    /// Theme used to build the inner [`SelectList`]. Stored so a
-    /// rebuild (after a search-text change) can reuse the same
-    /// palette without the host having to pass it back in.
+    /// Theme used to build the inner [`SelectList`]. Stored so the list
+    /// can be reconstructed (e.g. on resize) without the host having to
+    /// pass it back in.
     theme: SelectListTheme,
-    /// Reusable fuzzy matcher. Pulled out as a field so we don't
-    /// reconstruct the underlying nucleo state on every keystroke
-    /// (it allocates ~135 KB up front per `FuzzyMatcher::new`).
-    matcher: FuzzyMatcher,
     /// Maximum visible rows in the result list, sized by the host
     /// from the overlay's resolved height so a taller box shows more
     /// candidates at once.
     max_visible_rows: usize,
     /// `now` snapshot taken at construction time. Used to format
     /// each row's age (`5m`, `3h`, …) without re-reading the clock
-    /// on every rebuild. The selector closes within seconds in
+    /// on every batch. The selector closes within seconds in
     /// practice; "Just now" rows stay "Just now" for the whole
     /// session.
     now: DateTime<Utc>,
 }
 
 impl SessionSelectorComponent {
-    /// Build a fresh selector.
+    /// Build a fresh selector and kick off the preview scan on a
+    /// blocking thread. The list starts empty (showing a loading
+    /// indicator) and fills in as the scan streams batches.
     ///
-    /// `catalog` is the snapshotted preview list (must already be
-    /// sorted in the order the user should see when the query is
-    /// empty; [`aj_session::ConversationPersistence::list_session_previews`]
-    /// returns latest-first already). `current_session_id` is the
-    /// agent's active session — used to pre-select the matching row
-    /// and mark it `(current)`. `initial_query`, when set, pre-fills
-    /// the search box so the overlay opens already filtered; the
-    /// slash layer passes `None`, but the parameter is kept as a
-    /// general capability. `theme` styles the underlying
-    /// [`SelectList`]. `max_visible_rows` caps how many result rows
-    /// the list shows at once.
+    /// `current_session_id` is the agent's active session — used to
+    /// pre-select the matching row and mark it `(current)`.
+    /// `initial_query`, when set, pre-fills the search box so the
+    /// overlay opens already filtered; the slash layer passes `None`,
+    /// but the parameter is kept as a general capability. `theme` styles
+    /// the underlying [`SelectList`]. `max_visible_rows` caps how many
+    /// result rows the list shows at once. `scan` drives the streaming
+    /// preview walk (see
+    /// [`aj_session::ConversationPersistence::list_session_previews_streaming`]),
+    /// emitting one batch per session file in newest-first order.
     pub fn new(
         theme: SelectListTheme,
-        catalog: Vec<SessionPreview>,
         current_session_id: Option<String>,
         initial_query: Option<String>,
         max_visible_rows: usize,
+        render_handle: RenderHandle,
+        scan: impl FnOnce(&mut dyn FnMut(Vec<SessionPreview>)) + Send + 'static,
     ) -> Self {
         let mut search = TextInput::new("search: ");
-        if let Some(q) = initial_query {
-            search.set_value(&q);
+        if let Some(q) = &initial_query {
+            search.set_value(q);
         }
         search.set_focused(true);
 
-        // Placeholder list — `rebuild_list` below replaces it with
-        // the initial filter and pre-selection.
-        let list = SelectList::new(
+        let mut list = SelectList::new(
             Vec::new(),
             max_visible_rows,
             theme.clone(),
             primary_column_layout(),
         );
+        list.set_focused(true);
+        if let Some(q) = &initial_query {
+            list.set_filter(q);
+        }
 
-        let outcome: OutcomeHandle = Arc::new(Mutex::new(None));
-        let mut component = Self {
+        let (loads_tx, loads_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_scan(scan, loads_tx, render_handle);
+
+        Self {
             search,
             list,
-            catalog,
+            entries: Vec::new(),
+            select_current_pending: current_session_id.is_some(),
             current_session_id,
-            outcome,
+            loading: true,
+            loads_rx,
+            outcome: Arc::new(Mutex::new(None)),
             theme,
-            matcher: FuzzyMatcher::new(),
             max_visible_rows,
             now: Utc::now(),
-        };
-        component.rebuild_list();
-        component
+        }
     }
 
     /// Hand the host a clone of the outcome slot. After each input
@@ -157,68 +193,73 @@ impl SessionSelectorComponent {
         Arc::clone(&self.outcome)
     }
 
-    /// Rebuild `list` from `catalog` filtered by the current search
-    /// value.
+    /// Apply scan results delivered since the last drain: append each
+    /// batch to `entries` and stream its rows into the live list,
+    /// clearing the loading flag on `Done`.
     ///
-    /// Score policy: empty query returns the full catalog in its
-    /// supplied order (the loader already sorts latest-first); a
-    /// non-empty query fuzzy-scores against the preview's
-    /// searchable blob (first user message + session id) and sorts
-    /// highest-score-first with catalog-order tiebreak.
-    fn rebuild_list(&mut self) {
-        let query = self.search.value().trim().to_string();
-        let mut scored: Vec<(usize, u32)> = Vec::new();
-        if query.is_empty() {
-            scored.extend((0..self.catalog.len()).map(|i| (i, 0u32)));
-        } else {
-            for (idx, info) in self.catalog.iter().enumerate() {
-                let haystack = haystack_for(info);
-                if let Some(score) = self.matcher.score(&query, &haystack) {
-                    scored.push((idx, u32::from(score)));
+    /// New rows are coalesced into a single [`SelectList::extend_items`]
+    /// call so a burst of batches in one frame costs one append (and,
+    /// when a filter is active, one re-rank) rather than one per batch.
+    /// After appending, if the current session's row is still pending
+    /// selection and has now arrived, the highlight moves to it.
+    fn drain_loads(&mut self) {
+        let mut new_items: Vec<SelectItem> = Vec::new();
+        while let Ok(load) = self.loads_rx.try_recv() {
+            match load {
+                SessionLoad::Batch(previews) => {
+                    for preview in &previews {
+                        new_items.push(self.build_item(preview));
+                    }
+                    self.entries.extend(previews);
                 }
+                SessionLoad::Done => self.loading = false,
             }
-            scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         }
+        if !new_items.is_empty() {
+            self.list.extend_items(new_items);
+            self.try_select_current();
+        }
+    }
 
-        let mut selected_index = 0;
-        let items: Vec<SelectItem> = scored
-            .iter()
-            .enumerate()
-            .map(|(row, (idx, _))| {
-                let info = &self.catalog[*idx];
-                let is_current = self
-                    .current_session_id
-                    .as_ref()
-                    .is_some_and(|tid| tid == &info.session_id);
-                if is_current {
-                    selected_index = row;
-                }
-                let primary = format_primary(info, is_current);
-                let secondary = format_secondary(info, self.now);
-                SelectItem::new(&info.session_id, &primary).with_description(&secondary)
-            })
-            .collect();
+    /// Move the highlight to the current session's row if it's pending
+    /// and present. A no-op once the user has taken over navigation
+    /// (`select_current_pending` cleared) or once the row is selected.
+    fn try_select_current(&mut self) {
+        if !self.select_current_pending {
+            return;
+        }
+        if let Some(id) = self.current_session_id.as_ref()
+            && self.list.select_by_value(id)
+        {
+            self.select_current_pending = false;
+        }
+    }
 
-        let mut list = SelectList::new(
-            items,
-            self.max_visible_rows,
-            self.theme.clone(),
-            primary_column_layout(),
-        );
-        list.set_focused(true);
-        list.set_selected_index(selected_index);
-        self.list = list;
+    /// Build one [`SelectItem`] for a preview. The `(current)` marker is
+    /// baked into the label at build time so it survives filtering; the
+    /// session id is the row value and the searchable text covers both
+    /// the first user message and the id.
+    fn build_item(&self, preview: &SessionPreview) -> SelectItem {
+        let is_current = self
+            .current_session_id
+            .as_ref()
+            .is_some_and(|id| id == &preview.session_id);
+        let primary = format_primary(preview, is_current);
+        let secondary = format_secondary(preview, self.now);
+        SelectItem::new(&preview.session_id, &primary)
+            .with_description(&secondary)
+            .with_filter_key(&haystack_for(preview))
     }
 
     /// Commit the currently-highlighted list entry into the outcome
-    /// slot. Looks the entry up in `catalog` by its `session_id` to
+    /// slot. Looks the entry up in `entries` by its `session_id` to
     /// recover the full [`SessionPreview`].
     fn commit_selection(&self) {
         let Some(item) = self.list.selected_item().cloned() else {
             return;
         };
         let Some(info) = self
-            .catalog
+            .entries
             .iter()
             .find(|p| p.session_id == item.value)
             .cloned()
@@ -250,6 +291,14 @@ fn haystack_for(preview: &SessionPreview) -> String {
 /// primary column, which truncates our `<preview> (current)` rows.
 /// Lift the cap to leave room for both the preview text and the
 /// `(current)` suffix; the description column shrinks accordingly.
+///
+/// Filtering uses [`FilterMode::SubstringAllTokens`]: the searchable
+/// text is the whole first user message plus the session id, which can
+/// be long, so fuzzy subsequence matching is too permissive (a
+/// multi-word query subsequence-matches almost any prompt). Each
+/// whitespace-separated query token must instead appear as a
+/// case-insensitive substring, and matches keep their newest-first
+/// order.
 fn primary_column_layout() -> SelectListLayout {
     SelectListLayout {
         // PREVIEW_MAX_CHARS for the preview text + 10 chars for
@@ -257,6 +306,8 @@ fn primary_column_layout() -> SelectListLayout {
         // `SelectList` accounts for inside this width.
         max_primary_column_width: Some(PREVIEW_MAX_CHARS + 12),
         wrap_selection: false,
+        filter_mode: FilterMode::SubstringAllTokens,
+        empty_message: "No sessions in this project".to_string(),
         ..SelectListLayout::default()
     }
 }
@@ -385,17 +436,23 @@ impl Component for SessionSelectorComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
+        self.drain_loads();
         // Chrome (title + border) is provided by the surrounding
         // `OverlayWindow` at mount time; we render just the search
         // input stacked above the result list.
         let mut lines = Vec::with_capacity(self.max_visible_rows + 2);
         lines.extend(self.search.render(width));
         lines.push(String::new());
-        lines.extend(self.list.render(width));
+        if self.loading && self.entries.is_empty() {
+            lines.push((self.theme.description)("Loading sessions…"));
+        } else {
+            lines.extend(self.list.render(width));
+        }
         lines
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
+        self.drain_loads();
         let kb = keybindings::get();
 
         // Esc cancels regardless of where focus appears to be.
@@ -410,25 +467,30 @@ impl Component for SessionSelectorComponent {
             return true;
         }
 
-        // Navigation keys belong to the list.
+        // Navigation keys belong to the list. Once the user navigates,
+        // stop chasing the current-session row on later batches.
         if kb.matches(event, "tui.select.up")
             || kb.matches(event, "tui.select.down")
             || kb.matches(event, "tui.select.pageUp")
             || kb.matches(event, "tui.select.pageDown")
         {
             drop(kb);
+            self.select_current_pending = false;
             return self.list.handle_input(event);
         }
 
         // Everything else goes to the search box. Drop the
-        // keybinding registry guard first so the rebuild below can
+        // keybinding registry guard first so the filter below can
         // re-acquire it without contention.
         drop(kb);
 
         let before = self.search.value().to_string();
         let handled = self.search.handle_input(event);
         if handled && self.search.value() != before {
-            self.rebuild_list();
+            // Filtering is a user-driven selection too: it resets the
+            // list to the top match, so stop chasing the current row.
+            self.select_current_pending = false;
+            self.list.set_filter(self.search.value());
         }
         handled
     }
@@ -447,6 +509,40 @@ impl Component for SessionSelectorComponent {
 
     fn is_focused(&self) -> bool {
         self.search.is_focused()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background scanning
+// ---------------------------------------------------------------------------
+
+/// Drive the streaming `scan` on a blocking thread, forwarding each
+/// batch it emits to the overlay's channel and waking the TUI; a `Done`
+/// marker follows so the overlay can drop its loading indicator. Outside
+/// a Tokio runtime (unit tests) the scan runs inline so results are
+/// delivered synchronously.
+fn spawn_scan(
+    scan: impl FnOnce(&mut dyn FnMut(Vec<SessionPreview>)) + Send + 'static,
+    tx: UnboundedSender<SessionLoad>,
+    render_handle: RenderHandle,
+) {
+    let run = move || {
+        let mut emit = |previews: Vec<SessionPreview>| {
+            if previews.is_empty() {
+                return;
+            }
+            let _ = tx.send(SessionLoad::Batch(previews));
+            render_handle.request_render();
+        };
+        scan(&mut emit);
+        let _ = tx.send(SessionLoad::Done);
+        render_handle.request_render();
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            tokio::task::spawn_blocking(run);
+        }
+        Err(_) => run(),
     }
 }
 
@@ -536,16 +632,28 @@ mod tests {
         Key::down()
     }
 
+    /// Build a selector whose scan emits `catalog` as a single batch.
+    /// Tests run outside a Tokio runtime, so [`spawn_scan`] executes
+    /// the scan inline; the batch is delivered into the channel before
+    /// `new` returns and drained on the first `render` / `handle_input`.
+    fn selector(
+        catalog: Vec<SessionPreview>,
+        current: Option<&str>,
+        initial_query: Option<&str>,
+    ) -> SessionSelectorComponent {
+        SessionSelectorComponent::new(
+            identity_theme(),
+            current.map(|s| s.to_string()),
+            initial_query.map(|s| s.to_string()),
+            TEST_MAX_VISIBLE_ROWS,
+            RenderHandle::detached(),
+            move |emit| emit(catalog),
+        )
+    }
+
     #[test]
     fn highlights_current_session_on_open() {
-        let catalog = sample_catalog();
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            Some("2025-05-09".to_string()),
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(sample_catalog(), Some("2025-05-09"), None);
         // Render wide enough that SelectList's primary column
         // doesn't truncate the `(current)` suffix off the label.
         let body = sel.render(200).join("\n");
@@ -558,14 +666,7 @@ mod tests {
 
     #[test]
     fn enter_commits_highlighted_entry() {
-        let catalog = sample_catalog();
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            Some("2025-05-10".to_string()),
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(sample_catalog(), Some("2025-05-10"), None);
         let outcome = sel.outcome_handle();
         // 2025-05-10 is pre-selected (current); Enter should commit
         // it verbatim.
@@ -581,14 +682,7 @@ mod tests {
 
     #[test]
     fn esc_emits_cancelled_outcome() {
-        let catalog = sample_catalog();
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            None,
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(sample_catalog(), None, None);
         let outcome = sel.outcome_handle();
         sel.handle_input(&escape_event());
         let result = outcome.lock().unwrap().take().expect("outcome was set");
@@ -600,15 +694,8 @@ mod tests {
 
     #[test]
     fn down_arrow_moves_to_next_row_then_enter_confirms_it() {
-        let catalog = sample_catalog();
         // No current session → first row pre-selected.
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            None,
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(sample_catalog(), None, None);
         let outcome = sel.outcome_handle();
         sel.handle_input(&down_event());
         sel.handle_input(&enter_event());
@@ -624,14 +711,7 @@ mod tests {
 
     #[test]
     fn typing_filters_the_list_and_enter_commits_top_match() {
-        let catalog = sample_catalog();
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            None,
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(sample_catalog(), None, None);
         let outcome = sel.outcome_handle();
         // Type "stream" — only "debug the streaming protocol"
         // should remain.
@@ -653,44 +733,41 @@ mod tests {
 
     #[test]
     fn initial_query_pre_fills_search_and_filters_immediately() {
-        let catalog = sample_catalog();
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            None,
-            Some("refactor".to_string()),
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(sample_catalog(), None, Some("refactor"));
         let body = sel.render(80).join("\n");
         assert!(body.contains("refactor the agent loop"), "got: {body}");
         assert!(!body.contains("debug"), "got: {body}");
     }
 
     #[test]
-    fn empty_catalog_renders_no_match_placeholder() {
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            vec![],
-            None,
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+    fn filter_is_substring_not_fuzzy_subsequence() {
+        // "dbg" is a subsequence of "debug" (so fuzzy would match) but
+        // not a substring, so substring filtering must exclude it.
+        let mut sel = selector(sample_catalog(), None, None);
+        for c in "dbg".chars() {
+            sel.handle_input(&Key::char(c));
+        }
         let body = sel.render(80).join("\n");
-        // SelectList renders "No matching ..." when filtered
-        // indices is empty.
-        assert!(body.contains("No matching"), "got: {body}");
+        assert!(
+            !body.contains("debug the streaming protocol"),
+            "got: {body}"
+        );
+        assert!(body.contains("No sessions in this project"), "got: {body}");
+    }
+
+    #[test]
+    fn empty_catalog_renders_no_match_placeholder() {
+        let mut sel = selector(vec![], None, None);
+        let body = sel.render(80).join("\n");
+        // With no sessions the list renders its configured empty
+        // message once the scan completes.
+        assert!(body.contains("No sessions in this project"), "got: {body}");
     }
 
     #[test]
     fn session_with_no_user_message_shows_placeholder_in_primary() {
         let catalog = vec![make_preview("2025-05-11", None, 0, Duration::seconds(10))];
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            None,
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(catalog, None, None);
         let body = sel.render(80).join("\n");
         assert!(body.contains("(no user message yet)"), "got: {body}");
     }
@@ -878,18 +955,94 @@ mod tests {
         // Pick the middle row as current. The pre-selection should
         // land in the visible window without any scroll.
         let current = catalog[6].session_id.clone();
-        let mut sel = SessionSelectorComponent::new(
-            identity_theme(),
-            catalog,
-            Some(current.clone()),
-            None,
-            TEST_MAX_VISIBLE_ROWS,
-        );
+        let mut sel = selector(catalog, Some(&current), None);
         // Render wide so column truncation can't strip "(current)".
         let body = sel.render(200).join("\n");
         assert!(
             body.contains("session 6 (current)"),
             "expected the current row to be visible: {body}"
+        );
+    }
+
+    #[test]
+    fn streamed_batches_accumulate_in_arrival_order() {
+        // Each emit is a separate batch; the list appends them rather
+        // than replacing, preserving arrival (newest-first) order.
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            None,
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+            RenderHandle::detached(),
+            |emit| {
+                emit(vec![make_preview(
+                    "2025-05-10",
+                    Some("newest session"),
+                    1,
+                    Duration::minutes(1),
+                )]);
+                emit(vec![make_preview(
+                    "2025-05-09",
+                    Some("older session"),
+                    1,
+                    Duration::hours(1),
+                )]);
+            },
+        );
+        let body = sel.render(200).join("\n");
+        let newest = body.find("newest session").expect("newest shown");
+        let older = body.find("older session").expect("older shown");
+        assert!(newest < older, "expected newest before older, got: {body}");
+    }
+
+    #[test]
+    fn current_session_selected_regardless_of_arrival_position() {
+        // The current row arrives in the second batch; the highlight
+        // should land on it wherever it appears (the user hasn't
+        // navigated), not default to the first row.
+        let mut sel = SessionSelectorComponent::new(
+            identity_theme(),
+            Some("2025-05-09".to_string()),
+            None,
+            TEST_MAX_VISIBLE_ROWS,
+            RenderHandle::detached(),
+            |emit| {
+                emit(vec![make_preview(
+                    "2025-05-10",
+                    Some("first batch"),
+                    1,
+                    Duration::minutes(1),
+                )]);
+                emit(vec![make_preview(
+                    "2025-05-09",
+                    Some("current session"),
+                    1,
+                    Duration::hours(1),
+                )]);
+            },
+        );
+        let outcome = sel.outcome_handle();
+        // Drain + confirm without navigating: the committed entry is the
+        // current session, even though it's not the first row.
+        sel.handle_input(&enter_event());
+        match outcome.lock().unwrap().take().expect("outcome was set") {
+            SessionSelectorOutcome::Confirmed(p) => assert_eq!(p.session_id, "2025-05-09"),
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn navigation_clears_pending_current_selection() {
+        // Navigating clears the pending flag so a later batch carrying
+        // the current row can't yank the cursor back. Use a current id
+        // absent from the catalog so the drain itself can't clear the
+        // flag — only the Down keypress should.
+        let mut sel = selector(sample_catalog(), Some("not-in-catalog"), None);
+        assert!(sel.select_current_pending);
+        sel.handle_input(&down_event());
+        assert!(
+            !sel.select_current_pending,
+            "navigation should stop the selector chasing the current row"
         );
     }
 }

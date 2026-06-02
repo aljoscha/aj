@@ -1582,36 +1582,22 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::OpenSessionSelector => 'arm: {
+        SlashAction::OpenSessionSelector => {
             // Read the current session id so the overlay pre-selects
-            // the active row.
+            // the active row once it streams in.
             let current_session_id = {
                 let l = log.lock().await;
                 l.session_id().to_string()
             };
 
-            // Load previews synchronously. At our scale (a few
-            // hundred sessions per project on a busy machine) this
-            // is sub-second; if/when that stops being true we'll
-            // move it onto `tokio::task::spawn_blocking` with the
-            // [`ConversationPersistence::list_session_previews`]
-            // progress callback wired into a header indicator.
-            let previews = match conversation_persistence.list_session_previews(|_, _| {}) {
-                Ok(p) => p,
-                Err(err) => {
-                    break 'arm SlashHandled::Continue {
-                        selector: None,
-                        notice: Some(format!("Failed to list sessions: {err}")),
-                    };
+            // Scan previews on a blocking thread so the overlay opens
+            // immediately and fills in incrementally as files are read.
+            let scan = {
+                let persistence = conversation_persistence.clone();
+                move |emit: &mut dyn FnMut(Vec<_>)| {
+                    persistence.list_session_previews_streaming(emit)
                 }
             };
-
-            if previews.is_empty() {
-                break 'arm SlashHandled::Continue {
-                    selector: None,
-                    notice: Some("No sessions to switch to in this project.".to_string()),
-                };
-            }
 
             let initial_inner_rows = large_overlay_inner_rows(usize::from(tui.terminal().rows()));
             // Session-selector chrome above the list: search input +
@@ -1619,10 +1605,11 @@ async fn handle_slash_command(
             let session_max_rows = initial_inner_rows.saturating_sub(3).max(1);
             let inner = SessionSelectorComponent::new(
                 select_list_theme(theme),
-                previews,
                 Some(current_session_id),
                 None,
                 session_max_rows,
+                tui.handle(),
+                scan,
             );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
