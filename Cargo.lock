@@ -29,6 +29,7 @@ dependencies = [
  "aj-tui",
  "anyhow",
  "arboard",
+ "async-trait",
  "chrono",
  "clap",
  "dotenv",

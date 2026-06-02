@@ -15,6 +15,8 @@
 //! [`AgentEvent`]: aj_agent::events::AgentEvent
 
 pub mod assistant_message;
+pub mod auth_picker;
+pub mod auth_status;
 pub mod bash_execution;
 pub mod command_palette;
 pub mod diff;
@@ -22,6 +24,7 @@ pub mod footer;
 pub mod header;
 pub mod help_overlay;
 pub mod loader_status;
+pub mod login_dialog;
 pub mod model_selector;
 pub mod prompt_history;
 pub mod session_selector;

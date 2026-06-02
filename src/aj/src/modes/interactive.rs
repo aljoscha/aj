@@ -30,6 +30,7 @@ use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
+use aj_models::auth::AuthStorage;
 use aj_models::registry::ModelRegistry;
 use aj_models::types::Speed;
 use aj_session::{
@@ -57,9 +58,18 @@ use crate::config::theme::{
     watch_user_theme,
 };
 use crate::model::{ResolvedModel, from_model_info};
+use crate::modes::interactive::components::auth_picker::{
+    AuthPickerComponent, AuthProviderItem, OutcomeHandle as AuthPickerOutcomeHandle,
+};
+use crate::modes::interactive::components::auth_status::{
+    AuthStatusComponent, AuthStatusOutcomeHandle,
+};
 use crate::modes::interactive::components::command_palette::CommandPaletteOutcomeHandle;
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
+use crate::modes::interactive::components::login_dialog::{
+    LoginDialogComponent, LoginDialogState, LoginLine, TuiOAuthCallbacks,
+};
 use crate::modes::interactive::components::model_selector::{
     ModelIdentityRef, ModelSelectorComponent, ModelSelectorOutcome,
     OutcomeHandle as ModelOutcomeHandle,
@@ -138,6 +148,14 @@ impl InteractiveMode {
         // for the `/model` selector overlay so it can pre-select the
         // active row when opened and track the swap target on
         // confirm.
+        // Credential store backing API-key resolution and the
+        // `/login` / `/logout` / `/auth` overlays. Cheap to clone
+        // (`Arc`-backed); the resolver installed in
+        // `crate::model::from_model_info` captures a clone and reads
+        // it on every inference, so a mid-session login takes effect
+        // without a restart.
+        let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
+
         let mut agent: Agent;
         let current_model_key: Arc<std::sync::Mutex<(String, String)>>;
         if let Some(name) = &self.args.scripted {
@@ -182,6 +200,7 @@ impl InteractiveMode {
             let registry = ModelRegistry::load();
             let resolved = crate::model::resolve(
                 &registry,
+                &auth,
                 self.args
                     .model_api
                     .as_deref()
@@ -228,6 +247,39 @@ impl InteractiveMode {
             );
         }
         agent.set_block_images(config.image_block);
+
+        // Apply a `--api-key` runtime override (if supplied) to the
+        // resolved provider, then check whether *any* credential is
+        // configured so we can nudge the user toward `/login` when
+        // none is. Both are skipped for the scripted fake provider,
+        // which needs no real credentials. The warning is emitted via
+        // the pump further below (it doesn't exist yet here).
+        let mut startup_auth_warning: Option<String> = None;
+        if self.args.scripted.is_none() {
+            let provider_id = {
+                let key = current_model_key
+                    .lock()
+                    .expect("current_model_key mutex poisoned");
+                key.0.clone()
+            };
+            if let Some(key) = self.args.api_key.clone() {
+                auth.set_runtime_api_key(&provider_id, key).await;
+            }
+            match auth.has_auth(&provider_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    startup_auth_warning = Some(format!(
+                        "Heads up: {}",
+                        crate::model::missing_key_message(&provider_id)
+                    ));
+                }
+                Err(err) => {
+                    startup_auth_warning = Some(format!(
+                        "Couldn't check credentials for {provider_id:?}: {err}"
+                    ));
+                }
+            }
+        }
 
         // Snapshot the model catalog up-front so the `/model`
         // selector overlay and the editor's argument completer
@@ -458,6 +510,9 @@ impl InteractiveMode {
         if sandbox_warning_enabled() {
             pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
         }
+        if let Some(warning) = &startup_auth_warning {
+            pump.handle(&mut tui, &warning_event(warning));
+        }
 
         // ---- Wrap log + agent in shared handles -----------------------
         // After replay we hand the log to the persistence listener
@@ -506,6 +561,17 @@ impl InteractiveMode {
         // so the main loop's job is just to poll the outcome slot
         // after every input event and close the overlay on result.
         let mut open_selector: Option<OpenSelector> = None;
+
+        // An in-flight OAuth login: the dialog overlay + a cancel flag
+        // the dialog (Esc) and Ctrl+C set, plus the spawned login task
+        // whose `JoinHandle` we poll alongside the agent turn. Kept
+        // separate from `open_selector` because the flow is async and
+        // long-running rather than a synchronous confirm/cancel
+        // selector.
+        let mut login_session: Option<LoginSession> = None;
+        let mut login_task: Option<
+            tokio::task::JoinHandle<Result<(), aj_models::auth::AuthError>>,
+        > = None;
 
         loop {
             // Build a future that resolves when the agent task
@@ -572,6 +638,46 @@ impl InteractiveMode {
                     }
                 }
 
+                // --- OAuth login task finished ---
+                login_outcome = async {
+                    match login_task.as_mut() {
+                        Some(handle) => handle.await,
+                        None => std::future::pending::<
+                            Result<Result<(), aj_models::auth::AuthError>, tokio::task::JoinError>,
+                        >()
+                        .await,
+                    }
+                } => {
+                    login_task = None;
+                    if let Some(session) = login_session.take() {
+                        tui.hide_overlay(&session.handle);
+                        let name = session.provider_name;
+                        match login_outcome {
+                            Ok(Ok(())) => {
+                                pump.handle(
+                                    &mut tui,
+                                    &notice_event(&format!("Logged in to {name}.")),
+                                );
+                            }
+                            Ok(Err(err)) => {
+                                pump.handle(
+                                    &mut tui,
+                                    &warning_event(&format!("Login to {name} failed: {err}")),
+                                );
+                            }
+                            // Aborted on Ctrl+C / Esc: the cancel-poll
+                            // arm already surfaced a "cancelled" notice.
+                            Err(join_err) if join_err.is_cancelled() => {}
+                            Err(join_err) => {
+                                pump.handle(
+                                    &mut tui,
+                                    &warning_event(&format!("Login task error: {join_err}")),
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // --- TUI input / render ---
                 maybe_event = tui.next_event() => {
                     let Some(event) = maybe_event else {
@@ -611,6 +717,13 @@ impl InteractiveMode {
                             if input.is_ctrl('c') {
                                 if let Some(token) = current_turn_cancel.as_ref() {
                                     token.cancel();
+                                    continue;
+                                }
+                                if let Some(session) = login_session.as_ref() {
+                                    // Login in flight: signal cancel.
+                                    // The cancel-poll below tears the
+                                    // dialog down and aborts the task.
+                                    session.cancel.store(true, Ordering::Relaxed);
                                     continue;
                                 }
                                 if open_selector.is_none() {
@@ -735,6 +848,7 @@ impl InteractiveMode {
                                     // our explicit teardown.
                                     consume_event = true;
                                 } else if open_selector.is_none()
+                                    && login_session.is_none()
                                     && kb.matches(
                                         &input,
                                         crate::config::keybindings::ACTION_PALETTE_OPEN,
@@ -747,6 +861,7 @@ impl InteractiveMode {
                                     // run (it's a no-op for this chord
                                     // since no component binds ctrl+o).
                                 } else if open_selector.is_none()
+                                    && login_session.is_none()
                                     && kb.matches(
                                         &input,
                                         crate::config::keybindings::ACTION_HISTORY_OPEN,
@@ -779,6 +894,27 @@ impl InteractiveMode {
                                 continue;
                             }
 
+                            // Login cancellation: the dialog's Esc (or
+                            // Ctrl+C above) flips the shared flag. Tear
+                            // the dialog down and abort the login task;
+                            // the task's `JoinHandle` arm sees the
+                            // cancellation and stays quiet.
+                            if let Some(session) = login_session.as_ref()
+                                && session.cancel.load(Ordering::Relaxed)
+                            {
+                                tui.hide_overlay(&session.handle);
+                                if let Some(task) = login_task.take() {
+                                    task.abort();
+                                }
+                                let name = session.provider_name.clone();
+                                login_session = None;
+                                pump.handle(
+                                    &mut tui,
+                                    &notice_event(&format!("Login to {name} cancelled.")),
+                                );
+                                continue;
+                            }
+
                             // Global palette open: fired either by the
                             // editor's `/`-at-empty-prompt callback
                             // (handled inside `tui.handle_input` above)
@@ -790,9 +926,11 @@ impl InteractiveMode {
                             // be inert while another selector is up.
                             if palette_open_request.swap(false, Ordering::Relaxed)
                                 && open_selector.is_none()
+                                && login_session.is_none()
                             {
                                 match handle_slash_command(
                                     &mut tui,
+                                    &auth,
                                     Arc::clone(&agent),
                                     Arc::clone(&model_catalog),
                                     Arc::clone(&current_model_key),
@@ -826,9 +964,11 @@ impl InteractiveMode {
                             // inert while another selector is up.
                             if history_open_request.swap(false, Ordering::Relaxed)
                                 && open_selector.is_none()
+                                && login_session.is_none()
                             {
                                 match handle_slash_command(
                                     &mut tui,
+                                    &auth,
                                     Arc::clone(&agent),
                                     Arc::clone(&model_catalog),
                                     Arc::clone(&current_model_key),
@@ -860,6 +1000,7 @@ impl InteractiveMode {
                                 match handle_selector_outcome(
                                     &mut tui,
                                     sel,
+                                    &auth,
                                     Arc::clone(&agent),
                                     Arc::clone(&current_model_key),
                                     Arc::clone(&config),
@@ -872,9 +1013,36 @@ impl InteractiveMode {
                                     SelectorPollOutcome::StillOpen(reopened) => {
                                         open_selector = Some(reopened);
                                     }
-                                    SelectorPollOutcome::Closed { notice, follow_up } => {
+                                    SelectorPollOutcome::Closed { notice, follow_up, start_login } => {
                                         if let Some(text) = notice {
                                             pump.handle(&mut tui, &notice_event(&text));
+                                        }
+                                        // A confirmed `/login` provider
+                                        // pick asks the host to launch
+                                        // the async browser flow: mount
+                                        // the dialog overlay and spawn
+                                        // the login task (polled by the
+                                        // login `select!` arm).
+                                        if let Some(provider_id) = start_login {
+                                            match start_login_session(
+                                                &mut tui,
+                                                &auth,
+                                                &theme,
+                                                &provider_id,
+                                            )
+                                            .await
+                                            {
+                                                Ok((session, task)) => {
+                                                    login_session = Some(session);
+                                                    login_task = Some(task);
+                                                }
+                                                Err(err) => pump.handle(
+                                                    &mut tui,
+                                                    &warning_event(&format!(
+                                                        "Couldn't start login: {err}"
+                                                    )),
+                                                ),
+                                            }
                                         }
                                         // The command palette chains into a
                                         // real slash command by emitting a
@@ -885,6 +1053,7 @@ impl InteractiveMode {
                                         if let Some(follow_up) = follow_up {
                                             match handle_slash_command(
                                                 &mut tui,
+                                                &auth,
                                                 Arc::clone(&agent),
                                                 Arc::clone(&model_catalog),
                                                 Arc::clone(&current_model_key),
@@ -935,6 +1104,7 @@ impl InteractiveMode {
                                     }
                                     match handle_slash_command(
                                         &mut tui,
+                                        &auth,
                                         Arc::clone(&agent),
                                         Arc::clone(&model_catalog),
                                         Arc::clone(&current_model_key),
@@ -1159,6 +1329,44 @@ enum OpenSelector {
         outcome: crate::modes::interactive::components::help_overlay::HelpOverlayOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
+    /// Provider picker for `/login` / `/logout`. `mode` decides what
+    /// confirming a provider does: start the OAuth browser flow, or
+    /// remove the stored credential.
+    AuthPicker {
+        handle: OverlayHandle,
+        outcome: AuthPickerOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
+        mode: AuthPickerMode,
+    },
+    /// Read-only `/auth` status overlay. Both Esc and Enter close it.
+    AuthStatus {
+        handle: OverlayHandle,
+        outcome: AuthStatusOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
+    },
+}
+
+/// What confirming a provider in the [`OpenSelector::AuthPicker`]
+/// overlay should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthPickerMode {
+    /// Start the provider's OAuth browser login flow.
+    Login,
+    /// Remove the provider's stored `auth.json` credential.
+    Logout,
+}
+
+/// An in-flight OAuth login the host is tracking.
+///
+/// The spawned login task lives in the main loop's `login_task`
+/// `JoinHandle`; this struct carries everything the host needs to
+/// tear the UI down: the dialog's overlay handle, the provider's
+/// display name (for the completion notice), and the cancel flag the
+/// dialog (Esc) and Ctrl+C flip.
+struct LoginSession {
+    provider_name: String,
+    handle: OverlayHandle,
+    cancel: Arc<AtomicBool>,
 }
 
 /// Snapshot of a palette pushed underneath a sub-selector. Held by
@@ -1204,6 +1412,11 @@ enum SelectorPollOutcome {
     Closed {
         notice: Option<String>,
         follow_up: Option<PaletteFollowUp>,
+        /// When set, a `/login` provider pick the host should turn
+        /// into a launched OAuth flow (the picker can't spawn the
+        /// task itself — that's the main loop's job, where the login
+        /// session state and the task `select!` arm live).
+        start_login: Option<String>,
     },
 }
 
@@ -1534,6 +1747,16 @@ fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
             handle,
             parent_palette,
             ..
+        }
+        | OpenSelector::AuthPicker {
+            handle,
+            parent_palette,
+            ..
+        }
+        | OpenSelector::AuthStatus {
+            handle,
+            parent_palette,
+            ..
         } => {
             tui.hide_overlay(&handle);
             if let Some(parent) = parent_palette {
@@ -1543,10 +1766,95 @@ fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
     }
 }
 
+/// Subtitle for the OAuth login dialog overlay: how to submit a
+/// pasted code and how to cancel, with key labels resolved from the
+/// keybindings manager.
+fn subtitle_login() -> String {
+    let submit = aj_tui::keybindings::format_action_shortcut("tui.input.submit")
+        .unwrap_or_else(|| "Enter".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    format!("{submit} to submit pasted code  \u{2022}  {cancel} to cancel")
+}
+
+/// Mount the OAuth login dialog overlay for `provider_id` and spawn
+/// the provider's login flow on a task.
+///
+/// The dialog and the flow's [`TuiOAuthCallbacks`] share a
+/// [`LoginDialogState`] (display lines + pending input), a pending-
+/// input sender slot, and a cancel flag. The returned
+/// [`LoginSession`] + `JoinHandle` are tracked by the main loop: its
+/// login `select!` arm surfaces the result and hides the overlay, and
+/// the cancel-poll aborts the task when the flag flips.
+async fn start_login_session(
+    tui: &mut Tui,
+    auth: &AuthStorage,
+    theme: &ThemeHandle,
+    provider_id: &str,
+) -> Result<(
+    LoginSession,
+    tokio::task::JoinHandle<Result<(), aj_models::auth::AuthError>>,
+)> {
+    let provider_name = auth
+        .oauth_provider_ids()
+        .await
+        .into_iter()
+        .find(|(id, _)| id == provider_id)
+        .map(|(_, name)| name)
+        .unwrap_or_else(|| provider_id.to_string());
+
+    // Shared handles: the dialog (UI thread) holds clones; the
+    // originals move into the login task's callbacks.
+    let state = Arc::new(std::sync::Mutex::new(LoginDialogState::default()));
+    let pending_input = Arc::new(std::sync::Mutex::new(None));
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Seed a line so the dialog isn't blank before the flow's first
+    // callback lands.
+    state
+        .lock()
+        .expect("login dialog state poisoned")
+        .lines
+        .push(LoginLine::Progress("Starting login…".to_string()));
+
+    let dialog = LoginDialogComponent::new(
+        theme,
+        Arc::clone(&state),
+        Arc::clone(&pending_input),
+        Arc::clone(&cancel),
+    );
+    let window = aj_tui::components::overlay_window::OverlayWindow::new(
+        &format!("Log in — {provider_name}"),
+        Box::new(dialog),
+        crate::config::theme::overlay_window_theme(theme),
+        PALETTE_OVERLAY_INNER_ROWS,
+    )
+    .with_subtitle(&subtitle_login());
+    let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+
+    let render = tui.handle();
+    let auth_for_task = auth.clone();
+    let provider_for_task = provider_id.to_string();
+    let task = tokio::spawn(async move {
+        let callbacks = TuiOAuthCallbacks::new(state, pending_input, render);
+        auth_for_task.login(&provider_for_task, &callbacks).await
+    });
+
+    Ok((
+        LoginSession {
+            provider_name,
+            handle,
+            cancel,
+        },
+        task,
+    ))
+}
+
 /// Dispatch a freshly-submitted slash-prefixed line.
 #[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
     tui: &mut Tui,
+    auth: &AuthStorage,
     agent: Arc<TokioMutex<Agent>>,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
@@ -1638,6 +1946,113 @@ async fn handle_slash_command(
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             SlashHandled::Continue {
                 selector: Some(OpenSelector::Model {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
+                notice: None,
+            }
+        }
+        SlashAction::OpenLoginSelector => {
+            let providers = auth.oauth_provider_ids().await;
+            if providers.is_empty() {
+                SlashHandled::Continue {
+                    selector: None,
+                    notice: Some("No OAuth providers are available to log in to.".to_string()),
+                }
+            } else {
+                let mut items = Vec::with_capacity(providers.len());
+                for (id, name) in &providers {
+                    let status = crate::auth::provider_status(auth, id, Some(name)).await;
+                    items.push(AuthProviderItem {
+                        provider_id: id.clone(),
+                        label: name.clone(),
+                        description: status.summary,
+                    });
+                }
+                let inner = AuthPickerComponent::new(select_list_theme(theme), items);
+                let outcome = inner.outcome_handle();
+                let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                    "Log in",
+                    Box::new(inner),
+                    crate::config::theme::overlay_window_theme(theme),
+                    PALETTE_OVERLAY_INNER_ROWS,
+                )
+                .with_subtitle(&subtitle_confirm_close());
+                let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+                SlashHandled::Continue {
+                    selector: Some(OpenSelector::AuthPicker {
+                        handle,
+                        outcome,
+                        parent_palette: parent_palette.clone(),
+                        mode: AuthPickerMode::Login,
+                    }),
+                    notice: None,
+                }
+            }
+        }
+        SlashAction::OpenLogoutSelector => {
+            let mut stored = auth.list().await.unwrap_or_default();
+            if stored.is_empty() {
+                SlashHandled::Continue {
+                    selector: None,
+                    notice: Some(
+                        "No stored credentials to remove. (Env vars and --api-key aren't \
+                         stored and can't be logged out.)"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                stored.sort();
+                let oauth = auth.oauth_provider_ids().await;
+                let mut items = Vec::with_capacity(stored.len());
+                for id in &stored {
+                    let name = oauth
+                        .iter()
+                        .find(|(pid, _)| pid == id)
+                        .map(|(_, n)| n.as_str());
+                    let status = crate::auth::provider_status(auth, id, name).await;
+                    items.push(AuthProviderItem {
+                        provider_id: id.clone(),
+                        label: name.map(|n| n.to_string()).unwrap_or_else(|| id.clone()),
+                        description: status.summary,
+                    });
+                }
+                let inner = AuthPickerComponent::new(select_list_theme(theme), items);
+                let outcome = inner.outcome_handle();
+                let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                    "Log out",
+                    Box::new(inner),
+                    crate::config::theme::overlay_window_theme(theme),
+                    PALETTE_OVERLAY_INNER_ROWS,
+                )
+                .with_subtitle(&subtitle_confirm_close());
+                let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+                SlashHandled::Continue {
+                    selector: Some(OpenSelector::AuthPicker {
+                        handle,
+                        outcome,
+                        parent_palette: parent_palette.clone(),
+                        mode: AuthPickerMode::Logout,
+                    }),
+                    notice: None,
+                }
+            }
+        }
+        SlashAction::OpenAuthStatus => {
+            let statuses = crate::auth::collect_statuses(auth).await;
+            let inner = AuthStatusComponent::new(select_list_theme(theme), statuses);
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Auth status",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::AuthStatus {
                     handle,
                     outcome,
                     parent_palette: parent_palette.clone(),
@@ -1815,7 +2230,9 @@ async fn handle_slash_command(
                         | OpenSelector::Model { .. }
                         | OpenSelector::Session { .. }
                         | OpenSelector::PromptHistory { .. }
-                        | OpenSelector::Help { .. },
+                        | OpenSelector::Help { .. }
+                        | OpenSelector::AuthPicker { .. }
+                        | OpenSelector::AuthStatus { .. },
                 ),
                 ..
             },
@@ -1837,6 +2254,7 @@ async fn handle_slash_command(
 async fn handle_selector_outcome(
     tui: &mut Tui,
     selector: OpenSelector,
+    auth: &AuthStorage,
     agent: Arc<TokioMutex<Agent>>,
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
     config: Arc<std::sync::Mutex<Config>>,
@@ -1892,6 +2310,7 @@ async fn handle_selector_outcome(
                     SelectorPollOutcome::Closed {
                         notice: Some(notice),
                         follow_up: None,
+                        start_login: None,
                     }
                 }
                 Some(ThinkingSelectorOutcome::Cancelled) => {
@@ -1912,6 +2331,7 @@ async fn handle_selector_outcome(
                     SelectorPollOutcome::Closed {
                         notice: None,
                         follow_up: None,
+                        start_login: None,
                     }
                 }
             }
@@ -1940,7 +2360,7 @@ async fn handle_selector_outcome(
                     // `--speed fast` at startup (it survives the
                     // swap if they re-pick a model that supports
                     // it; otherwise it silently degrades).
-                    match from_model_info(info.clone(), None) {
+                    match from_model_info(auth, info.clone(), None) {
                         Ok(ResolvedModel {
                             provider,
                             model_info,
@@ -2002,11 +2422,13 @@ async fn handle_selector_outcome(
                             SelectorPollOutcome::Closed {
                                 notice: Some(notice),
                                 follow_up: None,
+                                start_login: None,
                             }
                         }
                         Err(err) => SelectorPollOutcome::Closed {
                             notice: Some(format!("Failed to switch to {}: {err}", info.name)),
                             follow_up: None,
+                            start_login: None,
                         },
                     }
                 }
@@ -2022,6 +2444,7 @@ async fn handle_selector_outcome(
                     SelectorPollOutcome::Closed {
                         notice: None,
                         follow_up: None,
+                        start_login: None,
                     }
                 }
             }
@@ -2055,6 +2478,7 @@ async fn handle_selector_outcome(
                         return SelectorPollOutcome::Closed {
                             notice: Some(format!("Already on session {}.", preview.session_id)),
                             follow_up: None,
+                            start_login: None,
                         };
                     }
                     match perform_session_swap(
@@ -2072,6 +2496,7 @@ async fn handle_selector_outcome(
                         Ok(()) => SelectorPollOutcome::Closed {
                             notice: Some(format!("Switched to session {}.", preview.session_id)),
                             follow_up: None,
+                            start_login: None,
                         },
                         Err(err) => SelectorPollOutcome::Closed {
                             notice: Some(format!(
@@ -2079,6 +2504,7 @@ async fn handle_selector_outcome(
                                 preview.session_id
                             )),
                             follow_up: None,
+                            start_login: None,
                         },
                     }
                 }
@@ -2094,6 +2520,7 @@ async fn handle_selector_outcome(
                     SelectorPollOutcome::Closed {
                         notice: None,
                         follow_up: None,
+                        start_login: None,
                     }
                 }
             }
@@ -2122,6 +2549,7 @@ async fn handle_selector_outcome(
                 SelectorPollOutcome::Closed {
                     notice: None,
                     follow_up: None,
+                    start_login: None,
                 }
             }
             Some(PromptHistoryOutcome::Cancelled) => {
@@ -2136,6 +2564,7 @@ async fn handle_selector_outcome(
                 SelectorPollOutcome::Closed {
                     notice: None,
                     follow_up: None,
+                    start_login: None,
                 }
             }
         },
@@ -2163,6 +2592,98 @@ async fn handle_selector_outcome(
                     SelectorPollOutcome::Closed {
                         notice: None,
                         follow_up: None,
+                        start_login: None,
+                    }
+                }
+            }
+        }
+        OpenSelector::AuthPicker {
+            handle,
+            outcome,
+            parent_palette,
+            mode,
+        } => {
+            use crate::modes::interactive::components::auth_picker::AuthPickerOutcome;
+            let value = outcome.lock().expect("auth picker outcome poisoned").take();
+            match value {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::AuthPicker {
+                    handle,
+                    outcome,
+                    parent_palette,
+                    mode,
+                }),
+                Some(AuthPickerOutcome::Cancelled) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                    }
+                }
+                Some(AuthPickerOutcome::Confirmed(provider_id)) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.hide_overlay(&parent.handle);
+                    }
+                    match mode {
+                        // Login is async + long-running: hand the
+                        // provider id back so the main loop mounts the
+                        // dialog and spawns the flow.
+                        AuthPickerMode::Login => SelectorPollOutcome::Closed {
+                            notice: None,
+                            follow_up: None,
+                            start_login: Some(provider_id),
+                        },
+                        // Logout is a quick disk write we can do inline.
+                        AuthPickerMode::Logout => {
+                            let notice = match auth.logout(&provider_id).await {
+                                Ok(()) => format!("Logged out of {provider_id}."),
+                                Err(err) => {
+                                    format!("Failed to log out of {provider_id}: {err}")
+                                }
+                            };
+                            SelectorPollOutcome::Closed {
+                                notice: Some(notice),
+                                follow_up: None,
+                                start_login: None,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        OpenSelector::AuthStatus {
+            handle,
+            outcome,
+            parent_palette,
+        } => {
+            use crate::modes::interactive::components::auth_status::AuthStatusOutcome;
+            match outcome.take() {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::AuthStatus {
+                    handle,
+                    outcome,
+                    parent_palette,
+                }),
+                Some(AuthStatusOutcome::Closed) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
                     }
                 }
             }
@@ -2176,6 +2697,7 @@ async fn handle_selector_outcome(
                     SelectorPollOutcome::Closed {
                         notice: None,
                         follow_up: None,
+                        start_login: None,
                     }
                 }
                 Some(CommandPaletteOutcome::Confirmed { input }) => {
@@ -2199,6 +2721,7 @@ async fn handle_selector_outcome(
                                 outcome: outcome.clone(),
                             },
                         }),
+                        start_login: None,
                     }
                 }
             }

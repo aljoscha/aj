@@ -81,6 +81,27 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         action_id: None,
     },
     BuiltinCommand {
+        name: "login",
+        title: "login",
+        category: "auth",
+        description: "Log in to a provider via OAuth (browser flow).",
+        action_id: None,
+    },
+    BuiltinCommand {
+        name: "logout",
+        title: "logout",
+        category: "auth",
+        description: "Remove a provider's stored credentials.",
+        action_id: None,
+    },
+    BuiltinCommand {
+        name: "auth",
+        title: "status",
+        category: "auth",
+        description: "Show authentication status for each provider.",
+        action_id: None,
+    },
+    BuiltinCommand {
         name: "resume",
         title: "resume",
         category: "session",
@@ -156,6 +177,16 @@ pub enum SlashAction {
     /// Open the model selector overlay. The current model is
     /// pre-selected; `Esc` cancels, `Enter` applies.
     OpenModelSelector,
+    /// Open the OAuth login provider picker. On confirm the host
+    /// starts the provider's browser login flow in a dialog overlay.
+    OpenLoginSelector,
+    /// Open the logout provider picker (only providers with stored
+    /// credentials are listed). On confirm the host removes the
+    /// chosen provider's `auth.json` entry.
+    OpenLogoutSelector,
+    /// Open the read-only authentication-status overlay listing each
+    /// provider's credential method and source.
+    OpenAuthStatus,
     /// Open the session selector overlay. The currently-active
     /// session is pre-selected; `Enter` swaps the agent over to the
     /// chosen session, `Esc` cancels.
@@ -206,6 +237,9 @@ pub fn dispatch(input: &str) -> SlashAction {
     match head {
         "thinking" => SlashAction::OpenThinkingSelector,
         "model" => SlashAction::OpenModelSelector,
+        "login" => SlashAction::OpenLoginSelector,
+        "logout" => SlashAction::OpenLogoutSelector,
+        "auth" => SlashAction::OpenAuthStatus,
         "resume" => SlashAction::OpenSessionSelector,
         "history" => SlashAction::OpenPromptHistory,
         "palette" => SlashAction::OpenCommandPalette,
@@ -354,6 +388,18 @@ mod tests {
         assert_eq!(dispatch("  /model  "), SlashAction::OpenModelSelector);
         // Trailing tokens are ignored.
         assert_eq!(dispatch("/model sonnet"), SlashAction::OpenModelSelector);
+    }
+
+    #[test]
+    fn dispatch_auth_commands() {
+        assert_eq!(dispatch("/login"), SlashAction::OpenLoginSelector);
+        assert_eq!(dispatch("/logout"), SlashAction::OpenLogoutSelector);
+        // `auth status` is the friendly two-word phrasing surfaced in
+        // the palette; the second token is ignored like every other
+        // zero-argument command, so `/auth` and `/auth status` are
+        // equivalent.
+        assert_eq!(dispatch("/auth"), SlashAction::OpenAuthStatus);
+        assert_eq!(dispatch("/auth status"), SlashAction::OpenAuthStatus);
     }
 
     #[test]

@@ -25,6 +25,15 @@ pub struct Args {
     #[arg(long, env = "MODEL_NAME")]
     pub model_name: Option<String>,
 
+    /// API key for the resolved provider, applied as a runtime
+    /// override for this run only. Takes precedence over env vars
+    /// and any credential stored in `~/.aj/auth.json`, and is never
+    /// written to disk. Intentionally has no `env =` binding so the
+    /// only way to supply it is the explicit flag (provider-specific
+    /// env vars like `ANTHROPIC_API_KEY` remain the env path).
+    #[arg(long)]
+    pub api_key: Option<String>,
+
     /// Inference speed mode: `standard` (default) or `fast`
     /// (Anthropic beta `speed` parameter; requires the
     /// `fast-inference-2025-10-02` beta header).

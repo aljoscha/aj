@@ -200,6 +200,18 @@ impl AuthStorage {
             .remove(provider_id);
     }
 
+    /// Returns `true` if a runtime API-key override (CLI `--api-key`)
+    /// is currently installed for `provider_id`. The override's value
+    /// is deliberately not exposed — callers only need to know that it
+    /// wins the resolution chain, e.g. to label it in a status view.
+    pub async fn has_runtime_override(&self, provider_id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .runtime_overrides
+            .contains_key(provider_id)
+    }
+
     /// Read the credential currently stored for `provider_id`, if any.
     ///
     /// Performs a fresh disk read every call so multiple processes can
@@ -335,6 +347,23 @@ impl AuthStorage {
     /// [`AuthStorage::remove`] used by the CLI's `/logout` path.
     pub async fn logout(&self, provider_id: &str) -> Result<(), AuthError> {
         self.remove(provider_id).await
+    }
+
+    /// List the registered OAuth providers as `(id, display_name)`
+    /// pairs, sorted by id so a UI building a login picker gets a
+    /// stable order. The display name is [`OAuthProvider::name`]
+    /// (e.g. `"Anthropic (Claude Pro/Max)"`).
+    pub async fn oauth_provider_ids(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .state
+            .lock()
+            .await
+            .oauth_providers
+            .values()
+            .map(|p| (p.id().to_string(), p.name().to_string()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Look up an OAuth provider by id, returning a clone of the

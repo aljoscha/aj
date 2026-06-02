@@ -6,20 +6,29 @@
 //! [`ModelRegistry`](aj_models::registry::ModelRegistry), picks a
 //! concrete model (either an explicit `(provider, id)` pair or the
 //! provider's first listed entry), looks up the matching
-//! [`Provider`] impl by the model's `api` string, and resolves the
-//! API key from environment variables. The resulting bundle is what
+//! [`Provider`] impl by the model's `api` string, and installs an
+//! [`ApiKeyResolver`] backed by [`AuthStorage`]. The resulting bundle
+//! is what
 //! [`aj_agent::Agent::with_provider`] / [`aj_agent::Agent::set_provider`]
 //! consume directly — no further conversion at the call site.
+//!
+//! Key resolution is **lazy**: rather than reading a key up front and
+//! failing if none is set, the resolver is invoked by the provider
+//! before each inference and walks the [`AuthStorage`] chain (runtime
+//! `--api-key` override → env var → stored API key → stored OAuth,
+//! auto-refreshing). This lets a session start without credentials
+//! (e.g. so the user can run `/login`) and lets a mid-session login
+//! take effect on the next turn without a restart.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use aj_conf::ConfigThinkingDisplay;
-use aj_models::auth::{find_env_keys, get_env_api_key};
+use aj_models::auth::{AuthStorage, find_env_keys};
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
-use aj_models::types::{ReasoningSummary, Speed, StreamOptions, ThinkingDisplay};
-use anyhow::{Result, anyhow, bail};
+use aj_models::types::{ApiKeyResolver, ReasoningSummary, Speed, StreamOptions, ThinkingDisplay};
+use anyhow::{Result, anyhow};
 
 /// Beta header value that opts an Anthropic request into the
 /// fast-inference variant of the model. Stamped onto the outgoing
@@ -78,6 +87,7 @@ pub struct ResolvedModel {
 /// wire types as well.
 pub fn resolve(
     registry: &ModelRegistry,
+    auth: &AuthStorage,
     provider_id: Option<&str>,
     model_id: Option<&str>,
     url_override: Option<&str>,
@@ -92,17 +102,21 @@ pub fn resolve(
         // registry.
         model_info.base_url = url.to_string();
     }
-    from_model_info(model_info, speed)
+    from_model_info(auth, model_info, speed)
 }
 
 /// Build a [`ResolvedModel`] from a pre-picked [`ModelInfo`] — used by
 /// the `/model` selector which already has the catalog row in hand.
 ///
 /// Same effect as [`resolve`] minus the lookup: dispatch the
-/// `model_info.api` to the matching [`Provider`] impl, resolve the
-/// API key from env, and stamp speed-driven headers onto the
-/// baseline [`StreamOptions`].
-pub fn from_model_info(model_info: ModelInfo, speed: Option<Speed>) -> Result<ResolvedModel> {
+/// `model_info.api` to the matching [`Provider`] impl, install an
+/// [`AuthStorage`]-backed [`ApiKeyResolver`], and stamp speed-driven
+/// headers onto the baseline [`StreamOptions`].
+pub fn from_model_info(
+    auth: &AuthStorage,
+    model_info: ModelInfo,
+    speed: Option<Speed>,
+) -> Result<ResolvedModel> {
     let provider = provider_for(&model_info.api).ok_or_else(|| {
         anyhow!(
             "no provider registered for api {:?} (model {}/{})",
@@ -112,34 +126,8 @@ pub fn from_model_info(model_info: ModelInfo, speed: Option<Speed>) -> Result<Re
         )
     })?;
 
-    let api_key = match get_env_api_key(&model_info.provider) {
-        Some(key) => key,
-        None => {
-            // Surface the env vars we *would* have consulted so the
-            // user knows what to set. Sorted by preference so the
-            // first listed var is the canonical one.
-            let vars = find_env_keys(&model_info.provider);
-            if vars.is_empty() {
-                bail!(
-                    "no API key resolver for provider {:?}; \
-                     set `headers` overrides in models.json or wait \
-                     for the §4.3 SettingsManager auth pipeline",
-                    model_info.provider
-                );
-            }
-            bail!(
-                "no API key in environment for provider {:?}; \
-                 set one of: {}",
-                model_info.provider,
-                vars.join(", "),
-            );
-        }
-    };
-
-    let mut stream_options = StreamOptions {
-        api_key: Some(api_key),
-        ..StreamOptions::default()
-    };
+    let mut stream_options = StreamOptions::default();
+    install_api_key_resolver(&mut stream_options, auth, &model_info.provider);
     apply_speed_headers(&mut stream_options, &model_info, speed);
 
     Ok(ResolvedModel {
@@ -147,6 +135,56 @@ pub fn from_model_info(model_info: ModelInfo, speed: Option<Speed>) -> Result<Re
         model_info: Arc::new(model_info),
         stream_options,
     })
+}
+
+/// Install an [`ApiKeyResolver`] on `options` that resolves
+/// `provider_id`'s bearer token through [`AuthStorage`] on every
+/// inference.
+///
+/// Cloning the [`AuthStorage`] is cheap (it's `Arc`-backed) and the
+/// resolver closure is `Fn`, so the provider can call it repeatedly
+/// across a long-running session — each call re-walks the resolution
+/// chain and refreshes an expired OAuth token under the storage's
+/// cross-process file lock. A missing credential is surfaced as a
+/// human-readable error (the provider maps it to an `Auth`-category
+/// failure) rather than a hard startup bail, so a session can come up
+/// uncredentialed and the user can `/login`.
+fn install_api_key_resolver(options: &mut StreamOptions, auth: &AuthStorage, provider_id: &str) {
+    let auth = auth.clone();
+    let provider_id = provider_id.to_string();
+    options.set_api_key_resolver(Some(ApiKeyResolver::new(move || {
+        let auth = auth.clone();
+        let provider_id = provider_id.clone();
+        async move {
+            match auth.get_api_key(&provider_id).await {
+                Ok(Some(key)) => Ok(key),
+                Ok(None) => Err(missing_key_message(&provider_id)),
+                Err(err) => Err(format!(
+                    "failed to resolve credentials for {provider_id:?}: {err}"
+                )),
+            }
+        }
+    })));
+}
+
+/// Human-readable "no credential" message naming the env vars we'd
+/// have consulted and pointing at the interactive login flow. Used
+/// both by the resolver (per-request failure text) and by the
+/// startup auth check.
+pub fn missing_key_message(provider_id: &str) -> String {
+    let vars = find_env_keys(provider_id);
+    if vars.is_empty() {
+        format!(
+            "no credentials for provider {provider_id:?}; run /login, \
+             or set a `headers` override in models.json"
+        )
+    } else {
+        format!(
+            "no credentials for provider {provider_id:?}; run /login \
+             or set one of: {}",
+            vars.join(", "),
+        )
+    }
 }
 
 /// Pick a [`ModelInfo`] for the given `(provider, model)` pair.

@@ -16,6 +16,7 @@ aj-tools = { path = "../aj-tools/" }
 aj-tui = { path = "../aj-tui/" }
 anyhow = { workspace = true }
 arboard = { workspace = true }
+async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }

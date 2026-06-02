@@ -175,12 +175,29 @@ pub async fn run(args: Args) -> Result<()> {
         )
     } else {
         let registry = ModelRegistry::load();
+        // Credential store backing the lazy API-key resolver. Print
+        // mode has no interactive `/login`, but it still benefits from
+        // the full resolution chain (runtime override → env → stored
+        // key → stored OAuth) so a credential obtained via the
+        // interactive TUI works here too.
+        let auth = aj_models::auth::AuthStorage::at_default_path()
+            .context("failed to open ~/.aj/auth.json")?;
+        let provider_id = args
+            .model_api
+            .as_deref()
+            .or(config.model_api.as_deref())
+            .unwrap_or(crate::model::DEFAULT_PROVIDER_ID)
+            .to_string();
+        if let Some(key) = args.api_key.clone() {
+            auth.set_runtime_api_key(&provider_id, key).await;
+        }
         let ResolvedModel {
             provider,
             model_info,
             stream_options,
         } = crate::model::resolve(
             &registry,
+            &auth,
             args.model_api.as_deref().or(config.model_api.as_deref()),
             args.model_name.as_deref().or(config.model_name.as_deref()),
             args.model_url.as_deref().or(config.model_url.as_deref()),

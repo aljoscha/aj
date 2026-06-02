@@ -21,6 +21,7 @@
 // in this crate.
 pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
 
+pub mod auth;
 pub mod cli;
 pub mod clipboard;
 pub mod config;
