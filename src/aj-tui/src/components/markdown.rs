@@ -1642,24 +1642,28 @@ impl Markdown {
             .map(|r| r.iter().map(|c| inline_render(c)).collect())
             .collect();
 
-        // Per-column natural width (max visible width) and minimum width
-        // (longest unbreakable token).
+        // Per-column natural width (max visible cell width) and minimum
+        // width (longest unbreakable token, capped at
+        // `MAX_UNBROKEN_TOKEN_WIDTH`). The cap keeps one very long token
+        // from pinning a column to its full width and starving the
+        // others; tokens past the cap are hard-broken by
+        // `wrap_text_with_ansi`. `natural` is left uncapped so short
+        // content still gets its preferred width.
         let mut natural = vec![0_usize; n_cols];
         let mut minimum = vec![1_usize; n_cols];
         for col in 0..n_cols {
             if let Some(text) = header_text.get(col) {
                 natural[col] = natural[col].max(visible_width(text));
-                minimum[col] = minimum[col].max(longest_token_width(text));
+                minimum[col] =
+                    minimum[col].max(longest_token_width(text).min(MAX_UNBROKEN_TOKEN_WIDTH));
             }
             for row in &row_text {
                 if let Some(text) = row.get(col) {
                     natural[col] = natural[col].max(visible_width(text));
-                    minimum[col] = minimum[col].max(longest_token_width(text));
+                    minimum[col] =
+                        minimum[col].max(longest_token_width(text).min(MAX_UNBROKEN_TOKEN_WIDTH));
                 }
             }
-            // Empty columns still need width 1 so the border doesn't
-            // collapse.
-            natural[col] = natural[col].max(minimum[col]).max(1);
         }
 
         // Past the fallback gate, `available_for_cells >= n_cols >= 1`,
@@ -2123,8 +2127,9 @@ impl Component for Markdown {
 // ---------------------------------------------------------------------------
 
 /// Length of the longest contiguous non-whitespace run (visible-width,
-/// ANSI-aware). Used to pick a column's minimum width so wrapping never
-/// slices a token mid-glyph.
+/// ANSI-aware). Callers cap this at `MAX_UNBROKEN_TOKEN_WIDTH` when
+/// deriving a column's minimum width; up to that cap a column stays wide
+/// enough to hold its longest token without mid-token wrapping.
 fn longest_token_width(text: &str) -> usize {
     // Strip ANSI first so token boundaries are computed on the visible
     // characters. `visible_width` already ignores CSI sequences, so we
@@ -2158,82 +2163,104 @@ fn strip_ansi_for_tokens(s: &str) -> String {
     out
 }
 
-/// Distribute `available` columns across `n` columns.
+/// Upper bound on a column's minimum width. A column floor is the
+/// longest unbreakable token it contains, clamped to this many columns
+/// so a single overlong token (URL, hash, identifier) can't pin the
+/// column to its full width and starve its neighbours. Tokens past the
+/// cap are hard-broken by `wrap_text_with_ansi`.
+const MAX_UNBROKEN_TOKEN_WIDTH: usize = 30;
+
+/// Distribute `available` columns of cell width across `natural.len()`
+/// columns, given each column's `natural` (preferred) width and
+/// `minimum` (floor) width.
 ///
-/// Three tiers:
+/// The allocation proceeds in two stages:
 ///
-/// 1. If every column's natural width fits (`sum(natural) <= available`),
-///    return natural widths.
-/// 2. If the preferred minimums fit (`sum(minimum) <= available`),
-///    allocate each column its minimum and distribute the rest
-///    proportionally to each column's slack (`natural - minimum`).
-/// 3. Otherwise the preferred minimums don't even fit — `available` is
-///    less than `sum(longest unbreakable token per column)`. Allocate
-///    proportionally by preferred-minimum weight, with every column
-///    getting at least 1; `wrap_text_with_ansi` will hard-break any
-///    token that still doesn't fit. This is the "extremely narrow
-///    width" path.
+/// 1. **Effective minimums.** Start from the per-column `minimum`. If
+///    their sum already exceeds `available`, the table is narrower than
+///    its floors: collapse every column to width 1 and hand the
+///    remaining budget out proportional to each column's
+///    `minimum - 1` weight (leftover distributed one column at a time).
+/// 2. **Widths.** If every column's `natural` width fits
+///    (`sum(natural) <= available`), give each column
+///    `max(natural, effective_min)`. Otherwise floor each column at its
+///    effective minimum and distribute the leftover budget proportional
+///    to each column's growth potential (`natural - effective_min`),
+///    then hand out any rounding remainder one column at a time to
+///    columns still below their natural width.
 fn distribute_column_widths(natural: &[usize], minimum: &[usize], available: usize) -> Vec<usize> {
     let n = natural.len();
-    let natural_total: usize = natural.iter().sum();
 
-    if natural_total <= available {
-        return natural.to_vec();
-    }
-
-    let min_total: usize = minimum.iter().sum();
-    if min_total <= available {
-        let extra_budget = available - min_total;
-        let slack: Vec<usize> = natural
-            .iter()
-            .zip(minimum.iter())
-            .map(|(n, m)| n.saturating_sub(*m))
-            .collect();
-        let slack_total: usize = slack.iter().sum();
-
-        let mut widths = minimum.to_vec();
-        if slack_total > 0 {
-            let mut distributed = 0_usize;
-            for i in 0..n {
-                let add = extra_budget * slack[i] / slack_total;
-                widths[i] += add;
-                distributed += add;
+    // Stage 1: effective minimums.
+    let mut min_widths = minimum.to_vec();
+    let min_total: usize = min_widths.iter().sum();
+    if min_total > available {
+        min_widths = vec![1; n];
+        let remaining = available.saturating_sub(n);
+        if remaining > 0 {
+            let total_weight: usize = minimum.iter().map(|m| m.saturating_sub(1)).sum();
+            let mut allocated = 0_usize;
+            if total_weight > 0 {
+                for i in 0..n {
+                    let weight = minimum[i].saturating_sub(1);
+                    let add = weight * remaining / total_weight;
+                    min_widths[i] += add;
+                    allocated += add;
+                }
             }
-            let mut leftover = extra_budget.saturating_sub(distributed);
-            for i in 0..n {
+            let mut leftover = remaining - allocated;
+            for w in min_widths.iter_mut() {
                 if leftover == 0 {
                     break;
                 }
-                if widths[i] < natural[i] {
-                    widths[i] += 1;
-                    leftover -= 1;
-                }
+                *w += 1;
+                leftover -= 1;
             }
         }
-        return widths;
+    }
+    let min_cells_width: usize = min_widths.iter().sum();
+
+    // Stage 2: widths.
+    let natural_total: usize = natural.iter().sum();
+    if natural_total <= available {
+        return (0..n).map(|i| natural[i].max(min_widths[i])).collect();
     }
 
-    // Even the preferred minimums don't fit. Distribute `available`
-    // proportionally by minimum weight, clamped to at least 1 per
-    // column. Wrapping will hard-break any overlong tokens.
-    let mut widths: Vec<usize> = minimum
-        .iter()
-        .map(|m| (available * *m / min_total).max(1))
+    let total_grow_potential: usize = (0..n)
+        .map(|i| natural[i].saturating_sub(min_widths[i]))
+        .sum();
+    let extra_width = available.saturating_sub(min_cells_width);
+    let mut widths: Vec<usize> = (0..n)
+        .map(|i| {
+            let delta = natural[i].saturating_sub(min_widths[i]);
+            let grow = if total_grow_potential > 0 {
+                delta * extra_width / total_grow_potential
+            } else {
+                0
+            };
+            min_widths[i] + grow
+        })
         .collect();
-    // If the `.max(1)` clamp pushed us over budget, trim from the
-    // largest column until we fit (or every column is at 1).
-    let mut total: usize = widths.iter().sum();
-    while total > available {
-        let Some((i, _)) = widths
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| **w > 1)
-            .max_by_key(|(_, w)| **w)
-        else {
+
+    // Round-off: hand out the remaining budget one column at a time to
+    // any column still below its natural width.
+    let allocated: usize = widths.iter().sum();
+    let mut remaining = available.saturating_sub(allocated);
+    while remaining > 0 {
+        let mut grew = false;
+        for i in 0..n {
+            if remaining == 0 {
+                break;
+            }
+            if widths[i] < natural[i] {
+                widths[i] += 1;
+                remaining -= 1;
+                grew = true;
+            }
+        }
+        if !grew {
             break;
-        };
-        widths[i] -= 1;
-        total -= 1;
+        }
     }
     widths
 }
@@ -2460,6 +2487,60 @@ mod tests {
         assert_ne!(
             narrow, wide,
             "different widths must produce different wrapping",
+        );
+    }
+
+    /// When every column's natural width fits the budget, each column
+    /// is allocated its natural width (raised to its floor where the
+    /// floor is larger).
+    #[test]
+    fn distribute_returns_natural_widths_when_everything_fits() {
+        let widths = distribute_column_widths(&[10, 5, 8], &[3, 3, 3], 100);
+        assert_eq!(widths, vec![10, 5, 8]);
+    }
+
+    /// The allocation never exceeds the available budget, even when the
+    /// natural widths overflow it.
+    #[test]
+    fn distribute_never_exceeds_budget_when_shrinking() {
+        let widths = distribute_column_widths(&[40, 40, 40], &[5, 5, 5], 30);
+        assert!(
+            widths.iter().sum::<usize>() <= 30,
+            "allocation {widths:?} overflowed the budget",
+        );
+        assert!(widths.iter().all(|&w| w >= 1));
+    }
+
+    /// When even the per-column floors don't fit, columns collapse and
+    /// the budget is shared out by floor weight — every column still
+    /// gets at least one column and the total stays within budget.
+    #[test]
+    fn distribute_collapses_when_minimums_exceed_budget() {
+        let widths = distribute_column_widths(&[30, 30], &[30, 30], 10);
+        assert_eq!(widths.len(), 2);
+        assert!(widths.iter().all(|&w| w >= 1));
+        assert!(widths.iter().sum::<usize>() <= 10);
+    }
+
+    /// A column whose floor is capped (its longest token exceeds the
+    /// cap) does not pin the column to the token width: the neighbour
+    /// column still receives a meaningful share of the budget, and the
+    /// allocation stays within budget.
+    #[test]
+    fn distribute_capped_floor_leaves_room_for_neighbours() {
+        // Column 0: a 60-wide token capped to `MAX_UNBROKEN_TOKEN_WIDTH`.
+        // Column 1: natural 40, floor 8.
+        let cap = MAX_UNBROKEN_TOKEN_WIDTH;
+        let widths = distribute_column_widths(&[60, 40], &[cap, 8], 53);
+        assert_eq!(widths.len(), 2);
+        assert!(widths.iter().sum::<usize>() <= 53);
+        assert!(
+            widths[1] >= 8,
+            "neighbour column should keep at least its floor; got {widths:?}",
+        );
+        assert!(
+            widths[0] < 60,
+            "capped column should be narrower than its overlong token; got {widths:?}",
         );
     }
 }

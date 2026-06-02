@@ -431,6 +431,47 @@ fn wraps_long_unbroken_tokens_inside_table_cells() {
     assert!(joined.contains(url));
 }
 
+/// A column holding one overlong token must not pin itself to the token
+/// width and starve its neighbour. With a long URL in column one and a
+/// short word in column two, the URL column wraps (so the URL spans
+/// multiple lines) while the neighbour column still renders its content
+/// intact, and no line exceeds the render width.
+#[test]
+fn long_token_column_leaves_room_for_neighbour_column() {
+    let url = "https://example.com/some/quite/long/path/that/exceeds/the/cap";
+    let mut m = md(&format!(
+        "| Link | Note |\n| --- | --- |\n| {} | readable |",
+        url
+    ));
+    let width = 50;
+    let lines = m.render(width);
+    let plain = plain_lines_trim_end(&lines);
+
+    for line in &plain {
+        assert!(
+            aj_tui::ansi::visible_width(line) <= width,
+            "line exceeds width {}: {:?}",
+            width,
+            line,
+        );
+    }
+
+    // The neighbour column keeps its word intact on some row.
+    assert!(
+        plain.iter().any(|l| l.contains("readable")),
+        "neighbour column content should survive; got {:?}",
+        plain,
+    );
+
+    // The URL is hard-broken across rows (no single content row holds
+    // the whole thing), proving the column did not widen to the token.
+    assert!(
+        !plain.iter().any(|l| l.contains(url)),
+        "overlong token should wrap rather than widen its column; got {:?}",
+        plain,
+    );
+}
+
 #[test]
 fn wraps_styled_inline_code_inside_table_cells_without_breaking_borders() {
     let mut m = md("| Code |\n| --- |\n| `averyveryveryverylongidentifier` |");
