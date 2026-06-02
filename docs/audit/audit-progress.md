@@ -1,0 +1,118 @@
+# Module audit progress
+
+Tracking file for the audit specified in `docs/audit/audit-plan.md`.
+This is the file to point a session at:
+
+> follow `@docs/audit/audit-progress.md` and do the next step
+
+## How to do the next step
+
+1. Read `docs/audit/audit-plan.md` for the rubric, severity taxonomy, and
+   report template. (You only need to internalize it once per session.)
+2. In the tables below, find the first step with status `TODO` and start it.
+3. Record the commit under audit: `git rev-parse --short HEAD`.
+4. **Spawn one read-only sub-agent** for the step. Its task must:
+   - tell it to read `docs/audit/audit-plan.md` for the rubric and the
+     `_TEMPLATE.md` format;
+   - list the exact files in the step's scope (see the plan), including
+     their tests;
+   - have it **write** its report to `docs/audit/findings/<unit>.md` from
+     the template, and **return** a short summary plus severity counts;
+   - remind it the audit is **read-only**: no edits to source or tests.
+5. Read the written findings file; sanity-check that it's specific,
+   classified, and actionable.
+6. Update this file: set the step's status to `Done`, fill in the
+   severity counts, the findings link, the audited commit, and the date.
+   Add anything reusable to "Cross-cutting themes".
+7. Commit: `docs(audit): <unit> findings`.
+8. Stop after one step (incremental mode), unless explicitly driving
+   multiple steps in one session.
+
+The final step **X1** is done by the main agent directly (no sub-agent):
+it reads every findings report and synthesizes a top-level summary.
+
+## Status legend
+
+- `TODO` — not started.
+- `WIP` — sub-agent dispatched / report being finalized.
+- `Done` — findings written, counts recorded, committed.
+
+Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
+
+## Phase S — provider SDK clients
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| S1 | anthropic-sdk | TODO | – | – | – | – | – | – |
+| S2 | openai-sdk | TODO | – | – | – | – | – | – |
+
+## Phase M — `aj-models` (wire layer)
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| M1 | models-core | TODO | – | – | – | – | – | – |
+| M2 | models-streaming | TODO | – | – | – | – | – | – |
+| M3 | models-anthropic | TODO | – | – | – | – | – | – |
+| M4 | models-openai | TODO | – | – | – | – | – | – |
+| M5 | models-auth | TODO | – | – | – | – | – | – |
+
+## Phase C — `aj-conf`
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| C1 | conf | TODO | – | – | – | – | – | – |
+
+## Phase AG — `aj-agent` (runtime + contracts)
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| AG1 | agent-runtime | TODO | – | – | – | – | – | – |
+| AG2 | agent-contracts | TODO | – | – | – | – | – | – |
+
+## Phase SE — `aj-session`
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| SE1 | session | TODO | – | – | – | – | – | – |
+
+## Phase TO — `aj-tools`
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| TO1 | tools-framework | TODO | – | – | – | – | – | – |
+| TO2 | tools-impls | TODO | – | – | – | – | – | – |
+
+## Phase T — `aj-tui`
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| T1 | tui-core | TODO | – | – | – | – | – | – |
+| T2 | tui-text | TODO | – | – | – | – | – | – |
+| T3 | tui-editor | TODO | – | – | – | – | – | – |
+| T4 | tui-components | TODO | – | – | – | – | – | – |
+| T5 | tui-tests | TODO | – | – | – | – | – | – |
+
+## Phase A — `aj` (binary)
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| A1 | aj-cli | TODO | – | – | – | – | – | – |
+| A2 | aj-core | TODO | – | – | – | – | – | – |
+| A3 | aj-interactive | TODO | – | – | – | – | – | – |
+| A4 | aj-components | TODO | – | – | – | – | – | – |
+| A5 | aj-tests | TODO | – | – | – | – | – | – |
+
+## Phase X — synthesis
+
+| Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
+|---|---|---|---|---|---|---|---|---|
+| X1 | cross-crate synthesis | TODO | – | – | – | – | – | – |
+
+## Cross-cutting themes
+
+Recurring observations collected as steps complete; consumed by X1.
+(Empty until findings start landing.)
+
+## Audit log
+
+One line per completed step (most recent last).
