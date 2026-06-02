@@ -144,6 +144,23 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// Wrap `text` as an OSC 8 hyperlink pointing at `uri`.
+///
+/// On terminals that support hyperlinks (and tmux >= 3.4, which
+/// forwards them) the user can click `text` to open `uri` directly —
+/// no clipboard round-trip. On terminals without hyperlink support the
+/// escapes are inert and only `text` shows, so this degrades cleanly.
+/// The escapes are OSC sequences, which [`crate::ansi`]-style width
+/// measurement (`visible_width`) treats as zero-width, so they don't
+/// disturb the overlay's width-based padding.
+fn hyperlink(uri: &str, text: &str) -> String {
+    // Defensive: a stray ESC/BEL in the URI would break out of the
+    // OSC 8 sequence. Our login URLs are provider-constructed, but
+    // strip control bytes regardless.
+    let safe: String = uri.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]8;;{safe}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
 impl Component for LoginDialogComponent {
     aj_tui::impl_component_any!();
 
@@ -175,8 +192,10 @@ impl Component for LoginDialogComponent {
                 LoginLine::Info(t) => out.push((self.style.info)(t)),
                 LoginLine::Progress(t) => out.push((self.style.progress)(t)),
                 LoginLine::Url(u) => {
+                    // Each wrapped chunk is its own hyperlink to the
+                    // full URL, so clicking any visible part opens it.
                     for chunk in wrap_chars(u, width) {
-                        out.push((self.style.url)(&chunk));
+                        out.push(hyperlink(u, &(self.style.url)(&chunk)));
                     }
                 }
             }
@@ -330,7 +349,7 @@ impl OAuthCallbacks for TuiOAuthCallbacks {
                 st.lines.push(LoginLine::Info(instructions.to_string()));
             }
             st.lines.push(LoginLine::Info(
-                "If it doesn't open, copy this URL (Ctrl+Y) or visit it:".to_string(),
+                "If it doesn't open, click or copy (Ctrl+Y) this URL:".to_string(),
             ));
             st.lines.push(LoginLine::Url(info.url.to_string()));
             st.url = Some(info.url.to_string());
@@ -436,5 +455,41 @@ mod tests {
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| c.chars().count() <= 40));
         assert_eq!(chunks.concat(), long);
+    }
+
+    #[test]
+    fn hyperlink_wraps_text_in_osc8() {
+        assert_eq!(
+            hyperlink("https://x/y", "label"),
+            "\x1b]8;;https://x/y\x1b\\label\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn hyperlink_strips_control_bytes_from_uri() {
+        // A stray ESC in the URI must not survive into the sequence.
+        let h = hyperlink("https://x/\x1bevil", "t");
+        assert!(h.contains("https://x/evil"), "{h:?}");
+        // The only ESC bytes are the OSC 8 framing, never the injected one.
+        assert_eq!(h.matches('\x1b').count(), 4);
+    }
+
+    #[test]
+    fn url_line_renders_as_hyperlink() {
+        let (mut dialog, state, _pending, _cancel) = make();
+        // Skip the copy-on-first-render side effect (clipboard/stdout).
+        dialog.auto_copied = true;
+        let url = "https://example.com/oauth/authorize?x=1";
+        state
+            .lock()
+            .unwrap()
+            .lines
+            .push(LoginLine::Url(url.to_string()));
+        let body = dialog.render(80).join("\n");
+        assert!(
+            body.contains(&format!("\x1b]8;;{url}\x1b\\")),
+            "expected OSC 8 open for {url} in {body:?}"
+        );
+        assert!(body.contains(url), "{body:?}");
     }
 }
