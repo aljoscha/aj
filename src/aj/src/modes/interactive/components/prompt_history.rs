@@ -15,11 +15,12 @@
 //!
 //! Both scopes are scanned on a blocking thread, not on the TUI event
 //! loop: the overlay opens immediately (showing a loading indicator)
-//! and the list is populated when a scan delivers its result through
-//! an internal channel drained at the top of `render`. The
-//! current-workspace scan starts as soon as the overlay is built; the
-//! all-workspaces scan is deferred until the first toggle so it costs
-//! nothing when the user never leaves the workspace scope.
+//! and the list fills in incrementally as the scan streams batches
+//! (one per session file, newest-first) through an internal channel
+//! drained at the top of `render`. The current-workspace scan starts
+//! as soon as the overlay is built; the all-workspaces scan is
+//! deferred until the first toggle so it costs nothing when the user
+//! never leaves the workspace scope.
 //!
 //! Like the command palette, the list is built once per scope and
 //! filtered via [`SelectList::set_filter`] on each keystroke rather
@@ -106,18 +107,23 @@ impl PromptHistoryOutcomeHandle {
     }
 }
 
-/// Loader for the all-workspaces scope. Invoked at most once (on the
-/// first toggle to that scope) on a blocking thread; the result is
-/// cached.
-type AllLoader = Arc<dyn Fn() -> Vec<PromptHistoryEntry> + Send + Sync>;
-
 /// Result of a background scan, delivered to the live overlay. The
-/// component drains these at the top of `render` and rebuilds the list
-/// when the result targets the visible scope.
+/// component drains these at the top of `render`, appending batches and
+/// clearing the loading indicator on `Done`.
 enum PromptHistoryLoad {
-    Workspace(Vec<PromptHistoryEntry>),
-    All(Vec<PromptHistoryEntry>),
+    /// A batch of entries for `scope`, appended in arrival order.
+    Batch {
+        scope: Scope,
+        entries: Vec<PromptHistoryEntry>,
+    },
+    /// `scope`'s scan finished; clears its loading indicator.
+    Done { scope: Scope },
 }
+
+/// A streaming scan: given an `emit` sink, drives the scan and calls
+/// `emit` once per session file. Boxed so the all-workspaces scan can
+/// be stored until the first toggle.
+type Scan = Box<dyn FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send>;
 
 /// Prompt-history search component.
 pub struct PromptHistorySearchComponent {
@@ -126,18 +132,16 @@ pub struct PromptHistorySearchComponent {
     theme: SelectListTheme,
     max_visible_rows: usize,
     scope: Scope,
+    /// Entries per scope, appended as background batches arrive.
     workspace_entries: Vec<PromptHistoryEntry>,
-    /// Cached all-workspaces entries; `None` until the first toggle's
-    /// scan completes.
-    all_entries: Option<Vec<PromptHistoryEntry>>,
+    all_entries: Vec<PromptHistoryEntry>,
     /// Whether each scope's background scan is still in flight. Used to
-    /// show a loading indicator rather than an empty list.
+    /// show a loading indicator and a scope-line hint.
     workspace_loading: bool,
     all_loading: bool,
-    /// Set once the all-workspaces scan has been kicked off so toggling
-    /// back and forth doesn't re-scan.
-    all_requested: bool,
-    all_loader: AllLoader,
+    /// The all-workspaces scan, taken and started on the first toggle to
+    /// that scope; `None` thereafter so it never re-scans.
+    all_scan: Option<Scan>,
     /// Inbound scan results, drained in `render`.
     loads_tx: UnboundedSender<PromptHistoryLoad>,
     loads_rx: UnboundedReceiver<PromptHistoryLoad>,
@@ -148,15 +152,15 @@ pub struct PromptHistorySearchComponent {
 impl PromptHistorySearchComponent {
     /// Build the overlay and kick off the current-workspace scan on a
     /// blocking thread. The list starts empty (showing a loading
-    /// indicator) and is populated when the scan delivers its result.
-    /// `all_loader` produces the all-workspaces set on demand, scanned
-    /// the first time the user toggles to that scope.
+    /// indicator) and fills in as the scan streams batches. `all_scan`
+    /// produces the all-workspaces set on demand, scanned the first
+    /// time the user toggles to that scope.
     pub fn new(
         theme: SelectListTheme,
         max_visible_rows: usize,
         render_handle: RenderHandle,
-        workspace_loader: impl FnOnce() -> Vec<PromptHistoryEntry> + Send + 'static,
-        all_loader: impl Fn() -> Vec<PromptHistoryEntry> + Send + Sync + 'static,
+        workspace_scan: impl FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send + 'static,
+        all_scan: impl FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send + 'static,
     ) -> Self {
         let mut search = TextInput::new("search: ");
         search.set_focused(true);
@@ -165,11 +169,11 @@ impl PromptHistorySearchComponent {
         list.set_focused(true);
 
         let (loads_tx, loads_rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_load(
-            workspace_loader,
+        spawn_scan(
+            Scope::Workspace,
+            workspace_scan,
             loads_tx.clone(),
             render_handle.clone(),
-            PromptHistoryLoad::Workspace,
         );
 
         Self {
@@ -179,11 +183,10 @@ impl PromptHistorySearchComponent {
             max_visible_rows,
             scope: Scope::Workspace,
             workspace_entries: Vec::new(),
-            all_entries: None,
+            all_entries: Vec::new(),
             workspace_loading: true,
             all_loading: false,
-            all_requested: false,
-            all_loader: Arc::new(all_loader),
+            all_scan: Some(Box::new(all_scan)),
             loads_tx,
             loads_rx,
             render_handle,
@@ -197,12 +200,12 @@ impl PromptHistorySearchComponent {
     }
 
     /// Entries backing the currently-selected scope. The all-workspaces
-    /// scope returns an empty slice until its scan completes (the
-    /// loading indicator covers that window).
+    /// scope is empty until its scan streams in (the loading indicator
+    /// covers that window).
     fn current_entries(&self) -> &[PromptHistoryEntry] {
         match self.scope {
             Scope::Workspace => &self.workspace_entries,
-            Scope::All => self.all_entries.as_deref().unwrap_or(&[]),
+            Scope::All => &self.all_entries,
         }
     }
 
@@ -214,21 +217,28 @@ impl PromptHistorySearchComponent {
         }
     }
 
-    /// Apply scan results delivered since the last render, rebuilding
-    /// the list when a result targets the visible scope.
+    /// Apply scan results delivered since the last render: append
+    /// batches and clear the loading flag on `Done`. Rebuilds the list
+    /// once when anything touched the visible scope.
     fn drain_loads(&mut self) {
         let mut visible_changed = false;
         while let Ok(load) = self.loads_rx.try_recv() {
             match load {
-                PromptHistoryLoad::Workspace(entries) => {
-                    self.workspace_entries = entries;
-                    self.workspace_loading = false;
-                    visible_changed |= self.scope == Scope::Workspace;
+                PromptHistoryLoad::Batch { scope, entries } => {
+                    match scope {
+                        Scope::Workspace => self.workspace_entries.extend(entries),
+                        Scope::All => self.all_entries.extend(entries),
+                    }
+                    visible_changed |= scope == self.scope;
                 }
-                PromptHistoryLoad::All(entries) => {
-                    self.all_entries = Some(entries);
-                    self.all_loading = false;
-                    visible_changed |= self.scope == Scope::All;
+                PromptHistoryLoad::Done { scope } => {
+                    match scope {
+                        Scope::Workspace => self.workspace_loading = false,
+                        Scope::All => self.all_loading = false,
+                    }
+                    // A `Done` for the visible scope may need to swap the
+                    // loading indicator for an empty list.
+                    visible_changed |= scope == self.scope;
                 }
             }
         }
@@ -237,10 +247,13 @@ impl PromptHistorySearchComponent {
         }
     }
 
-    /// Rebuild the list for the current scope and re-apply the active
-    /// search filter. Used on scope toggle and whenever a scan delivers
-    /// results for the visible scope.
+    /// Rebuild the list for the current scope, re-apply the active
+    /// search filter, and restore the previously-highlighted row when it
+    /// survives. Used on scope toggle and whenever a scan streams more
+    /// entries into the visible scope, so incremental fill doesn't yank
+    /// the user's selection back to the top.
     fn rebuild_list(&mut self) {
+        let selected_value = self.list.selected_item().map(|item| item.value.clone());
         let items = build_items(self.current_entries());
         let mut list = SelectList::new(
             items,
@@ -249,8 +262,11 @@ impl PromptHistorySearchComponent {
             list_layout(),
         );
         list.set_focused(true);
+        list.set_filter(self.search.value());
+        if let Some(value) = selected_value {
+            list.select_by_value(&value);
+        }
         self.list = list;
-        self.list.set_filter(self.search.value());
     }
 
     /// Flip the scope, kicking off the all-workspaces scan the first
@@ -267,21 +283,18 @@ impl PromptHistorySearchComponent {
     }
 
     /// Kick off the all-workspaces scan on a blocking thread the first
-    /// time the scope is toggled. The result is cached, so repeated
+    /// time the scope is toggled. The scan is consumed here, so repeated
     /// toggles never re-scan.
     fn request_all_load(&mut self) {
-        if self.all_requested {
-            return;
+        if let Some(scan) = self.all_scan.take() {
+            self.all_loading = true;
+            spawn_scan(
+                Scope::All,
+                scan,
+                self.loads_tx.clone(),
+                self.render_handle.clone(),
+            );
         }
-        self.all_requested = true;
-        self.all_loading = true;
-        let loader = Arc::clone(&self.all_loader);
-        spawn_load(
-            move || loader(),
-            self.loads_tx.clone(),
-            self.render_handle.clone(),
-            PromptHistoryLoad::All,
-        );
     }
 
     fn commit_selection(&self) {
@@ -297,14 +310,19 @@ impl PromptHistorySearchComponent {
     }
 
     /// Dim status line advertising the current scope and the toggle
-    /// chord, rendered between the search box and the list.
+    /// chord, rendered between the search box and the list. While the
+    /// visible scope is still streaming results it also carries a
+    /// `loading…` hint so partial lists don't look complete.
     fn scope_line(&self) -> String {
         let key = aj_tui::keybindings::format_action_shortcut(ACTION_HISTORY_TOGGLE_SCOPE)
             .unwrap_or_else(|| "Ctrl+T".to_string());
-        let text = match self.scope {
+        let mut text = match self.scope {
             Scope::Workspace => format!("this workspace  \u{2022}  {key} all workspaces"),
             Scope::All => format!("all workspaces  \u{2022}  {key} this workspace"),
         };
+        if self.is_current_loading() {
+            text.push_str("  \u{2022}  loading\u{2026}");
+        }
         (self.theme.description)(&text)
     }
 }
@@ -444,18 +462,27 @@ impl Component for PromptHistorySearchComponent {
 // Scanning: extract submitted prompts from on-disk session logs.
 // ---------------------------------------------------------------------------
 
-/// Run `load` on a blocking thread, deliver the result (wrapped by
-/// `wrap`) to the overlay's channel, and wake the TUI. Outside a Tokio
-/// runtime (unit tests) the load runs inline so results are delivered
-/// synchronously.
-fn spawn_load(
-    load: impl FnOnce() -> Vec<PromptHistoryEntry> + Send + 'static,
+/// Drive a streaming `scan` on a blocking thread, forwarding each
+/// batch it emits to the overlay's channel tagged with `scope` and
+/// waking the TUI; a `Done` marker follows so the overlay can drop its
+/// loading indicator. Outside a Tokio runtime (unit tests) the scan
+/// runs inline so results are delivered synchronously.
+fn spawn_scan(
+    scope: Scope,
+    scan: impl FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send + 'static,
     tx: UnboundedSender<PromptHistoryLoad>,
     render_handle: RenderHandle,
-    wrap: fn(Vec<PromptHistoryEntry>) -> PromptHistoryLoad,
 ) {
     let run = move || {
-        let _ = tx.send(wrap(load()));
+        let mut emit = |entries: Vec<PromptHistoryEntry>| {
+            if entries.is_empty() {
+                return;
+            }
+            let _ = tx.send(PromptHistoryLoad::Batch { scope, entries });
+            render_handle.request_render();
+        };
+        scan(&mut emit);
+        let _ = tx.send(PromptHistoryLoad::Done { scope });
         render_handle.request_render();
     };
     match tokio::runtime::Handle::try_current() {
@@ -466,18 +493,28 @@ fn spawn_load(
     }
 }
 
-/// Collect the current workspace's submitted prompts, newest-first,
-/// deduplicated.
-pub fn workspace_history(persistence: &ConversationPersistence) -> Vec<PromptHistoryEntry> {
+/// Stream the current workspace's submitted prompts, newest-first and
+/// deduplicated, invoking `emit` once per session file (each call
+/// carrying that file's new prompts). Capped at [`MAX_ENTRIES`] across
+/// the whole scan.
+pub fn workspace_history_streaming(
+    persistence: &ConversationPersistence,
+    emit: &mut dyn FnMut(Vec<PromptHistoryEntry>),
+) {
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    collect_dir(persistence.sessions_dir(), None, &mut seen, &mut out);
-    out
+    let mut remaining = MAX_ENTRIES;
+    collect_dir(
+        persistence.sessions_dir(),
+        None,
+        &mut seen,
+        &mut remaining,
+        emit,
+    );
 }
 
-/// Collect submitted prompts across every project under
-/// `sessions_base` (`~/.aj/sessions`), deduplicated, each entry tagged
-/// with its project (subdirectory) label.
+/// Stream submitted prompts across every project under `sessions_base`
+/// (`~/.aj/sessions`), deduplicated and each tagged with its project
+/// (subdirectory) label, invoking `emit` once per session file.
 ///
 /// Projects are visited in reverse-lexicographic directory order and
 /// files within a project newest-first, so a prompt's tag reflects
@@ -485,10 +522,10 @@ pub fn workspace_history(persistence: &ConversationPersistence) -> Vec<PromptHis
 /// directory order is unrelated to recency — it exists only to make
 /// the dedup deterministic — so the tag on a prompt shared across
 /// projects is stable but not a "most recent workspace" guarantee.
-pub fn all_workspaces_history(sessions_base: &Path) -> Vec<PromptHistoryEntry> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
+pub fn all_workspaces_history_streaming(
+    sessions_base: &Path,
+    emit: &mut dyn FnMut(Vec<PromptHistoryEntry>),
+) {
     let read_dir = match std::fs::read_dir(sessions_base) {
         Ok(rd) => rd,
         Err(e) => {
@@ -496,7 +533,7 @@ pub fn all_workspaces_history(sessions_base: &Path) -> Vec<PromptHistoryEntry> {
                 "could not read sessions base {}: {e}",
                 sessions_base.display()
             );
-            return out;
+            return;
         }
     };
 
@@ -511,27 +548,31 @@ pub fn all_workspaces_history(sessions_base: &Path) -> Vec<PromptHistoryEntry> {
     projects.sort();
     projects.reverse();
 
+    let mut seen = HashSet::new();
+    let mut remaining = MAX_ENTRIES;
     for dir in &projects {
+        if remaining == 0 {
+            break;
+        }
         let project = dir
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string());
-        collect_dir(dir, project, &mut seen, &mut out);
-        if out.len() >= MAX_ENTRIES {
-            break;
-        }
+        collect_dir(dir, project, &mut seen, &mut remaining, emit);
     }
-    out
 }
 
-/// Walk every `*.jsonl` file in `dir`, newest file first, appending
-/// each file's prompts newest-first to `out` (skipping bodies already
-/// in `seen`). `project` tags every entry produced here.
+/// Walk every `*.jsonl` file in `dir`, newest file first, invoking
+/// `emit` once per file with that file's new prompts (newest-first,
+/// skipping bodies already in `seen`). `project` tags every entry.
+/// `remaining` is the shared [`MAX_ENTRIES`] budget, decremented as
+/// entries are produced; the walk stops once it hits zero.
 fn collect_dir(
     dir: &Path,
     project: Option<String>,
     seen: &mut HashSet<String>,
-    out: &mut Vec<PromptHistoryEntry>,
+    remaining: &mut usize,
+    emit: &mut dyn FnMut(Vec<PromptHistoryEntry>),
 ) {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -551,21 +592,27 @@ fn collect_dir(
     files.reverse();
 
     for path in &files {
+        if *remaining == 0 {
+            return;
+        }
         // Within a file prompts are chronological; reverse so the
         // most recent prompt in this file lands first.
         let mut prompts = load_file_prompts(path);
         prompts.reverse();
+        let mut batch = Vec::new();
         for text in prompts {
+            if *remaining == 0 {
+                break;
+            }
             if seen.insert(text.clone()) {
-                out.push(PromptHistoryEntry {
+                batch.push(PromptHistoryEntry {
                     text,
                     project: project.clone(),
                 });
-                if out.len() >= MAX_ENTRIES {
-                    return;
-                }
+                *remaining -= 1;
             }
         }
+        emit(batch);
     }
 }
 
@@ -645,9 +692,18 @@ mod tests {
             identity_theme(),
             10,
             RenderHandle::detached(),
-            move || workspace,
-            move || all.clone(),
+            move |emit| emit(workspace),
+            move |emit| emit(all),
         )
+    }
+
+    /// Drain a streaming scan into a single vector (test convenience).
+    fn collect(
+        scan: impl FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)),
+    ) -> Vec<PromptHistoryEntry> {
+        let mut out = Vec::new();
+        scan(&mut |batch| out.extend(batch));
+        out
     }
 
     #[test]
@@ -698,6 +754,26 @@ mod tests {
     }
 
     #[test]
+    fn batches_accumulate_in_arrival_order() {
+        // Each `emit` is a separate batch; the list appends them rather
+        // than replacing, preserving arrival (newest-first) order.
+        let mut c = PromptHistorySearchComponent::new(
+            identity_theme(),
+            10,
+            RenderHandle::detached(),
+            |emit| {
+                emit(vec![entry("newest", None)]);
+                emit(vec![entry("older", None)]);
+            },
+            |_emit| {},
+        );
+        let body = c.render(80).join("\n");
+        let newest = body.find("newest").expect("newest shown");
+        let older = body.find("older").expect("older shown");
+        assert!(newest < older, "expected newest before older, got: {body}");
+    }
+
+    #[test]
     fn toggle_scope_loads_all_lazily_once() {
         crate::config::keybindings::install_global_manager_defaults();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -706,10 +782,10 @@ mod tests {
             identity_theme(),
             10,
             RenderHandle::detached(),
-            || vec![entry("workspace prompt", None)],
-            move || {
+            |emit| emit(vec![entry("workspace prompt", None)]),
+            move |emit| {
                 calls_for_loader.fetch_add(1, Ordering::Relaxed);
-                vec![entry("other workspace prompt", Some("other-proj"))]
+                emit(vec![entry("other workspace prompt", Some("other-proj"))]);
             },
         );
 
@@ -788,7 +864,7 @@ mod tests {
         );
 
         let persistence = ConversationPersistence::new(dir);
-        let entries = workspace_history(&persistence);
+        let entries = collect(|emit| workspace_history_streaming(&persistence, emit));
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         // Newest file first, prompts within a file newest-first, then
         // older files; `second` deduped to its newest position.
@@ -814,7 +890,7 @@ mod tests {
             &[user_line("shared prompt", "1"), user_line("only in b", "2")],
         );
 
-        let entries = all_workspaces_history(&base);
+        let entries = collect(|emit| all_workspaces_history_streaming(&base, emit));
         // Every prompt is tagged with the project it came from.
         let by_text: std::collections::HashMap<&str, Option<&str>> = entries
             .iter()
@@ -831,6 +907,6 @@ mod tests {
     fn all_workspaces_history_missing_base_is_empty() {
         let base = scratch_dir("missing-base");
         std::fs::remove_dir_all(&base).unwrap();
-        assert!(all_workspaces_history(&base).is_empty());
+        assert!(collect(|emit| all_workspaces_history_streaming(&base, emit)).is_empty());
     }
 }

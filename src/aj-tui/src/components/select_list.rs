@@ -295,6 +295,24 @@ impl SelectList {
         self.selected = index.min(self.filtered_indices.len() - 1);
     }
 
+    /// Move the selection to the first visible row whose
+    /// [`SelectItem::value`] equals `value`, returning whether a match
+    /// was found. Used to preserve the user's selection across a
+    /// rebuild (e.g. when a list is repopulated incrementally).
+    pub fn select_by_value(&mut self, value: &str) -> bool {
+        match self
+            .filtered_indices
+            .iter()
+            .position(|&i| self.items[i].value == value)
+        {
+            Some(pos) => {
+                self.selected = pos;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.filtered_indices.is_empty() {
             return;
@@ -662,6 +680,23 @@ mod tests {
             prefix: Arc::new(|s| s.to_string()),
             shortcut: Arc::new(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn select_by_value_moves_to_matching_visible_row() {
+        let items = vec![
+            SelectItem::new("a", "alpha"),
+            SelectItem::new("b", "bravo"),
+            SelectItem::new("c", "charlie"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+
+        assert!(list.select_by_value("c"));
+        assert_eq!(list.selected_item().map(|i| i.value.as_str()), Some("c"));
+
+        // A value that isn't present leaves the selection untouched.
+        assert!(!list.select_by_value("missing"));
+        assert_eq!(list.selected_item().map(|i| i.value.as_str()), Some("c"));
     }
 
     #[test]

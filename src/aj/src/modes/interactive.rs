@@ -66,7 +66,7 @@ use crate::modes::interactive::components::model_selector::{
 };
 use crate::modes::interactive::components::prompt_history::{
     PromptHistoryOutcome, PromptHistoryOutcomeHandle, PromptHistorySearchComponent,
-    all_workspaces_history, workspace_history,
+    all_workspaces_history_streaming, workspace_history_streaming,
 };
 use crate::modes::interactive::components::session_selector::{
     OutcomeHandle as SessionOutcomeHandle, SessionSelectorComponent, SessionSelectorOutcome,
@@ -1645,22 +1645,22 @@ async fn handle_slash_command(
         }
         SlashAction::OpenPromptHistory => {
             // Both scans run on a blocking thread so the overlay opens
-            // immediately. The current-workspace scan starts on
-            // construction; the all-workspaces scan is deferred to the
-            // first scope toggle.
-            let workspace_loader = {
+            // immediately and fills in incrementally. The
+            // current-workspace scan starts on construction; the
+            // all-workspaces scan is deferred to the first scope toggle.
+            let workspace_scan = {
                 let persistence = conversation_persistence.clone();
-                move || workspace_history(&persistence)
+                move |emit: &mut dyn FnMut(Vec<_>)| workspace_history_streaming(&persistence, emit)
             };
-            let all_loader = {
+            let all_scan = {
                 let persistence = conversation_persistence.clone();
-                move || match Config::get_sessions_base_dir_path() {
-                    Ok(base) => all_workspaces_history(&base),
+                move |emit: &mut dyn FnMut(Vec<_>)| match Config::get_sessions_base_dir_path() {
+                    Ok(base) => all_workspaces_history_streaming(&base, emit),
                     Err(err) => {
                         tracing::debug!("could not resolve sessions base dir: {err}");
                         // Fall back to the current workspace so the
                         // toggle still shows something.
-                        workspace_history(&persistence)
+                        workspace_history_streaming(&persistence, emit)
                     }
                 }
             };
@@ -1673,8 +1673,8 @@ async fn handle_slash_command(
                 select_list_theme(theme),
                 history_max_rows,
                 tui.handle(),
-                workspace_loader,
-                all_loader,
+                workspace_scan,
+                all_scan,
             );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
