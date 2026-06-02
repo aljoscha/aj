@@ -78,3 +78,15 @@ commit secrets.
 
 - Unit tests live in the same module with `#[cfg(test)]`.
 - Integration tests go in `<crate>/tests/`.
+
+## Commit Messages
+
+- Prefix the subject with a scope followed by a colon: `<scope>: <summary>`.
+  The scope is the affected crate or area (e.g. `aj`, `aj-models`,
+  `aj-tui`, `workspace`). Comma-separate multiple scopes:
+  `aj-tui,aj: ...`.
+- A Conventional-Commits type may wrap the scope when it adds signal:
+  `feat(history): ...`, `perf(history): ...`. Plain `scope:` is fine for
+  everything else.
+- Write the summary in imperative mood, lower-case, with no trailing
+  period (e.g. `aj: rename the model switch command to model use`).
