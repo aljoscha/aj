@@ -74,13 +74,6 @@ commit secrets.
 - `snake_case` for functions/variables, `PascalCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
 - Use proper capitalization and punctuation when writing docstrings or comments.
 
-## Rust Compilation
-
-- When you make code changes, run `cargo fmt` and `cargo build` after each logical unit of change. Fix any compilation errors before committing.
-- When refactoring function signatures or types, grep for all call sites and update them in the same pass.
-- Check visibility (`pub`) before accessing fields/methods from other modules.
-- Read and understand existing code before modifying it. Don't edit blind.
-
 ## Testing
 
 - Unit tests live in the same module with `#[cfg(test)]`.
