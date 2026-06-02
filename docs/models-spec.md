@@ -1806,21 +1806,34 @@ For each assistant message in the history:
    serializers (§6.2, §7.3.1) may still demote unsigned thinking blocks
    to plain text when building the wire request, since there is nothing
    to round-trip in that case.
-2. **Different model** (different provider, different api, or different model id):
+
+   1a. **Same provider + api, different model id, on a provider whose
+   signatures are not model-bound** (currently Anthropic): preserve all
+   thinking blocks (signed and redacted) and `text_signature` unchanged,
+   exactly as the same-model case, and skip tool-call ID normalization (the
+   api is identical). This is verified empirically against the live
+   Anthropic Messages API: a valid signature minted by one model is accepted
+   by another, while a corrupted signature is rejected, so the signature is
+   validated as a standalone token rather than bound to the producing model.
+   Redacted (encrypted) thinking is preserved on the same premise even
+   though its cross-model portability has not been independently verified;
+   revisit if it proves model-bound in practice. Other providers — notably
+   `openai-responses`, which returns `invalid_encrypted_content` when a
+   reasoning item crosses model boundaries — are not portable and fall to
+   rule 2. Revisit per provider as their behavior is verified.
+2. **Different model** where signatures do not survive (different provider,
+   different api, or a model-id change on a provider not covered by rule 1a):
    - Redacted thinking blocks: **drop** (encrypted for the original model).
-   - Thinking blocks with signatures: **drop the signature
-     unconditionally.** Any model change invalidates it: Anthropic
-     signatures are cryptographically bound to the producing model,
-     and `openai-responses` returns `invalid_encrypted_content` when
-     a reasoning item crosses model boundaries. If `thinking` is
-     non-empty, convert the visible text to a plain-text assistant
-     block (same treatment as the "non-empty text, no signature"
-     bullet below); if `thinking` is empty, drop the block entirely.
-     Redacted thinking blocks (see the preceding bullet) are a
+   - Thinking blocks with signatures: **drop the signature.** The signature
+     is invalid against the target: `openai-responses` returns
+     `invalid_encrypted_content` when a reasoning item crosses model
+     boundaries, and cross-provider signatures are meaningless to the
+     target. If `thinking` is non-empty, convert the visible text to a
+     plain-text assistant block (same treatment as the "non-empty text, no
+     signature" bullet below); if `thinking` is empty, drop the block
+     entirely. Redacted thinking blocks (see the preceding bullet) are a
      separate case — they are empty by invariant, so this rule does
-     not apply to them. We do not carve out a per-provider exception
-     for the signature drop — if a future provider documents cross-
-     model signature compatibility, revisit this rule then.
+     not apply to them.
    - Thinking blocks with empty text and no signature: **drop**.
    - Thinking blocks with non-empty text but no signature: **convert
      to plain text.** This shape typically arises from aborted streams

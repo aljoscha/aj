@@ -97,9 +97,32 @@ fn is_same_model(a: &AssistantMessage, target: &ModelInfo) -> bool {
     a.provider == target.provider && a.api == target.api && a.model == target.id
 }
 
+/// Provider whose thinking-block signatures are not bound to the producing
+/// model. Anthropic validates a signature as a standalone token that stays
+/// valid across model-id changes within the Messages API (empirically
+/// verified against the live API), so signed thinking can be replayed on a
+/// different Anthropic model. Other providers (e.g. `openai-responses`,
+/// which rejects reasoning items across model boundaries with
+/// `invalid_encrypted_content`) are not assumed portable.
+const SIGNATURE_PORTABLE_PROVIDER: &str = "anthropic";
+
+/// True when a signature produced by `a` stays valid when replayed against
+/// `target`: same provider and api on a provider whose signatures are not
+/// model-bound. Used to preserve thinking (signed and redacted) and text
+/// signatures across model-id changes within Anthropic instead of demoting
+/// or dropping them.
+fn signatures_portable(a: &AssistantMessage, target: &ModelInfo) -> bool {
+    a.provider == target.provider
+        && a.api == target.api
+        && a.provider == SIGNATURE_PORTABLE_PROVIDER
+}
+
 /// Apply §8.1 rules 2 and 3 to a single assistant message. Same-model
 /// messages pass through unchanged so signatures and redacted thinking
-/// survive the round-trip.
+/// survive the round-trip. When the source and target are different models
+/// but signatures remain valid between them (see [`signatures_portable`]),
+/// all thinking blocks (signed and redacted) and text signatures are
+/// likewise preserved.
 fn transform_assistant(
     a: &AssistantMessage,
     target: &ModelInfo,
@@ -109,13 +132,25 @@ fn transform_assistant(
         return a.clone();
     }
 
+    // Within a provider whose signatures are not model-bound, a model-id
+    // change keeps thinking blocks and text signatures valid as-is.
+    // Tool-call IDs need no normalization because the api is identical.
+    let preserve_signatures = signatures_portable(a, target);
+
     let mut new_content: Vec<AssistantContent> = Vec::with_capacity(a.content.len());
     for block in &a.content {
         match block {
             AssistantContent::Thinking(th) => {
+                if preserve_signatures {
+                    // Signature (and any redacted/encrypted payload) stays
+                    // valid across the model-id change, so keep the block
+                    // intact. The serializer demotes any unsigned thinking
+                    // to text at wire time, matching the same-model path.
+                    new_content.push(AssistantContent::Thinking(th.clone()));
+                    continue;
+                }
                 // Redacted blocks are an opaque encrypted payload bound
-                // to the source model — drop unconditionally on cross-
-                // model replay.
+                // to the source model — drop on cross-provider/api replay.
                 if th.redacted {
                     continue;
                 }
@@ -134,11 +169,16 @@ fn transform_assistant(
                 )));
             }
             AssistantContent::Text(t) => {
-                // Strip text_signature: it's bound to the source model.
-                new_content.push(AssistantContent::Text(TextContent {
-                    text: t.text.clone(),
-                    text_signature: None,
-                }));
+                if preserve_signatures {
+                    // text_signature stays valid within the same api.
+                    new_content.push(AssistantContent::Text(t.clone()));
+                } else {
+                    // Strip text_signature: it's bound to the source model.
+                    new_content.push(AssistantContent::Text(TextContent {
+                        text: t.text.clone(),
+                        text_signature: None,
+                    }));
+                }
             }
             AssistantContent::ToolCall(tc) => {
                 let new_id = normalize_tool_call_id(&target.api, &a.provider, &tc.id);
@@ -574,6 +614,74 @@ mod tests {
     }
 
     // -- Cross-model thinking handling (§8.1 rule 2) -----------------------
+
+    #[test]
+    fn anthropic_model_change_preserves_signatures_and_redacted() {
+        // Same provider + api, different model id: Anthropic signatures stay
+        // valid, so all thinking blocks (signed and redacted) and text
+        // signatures are preserved intact.
+        let target = model("anthropic", "anthropic-messages", "claude-y", false);
+        let asst = assistant(
+            "anthropic",
+            "anthropic-messages",
+            "claude-x",
+            vec![
+                AssistantContent::Thinking(ThinkingContent {
+                    thinking: "visible".into(),
+                    thinking_signature: Some("sig".into()),
+                    redacted: false,
+                }),
+                AssistantContent::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: Some("opaque".into()),
+                    redacted: true,
+                }),
+                AssistantContent::Text(TextContent {
+                    text: "hello".into(),
+                    text_signature: Some("ts".into()),
+                }),
+                tool_call("toolu_abc", "ls"),
+            ],
+        );
+        let out = transform_messages(
+            &[
+                Message::Assistant(asst),
+                tool_result("toolu_abc", "ls", "ok"),
+            ],
+            &target,
+        );
+        let Message::Assistant(a) = &out[0] else {
+            panic!("expected assistant");
+        };
+        // All four blocks preserved, including redacted thinking.
+        assert_eq!(a.content.len(), 4);
+        match &a.content[0] {
+            AssistantContent::Thinking(th) => {
+                assert!(!th.redacted);
+                assert_eq!(th.thinking, "visible");
+                assert_eq!(th.thinking_signature.as_deref(), Some("sig"));
+            }
+            _ => panic!("expected preserved thinking"),
+        }
+        match &a.content[1] {
+            AssistantContent::Thinking(th) => {
+                assert!(th.redacted);
+                assert_eq!(th.thinking_signature.as_deref(), Some("opaque"));
+            }
+            _ => panic!("expected preserved redacted thinking"),
+        }
+        match &a.content[2] {
+            AssistantContent::Text(t) => {
+                assert_eq!(t.text, "hello");
+                assert_eq!(t.text_signature.as_deref(), Some("ts"));
+            }
+            _ => panic!("expected preserved text"),
+        }
+        match &a.content[3] {
+            AssistantContent::ToolCall(tc) => assert_eq!(tc.id, "toolu_abc"),
+            _ => panic!("expected tool call"),
+        }
+    }
 
     #[test]
     fn cross_model_drops_redacted_and_strips_signatures() {
