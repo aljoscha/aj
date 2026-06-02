@@ -194,12 +194,18 @@ impl Default for SelectListLayout {
 ///
 /// [`SelectList::new`] takes the theme and layout at construction time
 /// and they are immutable for the life of the instance — there are no
-/// `set_theme` / `set_layout` / `set_items` mutators. Rebuild the list
-/// when those need to change.
+/// `set_theme` / `set_layout` mutators. Rebuild the list to change
+/// those or to replace the item set wholesale. Items may be *appended*
+/// in place with [`SelectList::extend_items`] (for lists that load
+/// incrementally); appending keeps the active filter and selection.
 pub struct SelectList {
     items: Vec<SelectItem>,
     filtered_indices: Vec<usize>,
     selected: usize,
+    /// The active (trimmed) filter query, retained so the visible set
+    /// can be recomputed when items are appended via
+    /// [`SelectList::extend_items`]. Empty means "show everything".
+    filter: String,
     max_visible: usize,
     theme: SelectListTheme,
     layout: SelectListLayout,
@@ -231,6 +237,7 @@ impl SelectList {
             items,
             filtered_indices,
             selected: 0,
+            filter: String::new(),
             max_visible,
             theme,
             layout,
@@ -246,11 +253,21 @@ impl SelectList {
     /// best-match-first; the selection resets to the top match.
     ///
     /// An empty (or whitespace-only) `filter` restores the full list in
-    /// its original order. The filter string is *not* retained between
-    /// calls — each invocation rebuilds `filtered_indices` from `items`.
+    /// its original order. The trimmed query is retained internally so
+    /// [`SelectList::extend_items`] can keep newly-appended rows
+    /// consistent with it; each call still recomputes `filtered_indices`
+    /// from scratch.
     pub fn set_filter(&mut self, filter: &str) {
-        let query = filter.trim();
-        if query.is_empty() {
+        self.filter = filter.trim().to_string();
+        self.apply_filter();
+        self.selected = 0;
+    }
+
+    /// Recompute `filtered_indices` from the current items and the
+    /// retained [`Self::filter`]. Leaves `selected` untouched (callers
+    /// reset or restore it as appropriate).
+    fn apply_filter(&mut self) {
+        if self.filter.is_empty() {
             self.filtered_indices = (0..self.items.len()).collect();
         } else {
             let candidates: Vec<(usize, &str)> = self
@@ -259,10 +276,39 @@ impl SelectList {
                 .enumerate()
                 .map(|(i, item)| (i, item.filter_text()))
                 .collect();
-            let ranked = crate::fuzzy::fuzzy_filter(candidates, query, |(_, text)| *text);
+            let ranked = crate::fuzzy::fuzzy_filter(candidates, &self.filter, |(_, text)| *text);
             self.filtered_indices = ranked.into_iter().map(|(i, _)| i).collect();
         }
-        self.selected = 0;
+    }
+
+    /// Append `new_items` to the list, keeping it consistent with the
+    /// active filter and preserving the highlighted row. Intended for
+    /// lists that load incrementally.
+    ///
+    /// With no active filter this is O(`new_items`): the rows are
+    /// appended in order, revealed at the bottom, and the selection is
+    /// untouched. With an active filter the visible set is re-ranked
+    /// (new rows may interleave with existing matches) and the
+    /// previously-highlighted row is restored when it still matches.
+    pub fn extend_items(&mut self, new_items: impl IntoIterator<Item = SelectItem>) {
+        let first_new = self.items.len();
+        self.items.extend(new_items);
+        if first_new == self.items.len() {
+            return;
+        }
+
+        if self.filter.is_empty() {
+            // Order is stable and the new rows go at the end, so the
+            // current selection index still points at the same item.
+            self.filtered_indices.extend(first_new..self.items.len());
+        } else {
+            let selected_value = self.selected_item().map(|item| item.value.clone());
+            self.apply_filter();
+            self.selected = 0;
+            if let Some(value) = selected_value {
+                self.select_by_value(&value);
+            }
+        }
     }
 
     /// Get the currently selected item, if any.
@@ -680,6 +726,64 @@ mod tests {
             prefix: Arc::new(|s| s.to_string()),
             shortcut: Arc::new(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn extend_items_unfiltered_appends_and_keeps_selection() {
+        let items = vec![SelectItem::new("a", "alpha"), SelectItem::new("b", "bravo")];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+        // Highlight the second row, then stream more rows in.
+        list.set_selected_index(1);
+
+        list.extend_items(vec![
+            SelectItem::new("c", "charlie"),
+            SelectItem::new("d", "delta"),
+        ]);
+
+        // Appended at the end, in order, and the selection is untouched.
+        assert_eq!(list.items().len(), 4);
+        assert_eq!(list.selected_item().map(|i| i.value.as_str()), Some("b"));
+        let visible: Vec<&str> = list
+            .filtered_indices
+            .iter()
+            .map(|&i| list.items[i].value.as_str())
+            .collect();
+        assert_eq!(visible, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn extend_items_filtered_reranks_and_restores_selection() {
+        let items = vec![
+            SelectItem::new("apple", "apple"),
+            SelectItem::new("apricot", "apricot"),
+        ];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+        list.set_filter("ap");
+        // Highlight "apricot" within the filtered set.
+        assert!(list.select_by_value("apricot"));
+
+        // Stream in a new matching row and a non-matching one.
+        list.extend_items(vec![
+            SelectItem::new("apex", "apex"),
+            SelectItem::new("banana", "banana"),
+        ]);
+
+        // The filter still excludes the non-match, the new match is
+        // visible, and the highlight stays on "apricot".
+        let visible: Vec<&str> = list
+            .filtered_indices
+            .iter()
+            .map(|&i| list.items[i].value.as_str())
+            .collect();
+        assert!(visible.contains(&"apex"), "new match visible: {visible:?}");
+        assert!(
+            !visible.contains(&"banana"),
+            "non-match hidden: {visible:?}"
+        );
+        assert_eq!(
+            list.selected_item().map(|i| i.value.as_str()),
+            Some("apricot")
+        );
     }
 
     #[test]

@@ -217,41 +217,43 @@ impl PromptHistorySearchComponent {
         }
     }
 
-    /// Apply scan results delivered since the last render: append
-    /// batches and clear the loading flag on `Done`. Rebuilds the list
-    /// once when anything touched the visible scope.
+    /// Apply scan results delivered since the last render: append each
+    /// batch to its scope and stream the visible scope's new rows into
+    /// the live list, clearing the loading flag on `Done`.
+    ///
+    /// New rows for the visible scope are coalesced into a single
+    /// [`SelectList::extend_items`] call so a burst of batches in one
+    /// frame costs one append (and, when a search filter is active, one
+    /// re-rank) rather than one per batch.
     fn drain_loads(&mut self) {
-        let mut visible_changed = false;
+        let mut new_visible: Vec<SelectItem> = Vec::new();
         while let Ok(load) = self.loads_rx.try_recv() {
             match load {
                 PromptHistoryLoad::Batch { scope, entries } => {
+                    if scope == self.scope {
+                        new_visible.extend(build_items(&entries));
+                    }
                     match scope {
                         Scope::Workspace => self.workspace_entries.extend(entries),
                         Scope::All => self.all_entries.extend(entries),
                     }
-                    visible_changed |= scope == self.scope;
                 }
-                PromptHistoryLoad::Done { scope } => {
-                    match scope {
-                        Scope::Workspace => self.workspace_loading = false,
-                        Scope::All => self.all_loading = false,
-                    }
-                    // A `Done` for the visible scope may need to swap the
-                    // loading indicator for an empty list.
-                    visible_changed |= scope == self.scope;
-                }
+                PromptHistoryLoad::Done { scope } => match scope {
+                    Scope::Workspace => self.workspace_loading = false,
+                    Scope::All => self.all_loading = false,
+                },
             }
         }
-        if visible_changed {
-            self.rebuild_list();
+        if !new_visible.is_empty() {
+            self.list.extend_items(new_visible);
         }
     }
 
-    /// Rebuild the list for the current scope, re-apply the active
-    /// search filter, and restore the previously-highlighted row when it
-    /// survives. Used on scope toggle and whenever a scan streams more
-    /// entries into the visible scope, so incremental fill doesn't yank
-    /// the user's selection back to the top.
+    /// Rebuild the list from scratch for the current scope, re-applying
+    /// the active search filter and restoring the highlighted row when
+    /// it survives. Used on scope toggle, where the whole item set
+    /// changes; incremental fill within a scope appends via
+    /// [`SelectList::extend_items`] instead (see `drain_loads`).
     fn rebuild_list(&mut self) {
         let selected_value = self.list.selected_item().map(|item| item.value.clone());
         let items = build_items(self.current_entries());
