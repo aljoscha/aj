@@ -1669,6 +1669,7 @@ impl Markdown {
         let mut lines: Vec<String> = Vec::new();
         let separator = make_separator_row(&widths);
 
+        lines.push(make_top_border_row(&widths));
         push_row(
             &mut lines,
             render_table_row(&header_text, &widths, alignments),
@@ -1680,6 +1681,7 @@ impl Markdown {
             }
             push_row(&mut lines, render_table_row(row, &widths, alignments));
         }
+        lines.push(make_bottom_border_row(&widths));
         lines.push(String::new());
         lines
     }
@@ -2295,22 +2297,41 @@ fn pad_cell(content: &str, width: usize, alignment: Alignment) -> String {
     }
 }
 
-/// The `├─...┼─...┤` row used as the header separator and between data
-/// rows.
-fn make_separator_row(widths: &[usize]) -> String {
+/// Build a horizontal rule row spanning the table, using the given
+/// corner/junction glyphs: `left` at the start, `mid` between columns,
+/// `right` at the end. The fill character is always `─`, sized to each
+/// column width plus the two cells of padding so it matches the
+/// `│ … │` data rows.
+fn make_border_row(widths: &[usize], left: char, mid: char, right: char) -> String {
     let mut out = String::new();
-    out.push('├');
+    out.push(left);
     for (idx, w) in widths.iter().enumerate() {
         if idx > 0 {
-            out.push('┼');
+            out.push(mid);
         }
         // Two chars of padding become `─`s to match the border width.
         for _ in 0..(w + 2) {
             out.push('─');
         }
     }
-    out.push('┤');
+    out.push(right);
     out
+}
+
+/// The `┌─...┬─...┐` rule that frames the top of the table.
+fn make_top_border_row(widths: &[usize]) -> String {
+    make_border_row(widths, '┌', '┬', '┐')
+}
+
+/// The `├─...┼─...┤` row used as the header separator and between data
+/// rows.
+fn make_separator_row(widths: &[usize]) -> String {
+    make_border_row(widths, '├', '┼', '┤')
+}
+
+/// The `└─...┴─...┘` rule that frames the bottom of the table.
+fn make_bottom_border_row(widths: &[usize]) -> String {
+    make_border_row(widths, '└', '┴', '┘')
 }
 
 /// Split an already-rendered row on embedded `\n` boundaries and push

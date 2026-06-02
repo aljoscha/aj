@@ -244,6 +244,41 @@ fn renders_a_simple_table() {
     assert!(plain.iter().any(|l| l.contains('─')));
 }
 
+/// The table is framed top and bottom: the first rendered line is the
+/// `┌─…┬─…┐` rule and the last non-blank line is the `└─…┴─…┘` rule, so
+/// the header and final data row are never flush against surrounding
+/// content (which made them look "cut off").
+#[test]
+fn frames_table_with_top_and_bottom_borders() {
+    let mut m = md("| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |");
+    let lines = m.render(80);
+    let plain = plain_lines(&lines);
+
+    let first = plain
+        .first()
+        .map(|l| l.trim_end())
+        .expect("table must emit at least one line");
+    assert!(
+        first.starts_with('┌') && first.contains('┬') && first.ends_with('┐'),
+        "first line must be the top border row; got {:?}",
+        first,
+    );
+
+    let last_non_blank = plain
+        .iter()
+        .rev()
+        .map(|l| l.trim_end())
+        .find(|l| !l.is_empty())
+        .expect("table must emit a non-blank line");
+    assert!(
+        last_non_blank.starts_with('└')
+            && last_non_blank.contains('┴')
+            && last_non_blank.ends_with('┘'),
+        "last non-blank line must be the bottom border row; got {:?}",
+        last_non_blank,
+    );
+}
+
 #[test]
 fn renders_row_dividers_between_data_rows() {
     let mut m = md("| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |");
@@ -2570,9 +2605,9 @@ fn single_column_table_at_zero_width_falls_back_to_raw_markdown() {
 
     // Raw markdown bytes (`|`, `h`, `x`) must appear; table-chrome
     // glyphs must not, because the fallback bypasses `render_table_row`.
-    // Our port emits `│` sides and `├─...─┤` separators (no top/bottom
-    // borders) for rendered tables, so checking for either of those
-    // catches the "table rendered anyway" regression.
+    // A rendered table emits `│` sides, `├─...─┤` separators, and
+    // `┌`/`└` top/bottom borders, so checking for any of those catches
+    // the "table rendered anyway" regression.
     let joined: String = plain.iter().flat_map(|s| s.chars()).collect();
     for ch in ['|', 'h', 'x', '-'] {
         assert!(
@@ -2582,7 +2617,7 @@ fn single_column_table_at_zero_width_falls_back_to_raw_markdown() {
             plain,
         );
     }
-    for ch in ['│', '├', '┤', '┼'] {
+    for ch in ['│', '├', '┤', '┼', '┌', '└'] {
         assert!(
             !joined.contains(ch),
             "table-chrome glyph `{}` must not appear when falling back; got {:?}",
@@ -2626,7 +2661,7 @@ fn two_column_table_at_zero_width_falls_back_to_raw_markdown() {
             plain,
         );
     }
-    for ch in ['│', '├', '┤', '┼'] {
+    for ch in ['│', '├', '┤', '┼', '┌', '└'] {
         assert!(
             !joined.contains(ch),
             "table-chrome glyph `{}` must not appear when falling back; got {:?}",
@@ -2640,9 +2675,8 @@ fn two_column_table_at_zero_width_falls_back_to_raw_markdown() {
 /// even one cell column past the borders), the renderer still falls
 /// back. For a single-column table `chrome = 4`, so width 4 hits the
 /// fallback (`available_for_cells = 0 < n_cols = 1`); width 5 fits
-/// one cell and renders the full table (with `│` side borders and
-/// `├─...─┤` separator rows — our port doesn't emit `┌`/`└` top
-/// or bottom borders).
+/// one cell and renders the full table (with `┌`/`└` top and bottom
+/// borders, `│` side borders, and `├─...─┤` separator rows).
 #[test]
 fn single_column_table_falls_back_when_width_equals_chrome() {
     let mut m = md("| h |\n|---|\n| x |");
