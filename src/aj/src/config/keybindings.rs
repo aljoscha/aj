@@ -64,6 +64,17 @@ pub const ACTION_OVERLAY_CLOSE_ALL: &str = "aj.overlay.close_all";
 /// workspace.
 pub const ACTION_HISTORY_TOGGLE_SCOPE: &str = "aj.history.toggle_scope";
 
+/// Action ID for the "open prompt-history search" chord.
+///
+/// Bound by default to `ctrl+r`. The interactive loop intercepts the
+/// keystroke globally (before any component sees it) and opens the
+/// prompt-history search overlay, exactly as if the user had typed
+/// `/history`. Because it is dispatched directly (not via the
+/// command palette), the overlay has no parent palette: `Esc`
+/// closes it back to the editor rather than popping to the palette.
+/// Inert while a capturing overlay is already up.
+pub const ACTION_HISTORY_OPEN: &str = "aj.history.open";
+
 /// Built-in `aj`-level keybinding definitions.
 ///
 /// Returned as a fresh `Vec` so callers can extend or filter before
@@ -94,6 +105,10 @@ pub fn aj_keybindings() -> KeybindingDefinitions {
         (
             ACTION_HISTORY_TOGGLE_SCOPE.to_string(),
             K::new("ctrl+t", "Toggle prompt-history scope (workspace / all)"),
+        ),
+        (
+            ACTION_HISTORY_OPEN.to_string(),
+            K::new("ctrl+r", "Open prompt-history search"),
         ),
     ]
 }
@@ -169,6 +184,12 @@ mod tests {
             kbm.get_keys(ACTION_OVERLAY_CLOSE_ALL),
             &["ctrl+c".to_string()]
         );
+    }
+
+    #[test]
+    fn aj_history_open_defaults_to_ctrl_r() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(kbm.get_keys(ACTION_HISTORY_OPEN), &["ctrl+r".to_string()]);
     }
 
     #[test]

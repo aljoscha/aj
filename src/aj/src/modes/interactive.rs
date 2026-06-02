@@ -379,6 +379,12 @@ impl InteractiveMode {
         // `tui.handle_input` to tear down the entire overlay
         // back-stack — distinct from Esc's one-level pop.
         let close_all_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // Set by the global `aj.history.open` chord (default
+        // `ctrl+r`). Drained after `tui.handle_input` to route a
+        // synthetic `/history` through the slash dispatcher, mirroring
+        // the `palette_open_request` path. Dispatched without a parent
+        // palette so `Esc` closes the overlay back to the editor.
+        let history_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         {
             let flag = Arc::clone(&palette_open_request);
             if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
@@ -740,6 +746,20 @@ impl InteractiveMode {
                                     // arm below by letting handle_input
                                     // run (it's a no-op for this chord
                                     // since no component binds ctrl+o).
+                                } else if open_selector.is_none()
+                                    && kb.matches(
+                                        &input,
+                                        crate::config::keybindings::ACTION_HISTORY_OPEN,
+                                    )
+                                {
+                                    drop(kb);
+                                    history_open_request.store(true, Ordering::Relaxed);
+                                    // Consume: the editor binds no
+                                    // ctrl+r, but skipping handle_input
+                                    // keeps the chord from reaching any
+                                    // future binding and matches the
+                                    // close-all interception style.
+                                    consume_event = true;
                                 }
                             }
                             if !consume_event {
@@ -797,7 +817,41 @@ impl InteractiveMode {
                                 continue;
                             }
 
-                            // If a selector overlay is open, the
+                            // Global prompt-history open: fired by the
+                            // `Ctrl+R` chord intercepted above. Routes a
+                            // synthetic `/history` through the same
+                            // dispatcher with no parent palette, so the
+                            // overlay's `Esc` closes straight back to
+                            // the editor. Gated on `open_selector` to be
+                            // inert while another selector is up.
+                            if history_open_request.swap(false, Ordering::Relaxed)
+                                && open_selector.is_none()
+                            {
+                                match handle_slash_command(
+                                    &mut tui,
+                                    Arc::clone(&agent),
+                                    Arc::clone(&model_catalog),
+                                    Arc::clone(&current_model_key),
+                                    &mut log,
+                                    &mut persistence_handle,
+                                    &mut pump,
+                                    &conversation_persistence,
+                                    &theme,
+                                    "/history",
+                                    None,
+                                ).await {
+                                    SlashHandled::Continue { selector, notice } => {
+                                        if let Some(text) = notice {
+                                            pump.handle(&mut tui, &notice_event(&text));
+                                        }
+                                        if let Some(sel) = selector {
+                                            open_selector = Some(sel);
+                                        }
+                                    }
+                                    SlashHandled::Quit => break,
+                                }
+                                continue;
+                            }
                             // input was just routed to it. Poll
                             // the overlay's outcome slot; on a
                             // confirm/cancel, close it and apply

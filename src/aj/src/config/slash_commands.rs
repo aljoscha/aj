@@ -99,7 +99,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         title: "history",
         category: "prompt",
         description: "Search and recall a previous prompt.",
-        action_id: None,
+        action_id: Some(crate::config::keybindings::ACTION_HISTORY_OPEN),
     },
     BuiltinCommand {
         name: "help",
