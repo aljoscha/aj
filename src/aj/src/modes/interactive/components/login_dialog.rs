@@ -153,12 +153,18 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
 /// The escapes are OSC sequences, which [`crate::ansi`]-style width
 /// measurement (`visible_width`) treats as zero-width, so they don't
 /// disturb the overlay's width-based padding.
+///
+/// A long URL is rendered as several wrapped segments, each its own
+/// hyperlink. The shared `id=` parameter tells the terminal those
+/// segments are one logical link (per the OSC 8 spec for soft-wrapped
+/// hyperlinks), so hover-highlighting spans the whole URL and clicking
+/// any segment opens the full `uri`.
 fn hyperlink(uri: &str, text: &str) -> String {
     // Defensive: a stray ESC/BEL in the URI would break out of the
     // OSC 8 sequence. Our login URLs are provider-constructed, but
     // strip control bytes regardless.
     let safe: String = uri.chars().filter(|c| !c.is_control()).collect();
-    format!("\x1b]8;;{safe}\x1b\\{text}\x1b]8;;\x1b\\")
+    format!("\x1b]8;id=aj-oauth;{safe}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
 impl Component for LoginDialogComponent {
@@ -461,7 +467,7 @@ mod tests {
     fn hyperlink_wraps_text_in_osc8() {
         assert_eq!(
             hyperlink("https://x/y", "label"),
-            "\x1b]8;;https://x/y\x1b\\label\x1b]8;;\x1b\\"
+            "\x1b]8;id=aj-oauth;https://x/y\x1b\\label\x1b]8;;\x1b\\"
         );
     }
 
@@ -487,7 +493,7 @@ mod tests {
             .push(LoginLine::Url(url.to_string()));
         let body = dialog.render(80).join("\n");
         assert!(
-            body.contains(&format!("\x1b]8;;{url}\x1b\\")),
+            body.contains(&format!("\x1b]8;id=aj-oauth;{url}\x1b\\")),
             "expected OSC 8 open for {url} in {body:?}"
         );
         assert!(body.contains(url), "{body:?}");
