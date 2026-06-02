@@ -16,10 +16,23 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_ansi(true)
-        .init();
+    // Logs go to stderr by default. Set `AJ_LOG_FILE` to redirect them
+    // to a file instead (appended, without ANSI colors), which keeps the
+    // interactive TUI from fighting with log output over the terminal.
+    let builder = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+    match std::env::var_os("AJ_LOG_FILE") {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            builder
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file))
+                .init();
+        }
+        None => builder.with_ansi(true).init(),
+    }
 
     // `~/.aj/.env` first (highest priority for env-driven config),
     // then a project-local `.env` if present. CLI flags layered on
