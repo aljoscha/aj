@@ -84,6 +84,37 @@ impl FuzzyMatcher {
         Some(base.saturating_add(bonus))
     }
 
+    /// Score `query` against a set of fields belonging to one item,
+    /// best first. Returns `None` if the item does not match.
+    ///
+    /// `query` is split on whitespace into tokens; each token must
+    /// match at least one field (case-insensitive subsequence) or the
+    /// whole item is rejected. A token's contribution is its best score
+    /// across the fields, and the returned score is the sum of the
+    /// per-token contributions.
+    ///
+    /// Matching each token *within a single field* — rather than
+    /// against a concatenation of every field — keeps a token from
+    /// being satisfied by characters that straddle two fields. For
+    /// example the query `gpt-5.5` will not match an item with id
+    /// `gpt-5.1` and name `GPT-5.1` by borrowing the trailing `5` from
+    /// the name; against the concatenated `"gpt-5.1 GPT-5.1"` it
+    /// otherwise would.
+    ///
+    /// An empty (or whitespace-only) `query` yields `Some(0)`.
+    pub fn score_fields(&mut self, query: &str, fields: &[&str]) -> Option<u32> {
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Some(0);
+        }
+        let mut total: u32 = 0;
+        for token in tokens {
+            let best = fields.iter().filter_map(|f| self.score(token, f)).max()?;
+            total = total.saturating_add(u32::from(best));
+        }
+        Some(total)
+    }
+
     /// Filter and sort `items` by match quality, best first.
     ///
     /// `query` is split on whitespace into tokens; every token must match
@@ -164,4 +195,48 @@ where
     F: Fn(&T) -> &str,
 {
     SHARED.with(|m| m.borrow_mut().filter(items, query, get_text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_fields_rejects_token_spanning_two_fields() {
+        let mut m = FuzzyMatcher::new();
+        // The `5.5` query has two `5`s. Against a `gpt-5.1` id and
+        // `GPT-5.1` name it must NOT match by borrowing the second `5`
+        // from the name — each token is scored within a single field.
+        assert!(
+            m.score_fields("gpt-5.5", &["openai", "gpt-5.1", "GPT-5.1"])
+                .is_none()
+        );
+        // The genuine 5.5 entry still matches.
+        assert!(
+            m.score_fields("gpt-5.5", &["openai", "gpt-5.5", "GPT-5.5"])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn score_fields_matches_tokens_across_distinct_fields() {
+        let mut m = FuzzyMatcher::new();
+        // Multi-word query: each token may match a different field.
+        assert!(
+            m.score_fields("openai 5.5", &["openai", "gpt-5.5", "GPT-5.5"])
+                .is_some()
+        );
+        // A token that matches no field rejects the whole item.
+        assert!(
+            m.score_fields("openai claude", &["openai", "gpt-5.5", "GPT-5.5"])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn score_fields_empty_query_matches_with_zero() {
+        let mut m = FuzzyMatcher::new();
+        assert_eq!(m.score_fields("", &["anything"]), Some(0));
+        assert_eq!(m.score_fields("   ", &["anything"]), Some(0));
+    }
 }

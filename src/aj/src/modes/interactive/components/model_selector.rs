@@ -26,12 +26,6 @@ use aj_tui::fuzzy::FuzzyMatcher;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 
-/// Maximum visible rows in the result list. Eight matches the
-/// thinking selector's screen footprint at a 60-column overlay;
-/// taller terminals see a scrolled view via [`SelectList`]'s own
-/// scroll model.
-const MAX_VISIBLE_ROWS: usize = 8;
-
 /// Outcome of a single overlay session.
 ///
 /// `Confirmed(info)` carries the chosen [`ModelInfo`] (cloned so the
@@ -82,7 +76,21 @@ pub struct ModelSelectorComponent {
     /// reconstruct the underlying nucleo state on every keystroke
     /// (it allocates ~135 KB up front per `FuzzyMatcher::new`).
     matcher: FuzzyMatcher,
+    /// Visible-row budget for the inner [`SelectList`]. Seeded with
+    /// [`DEFAULT_VISIBLE_ROWS`] and updated by
+    /// [`Component::set_available_height`] so the list fills the
+    /// overlay's content area. Remembered as a field because
+    /// `rebuild_list` reconstructs the `SelectList` on every keystroke
+    /// and must reapply the current budget.
+    max_visible_rows: usize,
 }
+
+/// Initial visible-row budget for the result list, used before the
+/// surrounding overlay reports its real inner height via
+/// [`Component::set_available_height`]. The overlay then resizes the
+/// list to fill its content area; this default just keeps the first
+/// render sensible if a height is never pushed (e.g. in tests).
+const DEFAULT_VISIBLE_ROWS: usize = 8;
 
 impl ModelSelectorComponent {
     /// Build a fresh selector.
@@ -113,7 +121,7 @@ impl ModelSelectorComponent {
         // the initial filter and pre-selection.
         let list = SelectList::new(
             Vec::new(),
-            MAX_VISIBLE_ROWS,
+            DEFAULT_VISIBLE_ROWS,
             theme.clone(),
             SelectListLayout::default(),
         );
@@ -127,6 +135,7 @@ impl ModelSelectorComponent {
             outcome,
             theme,
             matcher: FuzzyMatcher::new(),
+            max_visible_rows: DEFAULT_VISIBLE_ROWS,
         };
         component.rebuild_list();
         component
@@ -143,10 +152,14 @@ impl ModelSelectorComponent {
     /// value.
     ///
     /// Score policy: empty query returns the full catalog in stable
-    /// catalog order; non-empty query fuzzy-scores against a
-    /// `"provider id name"` blob and sorts highest-score-first with
-    /// a catalog-order tiebreak (so equally strong matches stay in
-    /// the registry's intentional sequence). The matcher
+    /// catalog order; non-empty query fuzzy-scores each entry's
+    /// `provider`, `id`, and `name` fields independently (taking the
+    /// best per-token field score, see
+    /// [`FuzzyMatcher::score_fields`]) and sorts highest-score-first
+    /// with a catalog-order tiebreak (so equally strong matches stay
+    /// in the registry's intentional sequence). Scoring fields
+    /// separately keeps a query like `gpt-5.5` from matching a
+    /// `gpt-5.1` entry by spanning its id and name. The matcher
     /// (`self.matcher`) is reused across calls — only its scratch
     /// buffers are cleared.
     fn rebuild_list(&mut self) {
@@ -156,9 +169,9 @@ impl ModelSelectorComponent {
             scored.extend((0..self.catalog.len()).map(|i| (i, 0u32)));
         } else {
             for (idx, info) in self.catalog.iter().enumerate() {
-                let haystack = format!("{} {} {}", info.provider, info.id, info.name);
-                if let Some(score) = self.matcher.score(&query, &haystack) {
-                    scored.push((idx, u32::from(score)));
+                let fields = [info.provider.as_str(), info.id.as_str(), info.name.as_str()];
+                if let Some(score) = self.matcher.score_fields(&query, &fields) {
+                    scored.push((idx, score));
                 }
             }
             scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -197,7 +210,7 @@ impl ModelSelectorComponent {
         // stays consistent across rebuilds.
         let mut list = SelectList::new(
             items,
-            MAX_VISIBLE_ROWS,
+            self.max_visible_rows,
             self.theme.clone(),
             SelectListLayout::default(),
         );
@@ -281,7 +294,7 @@ impl Component for ModelSelectorComponent {
         // Chrome (title + border) is provided by the surrounding
         // `OverlayWindow` at mount time; we render just the search
         // input stacked above the result list.
-        let mut lines = Vec::with_capacity(MAX_VISIBLE_ROWS + 2);
+        let mut lines = Vec::with_capacity(self.max_visible_rows + 2);
         lines.extend(self.search.render(width));
         lines.push(String::new());
         lines.extend(self.list.render(width));
@@ -341,6 +354,13 @@ impl Component for ModelSelectorComponent {
     fn set_focused(&mut self, focused: bool) {
         self.search.set_focused(focused);
         self.list.set_focused(focused);
+    }
+
+    fn set_available_height(&mut self, rows: usize) {
+        // Chrome above the list (mirrored in `render`): search input +
+        // blank separator + the list's own scroll-info line.
+        self.max_visible_rows = rows.saturating_sub(3).max(1);
+        self.list.set_max_visible(self.max_visible_rows);
     }
 
     fn is_focused(&self) -> bool {
@@ -523,6 +543,54 @@ mod tests {
         // indices is empty; the selector inherits that placeholder
         // verbatim.
         assert!(body.contains("No matching"), "got: {body}");
+    }
+
+    #[test]
+    fn version_query_excludes_other_minor_versions() {
+        // Reproduces the reported bug: filtering "gpt-5.5" must not
+        // surface "gpt-5.1" / "gpt-5.2" rows. With a concatenated
+        // "id name" haystack the second `5` of the query could be
+        // borrowed from the repeated version in the name; scoring each
+        // field independently prevents that.
+        let catalog = vec![
+            make_model("openai", "gpt-5.5", "GPT-5.5"),
+            make_model("openai", "gpt-5.5-pro", "GPT-5.5 Pro"),
+            make_model("openai", "gpt-5.1", "GPT-5.1"),
+            make_model("openai", "gpt-5.2", "GPT-5.2"),
+            make_model("openai", "gpt-5.4", "GPT-5.4"),
+        ];
+        let mut sel = ModelSelectorComponent::new(
+            identity_theme(),
+            catalog,
+            None,
+            Some("gpt-5.5".to_string()),
+        );
+        let body = sel.render(60).join("\n");
+        assert!(body.contains("GPT-5.5"), "got: {body}");
+        assert!(body.contains("GPT-5.5 Pro"), "got: {body}");
+        assert!(!body.contains("GPT-5.1"), "got: {body}");
+        assert!(!body.contains("GPT-5.2"), "got: {body}");
+        assert!(!body.contains("GPT-5.4"), "got: {body}");
+    }
+
+    #[test]
+    fn set_available_height_grows_the_visible_list() {
+        // Catalog larger than the default visible budget so the window
+        // is what bounds the row count.
+        let catalog: Vec<ModelInfo> = (0..20)
+            .map(|i| make_model("openai", &format!("gpt-{i}"), &format!("GPT {i}")))
+            .collect();
+        let mut sel = ModelSelectorComponent::new(identity_theme(), catalog, None, None);
+
+        let default_rows = sel.render(60).len();
+        // Report a tall overlay: the list should fill it (minus the
+        // search box, blank separator, and scroll-info chrome).
+        sel.set_available_height(20);
+        let tall_rows = sel.render(60).len();
+        assert!(
+            tall_rows > default_rows,
+            "expected the list to grow with available height: {default_rows} -> {tall_rows}"
+        );
     }
 
     #[test]
