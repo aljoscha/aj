@@ -81,8 +81,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         action_id: None,
     },
     BuiltinCommand {
-        name: "sessions",
-        title: "switch",
+        name: "resume",
+        title: "resume",
         category: "session",
         description: "Resume a different conversation session.",
         action_id: None,
@@ -206,7 +206,7 @@ pub fn dispatch(input: &str) -> SlashAction {
     match head {
         "thinking" => SlashAction::OpenThinkingSelector,
         "model" => SlashAction::OpenModelSelector,
-        "sessions" => SlashAction::OpenSessionSelector,
+        "resume" => SlashAction::OpenSessionSelector,
         "history" => SlashAction::OpenPromptHistory,
         "palette" => SlashAction::OpenCommandPalette,
         "new" => SlashAction::NewSession,
@@ -338,12 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_sessions_opens_selector() {
-        assert_eq!(dispatch("/sessions"), SlashAction::OpenSessionSelector);
-        assert_eq!(dispatch("  /sessions  "), SlashAction::OpenSessionSelector);
+    fn dispatch_resume_opens_session_selector() {
+        assert_eq!(dispatch("/resume"), SlashAction::OpenSessionSelector);
+        assert_eq!(dispatch("  /resume  "), SlashAction::OpenSessionSelector);
         // Trailing tokens are ignored.
         assert_eq!(
-            dispatch("/sessions fix bug"),
+            dispatch("/resume fix bug"),
             SlashAction::OpenSessionSelector
         );
     }

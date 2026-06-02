@@ -457,7 +457,7 @@ impl InteractiveMode {
         // After replay we hand the log to the persistence listener
         // and to any future code path that wants to read the session
         // id back. Both `log` and `persistence_handle` are bound
-        // mutably so the `/sessions` selector can swap them out for
+        // mutably so the `/resume` selector can swap them out for
         // the resumed session without restarting the binary.
         // The agent goes behind a TokioMutex because the
         // submit-handler spawns a task that holds it across an

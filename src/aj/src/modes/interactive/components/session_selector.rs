@@ -1,10 +1,10 @@
-//! Session-selector overlay (`/sessions`).
+//! Session-selector overlay (`/resume`).
 //!
 //! Pairs a [`aj_tui::components::text_input::TextInput`] for live
 //! substring filtering with a
 //! [`aj_tui::components::select_list::SelectList`] of
 //! [`aj_session::SessionPreview`]s. The host opens this overlay from
-//! `/sessions`; `Enter` commits the highlighted session, `Esc`
+//! `/resume`; `Enter` commits the highlighted session, `Esc`
 //! cancels.
 //!
 //! The previews are scanned on a blocking thread, not on the TUI event
