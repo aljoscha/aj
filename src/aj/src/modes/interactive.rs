@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
-use aj_conf::{AgentEnv, Config, ConfigSpeed, Severity, display_path};
+use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
 use aj_models::registry::ModelRegistry;
 use aj_models::types::Speed;
 use aj_session::{
@@ -464,6 +464,13 @@ impl InteractiveMode {
         // `agent.prompt(...).await`.
         let mut log = Arc::new(TokioMutex::new(log));
         let agent = Arc::new(TokioMutex::new(agent));
+        // Shared, mutable view of the on-disk config. Selector
+        // outcomes (model / thinking, and future settings popups)
+        // mutate this and persist it via `persist_config` so a choice
+        // made in the TUI survives a restart. Held behind a std mutex
+        // because `Config::save` is a quick synchronous file write,
+        // never awaited across.
+        let config = Arc::new(std::sync::Mutex::new(config));
         let mut persistence_handle: SubscriptionHandle = {
             let a = agent.lock().await;
             a.subscribe(persistence_listener(Arc::clone(&log)))
@@ -801,6 +808,7 @@ impl InteractiveMode {
                                     sel,
                                     Arc::clone(&agent),
                                     Arc::clone(&current_model_key),
+                                    Arc::clone(&config),
                                     &mut log,
                                     &mut persistence_handle,
                                     &mut pump,
@@ -1268,6 +1276,44 @@ fn refresh_footer_model(
 ) {
     if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
         footer.set_model(Some(format_footer_model(model_id, thinking)));
+    }
+}
+
+/// Map the agent's live default thinking back onto its persisted
+/// `config.toml` representation. The forward map in
+/// `Agent::with_provider` collapses [`ConfigThinkingLevel::Off`] to
+/// `None`; this is its exact inverse, so a popup choice round-trips
+/// through `config.toml` unchanged.
+fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> ConfigThinkingLevel {
+    use aj_models::ThinkingConfig;
+    match thinking {
+        None => ConfigThinkingLevel::Off,
+        Some(ThinkingConfig::Low) => ConfigThinkingLevel::Low,
+        Some(ThinkingConfig::Medium) => ConfigThinkingLevel::Medium,
+        Some(ThinkingConfig::High) => ConfigThinkingLevel::High,
+        Some(ThinkingConfig::XHigh) => ConfigThinkingLevel::XHigh,
+        Some(ThinkingConfig::Max) => ConfigThinkingLevel::Max,
+    }
+}
+
+/// Apply `mutate` to the shared [`Config`] and persist it to
+/// `~/.aj/config.toml`. Selector outcomes change live agent/TUI state
+/// for the running session; this mirrors the change into the
+/// persisted config so it survives a restart.
+///
+/// Persistence is best-effort: a save failure returns a user-facing
+/// notice (to append to the action's confirmation) rather than an
+/// error, since the in-memory change already took effect. Returns
+/// `None` on success.
+fn persist_config(
+    config: &Arc<std::sync::Mutex<Config>>,
+    mutate: impl FnOnce(&mut Config),
+) -> Option<String> {
+    let mut cfg = config.lock().expect("config mutex poisoned");
+    mutate(&mut cfg);
+    match cfg.save() {
+        Ok(()) => None,
+        Err(err) => Some(format!("(couldn't save to config.toml: {err})")),
     }
 }
 
@@ -1739,6 +1785,7 @@ async fn handle_selector_outcome(
     selector: OpenSelector,
     agent: Arc<TokioMutex<Agent>>,
     current_model_key: Arc<std::sync::Mutex<(String, String)>>,
+    config: Arc<std::sync::Mutex<Config>>,
     log: &mut Arc<TokioMutex<ConversationLog>>,
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
@@ -1780,8 +1827,16 @@ async fn handle_selector_outcome(
                     };
                     refresh_footer_model(tui, &model_id, &level);
                     let name = thinking_level_name(&level);
+                    // Persist the choice so it survives a restart.
+                    let save_note = persist_config(&config, |c| {
+                        c.thinking = Some(config_thinking_level(level.as_ref()));
+                    });
+                    let notice = match save_note {
+                        Some(note) => format!("Thinking effort set to {name}. {note}"),
+                        None => format!("Thinking effort set to {name}."),
+                    };
                     SelectorPollOutcome::Closed {
-                        notice: Some(format!("Thinking effort set to {name}.")),
+                        notice: Some(notice),
                         follow_up: None,
                     }
                 }
@@ -1871,11 +1926,27 @@ async fn handle_selector_outcome(
                             // size, so update the denominator immediately
                             // rather than waiting for the next turn.
                             pump.set_context_window(tui, info.context_window);
+                            // Persist the model choice (provider + id)
+                            // so it survives a restart. `model_url` is
+                            // intentionally left untouched: it's a
+                            // user-supplied endpoint override, not part
+                            // of "which model", and pinning the
+                            // catalog's base URL into it would freeze
+                            // out future `models.json` updates.
+                            let save_note = persist_config(&config, |c| {
+                                c.model_api = Some(info.provider.clone());
+                                c.model_name = Some(info.id.clone());
+                            });
+                            let confirm = format!(
+                                "Model set to {} ({}/{}).",
+                                info.name, info.provider, info.id
+                            );
+                            let notice = match save_note {
+                                Some(note) => format!("{confirm} {note}"),
+                                None => confirm,
+                            };
                             SelectorPollOutcome::Closed {
-                                notice: Some(format!(
-                                    "Model set to {} ({}/{}).",
-                                    info.name, info.provider, info.id
-                                )),
+                                notice: Some(notice),
                                 follow_up: None,
                             }
                         }

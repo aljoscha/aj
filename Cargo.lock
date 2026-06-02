@@ -76,6 +76,7 @@ dependencies = [
  "strsim",
  "thiserror",
  "toml",
+ "toml_edit",
  "tracing",
 ]
 

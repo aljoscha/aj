@@ -307,6 +307,11 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("home directory not found")]
     HomeNotFound,
+    /// The existing `config.toml` could not be parsed while preparing
+    /// to write an update, so [`Config::save`] refused to clobber it.
+    /// Carries the `toml_edit` parse error verbatim.
+    #[error("cannot update config.toml (existing file is not valid TOML): {0}")]
+    Update(String),
 }
 
 /// Severity of a [`ConfigDiagnostic`]. Determines how the diagnostic
@@ -472,6 +477,12 @@ pub struct ConfigOption {
     /// Render the field's current value, distinguishing unset
     /// (`<unset>`) from set values.
     display_fn: fn(&Config) -> String,
+    /// Serialize the field's current value into a `toml_edit::Item`
+    /// for [`Config::save`], or `None` when the field holds its
+    /// default/unset value. A `None` result tells the writer to drop
+    /// the key from `config.toml` rather than emit a redundant
+    /// at-default line — see [`Config::save`] for the full contract.
+    to_toml_fn: fn(&Config) -> Option<toml_edit::Item>,
 }
 
 impl ConfigOption {
@@ -487,6 +498,13 @@ impl ConfigOption {
     /// Render the field's current value for display.
     pub fn display(&self, config: &Config) -> String {
         (self.display_fn)(config)
+    }
+
+    /// Serialize the field's current value for [`Config::save`].
+    /// `None` means the field is at its default/unset value and the
+    /// key should be removed from `config.toml`.
+    pub fn to_toml(&self, config: &Config) -> Option<toml_edit::Item> {
+        (self.to_toml_fn)(config)
     }
 }
 
@@ -509,6 +527,35 @@ fn display_string_list(value: &[String]) -> String {
         let items: Vec<String> = value.iter().map(|s| format!("\"{s}\"")).collect();
         format!("[{}]", items.join(", "))
     }
+}
+
+/// `to_toml` helper for `Option<T: Display>` fields: emit the value's
+/// canonical string form when set, or `None` (drop the key) when unset.
+/// Enum fields rely on their lowercase [`fmt::Display`] matching the
+/// parser's accepted spelling so the value round-trips.
+fn opt_value_item<T: fmt::Display>(value: &Option<T>) -> Option<toml_edit::Item> {
+    value.as_ref().map(|v| toml_edit::value(v.to_string()))
+}
+
+/// `to_toml` helper for `Vec<String>` list fields: emit a TOML array
+/// when non-empty, or `None` (drop the key) when empty.
+fn string_list_item(value: &[String]) -> Option<toml_edit::Item> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut array = toml_edit::Array::new();
+    for item in value {
+        array.push(item.as_str());
+    }
+    Some(toml_edit::value(array))
+}
+
+/// `to_toml` helper for `bool` fields: emit the value only when it
+/// differs from `default`, so a config left at its default doesn't
+/// accumulate redundant lines. When the value matches `default` the
+/// key is dropped from the file.
+fn bool_item(value: bool, default: bool) -> Option<toml_edit::Item> {
+    (value != default).then(|| toml_edit::value(value))
 }
 
 /// Application configuration loaded from `~/.aj/config.toml`.
@@ -653,6 +700,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_opt(&c.model_api),
+            to_toml_fn: |c| opt_value_item(&c.model_api),
         },
         ConfigOption {
             name: "model_url",
@@ -663,6 +711,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_opt(&c.model_url),
+            to_toml_fn: |c| opt_value_item(&c.model_url),
         },
         ConfigOption {
             name: "model_name",
@@ -673,6 +722,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_opt(&c.model_name),
+            to_toml_fn: |c| opt_value_item(&c.model_name),
         },
         ConfigOption {
             name: "thinking",
@@ -683,6 +733,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_opt(&c.thinking),
+            to_toml_fn: |c| opt_value_item(&c.thinking),
         },
         ConfigOption {
             name: "thinking_display",
@@ -693,6 +744,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_opt(&c.thinking_display),
+            to_toml_fn: |c| opt_value_item(&c.thinking_display),
         },
         ConfigOption {
             name: "speed",
@@ -703,6 +755,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_opt(&c.speed),
+            to_toml_fn: |c| opt_value_item(&c.speed),
         },
         ConfigOption {
             name: "theme",
@@ -713,6 +766,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_opt(&c.theme),
+            to_toml_fn: |c| opt_value_item(&c.theme),
         },
         ConfigOption {
             name: "disabled_tools",
@@ -723,6 +777,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| display_string_list(&c.disabled_tools),
+            to_toml_fn: |c| string_list_item(&c.disabled_tools),
         },
         ConfigOption {
             name: "hide_thinking_block",
@@ -733,6 +788,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| c.hide_thinking_block.to_string(),
+            to_toml_fn: |c| bool_item(c.hide_thinking_block, false),
         },
         ConfigOption {
             name: "image_auto_resize",
@@ -743,6 +799,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| c.image_auto_resize.to_string(),
+            to_toml_fn: |c| bool_item(c.image_auto_resize, true),
         },
         ConfigOption {
             name: "image_show_in_terminal",
@@ -753,6 +810,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| c.image_show_in_terminal.to_string(),
+            to_toml_fn: |c| bool_item(c.image_show_in_terminal, true),
         },
         ConfigOption {
             name: "image_block",
@@ -763,6 +821,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| c.image_block.to_string(),
+            to_toml_fn: |c| bool_item(c.image_block, false),
         },
     ];
 
@@ -786,10 +845,9 @@ impl Config {
     /// paths that actually need those directories (sessions, dotenv)
     /// will surface their own errors.
     pub fn load() -> (Self, Vec<ConfigDiagnostic>) {
-        let Ok(config_dir) = Self::get_config_dir() else {
+        let Ok(config_path) = Self::config_file_path() else {
             return (Config::default(), Vec::new());
         };
-        let config_path = config_dir.join("config.toml");
 
         if !config_path.exists() {
             tracing::debug!(config_path = %config_path.display(), "no config file found, using defaults");
@@ -822,6 +880,68 @@ impl Config {
         }
 
         Ok(aj_dir)
+    }
+
+    /// Path to `~/.aj/config.toml`. Creates the `~/.aj` directory if
+    /// it doesn't exist (via [`Self::get_config_dir`]) but does not
+    /// create the file itself.
+    pub fn config_file_path() -> Result<PathBuf, ConfigError> {
+        Ok(Self::get_config_dir()?.join("config.toml"))
+    }
+
+    /// Persist the current configuration to `~/.aj/config.toml`.
+    ///
+    /// The write round-trips through `toml_edit`, so any existing
+    /// comments, key ordering, and surrounding whitespace in the
+    /// user's file are preserved; only the value items this binary
+    /// owns are rewritten. The schema in [`Config::OPTIONS`] is the
+    /// single source of truth — every option is visited and:
+    ///
+    /// - a `Some` from [`ConfigOption::to_toml`] sets (or updates in
+    ///   place) the key. Updating in place preserves the leading
+    ///   comment attached to an existing key; an inline trailing
+    ///   comment on the value itself is not preserved.
+    /// - a `None` removes the key, so a setting reverted to its
+    ///   default leaves no redundant at-default line behind.
+    ///
+    /// Refuses to clobber a `config.toml` that isn't valid TOML,
+    /// returning [`ConfigError::Update`] instead so the caller can
+    /// surface the problem rather than silently overwriting the
+    /// user's file. A missing file is treated as empty and created
+    /// on write.
+    pub fn save(&self) -> Result<(), ConfigError> {
+        let path = Self::config_file_path()?;
+
+        let existing = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(ConfigError::Io(e)),
+        };
+
+        let mut doc = existing
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| ConfigError::Update(e.to_string()))?;
+
+        self.apply_into_document(&mut doc);
+
+        fs::write(&path, doc.to_string())?;
+        Ok(())
+    }
+
+    /// Write every option's current value into `doc`, the in-memory
+    /// representation of an existing `config.toml`. Factored out of
+    /// [`Self::save`] so the round-trip can be exercised without
+    /// touching the filesystem. See [`Self::save`] for the per-option
+    /// set/remove contract.
+    fn apply_into_document(&self, doc: &mut toml_edit::DocumentMut) {
+        for option in Self::OPTIONS {
+            match option.to_toml(self) {
+                Some(item) => doc[option.name] = item,
+                None => {
+                    doc.remove(option.name);
+                }
+            }
+        }
     }
 
     pub fn get_dotenv_file_path() -> Result<PathBuf, ConfigError> {
@@ -1570,5 +1690,127 @@ image_block = true
         let dir = make_temp_dir("none-missing");
         assert!(AgentEnv::load_project_instructions(&dir).is_none());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Apply `config` onto `existing` config-file text via the same
+    /// path [`Config::save`] uses, returning the rewritten text. Lets
+    /// the round-trip be asserted without touching `~/.aj`.
+    fn rewrite(existing: &str, config: &Config) -> String {
+        let mut doc = existing.parse::<toml_edit::DocumentMut>().unwrap();
+        config.apply_into_document(&mut doc);
+        doc.to_string()
+    }
+
+    #[test]
+    fn test_save_updates_value_and_preserves_comment() {
+        let existing = "\
+# Pick the reasoning effort.
+thinking = \"low\"
+";
+        let mut config = Config::default();
+        config.thinking = Some(ConfigThinkingLevel::High);
+
+        let rewritten = rewrite(existing, &config);
+        assert!(
+            rewritten.contains("# Pick the reasoning effort."),
+            "leading comment should survive: {rewritten:?}"
+        );
+        assert!(
+            rewritten.contains("thinking = \"high\""),
+            "got: {rewritten:?}"
+        );
+
+        // And it parses back to the value we wrote.
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(parsed.thinking, Some(ConfigThinkingLevel::High));
+    }
+
+    #[test]
+    fn test_save_adds_missing_keys() {
+        let mut config = Config::default();
+        config.model_api = Some("anthropic".to_string());
+        config.model_name = Some("claude-x".to_string());
+
+        let rewritten = rewrite("", &config);
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(parsed.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(parsed.model_name.as_deref(), Some("claude-x"));
+    }
+
+    #[test]
+    fn test_save_removes_key_reverted_to_default() {
+        // An unset Option, an emptied list, and a bool back at its
+        // default should all be dropped from the file.
+        let existing = "\
+thinking = \"low\"
+disabled_tools = [\"bash\"]
+image_block = true
+";
+        let config = Config::default();
+        let rewritten = rewrite(existing, &config);
+
+        assert!(!rewritten.contains("thinking"), "got: {rewritten:?}");
+        assert!(!rewritten.contains("disabled_tools"), "got: {rewritten:?}");
+        assert!(!rewritten.contains("image_block"), "got: {rewritten:?}");
+    }
+
+    #[test]
+    fn test_save_omits_default_bools() {
+        // A pristine default config writes nothing — defaults never
+        // accumulate redundant lines in a fresh file.
+        let rewritten = rewrite("", &Config::default());
+        assert_eq!(rewritten.trim(), "", "got: {rewritten:?}");
+    }
+
+    #[test]
+    fn test_save_writes_nondefault_bool() {
+        let mut config = Config::default();
+        // image_auto_resize defaults to true; flipping it off should persist.
+        config.image_auto_resize = false;
+        let rewritten = rewrite("", &config);
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert!(!parsed.image_auto_resize);
+    }
+
+    #[test]
+    fn test_save_full_round_trip() {
+        // Every option set to a non-default value must survive a
+        // serialize → parse cycle unchanged.
+        let mut config = Config::default();
+        config.model_api = Some("openai".to_string());
+        config.model_url = Some("https://example.test".to_string());
+        config.model_name = Some("gpt-x".to_string());
+        config.thinking = Some(ConfigThinkingLevel::Max);
+        config.thinking_display = Some(ConfigThinkingDisplay::Detailed);
+        config.speed = Some(ConfigSpeed::Fast);
+        config.theme = Some("light".to_string());
+        config.disabled_tools = vec!["bash".to_string(), "todo_read".to_string()];
+        config.hide_thinking_block = true;
+        config.image_auto_resize = false;
+        config.image_show_in_terminal = false;
+        config.image_block = true;
+
+        let rewritten = rewrite("", &config);
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+
+        assert_eq!(parsed.model_api.as_deref(), Some("openai"));
+        assert_eq!(parsed.model_url.as_deref(), Some("https://example.test"));
+        assert_eq!(parsed.model_name.as_deref(), Some("gpt-x"));
+        assert_eq!(parsed.thinking, Some(ConfigThinkingLevel::Max));
+        assert_eq!(
+            parsed.thinking_display,
+            Some(ConfigThinkingDisplay::Detailed)
+        );
+        assert_eq!(parsed.speed, Some(ConfigSpeed::Fast));
+        assert_eq!(parsed.theme.as_deref(), Some("light"));
+        assert_eq!(parsed.disabled_tools, vec!["bash", "todo_read"]);
+        assert!(parsed.hide_thinking_block);
+        assert!(!parsed.image_auto_resize);
+        assert!(!parsed.image_show_in_terminal);
+        assert!(parsed.image_block);
     }
 }
