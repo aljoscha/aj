@@ -63,6 +63,11 @@ pub struct LoginDialogState {
     /// and the next `Enter` delivers its value to the awaiting
     /// callback.
     pub input_prompt: Option<String>,
+    /// The authorization URL, set by [`OAuthCallbacks::on_auth`]. Held
+    /// separately from its `Url` display line so the dialog can copy
+    /// it to the clipboard on demand (Ctrl+Y) and auto-copy it the
+    /// first time it appears.
+    pub url: Option<String>,
 }
 
 /// Slot holding the sender an input-awaiting callback is blocked on.
@@ -85,6 +90,12 @@ pub struct LoginDialogComponent {
     input: TextInput,
     style: DialogStyle,
     focused: bool,
+    /// Set once the authorization URL has been auto-copied so the
+    /// copy-on-first-display in `render` is idempotent.
+    auto_copied: bool,
+    /// Ephemeral feedback line (e.g. "Copied …") rendered at the
+    /// bottom of the dialog.
+    notice: Option<String>,
 }
 
 impl LoginDialogComponent {
@@ -110,6 +121,8 @@ impl LoginDialogComponent {
                 hint: theme.fg_closure(ThemeColor::Dim),
             },
             focused: true,
+            auto_copied: false,
+            notice: None,
         }
     }
 }
@@ -135,10 +148,26 @@ impl Component for LoginDialogComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        let (lines, prompt) = {
+        let (lines, prompt, url) = {
             let st = self.state.lock().expect("login dialog state poisoned");
-            (st.lines.clone(), st.input_prompt.clone())
+            (st.lines.clone(), st.input_prompt.clone(), st.url.clone())
         };
+
+        // Copy the URL to the clipboard the first time it appears so
+        // the user never has to select it out of the overlay. Guarded
+        // by `auto_copied` to stay idempotent across renders; this runs
+        // on the UI (render) thread, which is where the OSC 52 write in
+        // `copy_to_clipboard` must happen.
+        if let Some(url) = &url
+            && !self.auto_copied
+        {
+            crate::auth::copy_to_clipboard(url);
+            self.auto_copied = true;
+            self.notice = Some(
+                "Copied the authorization URL to your clipboard (Ctrl+Y to copy again)."
+                    .to_string(),
+            );
+        }
 
         let mut out = Vec::new();
         for line in &lines {
@@ -158,10 +187,36 @@ impl Component for LoginDialogComponent {
             out.push((self.style.hint)(&prompt));
             out.extend(self.input.render(width));
         }
+
+        if let Some(notice) = &self.notice {
+            out.push(String::new());
+            out.push((self.style.hint)(notice));
+        }
         out
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
+        // Copy the authorization URL to the clipboard. Hard-coded
+        // (like the global Ctrl+C / Ctrl+D handling) rather than a
+        // rebindable action; checked before routing to the text input
+        // so it works even while the manual-paste field is focused.
+        if event.is_ctrl('y') {
+            let url = self
+                .state
+                .lock()
+                .expect("login dialog state poisoned")
+                .url
+                .clone();
+            self.notice = Some(match url {
+                Some(url) => {
+                    crate::auth::copy_to_clipboard(&url);
+                    "Copied the authorization URL to your clipboard.".to_string()
+                }
+                None => "No authorization URL to copy yet.".to_string(),
+            });
+            return true;
+        }
+
         let kb = keybindings::get();
 
         if kb.matches(event, "tui.select.cancel") {
@@ -275,9 +330,10 @@ impl OAuthCallbacks for TuiOAuthCallbacks {
                 st.lines.push(LoginLine::Info(instructions.to_string()));
             }
             st.lines.push(LoginLine::Info(
-                "If it doesn't open, visit this URL:".to_string(),
+                "If it doesn't open, copy this URL (Ctrl+Y) or visit it:".to_string(),
             ));
             st.lines.push(LoginLine::Url(info.url.to_string()));
+            st.url = Some(info.url.to_string());
         }
         crate::auth::open_browser(info.url);
         self.render.request_render();
@@ -335,6 +391,18 @@ mod tests {
         let (mut dialog, _state, _pending, cancel) = make();
         dialog.handle_input(&Key::escape());
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ctrl_y_without_url_reports_nothing_to_copy() {
+        // No URL set yet: Ctrl+Y must not touch the clipboard and
+        // should leave an explanatory notice. (With a URL present the
+        // copy path is exercised by hand — it writes to the real
+        // clipboard / stdout, which a unit test shouldn't do.)
+        let (mut dialog, _state, _pending, _cancel) = make();
+        assert!(dialog.handle_input(&Key::ctrl('y')));
+        let body = dialog.render(80).join("\n");
+        assert!(body.contains("No authorization URL to copy yet"), "{body}");
     }
 
     #[tokio::test]

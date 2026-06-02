@@ -211,6 +211,44 @@ pub fn open_browser(url: &str) {
         .spawn();
 }
 
+/// Copy `text` to the user's clipboard, best-effort, via two
+/// complementary mechanisms so the common failure modes don't overlap:
+///
+/// - the system clipboard through `arboard` — works locally on
+///   macOS / Windows / X11; and
+/// - an OSC 52 terminal escape written to stdout, which many terminals
+///   honor *over SSH* (iTerm2, kitty, wezterm, tmux with
+///   `set-clipboard on`), covering the headless/remote case where
+///   `arboard` can't reach a clipboard.
+///
+/// Nota bene: must be called on the UI thread. The OSC 52 write targets
+/// the same stdout the TUI renders to, so issuing it off-thread could
+/// interleave with a frame and corrupt the display.
+///
+/// On X11 the `arboard` selection is dropped as soon as this returns
+/// (X11 clipboard ownership is process-bound), so on a plain X11
+/// terminal without OSC 52 support the copy may not outlive a paste
+/// attempt — the always-visible URL line remains the final fallback.
+pub fn copy_to_clipboard(text: &str) {
+    if let Err(err) = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+        tracing::debug!("clipboard: arboard set_text failed: {err}");
+    }
+    emit_osc52(text);
+}
+
+/// Write an OSC 52 "set clipboard" escape for `text` to stdout.
+fn emit_osc52(text: &str) {
+    use base64::Engine;
+    use std::io::Write;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    // OSC 52 ; c ; <base64> BEL — `c` selects the clipboard buffer.
+    let seq = format!("\x1b]52;c;{encoded}\x07");
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

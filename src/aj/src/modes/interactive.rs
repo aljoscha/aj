@@ -1774,7 +1774,9 @@ fn subtitle_login() -> String {
         .unwrap_or_else(|| "Enter".to_string());
     let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
         .unwrap_or_else(|| "Esc".to_string());
-    format!("{submit} to submit pasted code  \u{2022}  {cancel} to cancel")
+    format!(
+        "Ctrl+Y to copy URL  \u{2022}  {submit} to submit pasted code  \u{2022}  {cancel} to cancel"
+    )
 }
 
 /// Mount the OAuth login dialog overlay for `provider_id` and spawn
