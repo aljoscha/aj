@@ -268,11 +268,11 @@ mod tests {
             p.handle_input(&Key::char(c));
         }
         let body = p.render(80).join("\n");
-        // Both `model` rows (`thinking` and `switch`) should be on
+        // Both `model` rows (`thinking` and `use`) should be on
         // screen — querying the category surfaces every entry in that
         // group via the `"<category> <title>"` filter key.
         assert!(body.contains("thinking"), "got: {body}");
-        assert!(body.contains("switch"), "got: {body}");
+        assert!(body.contains("use"), "got: {body}");
     }
 
     #[test]

@@ -31,7 +31,7 @@ use aj_models::registry::{ModelInfo, ModelRegistry};
 ///   [`dispatch`] on confirm.
 /// - `title`: friendly label shown as the primary column in the
 ///   command palette and help overlay. Decoupled from `name` so the
-///   UI can read cleanly (e.g. category `model` + title `switch`)
+///   UI can read cleanly (e.g. category `model` + title `use`)
 ///   without the token having to carry the whole phrase.
 /// - `category`: short label grouping commands in the palette UI;
 ///   currently one of `"model"`, `"session"`, `"prompt"`, or `"aj"`.
@@ -75,9 +75,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "model",
-        title: "switch",
+        title: "use",
         category: "model",
-        description: "Switch the active model.",
+        description: "Use a different model.",
         action_id: None,
     },
     BuiltinCommand {
