@@ -305,13 +305,13 @@ impl InteractiveMode {
         }
 
         // ---- Theme ----------------------------------------------------
-        // Loaded once at startup from `config.theme` (default `dark`).
+        // Loaded once at startup from `config.theme` (default `light`).
         // The handle is reused everywhere a component needs theme
         // colors: layout, event pump, selector overlays. A runtime
         // swap re-points the inner [`Theme`] without rebuilding any
         // component — every theme closure resolves through the
         // shared [`RwLock`] on each call.
-        let configured_theme = config.theme.as_deref().unwrap_or("light").to_string();
+        let configured_theme = resolve_theme_name(config.theme.as_deref()).to_string();
         let theme = ThemeHandle::new(Theme::load(&configured_theme));
 
         // ---- Theme file watcher (hot-reload) -------------------------
@@ -1250,6 +1250,15 @@ fn error_event(text: &str) -> AgentEvent {
         agent_id: aj_agent::events::AgentId::Main,
         text: text.to_string(),
     }
+}
+
+/// Resolve the startup theme name from `config.theme`. When the key
+/// is unset the interactive TUI defaults to `light`; an explicit
+/// name passes through unchanged. (A failed *load* of that name is a
+/// separate concern handled by [`Theme::load`], which falls back to
+/// the bundled `dark` palette.)
+fn resolve_theme_name(configured: Option<&str>) -> &str {
+    configured.unwrap_or("light")
 }
 
 /// Build the chat-scrollback "Context:" notice listing every
@@ -2463,6 +2472,17 @@ mod tests {
             today_date: "2025-01-01".to_string(),
             context_files,
         }
+    }
+
+    #[test]
+    fn resolve_theme_name_defaults_to_light_when_unset() {
+        assert_eq!(resolve_theme_name(None), "light");
+    }
+
+    #[test]
+    fn resolve_theme_name_passes_explicit_name_through() {
+        assert_eq!(resolve_theme_name(Some("dark")), "dark");
+        assert_eq!(resolve_theme_name(Some("solarized")), "solarized");
     }
 
     #[test]

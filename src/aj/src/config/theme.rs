@@ -19,10 +19,11 @@
 //!
 //! ## Built-in themes
 //!
-//! Two palettes ship bundled in the binary: `dark` (the default)
-//! and `light`. The JSON for each lives next to this file and is
-//! embedded via [`include_str!`] so the binary always loads cleanly
-//! offline.
+//! Two palettes ship bundled in the binary: `light` (the default
+//! when `theme` is unset) and `dark` (also the safe fallback when a
+//! named theme fails to parse). The JSON for each lives next to this
+//! file and is embedded via [`include_str!`] so the binary always
+//! loads cleanly offline.
 //!
 //! ## User themes
 //!
@@ -66,13 +67,13 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-/// Bundled "dark" palette. The default; loads when `theme` is unset
-/// in `config.toml` or when an explicitly-named theme fails to
-/// parse.
+/// Bundled "dark" palette. The safe fallback: loads when an
+/// explicitly-named theme fails to parse so the binary always comes
+/// up with a working palette.
 const DARK_THEME_JSON: &str = include_str!("theme/dark.json");
 
-/// Bundled "light" palette. Companion to `dark`; picked via
-/// `theme = "light"` in `config.toml`.
+/// Bundled "light" palette. The default when `theme` is unset in
+/// `config.toml`; also picked explicitly via `theme = "light"`.
 const LIGHT_THEME_JSON: &str = include_str!("theme/light.json");
 
 // ============================================================================

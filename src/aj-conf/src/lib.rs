@@ -597,7 +597,7 @@ pub struct Config {
     pub speed: Option<ConfigSpeed>,
     /// Interactive TUI theme name. Resolved against the bundled
     /// catalog (`dark`, `light`) plus any `*.json` files in
-    /// `~/.aj/themes/`. Defaults to `dark` when unset.
+    /// `~/.aj/themes/`. Defaults to `light` when unset.
     pub theme: Option<String>,
     /// List of builtin tool names to disable. Tools in this list will not be
     /// available to the agent.
