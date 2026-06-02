@@ -237,12 +237,14 @@ name = "anthropic-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dotenv",
  "eventsource-stream",
  "futures",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
