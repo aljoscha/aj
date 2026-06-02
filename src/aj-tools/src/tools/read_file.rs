@@ -209,7 +209,7 @@ impl ToolDefinition for ReadFileTool {
         let formatted_for_model: Vec<String> = kept
             .iter()
             .enumerate()
-            .map(|(i, line)| format!("{:5>}: {}", start_idx + i + 1, line))
+            .map(|(i, line)| format!("{:>5}: {}", start_idx + i + 1, line))
             .collect();
         let mut model_body = formatted_for_model.join("\n");
         let mut display_body = format_for_display(kept);
@@ -438,7 +438,7 @@ fn image_omitted_outcome(display_path: String, source_mime: &str) -> ToolOutcome
 pub fn format_for_display(lines: &[&str]) -> String {
     let mut result = String::new();
     for (i, line) in lines.iter().enumerate() {
-        result.push_str(&format!("{:5>}: {}\n", i + 1, line));
+        result.push_str(&format!("{:>5}: {}\n", i + 1, line));
     }
     result
 }
@@ -508,6 +508,40 @@ mod tests {
         }
     }
 
+    /// Pins the line-number gutter contract: numbers are right-aligned
+    /// in a 5-wide column, so single- and multi-digit lines share a
+    /// common separator position. `contains("1: ...")` cannot catch
+    /// this, so we assert the padded prefixes exactly.
+    #[tokio::test]
+    async fn execute_right_aligns_line_number_gutter() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        for i in 1..=10 {
+            writeln!(file, "line {i}").unwrap();
+        }
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool::new()
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        let wire = extract_text(&outcome.content);
+        assert!(wire.contains("    1: line 1"), "wire: {wire:?}");
+        assert!(wire.contains("   10: line 10"), "wire: {wire:?}");
+
+        let display = format_for_display(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        assert!(display.contains("    1: a"), "display: {display:?}");
+        assert!(display.contains("   10: j"), "display: {display:?}");
+    }
+
     #[tokio::test]
     async fn execute_honors_offset_and_limit() {
         let mut file = NamedTempFile::new().expect("temp file");
@@ -548,8 +582,8 @@ mod tests {
         match &outcome.details {
             ToolDetails::Text { summary, body } => {
                 assert!(summary.ends_with(" 3:4"), "summary: {summary:?}");
-                assert!(body.starts_with("1: line 3"), "body: {body:?}");
-                assert!(body.contains("2: line 4"), "body: {body:?}");
+                assert!(body.starts_with("    1: line 3"), "body: {body:?}");
+                assert!(body.contains("    2: line 4"), "body: {body:?}");
             }
             other => panic!("expected Text details, got {other:?}"),
         }
