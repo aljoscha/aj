@@ -44,7 +44,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
 | S1 | anthropic-sdk | Done | 0 | 1 | 4 | 3 | [anthropic-sdk](findings/anthropic-sdk.md) | adfcaca |
-| S2 | openai-sdk | TODO | – | – | – | – | – | – |
+| S2 | openai-sdk | Done | 0 | 1 | 4 | 2 | [openai-sdk](findings/openai-sdk.md) | 5d43f02 |
 
 ## Phase M — `aj-models` (wire layer)
 
@@ -121,12 +121,21 @@ Recurring observations collected as steps complete; consumed by X1.
   never-constructed error variants). Set one surface policy and apply it.
 - **`thiserror` vs. hand-written `Display`** (S1): `ApiError` hand-rolls
   `Display` while deriving `Error`; pick one convention across crates.
-- **Where wire-correctness is asserted** (S1): SDKs lean on
+- **Where wire-correctness is asserted** (S1, S2): SDKs lean on
   `aj-models/tests/roundtrip/` rather than testing their own request/error
-  mapping. Decide where the HTTP boundary is covered.
+  mapping. Decide where the HTTP boundary is covered. Confirmed for both.
+- **Within-crate duplication of error/SSE mapping** (S2): openai-sdk's two
+  streaming methods duplicate non-2xx + `Retry-After` + SSE-parse logic
+  verbatim. Check whether aj-models adapters (M3/M4) repeat this.
+- **Unused declared dependency** (S2): `async-stream` declared but unused
+  in openai-sdk. Sweep other crates for unused deps.
+
+Note: all S1 themes were confirmed in S2 (error split doubled, broader
+dead surface, identical `ApiError` Display pattern).
 
 ## Audit log
 
 One line per completed step (most recent last).
 
 - 2026-06-02 · S1 anthropic-sdk · 0C/1Ma/4Mi/3N · adfcaca
+- 2026-06-02 · S2 openai-sdk · 0C/1Ma/4Mi/2N · 5d43f02
