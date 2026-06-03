@@ -51,7 +51,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
 | M1 | models-core | Done | 0 | 1 | 4 | 3 | [aj-models-core](findings/aj-models-core.md) | b415d89 |
-| M2 | models-streaming | TODO | – | – | – | – | – | – |
+| M2 | models-streaming | Done | 0 | 0 | 4 | 3 | [aj-models-streaming](findings/aj-models-streaming.md) | 867a6df |
 | M3 | models-anthropic | TODO | – | – | – | – | – | – |
 | M4 | models-openai | TODO | – | – | – | – | – | – |
 | M5 | models-auth | TODO | – | – | – | – | – | – |
@@ -134,6 +134,12 @@ Recurring observations collected as steps complete; consumed by X1.
   `ErasedToolDefinition → Tool → ToolDefinition`. Revisit in AG2.
 - **`anyhow` reaches into lib crates** (S1, S2, M1): confirmed again in
   `aj-models/src/refresh.rs`. Track all lib-crate `anyhow` use.
+- **Streaming hot-path cost** (M2): partial-JSON tool-arg parsing is
+  O(n²) (each delta reparses the cumulative buffer) plus per-event deep
+  clones. Watch the adapters (M3/M4) for similar.
+- **Non-determinism from wall-clock in lib code** (M2): `transform.rs`
+  stamps synthetic orphan tool-results with `Utc::now()`. Sweep for
+  `Utc::now()`/`Instant::now()` in pure transform/persistence paths.
 
 Note: all S1 themes were confirmed in S2 (error split doubled, broader
 dead surface, identical `ApiError` Display pattern).
@@ -145,3 +151,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · S1 anthropic-sdk · 0C/1Ma/4Mi/3N · adfcaca
 - 2026-06-02 · S2 openai-sdk · 0C/1Ma/4Mi/2N · 5d43f02
 - 2026-06-02 · M1 models-core · 0C/1Ma/4Mi/3N · b415d89
+- 2026-06-02 · M2 models-streaming · 0C/0Ma/4Mi/3N · 867a6df
