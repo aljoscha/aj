@@ -50,7 +50,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| M1 | models-core | TODO | – | – | – | – | – | – |
+| M1 | models-core | Done | 0 | 1 | 4 | 3 | [aj-models-core](findings/aj-models-core.md) | b415d89 |
 | M2 | models-streaming | TODO | – | – | – | – | – | – |
 | M3 | models-anthropic | TODO | – | – | – | – | – | – |
 | M4 | models-openai | TODO | – | – | – | – | – | – |
@@ -127,8 +127,13 @@ Recurring observations collected as steps complete; consumed by X1.
 - **Within-crate duplication of error/SSE mapping** (S2): openai-sdk's two
   streaming methods duplicate non-2xx + `Retry-After` + SSE-parse logic
   verbatim. Check whether aj-models adapters (M3/M4) repeat this.
-- **Unused declared dependency** (S2): `async-stream` declared but unused
-  in openai-sdk. Sweep other crates for unused deps.
+- **Unused declared dependency** (S2, M1): `async-stream` declared but
+  unused in openai-sdk and aj-models. Sweep all crates for unused deps.
+- **Duplicated type across the aj-models/aj-agent boundary** (M1):
+  `tools::Tool` duplicates `types::ToolDefinition`; `aj-agent` round-trips
+  `ErasedToolDefinition → Tool → ToolDefinition`. Revisit in AG2.
+- **`anyhow` reaches into lib crates** (S1, S2, M1): confirmed again in
+  `aj-models/src/refresh.rs`. Track all lib-crate `anyhow` use.
 
 Note: all S1 themes were confirmed in S2 (error split doubled, broader
 dead surface, identical `ApiError` Display pattern).
@@ -139,3 +144,4 @@ One line per completed step (most recent last).
 
 - 2026-06-02 · S1 anthropic-sdk · 0C/1Ma/4Mi/3N · adfcaca
 - 2026-06-02 · S2 openai-sdk · 0C/1Ma/4Mi/2N · 5d43f02
+- 2026-06-02 · M1 models-core · 0C/1Ma/4Mi/3N · b415d89
