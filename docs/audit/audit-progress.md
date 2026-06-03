@@ -43,7 +43,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| S1 | anthropic-sdk | TODO | – | – | – | – | – | – |
+| S1 | anthropic-sdk | Done | 0 | 1 | 4 | 3 | [anthropic-sdk](findings/anthropic-sdk.md) | adfcaca |
 | S2 | openai-sdk | TODO | – | – | – | – | – | – |
 
 ## Phase M — `aj-models` (wire layer)
@@ -111,8 +111,22 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 ## Cross-cutting themes
 
 Recurring observations collected as steps complete; consumed by X1.
-(Empty until findings start landing.)
+
+- **Error-type consistency at SDK boundaries** (S1): non-streaming
+  `messages()` returns `anyhow::Error` while the streaming path returns
+  structured `ClientError`. Check both SDKs standardize on a structured
+  error (status + retry-after) and avoid `anyhow` in lib crates.
+- **Dead/unused public surface on "thin" clients** (S1): SDKs expose more
+  than `aj-models` consumes (orphaned conversions, setters,
+  never-constructed error variants). Set one surface policy and apply it.
+- **`thiserror` vs. hand-written `Display`** (S1): `ApiError` hand-rolls
+  `Display` while deriving `Error`; pick one convention across crates.
+- **Where wire-correctness is asserted** (S1): SDKs lean on
+  `aj-models/tests/roundtrip/` rather than testing their own request/error
+  mapping. Decide where the HTTP boundary is covered.
 
 ## Audit log
 
 One line per completed step (most recent last).
+
+- 2026-06-02 · S1 anthropic-sdk · 0C/1Ma/4Mi/3N · adfcaca
