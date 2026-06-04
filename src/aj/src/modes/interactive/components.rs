@@ -18,6 +18,7 @@ pub mod assistant_message;
 pub mod auth_picker;
 pub mod auth_status;
 pub mod bash_execution;
+pub mod chat_view;
 pub mod command_palette;
 pub mod diff;
 pub mod footer;
