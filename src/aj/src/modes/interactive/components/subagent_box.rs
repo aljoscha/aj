@@ -172,14 +172,22 @@ impl SubAgentBox {
             .join(" ")
     }
 
-    /// One-line compact title `{glyph} agent {N} · {task}`, with the
-    /// task summary truncated to fit `content_width` so the title
-    /// never overflows.
+    /// One-line compact title `{glyph} agent {N} · {task}`, truncated as
+    /// a whole to `content_width`.
+    ///
+    /// The assembled line is truncated rather than just the task summary:
+    /// the `{glyph} agent {N} · ` prefix is ~12 columns, so truncating
+    /// only the summary leaves the title that much wider than
+    /// `content_width` and overflows the box (the bg-paint pipeline pads
+    /// but never trims, so the over-wide row reaches the Tui's strict
+    /// line-width check and panics). Truncating the whole line also keeps
+    /// the contract when the prefix alone would exceed a very narrow box.
     fn compact_title(&self, content_width: usize) -> String {
         let glyph = self.status_glyph();
         let label = style::bold(&format!("agent {}", self.agent_index));
-        let summary = truncate_to_width(&self.task_summary(), content_width, "…", false);
-        format!("{glyph} {label} · {}", style::dim(&summary))
+        let summary = style::dim(&self.task_summary());
+        let title = format!("{glyph} {label} · {summary}");
+        truncate_to_width(&title, content_width, "…", false)
     }
 }
 
@@ -408,6 +416,30 @@ mod tests {
                 visible_width(line) <= width,
                 "row {i} exceeds width: {line:?}"
             );
+        }
+    }
+
+    #[test]
+    fn compact_title_with_a_long_task_never_overflows_the_box() {
+        // Regression: `compact_title` used to truncate only the task
+        // summary to `content_width`, then prepend the
+        // `{glyph} agent {N} · ` prefix — so the title overran the box
+        // by the prefix width. The bg-paint pads but never trims, so
+        // the over-wide row reached the Tui's strict line-width check
+        // and panicked. Render a far-too-long task into a wide box and
+        // assert every painted row is exactly `width`.
+        let long_task = "Search the aj codebase (Rust workspace at /home/ubuntu/aj) for \
+            patterns where we iterate over chat messages and call setters to update \
+            rendering settings. Specifically look for thinking visibility and tool \
+            result expansion toggles."
+            .to_string();
+        let mut b = SubAgentBox::new(1, &long_task, &theme());
+        b.set_status(SubAgentStatus::Done);
+        push_text(&mut b, "inner line");
+        let width = 202;
+        let lines = b.render(width);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(visible_width(line), width, "row {i} width: {line:?}");
         }
     }
 
