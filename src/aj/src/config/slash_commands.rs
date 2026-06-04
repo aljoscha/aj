@@ -123,6 +123,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         action_id: Some(crate::config::keybindings::ACTION_HISTORY_OPEN),
     },
     BuiltinCommand {
+        name: "agents",
+        title: "switch",
+        category: "agent",
+        description: "Switch which agent's transcript is shown.",
+        action_id: Some(crate::config::keybindings::ACTION_AGENT_PICKER),
+    },
+    BuiltinCommand {
         name: "help",
         title: "help",
         category: "aj",
@@ -194,6 +201,9 @@ pub enum SlashAction {
     /// Open the prompt-history search overlay. `Enter` recalls the
     /// chosen prompt into the editor; `Esc` cancels.
     OpenPromptHistory,
+    /// Open the agent picker overlay. `Enter` switches the chat view
+    /// to the chosen agent's transcript; `Esc` cancels.
+    OpenAgentPicker,
     /// Start a fresh session. The current session is preserved on
     /// disk; the host creates a new [`ConversationLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the
@@ -242,6 +252,7 @@ pub fn dispatch(input: &str) -> SlashAction {
         "auth" => SlashAction::OpenAuthStatus,
         "resume" => SlashAction::OpenSessionSelector,
         "history" => SlashAction::OpenPromptHistory,
+        "agents" => SlashAction::OpenAgentPicker,
         "palette" => SlashAction::OpenCommandPalette,
         "new" => SlashAction::NewSession,
         "help" => SlashAction::Help,
@@ -369,6 +380,12 @@ mod tests {
     fn dispatch_history_opens_prompt_history() {
         assert_eq!(dispatch("/history"), SlashAction::OpenPromptHistory);
         assert_eq!(dispatch("  /history  "), SlashAction::OpenPromptHistory);
+    }
+
+    #[test]
+    fn dispatch_agents_opens_agent_picker() {
+        assert_eq!(dispatch("/agents"), SlashAction::OpenAgentPicker);
+        assert_eq!(dispatch("  /agents  "), SlashAction::OpenAgentPicker);
     }
 
     #[test]

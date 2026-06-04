@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::modes::interactive::components::chat_view::ChatView;
 use aj_agent::bus::SubscriptionHandle;
-use aj_agent::events::AgentEvent;
+use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
 use aj_models::ThinkingConfig;
@@ -60,6 +60,9 @@ use crate::config::theme::{
     watch_user_theme,
 };
 use crate::model::{ResolvedModel, from_model_info};
+use crate::modes::interactive::components::agent_picker::{
+    AgentPickerComponent, AgentPickerOutcome, AgentPickerOutcomeHandle,
+};
 use crate::modes::interactive::components::auth_picker::{
     AuthPickerComponent, AuthProviderItem, OutcomeHandle as AuthPickerOutcomeHandle,
 };
@@ -506,6 +509,11 @@ impl InteractiveMode {
         // the `palette_open_request` path. Dispatched without a parent
         // palette so `Esc` closes the overlay back to the editor.
         let history_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // Set by the global `aj.agent.open` chord (default `alt+a`).
+        // Drained after `tui.handle_input` to route a synthetic
+        // `/agents` through the dispatcher (mirroring the history
+        // chord), opening the agent picker.
+        let agent_picker_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         {
             let flag = Arc::clone(&palette_open_request);
             if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
@@ -944,6 +952,20 @@ impl InteractiveMode {
                                     // future binding and matches the
                                     // close-all interception style.
                                     consume_event = true;
+                                } else if open_selector.is_none()
+                                    && login_session.is_none()
+                                    && kb.matches(
+                                        &input,
+                                        crate::config::keybindings::ACTION_AGENT_PICKER,
+                                    )
+                                {
+                                    drop(kb);
+                                    agent_picker_open_request.store(true, Ordering::Relaxed);
+                                    // Consume: the editor binds no alt+a;
+                                    // skipping handle_input keeps the
+                                    // chord from reaching any future
+                                    // binding, like the history chord.
+                                    consume_event = true;
                                 }
                             }
                             if !consume_event {
@@ -1048,6 +1070,45 @@ impl InteractiveMode {
                                     &conversation_persistence,
                                     &theme,
                                     "/history",
+                                    None,
+                                    running_task.is_some(),
+                                ).await {
+                                    SlashHandled::Continue { selector, notice } => {
+                                        if let Some(text) = notice {
+                                            pump.handle(&mut tui, &notice_event(&text));
+                                        }
+                                        if let Some(sel) = selector {
+                                            open_selector = Some(sel);
+                                        }
+                                    }
+                                    SlashHandled::Quit => break,
+                                }
+                                continue;
+                            }
+
+                            // Global agent-picker open: fired by the
+                            // `Alt+A` chord intercepted above. Routes a
+                            // synthetic `/agents` through the same
+                            // dispatcher with no parent palette, so the
+                            // overlay's `Esc` closes straight back to
+                            // the editor. Gated on `open_selector` to be
+                            // inert while another selector is up.
+                            if agent_picker_open_request.swap(false, Ordering::Relaxed)
+                                && open_selector.is_none()
+                                && login_session.is_none()
+                            {
+                                match handle_slash_command(
+                                    &mut tui,
+                                    &auth,
+                                    Arc::clone(&agent),
+                                    Arc::clone(&model_catalog),
+                                    Arc::clone(&run_config),
+                                    &mut log,
+                                    &mut persistence_handle,
+                                    &mut pump,
+                                    &conversation_persistence,
+                                    &theme,
+                                    "/agents",
                                     None,
                                     running_task.is_some(),
                                 ).await {
@@ -1418,6 +1479,14 @@ enum OpenSelector {
         outcome: PromptHistoryOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
+    /// Agent picker overlay. `Enter` switches the chat view to the
+    /// chosen agent's transcript (and sets the editor's observing
+    /// marker); `Esc` (or back-stack pop) closes it.
+    AgentPicker {
+        handle: OverlayHandle,
+        outcome: AgentPickerOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
+    },
     Palette {
         handle: OverlayHandle,
         outcome: CommandPaletteOutcomeHandle,
@@ -1635,6 +1704,20 @@ fn apply_editor_border_for_thinking(
     }
 }
 
+/// Reflect the observed agent in the editor's top-bar label: an
+/// `observing agent N` marker for a sub-agent, cleared for the main
+/// agent. Called when the agent picker confirms a switch and when a
+/// session reset returns the view to the main agent.
+fn apply_editor_agent_marker(tui: &mut Tui, id: AgentId) {
+    let label = match id {
+        AgentId::Main => None,
+        AgentId::Sub(n) => Some(format!("observing agent {n}")),
+    };
+    if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+        editor.set_top_bar_label(label);
+    }
+}
+
 /// Format the footer's model field as `"<model-id> <thinking-effort>"`.
 ///
 /// The thinking effort (e.g. `"off"`, `"medium"`, `"max"`) is more
@@ -1797,6 +1880,20 @@ fn subtitle_confirm_close() -> String {
     }
 }
 
+/// Subtitle for the agent picker: how to observe, toggle scope, and
+/// close, with key labels resolved from the keybindings manager.
+fn subtitle_agent_picker() -> String {
+    let confirm = aj_tui::keybindings::format_action_shortcut("tui.input.submit")
+        .unwrap_or_else(|| "Enter".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    let scope = aj_tui::keybindings::format_action_shortcut(
+        crate::config::keybindings::ACTION_AGENT_TOGGLE_SCOPE,
+    )
+    .unwrap_or_else(|| "Ctrl+T".to_string());
+    format!("{confirm} to observe  \u{2022}  {scope} all agents  \u{2022}  {cancel} to close")
+}
+
 /// Subtitle for read-only overlays (the help screen): just the
 /// resolved cancel key + `"to close"`.
 fn subtitle_close() -> String {
@@ -1855,6 +1952,11 @@ fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
             ..
         }
         | OpenSelector::AuthStatus {
+            handle,
+            parent_palette,
+            ..
+        }
+        | OpenSelector::AgentPicker {
             handle,
             parent_palette,
             ..
@@ -2270,6 +2372,31 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
+        SlashAction::OpenAgentPicker => {
+            // Snapshot the known agents and the active view from the
+            // pump (reads through the `ChatView`); never touches the
+            // agent, so it's safe mid-turn.
+            let agents = pump.agents(tui);
+            let active = pump.active_view(tui);
+            let inner = AgentPickerComponent::new(select_list_theme(theme), agents, active);
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Agents",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_agent_picker());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::AgentPicker {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
+                notice: None,
+            }
+        }
         SlashAction::NewSession if turn_running => SlashHandled::Continue {
             selector: None,
             notice: Some(session_busy_notice("start a new session")),
@@ -2344,6 +2471,7 @@ async fn handle_slash_command(
                         | OpenSelector::Model { .. }
                         | OpenSelector::Session { .. }
                         | OpenSelector::PromptHistory { .. }
+                        | OpenSelector::AgentPicker { .. }
                         | OpenSelector::Help { .. }
                         | OpenSelector::AuthPicker { .. }
                         | OpenSelector::AuthStatus { .. },
@@ -2798,6 +2926,54 @@ async fn handle_selector_outcome(
                 }
             }
         }
+        OpenSelector::AgentPicker {
+            handle,
+            outcome,
+            parent_palette,
+        } => {
+            let outcome_value = outcome
+                .lock()
+                .expect("agent picker outcome poisoned")
+                .take();
+            match outcome_value {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::AgentPicker {
+                    handle,
+                    outcome,
+                    parent_palette,
+                }),
+                Some(AgentPickerOutcome::Confirmed(id)) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.hide_overlay(&parent.handle);
+                    }
+                    // Switch the chat view to the chosen agent and mark
+                    // the editor so the user sees which agent they're
+                    // observing (cleared when switching back to main).
+                    pump.set_active_view(tui, id);
+                    apply_editor_agent_marker(tui, id);
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                    }
+                }
+                Some(AgentPickerOutcome::Cancelled) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                    }
+                }
+            }
+        }
         OpenSelector::Palette { handle, outcome } => {
             use crate::modes::interactive::components::command_palette::CommandPaletteOutcome;
             match outcome.take() {
@@ -2963,6 +3139,8 @@ async fn perform_session_swap(
     if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
         chat.reset();
     }
+    // Back to the main view: clear any "observing agent N" marker.
+    apply_editor_agent_marker(tui, AgentId::Main);
     let hide_thinking_block = pump.hide_thinking_block();
     let show_image_in_terminal = pump.show_image_in_terminal();
     let context_window = agent.lock().await.model_info().context_window;
@@ -3061,6 +3239,8 @@ async fn perform_new_session(
     if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
         chat.reset();
     }
+    // Back to the main view: clear any "observing agent N" marker.
+    apply_editor_agent_marker(tui, AgentId::Main);
     let hide_thinking_block = pump.hide_thinking_block();
     let show_image_in_terminal = pump.show_image_in_terminal();
     let context_window = agent.lock().await.model_info().context_window;
