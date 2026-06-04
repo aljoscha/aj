@@ -423,6 +423,10 @@ pub struct Editor {
     padding_x: usize,
     focused: bool,
     theme: EditorTheme,
+    /// Optional short label inlaid into the top border, rendered like
+    /// the `↑ N more` scroll indicator. `None` (the default) leaves the
+    /// border a plain rule. Set via [`Editor::set_top_bar_label`].
+    top_bar_label: Option<String>,
 
     // Editing state.
     kill_ring: KillRing,
@@ -673,6 +677,7 @@ impl Editor {
             padding_x: 0,
             focused: false,
             theme,
+            top_bar_label: None,
             kill_ring: KillRing::default(),
             undo_stack: UndoStack::default(),
             last_action: LastAction::None,
@@ -787,6 +792,16 @@ impl Editor {
     /// from the terminal height.
     pub fn clear_max_visible_lines(&mut self) {
         self.max_visible_lines = None;
+    }
+
+    /// Inlay a short label into the editor's top border (rendered like
+    /// the `↑ N more` scroll indicator). `None` clears it. The label is
+    /// styled with the themed border color; callers pass plain text.
+    pub fn set_top_bar_label(&mut self, label: Option<String>) {
+        if self.top_bar_label != label {
+            self.top_bar_label = label;
+            self.invalidate();
+        }
     }
 
     /// Effective cap on visual rows revealed before scrolling.
@@ -3031,21 +3046,29 @@ impl Component for Editor {
         // fight the select list for the hardware cursor position.
         let emit_cursor_marker = self.focused && self.autocomplete_state.is_none();
 
-        // Top border. When the buffer is scrolled we show a scroll
-        // indicator like `─── ↑ N more ` followed by `─` padding to the
-        // end of the line; otherwise a plain `─` line spanning `width`.
+        // Top border. Optional left-inlaid segments (the `↑ N more`
+        // scroll indicator, then the top-bar label) are rendered as
+        // `─── {text} ` runs, concatenated and padded with `─` out to
+        // `width`; the whole line is then styled with the border color.
+        // With no segments the border is a plain `─` rule.
         let horizontal = (self.theme.border_color)("─");
+        let mut segments = String::new();
         if scroll_start > 0 {
-            let indicator = format!("─── ↑ {} more ", scroll_start);
-            let ind_w = visible_width(&indicator);
-            let line = if ind_w >= width {
-                truncate_to_width(&indicator, width, "", false)
+            segments.push_str(&format!("─── ↑ {} more ", scroll_start));
+        }
+        if let Some(label) = &self.top_bar_label {
+            segments.push_str(&format!("─── {} ", label));
+        }
+        if segments.is_empty() {
+            result.push(horizontal.repeat(width));
+        } else {
+            let seg_w = visible_width(&segments);
+            let line = if seg_w >= width {
+                truncate_to_width(&segments, width, "", false)
             } else {
-                format!("{}{}", indicator, "─".repeat(width - ind_w))
+                format!("{}{}", segments, "─".repeat(width - seg_w))
             };
             result.push((self.theme.border_color)(&line));
-        } else {
-            result.push(horizontal.repeat(width));
         }
 
         // Visible content.
@@ -3864,5 +3887,69 @@ mod tests {
             "mid-line `/` must not fire the palette trigger"
         );
         assert_eq!(editor.get_text(), "ab/");
+    }
+
+    /// A set top-bar label is inlaid into the rendered top border.
+    #[test]
+    fn top_bar_label_appears_in_top_row() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_top_bar_label(Some("observing agent 2".into()));
+        let lines = editor.render(80);
+        assert!(
+            lines[0].contains("observing agent 2"),
+            "top row must carry the label: got {:?}",
+            lines[0],
+        );
+    }
+
+    /// The default (`None`) top border is a plain rule with no label.
+    #[test]
+    fn no_top_bar_label_renders_plain_rule() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        let lines = editor.render(80);
+        assert!(
+            !lines[0].contains("observing"),
+            "default top row must not carry a label: got {:?}",
+            lines[0],
+        );
+        // A plain rule is `─` repeated to width (identity theme = no ANSI).
+        assert_eq!(lines[0], "─".repeat(80));
+    }
+
+    /// The label coexists with the scroll indicator: when both are
+    /// present the top row carries the `↑ N more` indicator and the
+    /// label, in that order.
+    #[test]
+    fn top_bar_label_coexists_with_scroll_indicator() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_max_visible_lines(2);
+        // Enough lines and cursor at the end to force a scroll-up state.
+        editor.set_text("l1\nl2\nl3\nl4\nl5");
+        editor.set_top_bar_label(Some("observing agent 2".into()));
+        let top = &editor.render(80)[0];
+        assert!(top.contains("more"), "expected scroll indicator: {top:?}");
+        assert!(top.contains("observing agent 2"), "expected label: {top:?}");
+        let more = top.find("more").unwrap();
+        let label = top.find("observing agent 2").unwrap();
+        assert!(more < label, "indicator must precede label: {top:?}");
+    }
+
+    /// The first rendered row never exceeds `width` for a range of
+    /// widths, with the label set (which is the longest segment). Width
+    /// 0 yields no lines (content width collapses), so guard for that.
+    #[test]
+    fn top_row_never_exceeds_width() {
+        for width in [0usize, 1, 2, 10, 40, 80, 200] {
+            let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+            editor.set_top_bar_label(Some("observing agent 2".into()));
+            let lines = editor.render(width);
+            if let Some(top) = lines.first() {
+                assert!(
+                    visible_width(top) <= width,
+                    "width {width}: top row visible width {} exceeds {width}: {top:?}",
+                    visible_width(top),
+                );
+            }
+        }
     }
 }
