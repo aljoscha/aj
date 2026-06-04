@@ -73,7 +73,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| SE1 | session | TODO | – | – | – | – | – | – |
+| SE1 | session | Done | 0 | 3 | 5 | 3 | [aj-session](findings/aj-session.md) | a477dca |
 
 ## Phase TO — `aj-tools`
 
@@ -158,9 +158,17 @@ Recurring observations collected as steps complete; consumed by X1.
   ~80% byte-identical (callback server, parsing, mock harness) with no
   shared seam — widest duplication locus so far. Pairs with M4 error-map
   duplication.
-- **Non-atomic user-file writes** (C1): `Config::save` truncates in place;
-  a crash mid-write can corrupt `config.toml`. Sweep config/themes/session
-  writers for write-to-temp+rename (the `auth.rs` pattern is the model).
+- **Non-atomic user-file writes** (C1, SE1): two axes. C1: `Config::save`
+  truncates in place (rewrite-atomicity). SE1: append-only log never
+  `sync_data`/`flush` despite "durable when the call returns" docs
+  (append-fsync). Sweep both classes across config/themes/session writers.
+- **Concurrency / single-writer guard** (SE1, NEW): two `aj continue <id>`
+  processes interleave JSONL lines and mint colliding entry ids,
+  corrupting the parent chain. No file lock. Check the binary (A2/A3)
+  for whether it ever opens the same thread twice.
+- **Replay drops persisted timestamps** (SE1): the log records per-entry
+  `Utc::now()` but projection/replay discards it, so resumed turns lose
+  their original timeline. Pairs with the wall-clock theme.
 - **Real-env/wall-clock coupling without an injection seam** (M2, M5, C1):
   `AgentEnv::new()` reads cwd/HOME/FS/`Utc::now()` directly; tests can't
   isolate it. Recurs with the wall-clock theme; a context/env seam would
@@ -215,3 +223,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · C1 conf · 0C/2Ma/5Mi/3N · 5a9eec6
 - 2026-06-02 · AG1 agent-runtime · 1C/3Ma/4Mi/3N · 2f5dfd0
 - 2026-06-02 · AG2 agent-contracts · 0C/1Ma/4Mi/2N · f5950da
+- 2026-06-02 · SE1 session · 0C/3Ma/5Mi/3N · a477dca
