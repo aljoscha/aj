@@ -316,7 +316,7 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   and over a deeper `aj-agent` live-config refactor (R7-adjacent).
   Fixed the misleading `/quit`-mid-turn + `disable_submit` comments;
   unit-tested the busy notice; full run-loop test deferred to R17.
-- 2026-06-04 · R3 · DONE · PENDING · Threaded a nesting-depth
+- 2026-06-04 · R3 · DONE · 5565fa8 · Threaded a nesting-depth
   counter through the markdown parser (`MAX_NESTING_DEPTH = 64`):
   `parse_markdown`/`parse_list` share one block-nesting counter
   (blockquote recursion + nested-list recursion), `parse_inline` an
