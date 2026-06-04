@@ -1979,6 +1979,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn switching_to_observe_a_subagent_expands_tools_collected_on_main() {
+        // Mirror of the test above, pinning the other direction: a
+        // sub-agent tool collected *while on main* arrives header-only
+        // (it lives in the compact box). Switching to observe that
+        // sub-agent must flip the already-collected tool to its full
+        // body, and returning to main must collapse it again. This
+        // exercises the view-switch re-flip (`ChatView::set_active` ->
+        // `SubAgentBox::set_mode`), independent of the append-time
+        // initial state.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "explore".into(),
+            },
+        );
+        // Stay on main: the tool is collected header-only.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Sub(1),
+                call_id: "c1".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Sub(1),
+                call_id: "c1".into(),
+                tool: "read_file".into(),
+                result: aj_agent::tool::ToolDetails::Text {
+                    summary: String::new(),
+                    body: "BODYMARKER".into(),
+                },
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
+                is_error: false,
+            },
+        );
+
+        // Main view: the compact box hides the tool body.
+        let main = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .render(80)
+            .join("\n");
+        assert!(
+            !main.contains("BODYMARKER"),
+            "compact box should hide the tool body; got:\n{main}",
+        );
+
+        // Switch to observe: the already-collected tool expands to
+        // its full body.
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        let full = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .render(80)
+            .join("\n");
+        assert!(
+            full.contains("BODYMARKER"),
+            "observing should expand the collected tool; got:\n{full}",
+        );
+
+        // Return to main: it collapses back to header-only.
+        pump.set_active_view(&mut tui, AgentId::Main);
+        let main_again = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .render(80)
+            .join("\n");
+        assert!(
+            !main_again.contains("BODYMARKER"),
+            "returning to main should re-collapse the tool; got:\n{main_again}",
+        );
+    }
+
     /// Runtime regression for the CPU-pegging bug the refcount fix
     /// addresses. The four `#[test]`s above pin the bookkeeping
     /// — `running_agents` transitions, `Loader::start` / `stop`
