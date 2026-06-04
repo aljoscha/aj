@@ -765,9 +765,26 @@ impl InteractiveMode {
                     match event {
                         TuiEvent::Render => tui.render(),
                         TuiEvent::Input(input) => {
-                            // Ctrl+C semantics, in priority order:
+                            // Ctrl+C semantics, in priority order.
+                            // A visible overlay always wins: a Ctrl+C
+                            // aimed at a modal dismisses the modal and
+                            // leaves any turn running behind it intact.
                             //
-                            // 1. Turn in flight (`current_turn_cancel`
+                            // 1. Overlay up (`open_selector` is
+                            //    `Some`): dismiss the overlay. Don't
+                            //    break or cancel the turn; fall
+                            //    through to the
+                            //    `ACTION_OVERLAY_CLOSE_ALL`
+                            //    interception below, which matches
+                            //    `ctrl+c` by default and tears the
+                            //    overlay stack down.
+                            // 2. Login dialog up (`login_session` is
+                            //    `Some`): the OAuth dialog is also a
+                            //    modal, so it takes precedence over a
+                            //    turn. Signal cancel; the cancel-poll
+                            //    below tears the dialog down and
+                            //    aborts the task.
+                            // 3. Turn in flight (`current_turn_cancel`
                             //    is `Some`): cancel the turn. The
                             //    cancel handle is the binary's clone
                             //    of the per-turn `CancellationToken`
@@ -777,39 +794,27 @@ impl InteractiveMode {
                             //    every provider / tool subscribed to
                             //    the same token, including the bash
                             //    tool's process group.
-                            // 2. Overlay up (`open_selector` is
-                            //    `Some`): fall through to the
-                            //    `ACTION_OVERLAY_CLOSE_ALL`
-                            //    interception below, which matches
-                            //    `ctrl+c` by default and tears the
-                            //    overlay stack down.
-                            // 3. Neither: exit the binary. This is
-                            //    the legacy behavior — Ctrl+C with
-                            //    no turn and no overlay quits.
+                            // 4. None of the above: exit the binary.
+                            //    This is the legacy behavior — Ctrl+C
+                            //    with no overlay and no turn quits.
                             //
                             // Ctrl+D always exits regardless. The
                             // terminal is in raw mode so neither
                             // chord raises SIGINT; both arrive here
                             // as ordinary key events.
                             if input.is_ctrl('c') {
-                                if let Some(token) = current_turn_cancel.as_ref() {
-                                    token.cancel();
-                                    continue;
-                                }
-                                if let Some(session) = login_session.as_ref() {
-                                    // Login in flight: signal cancel.
-                                    // The cancel-poll below tears the
-                                    // dialog down and aborts the task.
+                                if open_selector.is_some() {
+                                    // Overlay up: fall through to the
+                                    // close-all interception below.
+                                } else if let Some(session) = login_session.as_ref() {
                                     session.cancel.store(true, Ordering::Relaxed);
                                     continue;
-                                }
-                                if open_selector.is_none() {
+                                } else if let Some(token) = current_turn_cancel.as_ref() {
+                                    token.cancel();
+                                    continue;
+                                } else {
                                     break;
                                 }
-                                // Overlay is up: don't break. The
-                                // overlay close-all interception
-                                // below catches the same keystroke
-                                // and tears the stack down.
                             }
                             if input.is_ctrl('d') {
                                 break;
