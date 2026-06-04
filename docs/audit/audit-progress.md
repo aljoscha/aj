@@ -60,7 +60,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| C1 | conf | TODO | – | – | – | – | – | – |
+| C1 | conf | Done | 0 | 2 | 5 | 3 | [aj-conf](findings/aj-conf.md) | 5a9eec6 |
 
 ## Phase AG — `aj-agent` (runtime + contracts)
 
@@ -159,6 +159,13 @@ Recurring observations collected as steps complete; consumed by X1.
   ~80% byte-identical (callback server, parsing, mock harness) with no
   shared seam — widest duplication locus so far. Pairs with M4 error-map
   duplication.
+- **Non-atomic user-file writes** (C1): `Config::save` truncates in place;
+  a crash mid-write can corrupt `config.toml`. Sweep config/themes/session
+  writers for write-to-temp+rename (the `auth.rs` pattern is the model).
+- **Real-env/wall-clock coupling without an injection seam** (M2, M5, C1):
+  `AgentEnv::new()` reads cwd/HOME/FS/`Utc::now()` directly; tests can't
+  isolate it. Recurs with the wall-clock theme; a context/env seam would
+  help testability across the binary too.
 - **Happy-path-only roundtrip coverage** (M3, M4): confirmed across all
   provider roundtrip suites; the truncation Major lives in an untested path.
 - **Test-only `pub` items widen the surface** (M3, M4): widest locus is
@@ -178,3 +185,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · M3 models-anthropic · 0C/1Ma/4Mi/3N · b440134
 - 2026-06-02 · M4 models-openai · 0C/2Ma/5Mi/3N · d93f242
 - 2026-06-02 · M5 models-auth · 0C/2Ma/5Mi/4N · cf14db6
+- 2026-06-02 · C1 conf · 0C/2Ma/5Mi/3N · 5a9eec6
