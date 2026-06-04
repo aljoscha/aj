@@ -88,7 +88,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 |---|---|---|---|---|---|---|---|---|
 | T1 | tui-core | Done | 0 | 1 | 5 | 3 | [aj-tui-core](findings/aj-tui-core.md) | d1775db |
 | T2 | tui-text | Done | 0 | 0 | 4 | 4 | [aj-tui-text](findings/aj-tui-text.md) | 9142a6c |
-| T3 | tui-editor | TODO | – | – | – | – | – | – |
+| T3 | tui-editor | Done | 0 | 1 | 5 | 4 | [aj-tui-editor](findings/aj-tui-editor.md) | c477c5a |
 | T4 | tui-components | TODO | – | – | – | – | – | – |
 | T5 | tui-tests | TODO | – | – | – | – | – | – |
 
@@ -180,6 +180,14 @@ Recurring observations collected as steps complete; consumed by X1.
   frame buffer, skips byte-identical rows, and restores the terminal on
   panic (atomics + panic hook + Drop). Hold this up as the model for the
   perf/teardown themes.
+- **Internal god-objects wanting decomposition** (T1, T3): `Tui` (59 public
+  methods, fuses diff/overlay/focus) and `Editor` (3868 lines, ~40 fields,
+  embeds the whole autocomplete subsystem). Public surfaces are
+  disciplined; the sprawl is internal. Candidates for extraction.
+- **Keybinding vocabulary mismatch** (T3): `keybindings` formats
+  `meta`/`cmd`/`super` but `keys::parse_key_id` rejects `meta`/`cmd`, so a
+  user-configured `cmd+k` formats fine but never fires. Verify against the
+  `aj` keybindings config (A1).
 - **Concurrency / single-writer guard** (SE1, NEW): two `aj continue <id>`
   processes interleave JSONL lines and mint colliding entry ids,
   corrupting the parent chain. No file lock. Check the binary (A2/A3)
@@ -258,3 +266,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · TO2 tools-impls · 0C/1Ma/7Mi/2N · 61b31b1
 - 2026-06-02 · T1 tui-core · 0C/1Ma/5Mi/3N · d1775db
 - 2026-06-02 · T2 tui-text · 0C/0Ma/4Mi/4N · 9142a6c
+- 2026-06-02 · T3 tui-editor · 0C/1Ma/5Mi/4N · c477c5a
