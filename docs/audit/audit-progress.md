@@ -87,7 +87,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
 | T1 | tui-core | Done | 0 | 1 | 5 | 3 | [aj-tui-core](findings/aj-tui-core.md) | d1775db |
-| T2 | tui-text | TODO | – | – | – | – | – | – |
+| T2 | tui-text | Done | 0 | 0 | 4 | 4 | [aj-tui-text](findings/aj-tui-text.md) | 9142a6c |
 | T3 | tui-editor | TODO | – | – | – | – | – | – |
 | T4 | tui-components | TODO | – | – | – | – | – | – |
 | T5 | tui-tests | TODO | – | – | – | – | – | – |
@@ -194,10 +194,11 @@ Recurring observations collected as steps complete; consumed by X1.
 - **Duplicated disabled-tools filter** (TO1): the disabled-tools filter is
   copy-pasted across three binary call sites though `aj-tools` owns the
   catalog. Confirm in A1/A2 and consider a single seam in `aj-tools`.
-- **Two truncation impls with different safety contracts** (M2, TO1):
-  `aj-models::transform::truncate` slices bytes assuming ASCII;
-  `aj-tools::truncate` is line-oriented and UTF-8-safe. Reconcile or
-  clearly scope each.
+- **Two truncation impls with different safety contracts** (M2, TO1, T2):
+  now THREE. `aj-models::transform::truncate` (byte, ASCII-assuming),
+  `aj-tools::truncate` (line-oriented, UTF-8-safe), and `aj-tui` text
+  (display-width-authoritative). They solve different problems but the
+  shared name misleads; reconcile naming/scoping in X1.
 - **Real-env/wall-clock coupling without an injection seam** (M2, M5, C1):
   `AgentEnv::new()` reads cwd/HOME/FS/`Utc::now()` directly; tests can't
   isolate it. Recurs with the wall-clock theme; a context/env seam would
@@ -256,3 +257,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · TO1 tools-framework · 0C/1Ma/4Mi/2N · 5424919
 - 2026-06-02 · TO2 tools-impls · 0C/1Ma/7Mi/2N · 61b31b1
 - 2026-06-02 · T1 tui-core · 0C/1Ma/5Mi/3N · d1775db
+- 2026-06-02 · T2 tui-text · 0C/0Ma/4Mi/4N · 9142a6c
