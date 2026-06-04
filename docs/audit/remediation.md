@@ -291,7 +291,7 @@ aj-{cli,core,interactive,components,tests}.
 One line per resolved item (most recent last): `<date> · <id> · <status> ·
 <commit> · <one-line note/rationale>`.
 
-- 2026-06-04 · R1 · DONE · da2d73c · Added
+- 2026-06-04 · R1 · DONE · b09665d · Added
   `AssistantMessageEvent::truncated` (shared §10.3 classification) + a
   uniform `saw_terminal`/`finalize_or_truncate` seam on all four provider
   `StreamState`s, so a stream that ends before its terminal frame yields a
