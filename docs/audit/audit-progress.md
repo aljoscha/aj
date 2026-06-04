@@ -54,7 +54,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | M2 | models-streaming | Done | 0 | 0 | 4 | 3 | [aj-models-streaming](findings/aj-models-streaming.md) | 867a6df |
 | M3 | models-anthropic | Done | 0 | 1 | 4 | 3 | [aj-models-anthropic](findings/aj-models-anthropic.md) | b440134 |
 | M4 | models-openai | Done | 0 | 2 | 5 | 3 | [aj-models-openai](findings/aj-models-openai.md) | d93f242 |
-| M5 | models-auth | TODO | – | – | – | – | – | – |
+| M5 | models-auth | Done | 0 | 2 | 5 | 4 | [aj-models-auth](findings/aj-models-auth.md) | cf14db6 |
 
 ## Phase C — `aj-conf`
 
@@ -151,6 +151,14 @@ Recurring observations collected as steps complete; consumed by X1.
 - **Divergent terminal-error handling between sibling providers** (M4):
   Codex turns terminal `response.failed`/`error` into a hard `Err`
   (dropping partial content+usage) while Responses preserves the partial.
+- **Secrets: token body leaks into error strings** (M5): on a 2xx OAuth
+  token response that fails to deserialize, the raw body (live access/
+  refresh tokens) is folded into `OAuthError::Parse` → logs/terminal.
+  Sweep all `format!`s over HTTP bodies on auth paths.
+- **Sibling OAuth duplication** (M5): anthropic/openai OAuth modules are
+  ~80% byte-identical (callback server, parsing, mock harness) with no
+  shared seam — widest duplication locus so far. Pairs with M4 error-map
+  duplication.
 - **Happy-path-only roundtrip coverage** (M3, M4): confirmed across all
   provider roundtrip suites; the truncation Major lives in an untested path.
 - **Test-only `pub` items widen the surface** (M3, M4): widest locus is
@@ -169,3 +177,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · M2 models-streaming · 0C/0Ma/4Mi/3N · 867a6df
 - 2026-06-02 · M3 models-anthropic · 0C/1Ma/4Mi/3N · b440134
 - 2026-06-02 · M4 models-openai · 0C/2Ma/5Mi/3N · d93f242
+- 2026-06-02 · M5 models-auth · 0C/2Ma/5Mi/4N · cf14db6
