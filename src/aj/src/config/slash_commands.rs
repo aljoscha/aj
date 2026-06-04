@@ -68,7 +68,7 @@ pub struct BuiltinCommand {
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "thinking",
-        title: "thinking",
+        title: "thinking effort",
         category: "model",
         description: "Set the reasoning effort for new turns.",
         action_id: None,
