@@ -14,6 +14,7 @@
 //!
 //! [`AgentEvent`]: aj_agent::events::AgentEvent
 
+pub mod agent_picker;
 pub mod assistant_message;
 pub mod auth_picker;
 pub mod auth_status;
