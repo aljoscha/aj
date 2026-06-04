@@ -90,7 +90,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | T2 | tui-text | Done | 0 | 0 | 4 | 4 | [aj-tui-text](findings/aj-tui-text.md) | 9142a6c |
 | T3 | tui-editor | Done | 0 | 1 | 5 | 4 | [aj-tui-editor](findings/aj-tui-editor.md) | c477c5a |
 | T4 | tui-components | Done | 0 | 2 | 5 | 4 | [aj-tui-components](findings/aj-tui-components.md) | 94e21ea |
-| T5 | tui-tests | TODO | – | – | – | – | – | – |
+| T5 | tui-tests | Done | 0 | 1 | 5 | 3 | [aj-tui-tests](findings/aj-tui-tests.md) | b76044a |
 
 ## Phase A — `aj` (binary)
 
@@ -198,6 +198,16 @@ Recurring observations collected as steps complete; consumed by X1.
 - **Tab-width constant duplicated** (T2, T4): "tab = 3 spaces" is spelled
   as magic literals across `ansi.rs`, `text.rs`, `markdown.rs`. Hoist one
   shared constant.
+- **Wall-clock coupling in timing tests** (M2/SE1 wall-clock theme, T5):
+  `aj-tui` `terminal.rs`/`loader.rs` progress tests use real
+  `thread::sleep` keyed to a 1000ms interval and assert emission counts —
+  CI-flaky and ~5s wall-clock, against the suite's own paused-clock tier.
+  Sweep all crates for sleep-based timing assertions.
+- **POSITIVE pattern — test boundary harness** (T5): the `aj-tui` suite is
+  the workspace high-water mark — a real VT100 virtual terminal asserts on
+  rendered viewport (not internals), with strong edge/regression coverage.
+  Hold up as the model for the "happy-path-only" gaps seen elsewhere
+  (M3/M4 roundtrips, C1, auth).
 - **Concurrency / single-writer guard** (SE1, NEW): two `aj continue <id>`
   processes interleave JSONL lines and mint colliding entry ids,
   corrupting the parent chain. No file lock. Check the binary (A2/A3)
@@ -278,3 +288,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · T2 tui-text · 0C/0Ma/4Mi/4N · 9142a6c
 - 2026-06-02 · T3 tui-editor · 0C/1Ma/5Mi/4N · c477c5a
 - 2026-06-02 · T4 tui-components · 0C/2Ma/5Mi/4N · 94e21ea
+- 2026-06-02 · T5 tui-tests · 0C/1Ma/5Mi/3N · b76044a
