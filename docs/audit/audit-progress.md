@@ -67,7 +67,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
 | AG1 | agent-runtime | Done | 1 | 3 | 4 | 3 | [aj-agent-runtime](findings/aj-agent-runtime.md) | 2f5dfd0 |
-| AG2 | agent-contracts | TODO | – | – | – | – | – | – |
+| AG2 | agent-contracts | Done | 0 | 1 | 4 | 2 | [aj-agent-contracts](findings/aj-agent-contracts.md) | f5950da |
 
 ## Phase SE — `aj-session`
 
@@ -179,6 +179,20 @@ Recurring observations collected as steps complete; consumed by X1.
   always empty despite its doc. Sibling of the test-only-`pub` theme.
 - **Manifest/edition drift** (AG1): `aj-agent` pins `edition = "2021"`
   against a 2024 workspace. Sweep all crate manifests in X1.
+- **`anyhow` reaches the public tool trait** (AG2): `Tool::execute` and
+  `spawn_agent` return `anyhow::Result`, so every downstream tool inherits
+  the dependency and failures are only string-renderable. Broadest
+  anyhow-in-lib locus; pairs with the M1/M5 error-type theme.
+- **Half-wired `emit_update` feature across three layers** (AG1, AG2):
+  `ToolContext::emit_update` is documented but the runtime impl is a
+  permanent no-op, yet `bash` self-throttles and the TUI carries debounce
+  logic for it. This is the source of AG1's dead `ToolExecutionUpdate`
+  event. Decide: finish wiring or remove all three layers.
+- **Tool/ToolDefinition duplication is the runtime's fault, not the
+  contract's** (AG2): the tool contract cleanly yields `ErasedToolDefinition`
+  (1:1 with wire `UnifiedToolDefinition`); the redundant `tools::Tool` hop
+  is introduced in `aj-agent/src/lib.rs:167` and is removable without
+  touching the contract.
 - **Happy-path-only roundtrip coverage** (M3, M4): confirmed across all
   provider roundtrip suites; the truncation Major lives in an untested path.
 - **Test-only `pub` items widen the surface** (M3, M4): widest locus is
@@ -200,3 +214,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · M5 models-auth · 0C/2Ma/5Mi/4N · cf14db6
 - 2026-06-02 · C1 conf · 0C/2Ma/5Mi/3N · 5a9eec6
 - 2026-06-02 · AG1 agent-runtime · 1C/3Ma/4Mi/3N · 2f5dfd0
+- 2026-06-02 · AG2 agent-contracts · 0C/1Ma/4Mi/2N · f5950da
