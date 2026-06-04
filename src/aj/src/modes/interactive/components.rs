@@ -28,6 +28,7 @@ pub mod login_dialog;
 pub mod model_selector;
 pub mod prompt_history;
 pub mod session_selector;
+pub mod subagent_box;
 pub mod thinking_selector;
 pub mod tool_execution;
 pub mod user_message;

@@ -413,6 +413,14 @@ Event handling changes:
     normally; if the report begins with the agent's error synthesis
     (or, simpler and robust: leave `Done` unless we later add a flag).
     For this iteration: `Done`. Failure styling is a follow-up; note it.
+- `ToolExecution*` (Start/Update/End) for `tool == "agent"` on the
+  parent: **skip** — do not create or update a tool bubble. The
+  `SubAgentBox` (created by the immediately-following `SubAgentStart`,
+  finalized by `SubAgentEnd`) is the visual representation of that
+  call; rendering the bubble too would duplicate the report. The
+  parent's `agent` `ToolExecutionStart` fires just before
+  `spawn_agent` emits `SubAgentStart`, so the box lands in the same
+  spot the bubble would have.
 - `AgentStart/End`: unchanged loader-refcount logic. Per-agent cleanup:
   on `AgentEnd { agent_id }` clear `agents.get_mut(agent_id)` bookkeeping
   for that agent only (so a sub-agent's end no longer needs the special
