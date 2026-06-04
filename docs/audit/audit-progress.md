@@ -86,7 +86,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| T1 | tui-core | TODO | – | – | – | – | – | – |
+| T1 | tui-core | Done | 0 | 1 | 5 | 3 | [aj-tui-core](findings/aj-tui-core.md) | d1775db |
 | T2 | tui-text | TODO | – | – | – | – | – | – |
 | T3 | tui-editor | TODO | – | – | – | – | – | – |
 | T4 | tui-components | TODO | – | – | – | – | – | – |
@@ -168,6 +168,18 @@ Recurring observations collected as steps complete; consumed by X1.
   "single turn" but runs the full uncapped agent loop; edit tools omit
   their exact-substring/non-overlapping-count contract. The model-facing
   schema is a contract — verify all tool descriptions match behavior.
+- **Dead surface on central abstractions** (T1, sibling of AG1/M-surface
+  themes): six `Terminal` trait methods have no production caller (the
+  renderer inlines escape bytes), exercised only by test doubles. Central
+  portability seam carries dead surface. Pairs with the over-broad/
+  test-only `pub` theme.
+- **Workspace dependency pinning drift** (T1): `aj-tui` pins direct
+  versions (crossterm, unicode-*) instead of `[workspace.dependencies]`.
+  Sweep manifests in X1 (alongside the AG1 edition drift).
+- **POSITIVE pattern — render hot path** (T1): the tui renderer reuses one
+  frame buffer, skips byte-identical rows, and restores the terminal on
+  panic (atomics + panic hook + Drop). Hold this up as the model for the
+  perf/teardown themes.
 - **Concurrency / single-writer guard** (SE1, NEW): two `aj continue <id>`
   processes interleave JSONL lines and mint colliding entry ids,
   corrupting the parent chain. No file lock. Check the binary (A2/A3)
@@ -243,3 +255,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · SE1 session · 0C/3Ma/5Mi/3N · a477dca
 - 2026-06-02 · TO1 tools-framework · 0C/1Ma/4Mi/2N · 5424919
 - 2026-06-02 · TO2 tools-impls · 0C/1Ma/7Mi/2N · 61b31b1
+- 2026-06-02 · T1 tui-core · 0C/1Ma/5Mi/3N · d1775db
