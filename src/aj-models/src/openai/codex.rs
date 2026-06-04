@@ -31,7 +31,7 @@
 
 use futures::StreamExt;
 use openai_sdk::client::{Client, ClientError};
-use openai_sdk::types::common::{ReasoningEffort, ServiceTier as OpenAIServiceTier};
+use openai_sdk::types::common::ServiceTier as OpenAIServiceTier;
 use openai_sdk::types::responses::{
     CreateResponseRequest, Reasoning, ReasoningSummaryMode, ResponseIncludable, ResponseInput,
     ResponseInputItem, ResponseInstructions, ResponseStatus, ResponseStreamEvent, ResponseTool,
@@ -740,31 +740,23 @@ fn build_request(
     let tools: Vec<ResponseTool> = context.tools.iter().map(to_codex_tool).collect();
 
     // §7.4.3 reasoning configuration. Non-reasoning models reject the
-    // `reasoning` parameter entirely.
+    // `reasoning` parameter entirely. For reasoning models, "off" (no
+    // requested level) floors to `minimal`: a reasoning model can't be
+    // told not to reason, so we treat off identically to minimal.
     let (reasoning_cfg, include) = if model.reasoning {
-        match reasoning {
-            Some(level) => {
-                let summary = match options.reasoning_summary.as_ref() {
-                    Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,
-                    Some(UnifiedReasoningSummary::Detailed) => ReasoningSummaryMode::Detailed,
-                    Some(UnifiedReasoningSummary::Concise) => ReasoningSummaryMode::Concise,
-                };
-                (
-                    Some(Reasoning {
-                        effort: Some(map_reasoning_effort(Some(level))),
-                        summary: Some(summary),
-                    }),
-                    vec![ResponseIncludable::ReasoningEncryptedContent],
-                )
-            }
-            None => (
-                Some(Reasoning {
-                    effort: Some(ReasoningEffort::None),
-                    summary: None,
-                }),
-                Vec::new(),
-            ),
-        }
+        let level = reasoning.unwrap_or(&ThinkingLevel::Minimal);
+        let summary = match options.reasoning_summary.as_ref() {
+            Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,
+            Some(UnifiedReasoningSummary::Detailed) => ReasoningSummaryMode::Detailed,
+            Some(UnifiedReasoningSummary::Concise) => ReasoningSummaryMode::Concise,
+        };
+        (
+            Some(Reasoning {
+                effort: Some(map_reasoning_effort(level)),
+                summary: Some(summary),
+            }),
+            vec![ResponseIncludable::ReasoningEncryptedContent],
+        )
     } else {
         (None, Vec::new())
     };
@@ -836,6 +828,7 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use openai_sdk::types::common::ApiError;
+    use openai_sdk::types::common::ReasoningEffort;
     use openai_sdk::types::responses::MessagePhase;
 
     fn fake_model(id: &str, reasoning: bool) -> ModelInfo {

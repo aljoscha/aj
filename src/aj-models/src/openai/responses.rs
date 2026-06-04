@@ -370,31 +370,24 @@ fn build_request(
         .map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
     // §7.3.2 reasoning configuration. Non-reasoning models reject the
-    // `reasoning` parameter entirely.
+    // `reasoning` parameter entirely. For reasoning models, "off" (no
+    // requested level) floors to `minimal`: a reasoning model can't be
+    // told not to reason — `reasoning_effort: "none"` is rejected by
+    // most GPT-5 models — so we treat off identically to minimal.
     let (reasoning_cfg, include) = if model.reasoning {
-        match reasoning {
-            Some(level) => {
-                let summary = match options.reasoning_summary.as_ref() {
-                    Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,
-                    Some(UnifiedReasoningSummary::Detailed) => ReasoningSummaryMode::Detailed,
-                    Some(UnifiedReasoningSummary::Concise) => ReasoningSummaryMode::Concise,
-                };
-                (
-                    Some(Reasoning {
-                        effort: Some(map_reasoning_effort(Some(level))),
-                        summary: Some(summary),
-                    }),
-                    vec![ResponseIncludable::ReasoningEncryptedContent],
-                )
-            }
-            None => (
-                Some(Reasoning {
-                    effort: Some(ReasoningEffort::None),
-                    summary: None,
-                }),
-                Vec::new(),
-            ),
-        }
+        let level = reasoning.unwrap_or(&ThinkingLevel::Minimal);
+        let summary = match options.reasoning_summary.as_ref() {
+            Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,
+            Some(UnifiedReasoningSummary::Detailed) => ReasoningSummaryMode::Detailed,
+            Some(UnifiedReasoningSummary::Concise) => ReasoningSummaryMode::Concise,
+        };
+        (
+            Some(Reasoning {
+                effort: Some(map_reasoning_effort(level)),
+                summary: Some(summary),
+            }),
+            vec![ResponseIncludable::ReasoningEncryptedContent],
+        )
     } else {
         (None, Vec::new())
     };
@@ -450,14 +443,13 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
 /// [`validate_thinking_level`] before we get here; it's folded onto
 /// `XHigh` defensively to keep the match total. Shared by the
 /// Responses and Codex providers.
-pub(super) fn map_reasoning_effort(level: Option<&ThinkingLevel>) -> ReasoningEffort {
+pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
-        None => ReasoningEffort::None,
-        Some(ThinkingLevel::Minimal) => ReasoningEffort::Minimal,
-        Some(ThinkingLevel::Low) => ReasoningEffort::Low,
-        Some(ThinkingLevel::Medium) => ReasoningEffort::Medium,
-        Some(ThinkingLevel::High) => ReasoningEffort::High,
-        Some(ThinkingLevel::XHigh) | Some(ThinkingLevel::Max) => ReasoningEffort::XHigh,
+        ThinkingLevel::Minimal => ReasoningEffort::Minimal,
+        ThinkingLevel::Low => ReasoningEffort::Low,
+        ThinkingLevel::Medium => ReasoningEffort::Medium,
+        ThinkingLevel::High => ReasoningEffort::High,
+        ThinkingLevel::XHigh | ThinkingLevel::Max => ReasoningEffort::XHigh,
     }
 }
 
@@ -1636,12 +1628,18 @@ mod tests {
     }
 
     #[test]
-    fn build_request_reasoning_disabled_uses_effort_none_and_no_include() {
+    fn build_request_reasoning_off_floors_to_minimal() {
         let ctx = Context::new("hello");
         let req = build_request(&fake_model(true), &ctx, &StreamOptions::default(), None);
         let r = req.reasoning.expect("reasoning set");
-        assert!(matches!(r.effort, Some(ReasoningEffort::None)));
-        assert!(req.include.is_empty());
+        // A reasoning model can't disable reasoning; "off" floors to
+        // minimal and is treated like any other reasoning level.
+        assert!(matches!(r.effort, Some(ReasoningEffort::Minimal)));
+        assert!(matches!(r.summary, Some(ReasoningSummaryMode::Auto)));
+        assert_eq!(
+            req.include,
+            vec![ResponseIncludable::ReasoningEncryptedContent]
+        );
     }
 
     #[test]

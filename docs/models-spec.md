@@ -1222,7 +1222,8 @@ conversations are never stored server-side even if the default changes.
 
 **Reasoning effort:**
 - Set `reasoning_effort` on the request for models that support it
-- ThinkingLevel mapping: Minimal→"minimal", Low→"low", Medium→"medium", High→"high", XHigh→"xhigh" (GPT-5.2+ only; falls back to "high" on other models)
+- ThinkingLevel mapping is one-to-one: Minimal→"minimal", Low→"low", Medium→"medium", High→"high", XHigh→"xhigh". `Max` has no OpenAI equivalent and is rejected by `validate_thinking_level` before the request is built; per-model effort support (e.g. `xhigh` on an older model) is left to the provider API.
+- "off" (no requested level) floors to `minimal` for reasoning models: a reasoning model can't be told not to reason (`reasoning_effort: "none"` is rejected by most GPT-5 models), so off is treated like minimal. Non-reasoning models omit the field entirely.
 - Temperature is set normally (not incompatible with reasoning_effort like Anthropic's thinking)
 
 **Tool choice mapping:**
@@ -1397,10 +1398,13 @@ Both are Responses-specific concerns and do not belong in the base
   <mapped_level>, summary: <reasoning_summary or "auto">}` and
   `include: ["reasoning.encrypted_content"]` to receive encrypted
   reasoning for multi-turn continuity.
-- Reasoning-capable model, reasoning disabled by caller:
-  `reasoning: {effort: "none"}` (without `include`). The model still
-  accepts the parameter; the effort level explicitly opts out.
-- ThinkingLevel mapping: same as §7.2 (Minimal→"minimal", ..., XHigh→"xhigh")
+- Reasoning-capable model, reasoning off (no requested level): floors
+  to `minimal` and is treated identically to a requested `minimal`
+  (same `effort: "minimal"`, summary, and `include`). A reasoning
+  model can't disable reasoning — `reasoning: {effort: "none"}` is
+  rejected by most GPT-5 models — so off is not a distinct wire shape.
+- ThinkingLevel mapping: same as §7.2 (one-to-one; Minimal→"minimal",
+  …, XHigh→"xhigh"; `Max` rejected pre-flight)
 
 **Tool choice mapping:** same wire format as Chat Completions (§7.2).
 

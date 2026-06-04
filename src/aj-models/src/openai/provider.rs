@@ -297,7 +297,11 @@ fn build_request(
         .map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
     let reasoning_effort = if model.reasoning {
-        Some(map_reasoning_effort(reasoning))
+        // "off" (no requested level) floors to `minimal`: a reasoning
+        // model can't be told not to reason — `reasoning_effort: "none"`
+        // is rejected by most GPT-5 models — so we treat off as minimal.
+        let level = reasoning.unwrap_or(&ThinkingLevel::Minimal);
+        Some(map_reasoning_effort(level))
     } else {
         // Non-reasoning models reject the field entirely.
         None
@@ -738,14 +742,17 @@ fn to_chat_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Option<C
 /// enum one-to-one. `Max` has no OpenAI equivalent and is rejected by
 /// [`validate_thinking_level`] before we get here; it's folded onto
 /// `XHigh` defensively to keep the match total.
-fn map_reasoning_effort(level: Option<&ThinkingLevel>) -> ReasoningEffort {
+/// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
+/// enum one-to-one. `Max` has no OpenAI equivalent and is rejected by
+/// [`validate_thinking_level`] before we get here; it's folded onto
+/// `XHigh` defensively to keep the match total.
+fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
-        None => ReasoningEffort::None,
-        Some(ThinkingLevel::Minimal) => ReasoningEffort::Minimal,
-        Some(ThinkingLevel::Low) => ReasoningEffort::Low,
-        Some(ThinkingLevel::Medium) => ReasoningEffort::Medium,
-        Some(ThinkingLevel::High) => ReasoningEffort::High,
-        Some(ThinkingLevel::XHigh) | Some(ThinkingLevel::Max) => ReasoningEffort::XHigh,
+        ThinkingLevel::Minimal => ReasoningEffort::Minimal,
+        ThinkingLevel::Low => ReasoningEffort::Low,
+        ThinkingLevel::Medium => ReasoningEffort::Medium,
+        ThinkingLevel::High => ReasoningEffort::High,
+        ThinkingLevel::XHigh | ThinkingLevel::Max => ReasoningEffort::XHigh,
     }
 }
 
@@ -1373,14 +1380,17 @@ mod tests {
         // Each level passes straight through to the wire enum,
         // one-to-one.
         assert!(matches!(
-            map_reasoning_effort(Some(&ThinkingLevel::XHigh)),
+            map_reasoning_effort(&ThinkingLevel::XHigh),
             ReasoningEffort::XHigh
         ));
         assert!(matches!(
-            map_reasoning_effort(Some(&ThinkingLevel::Minimal)),
+            map_reasoning_effort(&ThinkingLevel::Minimal),
             ReasoningEffort::Minimal
         ));
-        assert!(matches!(map_reasoning_effort(None), ReasoningEffort::None));
+        assert!(matches!(
+            map_reasoning_effort(&ThinkingLevel::High),
+            ReasoningEffort::High
+        ));
     }
 
     #[test]
