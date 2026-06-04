@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aj::config::theme::{Theme, ThemeHandle, chat_theme};
+use aj::modes::interactive::components::chat_view::ChatView;
 use aj::modes::interactive::event_pump::EventPump;
 use aj::modes::interactive::layout::{SlotIndex, build_layout};
 use aj_agent::bus::{Listener, listener_from_sync};
@@ -57,7 +58,6 @@ use aj_models::types::{AssistantContent, AssistantMessage, StopReason, StreamOpt
 use aj_session::{ConversationLog, ConversationPersistence, persistence_listener, replay};
 use aj_tools::{BashTool, EditFileTool, TodoWriteTool};
 use aj_tui::component::Component;
-use aj_tui::container::Container;
 use aj_tui::terminal::Terminal;
 use aj_tui::tui::Tui;
 use anyhow::anyhow;
@@ -209,7 +209,7 @@ fn build_tui_and_pump() -> (Tui, EventPump) {
 /// running-vs-idle state at the moment of capture, etc.).
 fn render_chat(tui: &mut Tui) -> Vec<String> {
     let chat = tui
-        .get_mut_as::<Container>(SlotIndex::Chat.idx())
+        .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
         .expect("chat slot present");
     chat.render(usize::from(SCREEN_WIDTH))
 }
