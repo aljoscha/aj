@@ -94,7 +94,7 @@ When presenting a proposal, cover:
   shared classification. Mind R7 (the `aj-agent` boundary) for the
   runtime-side guard. Pairs with R16 (test fixtures).
 
-### R2 — Don't hold the agent mutex across a whole turn  [bug · TODO]
+### R2 — Don't hold the agent mutex across a whole turn  [bug · DONE]
 - **Sources:** A3 (Major); `_SUMMARY` P0 #2.
 - **Problem:** `interactive.rs:1163` holds `agent.lock().await` across the
   entire `prompt().await`; other paths (`:1895`) lock the same mutex.
@@ -299,3 +299,20 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   agent retry gate from `Overloaded` to `Overloaded | Transient` (full
   §10.4 `RateLimit`/`retry_after_ms` policy deferred). Regression tests at
   each provider + the agent retry path.
+- 2026-06-04 · R2 · DONE · 409a91e · Introduced a loop-side
+  `RunConfigSnapshot` (provider/model/stream-options/thinking +
+  `/model` pre-select key) as the source of truth for the next turn's
+  config. The `/model` and `/thinking` selectors now read/write the
+  snapshot without locking the agent; the footer renders from it; the
+  submit handler copies it into the agent just before each turn under
+  the turn's own (uncontended) lock — so a mid-turn model/thinking
+  change is accepted immediately (footer wart accepted) but applies on
+  the next turn. Session-changing commands (`/resume`, `/new`) reseed
+  the transcript and stay agent-locking, so they're refused mid-turn
+  with a notice. Net: no `agent.lock().await` is reachable from the
+  select loop while a turn is in flight, so the freeze + lost-Ctrl+C
+  bug is gone. Chose this `/tmp/pi`-style snapshot approach over the
+  cheaper "gate all overlays" fix (keeps the palette usable mid-turn)
+  and over a deeper `aj-agent` live-config refactor (R7-adjacent).
+  Fixed the misleading `/quit`-mid-turn + `disable_submit` comments;
+  unit-tested the busy notice; full run-loop test deferred to R17.
