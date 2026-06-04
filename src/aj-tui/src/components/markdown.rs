@@ -335,8 +335,37 @@ enum Inline {
     Link(Vec<Inline>, String),
 }
 
+/// Maximum nesting depth the parser descends before degrading to
+/// literal text.
+///
+/// Caps two independent recursion families: block nesting (blockquotes
+/// and lists share one counter, since a list can sit inside a quote)
+/// and inline nesting (emphasis and links). Past the limit the parser
+/// stops building structure and emits the remainder as plain text.
+///
+/// This is the only guard against unbounded recursion on the untrusted
+/// model output this component renders. A Rust stack overflow is an
+/// uncatchable process abort — no panic hook, no terminal restore — so
+/// the cap, not graceful unwinding, is what keeps a pathologically
+/// nested message from taking the TUI down. Because [`Block`] and
+/// [`Inline`] are only ever built by the parser, capping it bounds the
+/// AST depth and therefore also bounds the render-time recursion that
+/// walks it; the render methods need no separate guard.
+///
+/// 64 is far above realistic content (a handful of levels) while
+/// keeping the worst-case render stack to a few hundred frames.
+const MAX_NESTING_DEPTH: usize = 64;
+
 /// Parse markdown text into blocks.
-fn parse_markdown(text: &str) -> Vec<Block> {
+///
+/// `depth` tracks block-nesting (incremented per blockquote level,
+/// shared with [`parse_list`]); top-level callers pass 0. At
+/// [`MAX_NESTING_DEPTH`] the text is emitted as one literal paragraph
+/// rather than recursing further.
+fn parse_markdown(text: &str, depth: usize) -> Vec<Block> {
+    if depth >= MAX_NESTING_DEPTH {
+        return vec![Block::Paragraph(parse_inline(text, 0))];
+    }
     let mut blocks: Vec<Block> = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -417,7 +446,7 @@ fn parse_markdown(text: &str) -> Vec<Block> {
             // because the inner paragraph parser preserves `\n`
             // between source lines (see `join_paragraph_lines`).
             let inner = quote_lines.join("\n");
-            let sub_blocks = parse_markdown(&inner);
+            let sub_blocks = parse_markdown(&inner, depth + 1);
             blocks.push(Block::Blockquote(sub_blocks));
             continue;
         }
@@ -434,7 +463,7 @@ fn parse_markdown(text: &str) -> Vec<Block> {
 
         // Unordered list.
         if line_bullet(line).is_some() {
-            let (list, new_i) = parse_list(&lines, i, false);
+            let (list, new_i) = parse_list(&lines, i, false, depth);
             blocks.push(list);
             i = new_i;
             continue;
@@ -442,7 +471,7 @@ fn parse_markdown(text: &str) -> Vec<Block> {
 
         // Ordered list.
         if line_number(line).is_some() {
-            let (list, new_i) = parse_list(&lines, i, true);
+            let (list, new_i) = parse_list(&lines, i, true, depth);
             blocks.push(list);
             i = new_i;
             continue;
@@ -476,7 +505,7 @@ fn parse_markdown(text: &str) -> Vec<Block> {
         }
         if !para_lines.is_empty() {
             let text = join_paragraph_lines(&para_lines);
-            blocks.push(Block::Paragraph(parse_inline(&text)));
+            blocks.push(Block::Paragraph(parse_inline(&text, 0)));
         }
     }
 
@@ -551,7 +580,7 @@ fn parse_heading(line: &str) -> Option<Block> {
     let rest = trimmed[level_count..].trim();
     // Trim trailing # marks.
     let rest = rest.trim_end_matches('#').trim();
-    Some(Block::Heading(level, parse_inline(rest)))
+    Some(Block::Heading(level, parse_inline(rest, 0)))
 }
 
 /// Return the `(indent, marker_len)` for a line that starts with an
@@ -593,7 +622,12 @@ fn indent_of(line: &str) -> usize {
 /// first line's marker determines the list style and its column-0
 /// indentation sets the base level. More-indented list markers become
 /// nested sub-lists attached to the previous item's `sub_blocks`.
-fn parse_list(lines: &[&str], start: usize, ordered: bool) -> (Block, usize) {
+///
+/// `depth` is the shared block-nesting counter (see [`parse_markdown`]);
+/// a nested sub-list opens only while `depth + 1 < MAX_NESTING_DEPTH`,
+/// otherwise the deeper line folds into the current item as
+/// continuation text.
+fn parse_list(lines: &[&str], start: usize, ordered: bool, depth: usize) -> (Block, usize) {
     // Indentation of the first list marker defines the base level. A
     // later line at or beyond this indent that is NOT itself a list
     // marker is treated as a continuation of the last item's content.
@@ -628,7 +662,7 @@ fn parse_list(lines: &[&str], start: usize, ordered: bool) -> (Block, usize) {
                     let (_ind, marker_len) = is_bullet.unwrap();
                     let content_text = &line[base_indent + marker_len..];
                     items.push(ListItem {
-                        content: parse_inline(content_text),
+                        content: parse_inline(content_text, 0),
                         sub_blocks: Vec::new(),
                         number: None,
                     });
@@ -638,7 +672,7 @@ fn parse_list(lines: &[&str], start: usize, ordered: bool) -> (Block, usize) {
                     let (_ind, marker_len, n) = is_number.unwrap();
                     let content_text = &line[base_indent + marker_len..];
                     items.push(ListItem {
-                        content: parse_inline(content_text),
+                        content: parse_inline(content_text, 0),
                         sub_blocks: Vec::new(),
                         number: Some(n),
                     });
@@ -648,17 +682,25 @@ fn parse_list(lines: &[&str], start: usize, ordered: bool) -> (Block, usize) {
             }
         } else {
             // Deeper indent than our base.
-            if is_bullet.is_some() || is_number.is_some() {
+            //
+            // A nested list opens only while we have block-nesting
+            // budget; at the [`MAX_NESTING_DEPTH`] cap the deeper line
+            // is folded into the current item as continuation text so
+            // pathologically indented input can't recurse without
+            // bound.
+            if (is_bullet.is_some() || is_number.is_some()) && depth + 1 < MAX_NESTING_DEPTH {
                 // Nested list. Parse it recursively and attach to the
                 // most recent item's sub_blocks.
                 let nested_ordered = is_number.is_some();
-                let (nested, new_i) = parse_list(lines, i, nested_ordered);
+                let (nested, new_i) = parse_list(lines, i, nested_ordered, depth + 1);
                 if let Some(last) = items.last_mut() {
                     last.sub_blocks.push(nested);
                 }
                 i = new_i;
             } else if let Some(last) = items.last_mut() {
-                // Continuation text under the last item.
+                // Continuation text under the last item (also the
+                // landing spot for a nested marker we refused to
+                // descend into at the depth cap).
                 last.content.push(Inline::Text(format!(" {}", trimmed)));
                 i += 1;
             } else {
@@ -690,7 +732,7 @@ fn parse_table(lines: &[&str], start: usize) -> Option<(Block, usize)> {
         return None;
     }
 
-    let headers: Vec<Vec<Inline>> = header_cells.iter().map(|c| parse_inline(c)).collect();
+    let headers: Vec<Vec<Inline>> = header_cells.iter().map(|c| parse_inline(c, 0)).collect();
     let mut rows: Vec<Vec<Vec<Inline>>> = Vec::new();
     let mut i = start + 2;
 
@@ -700,7 +742,7 @@ fn parse_table(lines: &[&str], start: usize) -> Option<(Block, usize)> {
         };
         let row: Vec<Vec<Inline>> = cells
             .iter()
-            .map(|c| parse_inline(c))
+            .map(|c| parse_inline(c, 0))
             .chain(std::iter::repeat_with(Vec::new))
             .take(alignments.len())
             .collect();
@@ -779,7 +821,14 @@ fn parse_table_alignments(cells: &[String]) -> Option<Vec<Alignment>> {
 /// regression test is
 /// `renders_html_like_tags_in_text_as_content_rather_than_hiding_them`
 /// in `tests/markdown.rs`.
-fn parse_inline(text: &str) -> Vec<Inline> {
+///
+/// `depth` tracks inline-nesting (emphasis/link recursion), independent
+/// of block nesting; block-level callers pass 0. At [`MAX_NESTING_DEPTH`]
+/// the text is returned as a single literal run rather than recursing.
+fn parse_inline(text: &str, depth: usize) -> Vec<Inline> {
+    if depth >= MAX_NESTING_DEPTH {
+        return vec![Inline::Text(text.to_string())];
+    }
     let mut result: Vec<Inline> = Vec::new();
     let mut current = String::new();
     let chars: Vec<char> = text.chars().collect();
@@ -802,7 +851,7 @@ fn parse_inline(text: &str) -> Vec<Inline> {
                     result.push(Inline::Text(std::mem::take(&mut current)));
                 }
                 let inner: String = chars[i + 2..end].iter().collect();
-                result.push(Inline::Bold(parse_inline(&inner)));
+                result.push(Inline::Bold(parse_inline(&inner, depth + 1)));
                 i = end + 2;
                 continue;
             }
@@ -828,7 +877,7 @@ fn parse_inline(text: &str) -> Vec<Inline> {
                 result.push(Inline::Text(std::mem::take(&mut current)));
             }
             let inner: String = chars[i + 2..end].iter().collect();
-            result.push(Inline::Strikethrough(parse_inline(&inner)));
+            result.push(Inline::Strikethrough(parse_inline(&inner, depth + 1)));
             i = end + 2;
             continue;
         }
@@ -853,7 +902,7 @@ fn parse_inline(text: &str) -> Vec<Inline> {
                         result.push(Inline::Text(std::mem::take(&mut current)));
                     }
                     let inner: String = chars[i + 1..end].iter().collect();
-                    result.push(Inline::Italic(parse_inline(&inner)));
+                    result.push(Inline::Italic(parse_inline(&inner, depth + 1)));
                     i = end + 1;
                     continue;
                 }
@@ -892,7 +941,7 @@ fn parse_inline(text: &str) -> Vec<Inline> {
                         // Recursively parse the bracket content as
                         // inlines so `[**bold**](url)` keeps its
                         // emphasis.
-                        result.push(Inline::Link(parse_inline(&link_text), link_url));
+                        result.push(Inline::Link(parse_inline(&link_text, depth + 1), link_url));
                         i = close_paren + 1;
                         continue;
                     }
@@ -1987,7 +2036,7 @@ impl Component for Markdown {
         // idempotent and deterministic, so a hit returns the same
         // result we'd produce by re-normalizing.
         let normalized = self.text.replace('\t', TAB_AS_SPACES);
-        let blocks = parse_markdown(&normalized);
+        let blocks = parse_markdown(&normalized, 0);
 
         // Phase 1: collect block-rendered lines (no horizontal
         // padding, no outer wrap yet). The per-block `render_block`
@@ -2541,6 +2590,59 @@ mod tests {
         assert!(
             widths[0] < 60,
             "capped column should be narrower than its overlong token; got {widths:?}",
+        );
+    }
+
+    /// Deepest block-nesting level in an AST. Recurses over the same
+    /// shape the renderer walks, so it's itself bounded by the parser
+    /// cap under test.
+    fn block_depth(blocks: &[Block]) -> usize {
+        blocks
+            .iter()
+            .map(|b| match b {
+                Block::Blockquote(inner) => 1 + block_depth(inner),
+                Block::UnorderedList(items) | Block::OrderedList(items) => {
+                    1 + items
+                        .iter()
+                        .map(|it| block_depth(&it.sub_blocks))
+                        .max()
+                        .unwrap_or(0)
+                }
+                _ => 1,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Pathologically nested block input must not recurse without
+    /// bound: a long run of `> ` (blockquotes) or increasing-indent
+    /// list markers nests one AST level per token, which would overflow
+    /// the stack at parse or render time without [`MAX_NESTING_DEPTH`].
+    /// The parser caps the descent and folds the remainder into literal
+    /// text, so the resulting AST is shallow regardless of input depth.
+    #[test]
+    fn parser_caps_block_nesting_on_adversarial_input() {
+        // ~100k nested blockquotes collapse to a capped quote stack
+        // wrapping a single literal paragraph.
+        let quotes = parse_markdown(&"> ".repeat(100_000), 0);
+        assert!(
+            block_depth(&quotes) <= MAX_NESTING_DEPTH + 1,
+            "blockquote nesting not capped: depth {}",
+            block_depth(&quotes),
+        );
+
+        // 1000 list levels (each line one space deeper) fold into
+        // continuation text past the cap.
+        let mut nested_list = String::new();
+        for level in 0..1000 {
+            nested_list.push_str(&" ".repeat(level));
+            nested_list.push_str("- x\n");
+        }
+        let list = parse_markdown(&nested_list, 0);
+        assert!(
+            block_depth(&list) <= MAX_NESTING_DEPTH + 1,
+            "list nesting not capped: depth {}",
+            block_depth(&list),
         );
     }
 }

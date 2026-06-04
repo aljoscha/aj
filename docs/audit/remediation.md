@@ -107,7 +107,7 @@ When presenting a proposal, cover:
 
 ## P1 — serious bugs / data safety
 
-### R3 — Bound markdown parsing depth  [bug · TODO]
+### R3 — Bound markdown parsing depth  [bug · DONE]
 - **Sources:** T4 (Major), A4; `_SUMMARY` P1.
 - **Problem:** `render_list`/`parse_inline` recurse over nested
   `**`/`>`/`[[…]]` with only a width cap; assistant/user components feed
@@ -316,3 +316,24 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   and over a deeper `aj-agent` live-config refactor (R7-adjacent).
   Fixed the misleading `/quit`-mid-turn + `disable_submit` comments;
   unit-tested the busy notice; full run-loop test deferred to R17.
+- 2026-06-04 · R3 · DONE · PENDING · Threaded a nesting-depth
+  counter through the markdown parser (`MAX_NESTING_DEPTH = 64`):
+  `parse_markdown`/`parse_list` share one block-nesting counter
+  (blockquote recursion + nested-list recursion), `parse_inline` an
+  independent inline counter (emphasis/links). Past the cap the parser
+  degrades to literal text instead of recursing, so untrusted model
+  output can no longer overflow the stack (an uncatchable abort in
+  Rust). The renderer needs no separate guard: `Block`/`Inline` are
+  only built by the parser, so capping it bounds the AST depth the
+  render recursion walks. Confirmed the practical overflow vectors are
+  blockquotes and nested lists (emphasis/links don't deeply nest under
+  the current word-boundary/first-match rules); capped inline anyway as
+  cheap, uniform defense. Tests: an in-module parser-cap assertion on
+  100k-deep input + integration tests that adversarial input renders
+  without aborting and that within-cap nesting isn't clipped. Surveyed
+  `/tmp/pi`: it delegates parsing to `marked` and survives only because
+  a JS stack overflow is a catchable `RangeError` caught by a global
+  handler — no technique to borrow; a pull-parser swap
+  (`pulldown-cmark`) is the larger structural option, deferred. Noted
+  a separate pre-existing O(n²) blowup on bare `[` runs (not a
+  recursion bug) for later.

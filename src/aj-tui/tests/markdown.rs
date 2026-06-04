@@ -142,6 +142,81 @@ fn preserves_original_numbering_when_code_blocks_split_an_ordered_list() {
 }
 
 // ---------------------------------------------------------------------------
+// Recursion-depth bounds (adversarial model output)
+//
+// The component renders untrusted model text, and its parser recurses
+// on blockquote / list / emphasis nesting. A Rust stack overflow is an
+// uncatchable abort, so the parser caps nesting depth and degrades the
+// remainder to literal text. These tests feed pathological input
+// through the public `render` and assert it *returns* — a regressed cap
+// would overflow and abort the whole test binary. (The matching
+// parser-depth assertion lives in the in-module `parser_caps_block_
+// nesting_on_adversarial_input`.) The deep cases use a wide render
+// width so the post-cap wrapping stays cheap; depth, not wrapping, is
+// what's under test here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deeply_nested_blockquotes_render_without_aborting() {
+    let mut m = md(&format!("{}deep", "> ".repeat(5_000)));
+    let plain = plain_lines(&m.render(1000));
+    assert!(
+        plain.iter().any(|l| l.contains("deep")),
+        "innermost content should survive as literal text",
+    );
+}
+
+#[test]
+fn adversarial_inline_markers_render_without_aborting() {
+    // Long runs of emphasis / link openers exercise the inline-parse
+    // recursion. None of these nest deeply under the word-boundary
+    // rules today, but the cap keeps them bounded regardless; the test
+    // proves they render without aborting and don't blow up the output.
+    // (Kept modest because a bare `[` run is quadratic in the current
+    // parser — a separate, non-recursion concern.)
+    for marker in ["*", "_", "~", "["] {
+        let mut m = md(&marker.repeat(10_000));
+        let lines = m.render(1000);
+        assert!(
+            lines.len() < 1_000,
+            "`{marker}` run produced {} lines",
+            lines.len(),
+        );
+    }
+}
+
+#[test]
+fn list_nesting_within_the_cap_is_not_clipped() {
+    // Twenty genuinely-nested levels (two-space source increments) are
+    // far below the cap and must all survive — a guard against setting
+    // `MAX_NESTING_DEPTH` so low it clips realistic content.
+    let mut src = String::new();
+    for level in 0..20 {
+        src.push_str(&"  ".repeat(level));
+        src.push_str(&format!("- x{level}y\n"));
+    }
+    let mut m = md(&src);
+    let plain = plain_lines(&m.render(200));
+
+    for level in 0..20 {
+        assert!(
+            plain.iter().any(|l| l.contains(&format!("x{level}y"))),
+            "level {level} should render",
+        );
+    }
+    let max_indent = plain
+        .iter()
+        .filter(|l| l.trim_start().starts_with("- "))
+        .map(|l| l.len() - l.trim_start().len())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        max_indent, 38,
+        "deepest of 20 levels should render at two-space-per-level indent",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tab normalization
 //
 // Every `\t` is replaced with three spaces before parsing. The
