@@ -99,7 +99,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | A1 | aj-cli | Done | 0 | 2 | 4 | 2 | [aj-cli](findings/aj-cli.md) | aaefc43 |
 | A2 | aj-core | Done | 0 | 2 | 5 | 2 | [aj-core](findings/aj-core.md) | 9d3e6ab |
 | A3 | aj-interactive | Done | 0 | 4 | 5 | 2 | [aj-interactive](findings/aj-interactive.md) | 5030a5a |
-| A4 | aj-components | TODO | – | – | – | – | – | – |
+| A4 | aj-components | Done | 0 | 2 | 5 | 2 | [aj-components](findings/aj-components.md) | e0b380f |
 | A5 | aj-tests | TODO | – | – | – | – | – | – |
 
 ## Phase X — synthesis
@@ -230,10 +230,25 @@ Recurring observations collected as steps complete; consumed by X1.
   `agent.lock().await`, suspending the entire select loop (including the
   Ctrl+C cancel arm) until the turn ends. Real reachable defect; the most
   impactful runtime bug after the four-provider truncation issue.
-- **Truncation-as-success propagates to the UI** (M3, M4, AG1, A3): the
-  interactive renderer shows a truncated `Done` as a complete assistant
-  message with no guard or indicator. Reinforces that the fix belongs at
-  the runtime/provider layer, not the UI.
+- **Truncation-as-success propagates to the UI** (M3, M4, AG1, A3, A4):
+  the interactive renderer shows a truncated `Done` as a complete
+  assistant message with no guard or indicator. Reinforces that the fix
+  belongs at the runtime/provider layer, not the UI.
+- **Sibling-component drift** (T1, T4, A4): `SelectList` vs `SettingsList`
+  inside aj-tui (T4), and now the binary's selectors —
+  model/session/command-palette/prompt-history hand-copy one filterable-
+  overlay-list skeleton (and a duplicated background-scan machinery), while
+  thinking/auth use the cleaner `SelectList` callbacks for the same job
+  (A4). Widest UI duplication; a shared "filterable overlay list" + the
+  `SelectList` callback pattern would absorb it.
+- **Markdown unbounded recursion reachable from model output** (T4, A4):
+  A4 confirms `assistant_message`/`user_message` feed untrusted model text
+  into the markdown component that T4 found can overflow the stack. Live
+  call path; reinforces the T4 hazard.
+- **ToolDetails-driven rendering CONFIRMED clean** (AG2, A4): the frontend
+  renders by matching the `ToolDetails` enum variant (not re-parsing
+  strings) and sanitizes external text. Hold up as the positive model for
+  the structured-contract design.
 - **Persistence-as-pure-subscriber CONFIRMED clean** (SE1, A2): empty
   `persistence.rs`, listener is a plain subscriber, no back-coupling; print
   mode reads live `agent.messages()` rather than the always-empty
@@ -327,3 +342,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · A1 aj-cli · 0C/2Ma/4Mi/2N · aaefc43
 - 2026-06-02 · A2 aj-core · 0C/2Ma/5Mi/2N · 9d3e6ab
 - 2026-06-02 · A3 aj-interactive · 0C/4Ma/5Mi/2N · 5030a5a
+- 2026-06-02 · A4 aj-components · 0C/2Ma/5Mi/2N · e0b380f
