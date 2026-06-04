@@ -97,7 +97,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
 | A1 | aj-cli | Done | 0 | 2 | 4 | 2 | [aj-cli](findings/aj-cli.md) | aaefc43 |
-| A2 | aj-core | TODO | – | – | – | – | – | – |
+| A2 | aj-core | Done | 0 | 2 | 5 | 2 | [aj-core](findings/aj-core.md) | 9d3e6ab |
 | A3 | aj-interactive | TODO | – | – | – | – | – | – |
 | A4 | aj-components | TODO | – | – | – | – | – | – |
 | A5 | aj-tests | TODO | – | – | – | – | – | – |
@@ -213,10 +213,22 @@ Recurring observations collected as steps complete; consumed by X1.
   (`cli/file_args.rs` returns input unchanged) yet CLAUDE.md + four docs
   advertise it, and it's only wired into print mode. Treat doc-vs-behavior
   gaps as first-class findings.
-- **Scattered precedence merge / no agent-startup seam** (C1, TO1, A1):
-  the CLI>env>config overlay is hand-copied across 5 sites and the
-  disabled-tools filter across 3, already diverging. The binary lacks a
-  single "build agent startup inputs" seam. Strong X1 candidate.
+- **Scattered precedence merge / no agent-startup seam** (C1, TO1, A1, A2):
+  **now the single widest refactor.** A2 found the entire session-setup
+  pipeline (~120 lines: log resume/create, prompt freeze, sub-agent seed,
+  repair+re-linearize, model/tool/precedence assembly) duplicated and
+  drifting between `print.rs` and `interactive.rs`. A1's precedence (5x)
+  and disabled-tools (3x) duplication are sub-cases. One `SessionSetup`
+  composition seam would absorb all of them. Top X1 candidate.
+- **Startup sequencing bug** (A2): `main.rs` inits the logger *before*
+  loading `~/.aj/.env`, so documented `RUST_LOG`/`AJ_LOG_FILE` from that
+  file don't apply; a bad `AJ_LOG_FILE` path aborts the binary before arg
+  parsing.
+- **Persistence-as-pure-subscriber CONFIRMED clean** (SE1, A2): empty
+  `persistence.rs`, listener is a plain subscriber, no back-coupling; print
+  mode reads live `agent.messages()` rather than the always-empty
+  `AgentEnd.messages` (AG1). But JSON-mode broken-pipe is silently
+  swallowed, inverting the "Err aborts the turn" contract.
 - **Secrets handling CONFIRMED clean in the binary** (A1): `--api-key`
   never persisted/logged; `auth.rs` renders only method/source labels;
   clipboard copies the public OAuth URL, not tokens. (M5's leak is the
@@ -303,3 +315,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · T4 tui-components · 0C/2Ma/5Mi/4N · 94e21ea
 - 2026-06-02 · T5 tui-tests · 0C/1Ma/5Mi/3N · b76044a
 - 2026-06-02 · A1 aj-cli · 0C/2Ma/4Mi/2N · aaefc43
+- 2026-06-02 · A2 aj-core · 0C/2Ma/5Mi/2N · 9d3e6ab
