@@ -274,8 +274,11 @@ async fn run_stream_inner(
         }
     }
 
-    let final_event = state.finalize();
-    producer.push(final_event);
+    // A clean stream carries a terminal response lifecycle event before
+    // closing. If the byte stream ends without one,
+    // `finalize_or_truncate` emits a retryable transient `Error` rather
+    // than a bogus `Done`.
+    producer.push(state.finalize_or_truncate());
     Ok(())
 }
 
@@ -712,7 +715,7 @@ pub fn replay_sse_events(
             }
         }
     }
-    match state.finalize() {
+    match state.finalize_or_truncate() {
         AssistantMessageEvent::Done { message, .. }
         | AssistantMessageEvent::Error { error: message, .. } => message,
         other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
@@ -1187,6 +1190,49 @@ mod tests {
             NormalizedEvent::Forward(ResponseStreamEvent::Other(v)) => assert_eq!(v, value),
             other => panic!("expected Forward(Other), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replay_stream_without_completed_is_truncated_transient_error() {
+        let text_delta: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "partial",
+            "item_id": "item_1",
+            "output_index": 0,
+            "content_index": 0,
+            "sequence_number": 1,
+        }))
+        .expect("parse output_text.delta");
+        let completed: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0.0,
+                "model": "gpt-5.1",
+                "output": [],
+                "parallel_tool_calls": true,
+                "tools": [],
+                "status": "completed",
+            },
+            "sequence_number": 2,
+        }))
+        .expect("parse response.completed");
+
+        let model = fake_model("gpt-5.1", false);
+
+        // Stream drops after a text delta but before `response.completed`.
+        let truncated = replay_sse_events(&model, [text_delta.clone()], None);
+        assert_eq!(truncated.stop_reason, StopReason::Error);
+        assert_eq!(
+            truncated.error.as_ref().map(|e| e.category),
+            Some(ErrorCategory::Transient),
+        );
+
+        // Positive control: the closing lifecycle event yields `Done`.
+        let complete = replay_sse_events(&model, [text_delta, completed], None);
+        assert_eq!(complete.stop_reason, StopReason::Stop);
+        assert!(complete.error.is_none());
     }
 
     #[tokio::test]

@@ -185,6 +185,34 @@ impl AssistantMessageEvent {
         }
     }
 
+    /// Build the canonical `Error { reason: Error, ... }` terminal event
+    /// for a stream that closed before the provider sent its terminal
+    /// frame (`message_stop` / `finish_reason` / `response.completed`).
+    ///
+    /// A mid-stream transport drop leaves a truncated turn: the accumulated
+    /// deltas are real, but the turn never actually finished. Per
+    /// `docs/models-spec.md` §10.3 this is a retryable
+    /// [`ErrorCategory::Transient`] failure, not a successful `Done` — so a
+    /// caller's retry layer re-issues the turn instead of persisting a
+    /// cut-off answer as complete. Accumulated content is preserved
+    /// verbatim (mirroring [`Self::aborted`]) so a non-retrying consumer
+    /// still sees best-effort output. When the partial already carries an
+    /// error payload (e.g. a mid-stream `error` frame arrived but the
+    /// closing terminal frame did not) that classification is kept.
+    pub fn truncated(mut partial: AssistantMessage) -> Self {
+        partial.stop_reason = StopReason::Error;
+        if partial.error.is_none() {
+            partial.error = Some(AssistantError::new(
+                ErrorCategory::Transient,
+                "stream ended without a terminal event",
+            ));
+        }
+        Self::Error {
+            reason: ErrorReason::Error,
+            error: partial,
+        }
+    }
+
     /// Borrow the running snapshot of the partial message.
     ///
     /// For terminal events this returns the final message (the one that will
@@ -585,6 +613,43 @@ mod tests {
     fn error_reason_maps_to_stop_reason() {
         assert_eq!(StopReason::from(ErrorReason::Error), StopReason::Error);
         assert_eq!(StopReason::from(ErrorReason::Aborted), StopReason::Aborted);
+    }
+
+    #[test]
+    fn truncated_sets_transient_error_and_preserves_content() {
+        let mut partial = sample_partial();
+        partial.content = vec![AssistantContent::text("partial answer")];
+        partial.stop_reason = StopReason::Stop;
+
+        let event = AssistantMessageEvent::truncated(partial);
+        match event {
+            AssistantMessageEvent::Error { reason, error } => {
+                assert_eq!(reason, ErrorReason::Error);
+                assert_eq!(error.stop_reason, StopReason::Error);
+                // Accumulated deltas survive so a non-retrying consumer
+                // still sees the best-effort partial output.
+                assert_eq!(error.content.len(), 1);
+                let err = error.error.as_ref().expect("transient error attached");
+                assert_eq!(err.category, ErrorCategory::Transient);
+            }
+            other => panic!("expected Error terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_keeps_existing_error_payload() {
+        let mut partial = sample_partial();
+        partial.error = Some(AssistantError::new(ErrorCategory::ContentFilter, "blocked"));
+
+        if let AssistantMessageEvent::Error { error, .. } =
+            AssistantMessageEvent::truncated(partial)
+        {
+            let err = error.error.as_ref().expect("error preserved");
+            assert_eq!(err.category, ErrorCategory::ContentFilter);
+            assert_eq!(err.message, "blocked");
+        } else {
+            panic!("expected Error terminal");
+        }
     }
 
     #[test]

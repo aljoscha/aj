@@ -185,7 +185,6 @@ async fn run_stream_inner(
         };
 
     let mut state = StreamState::new(model);
-    let mut saw_terminal = false;
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
@@ -195,7 +194,6 @@ async fn run_stream_inner(
                     producer.push(ev);
                 }
                 if outcome.terminal {
-                    saw_terminal = true;
                     break;
                 }
             }
@@ -208,13 +206,10 @@ async fn run_stream_inner(
     }
 
     // The SSE stream is expected to deliver `MessageStop` (or `Error`),
-    // at which point we synthesize the final `Done` / `Error` event.
-    // If the stream closes before that, treat the partial as best-effort.
-    if !saw_terminal {
-        tracing::debug!("anthropic SSE closed without MessageStop; finalizing partial");
-    }
-    let final_event = state.finalize();
-    producer.push(final_event);
+    // at which point we synthesize the final `Done` / `Error` event. If
+    // the byte stream closes before that, `finalize_or_truncate` emits a
+    // retryable transient `Error` rather than a bogus `Done`.
+    producer.push(state.finalize_or_truncate());
     Ok(())
 }
 
@@ -611,7 +606,7 @@ pub fn replay_sse_events(
     if let Some(AssistantMessageEvent::Error { error, .. }) = last_event {
         return error;
     }
-    match state.finalize() {
+    match state.finalize_or_truncate() {
         AssistantMessageEvent::Done { message, .. }
         | AssistantMessageEvent::Error { error: message, .. } => message,
         other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
@@ -865,6 +860,10 @@ struct StreamState {
     stop_reason: Option<AStopReason>,
     /// Captured refusal text from a `stop_details: refusal` payload.
     refusal_message: Option<String>,
+    /// Whether the wire stream delivered its terminal frame (a
+    /// `message_stop` or `error` event). Distinguishes a finished turn
+    /// from a truncated one when the SSE byte stream simply ends.
+    saw_terminal: bool,
 }
 
 /// Result of processing a single SSE event.
@@ -887,6 +886,7 @@ impl StreamState {
             blocks: Vec::new(),
             stop_reason: None,
             refusal_message: None,
+            saw_terminal: false,
         }
     }
 
@@ -1153,7 +1153,31 @@ impl StreamState {
             ServerSentEvent::Ping => {}
         }
 
+        self.saw_terminal |= terminal;
         ProcessOutcome { events, terminal }
+    }
+
+    /// Whether the wire stream delivered its terminal frame
+    /// (`message_stop` or `error`). When `false` at stream end the turn
+    /// was truncated mid-flight.
+    fn saw_terminal(&self) -> bool {
+        self.saw_terminal
+    }
+
+    /// Build the stream's terminal event, classifying a stream that ended
+    /// before its wire terminal frame as a retryable truncation error
+    /// (`docs/models-spec.md` §10.3) rather than a successful `Done`.
+    /// Otherwise defers to [`Self::finalize`].
+    fn finalize_or_truncate(self) -> AssistantMessageEvent {
+        if self.saw_terminal() {
+            self.finalize()
+        } else {
+            tracing::debug!(
+                api = %self.partial.api,
+                "stream ended before terminal frame; treating turn as truncated (retryable)"
+            );
+            AssistantMessageEvent::truncated(self.partial.clone())
+        }
     }
 
     /// Build the terminal event that wraps up the stream. Called
@@ -1755,6 +1779,72 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replay_stream_without_message_stop_is_truncated_transient_error() {
+        // A byte stream that drops after content but before `message_stop`
+        // must finalize as a retryable transient error, not a bogus
+        // `Done` — and must preserve the partial deltas.
+        let model = fake_model();
+        let truncated = replay_sse_events(
+            &model,
+            [
+                ServerSentEvent::MessageStart {
+                    message: empty_a_message(),
+                },
+                ServerSentEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: AContentBlock::TextBlock {
+                        text: String::new(),
+                        citations: Vec::new(),
+                    },
+                },
+                ServerSentEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: AContentBlockDelta::TextDelta {
+                        text: "partial".into(),
+                    },
+                },
+            ],
+        );
+        assert_eq!(truncated.stop_reason, StopReason::Error);
+        assert_eq!(
+            truncated.error.as_ref().map(|e| e.category),
+            Some(ErrorCategory::Transient),
+        );
+        match truncated.content.first() {
+            Some(AssistantContent::Text(t)) => assert_eq!(t.text, "partial"),
+            other => panic!("expected preserved partial text, got {other:?}"),
+        }
+
+        // Positive control: the same stream closed by `message_stop`
+        // finalizes as a successful `Done`.
+        let complete = replay_sse_events(
+            &model,
+            [
+                ServerSentEvent::MessageStart {
+                    message: empty_a_message(),
+                },
+                ServerSentEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: AContentBlock::TextBlock {
+                        text: String::new(),
+                        citations: Vec::new(),
+                    },
+                },
+                ServerSentEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: AContentBlockDelta::TextDelta {
+                        text: "partial".into(),
+                    },
+                },
+                ServerSentEvent::ContentBlockStop { index: 0 },
+                ServerSentEvent::MessageStop,
+            ],
+        );
+        assert_eq!(complete.stop_reason, StopReason::Stop);
+        assert!(complete.error.is_none());
     }
 
     #[test]

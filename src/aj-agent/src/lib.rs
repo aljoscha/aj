@@ -936,14 +936,22 @@ impl Agent {
                         .push(AgentMessage::wire(Message::Assistant(final_message)));
                     return Err(TurnError::Aborted);
                 }
-                // Retry strictly on `Overloaded` to match the legacy
-                // agent's behavior; other retryable categories
-                // (RateLimit, Transient) bubble up as recoverable
-                // errors today.
-                let is_overloaded = assistant_err
-                    .as_ref()
-                    .is_some_and(|e| e.category == ErrorCategory::Overloaded);
-                if is_overloaded {
+                // Auto-retry the transport-transient categories with
+                // backoff. `Transient` covers a stream that dropped
+                // before its terminal frame (a truncated turn,
+                // `docs/models-spec.md` §10.3): retrying re-issues the
+                // turn instead of surfacing a cut-off answer as final.
+                // `Overloaded` (provider 529/503) retries for the same
+                // reason. `RateLimit` is also retryable per §10.4 but
+                // must honour `retry_after_ms`, which this fixed backoff
+                // does not; it surfaces as a recoverable error instead.
+                let is_retryable = assistant_err.as_ref().is_some_and(|e| {
+                    matches!(
+                        e.category,
+                        ErrorCategory::Overloaded | ErrorCategory::Transient
+                    )
+                });
+                if is_retryable {
                     if retry_strategy.is_none() {
                         retry_strategy = Some(Self::create_retry_strategy());
                     }
@@ -952,7 +960,7 @@ impl Agent {
                         let err_text = assistant_err
                             .as_ref()
                             .map(|e| e.message.clone())
-                            .unwrap_or_else(|| "overloaded".to_string());
+                            .unwrap_or_else(|| "model stream failed".to_string());
                         let message =
                             format!("{err_text}, retrying in {}s...", retry_sleep.as_secs(),);
                         self.bus
@@ -2061,6 +2069,35 @@ mod event_protocol_tests {
         ]
     }
 
+    /// Build a script whose terminal event is a retryable transient
+    /// `Error` — the shape a provider emits for a stream that dropped
+    /// before its terminal frame (a truncated turn,
+    /// `docs/models-spec.md` §10.3, via `AssistantMessageEvent::truncated`).
+    /// The agent's retry layer should re-issue the turn rather than
+    /// surface this as a finished answer.
+    fn transient_error_script() -> Vec<AssistantMessageEvent> {
+        use aj_models::streaming::ErrorReason;
+        use aj_models::types::{AssistantError, ErrorCategory};
+        let mut partial = AssistantMessage::empty();
+        partial.api = SCRIPT_API.to_string();
+        partial.provider = SCRIPT_PROVIDER.to_string();
+        partial.model = SCRIPT_MODEL.to_string();
+        partial.stop_reason = StopReason::Error;
+        partial.error = Some(AssistantError::new(
+            ErrorCategory::Transient,
+            "stream ended without a terminal event",
+        ));
+        vec![
+            AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            },
+            AssistantMessageEvent::Error {
+                reason: ErrorReason::Error,
+                error: partial,
+            },
+        ]
+    }
+
     /// Compact, comparable representation of an [`AgentEvent`] for
     /// snapshot assertions. We don't `derive(PartialEq)` on the
     /// real enum because some payloads (e.g. the legacy
@@ -2898,6 +2935,56 @@ mod event_protocol_tests {
             .prompt("second".to_string(), CancellationToken::new())
             .await
             .expect("follow-up prompt should succeed");
+    }
+
+    #[tokio::test]
+    async fn truncated_turn_is_retried_then_succeeds() {
+        // A provider stream that drops before its terminal frame
+        // surfaces as a transient `Error` (docs/models-spec.md §10.3,
+        // `AssistantMessageEvent::truncated`). The agent's retry layer
+        // must re-issue the turn rather than accept the truncated turn
+        // as final. Strict-mode provider: exactly two inferences are
+        // scripted (the truncation, then the recovery), so a missing
+        // retry would surface `Recoverable` and a spurious extra
+        // inference would panic.
+        let scripts = vec![
+            transient_error_script(),
+            finalize_script(finalize_text("recovered")),
+        ];
+        let mut agent = build_agent(scripts, Vec::new());
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        let final_text = agent
+            .run_single_turn("hello".to_string())
+            .await
+            .expect("transient truncation should be retried into a successful turn");
+        assert_eq!(final_text, "recovered");
+
+        // Exactly one StreamRetry was emitted for the truncated attempt.
+        let retries: Vec<u32> = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|l| match l {
+                EventLabel::StreamRetry(_, attempt) => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retries, vec![1], "expected exactly one stream retry");
+
+        // Only the recovered turn — not the truncated one — landed on
+        // the transcript.
+        let messages = agent.messages();
+        let last_assistant = match messages.last().and_then(|m| m.as_wire()) {
+            Some(Message::Assistant(a)) => a,
+            _ => panic!("expected trailing assistant message"),
+        };
+        assert_eq!(last_assistant.stop_reason, StopReason::Stop);
     }
 
     #[test]

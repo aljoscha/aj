@@ -298,8 +298,11 @@ async fn run_stream_inner(
         }
     }
 
-    let final_event = state.finalize();
-    producer.push(final_event);
+    // A clean stream carries a `response.completed`/`incomplete`/`failed`
+    // lifecycle event before closing. If the byte stream ends without
+    // one, `finalize_or_truncate` emits a retryable transient `Error`
+    // rather than a bogus `Done`.
+    producer.push(state.finalize_or_truncate());
     Ok(())
 }
 
@@ -868,7 +871,7 @@ pub fn replay_sse_events(
     for ev in events {
         let _ = state.process(ev);
     }
-    match state.finalize() {
+    match state.finalize_or_truncate() {
         AssistantMessageEvent::Done { message, .. }
         | AssistantMessageEvent::Error { error: message, .. } => message,
         other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
@@ -1393,6 +1396,30 @@ impl StreamState {
         });
     }
 
+    /// Whether the wire stream delivered its terminal lifecycle event
+    /// (`response.completed` / `response.incomplete` / `response.failed`,
+    /// or a top-level SSE `error`), each of which sets `finish_status`.
+    /// When `false` at stream end the turn was truncated mid-flight.
+    pub(super) fn saw_terminal(&self) -> bool {
+        self.finish_status.is_some()
+    }
+
+    /// Build the stream's terminal event, classifying a stream that ended
+    /// before its terminal lifecycle event as a retryable truncation
+    /// error (`docs/models-spec.md` §10.3) rather than a successful
+    /// `Done`. Otherwise defers to [`Self::finalize`].
+    pub(super) fn finalize_or_truncate(self) -> AssistantMessageEvent {
+        if self.saw_terminal() {
+            self.finalize()
+        } else {
+            tracing::debug!(
+                api = %self.partial.api,
+                "stream ended before terminal frame; treating turn as truncated (retryable)"
+            );
+            AssistantMessageEvent::truncated(self.partial.clone())
+        }
+    }
+
     pub(super) fn finalize(mut self) -> AssistantMessageEvent {
         // Apply usage / cost from the captured terminal response.
         let server_tier = self
@@ -1801,6 +1828,39 @@ mod tests {
         );
         assert_eq!(sr, StopReason::Length);
         assert!(dr.is_some());
+    }
+
+    #[test]
+    fn finalize_or_truncate_classifies_missing_completion_as_transient() {
+        // No terminal lifecycle event (`finish_status` unset) means the
+        // byte stream dropped mid-turn: finalize as a retryable transient
+        // error, preserving the accumulated content.
+        let mut state = StreamState::new(&fake_model(false), None);
+        state
+            .partial
+            .content
+            .push(AssistantContent::text("partial"));
+        assert!(!state.saw_terminal());
+        match state.finalize_or_truncate() {
+            AssistantMessageEvent::Error { error, .. } => {
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert_eq!(
+                    error.error.as_ref().map(|e| e.category),
+                    Some(ErrorCategory::Transient),
+                );
+                assert_eq!(error.content.len(), 1);
+            }
+            other => panic!("expected truncated Error, got {other:?}"),
+        }
+
+        // Positive control: a terminal lifecycle status finalizes `Done`.
+        let mut state = StreamState::new(&fake_model(false), None);
+        state.finish_status = Some(ResponseStatus::Completed);
+        assert!(state.saw_terminal());
+        assert!(matches!(
+            state.finalize_or_truncate(),
+            AssistantMessageEvent::Done { .. }
+        ));
     }
 
     #[test]

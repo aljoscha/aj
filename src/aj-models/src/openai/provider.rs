@@ -195,7 +195,6 @@ async fn run_stream_inner(
     };
 
     let mut state = StreamState::new(model);
-    let mut saw_terminal = false;
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
@@ -205,7 +204,6 @@ async fn run_stream_inner(
                     producer.push(ev);
                 }
                 if outcome.terminal {
-                    saw_terminal = true;
                     break;
                 }
             }
@@ -220,11 +218,10 @@ async fn run_stream_inner(
         }
     }
 
-    if !saw_terminal {
-        tracing::debug!("openai-completions stream closed without finish_reason; finalizing");
-    }
-    let final_event = state.finalize();
-    producer.push(final_event);
+    // A clean stream carries a `finish_reason` chunk before closing. If
+    // the byte stream ends without one, `finalize_or_truncate` emits a
+    // retryable transient `Error` rather than a bogus `Done`.
+    producer.push(state.finalize_or_truncate());
     Ok(())
 }
 
@@ -690,10 +687,12 @@ pub fn replay_sse_events(
     for chunk in events {
         // We deliberately discard the per-chunk events: the round-trip
         // suite only cares about the finalized terminal message, and
-        // `state.finalize()` rebuilds it from the running snapshot.
+        // `finalize_or_truncate` rebuilds it from the running snapshot
+        // (and classifies a terminal-less dump as a truncation error,
+        // mirroring the live provider).
         let _ = state.process(chunk);
     }
-    match state.finalize() {
+    match state.finalize_or_truncate() {
         AssistantMessageEvent::Done { message, .. }
         | AssistantMessageEvent::Error { error: message, .. } => message,
         other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
@@ -1109,6 +1108,30 @@ impl StreamState {
                     partial: self.partial.clone(),
                 });
             }
+        }
+    }
+
+    /// Whether the wire stream delivered its terminal signal. For Chat
+    /// Completions that is a non-null `finish_reason` on some choice; the
+    /// stream closes after it (a trailing usage-only chunk may follow).
+    /// When `false` at stream end the turn was truncated mid-flight.
+    fn saw_terminal(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    /// Build the stream's terminal event, classifying a stream that ended
+    /// before its `finish_reason` as a retryable truncation error
+    /// (`docs/models-spec.md` §10.3) rather than a successful `Done`.
+    /// Otherwise defers to [`Self::finalize`].
+    fn finalize_or_truncate(self) -> AssistantMessageEvent {
+        if self.saw_terminal() {
+            self.finalize()
+        } else {
+            tracing::debug!(
+                api = %self.partial.api,
+                "stream ended before terminal frame; treating turn as truncated (retryable)"
+            );
+            AssistantMessageEvent::truncated(self.partial.clone())
         }
     }
 
@@ -1738,6 +1761,41 @@ mod tests {
         let err = err.expect("error detail set");
         assert_eq!(err.category, ErrorCategory::Unknown);
         assert!(err.message.contains("boom"));
+    }
+
+    #[test]
+    fn finalize_or_truncate_classifies_missing_finish_reason_as_transient() {
+        // A stream that delivered content but no `finish_reason` chunk
+        // (byte stream dropped) must finalize as a retryable transient
+        // error, preserving the partial text.
+        let mut state = StreamState::new(&fake_model());
+        let _ = state.process(delta_chunk(text_delta("partial")));
+        assert!(!state.saw_terminal());
+        let truncated = state.finalize_or_truncate();
+        match truncated {
+            AssistantMessageEvent::Error { error, .. } => {
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert_eq!(
+                    error.error.as_ref().map(|e| e.category),
+                    Some(ErrorCategory::Transient),
+                );
+                match error.content.first() {
+                    Some(AssistantContent::Text(t)) => assert_eq!(t.text, "partial"),
+                    other => panic!("expected preserved partial text, got {other:?}"),
+                }
+            }
+            other => panic!("expected truncated Error, got {other:?}"),
+        }
+
+        // Positive control: a `finish_reason` chunk finalizes as `Done`.
+        let mut state = StreamState::new(&fake_model());
+        let _ = state.process(delta_chunk(text_delta("partial")));
+        let _ = state.process(finish_chunk(FinishReason::Stop));
+        assert!(state.saw_terminal());
+        assert!(matches!(
+            state.finalize_or_truncate(),
+            AssistantMessageEvent::Done { .. }
+        ));
     }
 
     #[test]
