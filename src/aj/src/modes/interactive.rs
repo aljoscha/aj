@@ -1714,13 +1714,13 @@ fn apply_editor_border_for_thinking(
 }
 
 /// Reflect the observed agent in the editor's top-bar label: an
-/// `observing agent N` marker for a sub-agent, cleared for the main
-/// agent. Called when the agent picker confirms a switch and when a
-/// session reset returns the view to the main agent.
+/// `agent N` marker for a sub-agent, cleared for the main agent.
+/// Called when the agent picker confirms a switch and when a session
+/// reset returns the view to the main agent.
 fn apply_editor_agent_marker(tui: &mut Tui, id: AgentId) {
     let label = match id {
         AgentId::Main => None,
-        AgentId::Sub(n) => Some(format!("observing agent {n}")),
+        AgentId::Sub(n) => Some(format!("agent {n}")),
     };
     if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
         editor.set_top_bar_label(label);
