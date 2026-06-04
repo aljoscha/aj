@@ -106,7 +106,16 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| X1 | cross-crate synthesis | TODO | – | – | – | – | – | – |
+| X1 | cross-crate synthesis | Done | 1 | 36 | 106 | 63 | [_SUMMARY](findings/_SUMMARY.md) | 7de08cc |
+
+**Totals across all 23 unit reports: 1 Critical · 36 Major · 106 Minor ·
+63 Nit = 206 findings.** Dependency graph matches the intended
+`CLAUDE.md` shape except the `aj-agent → aj-conf` edge (the lone
+Critical). See [`findings/_SUMMARY.md`](findings/_SUMMARY.md) for the
+prioritized P0/P1 runtime risks, the nine cross-cutting themes, the
+patterns to preserve, and the suggested action backlog.
+
+**Audit complete — all 24 steps done.**
 
 ## Cross-cutting themes
 
@@ -360,3 +369,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · A3 aj-interactive · 0C/4Ma/5Mi/2N · 5030a5a
 - 2026-06-02 · A4 aj-components · 0C/2Ma/5Mi/2N · e0b380f
 - 2026-06-02 · A5 aj-tests · 0C/2Ma/4Mi/1N · 3dca263
+- 2026-06-02 · X1 synthesis · totals 1C/36Ma/106Mi/63N · _SUMMARY.md · 7de08cc
