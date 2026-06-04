@@ -79,7 +79,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| TO1 | tools-framework | TODO | – | – | – | – | – | – |
+| TO1 | tools-framework | Done | 0 | 1 | 4 | 2 | [aj-tools-framework](findings/aj-tools-framework.md) | 5424919 |
 | TO2 | tools-impls | TODO | – | – | – | – | – | – |
 
 ## Phase T — `aj-tui`
@@ -169,6 +169,17 @@ Recurring observations collected as steps complete; consumed by X1.
 - **Replay drops persisted timestamps** (SE1): the log records per-entry
   `Utc::now()` but projection/replay discards it, so resumed turns lose
   their original timeline. Pairs with the wall-clock theme.
+- **Test harness shipped in production public API** (M5, TO1): aj-models
+  `scripted` (with a `panic!` arm) and aj-tools `testing.rs`
+  (`DummyToolContext`) are ungated `pub mod`s. Decide a uniform policy
+  (`#[cfg(test)]`, a `testing` feature, or a separate dev crate).
+- **Duplicated disabled-tools filter** (TO1): the disabled-tools filter is
+  copy-pasted across three binary call sites though `aj-tools` owns the
+  catalog. Confirm in A1/A2 and consider a single seam in `aj-tools`.
+- **Two truncation impls with different safety contracts** (M2, TO1):
+  `aj-models::transform::truncate` slices bytes assuming ASCII;
+  `aj-tools::truncate` is line-oriented and UTF-8-safe. Reconcile or
+  clearly scope each.
 - **Real-env/wall-clock coupling without an injection seam** (M2, M5, C1):
   `AgentEnv::new()` reads cwd/HOME/FS/`Utc::now()` directly; tests can't
   isolate it. Recurs with the wall-clock theme; a context/env seam would
@@ -224,3 +235,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · AG1 agent-runtime · 1C/3Ma/4Mi/3N · 2f5dfd0
 - 2026-06-02 · AG2 agent-contracts · 0C/1Ma/4Mi/2N · f5950da
 - 2026-06-02 · SE1 session · 0C/3Ma/5Mi/3N · a477dca
+- 2026-06-02 · TO1 tools-framework · 0C/1Ma/4Mi/2N · 5424919
