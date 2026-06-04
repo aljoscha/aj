@@ -52,7 +52,7 @@ use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::AgentMessage;
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::TokenUsage;
-use aj_models::types::{Message, Usage, UserContent};
+use aj_models::types::{AssistantContent, Message, Usage, UserContent};
 use serde_json::Value;
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationLog, ThreadKind};
@@ -67,8 +67,11 @@ pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> {
     let mut state = ReplayState::default();
     let mut events: Vec<AgentEvent> = Vec::new();
     for entry in log.entries_in_order() {
+        state.bracket_subagent(entry, &mut events);
         state.project_entry(entry, &mut events);
     }
+    // Close a sub-agent run still open at end-of-log.
+    state.close_open_sub(&mut events);
     events.into_iter()
 }
 
@@ -92,9 +95,68 @@ struct ReplayState {
     /// `aj_agent::Agent::prompt`: `TurnUsage` carries the
     /// pre-add total, and the per-turn delta is added afterwards).
     usage_accumulators: HashMap<AgentId, Usage>,
+    /// The `Sub(n)` index of the sub-agent run currently being
+    /// walked, if any. Sub-agent entries are contiguous in append
+    /// order (a sub-agent runs fully within one parent tool call),
+    /// so a single open run is enough to bracket each sub run with
+    /// [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`].
+    open_sub: Option<usize>,
+    /// Concatenated text of the most recent `Sub` assistant message
+    /// seen during the open run. After the run's last assistant
+    /// message this holds the final report carried on the closing
+    /// [`AgentEvent::SubAgentEnd`].
+    open_sub_report: String,
 }
 
 impl ReplayState {
+    /// Emit [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
+    /// correlation events around a sub-agent's contiguous run, before
+    /// the entry's own events are projected.
+    ///
+    /// Transitions are keyed off `agent_id_for`: leaving an open
+    /// `Sub(k)` (to `Main` or a different sub) closes it with the
+    /// accumulated report; entering a `Sub(n)` with no run open emits
+    /// the start, taking the task from this first entry's user text.
+    /// `Meta` entries carry no agent id and never transition.
+    fn bracket_subagent(&mut self, entry: &ConversationEntry, out: &mut Vec<AgentEvent>) {
+        let Some(current) = agent_id_for(entry) else {
+            return;
+        };
+
+        if let Some(k) = self.open_sub {
+            if current != AgentId::Sub(k) {
+                self.close_open_sub(out);
+            }
+        }
+
+        if let AgentId::Sub(n) = current {
+            if self.open_sub.is_none() {
+                // The first entry of a sub run is its user message,
+                // whose text is the task.
+                let task = subagent_task(entry);
+                out.push(AgentEvent::SubAgentStart {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(n),
+                    task,
+                });
+                self.open_sub = Some(n);
+                self.open_sub_report.clear();
+            }
+        }
+    }
+
+    /// Close the currently open sub-agent run, if any, emitting its
+    /// [`AgentEvent::SubAgentEnd`] with the accumulated report.
+    fn close_open_sub(&mut self, out: &mut Vec<AgentEvent>) {
+        if let Some(k) = self.open_sub.take() {
+            out.push(AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(k),
+                report: std::mem::take(&mut self.open_sub_report),
+            });
+        }
+    }
+
     /// Translate one entry into zero or more events, appending them
     /// to `out`.
     fn project_entry(&mut self, entry: &ConversationEntry, out: &mut Vec<AgentEvent>) {
@@ -176,6 +238,19 @@ impl ReplayState {
             agent_id,
             message: agent_msg.clone(),
         });
+
+        // While a sub-agent run is open, record this assistant
+        // message's text as the running report; after the run's last
+        // assistant message it holds the final report.
+        if matches!((self.open_sub, agent_id), (Some(n), AgentId::Sub(m)) if n == m) {
+            let mut report = String::new();
+            for c in &assistant.content {
+                if let AssistantContent::Text(t) = c {
+                    report.push_str(&t.text);
+                }
+            }
+            self.open_sub_report = report;
+        }
 
         // Synthesize the matching `TurnUsage`. Live runs emit one
         // per assistant turn on the bus; without this resumed
@@ -310,6 +385,25 @@ fn text_fallback(tool_name: &str, content: &[UserContent]) -> ToolDetails {
         summary: tool_name.to_string(),
         body,
     }
+}
+
+/// Extract a sub-agent's task from its first entry. The first entry
+/// of a sub-agent run is its user message, whose concatenated text is
+/// the task; any other shape yields an empty task.
+fn subagent_task(entry: &ConversationEntry) -> String {
+    let ConversationEntryKind::Message { message } = &entry.entry else {
+        return String::new();
+    };
+    let Some(Message::User(u)) = message.as_wire() else {
+        return String::new();
+    };
+    let mut task = String::new();
+    for block in &u.content {
+        if let UserContent::Text(t) = block {
+            task.push_str(&t.text);
+        }
+    }
+    task
 }
 
 /// Map an entry's [`ThreadKind`] / `agent_id` framing onto an
@@ -600,6 +694,166 @@ mod tests {
         assert!(any_sub, "expected at least one Sub(1) event in {events:#?}");
         let any_main = events.iter().any(|e| matches!(e.agent_id(), AgentId::Main));
         assert!(any_main, "expected at least one Main event in {events:#?}");
+    }
+
+    #[test]
+    fn replay_brackets_subagent_run_with_start_and_end() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head present")
+        };
+
+        {
+            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "reply".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+
+        let start_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
+            .expect("SubAgentStart present");
+        let end_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::SubAgentEnd { .. }))
+            .expect("SubAgentEnd present");
+
+        match &events[start_idx] {
+            AgentEvent::SubAgentStart {
+                parent,
+                child,
+                task,
+            } => {
+                assert_eq!(*parent, AgentId::Main);
+                assert_eq!(*child, AgentId::Sub(1));
+                assert_eq!(task, "subtask");
+            }
+            other => panic!("expected SubAgentStart, got {other:?}"),
+        }
+        match &events[end_idx] {
+            AgentEvent::SubAgentEnd {
+                parent,
+                child,
+                report,
+            } => {
+                assert_eq!(*parent, AgentId::Main);
+                assert_eq!(*child, AgentId::Sub(1));
+                assert_eq!(report, "reply");
+            }
+            other => panic!("expected SubAgentEnd, got {other:?}"),
+        }
+
+        let first_sub = events
+            .iter()
+            .position(|e| matches!(e.agent_id(), AgentId::Sub(1)))
+            .expect("at least one Sub(1) event");
+        let last_sub = events
+            .iter()
+            .rposition(|e| matches!(e.agent_id(), AgentId::Sub(1)))
+            .expect("at least one Sub(1) event");
+
+        assert!(
+            start_idx < first_sub,
+            "SubAgentStart must precede the first Sub(1) event"
+        );
+        assert!(
+            end_idx > last_sub,
+            "SubAgentEnd must follow the last Sub(1) event"
+        );
+    }
+
+    #[test]
+    fn replay_closes_subagent_before_main_resumes() {
+        // A main turn that follows a sub-agent run must close the sub
+        // (emit SubAgentEnd) before any of its own events appear. We
+        // build the resuming main activity by appending to the user
+        // thread head captured before the sub run.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head present")
+        };
+
+        let sub_head = {
+            let mut view = ConversationView::subagent(&mut log, user_head.clone(), 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "reply".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("sub head present")
+        };
+
+        // Resume main activity after the sub run.
+        {
+            let mut view = ConversationView::user(&mut log, Some(sub_head));
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "back on main".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+
+        let end_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::SubAgentEnd { .. }))
+            .expect("SubAgentEnd present");
+        let last_sub = events
+            .iter()
+            .rposition(|e| matches!(e.agent_id(), AgentId::Sub(1)))
+            .expect("Sub(1) event present");
+        // First Main event after the last Sub(1) event marks main
+        // resuming. Skip the correlation events, whose `agent_id()`
+        // reports the parent (Main).
+        let main_resumes = events
+            .iter()
+            .enumerate()
+            .skip(last_sub + 1)
+            .find(|(_, e)| {
+                matches!(e.agent_id(), AgentId::Main)
+                    && !matches!(
+                        e,
+                        AgentEvent::SubAgentStart { .. } | AgentEvent::SubAgentEnd { .. }
+                    )
+            })
+            .map(|(i, _)| i)
+            .expect("Main resumes after sub run");
+
+        assert!(end_idx > last_sub, "SubAgentEnd follows last Sub(1) event");
+        assert!(
+            end_idx < main_resumes,
+            "SubAgentEnd must close the sub before main resumes"
+        );
     }
 
     #[test]
