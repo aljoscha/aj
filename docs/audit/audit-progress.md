@@ -80,7 +80,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
 | TO1 | tools-framework | Done | 0 | 1 | 4 | 2 | [aj-tools-framework](findings/aj-tools-framework.md) | 5424919 |
-| TO2 | tools-impls | TODO | – | – | – | – | – | – |
+| TO2 | tools-impls | Done | 0 | 1 | 7 | 2 | [aj-tools-impls](findings/aj-tools-impls.md) | 61b31b1 |
 
 ## Phase T — `aj-tui`
 
@@ -158,10 +158,16 @@ Recurring observations collected as steps complete; consumed by X1.
   ~80% byte-identical (callback server, parsing, mock harness) with no
   shared seam — widest duplication locus so far. Pairs with M4 error-map
   duplication.
-- **Non-atomic user-file writes** (C1, SE1): two axes. C1: `Config::save`
-  truncates in place (rewrite-atomicity). SE1: append-only log never
-  `sync_data`/`flush` despite "durable when the call returns" docs
-  (append-fsync). Sweep both classes across config/themes/session writers.
+- **Non-atomic user-file writes** (C1, SE1, TO2): three axes/loci. C1:
+  `Config::save` truncates in place. SE1: append-only log never fsyncs.
+  TO2: `write_file`/`edit_file`/`edit_file_multi` all `fs::write`
+  truncate-in-place — highest-frequency locus, and `edit_file_multi`
+  advertises an "atomic" contract its write doesn't honor. Sweep all
+  user-file writers for write-temp+rename and/or fsync.
+- **Tool descriptions diverge from behavior** (TO2): the `agent` tool says
+  "single turn" but runs the full uncapped agent loop; edit tools omit
+  their exact-substring/non-overlapping-count contract. The model-facing
+  schema is a contract — verify all tool descriptions match behavior.
 - **Concurrency / single-writer guard** (SE1, NEW): two `aj continue <id>`
   processes interleave JSONL lines and mint colliding entry ids,
   corrupting the parent chain. No file lock. Check the binary (A2/A3)
@@ -236,3 +242,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · AG2 agent-contracts · 0C/1Ma/4Mi/2N · f5950da
 - 2026-06-02 · SE1 session · 0C/3Ma/5Mi/3N · a477dca
 - 2026-06-02 · TO1 tools-framework · 0C/1Ma/4Mi/2N · 5424919
+- 2026-06-02 · TO2 tools-impls · 0C/1Ma/7Mi/2N · 61b31b1
