@@ -297,11 +297,15 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         provider: fixed.provider_id.to_string(),
         base_url: fixed.base_url.to_string(),
         reasoning: m.reasoning.unwrap_or(false),
-        // §3.4.4: `supports_xhigh` and `supports_adaptive_thinking` are
-        // not in models.dev. Default to `false` here; overrides flip
-        // them on for the models that need it.
-        supports_xhigh: false,
-        supports_adaptive_thinking: false,
+        // §3.4.4: `supports_adaptive_thinking` is not in models.dev.
+        // Default to `true` for Anthropic reasoning models so a newly
+        // released model uses the modern adaptive API rather than
+        // silently falling back to budget-based thinking; legacy
+        // budget-only Anthropic models are pinned `false` via
+        // overrides. Always `false` for non-Anthropic and non-reasoning
+        // models.
+        supports_adaptive_thinking: fixed.api == "anthropic-messages"
+            && m.reasoning.unwrap_or(false),
         input,
         cost: ModelCost {
             input: cost.and_then(|c| c.input).unwrap_or(0.0),
@@ -492,8 +496,8 @@ mod tests {
         assert_eq!(claude.api, "anthropic-messages");
         assert_eq!(claude.base_url, "https://api.anthropic.com");
         assert!(claude.reasoning);
-        assert!(!claude.supports_xhigh);
-        assert!(!claude.supports_adaptive_thinking);
+        // Anthropic reasoning model defaults to adaptive thinking.
+        assert!(claude.supports_adaptive_thinking);
         assert_eq!(
             claude.input,
             vec![InputModality::Text, InputModality::Image]

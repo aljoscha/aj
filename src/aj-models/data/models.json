@@ -9,7 +9,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -31,7 +30,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -53,7 +51,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -75,7 +72,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -97,7 +93,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -119,7 +114,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -141,7 +135,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -163,7 +156,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -185,7 +177,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -207,7 +198,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -229,7 +219,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -251,7 +240,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -273,7 +261,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -295,7 +282,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -317,7 +303,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -339,7 +324,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -361,7 +345,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": true,
       "input": [
         "text",
@@ -383,7 +366,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": true,
       "input": [
         "text",
@@ -405,8 +387,7 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
-      "supports_adaptive_thinking": false,
+      "supports_adaptive_thinking": true,
       "input": [
         "text",
         "image"
@@ -427,7 +408,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -449,7 +429,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -471,7 +450,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -493,7 +471,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -515,7 +492,6 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": true,
       "input": [
         "text",
@@ -537,7 +513,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text"
@@ -558,7 +533,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -580,7 +554,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -602,7 +575,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -624,7 +596,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -646,7 +617,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -668,7 +638,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -690,7 +659,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -712,7 +680,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -734,7 +701,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -756,7 +722,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -778,7 +743,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -800,7 +764,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -822,7 +785,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -844,7 +806,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -866,7 +827,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -888,7 +848,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -910,7 +869,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -932,7 +890,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -954,7 +911,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -976,7 +932,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -998,7 +953,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1020,7 +974,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1042,7 +995,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1064,7 +1016,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1086,7 +1037,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1108,7 +1058,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1130,7 +1079,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1152,7 +1100,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1174,7 +1121,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1196,7 +1142,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1218,7 +1163,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1240,7 +1184,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1262,7 +1205,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1284,7 +1226,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1306,7 +1247,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1328,7 +1268,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1350,7 +1289,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text"
@@ -1371,7 +1309,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1393,7 +1330,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",
@@ -1415,7 +1351,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": [
         "text",

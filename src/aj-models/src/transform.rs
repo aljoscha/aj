@@ -507,7 +507,6 @@ mod tests {
             provider: provider.into(),
             base_url: "https://example.test".into(),
             reasoning: false,
-            supports_xhigh: false,
             supports_adaptive_thinking: false,
             input,
             cost: ModelCost::default(),

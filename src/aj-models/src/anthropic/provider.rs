@@ -24,7 +24,9 @@ use crate::errors::{
 };
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
-use crate::registry::{ModelInfo, calculate_cost, supports_adaptive_thinking, supports_xhigh};
+use crate::registry::{
+    ModelInfo, calculate_cost, supports_adaptive_thinking, validate_thinking_level,
+};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
     select_cancel,
@@ -150,6 +152,15 @@ async fn run_stream_inner(
         // callers and the agent's retry layer see the right category.
         AssistantError::new(ErrorCategory::Auth, format!("anthropic provider: {err}"))
     })?;
+
+    // Reject a thinking level the model can't honour before building
+    // the request: aj sends the chosen effort verbatim, so this is the
+    // only client-side guard against an out-of-vocabulary level.
+    if let Some(level) = reasoning
+        && let Err(msg) = validate_thinking_level(model, level)
+    {
+        return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
+    }
 
     let client = build_client(model, api_key, reasoning, options);
     let request = build_request(model, context, options, reasoning);
@@ -747,7 +758,7 @@ fn build_thinking(
     }
     let display = display.map(to_anthropic_display);
     if supports_adaptive_thinking(model) {
-        let effort = adaptive_effort_for(level, model);
+        let effort = adaptive_effort_for(level);
         (
             Some(AThinking::Adaptive { display }),
             Some(OutputConfig {
@@ -777,18 +788,17 @@ fn to_anthropic_display(display: &ThinkingDisplay) -> AThinkingDisplay {
     }
 }
 
-fn adaptive_effort_for(level: &ThinkingLevel, model: &ModelInfo) -> OutputEffort {
+/// Map the unified [`ThinkingLevel`] onto the Anthropic adaptive
+/// `effort` enum one-to-one. `Minimal` has no adaptive rung and is
+/// rejected by [`validate_thinking_level`] before we get here; it's
+/// folded onto `Low` defensively to keep the match total.
+fn adaptive_effort_for(level: &ThinkingLevel) -> OutputEffort {
     match level {
         ThinkingLevel::Minimal | ThinkingLevel::Low => OutputEffort::Low,
         ThinkingLevel::Medium => OutputEffort::Medium,
         ThinkingLevel::High => OutputEffort::High,
-        ThinkingLevel::XHigh => {
-            if supports_xhigh(model) {
-                OutputEffort::Max
-            } else {
-                OutputEffort::High
-            }
-        }
+        ThinkingLevel::XHigh => OutputEffort::XHigh,
+        ThinkingLevel::Max => OutputEffort::Max,
     }
 }
 
@@ -797,8 +807,9 @@ fn budget_for(level: &ThinkingLevel) -> u64 {
         ThinkingLevel::Minimal => 1024,
         ThinkingLevel::Low => 2048,
         ThinkingLevel::Medium => 8192,
-        // XHigh has no separate budget tier; falls back to High.
-        ThinkingLevel::High | ThinkingLevel::XHigh => 16_384,
+        // Budget-based (legacy) models have no separate effort tiers
+        // above `high`; the higher rungs share the top budget.
+        ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => 16_384,
     }
 }
 
@@ -1269,7 +1280,6 @@ mod tests {
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
             reasoning: true,
-            supports_xhigh: false,
             supports_adaptive_thinking: true,
             input: vec![InputModality::Text],
             cost: ModelCost {
@@ -1287,7 +1297,6 @@ mod tests {
     fn budget_model() -> ModelInfo {
         ModelInfo {
             supports_adaptive_thinking: false,
-            supports_xhigh: false,
             ..fake_model()
         }
     }
@@ -1482,15 +1491,18 @@ mod tests {
     }
 
     #[test]
-    fn xhigh_falls_back_to_high_when_unsupported() {
-        let mut m = fake_model();
-        m.supports_xhigh = false;
-        let (_think, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh), None);
-        assert!(matches!(oc.unwrap().effort, Some(OutputEffort::High)));
+    fn adaptive_effort_maps_one_to_one() {
+        // Adaptive models pass each level straight to the wire effort
+        // enum — one-to-one, no downgrade.
+        let m = fake_model();
+        let (_t, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh), None);
+        assert!(matches!(oc.unwrap().effort, Some(OutputEffort::XHigh)));
 
-        m.supports_xhigh = true;
-        let (_think, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh), None);
+        let (_t, oc) = build_thinking(&m, Some(&ThinkingLevel::Max), None);
         assert!(matches!(oc.unwrap().effort, Some(OutputEffort::Max)));
+
+        let (_t, oc) = build_thinking(&m, Some(&ThinkingLevel::High), None);
+        assert!(matches!(oc.unwrap().effort, Some(OutputEffort::High)));
     }
 
     #[test]

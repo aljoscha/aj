@@ -48,7 +48,6 @@ fn fixture_model() -> ModelInfo {
         provider: "anthropic".into(),
         base_url: "https://api.anthropic.com".into(),
         reasoning: true,
-        supports_xhigh: false,
         supports_adaptive_thinking: true,
         input: vec![InputModality::Text],
         cost: ModelCost {

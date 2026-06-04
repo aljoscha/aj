@@ -58,7 +58,6 @@ fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
         provider: provider.into(),
         base_url: "https://example.test".into(),
         reasoning: false,
-        supports_xhigh: false,
         supports_adaptive_thinking: false,
         // Vision-on so the §8.2 image downgrade never fires here —
         // these tests focus on §8.1.

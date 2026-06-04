@@ -35,7 +35,7 @@ use serde_json::Value;
 use crate::errors::{classify_openai_error, parse_retry_after, transport_error};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
-use crate::registry::{ModelInfo, calculate_cost, supports_xhigh};
+use crate::registry::{ModelInfo, calculate_cost, validate_thinking_level};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
     select_cancel,
@@ -234,6 +234,14 @@ async fn run_stream_inner(
         )
     })?;
 
+    // Reject a thinking level the model can't honour before building
+    // the request: aj sends the chosen effort verbatim.
+    if let Some(level) = reasoning
+        && let Err(msg) = validate_thinking_level(model, level)
+    {
+        return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
+    }
+
     let base_url_present = !model.base_url.is_empty();
     let base_url_opt = base_url_present.then(|| model.base_url.clone());
     let base_url_for_check = base_url_opt
@@ -373,7 +381,7 @@ fn build_request(
                 };
                 (
                     Some(Reasoning {
-                        effort: Some(map_reasoning_effort(Some(level), model)),
+                        effort: Some(map_reasoning_effort(Some(level))),
                         summary: Some(summary),
                     }),
                     vec![ResponseIncludable::ReasoningEncryptedContent],
@@ -437,24 +445,19 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
     }
 }
 
-pub(super) fn map_reasoning_effort(
-    level: Option<&ThinkingLevel>,
-    model: &ModelInfo,
-) -> ReasoningEffort {
+/// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
+/// enum one-to-one. `Max` has no OpenAI equivalent and is rejected by
+/// [`validate_thinking_level`] before we get here; it's folded onto
+/// `XHigh` defensively to keep the match total. Shared by the
+/// Responses and Codex providers.
+pub(super) fn map_reasoning_effort(level: Option<&ThinkingLevel>) -> ReasoningEffort {
     match level {
         None => ReasoningEffort::None,
         Some(ThinkingLevel::Minimal) => ReasoningEffort::Minimal,
         Some(ThinkingLevel::Low) => ReasoningEffort::Low,
         Some(ThinkingLevel::Medium) => ReasoningEffort::Medium,
         Some(ThinkingLevel::High) => ReasoningEffort::High,
-        Some(ThinkingLevel::XHigh) => {
-            if supports_xhigh(model) {
-                ReasoningEffort::XHigh
-            } else {
-                // §7.3.2: XHigh is GPT-5.2+ only; fall back to High.
-                ReasoningEffort::High
-            }
-        }
+        Some(ThinkingLevel::XHigh) | Some(ThinkingLevel::Max) => ReasoningEffort::XHigh,
     }
 }
 
@@ -1559,7 +1562,6 @@ fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
         provider: message.provider.clone(),
         base_url: String::new(),
         reasoning: false,
-        supports_xhigh: false,
         supports_adaptive_thinking: false,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),
@@ -1587,7 +1589,6 @@ mod tests {
             provider: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             reasoning,
-            supports_xhigh: false,
             supports_adaptive_thinking: false,
             input: vec![InputModality::Text],
             cost: ModelCost {

@@ -1819,16 +1819,17 @@ impl From<anyhow::Error> for TurnError {
 /// Map the agent / binary's [`ThinkingConfig`] policy onto the
 /// unified [`ThinkingLevel`] the [`Provider`] trait consumes.
 ///
-/// `ThinkingConfig::Max` collapses onto `ThinkingLevel::XHigh`
-/// because the unified protocol caps at XHigh — providers that
-/// support a higher thinking effort than XHigh treat the
-/// "Max" rung as a synonym for XHigh.
+/// The mapping is one-to-one: what the user sets is what the provider
+/// receives. Levels a model can't honour are rejected by the provider
+/// (see [`aj_models::registry::validate_thinking_level`]) rather than
+/// silently downgraded here.
 fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
     match level {
         ThinkingConfig::Low => ThinkingLevel::Low,
         ThinkingConfig::Medium => ThinkingLevel::Medium,
         ThinkingConfig::High => ThinkingLevel::High,
-        ThinkingConfig::XHigh | ThinkingConfig::Max => ThinkingLevel::XHigh,
+        ThinkingConfig::XHigh => ThinkingLevel::XHigh,
+        ThinkingConfig::Max => ThinkingLevel::Max,
     }
 }
 
@@ -1959,7 +1960,6 @@ mod event_protocol_tests {
             provider: SCRIPT_PROVIDER.to_string(),
             base_url: "scripted://internal".to_string(),
             reasoning: false,
-            supports_xhigh: false,
             supports_adaptive_thinking: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),

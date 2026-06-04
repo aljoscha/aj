@@ -43,7 +43,7 @@ use serde_json::Value;
 use crate::errors::{classify_openai_error, parse_retry_after, transport_error};
 use crate::oauth::openai::extract_account_id;
 use crate::provider::Provider;
-use crate::registry::ModelInfo;
+use crate::registry::{ModelInfo, validate_thinking_level};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, ErrorReason, SelectOutcome, select_cancel,
 };
@@ -177,6 +177,14 @@ async fn run_stream_inner(
             ),
         )
     })?;
+
+    // Reject a thinking level the model can't honour before building
+    // the request: aj sends the chosen effort verbatim.
+    if let Some(level) = reasoning
+        && let Err(msg) = validate_thinking_level(model, level)
+    {
+        return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
+    }
 
     // §7.4.1: decode the JWT *at request time* so a refresh in flight
     // doesn't desync the header from the bearer token.
@@ -743,7 +751,7 @@ fn build_request(
                 };
                 (
                     Some(Reasoning {
-                        effort: Some(map_reasoning_effort(Some(level), model)),
+                        effort: Some(map_reasoning_effort(Some(level))),
                         summary: Some(summary),
                     }),
                     vec![ResponseIncludable::ReasoningEncryptedContent],
@@ -838,7 +846,6 @@ mod tests {
             provider: "openai-codex".into(),
             base_url: DEFAULT_BASE_URL.into(),
             reasoning,
-            supports_xhigh: false,
             supports_adaptive_thinking: false,
             input: vec![InputModality::Text],
             cost: ModelCost {

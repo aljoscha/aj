@@ -317,8 +317,11 @@ pub struct Context {
 /// Controls the depth of extended thinking / reasoning.
 ///
 /// Serialized in lower-case form: `"minimal"`, `"low"`, `"medium"`,
-/// `"high"`, `"xhigh"`. The wire value for [`Self::XHigh`] matches
-/// OpenAI's `reasoning_effort: "xhigh"` exactly.
+/// `"high"`, `"xhigh"`, `"max"`. Each variant is sent to the provider
+/// verbatim — there is no remapping or silent downgrade. A level the
+/// target model's wire vocabulary doesn't accept is rejected before
+/// the request is sent (see
+/// [`crate::registry::validate_thinking_level`]).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -326,12 +329,11 @@ pub enum ThinkingLevel {
     Low,
     Medium,
     High,
-    /// Maximum reasoning effort. Maps to Anthropic adaptive
-    /// `output_config: {effort: "max"}` (Opus 4.6 only) and OpenAI
-    /// `reasoning_effort: "xhigh"` (GPT-5.2+ only). For models that
-    /// don't support this level, providers fall back to
-    /// [`Self::High`].
+    /// Anthropic `effort: "xhigh"` / OpenAI `reasoning_effort: "xhigh"`.
     XHigh,
+    /// Anthropic adaptive `effort: "max"`. Anthropic-only — the
+    /// OpenAI-family APIs have no `max` reasoning effort and reject it.
+    Max,
 }
 
 // ---------------------------------------------------------------------------

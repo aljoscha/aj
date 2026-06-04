@@ -186,7 +186,6 @@ mod tests {
             provider: "fake".into(),
             base_url: "https://example.invalid".into(),
             reasoning: false,
-            supports_xhigh: false,
             supports_adaptive_thinking: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),

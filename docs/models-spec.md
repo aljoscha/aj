@@ -559,13 +559,6 @@ struct ModelInfo {
     base_url: String,
     /// Whether the model supports extended thinking / reasoning.
     reasoning: bool,
-    /// Whether the model supports the `XHigh` reasoning level
-    /// (Anthropic `output_config: {effort: "max"}` / OpenAI
-    /// `reasoning_effort: "xhigh"`). Populated by the catalog
-    /// (§3.4) — models.dev does not carry this flag, so it comes
-    /// from the bundled overrides file. `false` for non-reasoning
-    /// models.
-    supports_xhigh: bool,
     /// Whether the model uses Anthropic's adaptive thinking API
     /// (`thinking: {type: "adaptive"}` + `output_config: {effort:
     /// ...}`) instead of the older budget-based thinking. Also
@@ -655,14 +648,16 @@ of helpers used by the provider and transform layers:
 /// Structural equality of two ModelInfo references by (provider, api, id).
 fn models_are_equal(a: &ModelInfo, b: &ModelInfo) -> bool;
 
-/// Whether the model supports the `XHigh` reasoning level (mapped to
-/// Anthropic `output_config: {effort: "max"}` or OpenAI
-/// `reasoning_effort: "xhigh"`). Thin accessor over
-/// `ModelInfo.supports_xhigh`; the source of truth is the catalog
-/// (seed + overrides, see §3.4). Wrapped as a function so provider
-/// code reads `supports_xhigh(model)` regardless of future schema
-/// changes (e.g. if the flag ever becomes derived).
-fn supports_xhigh(model: &ModelInfo) -> bool;
+/// Validate a requested `ThinkingLevel` against a model's wire
+/// vocabulary, returning a human-readable message when the level
+/// can't be honoured. aj sends the chosen effort verbatim — there is
+/// no remapping or silent downgrade — so an out-of-vocabulary level is
+/// rejected before the request is built: adaptive Anthropic models
+/// reject `Minimal` (no adaptive rung), and the OpenAI-family APIs
+/// reject `Max` (they cap at `xhigh`). Per-model effort support
+/// *within* a provider's vocabulary is left to the provider API,
+/// which returns its own 400.
+fn validate_thinking_level(model: &ModelInfo, level: &ThinkingLevel) -> Result<(), String>;
 
 /// Whether the model uses Anthropic's adaptive thinking API
 /// (top-level `thinking: {type: "adaptive"}` + `output_config:
@@ -702,7 +697,7 @@ error — the seed is used silently.
 **Overrides** (`src/aj-models/data/overrides.json`, bundled) are
 applied on top of whichever catalog loaded. They correct known
 inaccuracies in upstream data (e.g. wrong cache pricing), supply
-fields models.dev doesn't carry (e.g. `supports_xhigh`,
+fields models.dev doesn't carry (e.g.
 `supports_adaptive_thinking`), and add brand-new models not yet
 indexed upstream. Overrides run on every load — seed and user cache
 alike — so a fresh refresh never wipes our authored corrections.
@@ -723,7 +718,6 @@ Seed and user cache share one JSON schema:
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": true,
       "input": ["text", "image"],
       "cost": {
@@ -766,8 +760,9 @@ overrides (§3.4.4), and writes the result to `~/.aj/models.json`.
 | `limit.context` | `context_window` |
 | `limit.output` | `max_tokens` |
 
-`supports_xhigh` and `supports_adaptive_thinking` are not in
-models.dev; they come from overrides (§3.4.4).
+`supports_adaptive_thinking` is not in models.dev; it defaults to
+`true` for Anthropic reasoning models in the mapper and is pinned per
+model by overrides (§3.4.4).
 
 On fetch failure (network error, non-200, parse failure), the
 command exits non-zero and leaves `~/.aj/models.json` untouched —
@@ -811,11 +806,10 @@ applied in order at load time:
     {
       "target": {"provider": "anthropic", "id": "claude-opus-4-7-20260115"},
       "patch": {
-        "supports_xhigh": true,
         "supports_adaptive_thinking": true,
         "cost": {"cache_read": 0.30}
       },
-      "reason": "xhigh/adaptive flags aren't in models.dev; cache_read corrected from upstream typo"
+      "reason": "adaptive flag isn't in models.dev; cache_read corrected from upstream typo"
     }
   ]
 }
@@ -1133,8 +1127,8 @@ caching, and short prompts simply produce zero cache activity.
 - Adaptive models (`supports_adaptive_thinking(model) == true`): set top-level `thinking: {type: "adaptive"}` and top-level `output_config: {effort: "low"|"medium"|"high"|"max"}` (both are sibling request fields, not nested).
 - Non-adaptive reasoning models (`model.reasoning == true && !supports_adaptive_thinking(model)`): use `thinking: {type: "enabled", budget_tokens: N}`.
 - Non-reasoning or thinking disabled by caller: `thinking: {type: "disabled"}`.
-- ThinkingLevel mapping for adaptive: Minimal→`"low"`, Low→`"low"`, Medium→`"medium"`, High→`"high"`, XHigh→`"max"` when `supports_xhigh(model)`, otherwise falls back to `"high"`.
-- ThinkingLevel mapping for budget-based: Minimal→1024, Low→2048, Medium→8192, High→16384 (XHigh falls back to High).
+- ThinkingLevel mapping for adaptive: each level maps one-to-one to the wire `effort` enum (Low→`"low"`, Medium→`"medium"`, High→`"high"`, XHigh→`"xhigh"`, Max→`"max"`). `Minimal` has no adaptive rung and is rejected by `validate_thinking_level` before the request is built. Whether a given adaptive model accepts `xhigh` vs `max` is left to the provider API (a rejected effort surfaces as a 400).
+- ThinkingLevel mapping for budget-based: Minimal→1024, Low→2048, Medium→8192, High/XHigh/Max→16384 (the legacy budget API has no effort tiers above `high`, so the top rungs share the max budget).
 
 **Temperature + extended thinking:** When extended thinking is enabled
 (adaptive or budget-based), `temperature` must be omitted from the request.
@@ -2280,8 +2274,7 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
    stream with a `result()` future.
 
 3. **Define model metadata and registry** (`aj-models::registry`): Create
-   `ModelInfo` (including `supports_xhigh` and `supports_adaptive_thinking`
-   fields), `ModelCost`, `InputModality`, `ModelRegistry` from §3.
+   `ModelInfo` (including the `supports_adaptive_thinking` field), `ModelCost`, `InputModality`, `ModelRegistry` from §3.
    Implement `calculate_cost` and the capability-probe accessors from §3.3.1.
    The registry loads its catalog from (a) the user cache at
    `~/.aj/models.json` if present and parseable, otherwise (b) the bundled
@@ -2295,8 +2288,8 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
     fixed values (§3.4.3), applies overrides (§3.4.4), writes
     `~/.aj/models.json`. On fetch failure: non-zero exit, leave the
     existing cache intact. Run it once against a live models.dev,
-    apply manual overrides for `supports_xhigh` /
-    `supports_adaptive_thinking`, and commit the resulting JSON as
+    apply manual overrides for `supports_adaptive_thinking`, and
+    commit the resulting JSON as
     the initial seed (`src/aj-models/data/models.json`) and the
     initial overrides file (`src/aj-models/data/overrides.json`).
 

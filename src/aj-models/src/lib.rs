@@ -30,11 +30,10 @@ pub mod types;
 /// describe the user's preferred reasoning depth.
 ///
 /// The agent projects this onto the unified
-/// [`crate::types::ThinkingLevel`] before each inference: `Low`,
-/// `Medium`, `High` map directly, while `XHigh` and `Max` both
-/// collapse onto [`crate::types::ThinkingLevel::XHigh`] (the unified
-/// ceiling). `None` (i.e. `Option<ThinkingConfig>::None`) means
-/// "extended thinking off" — different from
+/// [`crate::types::ThinkingLevel`] one-to-one before each inference;
+/// each level is sent to the provider verbatim with no remapping.
+/// `None` (i.e. `Option<ThinkingConfig>::None`) means "extended
+/// thinking off" — different from
 /// [`crate::types::ThinkingLevel::Minimal`], which is the lowest
 /// effort rung for reasoning models that don't support disabling
 /// thinking entirely.

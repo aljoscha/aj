@@ -7,7 +7,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -26,7 +25,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -45,7 +43,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": false,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -64,7 +61,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -83,7 +79,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -102,7 +97,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -121,7 +115,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": ["text"],
       "cost": {
@@ -140,7 +133,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -159,7 +151,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {
@@ -178,7 +169,6 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_xhigh": true,
       "supports_adaptive_thinking": false,
       "input": ["text", "image"],
       "cost": {

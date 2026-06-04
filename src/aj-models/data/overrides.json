@@ -11,9 +11,10 @@
           "output": 25.0,
           "cache_read": 0.5,
           "cache_write": 6.25
-        }
+        },
+        "supports_adaptive_thinking": false
       },
-      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25"
+      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25. Pre-adaptive model: budget-based thinking only."
     },
     {
       "target": {
@@ -26,9 +27,10 @@
           "output": 25.0,
           "cache_read": 0.5,
           "cache_write": 6.25
-        }
+        },
+        "supports_adaptive_thinking": false
       },
-      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25"
+      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25. Pre-adaptive model: budget-based thinking only."
     },
     {
       "target": {
@@ -38,7 +40,7 @@
       "patch": {
         "supports_adaptive_thinking": true
       },
-      "reason": "uses top-level adaptive thinking + output_config.effort; not in models.dev"
+      "reason": "Adaptive thinking recommended (thinking:{type:adaptive} + effort); manual budget mode deprecated but still functional. Not in models.dev."
     },
     {
       "target": {
@@ -48,7 +50,17 @@
       "patch": {
         "supports_adaptive_thinking": true
       },
-      "reason": "uses top-level adaptive thinking + output_config.effort; not in models.dev"
+      "reason": "Adaptive thinking only; manual budget mode returns 400. Not in models.dev."
+    },
+    {
+      "target": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      },
+      "patch": {
+        "supports_adaptive_thinking": true
+      },
+      "reason": "Adaptive thinking only; manual budget mode returns 400. Not in models.dev."
     },
     {
       "target": {
@@ -58,157 +70,117 @@
       "patch": {
         "supports_adaptive_thinking": true
       },
-      "reason": "uses top-level adaptive thinking + output_config.effort; not in models.dev"
+      "reason": "Adaptive thinking recommended; manual budget mode deprecated but still functional. Not in models.dev."
     },
     {
       "target": {
         "provider": "anthropic",
-        "id": "claude-opus-4-6"
+        "id": "claude-3-7-sonnet-20250219"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports XHigh reasoning tier (output_config.effort=max/xhigh); not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
         "provider": "anthropic",
-        "id": "claude-opus-4-7"
+        "id": "claude-opus-4-0"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports XHigh reasoning tier (output_config.effort=max/xhigh); not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.2"
+        "provider": "anthropic",
+        "id": "claude-opus-4-1"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.2-codex"
+        "provider": "anthropic",
+        "id": "claude-opus-4-1-20250805"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.2-pro"
+        "provider": "anthropic",
+        "id": "claude-opus-4-20250514"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.2-chat-latest"
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-0"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.3-codex"
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-20250514"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.3-codex-spark"
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-5"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.3-chat-latest"
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-5-20250929"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.4"
+        "provider": "anthropic",
+        "id": "claude-haiku-4-5"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     },
     {
       "target": {
-        "provider": "openai",
-        "id": "gpt-5.4-mini"
+        "provider": "anthropic",
+        "id": "claude-haiku-4-5-20251001"
       },
       "patch": {
-        "supports_xhigh": true
+        "supports_adaptive_thinking": false
       },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
-    },
-    {
-      "target": {
-        "provider": "openai",
-        "id": "gpt-5.4-nano"
-      },
-      "patch": {
-        "supports_xhigh": true
-      },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
-    },
-    {
-      "target": {
-        "provider": "openai",
-        "id": "gpt-5.4-pro"
-      },
-      "patch": {
-        "supports_xhigh": true
-      },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
-    },
-    {
-      "target": {
-        "provider": "openai",
-        "id": "gpt-5.5"
-      },
-      "patch": {
-        "supports_xhigh": true
-      },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
-    },
-    {
-      "target": {
-        "provider": "openai",
-        "id": "gpt-5.5-pro"
-      },
-      "patch": {
-        "supports_xhigh": true
-      },
-      "reason": "supports OpenAI reasoning_effort=xhigh; not in models.dev"
+      "reason": "Pre-adaptive model: budget-based extended thinking only."
     }
   ]
 }

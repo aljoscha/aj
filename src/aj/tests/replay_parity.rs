@@ -147,7 +147,6 @@ fn scripted_model_info() -> ModelInfo {
         provider: SCRIPT_PROVIDER.to_string(),
         base_url: "scripted://internal".to_string(),
         reasoning: false,
-        supports_xhigh: false,
         supports_adaptive_thinking: false,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),

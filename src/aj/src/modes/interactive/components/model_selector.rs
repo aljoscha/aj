@@ -404,7 +404,6 @@ mod tests {
             provider: provider.into(),
             base_url: format!("https://api.{provider}.com"),
             reasoning: false,
-            supports_xhigh: false,
             supports_adaptive_thinking: false,
             input: vec![],
             cost: ModelCost::default(),

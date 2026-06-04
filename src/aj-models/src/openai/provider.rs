@@ -35,7 +35,7 @@ use crate::errors::{
 };
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
-use crate::registry::{ModelInfo, calculate_cost, supports_xhigh};
+use crate::registry::{ModelInfo, calculate_cost, validate_thinking_level};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
     select_cancel,
@@ -161,6 +161,14 @@ async fn run_stream_inner(
             format!("openai-completions provider: {err}"),
         )
     })?;
+
+    // Reject a thinking level the model can't honour before building
+    // the request: aj sends the chosen effort verbatim.
+    if let Some(level) = reasoning
+        && let Err(msg) = validate_thinking_level(model, level)
+    {
+        return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
+    }
 
     let base_url = (!model.base_url.is_empty()).then(|| model.base_url.clone());
     let client = Client::new(base_url, api_key);
@@ -289,7 +297,7 @@ fn build_request(
         .map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
     let reasoning_effort = if model.reasoning {
-        Some(map_reasoning_effort(reasoning, model))
+        Some(map_reasoning_effort(reasoning))
     } else {
         // Non-reasoning models reject the field entirely.
         None
@@ -726,22 +734,18 @@ fn to_chat_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Option<C
 // Reasoning effort (§7.2 "Reasoning effort")
 // ---------------------------------------------------------------------------
 
-fn map_reasoning_effort(level: Option<&ThinkingLevel>, model: &ModelInfo) -> ReasoningEffort {
+/// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
+/// enum one-to-one. `Max` has no OpenAI equivalent and is rejected by
+/// [`validate_thinking_level`] before we get here; it's folded onto
+/// `XHigh` defensively to keep the match total.
+fn map_reasoning_effort(level: Option<&ThinkingLevel>) -> ReasoningEffort {
     match level {
         None => ReasoningEffort::None,
         Some(ThinkingLevel::Minimal) => ReasoningEffort::Minimal,
         Some(ThinkingLevel::Low) => ReasoningEffort::Low,
         Some(ThinkingLevel::Medium) => ReasoningEffort::Medium,
         Some(ThinkingLevel::High) => ReasoningEffort::High,
-        Some(ThinkingLevel::XHigh) => {
-            if supports_xhigh(model) {
-                ReasoningEffort::XHigh
-            } else {
-                // §7.2: XHigh is GPT-5.2+ only; everything else falls
-                // back to High so the request still validates.
-                ReasoningEffort::High
-            }
-        }
+        Some(ThinkingLevel::XHigh) | Some(ThinkingLevel::Max) => ReasoningEffort::XHigh,
     }
 }
 
@@ -1163,7 +1167,6 @@ fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
         provider: message.provider.clone(),
         base_url: String::new(),
         reasoning: false,
-        supports_xhigh: false,
         supports_adaptive_thinking: false,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),
@@ -1283,7 +1286,6 @@ mod tests {
             provider: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             reasoning: true,
-            supports_xhigh: false,
             supports_adaptive_thinking: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
@@ -1367,18 +1369,18 @@ mod tests {
     }
 
     #[test]
-    fn xhigh_falls_back_to_high_when_unsupported() {
-        let m = fake_model();
+    fn reasoning_effort_maps_one_to_one() {
+        // Each level passes straight through to the wire enum,
+        // one-to-one.
         assert!(matches!(
-            map_reasoning_effort(Some(&ThinkingLevel::XHigh), &m),
-            ReasoningEffort::High
-        ));
-        let mut m = m;
-        m.supports_xhigh = true;
-        assert!(matches!(
-            map_reasoning_effort(Some(&ThinkingLevel::XHigh), &m),
+            map_reasoning_effort(Some(&ThinkingLevel::XHigh)),
             ReasoningEffort::XHigh
         ));
+        assert!(matches!(
+            map_reasoning_effort(Some(&ThinkingLevel::Minimal)),
+            ReasoningEffort::Minimal
+        ));
+        assert!(matches!(map_reasoning_effort(None), ReasoningEffort::None));
     }
 
     #[test]
