@@ -31,6 +31,7 @@ use aj_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use aj_tui::keys::InputEvent;
 
 use crate::config::theme::ChatTheme;
+use crate::modes::interactive::render_settings::RenderSettings;
 
 /// Per-message vertical padding. Set to `0` so the component
 /// itself doesn't emit blank rows around its content; the
@@ -127,12 +128,24 @@ pub struct AssistantMessageComponent {
     /// theme reload reskins existing widgets without rebuilding
     /// them.
     thinking_text: Arc<dyn Fn(&str) -> String>,
-    /// Whether to render the thinking channel as a single
-    /// `Thinking…` placeholder line (collapsed mode) instead of
-    /// the full italic markdown widget. Flipped at runtime by the
-    /// `aj.thinking.toggle` keybinding via
-    /// [`Self::set_hide_thinking_block`]; see
-    /// `docs/aj-next-plan.md` §4.4.
+    /// Shared session-wide render settings. Read at render time
+    /// (see [`Self::reconcile_settings`]) so a `aj.thinking.toggle`
+    /// flip reaches this component without the toggle site walking
+    /// the transcript.
+    settings: RenderSettings,
+    /// Generation of [`Self::settings`] that the current thinking
+    /// widgets reflect. A mismatch at render time triggers a
+    /// reconcile.
+    last_generation: u64,
+    /// Last-applied thinking-block render mode — the mode the
+    /// current widgets were built for. Kept in step with
+    /// `settings.hide_thinking_block()` by
+    /// [`Self::reconcile_settings`]; the streaming mutators read it
+    /// when (re)building widgets, and the render loop keeps it
+    /// coherent because every settings change invalidates and
+    /// repaints. `true` renders the thinking channel as a single
+    /// `Thinking…` placeholder line instead of the full italic
+    /// markdown widget; see `docs/aj-next-plan.md` §4.4.
     hide_thinking_block: bool,
     /// In-order blocks the model has streamed so far.
     blocks: Vec<Block>,
@@ -142,14 +155,18 @@ impl AssistantMessageComponent {
     /// Build an empty assistant-message component. The caller adds
     /// it to the chat container immediately; the markdown widgets
     /// are created on the fly when the first chunk of each block
-    /// arrives. `hide_thinking_block` carries the session-wide
-    /// preference at the moment of construction — the host may
-    /// flip it later via [`Self::set_hide_thinking_block`] in
-    /// response to the `aj.thinking.toggle` toggle.
-    pub fn new(chat_theme: &ChatTheme, hide_thinking_block: bool) -> Self {
+    /// arrives. `settings` is the shared session-wide render config;
+    /// the component snapshots the current thinking-fold mode for
+    /// its widgets and re-reads `settings` at render time when the
+    /// generation moves (the user toggling `aj.thinking.toggle`).
+    pub fn new(chat_theme: &ChatTheme, settings: RenderSettings) -> Self {
+        let hide_thinking_block = settings.hide_thinking_block();
+        let last_generation = settings.generation();
         Self {
             markdown_theme: chat_theme.markdown.clone(),
             thinking_text: Arc::clone(&chat_theme.thinking_text),
+            settings,
+            last_generation,
             hide_thinking_block,
             blocks: Vec::new(),
         }
@@ -218,23 +235,25 @@ impl AssistantMessageComponent {
         );
     }
 
-    /// Swap the thinking-block render mode for this message.
+    /// Pull the latest shared render settings in and rebuild the
+    /// thinking widgets when the fold/expand mode changed.
     ///
-    /// The event pump walks every assistant message in the chat
-    /// container on a `aj.thinking.toggle` toggle and calls this; the next
-    /// render then shows the new mode for both finalized and
-    /// in-flight messages. A no-op when the mode hasn't actually
-    /// changed so we don't tear down a streaming markdown widget
-    /// just to rebuild an identical one.
-    pub fn set_hide_thinking_block(&mut self, hide: bool) {
+    /// Called at the top of [`Component::render`] when the settings
+    /// generation has moved (the user pressed `aj.thinking.toggle`).
+    /// A no-op for the widgets when the mode itself hasn't changed,
+    /// so an unrelated toggle (e.g. tool expansion, which shares the
+    /// generation counter) doesn't tear down a streaming markdown
+    /// widget just to rebuild an identical one. In collapsed mode
+    /// the markdown widget is dropped (the buffer stays the source
+    /// of truth for the placeholder); flipping back rebuilds it from
+    /// the preserved buffer.
+    fn reconcile_settings(&mut self) {
+        self.last_generation = self.settings.generation();
+        let hide = self.settings.hide_thinking_block();
         if self.hide_thinking_block == hide {
             return;
         }
         self.hide_thinking_block = hide;
-        // Walk every thinking block: drop the markdown widget in
-        // collapsed mode (the buffer stays as the source of truth
-        // for the placeholder rendering), or rebuild it from the
-        // preserved buffer when flipping back to expanded.
         for block in self.blocks.iter_mut() {
             if block.kind == BlockKind::Thinking {
                 Self::refresh_widget(
@@ -379,6 +398,12 @@ impl Component for AssistantMessageComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
+        // Pull in any session-wide settings change (the user toggled
+        // `aj.thinking.toggle`) before painting. Gated on the
+        // generation so steady-state renders skip the work.
+        if self.settings.generation() != self.last_generation {
+            self.reconcile_settings();
+        }
         let mut lines = Vec::new();
         // Pre-compute both placeholder variants once so we don't
         // need to re-borrow `self` while iterating `self.blocks`
@@ -454,6 +479,13 @@ mod tests {
         chat_theme(&ThemeHandle::new(Theme::bundled_dark()))
     }
 
+    /// Build a shared settings handle with the given thinking-fold
+    /// mode (the only setting this component reads). Tests that flip
+    /// the mode at runtime keep the returned handle and toggle it.
+    fn settings(hide_thinking_block: bool) -> RenderSettings {
+        RenderSettings::new(hide_thinking_block, false, true)
+    }
+
     #[test]
     fn empty_thinking_block_renders_placeholder_in_expanded_mode() {
         // Extended-thinking models routinely emit a signed-but-empty
@@ -461,7 +493,7 @@ mod tests {
         // mode (no `hide_thinking_block`) we surface the placeholder
         // so the user can see the model did engage the reasoning
         // channel; otherwise the empty block silently vanishes.
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Thinking, String::new());
         c.close_block(BlockKind::Thinking, None);
         // `is_empty()` treats any thinking block as content so the
@@ -488,7 +520,7 @@ mod tests {
         // placeholder should mention the configured key so they can
         // discover how to unfold it again.
         crate::config::keybindings::install_global_manager_defaults();
-        let mut c = AssistantMessageComponent::new(&theme(), true);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(true));
         c.open_block(BlockKind::Thinking, "first thought".to_string());
         c.close_block(BlockKind::Thinking, None);
         let lines = c.render(80);
@@ -506,7 +538,7 @@ mod tests {
         // turns: an empty thinking block followed by the user-facing
         // text. The placeholder, the intra-message blank separator,
         // and the text body should all be present.
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Thinking, String::new());
         c.close_block(BlockKind::Thinking, None);
         c.open_block(BlockKind::Text, "Hello!".to_string());
@@ -519,13 +551,13 @@ mod tests {
 
     #[test]
     fn fresh_component_is_empty() {
-        let c = AssistantMessageComponent::new(&theme(), false);
+        let c = AssistantMessageComponent::new(&theme(), settings(false));
         assert!(c.is_empty());
     }
 
     #[test]
     fn streaming_text_creates_a_widget_lazily_and_appends() {
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Text, "hello".to_string());
         assert!(!c.is_empty());
         assert_eq!(c.blocks.len(), 1);
@@ -541,7 +573,7 @@ mod tests {
         // widget creation until the first delta arrives, so the
         // chat container doesn't render an empty bubble for a
         // turn that got cancelled between Start and any Update.
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Text, String::new());
         assert!(c.is_empty());
         assert!(c.blocks[0].widget.is_none());
@@ -552,26 +584,31 @@ mod tests {
         // The collapsed-mode placeholder is emitted at render
         // time from the buffer alone; the heavy markdown widget
         // is dropped so a long replayed reasoning trace doesn't
-        // sit in memory just to be hidden.
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        // sit in memory just to be hidden. The drop/rebuild now
+        // happens lazily at render time when the shared settings'
+        // generation moves, so each toggle is followed by a render.
+        let s = settings(false);
+        let mut c = AssistantMessageComponent::new(&theme(), s.clone());
         c.open_block(
             BlockKind::Thinking,
             "first I'll consider the inputs…".to_string(),
         );
         assert!(c.blocks[0].widget.is_some());
-        c.set_hide_thinking_block(true);
+        s.set_hide_thinking_block(true);
+        c.render(80);
         assert!(c.blocks[0].widget.is_none());
         assert_eq!(c.blocks[0].body, "first I'll consider the inputs…");
         // Flipping back rebuilds the markdown widget from the
         // preserved buffer so the user sees the same reasoning
         // they just hid.
-        c.set_hide_thinking_block(false);
+        s.set_hide_thinking_block(false);
+        c.render(80);
         assert!(c.blocks[0].widget.is_some());
     }
 
     #[test]
     fn collapsed_mode_renders_a_single_placeholder_line() {
-        let mut c = AssistantMessageComponent::new(&theme(), true);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(true));
         c.open_block(
             BlockKind::Thinking,
             "verbose internal reasoning".to_string(),
@@ -587,7 +624,7 @@ mod tests {
         // blank row separates a thinking block (expanded *or*
         // collapsed) from a following text block. Collapsed mode
         // must honour the same rule.
-        let mut c = AssistantMessageComponent::new(&theme(), true);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(true));
         c.open_block(BlockKind::Thinking, "…".to_string());
         c.open_block(BlockKind::Text, "answer".to_string());
         let lines = c.render(80);
@@ -599,9 +636,10 @@ mod tests {
 
     #[test]
     fn toggling_to_a_message_with_no_thinking_is_a_noop() {
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let s = settings(false);
+        let mut c = AssistantMessageComponent::new(&theme(), s.clone());
         c.open_block(BlockKind::Text, "plain answer".to_string());
-        c.set_hide_thinking_block(true);
+        s.set_hide_thinking_block(true);
         let lines = c.render(80);
         assert!(
             lines.iter().all(|l| !l.contains(HIDDEN_THINKING_LABEL)),
@@ -611,7 +649,7 @@ mod tests {
 
     #[test]
     fn expanded_thinking_rendering_includes_inline_prefix() {
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(
             BlockKind::Thinking,
             "the model's reasoning here".to_string(),
@@ -636,7 +674,7 @@ mod tests {
         // a double space. The renderer trims leading whitespace
         // from the body before concatenating; the buffer itself
         // stays untouched so the on-disk transcript is faithful.
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Thinking, " leading space".to_string());
         let lines = c.render(80);
         let joined = lines.join("\n");
@@ -655,7 +693,7 @@ mod tests {
 
     #[test]
     fn thinking_buffer_excludes_prefix_so_collapse_logic_stays_clean() {
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Thinking, "raw thought".to_string());
         assert_eq!(c.blocks[0].body, "raw thought");
         assert!(!c.is_empty());
@@ -668,7 +706,7 @@ mod tests {
         // neither should a second text block clobber the first.
         // All four blocks must show up in the rendered output in
         // emission order.
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Thinking, "thought ONE".to_string());
         c.close_block(BlockKind::Thinking, None);
         c.open_block(BlockKind::Text, "reply ONE".to_string());
@@ -704,7 +742,7 @@ mod tests {
         // (it's a flush signal, not a finalize); the pump passes
         // `None` into `close_block` in that case, which must not
         // touch the accumulated body.
-        let mut c = AssistantMessageComponent::new(&theme(), false);
+        let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Thinking, String::new());
         c.append_delta(BlockKind::Thinking, "let me think");
         c.append_delta(BlockKind::Thinking, " carefully");

@@ -21,6 +21,7 @@ pub mod event_pump;
 pub mod footer_data;
 pub mod keys;
 pub mod layout;
+pub mod render_settings;
 pub mod shutdown;
 
 use std::sync::Arc;
@@ -94,6 +95,7 @@ use crate::modes::interactive::event_pump::{
     EventPump, set_editor_submit_enabled, take_submitted_prompt,
 };
 use crate::modes::interactive::layout::{SlotIndex, build_layout};
+use crate::modes::interactive::render_settings::RenderSettings;
 use crate::modes::interactive::shutdown::{
     build_usage_summary, print_resume_hint, print_usage_summary,
 };
@@ -549,9 +551,11 @@ impl InteractiveMode {
         let context_window = agent.model_info().context_window;
         let mut pump = EventPump::new(
             chat_theme(&theme),
-            config.hide_thinking_block,
-            false,
-            config.image_show_in_terminal,
+            RenderSettings::new(
+                config.hide_thinking_block,
+                false,
+                config.image_show_in_terminal,
+            ),
             context_window,
         );
         // Push the initial `?/<window>` so the indicator is
@@ -3151,9 +3155,7 @@ async fn perform_session_swap(
     let context_window = agent.lock().await.model_info().context_window;
     *pump = EventPump::new(
         chat_theme(theme),
-        hide_thinking_block,
-        false,
-        show_image_in_terminal,
+        RenderSettings::new(hide_thinking_block, false, show_image_in_terminal),
         context_window,
     );
     // Seed the footer indicator before replay so the row shows
@@ -3251,9 +3253,7 @@ async fn perform_new_session(
     let context_window = agent.lock().await.model_info().context_window;
     *pump = EventPump::new(
         chat_theme(theme),
-        hide_thinking_block,
-        false,
-        show_image_in_terminal,
+        RenderSettings::new(hide_thinking_block, false, show_image_in_terminal),
         context_window,
     );
     // Seed the footer indicator so the row shows `?/<window>`

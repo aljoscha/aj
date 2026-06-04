@@ -46,6 +46,7 @@ use aj::config::theme::{Theme, ThemeHandle, chat_theme};
 use aj::modes::interactive::components::chat_view::ChatView;
 use aj::modes::interactive::event_pump::EventPump;
 use aj::modes::interactive::layout::{SlotIndex, build_layout};
+use aj::modes::interactive::render_settings::RenderSettings;
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
 use aj_agent::tool::ErasedToolDefinition;
@@ -196,7 +197,11 @@ fn build_tui_and_pump() -> (Tui, EventPump) {
     let mut tui = Tui::new(Box::new(StubTerminal::new()));
     let theme = ThemeHandle::new(Theme::bundled_dark());
     build_layout(&mut tui, &theme);
-    let pump = EventPump::new(chat_theme(&theme), false, false, true, 200_000);
+    let pump = EventPump::new(
+        chat_theme(&theme),
+        RenderSettings::new(false, false, true),
+        200_000,
+    );
     (tui, pump)
 }
 

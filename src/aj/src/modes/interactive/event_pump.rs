@@ -48,6 +48,7 @@ use crate::modes::interactive::components::tool_execution::ToolExecutionComponen
 use crate::modes::interactive::components::user_message::UserMessageComponent;
 use crate::modes::interactive::footer_data::FooterData;
 use crate::modes::interactive::layout::SlotIndex;
+use crate::modes::interactive::render_settings::RenderSettings;
 
 /// Per-agent streaming bookkeeping. The pump keeps one of these for
 /// the main agent and one per sub-agent so streaming events route to
@@ -108,25 +109,14 @@ pub struct EventPump {
     /// indicator. Reset to zero on the main agent's lifecycle
     /// boundaries so a dropped `SubAgentEnd` can't pin the count.
     running_sub_agents: usize,
-    /// Whether new and existing assistant-message components
-    /// should render thinking blocks as a single italic
-    /// `Thinking…` placeholder line instead of the full expanded
-    /// markdown widget. Toggled at runtime by
-    /// [`Self::set_hide_thinking_block`].
-    hide_thinking_block: bool,
-    /// Whether new and existing tool-execution components should
-    /// render their bodies fully (`true`) or in the compact head/
-    /// tail-truncated form (`false`). Toggled at runtime by
-    /// [`Self::set_tools_expanded`] in response to the
-    /// `aj.tools.expand` keybinding; defaults to `false` so the
-    /// scrollback stays compact across long sessions.
-    tools_expanded: bool,
-    /// Whether tool-execution components should render their
-    /// image attachments inline. Sourced from the
-    /// `image_show_in_terminal` config key at startup; threaded
-    /// into every freshly-constructed [`ToolExecutionComponent`]
-    /// via [`ToolExecutionComponent::with_show_image_in_terminal`].
-    show_image_in_terminal: bool,
+    /// Shared session-wide render settings (tool expansion,
+    /// thinking-block fold, inline-image rendering). Cloned into
+    /// every assistant / tool component the pump creates so they
+    /// observe the current values; a runtime toggle (via
+    /// [`Self::set_hide_thinking_block`] / [`Self::set_tools_expanded`])
+    /// bumps the shared generation and the components reconcile on
+    /// their next render, so the pump never walks the transcript.
+    render_settings: RenderSettings,
     /// Snapshot fed to the [`Footer`] component's context-usage
     /// indicator. Updated from main-agent
     /// [`AgentEvent::TurnUsage`] events and on model swaps; the
@@ -140,34 +130,23 @@ pub struct EventPump {
 impl EventPump {
     /// Build a fresh pump bound to the supplied [`ChatTheme`]
     /// (used when constructing assistant / user message
-    /// components on the fly). `hide_thinking_block` is the
-    /// initial mode for the thinking channel; the host loads it
-    /// from `~/.aj/config.toml` (`hide_thinking_block` key) on
-    /// startup and can flip it at runtime via
-    /// [`Self::set_hide_thinking_block`]. `tools_expanded` is the
-    /// initial mode for tool-output bubbles; today the host
-    /// always starts collapsed and the user flips it at runtime
-    /// via [`Self::set_tools_expanded`].
+    /// components on the fly). `render_settings` is the shared
+    /// session-wide render config (thinking-block fold, tool-output
+    /// expansion, inline-image rendering); the host seeds it from
+    /// `~/.aj/config.toml` on startup and the components clone the
+    /// handle so a runtime toggle reaches them on their next render.
     ///
     /// `context_window` seeds the footer's context-usage
     /// denominator (in tokens). Pass `agent.model_info().context_window`;
     /// keep it in sync across model swaps via
     /// [`Self::set_context_window`].
-    pub fn new(
-        theme: ChatTheme,
-        hide_thinking_block: bool,
-        tools_expanded: bool,
-        show_image_in_terminal: bool,
-        context_window: u64,
-    ) -> Self {
+    pub fn new(theme: ChatTheme, render_settings: RenderSettings, context_window: u64) -> Self {
         Self {
             theme,
             agents: HashMap::new(),
             running_agents: HashSet::new(),
             running_sub_agents: 0,
-            hide_thinking_block,
-            tools_expanded,
-            show_image_in_terminal,
+            render_settings,
             footer_data: FooterData::new(context_window),
         }
     }
@@ -211,32 +190,24 @@ impl EventPump {
     /// `aj.thinking.toggle` handler can flip the state without first reading
     /// it back through a separate getter.
     pub fn hide_thinking_block(&self) -> bool {
-        self.hide_thinking_block
+        self.render_settings.hide_thinking_block()
     }
 
     /// Current inline-image render mode. Surface so session-swap /
     /// new-session paths can preserve the user's
     /// `image_show_in_terminal` choice across pump re-creation.
     pub fn show_image_in_terminal(&self) -> bool {
-        self.show_image_in_terminal
+        self.render_settings.show_image_in_terminal()
     }
 
     /// Update the thinking-block render mode for this session.
     ///
-    /// Updates the pump's own flag so freshly-created assistant
-    /// message components pick up the new mode, then asks the
-    /// [`ChatView`] to walk every assistant component (main
-    /// transcript and inside every sub-agent box) and apply it.
-    /// Finally invalidates the TUI's cached render output so the
-    /// next paint reflects the change.
+    /// Flips the shared render setting, which bumps its generation;
+    /// every assistant message component reconciles and rebuilds its
+    /// thinking widgets on its next render. Invalidates the TUI's
+    /// cached render output so that next paint actually happens.
     pub fn set_hide_thinking_block(&mut self, tui: &mut Tui, hide: bool) {
-        if self.hide_thinking_block == hide {
-            return;
-        }
-        self.hide_thinking_block = hide;
-        if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
-            chat.set_hide_thinking_block(hide);
-        }
+        self.render_settings.set_hide_thinking_block(hide);
         tui.invalidate();
         tui.request_render();
     }
@@ -245,25 +216,17 @@ impl EventPump {
     /// `aj.tools.expand` handler can flip the state without first
     /// reading it back through a separate getter.
     pub fn tools_expanded(&self) -> bool {
-        self.tools_expanded
+        self.render_settings.tools_expanded()
     }
 
     /// Update the tool-output render mode for this session.
     ///
-    /// Updates the pump's own flag so freshly-created tool
-    /// components pick up the new mode, then asks the [`ChatView`]
-    /// to walk every tool component (main transcript and inside
-    /// every sub-agent box) and apply it. Finally invalidates the
-    /// TUI's cached render output so the next paint reflects the
-    /// change.
+    /// Flips the shared render setting, which bumps its generation;
+    /// every tool component reconciles and rebuilds its body on its
+    /// next render. Invalidates the TUI's cached render output so
+    /// that next paint actually happens.
     pub fn set_tools_expanded(&mut self, tui: &mut Tui, expanded: bool) {
-        if self.tools_expanded == expanded {
-            return;
-        }
-        self.tools_expanded = expanded;
-        if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
-            chat.set_tools_expanded(expanded);
-        }
+        self.render_settings.set_tools_expanded(expanded);
         tui.invalidate();
         tui.request_render();
     }
@@ -733,7 +696,7 @@ impl EventPump {
         if let Some(idx) = self.agents.get(&agent_id).and_then(|a| a.current_assistant) {
             return idx;
         }
-        let component = AssistantMessageComponent::new(&self.theme, self.hide_thinking_block);
+        let component = AssistantMessageComponent::new(&self.theme, self.render_settings.clone());
         let idx = self.push_chat_child(tui, agent_id, Box::new(component));
         self.agents.entry(agent_id).or_default().current_assistant = Some(idx);
         idx
@@ -759,10 +722,9 @@ impl EventPump {
             tool.to_string(),
             args,
             &self.theme,
-            self.tools_expanded,
+            self.render_settings.clone(),
             cell_pixel_size,
-        )
-        .with_show_image_in_terminal(self.show_image_in_terminal);
+        );
         // Sub-agent tools render header-only inside the compact box;
         // when the user is observing this sub-agent (its box is the
         // active full view) they show full bodies like a main tool.
@@ -840,10 +802,9 @@ impl EventPump {
                     tool.to_string(),
                     &serde_json::json!({}),
                     &self.theme,
-                    self.tools_expanded,
+                    self.render_settings.clone(),
                     cell_pixel_size,
-                )
-                .with_show_image_in_terminal(self.show_image_in_terminal);
+                );
                 if matches!(agent_id, AgentId::Sub(_)) {
                     let observing = tui
                         .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
@@ -1122,7 +1083,11 @@ mod tests {
         // Test-only: 200k matches the canonical Sonnet window so
         // any incidental "context_window" expectations in future
         // tests don't need to know about a synthetic value.
-        let pump = EventPump::new(chat.clone(), false, false, true, 200_000);
+        let pump = EventPump::new(
+            chat.clone(),
+            RenderSettings::new(false, false, true),
+            200_000,
+        );
         (tui, pump, chat)
     }
 

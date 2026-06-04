@@ -63,6 +63,7 @@ use serde_json::Value;
 use crate::config::theme::ChatTheme;
 use crate::modes::interactive::components::bash_execution::render_bash_body;
 use crate::modes::interactive::components::diff::render_unified_diff;
+use crate::modes::interactive::render_settings::RenderSettings;
 
 /// Horizontal padding inside the bubble (one column on each side
 /// so the tinted rectangle reads as an inset block rather than
@@ -187,10 +188,11 @@ pub struct ToolExecutionComponent {
     /// finalized on `ToolExecutionEnd`.
     body: Vec<String>,
     /// Most recent details payload passed to [`Self::update_partial`]
-    /// or [`Self::update_result`]. Retained so [`Self::set_expanded`]
-    /// can re-run [`render_details_body`] with the new expansion
-    /// state without needing the event-pump to replay the original
-    /// event. `None` between construction and the first update.
+    /// or [`Self::update_result`]. Retained so
+    /// [`Self::reconcile_settings`] can re-run [`render_details_body`]
+    /// with the new expansion state at render time without needing
+    /// the event pump to replay the original event. `None` between
+    /// construction and the first update.
     last_details: Option<ToolDetails>,
     /// `is_error` value paired with [`Self::last_details`]; only
     /// meaningful when `last_details` was set by
@@ -198,15 +200,27 @@ pub struct ToolExecutionComponent {
     /// an expansion toggle doesn't accidentally flip the status
     /// back to `Started`.
     last_is_error: bool,
-    /// Whether the body renders in expanded form (full content) or
-    /// the compact head/tail-truncated form. Toggled globally by
-    /// the event pump in response to `aj.tools.expand`.
+    /// Last-applied body render mode — the mode the cached
+    /// [`Self::body`] reflects. Kept in step with
+    /// `settings.tools_expanded()` by [`Self::reconcile_settings`]:
+    /// `true` renders the full content, `false` the compact
+    /// head/tail-truncated form. Orthogonal to [`Self::header_only`].
     expanded: bool,
     /// Whether to render only the header line, with no bubble,
     /// background, or body. Set when this tool call lives inside a
     /// sub-agent box, whose own background paints behind it.
-    /// Orthogonal to [`Self::expanded`].
+    /// Per-component (driven by the owning box's mode), not a
+    /// session-wide setting; orthogonal to [`Self::expanded`].
     header_only: bool,
+    /// Shared session-wide render settings. Read at render time
+    /// (see [`Self::reconcile_settings`]) so toggling tool
+    /// expansion reaches this component without the toggle site
+    /// walking the transcript.
+    settings: RenderSettings,
+    /// Generation of [`Self::settings`] that the cached body and
+    /// children reflect. A mismatch at render time triggers a
+    /// reconcile.
+    last_generation: u64,
     /// Bg-paint closure for the in-flight state. Stored once at
     /// construction so the render path never has to rebuild the
     /// closure.
@@ -247,12 +261,13 @@ pub struct ToolExecutionComponent {
     /// block on a multi-image result is kept — current tools
     /// (`read_file`) emit at most one image per call.
     image_payload: Option<ImagePayload>,
-    /// Whether to render an inline [`Image`] child when the
-    /// terminal advertises an image protocol. `false` falls back
-    /// to the textual placeholder `render_details_body` already
-    /// produces. Sourced from the `image_show_in_terminal` config
-    /// key. Default `true` for back-compat with existing call
-    /// sites and tests.
+    /// Last-applied inline-image render mode — whether to render an
+    /// inline [`Image`] child when the terminal advertises an image
+    /// protocol. `false` falls back to the textual placeholder
+    /// `render_details_body` already produces. Kept in step with
+    /// `settings.show_image_in_terminal()` by
+    /// [`Self::reconcile_settings`]; sourced from the
+    /// `image_show_in_terminal` config key.
     show_image_in_terminal: bool,
 }
 
@@ -276,9 +291,17 @@ impl ToolExecutionComponent {
     /// and arguments. The component starts in [`Status::Started`]
     /// and paints with the `tool_pending_bg` tint until the agent
     /// emits a result; [`Self::update_partial`] / [`Self::update_result`]
-    /// flip the status and the matching bg.
-    pub fn new(tool_name: String, args: &Value, theme: &ChatTheme, expanded: bool) -> Self {
-        Self::with_cell_pixel_size(tool_name, args, theme, expanded, None)
+    /// flip the status and the matching bg. `settings` is the
+    /// shared session-wide render config; the component snapshots
+    /// the current expansion / inline-image modes and re-reads
+    /// `settings` at render time when the generation moves.
+    pub fn new(
+        tool_name: String,
+        args: &Value,
+        theme: &ChatTheme,
+        settings: RenderSettings,
+    ) -> Self {
+        Self::with_cell_pixel_size(tool_name, args, theme, settings, None)
     }
 
     /// Construct a component with an explicit per-cell pixel size
@@ -291,9 +314,12 @@ impl ToolExecutionComponent {
         tool_name: String,
         args: &Value,
         theme: &ChatTheme,
-        expanded: bool,
+        settings: RenderSettings,
         cell_pixel_size: Option<(u32, u32)>,
     ) -> Self {
+        let expanded = settings.tools_expanded();
+        let show_image_in_terminal = settings.show_image_in_terminal();
+        let last_generation = settings.generation();
         let mut me = Self {
             tool_name,
             args_pretty: format_args(args),
@@ -303,31 +329,19 @@ impl ToolExecutionComponent {
             last_is_error: false,
             expanded,
             header_only: false,
+            settings,
+            last_generation,
             bg_pending: Arc::clone(&theme.tool_pending_bg),
             bg_success: Arc::clone(&theme.tool_success_bg),
             bg_error: Arc::clone(&theme.tool_error_bg),
             bubble: TextBox::new(PADDING_X, PADDING_Y),
             cell_pixel_size,
             image_payload: None,
-            show_image_in_terminal: true,
+            show_image_in_terminal,
         };
         me.bubble.set_bg_fn(me.make_bg_box());
         me.rebuild_children();
         me
-    }
-
-    /// Override whether the component renders an inline image
-    /// attachment. Builder-style so call sites that need to flip
-    /// the flag (the event pump, threading the
-    /// `image_show_in_terminal` config knob) stay one-liners and
-    /// existing constructors keep producing the back-compat
-    /// default (`true`).
-    pub fn with_show_image_in_terminal(mut self, show: bool) -> Self {
-        if self.show_image_in_terminal != show {
-            self.show_image_in_terminal = show;
-            self.rebuild_children();
-        }
-        self
     }
 
     /// Replace the rendered body with the partial snapshot in
@@ -335,6 +349,7 @@ impl ToolExecutionComponent {
     /// [`aj_agent::events::AgentEvent::ToolExecutionUpdate`] (today
     /// only `bash` emits these).
     pub fn update_partial(&mut self, details: &ToolDetails, content: &[UserContent]) {
+        self.reconcile_settings();
         self.body = render_details_body(details, self.expanded);
         self.image_payload = derive_image_payload(details, content);
         self.last_details = Some(details.clone());
@@ -358,6 +373,7 @@ impl ToolExecutionComponent {
         content: &[UserContent],
         is_error: bool,
     ) {
+        self.reconcile_settings();
         self.body = render_details_body(details, self.expanded);
         self.image_payload = derive_image_payload(details, content);
         self.last_details = Some(details.clone());
@@ -373,27 +389,30 @@ impl ToolExecutionComponent {
         self.rebuild_children();
     }
 
-    /// Swap the body render mode between collapsed and expanded.
+    /// Pull the latest shared render settings into this component's
+    /// last-applied fields and snapshot the generation.
     ///
-    /// The event pump walks every tool component in the chat
-    /// container on a `aj.tools.expand` toggle and calls this; the
-    /// next render then reflects the new mode for both finalized
-    /// and in-flight tool executions. A no-op when the mode hasn't
-    /// changed so a redundant toggle doesn't churn the cached
-    /// `Text` / `TextBox` children. Components that have not yet
-    /// received a partial or final payload (`last_details: None`)
-    /// just update the flag and let the next
-    /// [`Self::update_partial`] / [`Self::update_result`] render
-    /// with the new mode.
-    pub fn set_expanded(&mut self, expanded: bool) {
-        if self.expanded == expanded {
-            return;
+    /// Returns `true` when a setting that affects the rendered body
+    /// or children — tool expansion or inline-image mode — actually
+    /// changed, so the caller knows to rebuild those caches. A no-op
+    /// for the caches when nothing relevant changed, so an unrelated
+    /// toggle (e.g. thinking fold, which shares the generation
+    /// counter) doesn't churn the cached `Text` / `TextBox`
+    /// children.
+    fn reconcile_settings(&mut self) -> bool {
+        self.last_generation = self.settings.generation();
+        let mut changed = false;
+        let expanded = self.settings.tools_expanded();
+        if self.expanded != expanded {
+            self.expanded = expanded;
+            changed = true;
         }
-        self.expanded = expanded;
-        if let Some(details) = self.last_details.clone() {
-            self.body = render_details_body(&details, self.expanded);
-            self.rebuild_children();
+        let show_image = self.settings.show_image_in_terminal();
+        if self.show_image_in_terminal != show_image {
+            self.show_image_in_terminal = show_image;
+            changed = true;
         }
+        changed
     }
 
     /// Render only the header line (no bubble, no background, no body).
@@ -508,6 +527,20 @@ impl Component for ToolExecutionComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
+        // Pull in any session-wide settings change (tool expansion
+        // or inline-image toggle) before painting. Gated on the
+        // generation so steady-state renders skip the work. Done
+        // before the header-only short-circuit so a tool inside a
+        // collapsed sub-agent box keeps its body cache current and
+        // shows the right content the instant the box switches to
+        // the full view.
+        if self.settings.generation() != self.last_generation && self.reconcile_settings() {
+            if let Some(details) = self.last_details.clone() {
+                self.body = render_details_body(&details, self.expanded);
+            }
+            self.rebuild_children();
+        }
+
         // Header-only mode: just the wrapped header line, no bubble
         // or background, so the tool composes inside the sub-agent
         // box's own painted background.
@@ -821,6 +854,14 @@ mod tests {
         chat_theme(&ThemeHandle::new(Theme::bundled_dark()))
     }
 
+    /// Build a shared settings handle with the given tool-expansion
+    /// mode and inline images enabled (the constructor default the
+    /// tests assume). Tests that flip expansion at runtime keep the
+    /// returned handle and toggle it.
+    fn settings(tools_expanded: bool) -> RenderSettings {
+        RenderSettings::new(false, tools_expanded, true)
+    }
+
     fn strip_ansi(s: &str) -> String {
         let mut out: Vec<u8> = Vec::with_capacity(s.len());
         let bytes = s.as_bytes();
@@ -852,7 +893,8 @@ mod tests {
     #[test]
     fn header_includes_tool_name_and_args_summary() {
         let args = serde_json::json!({"path": "/tmp/foo.txt"});
-        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), true);
+        let mut c =
+            ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), settings(true));
         let lines = c.render(80);
         // First and last rows are bg-painted blank padding.
         assert!(is_blank_row(&lines[0]));
@@ -870,7 +912,8 @@ mod tests {
     #[test]
     fn header_only_renders_just_the_header_without_bubble_or_body() {
         let args = serde_json::json!({"path": "/tmp/foo.txt"});
-        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), true);
+        let mut c =
+            ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), settings(true));
         c.update_result(
             &ToolDetails::Text {
                 summary: "/tmp/foo.txt".into(),
@@ -902,7 +945,8 @@ mod tests {
     #[test]
     fn toggling_header_only_off_restores_the_bubble() {
         let args = serde_json::json!({"path": "/tmp/foo.txt"});
-        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), true);
+        let mut c =
+            ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), settings(true));
         c.set_header_only(true);
         // Header-only: first row is the header, not a blank pad.
         assert!(!is_blank_row(&c.render(80)[0]));
@@ -926,7 +970,8 @@ mod tests {
             "command": "echo hi",
             "description": "x".repeat(200),
         });
-        let mut c = ToolExecutionComponent::new("bash".to_string(), &args, &theme(), true);
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &args, &theme(), settings(true));
         c.update_result(
             &ToolDetails::Text {
                 summary: String::new(),
@@ -953,7 +998,7 @@ mod tests {
             "read_file".to_string(),
             &serde_json::json!({}),
             &theme(),
-            true,
+            settings(true),
         );
         c.update_result(
             &ToolDetails::Text {
@@ -984,8 +1029,12 @@ mod tests {
 
     #[test]
     fn error_status_renders_a_red_cross_in_the_header() {
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
         c.update_result(
             &ToolDetails::Text {
                 summary: "boom".into(),
@@ -1006,8 +1055,12 @@ mod tests {
         // however needs to match what the user sees in the `[exit
         // N]` footer. Verify the bubble paints with the failure
         // glyph in that case.
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
         c.update_result(
             &ToolDetails::Bash {
                 command: "exit 1".into(),
@@ -1033,8 +1086,12 @@ mod tests {
     fn zero_bash_exit_code_still_paints_as_success() {
         // Don't regress the happy path: a zero exit must keep the
         // green check even though we now look at exit_code.
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
         c.update_result(
             &ToolDetails::Bash {
                 command: "echo hi".into(),
@@ -1063,8 +1120,12 @@ mod tests {
         // and the agent already raises `is_error: true` in that
         // path; with the flag clear we don't second-guess the
         // tool and keep the success styling.
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
         c.update_result(
             &ToolDetails::Bash {
                 command: "true".into(),
@@ -1104,8 +1165,12 @@ mod tests {
         // ...` suggestions naming a fully-qualified type). The
         // component must wrap them so the strict line-width check
         // in `Tui::render` doesn't panic on the next frame.
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
         let long_line = "x".repeat(300);
         c.update_result(
             &ToolDetails::Text {
@@ -1135,7 +1200,8 @@ mod tests {
             "command": "echo hi",
             "description": "x".repeat(200),
         });
-        let mut c = ToolExecutionComponent::new("bash".to_string(), &args, &theme(), true);
+        let mut c =
+            ToolExecutionComponent::new("bash".to_string(), &args, &theme(), settings(true));
         let width = 60;
         let lines = c.render(width);
         for (i, line) in lines.iter().enumerate() {
@@ -1155,8 +1221,12 @@ mod tests {
         // communicated through the header glyph (… / ✓ / ✗) and
         // not the bubble tint. Grab the bg-paint prefix off the
         // first row of each render and verify they're identical.
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
 
         let bg_sample = |c: &mut ToolExecutionComponent| -> String {
             let lines = c.render(40);
@@ -1218,7 +1288,7 @@ mod tests {
             "read_file".to_string(),
             &serde_json::json!({}),
             &theme(),
-            true,
+            settings(true),
         );
         c.update_result(
             &ToolDetails::Text {
@@ -1248,8 +1318,12 @@ mod tests {
         // sanitisation in `render_details_body` removes both before
         // they reach the wrap path, so every row of the bubble lands
         // at exactly the render width.
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
         // Progress-style overprint, an SGR-reset followed by an
         // erase-in-line (the canonical "ragged right edge"
         // pattern), and a control byte (`\x08`) for good measure.
@@ -1294,8 +1368,12 @@ mod tests {
         // control byte into `ToolDetails::Bash.command`, the dim-
         // styled `$ <command>` header line must still render flush
         // to width and contain only the visible command text.
-        let mut c =
-            ToolExecutionComponent::new("bash".to_string(), &serde_json::json!({}), &theme(), true);
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
         c.update_result(
             &ToolDetails::Bash {
                 command: "echo \x1b[31mboom\x1b[0m\rmore".into(),
@@ -1343,11 +1421,12 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let s = settings(false);
         let mut c = ToolExecutionComponent::new(
             "read_file".to_string(),
             &serde_json::json!({}),
             &theme(),
-            false,
+            s.clone(),
         );
         c.update_result(
             &ToolDetails::Text {
@@ -1376,8 +1455,12 @@ mod tests {
         assert!(hint.contains("alt+o"), "hint missing key: {hint:?}");
         assert!(hint.contains("20"), "hint missing count: {hint:?}");
 
-        // Expand → all 30 lines visible, hint gone.
-        c.set_expanded(true);
+        // Expand via the shared settings → the body cache is
+        // rebuilt at the next render, exposing all 30 lines with no
+        // hint. (Production toggles invalidate + repaint; the render
+        // call here stands in for that repaint.)
+        s.set_tools_expanded(true);
+        c.render(80);
         let plain: Vec<String> = c.body.iter().map(|l| strip_ansi(l)).collect();
         for i in 1..=30 {
             assert!(
@@ -1402,7 +1485,7 @@ mod tests {
             "bash".to_string(),
             &serde_json::json!({}),
             &theme(),
-            false,
+            settings(false),
         );
         c.update_result(
             &ToolDetails::Bash {

@@ -26,11 +26,9 @@ use aj_tui::container::Container;
 use aj_tui::keys::InputEvent;
 
 use crate::config::theme::ChatTheme;
-use crate::modes::interactive::components::assistant_message::AssistantMessageComponent;
 use crate::modes::interactive::components::subagent_box::{
     SubAgentBox, SubAgentBoxMode, SubAgentStatus,
 };
-use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
 
 /// A description of a known agent, suitable for an agent picker row.
 pub struct AgentEntry {
@@ -150,40 +148,6 @@ impl ChatView {
             }
         }
         out
-    }
-
-    /// Expand or collapse every tool execution, in the main transcript
-    /// and inside each sub-agent box.
-    pub fn set_tools_expanded(&mut self, expanded: bool) {
-        for i in 0..self.main.len() {
-            if let Some(t) = self.main.get_mut_as::<ToolExecutionComponent>(i) {
-                t.set_expanded(expanded);
-            } else if let Some(b) = self.main.get_mut_as::<SubAgentBox>(i) {
-                let inner = b.inner_mut();
-                for j in 0..inner.len() {
-                    if let Some(t) = inner.get_mut_as::<ToolExecutionComponent>(j) {
-                        t.set_expanded(expanded);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Show or hide the thinking block on every assistant message, in
-    /// the main transcript and inside each sub-agent box.
-    pub fn set_hide_thinking_block(&mut self, hide: bool) {
-        for i in 0..self.main.len() {
-            if let Some(a) = self.main.get_mut_as::<AssistantMessageComponent>(i) {
-                a.set_hide_thinking_block(hide);
-            } else if let Some(b) = self.main.get_mut_as::<SubAgentBox>(i) {
-                let inner = b.inner_mut();
-                for j in 0..inner.len() {
-                    if let Some(a) = inner.get_mut_as::<AssistantMessageComponent>(j) {
-                        a.set_hide_thinking_block(hide);
-                    }
-                }
-            }
-        }
     }
 }
 
