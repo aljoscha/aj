@@ -34,6 +34,19 @@ pub struct ContextUsage {
     pub context_window: u64,
 }
 
+/// Count of currently-running sub-agents plus the resolved key
+/// label that opens the agent picker. Rendered as a compact
+/// `N agent (alt+a)` / `N agents (alt+a)` part. `running == 0`
+/// is never passed; callers set `None` to clear the indicator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentActivity {
+    pub running: usize,
+    /// Resolved keybinding label (e.g. "alt+a"); the caller
+    /// resolves it from the keybindings manager so the footer
+    /// stays free of keybinding dependencies.
+    pub open_hint: String,
+}
+
 /// Thin wrapper around a single dim text row.
 pub struct Footer {
     /// Provider model name, e.g. `claude-sonnet-4`.
@@ -44,6 +57,9 @@ pub struct Footer {
     /// this into a `12.3k/200k (6.1%)` style string and applies
     /// the threshold-based color to the percentage substring.
     context_usage: Option<ContextUsage>,
+    /// Running sub-agent indicator. The renderer turns this into a
+    /// `N agent (alt+a)` part appended after the context usage.
+    agent_activity: Option<AgentActivity>,
 }
 
 impl Footer {
@@ -54,6 +70,7 @@ impl Footer {
             model: None,
             cwd: None,
             context_usage: None,
+            agent_activity: None,
         }
     }
 
@@ -71,6 +88,11 @@ impl Footer {
     /// removes the indicator from the rendered row entirely.
     pub fn set_context_usage(&mut self, usage: Option<ContextUsage>) {
         self.context_usage = usage;
+    }
+
+    /// Replace the running-sub-agent indicator. `None` removes it.
+    pub fn set_agent_activity(&mut self, activity: Option<AgentActivity>) {
+        self.agent_activity = activity;
     }
 }
 
@@ -95,6 +117,9 @@ impl Component for Footer {
             && let Some(rendered) = render_context_usage(*u)
         {
             parts.push(rendered);
+        }
+        if let Some(a) = self.agent_activity.as_ref() {
+            parts.push(render_agent_activity(a));
         }
         if parts.is_empty() {
             return Vec::new();
@@ -126,6 +151,14 @@ impl AsRef<dyn Any> for Footer {
     fn as_ref(&self) -> &(dyn Any + 'static) {
         self
     }
+}
+
+/// Format `AgentActivity` as `"1 agent (alt+a)"` /
+/// `"3 agents (alt+a)"`. Plain text so it inherits the dim wrap
+/// applied in [`Component::render`], like the model/cwd parts.
+fn render_agent_activity(a: &AgentActivity) -> String {
+    let noun = if a.running == 1 { "agent" } else { "agents" };
+    format!("{} {} ({})", a.running, noun, a.open_hint)
 }
 
 /// Format `usage` as e.g. `"12.3k/200k (6.1%)"`. The percentage
@@ -218,6 +251,54 @@ mod tests {
         assert!(visible.contains("·"));
     }
 
+    #[test]
+    fn agent_activity_singular_renders_with_hint() {
+        let mut f = Footer::new();
+        f.set_agent_activity(Some(AgentActivity {
+            running: 1,
+            open_hint: "alt+a".into(),
+        }));
+        let lines = f.render(80);
+        assert_eq!(lines.len(), 1);
+        let visible = lines[0].replace("\x1b[2m", "").replace("\x1b[22m", "");
+        assert!(visible.contains("1 agent (alt+a)"), "got {visible:?}");
+    }
+
+    #[test]
+    fn agent_activity_plural_renders_with_hint() {
+        let mut f = Footer::new();
+        f.set_agent_activity(Some(AgentActivity {
+            running: 3,
+            open_hint: "alt+a".into(),
+        }));
+        let lines = f.render(80);
+        let visible = lines[0].replace("\x1b[2m", "").replace("\x1b[22m", "");
+        assert!(visible.contains("3 agents (alt+a)"), "got {visible:?}");
+    }
+
+    /// The indicator alone counts as a part, so a footer with only
+    /// agent activity set still produces a single non-empty row.
+    #[test]
+    fn agent_activity_alone_renders_a_row() {
+        let mut f = Footer::new();
+        f.set_agent_activity(Some(AgentActivity {
+            running: 2,
+            open_hint: "alt+a".into(),
+        }));
+        let lines = f.render(80);
+        assert_eq!(lines.len(), 1);
+        let visible = lines[0].replace("\x1b[2m", "").replace("\x1b[22m", "");
+        assert!(visible.contains("2 agents (alt+a)"), "got {visible:?}");
+    }
+
+    /// Mirror `empty_footer_renders_nothing`: with no fields set
+    /// (agent activity `None` by default) the footer is silent.
+    #[test]
+    fn agent_activity_none_renders_nothing() {
+        let mut f = Footer::new();
+        assert!(f.render(80).is_empty());
+    }
+
     /// Regression: a long cwd or model name on a narrow terminal
     /// used to overflow because `render` ignored `width`. Mirrors
     /// the equivalent test in `header.rs`.
@@ -229,6 +310,10 @@ mod tests {
         f.set_context_usage(Some(ContextUsage {
             tokens: Some(12_345),
             context_window: 200_000,
+        }));
+        f.set_agent_activity(Some(AgentActivity {
+            running: 3,
+            open_hint: "alt+a".into(),
         }));
         for width in [0usize, 1, 2, 10, 40, 64, 80, 200] {
             let lines = f.render(width);
