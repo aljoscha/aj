@@ -75,6 +75,21 @@ pub const ACTION_HISTORY_TOGGLE_SCOPE: &str = "aj.history.toggle_scope";
 /// Inert while a capturing overlay is already up.
 pub const ACTION_HISTORY_OPEN: &str = "aj.history.open";
 
+/// Action ID for the "open agent picker" chord.
+///
+/// Bound by default to `alt+a`. The interactive loop intercepts the
+/// keystroke globally and opens the agent-picker overlay, which
+/// switches the chat view between the main agent and any sub-agent.
+/// Inert while a capturing overlay is already up.
+pub const ACTION_AGENT_PICKER: &str = "aj.agent.open";
+
+/// Toggles the agent picker between showing only running sub-agents
+/// and all sub-agents in the session. Default binding: `ctrl+t`.
+/// Handled inside the agent-picker overlay (contextual; only the
+/// focused picker reads it), mirroring the prompt-history scope
+/// toggle's key and feel.
+pub const ACTION_AGENT_TOGGLE_SCOPE: &str = "aj.agent.toggle_scope";
+
 /// Built-in `aj`-level keybinding definitions.
 ///
 /// Returned as a fresh `Vec` so callers can extend or filter before
@@ -109,6 +124,14 @@ pub fn aj_keybindings() -> KeybindingDefinitions {
         (
             ACTION_HISTORY_OPEN.to_string(),
             K::new("ctrl+r", "Open prompt-history search"),
+        ),
+        (
+            ACTION_AGENT_PICKER.to_string(),
+            K::new("alt+a", "Open agent picker"),
+        ),
+        (
+            ACTION_AGENT_TOGGLE_SCOPE.to_string(),
+            K::new("ctrl+t", "Toggle agent-picker scope (running / all)"),
         ),
     ]
 }
@@ -190,6 +213,21 @@ mod tests {
     fn aj_history_open_defaults_to_ctrl_r() {
         let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
         assert_eq!(kbm.get_keys(ACTION_HISTORY_OPEN), &["ctrl+r".to_string()]);
+    }
+
+    #[test]
+    fn aj_agent_picker_defaults_to_alt_a() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(kbm.get_keys(ACTION_AGENT_PICKER), &["alt+a".to_string()]);
+    }
+
+    #[test]
+    fn aj_agent_toggle_scope_defaults_to_ctrl_t() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(
+            kbm.get_keys(ACTION_AGENT_TOGGLE_SCOPE),
+            &["ctrl+t".to_string()]
+        );
     }
 
     #[test]
