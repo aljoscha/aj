@@ -30,9 +30,11 @@ use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
+use aj_models::ThinkingConfig;
 use aj_models::auth::AuthStorage;
-use aj_models::registry::ModelRegistry;
-use aj_models::types::Speed;
+use aj_models::provider::Provider;
+use aj_models::registry::{ModelInfo, ModelRegistry};
+use aj_models::types::{Speed, StreamOptions};
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
@@ -93,6 +95,51 @@ use crate::modes::interactive::shutdown::{
     build_usage_summary, print_resume_hint, print_usage_summary,
 };
 
+/// Loop-side snapshot of the agent's run configuration.
+///
+/// The interactive loop spawns each turn into a task that holds the
+/// agent `TokioMutex` for the turn's entire duration, so the loop
+/// itself must never `agent.lock().await` — that would suspend the
+/// whole `select!` (including its Ctrl+C arm) until the turn ends.
+///
+/// This snapshot is therefore the loop-side source of truth for "what
+/// the next turn runs against". The `/model` and `/thinking` selectors
+/// mutate it without touching the agent; the footer renders the active
+/// model and effort from it; and the submit handler copies it into the
+/// agent just before each turn starts (while holding the turn's own
+/// lock, which is uncontended because no turn is in flight yet). A
+/// model or thinking change made mid-turn is thus accepted — and shown
+/// in the footer — immediately, but only takes effect on the *next*
+/// turn: the in-flight turn keeps the config it captured when it
+/// started.
+struct RunConfigSnapshot {
+    /// Provider handle the next turn streams against.
+    provider: Arc<dyn Provider>,
+    /// Registry (or scripted) metadata for `provider`'s model.
+    model_info: Arc<ModelInfo>,
+    /// Per-call stream options (thinking-display mode, etc.).
+    stream_options: StreamOptions,
+    /// Default thinking effort for the next turn.
+    thinking: Option<ThinkingConfig>,
+    /// `(provider_id, model_id)` the `/model` selector pre-selects.
+    /// Tracked explicitly rather than read off `model_info` because
+    /// the scripted path's provider id (from `--model-api`) differs
+    /// from `model_info.provider`, which is always `"scripted"`.
+    model_key: (String, String),
+}
+
+/// User-facing notice shown when a session-changing command
+/// (`/resume`, `/new`) is invoked while a turn is in flight.
+///
+/// Those commands reseed the agent's transcript, which requires
+/// locking the agent. The loop must not lock the agent while a turn
+/// holds it (that freezes the `select!`, including its Ctrl+C arm), so
+/// they are refused mid-turn. `what` names the action, e.g.
+/// `"switch sessions"`.
+fn session_busy_notice(what: &str) -> String {
+    format!("Can't {what} while a turn is running — press Ctrl+C to cancel it first.")
+}
+
 /// Driver for a single interactive session. Owns the
 /// [`aj_tui::tui::Tui`], the registered listeners on the agent's
 /// bus, and the [`aj_session::ConversationLog`] for this session.
@@ -144,10 +191,12 @@ impl InteractiveMode {
         // sees the resulting `(Provider, ModelInfo, StreamOptions)`
         // bundle.
         //
-        // `current_model_key` keeps `(provider_id, model_id)` around
-        // for the `/model` selector overlay so it can pre-select the
-        // active row when opened and track the swap target on
-        // confirm.
+        // `run_config` is the loop-side snapshot of what the next
+        // turn runs against (provider, model, stream options, thinking
+        // effort, and `(provider_id, model_id)` for the `/model`
+        // selector to pre-select). The selectors mutate it without
+        // locking the agent; the submit handler copies it into the
+        // agent just before each turn. See [`RunConfigSnapshot`].
         // Credential store backing API-key resolution and the
         // `/login` / `/logout` / `/auth` overlays. Cheap to clone
         // (`Arc`-backed); the resolver installed in
@@ -157,7 +206,7 @@ impl InteractiveMode {
         let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
         let mut agent: Agent;
-        let current_model_key: Arc<std::sync::Mutex<(String, String)>>;
+        let run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>;
         if let Some(name) = &self.args.scripted {
             let crate::scripted::ResolvedScriptedModel {
                 provider,
@@ -170,7 +219,6 @@ impl InteractiveMode {
                 .or_else(|| config.model_api.clone())
                 .unwrap_or_else(|| crate::model::DEFAULT_PROVIDER_ID.to_string());
             let current_id = model_info.id.clone();
-            current_model_key = Arc::new(std::sync::Mutex::new((current_provider, current_id)));
             // ---- Tools (legacy / scripted path) -----------------------
             let mut tools = get_builtin_tools(&BuiltinToolOptions {
                 image_auto_resize: config.image_auto_resize,
@@ -181,6 +229,13 @@ impl InteractiveMode {
             let env = AgentEnv::new();
             let mut stream_options = aj_models::types::StreamOptions::default();
             crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
+            // Clone the run config into the loop-side snapshot before
+            // the agent takes ownership; `thinking` is read back from
+            // the agent below so it reflects the config-level mapping
+            // `Agent::with_provider` applies (e.g. `Off` -> `None`).
+            let snapshot_provider = Arc::clone(&provider);
+            let snapshot_model_info = Arc::clone(&model_info);
+            let snapshot_stream_options = stream_options.clone();
             agent = Agent::with_provider(
                 env,
                 SYSTEM_PROMPT,
@@ -191,6 +246,13 @@ impl InteractiveMode {
                 stream_options,
                 config.thinking,
             );
+            run_config = Arc::new(std::sync::Mutex::new(RunConfigSnapshot {
+                provider: snapshot_provider,
+                model_info: snapshot_model_info,
+                stream_options: snapshot_stream_options,
+                thinking: agent.default_thinking(),
+                model_key: (current_provider, current_id),
+            }));
         } else {
             // Load the registry once at startup; the same handle
             // also feeds the `/model` selector's model catalog.
@@ -216,10 +278,6 @@ impl InteractiveMode {
                 speed,
             )
             .context("failed to resolve model from registry")?;
-            current_model_key = Arc::new(std::sync::Mutex::new((
-                resolved.model_info.provider.clone(),
-                resolved.model_info.id.clone(),
-            )));
             // ---- Tools (registry / real-provider path) ----------------
             let mut tools = get_builtin_tools(&BuiltinToolOptions {
                 image_auto_resize: config.image_auto_resize,
@@ -235,6 +293,12 @@ impl InteractiveMode {
             } = resolved;
             let mut stream_options = stream_options;
             crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
+            let model_key = (model_info.provider.clone(), model_info.id.clone());
+            // Clone the run config into the loop-side snapshot before
+            // the agent takes ownership (see the scripted branch).
+            let snapshot_provider = Arc::clone(&provider);
+            let snapshot_model_info = Arc::clone(&model_info);
+            let snapshot_stream_options = stream_options.clone();
             agent = Agent::with_provider(
                 env,
                 SYSTEM_PROMPT,
@@ -245,6 +309,13 @@ impl InteractiveMode {
                 stream_options,
                 config.thinking,
             );
+            run_config = Arc::new(std::sync::Mutex::new(RunConfigSnapshot {
+                provider: snapshot_provider,
+                model_info: snapshot_model_info,
+                stream_options: snapshot_stream_options,
+                thinking: agent.default_thinking(),
+                model_key,
+            }));
         }
         agent.set_block_images(config.image_block);
 
@@ -257,10 +328,8 @@ impl InteractiveMode {
         let mut startup_auth_warning: Option<String> = None;
         if self.args.scripted.is_none() {
             let provider_id = {
-                let key = current_model_key
-                    .lock()
-                    .expect("current_model_key mutex poisoned");
-                key.0.clone()
+                let cfg = run_config.lock().expect("run config mutex poisoned");
+                cfg.model_key.0.clone()
             };
             if let Some(key) = self.args.api_key.clone() {
                 auth.set_runtime_api_key(&provider_id, key).await;
@@ -933,7 +1002,7 @@ impl InteractiveMode {
                                     &auth,
                                     Arc::clone(&agent),
                                     Arc::clone(&model_catalog),
-                                    Arc::clone(&current_model_key),
+                                    Arc::clone(&run_config),
                                     &mut log,
                                     &mut persistence_handle,
                                     &mut pump,
@@ -941,6 +1010,7 @@ impl InteractiveMode {
                                     &theme,
                                     "/palette",
                                     None,
+                                    running_task.is_some(),
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
@@ -971,7 +1041,7 @@ impl InteractiveMode {
                                     &auth,
                                     Arc::clone(&agent),
                                     Arc::clone(&model_catalog),
-                                    Arc::clone(&current_model_key),
+                                    Arc::clone(&run_config),
                                     &mut log,
                                     &mut persistence_handle,
                                     &mut pump,
@@ -979,6 +1049,7 @@ impl InteractiveMode {
                                     &theme,
                                     "/history",
                                     None,
+                                    running_task.is_some(),
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
@@ -1002,7 +1073,7 @@ impl InteractiveMode {
                                     sel,
                                     &auth,
                                     Arc::clone(&agent),
-                                    Arc::clone(&current_model_key),
+                                    Arc::clone(&run_config),
                                     Arc::clone(&config),
                                     &mut log,
                                     &mut persistence_handle,
@@ -1056,7 +1127,7 @@ impl InteractiveMode {
                                                 &auth,
                                                 Arc::clone(&agent),
                                                 Arc::clone(&model_catalog),
-                                                Arc::clone(&current_model_key),
+                                                Arc::clone(&run_config),
                                                 &mut log,
                                                 &mut persistence_handle,
                                                 &mut pump,
@@ -1064,6 +1135,7 @@ impl InteractiveMode {
                                                 &theme,
                                                 &follow_up.input,
                                                 Some(follow_up.parent_palette),
+                                                running_task.is_some(),
                                             )
                                             .await
                                             {
@@ -1093,9 +1165,17 @@ impl InteractiveMode {
                                     continue;
                                 }
 
-                                // Slash-command branch — dispatch
-                                // before checking `running_task`
-                                // so `/quit` works even mid-turn.
+                                // Slash-command branch: a submitted
+                                // `/...` line is dispatched as a command
+                                // (not queued as a prompt). `disable_submit`
+                                // gates editor submits while a turn runs,
+                                // so this path only fires between turns;
+                                // mid-turn settings changes go through the
+                                // palette/selectors, which never block on
+                                // the agent. `handle_slash_command` still
+                                // gets the live `running_task` state so it
+                                // can refuse session-changing commands if
+                                // one ever reaches here mid-turn.
                                 if trimmed.starts_with('/') {
                                     if let Some(editor) = tui.get_mut_as::<Editor>(
                                         SlotIndex::Editor.idx()
@@ -1107,7 +1187,7 @@ impl InteractiveMode {
                                         &auth,
                                         Arc::clone(&agent),
                                         Arc::clone(&model_catalog),
-                                        Arc::clone(&current_model_key),
+                                        Arc::clone(&run_config),
                                         &mut log,
                                         &mut persistence_handle,
                                         &mut pump,
@@ -1115,6 +1195,7 @@ impl InteractiveMode {
                                         &theme,
                                         &trimmed,
                                         None,
+                                        running_task.is_some(),
                                     ).await {
                                         SlashHandled::Continue { selector, notice } => {
                                             if let Some(text) = notice {
@@ -1148,6 +1229,7 @@ impl InteractiveMode {
                                 }
                                 set_editor_submit_enabled(&mut tui, false);
                                 let agent_for_run = Arc::clone(&agent);
+                                let run_config_for_turn = Arc::clone(&run_config);
                                 // Mint a fresh per-turn cancellation
                                 // token. The binary keeps one clone in
                                 // `current_turn_cancel` so the Ctrl+C
@@ -1161,6 +1243,25 @@ impl InteractiveMode {
                                 current_turn_cancel = Some(turn_cancel.clone());
                                 running_task = Some(tokio::spawn(async move {
                                     let mut a = agent_for_run.lock().await;
+                                    // Apply the loop-side run-config
+                                    // snapshot before the turn so a
+                                    // model / thinking change the user
+                                    // made since the last turn takes
+                                    // effect now. Done under the turn's
+                                    // own lock — uncontended, since no
+                                    // turn is in flight yet — so the
+                                    // loop never blocks on it.
+                                    {
+                                        let cfg = run_config_for_turn
+                                            .lock()
+                                            .expect("run config mutex poisoned");
+                                        a.set_provider(
+                                            Arc::clone(&cfg.provider),
+                                            Arc::clone(&cfg.model_info),
+                                            cfg.stream_options.clone(),
+                                        );
+                                        a.set_default_thinking(cfg.thinking.clone());
+                                    }
                                     a.prompt(trimmed, turn_cancel).await
                                 }));
                             }
@@ -1859,7 +1960,7 @@ async fn handle_slash_command(
     auth: &AuthStorage,
     agent: Arc<TokioMutex<Agent>>,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
-    current_model_key: Arc<std::sync::Mutex<(String, String)>>,
+    run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     log: &mut Arc<TokioMutex<ConversationLog>>,
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
@@ -1867,6 +1968,7 @@ async fn handle_slash_command(
     theme: &ThemeHandle,
     text: &str,
     parent_palette: Option<ParentPalette>,
+    turn_running: bool,
 ) -> SlashHandled {
     let result = match slash_dispatch(text) {
         SlashAction::OpenCommandPalette => {
@@ -1891,10 +1993,11 @@ async fn handle_slash_command(
             }
         }
         SlashAction::OpenThinkingSelector => {
-            let current = {
-                let a = agent.lock().await;
-                a.default_thinking()
-            };
+            let current = run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .thinking
+                .clone();
             let inner = ThinkingSelectorComponent::new(select_list_theme(theme), current);
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
@@ -1915,14 +2018,12 @@ async fn handle_slash_command(
             }
         }
         SlashAction::OpenModelSelector => {
-            // Snapshot the current (provider, id) pair so the
-            // overlay can pre-select the active row. The mutex lock
-            // is brief — we only need it to read the pair.
+            // Read the active (provider, id) pair from the loop-side
+            // snapshot so the overlay can pre-select the active row.
+            // Never touches the agent, so it's safe mid-turn.
             let (provider, id) = {
-                let key = current_model_key
-                    .lock()
-                    .expect("current_model_key mutex poisoned");
-                (key.0.clone(), key.1.clone())
+                let cfg = run_config.lock().expect("run config mutex poisoned");
+                (cfg.model_key.0.clone(), cfg.model_key.1.clone())
             };
             let identity = ModelIdentityRef {
                 provider: &provider,
@@ -2062,6 +2163,13 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
+        // Session-changing commands reseed the agent's transcript
+        // (an agent-locking op), so refuse them mid-turn rather than
+        // freeze the loop. The user can cancel the turn and retry.
+        SlashAction::OpenSessionSelector if turn_running => SlashHandled::Continue {
+            selector: None,
+            notice: Some(session_busy_notice("switch sessions")),
+        },
         SlashAction::OpenSessionSelector => {
             // Read the current session id so the overlay pre-selects
             // the active row once it streams in.
@@ -2162,6 +2270,10 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
+        SlashAction::NewSession if turn_running => SlashHandled::Continue {
+            selector: None,
+            notice: Some(session_busy_notice("start a new session")),
+        },
         SlashAction::NewSession => match perform_new_session(
             tui,
             Arc::clone(&agent),
@@ -2258,7 +2370,7 @@ async fn handle_selector_outcome(
     selector: OpenSelector,
     auth: &AuthStorage,
     agent: Arc<TokioMutex<Agent>>,
-    current_model_key: Arc<std::sync::Mutex<(String, String)>>,
+    run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: Arc<std::sync::Mutex<Config>>,
     log: &mut Arc<TokioMutex<ConversationLog>>,
     persistence_handle: &mut SubscriptionHandle,
@@ -2284,10 +2396,17 @@ async fn handle_selector_outcome(
                     if let Some(parent) = parent_palette {
                         tui.hide_overlay(&parent.handle);
                     }
-                    {
-                        let mut a = agent.lock().await;
-                        a.set_default_thinking(level.clone());
-                    }
+                    // Stage the new thinking effort into the loop-side
+                    // snapshot; the next turn applies it. Never locks
+                    // the agent, so it's safe while a turn is running
+                    // (the in-flight turn keeps its effort; the change
+                    // takes effect next turn). Read the model id back
+                    // for the footer from the same snapshot.
+                    let model_id = {
+                        let mut cfg = run_config.lock().expect("run config mutex poisoned");
+                        cfg.thinking = level.clone();
+                        cfg.model_key.1.clone()
+                    };
                     // Mirror the change onto the editor's border
                     // tint so the visual cue tracks the active
                     // reasoning mode.
@@ -2295,10 +2414,6 @@ async fn handle_selector_outcome(
                     // Footer surfaces the active thinking effort;
                     // refresh it so the change is visible without
                     // waiting for a turn.
-                    let model_id = {
-                        let a = agent.lock().await;
-                        a.model_info().id.clone()
-                    };
                     refresh_footer_model(tui, &model_id, &level);
                     let name = thinking_level_name(&level);
                     // Persist the choice so it survives a restart.
@@ -2369,33 +2484,26 @@ async fn handle_selector_outcome(
                             stream_options,
                         }) => {
                             let new_id = model_info.id.clone();
-                            {
-                                let mut a = agent.lock().await;
-                                a.set_provider(
-                                    Arc::clone(&provider),
-                                    Arc::clone(&model_info),
-                                    stream_options,
-                                );
-                            }
-                            // Track the new key so a re-open of the
-                            // selector pre-selects the freshly-
-                            // active row.
-                            {
-                                let mut key = current_model_key
-                                    .lock()
-                                    .expect("current_model_key mutex poisoned");
-                                *key = (info.provider.clone(), info.id.clone());
-                            }
+                            // Stage the swap into the loop-side snapshot
+                            // (provider + model + options + the
+                            // pre-select key); the next turn applies it.
+                            // Never locks the agent, so it's safe
+                            // mid-turn — the in-flight turn keeps its
+                            // model and the swap takes effect next turn.
+                            // Thinking effort is preserved; read it back
+                            // for the footer format.
+                            let current_thinking = {
+                                let mut cfg = run_config.lock().expect("run config mutex poisoned");
+                                cfg.provider = provider;
+                                cfg.model_info = model_info;
+                                cfg.stream_options = stream_options;
+                                cfg.model_key = (info.provider.clone(), info.id.clone());
+                                cfg.thinking.clone()
+                            };
                             // Refresh the footer's model line so
                             // the user has visual confirmation of
                             // the swap without waiting for the next
-                            // turn boundary. Thinking effort is
-                            // preserved across the swap; read it
-                            // back from the agent for the format.
-                            let current_thinking = {
-                                let a = agent.lock().await;
-                                a.default_thinking()
-                            };
+                            // turn boundary.
                             refresh_footer_model(tui, &new_id, &current_thinking);
                             // Same idea for the footer's context-occupancy
                             // indicator: the new model has its own window
@@ -2833,10 +2941,11 @@ async fn perform_session_swap(
     //    the old `persistence_handle`, otherwise a stray bus
     //    event landing in the window would have no listener and
     //    silently fail to persist. In practice the bus is quiet
-    //    between turns (no in-flight prompt is possible here —
-    //    `disable_submit` blocks editor submissions while a turn
-    //    is running, so no slash command can fire mid-turn), but
-    //    the ordering keeps the invariant honest.
+    //    here: `handle_slash_command` refuses `/resume` while a turn
+    //    is running, and a turn can't start while the session
+    //    selector is open (the editor isn't focused), so no turn is
+    //    in flight during a swap. The ordering keeps the invariant
+    //    honest regardless.
     let new_log_arc = Arc::new(TokioMutex::new(new_log));
     let new_handle = {
         let a = agent.lock().await;
@@ -2934,9 +3043,9 @@ async fn perform_new_session(
     // 4. Swap the shared log and persistence handle. Same ordering
     //    rule as [`perform_session_swap`]: build the new subscription
     //    before dropping the old one so a stray bus event can't
-    //    arrive without a listener. The editor's `disable_submit`
-    //    flag means we can't be mid-turn here, but the ordering
-    //    keeps the invariant honest.
+    //    arrive without a listener. `handle_slash_command` refuses
+    //    `/new` while a turn is running, so we can't be mid-turn
+    //    here, but the ordering keeps the invariant honest regardless.
     let new_log_arc = Arc::new(TokioMutex::new(new_log));
     let new_handle = {
         let a = agent.lock().await;
@@ -3112,5 +3221,17 @@ mod tests {
             }
             other => panic!("expected Warning, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_busy_notice_names_the_action_and_points_at_cancel() {
+        assert_eq!(
+            session_busy_notice("switch sessions"),
+            "Can't switch sessions while a turn is running — press Ctrl+C to cancel it first."
+        );
+        assert_eq!(
+            session_busy_notice("start a new session"),
+            "Can't start a new session while a turn is running — press Ctrl+C to cancel it first."
+        );
     }
 }
