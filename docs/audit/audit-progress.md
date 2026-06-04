@@ -100,7 +100,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | A2 | aj-core | Done | 0 | 2 | 5 | 2 | [aj-core](findings/aj-core.md) | 9d3e6ab |
 | A3 | aj-interactive | Done | 0 | 4 | 5 | 2 | [aj-interactive](findings/aj-interactive.md) | 5030a5a |
 | A4 | aj-components | Done | 0 | 2 | 5 | 2 | [aj-components](findings/aj-components.md) | e0b380f |
-| A5 | aj-tests | TODO | – | – | – | – | – | – |
+| A5 | aj-tests | Done | 0 | 2 | 4 | 1 | [aj-tests](findings/aj-tests.md) | 3dca263 |
 
 ## Phase X — synthesis
 
@@ -249,6 +249,22 @@ Recurring observations collected as steps complete; consumed by X1.
   renders by matching the `ToolDetails` enum variant (not re-parsing
   strings) and sanitizes external text. Hold up as the positive model for
   the structured-contract design.
+- **No test drives the interactive `run` loop** (A3, A5): the binary's
+  ~1150-line `select!` loop (incl. the A3 mutex-freeze/cancellation defect)
+  has no integration test; `replay_parity.rs` drives the Agent+pump
+  directly and never enters `run`. A scripted + headless-layout seam
+  exists. Sharpest happy-path-only/untested-complex-seam instance.
+- **Replay parity masks the dropped-timestamp bug** (SE1, A5): parity
+  compares two equally timestamp-lossy streams, so it holds *because* both
+  discard `ConversationEntry::timestamp` — false coverage on a fidelity
+  boundary.
+- **Extract a shared test-support crate** (M5/TO1 harness-in-prod theme,
+  T5, A5): the workspace-best `aj-tui` `VirtualTerminal` harness is
+  trapped in `tests/support`; the binary re-rolls a no-op `StubTerminal`
+  and never exercises the real compositor. A dev-dep `aj-tui-testkit`
+  crate would unblock real-compositor parity and the missing `run` test,
+  and lets the prod `testing.rs`/`scripted` doubles move out of the
+  shipped API. Concrete X1 recommendation.
 - **Persistence-as-pure-subscriber CONFIRMED clean** (SE1, A2): empty
   `persistence.rs`, listener is a plain subscriber, no back-coupling; print
   mode reads live `agent.messages()` rather than the always-empty
@@ -343,3 +359,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · A2 aj-core · 0C/2Ma/5Mi/2N · 9d3e6ab
 - 2026-06-02 · A3 aj-interactive · 0C/4Ma/5Mi/2N · 5030a5a
 - 2026-06-02 · A4 aj-components · 0C/2Ma/5Mi/2N · e0b380f
+- 2026-06-02 · A5 aj-tests · 0C/2Ma/4Mi/1N · 3dca263
