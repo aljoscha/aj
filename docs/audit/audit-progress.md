@@ -53,7 +53,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | M1 | models-core | Done | 0 | 1 | 4 | 3 | [aj-models-core](findings/aj-models-core.md) | b415d89 |
 | M2 | models-streaming | Done | 0 | 0 | 4 | 3 | [aj-models-streaming](findings/aj-models-streaming.md) | 867a6df |
 | M3 | models-anthropic | Done | 0 | 1 | 4 | 3 | [aj-models-anthropic](findings/aj-models-anthropic.md) | b440134 |
-| M4 | models-openai | TODO | – | – | – | – | – | – |
+| M4 | models-openai | Done | 0 | 2 | 5 | 3 | [aj-models-openai](findings/aj-models-openai.md) | d93f242 |
 | M5 | models-auth | TODO | – | – | – | – | – | – |
 
 ## Phase C — `aj-conf`
@@ -140,16 +140,21 @@ Recurring observations collected as steps complete; consumed by X1.
 - **Non-determinism from wall-clock in lib code** (M2): `transform.rs`
   stamps synthetic orphan tool-results with `Utc::now()`. Sweep for
   `Utc::now()`/`Instant::now()` in pure transform/persistence paths.
-- **Stream end without terminal event → false success** (M3): a stream
-  closing without `message_stop` is finalized as `Done/Stop`, so a
-  truncated turn looks complete and won't be retried. Check M4 OpenAI
-  adapters for the same classification gap.
-- **Happy-path-only roundtrip coverage** (M3): roundtrip suite lacks error
-  frames, refusals, truncation, unusual stop reasons. Recurring test gap;
-  confirm across M4.
-- **Test-only `pub` items widen the surface** (M3): provider fns made
-  `pub` solely for the integration-test crate. Recurs with M1/M2 surface
-  findings.
+- **Stream end without terminal event → false success** (M3, M4):
+  **CONFIRMED across all four providers** (Anthropic, OpenAI completions,
+  Responses, Codex). A stream closing without a terminal frame finalizes
+  as `Done/Stop`, so a truncated turn looks complete and is never retried.
+  This is the single most impactful cross-cutting finding so far.
+- **Duplicated error mapping across endpoints** (S2, M4): `classify_client_error`
+  duplicated byte-for-byte across OpenAI completions/responses and a third
+  time in Codex. SSE framing is correctly delegated to the SDKs (refuted).
+- **Divergent terminal-error handling between sibling providers** (M4):
+  Codex turns terminal `response.failed`/`error` into a hard `Err`
+  (dropping partial content+usage) while Responses preserves the partial.
+- **Happy-path-only roundtrip coverage** (M3, M4): confirmed across all
+  provider roundtrip suites; the truncation Major lives in an untested path.
+- **Test-only `pub` items widen the surface** (M3, M4): widest locus is
+  M4 (10 items). Recurs with M1/M2 surface findings.
 
 Note: all S1 themes were confirmed in S2 (error split doubled, broader
 dead surface, identical `ApiError` Display pattern).
@@ -163,3 +168,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · M1 models-core · 0C/1Ma/4Mi/3N · b415d89
 - 2026-06-02 · M2 models-streaming · 0C/0Ma/4Mi/3N · 867a6df
 - 2026-06-02 · M3 models-anthropic · 0C/1Ma/4Mi/3N · b440134
+- 2026-06-02 · M4 models-openai · 0C/2Ma/5Mi/3N · d93f242
