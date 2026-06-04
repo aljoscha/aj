@@ -22,7 +22,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use aj_tui::ansi::{apply_background_to_line, truncate_to_width, visible_width, wrap_text_with_ansi};
+use aj_tui::ansi::{apply_background_to_line, truncate_to_width, wrap_text_with_ansi};
 use aj_tui::component::Component;
 use aj_tui::container::Container;
 use aj_tui::keys::InputEvent;
@@ -282,6 +282,7 @@ impl AsRef<dyn Any> for SubAgentBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aj_tui::ansi::visible_width;
     use aj_tui::components::text::Text;
 
     use crate::config::theme::{Theme, ThemeHandle, chat_theme};

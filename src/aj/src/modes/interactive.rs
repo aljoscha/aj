@@ -26,6 +26,7 @@ pub mod shutdown;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::modes::interactive::components::chat_view::ChatView;
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TurnError};
@@ -42,7 +43,6 @@ use aj_session::{
 use aj_tools::{BuiltinToolOptions, get_builtin_tools};
 use aj_tui::EditorComponent;
 use aj_tui::components::editor::Editor;
-use aj_tui::container::Container;
 use aj_tui::terminal::ProcessTerminal;
 use aj_tui::tui::{OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, Tui, TuiEvent};
 use anyhow::{Context, Result};
@@ -2960,8 +2960,8 @@ async fn perform_session_swap(
     //    `hide_thinking_block` mode across the swap so a
     //    `aj.thinking.toggle` toggle the user pressed before the swap is
     //    still in effect afterwards.
-    if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
-        chat.clear();
+    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
+        chat.reset();
     }
     let hide_thinking_block = pump.hide_thinking_block();
     let show_image_in_terminal = pump.show_image_in_terminal();
@@ -3058,8 +3058,8 @@ async fn perform_new_session(
     //    in-flight assistant/tool-execution components don't leak
     //    into the fresh session. Carry `hide_thinking_block` across
     //    so a prior `aj.thinking.toggle` toggle stays in effect.
-    if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
-        chat.clear();
+    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
+        chat.reset();
     }
     let hide_thinking_block = pump.hide_thinking_block();
     let show_image_in_terminal = pump.show_image_in_terminal();

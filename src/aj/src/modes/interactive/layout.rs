@@ -12,7 +12,7 @@
 //! | Slot | Content |
 //! |---|---|
 //! | `Header` | one-line dim banner with session id + transient notices |
-//! | `Chat` | `Container` with assistant / user / tool components, in turn order |
+//! | `Chat` | [`super::components::chat_view::ChatView`] — main transcript + sub-agent boxes |
 //! | `Status` | `Container` holding the [`super::components::loader_status::LoaderStatus`] (idle = empty) |
 //! | `Editor` | the prompt editor (focused) |
 //! | `Footer` | one-line dim banner with model / cwd / usage |
@@ -23,7 +23,8 @@ use aj_tui::components::editor::Editor;
 use aj_tui::container::Container;
 use aj_tui::tui::Tui;
 
-use crate::config::theme::{ThemeHandle, editor_theme};
+use crate::config::theme::{ThemeHandle, chat_theme, editor_theme};
+use crate::modes::interactive::components::chat_view::ChatView;
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::loader_status::LoaderStatus;
@@ -77,11 +78,11 @@ pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle) {
     // Header slot.
     tui.add_child(Box::new(Header::new()));
 
-    // Chat scrollback. The event pump appends new components
-    // (user/assistant messages, tool execution blocks) to this
-    // container as events fire; the container owns their boxes
-    // and renders them in append order.
-    tui.add_child(Box::new(Container::new()));
+    // Chat scrollback. A `ChatView` owns the main transcript and
+    // the per-sub-agent boxes; the event pump routes each event to
+    // the owning agent's transcript and the view switches which
+    // agent's transcript is shown (main, or a sub-agent in full).
+    tui.add_child(Box::new(ChatView::new(chat_theme(theme))));
 
     // Status slot. Always present; the loader inside it toggles
     // its own visibility based on whether the agent is mid-turn.

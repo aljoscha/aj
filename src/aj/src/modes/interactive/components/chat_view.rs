@@ -105,15 +105,21 @@ impl ChatView {
         self.active
     }
 
+    /// Clear all transcripts and return to the main view. Used when the
+    /// session is swapped or reset; the caller rebuilds the event pump
+    /// alongside this so per-agent bookkeeping is reset in lockstep.
+    pub fn reset(&mut self) {
+        self.main.clear();
+        self.sub_boxes.clear();
+        self.active = AgentId::Main;
+    }
+
     /// Switch the observed agent. The matching sub-box becomes `Full`;
     /// every other box becomes `Compact`.
     pub fn set_active(&mut self, id: AgentId) {
         self.active = id;
-        let entries: Vec<(usize, usize)> = self
-            .sub_boxes
-            .iter()
-            .map(|(&n, &idx)| (n, idx))
-            .collect();
+        let entries: Vec<(usize, usize)> =
+            self.sub_boxes.iter().map(|(&n, &idx)| (n, idx)).collect();
         for (n, idx) in entries {
             let mode = if matches!(id, AgentId::Sub(active) if active == n) {
                 SubAgentBoxMode::Full

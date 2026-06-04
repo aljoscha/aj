@@ -5,15 +5,23 @@
 //! [`aj_agent::Agent::subscribe_channel`] and pulls events off the
 //! receiver in its `tokio::select!` loop. For each event the
 //! [`EventPump`] looks up (or creates) the matching component in
-//! the chat / status slots and forwards the update. Sub-agent
-//! events ride on the same pump (per `docs/aj-next-plan.md` §1.6
-//! sub-agents share the parent's bus) — for now they render
-//! identically to the main agent, with their `agent_id` surfaced
-//! through the existing chat container; richer sub-agent grouping
-//! lands alongside the `Ctrl+O` expand affordance in a follow-up.
+//! the chat / status slots and forwards the update.
+//!
+//! Sub-agents share the parent's bus and emit their events tagged
+//! with [`AgentId::Sub`]. The pump routes each event to the owning
+//! agent's transcript via the [`ChatView`] in `SlotIndex::Chat`: the
+//! main agent's events land in the main transcript, a sub-agent's
+//! events land inside its [`SubAgentBox`]. The box is created on
+//! [`AgentEvent::SubAgentStart`] (which also drives the footer's
+//! running-agent indicator) and finalized on
+//! [`AgentEvent::SubAgentEnd`]. The parent's `agent` tool call is the
+//! box's visual representation, so its `ToolExecution*` events are
+//! skipped to avoid duplicating the report.
 //!
 //! See `docs/aj-next-plan.md` §1.1 (event protocol) and §4
-//! (event-pump shape).
+//! (event-pump shape), plus `docs/subagent-observability-spec.md`.
+//!
+//! [`SubAgentBox`]: crate::modes::interactive::components::subagent_box::SubAgentBox
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,33 +40,46 @@ use crate::config::theme::ChatTheme;
 use crate::modes::interactive::components::assistant_message::{
     AssistantMessageComponent, BlockKind,
 };
-use crate::modes::interactive::components::footer::Footer;
+use crate::modes::interactive::components::chat_view::{AgentEntry, ChatView};
+use crate::modes::interactive::components::footer::{AgentActivity, Footer};
 use crate::modes::interactive::components::loader_status::LoaderStatus;
+use crate::modes::interactive::components::subagent_box::SubAgentStatus;
 use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
 use crate::modes::interactive::components::user_message::UserMessageComponent;
 use crate::modes::interactive::footer_data::FooterData;
 use crate::modes::interactive::layout::SlotIndex;
 
+/// Per-agent streaming bookkeeping. The pump keeps one of these for
+/// the main agent and one per sub-agent so streaming events route to
+/// the right component inside that agent's own transcript container.
+///
+/// The indices are container-local: `current_assistant` and the
+/// values in `tool_index` index into the agent's own [`Container`]
+/// (the main transcript for [`AgentId::Main`], or a
+/// [`SubAgentBox`](crate::modes::interactive::components::subagent_box::SubAgentBox)'s
+/// inner container for a sub-agent). Each container only ever appends,
+/// so recorded indices stay valid for the session.
+#[derive(Default)]
+struct AgentRender {
+    /// Index, inside this agent's container, of the in-flight
+    /// assistant message component. `None` between turns.
+    current_assistant: Option<usize>,
+    /// Map of `tool_use_id` → index inside this agent's container of
+    /// the matching [`ToolExecutionComponent`].
+    tool_index: HashMap<String, usize>,
+}
+
 /// Translates [`AgentEvent`]s into TUI mutations.
 ///
 /// The pump owns no view state of its own — every component lives
-/// inside the `Tui`'s slot tree. It only tracks the small amount of
-/// per-turn metadata needed to route streaming events to the
-/// right place: the index of the in-flight assistant message
-/// component (so `StreamChunk` updates land on the right widget)
-/// and the index map for tool-call ids → chat-container index.
+/// inside the `Tui`'s slot tree. It tracks per-agent streaming
+/// metadata ([`AgentRender`]) so streaming events reach the right
+/// widget, the in-flight-agent set that drives the working spinner,
+/// and the running sub-agent count behind the footer indicator.
 pub struct EventPump {
     theme: ChatTheme,
-    /// Index, inside the chat container, of the current
-    /// in-flight assistant message component. `None` between
-    /// turns; set when the first assistant chunk arrives, cleared
-    /// when the assistant message persists or the turn ends.
-    current_assistant: Option<usize>,
-    /// Map of `tool_use_id` → index inside the chat container of
-    /// the matching [`ToolExecutionComponent`]. Indices stay
-    /// stable for the lifetime of the chat session because the
-    /// container only ever appends.
-    tool_index: HashMap<String, usize>,
+    /// Per-agent streaming bookkeeping, keyed by [`AgentId`].
+    agents: HashMap<AgentId, AgentRender>,
     /// Identifiers of agents that have emitted [`AgentEvent::AgentStart`]
     /// without a matching [`AgentEvent::AgentEnd`] yet.
     ///
@@ -81,12 +102,17 @@ pub struct EventPump {
     /// and waiting for its `AgentEnd` would pin the spinner
     /// (and the render loop) forever on an idle session.
     running_agents: HashSet<AgentId>,
+    /// Count of sub-agents currently running, tracked off the
+    /// [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
+    /// correlation events. Drives the footer's `N agent(s) (key)`
+    /// indicator. Reset to zero on the main agent's lifecycle
+    /// boundaries so a dropped `SubAgentEnd` can't pin the count.
+    running_sub_agents: usize,
     /// Whether new and existing assistant-message components
     /// should render thinking blocks as a single italic
     /// `Thinking…` placeholder line instead of the full expanded
     /// markdown widget. Toggled at runtime by
-    /// [`Self::set_hide_thinking_block`]; see
-    /// `docs/aj-next-plan.md` §4.4.
+    /// [`Self::set_hide_thinking_block`].
     hide_thinking_block: bool,
     /// Whether new and existing tool-execution components should
     /// render their bodies fully (`true`) or in the compact head/
@@ -105,9 +131,9 @@ pub struct EventPump {
     /// indicator. Updated from main-agent
     /// [`AgentEvent::TurnUsage`] events and on model swaps; the
     /// pump pushes a fresh view into the footer after each
-    /// mutation. Sub-agent turns are tracked through the
-    /// scrollback row only and do not move the main footer (their
-    /// context windows are independent).
+    /// mutation. Sub-agent turns are tracked through their box
+    /// only and do not move the main footer (their context
+    /// windows are independent).
     footer_data: FooterData,
 }
 
@@ -136,9 +162,9 @@ impl EventPump {
     ) -> Self {
         Self {
             theme,
-            current_assistant: None,
-            tool_index: HashMap::new(),
+            agents: HashMap::new(),
             running_agents: HashSet::new(),
+            running_sub_agents: 0,
             hide_thinking_block,
             tools_expanded,
             show_image_in_terminal,
@@ -153,6 +179,21 @@ impl EventPump {
         let snapshot = self.footer_data.context_usage();
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
             footer.set_context_usage(Some(snapshot));
+        }
+        tui.request_render();
+    }
+
+    /// Push the running-sub-agent indicator into the [`Footer`].
+    /// Shows `N agent(s) (key)` while at least one sub-agent runs,
+    /// where `key` is the resolved `aj.agent.open` shortcut; clears
+    /// the indicator when none are running.
+    fn sync_agent_indicator(&self, tui: &mut Tui) {
+        let activity = (self.running_sub_agents > 0).then(|| AgentActivity {
+            running: self.running_sub_agents,
+            open_hint: agent_picker_hint(),
+        });
+        if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
+            footer.set_agent_activity(activity);
         }
         tui.request_render();
     }
@@ -183,26 +224,18 @@ impl EventPump {
     /// Update the thinking-block render mode for this session.
     ///
     /// Updates the pump's own flag so freshly-created assistant
-    /// message components pick up the new mode, then walks every
-    /// existing child of the chat container and calls
-    /// [`AssistantMessageComponent::set_hide_thinking_block`] on
-    /// each one so the next render reflects the new mode for both
-    /// finalized history and any in-flight streaming message.
+    /// message components pick up the new mode, then asks the
+    /// [`ChatView`] to walk every assistant component (main
+    /// transcript and inside every sub-agent box) and apply it.
     /// Finally invalidates the TUI's cached render output so the
-    /// next paint actually picks the change up — without this the
-    /// chat container would re-emit its memoised lines from
-    /// before the toggle.
+    /// next paint reflects the change.
     pub fn set_hide_thinking_block(&mut self, tui: &mut Tui, hide: bool) {
         if self.hide_thinking_block == hide {
             return;
         }
         self.hide_thinking_block = hide;
-        if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
-            for i in 0..chat.len() {
-                if let Some(msg) = chat.get_mut_as::<AssistantMessageComponent>(i) {
-                    msg.set_hide_thinking_block(hide);
-                }
-            }
+        if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
+            chat.set_hide_thinking_block(hide);
         }
         tui.invalidate();
         tui.request_render();
@@ -218,24 +251,45 @@ impl EventPump {
     /// Update the tool-output render mode for this session.
     ///
     /// Updates the pump's own flag so freshly-created tool
-    /// components pick up the new mode, then walks every existing
-    /// child of the chat container and calls
-    /// [`ToolExecutionComponent::set_expanded`] on each one so the
-    /// next render reflects the new mode for both finalized
-    /// history and any in-flight streaming tool. Finally
-    /// invalidates the TUI's cached render output so the next
-    /// paint actually picks the change up.
+    /// components pick up the new mode, then asks the [`ChatView`]
+    /// to walk every tool component (main transcript and inside
+    /// every sub-agent box) and apply it. Finally invalidates the
+    /// TUI's cached render output so the next paint reflects the
+    /// change.
     pub fn set_tools_expanded(&mut self, tui: &mut Tui, expanded: bool) {
         if self.tools_expanded == expanded {
             return;
         }
         self.tools_expanded = expanded;
-        if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) {
-            for i in 0..chat.len() {
-                if let Some(tool) = chat.get_mut_as::<ToolExecutionComponent>(i) {
-                    tool.set_expanded(expanded);
-                }
-            }
+        if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
+            chat.set_tools_expanded(expanded);
+        }
+        tui.invalidate();
+        tui.request_render();
+    }
+
+    /// Snapshot of every known agent (main first, then sub-agents)
+    /// for the agent picker. Reads through the [`ChatView`]; empty
+    /// when the chat slot is somehow absent.
+    pub fn agents(&self, tui: &mut Tui) -> Vec<AgentEntry> {
+        tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .map(|c| c.agents())
+            .unwrap_or_default()
+    }
+
+    /// The agent whose transcript is currently the main view.
+    pub fn active_view(&self, tui: &mut Tui) -> AgentId {
+        tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .map(|c| c.active())
+            .unwrap_or(AgentId::Main)
+    }
+
+    /// Switch the chat view to `id`'s transcript. Invalidates and
+    /// requests a render because the visible chat region changes
+    /// wholesale (the diff engine needs a full repaint).
+    pub fn set_active_view(&mut self, tui: &mut Tui, id: AgentId) {
+        if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
+            chat.set_active(id);
         }
         tui.invalidate();
         tui.request_render();
@@ -254,11 +308,8 @@ impl EventPump {
             // `AgentStart` / `AgentEnd` bracket inside the main
             // agent's turn, so we can't naively start/stop the
             // loader on each event — a sub-agent's `AgentEnd` would
-            // otherwise turn the spinner off while the main turn
-            // is still mid-execution, and (worse) leave the
-            // loader's animation pump running unmatched if the
-            // sub-agent's `AgentStart` had already cancelled and
-            // re-spawned it. Track the set of in-flight agents
+            // otherwise turn the spinner off while the main turn is
+            // still mid-execution. Track the set of in-flight agents
             // instead and only start/stop on the boundary
             // transitions.
             AgentEvent::AgentStart { agent_id } => {
@@ -266,10 +317,15 @@ impl EventPump {
                 // point: any state left over from a previous turn
                 // (e.g. a sub-agent whose `AgentEnd` never made it
                 // through because the agent task panicked) would
-                // otherwise pin the loader on forever, so we drop
-                // the stale set before inserting.
+                // otherwise pin the loader / the footer indicator
+                // on forever, so we drop the stale set before
+                // inserting.
                 if *agent_id == AgentId::Main {
                     self.running_agents.clear();
+                    if self.running_sub_agents != 0 {
+                        self.running_sub_agents = 0;
+                        self.sync_agent_indicator(tui);
+                    }
                 }
                 let was_idle = self.running_agents.is_empty();
                 self.running_agents.insert(*agent_id);
@@ -282,45 +338,39 @@ impl EventPump {
                 if was_present && self.running_agents.is_empty() {
                     self.with_loader(tui, |l| l.stop());
                 }
-                // Streaming-target and tool-index bookkeeping is
-                // scoped to the main turn: a sub-agent's end
-                // leaves the main agent's pending `agent` tool
-                // call (the one that *invoked* the sub-agent)
-                // mid-flight, so clearing `tool_index` here would
-                // strand the lookup the upcoming
-                // `ToolExecutionEnd` for that call needs. Only
-                // the main agent's `AgentEnd` ends the turn from
-                // the chat-scrollback's perspective.
-                //
-                // Main's end is also the authoritative "agent
-                // activity has stopped" signal for the loader.
-                // Stop it unconditionally and drain the set: any
-                // sub-agent ID still in `running_agents` is a
-                // stale entry whose `AgentEnd` was dropped (most
-                // often because the parent's `spawn_agent`
-                // future was cancelled mid-await) — by the time
-                // Main's `AgentEnd` fires, every sub-agent's
-                // future has been driven to completion or
-                // dropped, so the entry doesn't correspond to a
-                // task that's still running. Without this drain
-                // the loader's animation pump keeps requesting
-                // renders every 80 ms on what is, from the
-                // user's POV, an idle session.
+                // Each agent owns its streaming bookkeeping, so an
+                // agent's end clears only its own entry; the main
+                // agent's pending `agent` tool call (whose body is a
+                // sub-agent run) is unaffected.
+                if let Some(state) = self.agents.get_mut(agent_id) {
+                    state.current_assistant = None;
+                    state.tool_index.clear();
+                }
+                // Main's end is the authoritative "agent activity has
+                // stopped" signal. Drain any leaked sub-agent ids and
+                // reset the indicator: by the time Main's `AgentEnd`
+                // fires, every sub-agent's future has been driven to
+                // completion or dropped, so a lingering entry is
+                // stale. Without this the loader's animation pump
+                // keeps requesting renders on an idle session.
                 if *agent_id == AgentId::Main {
-                    self.current_assistant = None;
-                    self.tool_index.clear();
                     if !self.running_agents.is_empty() {
                         self.running_agents.clear();
                         self.with_loader(tui, |l| l.stop());
                     }
+                    if self.running_sub_agents != 0 {
+                        self.running_sub_agents = 0;
+                        self.sync_agent_indicator(tui);
+                    }
                 }
             }
-            AgentEvent::TurnStart { .. } => {
+            AgentEvent::TurnStart { agent_id } => {
                 // Each new turn starts with a fresh assistant
-                // message component; the previous turn's component
-                // (if any) was already finalized at `MessageEnd` /
-                // `MessagePersisted::Assistant`.
-                self.current_assistant = None;
+                // message component for that agent; the previous
+                // turn's component (if any) was already finalized.
+                if let Some(state) = self.agents.get_mut(agent_id) {
+                    state.current_assistant = None;
+                }
             }
 
             // ---- Streaming: unified message lifecycle. ----
@@ -328,69 +378,84 @@ impl EventPump {
             // The agent emits a `MessageStart` / `MessageEnd` pair
             // around every message (user, assistant, tool-result)
             // and, for assistant streaming, one `MessageUpdate` per
-            // provider [`AssistantMessageEvent`]. Renderers consume
-            // the embedded event directly to drive in-flight text /
-            // thinking / tool-call blocks; the finalized payload on
-            // `MessageEnd` is the authoritative snapshot, used for
-            // resume (which has no deltas) and to confirm streaming
-            // results.
-            AgentEvent::MessageStart { message, .. } => {
-                self.handle_message_start(tui, message);
+            // provider [`AssistantMessageEvent`]. Each event carries
+            // the emitting `agent_id` so the pump routes it to that
+            // agent's transcript container.
+            AgentEvent::MessageStart { agent_id, message } => {
+                self.handle_message_start(tui, *agent_id, message);
             }
-            AgentEvent::MessageUpdate { event, .. } => {
-                self.handle_message_update(tui, event);
+            AgentEvent::MessageUpdate {
+                agent_id, event, ..
+            } => {
+                self.handle_message_update(tui, *agent_id, event);
             }
-            AgentEvent::MessageEnd { message, .. } => {
-                self.handle_message_end(tui, message);
+            AgentEvent::MessageEnd { agent_id, message } => {
+                self.handle_message_end(tui, *agent_id, message);
             }
 
             // ---- Tool execution: header + result. ----
+            //
+            // The parent's `agent` tool call is represented by the
+            // sub-agent box, not a tool bubble, so its events are
+            // skipped to avoid duplicating the report.
             AgentEvent::ToolExecutionStart {
+                agent_id,
                 call_id,
                 tool,
                 args,
-                ..
-            } => self.append_tool_execution(tui, call_id, tool, args),
+            } => {
+                if tool != "agent" {
+                    self.append_tool_execution(tui, *agent_id, call_id, tool, args);
+                }
+            }
             AgentEvent::ToolExecutionUpdate {
+                agent_id,
+                tool,
                 call_id,
                 partial,
                 content,
                 ..
             } => {
-                self.update_tool_execution_partial(tui, call_id, partial, content);
+                if tool != "agent" {
+                    self.update_tool_execution_partial(tui, *agent_id, call_id, partial, content);
+                }
             }
             AgentEvent::ToolExecutionEnd {
+                agent_id,
                 call_id,
                 tool,
                 result,
                 content,
                 is_error,
-                ..
             } => {
-                self.update_tool_execution_result(tui, call_id, tool, result, content, *is_error);
+                if tool != "agent" {
+                    self.update_tool_execution_result(
+                        tui, *agent_id, call_id, tool, result, content, *is_error,
+                    );
+                }
             }
 
             // ---- Notices / warnings / errors. ----
-            AgentEvent::Notice { text, .. } => {
-                self.append_notice(tui, text);
+            AgentEvent::Notice { agent_id, text } => {
+                self.append_notice(tui, *agent_id, text);
             }
-            AgentEvent::Warning { text, .. } => {
-                self.append_styled_notice(tui, text, aj_tui::style::yellow);
+            AgentEvent::Warning { agent_id, text } => {
+                self.append_styled_notice(tui, *agent_id, text, aj_tui::style::yellow);
             }
-            AgentEvent::Error { text, .. } => {
-                self.append_styled_notice(tui, text, aj_tui::style::red);
+            AgentEvent::Error { agent_id, text } => {
+                self.append_styled_notice(tui, *agent_id, text, aj_tui::style::red);
             }
             AgentEvent::StreamRetry {
+                agent_id,
                 attempt,
                 delay,
                 error,
-                ..
             } => {
                 let msg = format!(
                     "Retrying inference (attempt {attempt}, in {}ms): {error}",
                     delay.as_millis()
                 );
-                self.append_styled_notice(tui, &msg, aj_tui::style::yellow);
+                self.append_styled_notice(tui, *agent_id, &msg, aj_tui::style::yellow);
             }
 
             // ---- Per-turn token usage. ----
@@ -398,26 +463,44 @@ impl EventPump {
                 self.append_turn_usage(tui, *agent_id, usage);
                 // Only main-agent turns drive the footer's
                 // context-occupancy indicator. Sub-agents run in
-                // their own context window and surface their
-                // usage through the scrollback row above; mixing
-                // their counts into the main footer would make
-                // the percentage jump unpredictably during a turn.
+                // their own context window and surface their usage
+                // through their box; mixing their counts into the
+                // main footer would make the percentage jump
+                // unpredictably during a turn.
                 if *agent_id == AgentId::Main {
                     self.footer_data.record_turn_usage(usage);
                     self.sync_footer(tui);
                 }
             }
 
+            // ---- Sub-agent boxes. ----
+            AgentEvent::SubAgentStart { child, task, .. } => {
+                if let AgentId::Sub(n) = child {
+                    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
+                        chat.ensure_sub_box(*n, task);
+                    }
+                    self.running_sub_agents += 1;
+                    self.sync_agent_indicator(tui);
+                }
+            }
+            AgentEvent::SubAgentEnd { child, .. } => {
+                if let AgentId::Sub(n) = child {
+                    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                        && let Some(b) = chat.sub_box_mut(*n)
+                    {
+                        b.set_status(SubAgentStatus::Done);
+                    }
+                    self.running_sub_agents = self.running_sub_agents.saturating_sub(1);
+                    self.sync_agent_indicator(tui);
+                }
+            }
+
             // ---- Placeholders: events whose UI work isn't yet wired. ----
-            AgentEvent::SubAgentStart { .. }
-            | AgentEvent::SubAgentEnd { .. }
-            | AgentEvent::TurnEnd { .. }
-            | AgentEvent::QueueUpdate { .. } => {
-                // Sub-agent grouping, queue indicators, and the
-                // `TurnEnd` summary all land in follow-up commits.
-                // Holding the arms here keeps the exhaustiveness
-                // check active so a newly-emitted event variant
-                // shows up as a compile error.
+            AgentEvent::TurnEnd { .. } | AgentEvent::QueueUpdate { .. } => {
+                // Queue indicators and the `TurnEnd` summary land in
+                // follow-up commits. Holding the arms here keeps the
+                // exhaustiveness check active so a newly-emitted
+                // event variant shows up as a compile error.
             }
         }
 
@@ -439,21 +522,14 @@ impl EventPump {
         f(loader);
     }
 
-    /// Append a [`UserMessageComponent`] for `content` to the
-    /// chat slot. Walks the wire content blocks and concatenates
-    /// every textual block into one rendered message — sub-second
-    /// latency is more important than perfect block separation
-    /// for live user prompts.
     /// Append a `UserMessageComponent` for a user message that
-    /// landed on the bus. Used by the live readline path (via the
-    /// agent's `MessageEnd { User }` event) and the resume path
-    /// (via the same event synthesized by `aj_session::replay`).
-    /// Multiple [`UserContent::Text`] blocks are joined with `\n`
-    /// so legacy multi-block user messages collapse into one
-    /// rendered component — live user prompts are always
-    /// single-block, but resumed sessions may carry multi-block
-    /// shapes from older formats.
-    fn append_user_message(&self, tui: &mut Tui, content: &[UserContent]) {
+    /// landed on the bus, into `agent_id`'s transcript. Used by the
+    /// live readline path (via the agent's `MessageEnd { User }`
+    /// event) and the resume path (via the same event synthesized
+    /// by `aj_session::replay`). Multiple [`UserContent::Text`]
+    /// blocks are joined with `\n` so legacy multi-block user
+    /// messages collapse into one rendered component.
+    fn append_user_message(&self, tui: &mut Tui, agent_id: AgentId, content: &[UserContent]) {
         let text = content
             .iter()
             .filter_map(|b| match b {
@@ -466,67 +542,44 @@ impl EventPump {
             return;
         }
         let component = UserMessageComponent::new(&text, &self.theme);
-        self.push_chat_child(tui, Box::new(component));
+        self.push_chat_child(tui, agent_id, Box::new(component));
     }
 
-    /// Handle [`AgentEvent::MessageStart`].
-    ///
-    /// All variants are no-ops on the TUI surface:
-    ///
-    /// * User / tool-result: the authoritative payload lands on
-    ///   the matching [`AgentEvent::MessageEnd`], which is where
-    ///   the rendering happens.
-    /// * Assistant: the [`AssistantMessageComponent`] slot is
-    ///   materialised lazily — by the first painting
-    ///   `MessageUpdate` (`TextStart` / `ThinkingStart`) on the
-    ///   live path, or by [`Self::handle_message_end`] on the
-    ///   replay path (which emits `MessageStart` + `MessageEnd`
-    ///   with no `MessageUpdate` in between).
-    ///
-    /// Earlier versions of this method pre-created the assistant
-    /// component here so the first `MessageUpdate` didn't have to
-    /// materialise it. That left an orphan empty component in the
-    /// chat container on tool-use-only turns (the model called a
-    /// tool without emitting any text / thinking first): the
-    /// component rendered zero lines, but the leading
-    /// [`Spacer`] inserted by [`Self::push_chat_child`] stuck
-    /// around and doubled up with the next chat row's leading
-    /// spacer, producing two visible blank rows where one was
-    /// intended. Deferring creation to the first event that
-    /// actually paints into the component removes the orphan
-    /// without changing visible behaviour for turns that DO paint
-    /// into the slot.
-    ///
-    /// The function is retained (rather than collapsing the
-    /// dispatch arm to an inline no-op) so the design rationale
-    /// has somewhere to live and a future hook for Start-time
-    /// work has an obvious home. The `&mut self` / `&mut Tui`
-    /// signature is preserved for the same reason: future Start-
-    /// time work will almost certainly need both.
+    /// Handle [`AgentEvent::MessageStart`]. A no-op on the TUI
+    /// surface: the authoritative payload lands on the matching
+    /// [`AgentEvent::MessageEnd`] (user / tool-result) or the
+    /// assistant slot is materialised lazily by the first painting
+    /// [`AgentEvent::MessageUpdate`] / by [`Self::handle_message_end`]
+    /// on the replay path. Retained (rather than inlined) so the
+    /// rationale has a home and future Start-time work has an
+    /// obvious hook.
     #[allow(clippy::needless_pass_by_ref_mut)]
-    fn handle_message_start(&mut self, _tui: &mut Tui, _message: &AgentMessage) {}
+    fn handle_message_start(
+        &mut self,
+        _tui: &mut Tui,
+        _agent_id: AgentId,
+        _message: &AgentMessage,
+    ) {
+    }
 
     /// Handle [`AgentEvent::MessageUpdate`] for an assistant
     /// streaming inference. Drives the in-flight
-    /// [`AssistantMessageComponent`] off the embedded
-    /// [`AssistantMessageEvent`].
-    fn handle_message_update(&mut self, tui: &mut Tui, event: &AssistantMessageEvent) {
+    /// [`AssistantMessageComponent`] in `agent_id`'s transcript off
+    /// the embedded [`AssistantMessageEvent`].
+    fn handle_message_update(
+        &mut self,
+        tui: &mut Tui,
+        agent_id: AgentId,
+        event: &AssistantMessageEvent,
+    ) {
         // Early-out for events that don't paint into the assistant
-        // component, BEFORE calling `ensure_assistant_message`:
-        //
-        // * `ToolCall{Start,Delta,End}` — tool calls render through
-        //   the dedicated `ToolExecutionStart` / `ToolExecutionEnd`
-        //   events, not through this component (the agent collects
-        //   them off the finalized `Done { message }` payload and
-        //   brackets them with their own events).
-        // * `Start` / `Done` / `Error` — agent-side lifecycle
-        //   markers; the matching `MessageStart` / `MessageEnd`
-        //   are the authoritative bookends.
-        //
-        // Returning here is what keeps tool-use-only turns from
-        // materialising an empty assistant slot whose leading
-        // auto-spacer would orphan into the next row's gap. See
-        // [`Self::handle_message_start`] for the full rationale.
+        // component, BEFORE materialising the slot. Tool calls render
+        // through the dedicated `ToolExecution*` events; `Start` /
+        // `Done` / `Error` are agent-side lifecycle markers whose
+        // bookends are the matching `MessageStart` / `MessageEnd`.
+        // Returning here keeps tool-use-only turns from materialising
+        // an empty assistant slot whose leading auto-spacer would
+        // orphan into the next row's gap.
         if !matches!(
             event,
             AssistantMessageEvent::TextStart { .. }
@@ -539,11 +592,14 @@ impl EventPump {
             return;
         }
 
-        let idx = self.ensure_assistant_message(tui);
-        let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) else {
+        let idx = self.ensure_assistant_message(tui, agent_id);
+        let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) else {
             return;
         };
-        let Some(c) = chat.get_mut_as::<AssistantMessageComponent>(idx) else {
+        let Some(container) = chat.agent_container_mut(agent_id) else {
+            return;
+        };
+        let Some(c) = container.get_mut_as::<AssistantMessageComponent>(idx) else {
             return;
         };
         match event {
@@ -587,48 +643,43 @@ impl EventPump {
     }
 
     /// Handle [`AgentEvent::MessageEnd`]. Assistant messages
-    /// finalize their in-flight component (next turn opens a fresh
-    /// one); user / tool-result messages append a fresh component
-    /// from the authoritative payload — this is the rendering path
-    /// for both live user prompts and replayed user threads.
-    fn handle_message_end(&mut self, tui: &mut Tui, message: &AgentMessage) {
+    /// finalize `agent_id`'s in-flight component (next turn opens a
+    /// fresh one); user messages append a fresh component from the
+    /// authoritative payload (the rendering path for both live user
+    /// prompts and replayed user threads). Tool-result messages are
+    /// structural framing — they render through `ToolExecutionEnd`.
+    fn handle_message_end(&mut self, tui: &mut Tui, agent_id: AgentId, message: &AgentMessage) {
         match &message.kind {
             AgentMessageKind::Wire(Message::User(u)) => {
-                self.append_user_message(tui, &u.content);
+                self.append_user_message(tui, agent_id, &u.content);
             }
             AgentMessageKind::Wire(Message::Assistant(a)) => {
                 // Two cases share this arm:
                 //
-                // 1. Live streaming has already painted the content
+                // 1. Live streaming already painted the content
                 //    through `handle_message_update`; the finalized
-                //    event just unbinds the streaming target so the
-                //    next turn starts fresh.
+                //    event just unbinds the streaming target.
                 //
                 // 2. Replay emits `MessageStart` + `MessageEnd` with
-                //    no `MessageUpdate` in between (see
-                //    `aj_session::replay`), so the slot was never
-                //    materialised by a painting event. We have to
-                //    create it here and synthesize per-block
-                //    open/close pairs from the finalized content so
-                //    the component lands in the same shape live
-                //    streaming would have produced.
+                //    no `MessageUpdate` in between, so the slot was
+                //    never materialised. We create it here and
+                //    synthesize per-block open/close pairs from the
+                //    finalized content.
                 //
-                // We only materialise the slot when the finalized
-                // payload carries at least one Text / Thinking
-                // block. Tool-use-only turns render entirely
-                // through the [`ToolExecutionComponent`]; creating
-                // an empty assistant slot for them would leave an
-                // orphan component whose leading auto-spacer
-                // doubles the gap to the next row (see
-                // [`Self::handle_message_start`] for the full
-                // rationale).
+                // The slot is only materialised when the payload
+                // carries at least one Text / Thinking block;
+                // tool-use-only turns render entirely through the
+                // [`ToolExecutionComponent`], and an empty assistant
+                // slot's leading auto-spacer would double the gap to
+                // the next row.
                 let has_renderable = a.content.iter().any(|b| {
                     matches!(b, AssistantContent::Text(_) | AssistantContent::Thinking(_))
                 });
                 if has_renderable {
-                    let idx = self.ensure_assistant_message(tui);
-                    if let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx())
-                        && let Some(c) = chat.get_mut_as::<AssistantMessageComponent>(idx)
+                    let idx = self.ensure_assistant_message(tui, agent_id);
+                    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                        && let Some(container) = chat.agent_container_mut(agent_id)
+                        && let Some(c) = container.get_mut_as::<AssistantMessageComponent>(idx)
                         && c.is_empty()
                     {
                         // Replay synthesis. Live streaming has
@@ -661,7 +712,9 @@ impl EventPump {
                         }
                     }
                 }
-                self.current_assistant = None;
+                if let Some(state) = self.agents.get_mut(&agent_id) {
+                    state.current_assistant = None;
+                }
             }
             AgentMessageKind::Wire(Message::ToolResult(_)) => {
                 // Tool results render through the dedicated
@@ -672,33 +725,37 @@ impl EventPump {
         }
     }
 
-    /// Ensure the chat slot's tail child is an
-    /// [`AssistantMessageComponent`]. Returns its container index.
-    /// Creates a new component (and remembers its index) if the
-    /// current turn doesn't have one yet.
-    fn ensure_assistant_message(&mut self, tui: &mut Tui) -> usize {
-        if let Some(idx) = self.current_assistant {
+    /// Ensure `agent_id`'s transcript tail is an
+    /// [`AssistantMessageComponent`]. Returns its container index,
+    /// creating (and remembering) a new component when the current
+    /// turn doesn't have one yet.
+    fn ensure_assistant_message(&mut self, tui: &mut Tui, agent_id: AgentId) -> usize {
+        if let Some(idx) = self.agents.get(&agent_id).and_then(|a| a.current_assistant) {
             return idx;
         }
         let component = AssistantMessageComponent::new(&self.theme, self.hide_thinking_block);
-        let idx = self.push_chat_child(tui, Box::new(component));
-        self.current_assistant = Some(idx);
+        let idx = self.push_chat_child(tui, agent_id, Box::new(component));
+        self.agents.entry(agent_id).or_default().current_assistant = Some(idx);
         idx
     }
 
-    /// Append a tool-execution component for a freshly-started
-    /// tool call. Records the chat-container index in
-    /// `tool_index` so subsequent `ToolExecutionUpdate` /
-    /// `ToolExecutionEnd` events can find it.
+    /// Append a tool-execution component for a freshly-started tool
+    /// call into `agent_id`'s transcript. Records the index in that
+    /// agent's `tool_index` so subsequent `ToolExecutionUpdate` /
+    /// `ToolExecutionEnd` events find it. Sub-agent tools render
+    /// header-only because they live inside the sub-agent box's
+    /// painted background; the box flips them to full bodies when
+    /// the user switches to observe it.
     fn append_tool_execution(
         &mut self,
         tui: &mut Tui,
+        agent_id: AgentId,
         call_id: &str,
         tool: &str,
         args: &serde_json::Value,
     ) {
         let cell_pixel_size = tui.terminal().cell_pixel_size();
-        let component = ToolExecutionComponent::with_cell_pixel_size(
+        let mut component = ToolExecutionComponent::with_cell_pixel_size(
             tool.to_string(),
             args,
             &self.theme,
@@ -706,30 +763,42 @@ impl EventPump {
             cell_pixel_size,
         )
         .with_show_image_in_terminal(self.show_image_in_terminal);
-        let idx = self.push_chat_child(tui, Box::new(component));
-        self.tool_index.insert(call_id.to_string(), idx);
+        if matches!(agent_id, AgentId::Sub(_)) {
+            component.set_header_only(true);
+        }
+        let idx = self.push_chat_child(tui, agent_id, Box::new(component));
+        let state = self.agents.entry(agent_id).or_default();
+        state.tool_index.insert(call_id.to_string(), idx);
         // A tool call that arrives mid-turn means the assistant
-        // message that emitted it is finished as far as the
-        // stream is concerned. Drop the streaming target so the
-        // next assistant turn opens a fresh component.
-        self.current_assistant = None;
+        // message that emitted it is finished as far as the stream
+        // is concerned. Drop the streaming target so the next
+        // assistant turn opens a fresh component.
+        state.current_assistant = None;
     }
 
     /// Update an in-flight tool's body with a partial snapshot.
     fn update_tool_execution_partial(
         &self,
         tui: &mut Tui,
+        agent_id: AgentId,
         call_id: &str,
         partial: &aj_agent::tool::ToolDetails,
         content: &[aj_models::types::UserContent],
     ) {
-        let Some(&idx) = self.tool_index.get(call_id) else {
+        let Some(&idx) = self
+            .agents
+            .get(&agent_id)
+            .and_then(|a| a.tool_index.get(call_id))
+        else {
             return;
         };
-        let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) else {
+        let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) else {
             return;
         };
-        let Some(c) = chat.get_mut_as::<ToolExecutionComponent>(idx) else {
+        let Some(container) = chat.agent_container_mut(agent_id) else {
+            return;
+        };
+        let Some(c) = container.get_mut_as::<ToolExecutionComponent>(idx) else {
             return;
         };
         c.update_partial(partial, content);
@@ -739,34 +808,29 @@ impl EventPump {
     fn update_tool_execution_result(
         &mut self,
         tui: &mut Tui,
+        agent_id: AgentId,
         call_id: &str,
         tool: &str,
         result: &aj_agent::tool::ToolDetails,
         content: &[aj_models::types::UserContent],
         is_error: bool,
     ) {
-        // If we never saw `ToolExecutionStart` (replay path), build
-        // a component now so the result is visible. Args aren't
+        // If we never saw `ToolExecutionStart` (replay path), build a
+        // component now so the result is visible. Args aren't
         // available on the End event, so we render with an empty
-        // object.
-        //
-        // The live path runs `append_tool_execution` on
-        // `ToolExecutionStart`, which clears `current_assistant`
-        // so the next streaming chunk opens a fresh assistant
-        // component *after* the tool. The replay fallback below
-        // builds an equivalent component but must replicate the
-        // same bookkeeping — otherwise a subsequent assistant
-        // text `StreamChunk` would attach to the previous turn's
-        // assistant component (created for the thinking block
-        // that *preceded* the tool), and the tool would appear
-        // visually below the next assistant message instead of
-        // between them. See the "Resume fidelity follow-up"
-        // section in `docs/aj-next-progress.md` for the trace.
-        let idx = match self.tool_index.get(call_id) {
+        // object. The build-on-miss branch must replicate the live
+        // path's bookkeeping (clear `current_assistant`) so a
+        // subsequent assistant text chunk opens a fresh component
+        // *after* the tool rather than reusing a pre-tool one.
+        let idx = match self
+            .agents
+            .get(&agent_id)
+            .and_then(|a| a.tool_index.get(call_id))
+        {
             Some(idx) => *idx,
             None => {
                 let cell_pixel_size = tui.terminal().cell_pixel_size();
-                let component = ToolExecutionComponent::with_cell_pixel_size(
+                let mut component = ToolExecutionComponent::with_cell_pixel_size(
                     tool.to_string(),
                     &serde_json::json!({}),
                     &self.theme,
@@ -774,94 +838,105 @@ impl EventPump {
                     cell_pixel_size,
                 )
                 .with_show_image_in_terminal(self.show_image_in_terminal);
-                let idx = self.push_chat_child(tui, Box::new(component));
-                self.tool_index.insert(call_id.to_string(), idx);
-                self.current_assistant = None;
+                if matches!(agent_id, AgentId::Sub(_)) {
+                    component.set_header_only(true);
+                }
+                let idx = self.push_chat_child(tui, agent_id, Box::new(component));
+                let state = self.agents.entry(agent_id).or_default();
+                state.tool_index.insert(call_id.to_string(), idx);
+                state.current_assistant = None;
                 idx
             }
         };
-        let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) else {
+        let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) else {
             return;
         };
-        let Some(c) = chat.get_mut_as::<ToolExecutionComponent>(idx) else {
+        let Some(container) = chat.agent_container_mut(agent_id) else {
+            return;
+        };
+        let Some(c) = container.get_mut_as::<ToolExecutionComponent>(idx) else {
             return;
         };
         c.update_result(result, content, is_error);
     }
 
-    /// Append a plain dim-styled notice line. The auto-spacer
-    /// inserted by [`Self::push_chat_child`] handles separation
-    /// from neighbouring chat elements, so the text component
-    /// itself uses `padding_y = 0` to keep the row compact.
-    fn append_notice(&self, tui: &mut Tui, text: &str) {
+    /// Append a plain dim-styled notice line into `agent_id`'s
+    /// transcript. The auto-spacer inserted by
+    /// [`Self::push_chat_child`] handles separation from neighbours,
+    /// so the text component itself uses `padding_y = 0`.
+    fn append_notice(&self, tui: &mut Tui, agent_id: AgentId, text: &str) {
         let styled = aj_tui::style::dim(text);
-        self.push_chat_child(tui, Box::new(Text::new(&styled, 1, 0)));
+        self.push_chat_child(tui, agent_id, Box::new(Text::new(&styled, 1, 0)));
     }
 
     /// Append a styled notice using the supplied colour function
-    /// (yellow for warnings, red for errors). Mirrors
-    /// [`Self::append_notice`]'s zero internal padding; the
-    /// surrounding auto-spacer provides the visible gap.
-    fn append_styled_notice(&self, tui: &mut Tui, text: &str, style: fn(&str) -> String) {
+    /// (yellow for warnings, red for errors) into `agent_id`'s
+    /// transcript. Mirrors [`Self::append_notice`]'s zero internal
+    /// padding; the surrounding auto-spacer provides the gap.
+    fn append_styled_notice(
+        &self,
+        tui: &mut Tui,
+        agent_id: AgentId,
+        text: &str,
+        style: fn(&str) -> String,
+    ) {
         let styled = style(text);
-        self.push_chat_child(tui, Box::new(Text::new(&styled, 1, 0)));
+        self.push_chat_child(tui, agent_id, Box::new(Text::new(&styled, 1, 0)));
     }
 
     /// Append a dim `Token Usage - ...` row for a freshly-completed
-    /// turn. Sub-agents get a leading `(sub agent N)` tag so their
-    /// per-turn counts stay distinguishable when they share the
-    /// parent's scrollback (per `docs/aj-next-plan.md` §1.6
-    /// sub-agents share the parent's bus). The format matches the
-    /// legacy `display_token_usage` line byte-for-byte (modulo the
-    /// ANSI dim escape sequence) so users with eyes trained on the
-    /// old format don't have to re-learn the layout.
+    /// turn into `agent_id`'s transcript. Sub-agents get a leading
+    /// `(sub agent N)` tag so their per-turn counts stay
+    /// distinguishable; the format otherwise matches the legacy
+    /// `display_token_usage` line.
     fn append_turn_usage(&self, tui: &mut Tui, agent_id: AgentId, usage: &TokenUsage) {
         let line = format_turn_usage_line(agent_id, usage);
         let styled = aj_tui::style::dim(&line);
-        self.push_chat_child(tui, Box::new(Text::new(&styled, 1, 0)));
+        self.push_chat_child(tui, agent_id, Box::new(Text::new(&styled, 1, 0)));
     }
 
-    /// Append `child` to the chat container slot and return its
-    /// index. Centralises the slot lookup so callers don't have to
-    /// know about [`SlotIndex::Chat`].
+    /// Append `child` to `agent_id`'s transcript container and
+    /// return its index. Centralises the slot lookup and the
+    /// inter-element spacing: when the target container already has
+    /// at least one child this inserts a one-row [`Spacer`] before
+    /// `child`, so each chat component stays focused on its own
+    /// layout while the container owns the vertical breathing room.
     ///
-    /// When the chat container already has at least one child this
-    /// helper inserts a [`Spacer`] of one blank row immediately
-    /// before `child`. Each chat-scrollback component (user
-    /// messages, assistant messages, tool executions, notices)
-    /// can therefore stay focused on its own internal layout — the
-    /// vertical breathing room between siblings is owned by the
-    /// container side.
-    ///
-    /// The returned index is the *child's* slot in the container,
-    /// not the spacer's. Callers that key follow-up lookups by
-    /// this index ([`Self::ensure_assistant_message`],
-    /// [`Self::append_tool_execution`]) continue to find the right
-    /// component after the spacer is inserted.
+    /// The returned index is the *child's* slot, not the spacer's.
+    /// Returns `0` when the chat slot or the agent's container is
+    /// absent (e.g. a sub-agent event arrived before its box).
     fn push_chat_child(
         &self,
         tui: &mut Tui,
+        agent_id: AgentId,
         child: Box<dyn aj_tui::component::Component>,
     ) -> usize {
-        let Some(chat) = tui.get_mut_as::<Container>(SlotIndex::Chat.idx()) else {
-            // The chat slot must exist for the lifetime of the TUI;
-            // if it doesn't, the layout was torn down and there's
-            // nothing useful to do but drop the child.
+        let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) else {
             return 0;
         };
-        if !chat.is_empty() {
-            chat.add_child(Box::new(Spacer::new(1)));
+        let Some(container) = chat.agent_container_mut(agent_id) else {
+            return 0;
+        };
+        if !container.is_empty() {
+            container.add_child(Box::new(Spacer::new(1)));
         }
-        let idx = chat.len();
-        chat.add_child(child);
+        let idx = container.len();
+        container.add_child(child);
         idx
     }
 }
 
+/// Resolve the `aj.agent.open` shortcut label for the footer's
+/// running-agent hint, falling back to `Alt+A` when unbound.
+fn agent_picker_hint() -> String {
+    aj_tui::keybindings::format_action_shortcut(crate::config::keybindings::ACTION_AGENT_PICKER)
+        .unwrap_or_else(|| "Alt+A".to_string())
+}
+
 /// Render the `Token Usage - ...` line for a single `TurnUsage`
 /// event. Sub-agents are tagged with their `(sub agent N)` prefix
-/// so their per-turn counts stand apart from the main agent's in
-/// the shared scrollback. Visible for testing.
+/// so their per-turn counts stand apart from the main agent's.
+/// Visible for testing.
 fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
     // `format_tokens` keeps the legacy convention: render the
     // accumulated total bare when the turn contributed nothing
@@ -1157,8 +1232,9 @@ mod tests {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
 
         let chat_len = |tui: &mut Tui| -> usize {
-            tui.get_mut_as::<Container>(SlotIndex::Chat.idx())
+            tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
                 .expect("chat slot")
+                .container_mut()
                 .len()
         };
         let chat_baseline = chat_len(&mut tui);
@@ -1232,8 +1308,9 @@ mod tests {
         // the regression in place the tool would be the last
         // child instead.
         let chat = tui
-            .get_mut_as::<Container>(SlotIndex::Chat.idx())
-            .expect("chat slot");
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
         let total = chat.len();
         assert!(total > chat_baseline + 6, "got {total} children");
         let last_idx = total - 1;
@@ -1367,8 +1444,9 @@ mod tests {
         // container — the regression would put an empty one
         // between the user message and the tool execution.
         let chat = tui
-            .get_mut_as::<Container>(SlotIndex::Chat.idx())
-            .expect("chat slot");
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
         let assistant_count = (0..chat.len())
             .filter(|&i| chat.get_mut_as::<AssistantMessageComponent>(i).is_some())
             .count();
@@ -1433,8 +1511,9 @@ mod tests {
         );
 
         let chat = tui
-            .get_mut_as::<Container>(SlotIndex::Chat.idx())
-            .expect("chat slot");
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
         let last = chat.len() - 1;
         let assistant = chat
             .get_mut_as::<AssistantMessageComponent>(last)
@@ -1456,8 +1535,9 @@ mod tests {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         let chat_len_before = {
             let chat = tui
-                .get_mut_as::<aj_tui::container::Container>(SlotIndex::Chat.idx())
-                .expect("chat slot");
+                .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                .expect("chat slot")
+                .container_mut();
             chat.len()
         };
         let usage = token_usage([42, 17, 0, 3], [0, 0, 0, 0]);
@@ -1469,8 +1549,9 @@ mod tests {
             },
         );
         let chat = tui
-            .get_mut_as::<aj_tui::container::Container>(SlotIndex::Chat.idx())
-            .expect("chat slot");
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
         assert_eq!(
             chat.len(),
             chat_len_before + 1,
@@ -1735,87 +1816,92 @@ mod tests {
     }
 
     #[test]
-    fn subagent_end_does_not_clear_main_tool_index() {
-        // Regression: while a sub-agent is running, the main
-        // agent's pending `agent` tool call is still in flight
-        // (the tool body *is* the sub-agent's run). The
-        // `ToolExecutionEnd` for that call lands after the
-        // sub-agent's `AgentEnd`. Clearing `tool_index` on the
-        // sub's `AgentEnd` would strand the lookup; the result
-        // would either silently drop or — through the
-        // build-on-miss fallback in `update_tool_execution_result`
-        // — append a second `ToolExecutionComponent` for the same
-        // call, leaving the original stuck on its `Started`
-        // spinner glyph.
+    fn subagent_events_route_into_box_and_agent_tool_is_skipped() {
+        // The parent's `agent` tool call is represented by the
+        // sub-agent box, not a tool bubble, so its `ToolExecution*`
+        // events are skipped. The sub-agent's own events route into
+        // the box's inner transcript (its tools render header-only).
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
 
-        // Main agent fires the `agent` tool.
-        pump.handle(
-            &mut tui,
-            &AgentEvent::AgentStart {
-                agent_id: AgentId::Main,
-            },
-        );
-        let call_id = "call-agent-1";
+        // Main fires the `agent` tool: no bubble in the main view.
         pump.handle(
             &mut tui,
             &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Main,
-                call_id: call_id.to_string(),
-                tool: "agent".to_string(),
-                args: serde_json::json!({"task": "summarise"}),
+                call_id: "call-agent".into(),
+                tool: "agent".into(),
+                args: serde_json::json!({"task": "summarize"}),
             },
         );
-        let chat_len_after_tool_start = tui
-            .get_mut_as::<Container>(SlotIndex::Chat.idx())
-            .expect("chat slot")
-            .len();
-
-        // Sub-agent runs and ends, with its `AgentStart` /
-        // `AgentEnd` bracketing.
+        // The spawn correlation creates the box in the main transcript.
         pump.handle(
             &mut tui,
-            &AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
+            &AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "summarize".into(),
             },
         );
+        // A sub-agent tool call routes into the box.
         pump.handle(
             &mut tui,
-            &AgentEvent::AgentEnd {
+            &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Sub(1),
-                messages: Vec::new(),
+                call_id: "call-bash".into(),
+                tool: "bash".into(),
+                args: serde_json::json!({"command": "ls"}),
             },
         );
-
-        // Now the agent-tool's End lands. With the old
-        // `tool_index.clear()`-on-every-End behaviour, the lookup
-        // would miss and a *second* `ToolExecutionComponent`
-        // would be appended; with the fix the existing component
-        // is updated in place and the chat length is unchanged.
         pump.handle(
             &mut tui,
             &AgentEvent::ToolExecutionEnd {
-                agent_id: AgentId::Main,
-                call_id: call_id.to_string(),
-                tool: "agent".to_string(),
+                agent_id: AgentId::Sub(1),
+                call_id: "call-bash".into(),
+                tool: "bash".into(),
                 result: aj_agent::tool::ToolDetails::Text {
-                    summary: "summary".into(),
-                    body: "the sub-agent's report".into(),
+                    summary: String::new(),
+                    body: "ok".into(),
                 },
                 content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
                 is_error: false,
             },
         );
-        let chat_len_after_tool_end = tui
-            .get_mut_as::<Container>(SlotIndex::Chat.idx())
-            .expect("chat slot")
-            .len();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "done".into(),
+            },
+        );
+
+        // The main transcript carries no tool bubble for the `agent`
+        // call.
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot");
+        let main = chat.container_mut();
+        let main_tools = (0..main.len())
+            .filter(|&i| main.get_mut_as::<ToolExecutionComponent>(i).is_some())
+            .count();
         assert_eq!(
-            chat_len_after_tool_start, chat_len_after_tool_end,
-            "ToolExecutionEnd should update the existing component \
-             in place, not append a second one — the sub-agent's \
-             AgentEnd must not have cleared the main agent's \
-             tool_index",
+            main_tools, 0,
+            "the `agent` tool call must not create a bubble in the main transcript",
+        );
+
+        // The sub-agent's tool routed into its box.
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot");
+        let inner = chat
+            .agent_container_mut(AgentId::Sub(1))
+            .expect("sub-agent box inner container");
+        let sub_tools = (0..inner.len())
+            .filter(|&i| inner.get_mut_as::<ToolExecutionComponent>(i).is_some())
+            .count();
+        assert_eq!(
+            sub_tools, 1,
+            "the sub-agent's tool should route into its box"
         );
     }
 
@@ -2016,8 +2102,9 @@ mod tests {
         // expanded mode (line index >= TEXT_COLLAPSED_LINES = 10).
         let count_expanded = |tui: &mut Tui| -> usize {
             let chat = tui
-                .get_mut_as::<Container>(SlotIndex::Chat.idx())
-                .expect("chat slot");
+                .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                .expect("chat slot")
+                .container_mut();
             let mut n = 0;
             for i in 0..chat.len() {
                 if let Some(tool) = chat.get_mut_as::<ToolExecutionComponent>(i) {
