@@ -89,7 +89,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 | T1 | tui-core | Done | 0 | 1 | 5 | 3 | [aj-tui-core](findings/aj-tui-core.md) | d1775db |
 | T2 | tui-text | Done | 0 | 0 | 4 | 4 | [aj-tui-text](findings/aj-tui-text.md) | 9142a6c |
 | T3 | tui-editor | Done | 0 | 1 | 5 | 4 | [aj-tui-editor](findings/aj-tui-editor.md) | c477c5a |
-| T4 | tui-components | TODO | – | – | – | – | – | – |
+| T4 | tui-components | Done | 0 | 2 | 5 | 4 | [aj-tui-components](findings/aj-tui-components.md) | 94e21ea |
 | T5 | tui-tests | TODO | – | – | – | – | – | – |
 
 ## Phase A — `aj` (binary)
@@ -188,6 +188,16 @@ Recurring observations collected as steps complete; consumed by X1.
   `meta`/`cmd`/`super` but `keys::parse_key_id` rejects `meta`/`cmd`, so a
   user-configured `cmd+k` formats fine but never fires. Verify against the
   `aj` keybindings config (A1).
+- **Unbounded markdown parser recursion on model output** (T4): nested
+  `**`/`>`/`[[...]]` can overflow the stack and abort the process — no
+  depth cap, no test, and the input is untrusted model text rendered every
+  turn. Highest crash-risk finding in the TUI; treat as a real hazard.
+- **Sibling-component drift** (T1, T4): `SelectList` vs `SettingsList` are
+  drifted re-implementations of one scroll/filter/render widget (cf. T1's
+  overlay-routing duplicated 4x). The widest UI-layer duplication.
+- **Tab-width constant duplicated** (T2, T4): "tab = 3 spaces" is spelled
+  as magic literals across `ansi.rs`, `text.rs`, `markdown.rs`. Hoist one
+  shared constant.
 - **Concurrency / single-writer guard** (SE1, NEW): two `aj continue <id>`
   processes interleave JSONL lines and mint colliding entry ids,
   corrupting the parent chain. No file lock. Check the binary (A2/A3)
@@ -267,3 +277,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · T1 tui-core · 0C/1Ma/5Mi/3N · d1775db
 - 2026-06-02 · T2 tui-text · 0C/0Ma/4Mi/4N · 9142a6c
 - 2026-06-02 · T3 tui-editor · 0C/1Ma/5Mi/4N · c477c5a
+- 2026-06-02 · T4 tui-components · 0C/2Ma/5Mi/4N · 94e21ea
