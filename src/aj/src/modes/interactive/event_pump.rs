@@ -763,8 +763,14 @@ impl EventPump {
             cell_pixel_size,
         )
         .with_show_image_in_terminal(self.show_image_in_terminal);
+        // Sub-agent tools render header-only inside the compact box;
+        // when the user is observing this sub-agent (its box is the
+        // active full view) they show full bodies like a main tool.
         if matches!(agent_id, AgentId::Sub(_)) {
-            component.set_header_only(true);
+            let observing = tui
+                .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                .is_some_and(|c| c.active() == agent_id);
+            component.set_header_only(!observing);
         }
         let idx = self.push_chat_child(tui, agent_id, Box::new(component));
         let state = self.agents.entry(agent_id).or_default();
@@ -839,7 +845,10 @@ impl EventPump {
                 )
                 .with_show_image_in_terminal(self.show_image_in_terminal);
                 if matches!(agent_id, AgentId::Sub(_)) {
-                    component.set_header_only(true);
+                    let observing = tui
+                        .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                        .is_some_and(|c| c.active() == agent_id);
+                    component.set_header_only(!observing);
                 }
                 let idx = self.push_chat_child(tui, agent_id, Box::new(component));
                 let state = self.agents.entry(agent_id).or_default();
@@ -1902,6 +1911,71 @@ mod tests {
         assert_eq!(
             sub_tools, 1,
             "the sub-agent's tool should route into its box"
+        );
+    }
+
+    #[test]
+    fn observing_a_subagent_shows_full_tool_bodies_then_hides_them_on_main() {
+        // Decision: tools render header-only inside the compact box,
+        // but full (with bodies) in the switched-to view. A tool that
+        // arrives *while observing* the sub-agent must render full, and
+        // collapse back to header-only when the user returns to main.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "explore".into(),
+            },
+        );
+        // Observe the sub-agent (its box becomes the full view).
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Sub(1),
+                call_id: "c1".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Sub(1),
+                call_id: "c1".into(),
+                tool: "read_file".into(),
+                result: aj_agent::tool::ToolDetails::Text {
+                    summary: String::new(),
+                    body: "BODYMARKER".into(),
+                },
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
+                is_error: false,
+            },
+        );
+
+        // Full view: the tool body is visible.
+        let full = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .render(80)
+            .join("\n");
+        assert!(
+            full.contains("BODYMARKER"),
+            "full view should show the tool body; got:\n{full}",
+        );
+
+        // Back to main: the compact box renders the tool header-only.
+        pump.set_active_view(&mut tui, AgentId::Main);
+        let main = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .render(80)
+            .join("\n");
+        assert!(
+            !main.contains("BODYMARKER"),
+            "compact box should hide the tool body; got:\n{main}",
         );
     }
 
