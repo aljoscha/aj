@@ -66,7 +66,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| AG1 | agent-runtime | TODO | – | – | – | – | – | – |
+| AG1 | agent-runtime | Done | 1 | 3 | 4 | 3 | [aj-agent-runtime](findings/aj-agent-runtime.md) | 2f5dfd0 |
 | AG2 | agent-contracts | TODO | – | – | – | – | – | – |
 
 ## Phase SE — `aj-session`
@@ -111,7 +111,6 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 ## Cross-cutting themes
 
 Recurring observations collected as steps complete; consumed by X1.
-
 - **Error-type consistency at SDK boundaries** (S1): non-streaming
   `messages()` returns `anyhow::Error` while the streaming path returns
   structured `ClientError`. Check both SDKs standardize on a structured
@@ -166,6 +165,20 @@ Recurring observations collected as steps complete; consumed by X1.
   `AgentEnv::new()` reads cwd/HOME/FS/`Utc::now()` directly; tests can't
   isolate it. Recurs with the wall-clock theme; a context/env seam would
   help testability across the binary too.
+- **Dependency graph drift vs. CLAUDE.md** (AG1, CRITICAL): `aj-agent`
+  depends on `aj-conf` (`AgentEnv`, `ConfigThinkingLevel`), but the stated
+  graph says the runtime depends only on `aj-models`. X1 must verify every
+  edge against the doc and decide: move the shared config types down, or
+  update the graph.
+- **Runtime trusts provider terminal blindly** (AG1): the agent treats a
+  provider `Done` as a complete turn with no re-classification, so the
+  four-provider truncation bug lands on the transcript. Pairs with the
+  truncation theme above; the fix likely needs a runtime-side guard.
+- **Dead declared surface in the event taxonomy** (AG1): `TurnEnd`,
+  `QueueUpdate`, `ToolExecutionUpdate` are never emitted; `AgentEnd.messages`
+  always empty despite its doc. Sibling of the test-only-`pub` theme.
+- **Manifest/edition drift** (AG1): `aj-agent` pins `edition = "2021"`
+  against a 2024 workspace. Sweep all crate manifests in X1.
 - **Happy-path-only roundtrip coverage** (M3, M4): confirmed across all
   provider roundtrip suites; the truncation Major lives in an untested path.
 - **Test-only `pub` items widen the surface** (M3, M4): widest locus is
@@ -186,3 +199,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · M4 models-openai · 0C/2Ma/5Mi/3N · d93f242
 - 2026-06-02 · M5 models-auth · 0C/2Ma/5Mi/4N · cf14db6
 - 2026-06-02 · C1 conf · 0C/2Ma/5Mi/3N · 5a9eec6
+- 2026-06-02 · AG1 agent-runtime · 1C/3Ma/4Mi/3N · 2f5dfd0
