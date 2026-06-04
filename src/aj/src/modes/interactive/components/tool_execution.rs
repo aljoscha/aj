@@ -202,6 +202,11 @@ pub struct ToolExecutionComponent {
     /// the compact head/tail-truncated form. Toggled globally by
     /// the event pump in response to `aj.tools.expand`.
     expanded: bool,
+    /// Whether to render only the header line, with no bubble,
+    /// background, or body. Set when this tool call lives inside a
+    /// sub-agent box, whose own background paints behind it.
+    /// Orthogonal to [`Self::expanded`].
+    header_only: bool,
     /// Bg-paint closure for the in-flight state. Stored once at
     /// construction so the render path never has to rebuild the
     /// closure.
@@ -297,6 +302,7 @@ impl ToolExecutionComponent {
             last_details: None,
             last_is_error: false,
             expanded,
+            header_only: false,
             bg_pending: Arc::clone(&theme.tool_pending_bg),
             bg_success: Arc::clone(&theme.tool_success_bg),
             bg_error: Arc::clone(&theme.tool_error_bg),
@@ -388,6 +394,17 @@ impl ToolExecutionComponent {
             self.body = render_details_body(&details, self.expanded);
             self.rebuild_children();
         }
+    }
+
+    /// Render only the header line (no bubble, no background, no body).
+    /// Used when this tool call lives inside a sub-agent box, whose own
+    /// background paints behind it. Orthogonal to `expanded`.
+    pub fn set_header_only(&mut self, value: bool) {
+        if self.header_only == value {
+            return;
+        }
+        self.header_only = value;
+        self.invalidate();
     }
 
     /// Render the header line (`status tool(args)`). Kept private
@@ -491,6 +508,13 @@ impl Component for ToolExecutionComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
+        // Header-only mode: just the wrapped header line, no bubble
+        // or background, so the tool composes inside the sub-agent
+        // box's own painted background.
+        if self.header_only {
+            return wrap_text_with_ansi(&self.header_line(), width.max(1));
+        }
+
         // Tiny widths drop into a degraded "render plain" path so
         // the strict line-width check in `Tui::render` doesn't
         // trip on the bg-padding pipeline. Headless and zero-width
@@ -841,6 +865,86 @@ mod tests {
         assert!(header_trimmed.starts_with("…"), "{header_trimmed:?}");
         assert!(header_trimmed.contains("read_file"));
         assert!(header_trimmed.contains("path=\"/tmp/foo.txt\""));
+    }
+
+    #[test]
+    fn header_only_renders_just_the_header_without_bubble_or_body() {
+        let args = serde_json::json!({"path": "/tmp/foo.txt"});
+        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), true);
+        c.update_result(
+            &ToolDetails::Text {
+                summary: "/tmp/foo.txt".into(),
+                body: "secret body line".into(),
+            },
+            &[],
+            false,
+        );
+        c.set_header_only(true);
+        let lines = c.render(80);
+        // No bg-painted blank padding rows: the first row carries the
+        // header glyph rather than being blank.
+        assert!(!is_blank_row(&lines[0]), "{:?}", lines[0]);
+        let first_trimmed = strip_ansi(&lines[0]);
+        let first_trimmed = first_trimmed.trim_start();
+        assert!(
+            first_trimmed.starts_with('✓')
+                || first_trimmed.starts_with('…')
+                || first_trimmed.starts_with('✗'),
+            "{first_trimmed:?}",
+        );
+        let joined = lines.iter().map(|l| strip_ansi(l)).collect::<String>();
+        assert!(joined.contains("read_file"), "{joined:?}");
+        assert!(joined.contains("/tmp/foo.txt"), "{joined:?}");
+        // The body text must not leak into the header-only render.
+        assert!(!joined.contains("secret body line"), "{joined:?}");
+    }
+
+    #[test]
+    fn toggling_header_only_off_restores_the_bubble() {
+        let args = serde_json::json!({"path": "/tmp/foo.txt"});
+        let mut c = ToolExecutionComponent::new("read_file".to_string(), &args, &theme(), true);
+        c.set_header_only(true);
+        // Header-only: first row is the header, not a blank pad.
+        assert!(!is_blank_row(&c.render(80)[0]));
+        // Flipping back restores the bubble's blank top/bottom pads.
+        c.set_header_only(false);
+        let lines = c.render(80);
+        assert!(is_blank_row(&lines[0]));
+        assert!(is_blank_row(lines.last().expect("non-empty render")));
+        let header_trimmed = strip_ansi(&lines[1]);
+        let header_trimmed = header_trimmed.trim_start();
+        assert!(header_trimmed.starts_with('…'), "{header_trimmed:?}");
+        assert!(header_trimmed.contains("read_file"));
+    }
+
+    #[test]
+    fn header_only_rows_never_exceed_width() {
+        // A long args summary plus a long body must still wrap to fit
+        // the render width in the header-only path; nothing should
+        // exceed `width`.
+        let args = serde_json::json!({
+            "command": "echo hi",
+            "description": "x".repeat(200),
+        });
+        let mut c = ToolExecutionComponent::new("bash".to_string(), &args, &theme(), true);
+        c.update_result(
+            &ToolDetails::Text {
+                summary: String::new(),
+                body: "y".repeat(300),
+            },
+            &[],
+            false,
+        );
+        c.set_header_only(true);
+        let width = 60;
+        let lines = c.render(width);
+        for (i, line) in lines.iter().enumerate() {
+            let w = visible_width(line);
+            assert!(
+                w <= width,
+                "line {i} exceeds width: {w} > {width}: {line:?}"
+            );
+        }
     }
 
     #[test]
