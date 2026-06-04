@@ -96,7 +96,7 @@ Severity columns: **C**ritical / **Ma**jor / **Mi**nor / **N**it.
 
 | Step | Unit | Status | C | Ma | Mi | N | Findings | Commit |
 |---|---|---|---|---|---|---|---|---|
-| A1 | aj-cli | TODO | – | – | – | – | – | – |
+| A1 | aj-cli | Done | 0 | 2 | 4 | 2 | [aj-cli](findings/aj-cli.md) | aaefc43 |
 | A2 | aj-core | TODO | – | – | – | – | – | – |
 | A3 | aj-interactive | TODO | – | – | – | – | – | – |
 | A4 | aj-components | TODO | – | – | – | – | – | – |
@@ -208,6 +208,19 @@ Recurring observations collected as steps complete; consumed by X1.
   rendered viewport (not internals), with strong edge/regression coverage.
   Hold up as the model for the "happy-path-only" gaps seen elsewhere
   (M3/M4 roundtrips, C1, auth).
+- **Documented contract advertised but not owned/implemented** (C1, A1):
+  C1's precedence doc overstated; A1's `@file` expansion is a **stub**
+  (`cli/file_args.rs` returns input unchanged) yet CLAUDE.md + four docs
+  advertise it, and it's only wired into print mode. Treat doc-vs-behavior
+  gaps as first-class findings.
+- **Scattered precedence merge / no agent-startup seam** (C1, TO1, A1):
+  the CLI>env>config overlay is hand-copied across 5 sites and the
+  disabled-tools filter across 3, already diverging. The binary lacks a
+  single "build agent startup inputs" seam. Strong X1 candidate.
+- **Secrets handling CONFIRMED clean in the binary** (A1): `--api-key`
+  never persisted/logged; `auth.rs` renders only method/source labels;
+  clipboard copies the public OAuth URL, not tokens. (M5's leak is the
+  lone outstanding secrets issue.)
 - **Concurrency / single-writer guard** (SE1, NEW): two `aj continue <id>`
   processes interleave JSONL lines and mint colliding entry ids,
   corrupting the parent chain. No file lock. Check the binary (A2/A3)
@@ -289,3 +302,4 @@ One line per completed step (most recent last).
 - 2026-06-02 · T3 tui-editor · 0C/1Ma/5Mi/4N · c477c5a
 - 2026-06-02 · T4 tui-components · 0C/2Ma/5Mi/4N · 94e21ea
 - 2026-06-02 · T5 tui-tests · 0C/1Ma/5Mi/3N · b76044a
+- 2026-06-02 · A1 aj-cli · 0C/2Ma/4Mi/2N · aaefc43
