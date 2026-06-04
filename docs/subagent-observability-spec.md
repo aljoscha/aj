@@ -116,7 +116,8 @@ the loader refcount, or persistence.
 
 **Non-goals**: nested sub-agents (still one level); changing what the
 parent model sees; changing the wire/persistence format; steering a
-sub-agent from the picker (observe-only).
+sub-agent from the picker (observe-only — superseded by
+`docs/subagent-steering-spec.md`).
 
 ---
 
