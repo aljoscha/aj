@@ -75,40 +75,41 @@ struct AgentRender {
 /// The pump owns no view state of its own — every component lives
 /// inside the `Tui`'s slot tree. It tracks per-agent streaming
 /// metadata ([`AgentRender`]) so streaming events reach the right
-/// widget, the in-flight-agent set that drives the working spinner,
-/// and the running sub-agent count behind the footer indicator.
+/// widget, and the in-flight-agent set that the per-view spinner,
+/// the footer indicator, and per-box status all derive from.
 pub struct EventPump {
     theme: ChatTheme,
     /// Per-agent streaming bookkeeping, keyed by [`AgentId`].
     agents: HashMap<AgentId, AgentRender>,
-    /// Identifiers of agents that have emitted [`AgentEvent::AgentStart`]
-    /// without a matching [`AgentEvent::AgentEnd`] yet.
+    /// The literal set of agents that have emitted
+    /// [`AgentEvent::AgentStart`] without a matching
+    /// [`AgentEvent::AgentEnd`] yet — the single source of truth
+    /// for "what is running".
     ///
-    /// Sub-agents share the parent's bus and emit their own
-    /// `AgentStart` / `AgentEnd` pair, so a single main turn that
-    /// spawns sub-agents produces nested events on this listener.
-    /// The set is the refcount that decides when the working
-    /// spinner runs: the loader starts on the 0→1 transition and
-    /// stops on the 1→0 transition, so the spinner is visible for
-    /// the entire span between the *first* `AgentStart` and the
-    /// *last* `AgentEnd`, regardless of how the events nest.
+    /// `AgentStart` inserts; `AgentEnd` removes; the pump never
+    /// special-cases [`AgentId::Main`]. Under concurrency a main
+    /// turn can legitimately start or end while a sub-agent turn
+    /// runs, so no agent's lifecycle may touch another's entry.
     ///
-    /// Main's `AgentEnd` is additionally treated as authoritative:
-    /// when it fires, the set is drained and the loader stops even
-    /// if a sub-agent's `AgentEnd` was lost. This is sound because
-    /// `Agent::run_top_level_turn` only emits Main's `AgentEnd`
-    /// after every spawned sub-agent's future has been awaited (or
-    /// dropped); anything still in the set at that point is a
-    /// stale entry, not a sub-agent that's actually still running,
-    /// and waiting for its `AgentEnd` would pin the spinner
-    /// (and the render loop) forever on an idle session.
+    /// Three things derive from this set:
+    /// - the per-view spinner ([`Self::sync_loader`]) — active iff
+    ///   the *viewed* agent is in the set, so a leaked entry can
+    ///   never pin the spinner of an idle view;
+    /// - the aggregate footer indicator
+    ///   ([`Self::sync_agent_indicator`]) — the count of running
+    ///   `Sub(_)` ids, so background activity stays visible while
+    ///   viewing an idle agent;
+    /// - per-box status (`Running` on `AgentStart(Sub n)`, `Done`
+    ///   on `AgentEnd(Sub n)`), which is what flips a re-prompted
+    ///   box back through `Running`→`Done`.
+    ///
+    /// Leak draining (a dropped `AgentEnd(Sub n)` from a cancelled
+    /// initial spawn) is the *binary's* responsibility on
+    /// main-turn completion via [`Self::mark_idle`]: only the
+    /// binary knows which running subs are independent
+    /// continuations versus nested initial spawns. The pump keeps
+    /// this set as literal truth.
     running_agents: HashSet<AgentId>,
-    /// Count of sub-agents currently running, tracked off the
-    /// [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
-    /// correlation events. Drives the footer's `N agent(s) (key)`
-    /// indicator. Reset to zero on the main agent's lifecycle
-    /// boundaries so a dropped `SubAgentEnd` can't pin the count.
-    running_sub_agents: usize,
     /// Shared session-wide render settings (tool expansion,
     /// thinking-block fold, inline-image rendering). Cloned into
     /// every assistant / tool component the pump creates so they
@@ -145,7 +146,6 @@ impl EventPump {
             theme,
             agents: HashMap::new(),
             running_agents: HashSet::new(),
-            running_sub_agents: 0,
             render_settings,
             footer_data: FooterData::new(context_window),
         }
@@ -165,10 +165,17 @@ impl EventPump {
     /// Push the running-sub-agent indicator into the [`Footer`].
     /// Shows `N agent(s) (key)` while at least one sub-agent runs,
     /// where `key` is the resolved `aj.agent.open` shortcut; clears
-    /// the indicator when none are running.
+    /// the indicator when none are running. The count is derived
+    /// from `running_agents` (every running `Sub(_)` id) so it
+    /// stays an aggregate regardless of the active view.
     fn sync_agent_indicator(&self, tui: &mut Tui) {
-        let activity = (self.running_sub_agents > 0).then(|| AgentActivity {
-            running: self.running_sub_agents,
+        let running = self
+            .running_agents
+            .iter()
+            .filter(|a| matches!(a, AgentId::Sub(_)))
+            .count();
+        let activity = (running > 0).then(|| AgentActivity {
+            running,
             open_hint: agent_picker_hint(),
         });
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
@@ -254,8 +261,42 @@ impl EventPump {
         if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
             chat.set_active(id);
         }
+        // The spinner is scoped to the viewed agent, so a view
+        // switch must immediately reflect the new agent's running
+        // state.
+        self.sync_loader(tui);
         tui.invalidate();
         tui.request_render();
+    }
+
+    /// Whether `id` is currently running (membership in the
+    /// authoritative `running_agents` set).
+    pub fn is_running(&self, id: AgentId) -> bool {
+        self.running_agents.contains(&id)
+    }
+
+    /// Snapshot of every agent currently in the running set. The
+    /// binary iterates this to reconcile leaked nested sub-agents
+    /// on main-turn completion; order is unspecified.
+    pub fn running_agents(&self) -> Vec<AgentId> {
+        self.running_agents.iter().copied().collect()
+    }
+
+    /// Force `id` out of the running set, reconciling everything
+    /// derived from it (per-view spinner, footer count, box
+    /// status). Idempotent w.r.t. an `AgentEnd` the pump already
+    /// processed. The binary calls this on main-turn completion to
+    /// drain a leaked sub-agent whose `AgentEnd` never arrived.
+    pub fn mark_idle(&mut self, tui: &mut Tui, id: AgentId) {
+        self.running_agents.remove(&id);
+        if let AgentId::Sub(n) = id
+            && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            && let Some(b) = chat.sub_box_mut(n)
+        {
+            b.set_status(SubAgentStatus::Done);
+        }
+        self.sync_loader(tui);
+        self.sync_agent_indicator(tui);
     }
 
     /// Dispatch one [`AgentEvent`] onto `tui`'s slot tree. Returns
@@ -265,42 +306,31 @@ impl EventPump {
     /// events that mutate visible state).
     pub fn handle(&mut self, tui: &mut Tui, event: &AgentEvent) {
         match event {
-            // ---- Lifecycle: start / stop the working spinner. ----
+            // ---- Lifecycle: drive the per-view spinner. ----
             //
-            // Sub-agents share the parent's bus and emit their own
-            // `AgentStart` / `AgentEnd` bracket inside the main
-            // agent's turn, so we can't naively start/stop the
-            // loader on each event — a sub-agent's `AgentEnd` would
-            // otherwise turn the spinner off while the main turn is
-            // still mid-execution. Track the set of in-flight agents
-            // instead and only start/stop on the boundary
-            // transitions.
+            // `running_agents` is the literal set of in-flight
+            // agents: `AgentStart` inserts, `AgentEnd` removes, no
+            // agent's lifecycle touches another's entry. The single
+            // status-slot spinner is scoped to the *viewed* agent
+            // ([`Self::sync_loader`]), so a sub-agent's lifecycle
+            // can't toggle the spinner of an unrelated view.
             AgentEvent::AgentStart { agent_id } => {
-                // A top-level `AgentStart(Main)` is a hard resync
-                // point: any state left over from a previous turn
-                // (e.g. a sub-agent whose `AgentEnd` never made it
-                // through because the agent task panicked) would
-                // otherwise pin the loader / the footer indicator
-                // on forever, so we drop the stale set before
-                // inserting.
-                if *agent_id == AgentId::Main {
-                    self.running_agents.clear();
-                    if self.running_sub_agents != 0 {
-                        self.running_sub_agents = 0;
-                        self.sync_agent_indicator(tui);
-                    }
-                }
-                let was_idle = self.running_agents.is_empty();
                 self.running_agents.insert(*agent_id);
-                if was_idle {
-                    self.with_loader(tui, |l| l.start());
+                // A continuation re-prompt emits no `SubAgentStart`,
+                // so `AgentStart(Sub n)` is what flips a re-prompted
+                // box back to `Running`. Defensive: skip when the
+                // box doesn't exist yet.
+                if let AgentId::Sub(n) = agent_id
+                    && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                    && let Some(b) = chat.sub_box_mut(*n)
+                {
+                    b.set_status(SubAgentStatus::Running);
                 }
+                self.sync_loader(tui);
+                self.sync_agent_indicator(tui);
             }
             AgentEvent::AgentEnd { agent_id, .. } => {
-                let was_present = self.running_agents.remove(agent_id);
-                if was_present && self.running_agents.is_empty() {
-                    self.with_loader(tui, |l| l.stop());
-                }
+                self.running_agents.remove(agent_id);
                 // Each agent owns its streaming bookkeeping, so an
                 // agent's end clears only its own entry; the main
                 // agent's pending `agent` tool call (whose body is a
@@ -309,23 +339,14 @@ impl EventPump {
                     state.current_assistant = None;
                     state.tool_index.clear();
                 }
-                // Main's end is the authoritative "agent activity has
-                // stopped" signal. Drain any leaked sub-agent ids and
-                // reset the indicator: by the time Main's `AgentEnd`
-                // fires, every sub-agent's future has been driven to
-                // completion or dropped, so a lingering entry is
-                // stale. Without this the loader's animation pump
-                // keeps requesting renders on an idle session.
-                if *agent_id == AgentId::Main {
-                    if !self.running_agents.is_empty() {
-                        self.running_agents.clear();
-                        self.with_loader(tui, |l| l.stop());
-                    }
-                    if self.running_sub_agents != 0 {
-                        self.running_sub_agents = 0;
-                        self.sync_agent_indicator(tui);
-                    }
+                if let AgentId::Sub(n) = agent_id
+                    && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                    && let Some(b) = chat.sub_box_mut(*n)
+                {
+                    b.set_status(SubAgentStatus::Done);
                 }
+                self.sync_loader(tui);
+                self.sync_agent_indicator(tui);
             }
             AgentEvent::TurnStart { agent_id } => {
                 // Each new turn starts with a fresh assistant
@@ -438,23 +459,22 @@ impl EventPump {
 
             // ---- Sub-agent boxes. ----
             AgentEvent::SubAgentStart { child, task, .. } => {
-                if let AgentId::Sub(n) = child {
-                    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
-                        chat.ensure_sub_box(*n, task);
-                    }
-                    self.running_sub_agents += 1;
-                    self.sync_agent_indicator(tui);
+                if let AgentId::Sub(n) = child
+                    && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                {
+                    // Create the box (initial `Running`) + the
+                    // persistence anchor. The footer count and the
+                    // box's running status come from the paired
+                    // `AgentStart(Sub n)`, not from here.
+                    chat.ensure_sub_box(*n, task);
                 }
             }
             AgentEvent::SubAgentEnd { child, .. } => {
-                if let AgentId::Sub(n) = child {
-                    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
-                        && let Some(b) = chat.sub_box_mut(*n)
-                    {
-                        b.set_status(SubAgentStatus::Done);
-                    }
-                    self.running_sub_agents = self.running_sub_agents.saturating_sub(1);
-                    self.sync_agent_indicator(tui);
+                if let AgentId::Sub(n) = child
+                    && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                    && let Some(b) = chat.sub_box_mut(*n)
+                {
+                    b.set_status(SubAgentStatus::Done);
                 }
             }
 
@@ -471,6 +491,21 @@ impl EventPump {
     }
 
     // ---- Helpers ---------------------------------------------------------
+
+    /// Drive the status-slot loader to reflect the *viewed* agent's
+    /// activity: active iff the active view's agent is in
+    /// `running_agents`. Only toggles on a genuine edge —
+    /// `Loader::start` resets the frame clock, so calling it on
+    /// every event would jitter the animation.
+    fn sync_loader(&self, tui: &mut Tui) {
+        let active = self.active_view(tui);
+        let should_run = self.running_agents.contains(&active);
+        self.with_loader(tui, |l| match (should_run, l.is_active()) {
+            (true, false) => l.start(),
+            (false, true) => l.stop(),
+            _ => {}
+        });
+    }
 
     /// Mutate the [`LoaderStatus`] component in the status slot.
     /// Centralised so callers don't repeat the slot/container
@@ -1554,14 +1589,12 @@ mod tests {
     #[test]
     fn nested_subagent_lifecycle_keeps_loader_running_until_main_ends() {
         // The loader's only periodic source of `request_render`
-        // calls is its animation pump. If a sub-agent run's
-        // `AgentStart` / `AgentEnd` events drop the loader while
-        // the main turn is still in flight, the user loses the
-        // spinner for the resume — and conversely, an off-by-one
-        // in the lifecycle leaves the pump running indefinitely
-        // and the render loop pegged at the 80 ms tick rate.
-        // Pin the expected behaviour: the loader stays active
-        // through nested events and only stops on the main agent's
+        // calls is its animation pump. The status spinner is scoped
+        // to the *viewed* agent; the default view is Main, so while
+        // the main turn runs the spinner stays on regardless of a
+        // sub-agent starting and ending inside it. Pin that: viewing
+        // Main, the loader is active from Main's `AgentStart` through
+        // the nested sub start/end and only stops on Main's
         // `AgentEnd`.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
 
@@ -1628,11 +1661,11 @@ mod tests {
 
     #[test]
     fn unmatched_subagent_end_does_not_stop_the_loader() {
-        // Defensive: a stray `AgentEnd` event for a sub-agent we
-        // never saw start (in practice this shouldn't happen, but
-        // the bus is the only source of ordering and any
-        // out-of-order event must not leave the loader in a state
-        // that contradicts the main agent's true running status).
+        // Defensive: a stray `AgentEnd` for a sub-agent we never saw
+        // start removes only that (absent) id from the set, so the
+        // viewed Main agent stays running and its spinner stays on.
+        // Per-view scoping means an unrelated sub's lifecycle can
+        // never toggle the Main view's spinner.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         pump.handle(
             &mut tui,
@@ -1659,21 +1692,20 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_end_drains_leaked_subagents_and_stops_loader() {
-        // Authoritative-end contract: when the main agent emits
-        // `AgentEnd`, the loader must stop even if a sub-agent's
+    fn main_end_stops_loader_when_viewing_main_despite_leaked_sub() {
+        // Per-view scoping: the status spinner reflects the *viewed*
+        // agent. The default active view is Main, so Main's
+        // `AgentEnd` turns the spinner off even though a sub-agent's
         // own `AgentEnd` was dropped earlier in the turn (typical
         // cause: the parent's `spawn_agent` future was cancelled
-        // mid-await, so `Agent::run_single_turn` was dropped at
-        // `run_single_turn_inner.await` and the `AgentEnd` emit
-        // on the following line never fired).
+        // mid-await, so the sub's `AgentEnd` emit never fired).
         //
-        // Regression for a CPU-pegging bug observed on a long
-        // idle session: a stale sub-agent ID kept `running_agents`
-        // non-empty after the main turn ended, the loader stayed
-        // active, and its animation pump kept calling
-        // `request_render` every 80 ms forever — pinning one CPU
-        // core through `Tui::render` over a ~25k-line scrollback.
+        // The pump keeps `running_agents` as literal truth: the
+        // leaked `Sub(1)` is *still* in the set after Main's end.
+        // Reconciling it is the binary's job on main-turn completion
+        // (it drains running subs it isn't independently driving via
+        // `mark_idle`), not the pump's — so the spinner-off here is
+        // purely the per-view scoping, not a drain.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
 
         fn is_loader_active(tui: &mut Tui) -> bool {
@@ -1711,19 +1743,24 @@ mod tests {
 
         assert!(
             !is_loader_active(&mut tui),
-            "loader must stop on Main's AgentEnd even with a leaked \
-             sub-agent — otherwise the animation pump pegs CPU on \
-             an idle session"
+            "loader must stop on Main's AgentEnd while viewing Main: \
+             the spinner is scoped to the viewed agent",
+        );
+        assert!(
+            pump.is_running(AgentId::Sub(1)),
+            "the leaked sub stays in the set: the binary, not the \
+             pump, reconciles it on main-turn completion",
         );
     }
 
     #[test]
     fn second_main_turn_recovers_loader_after_a_leaked_subagent() {
-        // Defence-in-depth: even with the authoritative-end fix,
-        // exercise the next-turn path so a future regression that
-        // weakens the AgentEnd handler is still caught by the
-        // top-level resync at AgentStart{Main} (which clears the
-        // stale set unconditionally).
+        // Per-view scoping holds across turns: with the default view
+        // on Main, the status spinner tracks Main's running state
+        // regardless of a leaked sub still lingering in the set. A
+        // second main turn drives the spinner on/off cleanly because
+        // it is keyed on Main's own `AgentStart`/`AgentEnd`, not on
+        // the (still non-empty) set as a whole.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
 
         fn is_loader_active(tui: &mut Tui) -> bool {
@@ -1756,19 +1793,17 @@ mod tests {
                 messages: Vec::new(),
             },
         );
-        // Main's `AgentEnd` is authoritative: even with the leaked
-        // sub still in the set when it fires, the loader stops.
+        // Viewing Main, which is now idle: the spinner stops even
+        // though the leaked sub is still in the set.
         assert!(
             !is_loader_active(&mut tui),
-            "loader stops on Main's AgentEnd; the leaked sub's stale \
-             entry is drained as part of that handler"
+            "loader stops when the viewed Main agent ends, per-view scoping",
         );
 
-        // Turn 2: a fresh `AgentStart(Main)` is also a resync point.
-        // The `running_agents.clear()` on Main's start is now a
-        // belt-and-suspenders guard (Main's End above already
-        // drained the set); the start/stop cycle of the new turn
-        // still transitions cleanly through it.
+        // Turn 2: a fresh `AgentStart(Main)` makes Main running
+        // again; the spinner follows the viewed agent on, then off
+        // on Main's end. The leaked `Sub(3)` never affects the Main
+        // view's spinner.
         pump.handle(
             &mut tui,
             &AgentEvent::AgentStart {
@@ -1787,6 +1822,208 @@ mod tests {
             !is_loader_active(&mut tui),
             "second main turn ends with the loader stopped",
         );
+    }
+
+    /// Shared loader-state probe for the per-view spinner tests.
+    fn loader_active(tui: &mut Tui) -> bool {
+        tui.get_mut_as::<Container>(SlotIndex::Status.idx())
+            .expect("status slot")
+            .get_mut_as::<LoaderStatus>(0)
+            .expect("loader status")
+            .is_active()
+    }
+
+    #[test]
+    fn spinner_follows_viewed_agent() {
+        // The status spinner reflects the *viewed* agent, not global
+        // activity. With Main idle and only `Sub(1)` running, the
+        // spinner is on iff the sub is the active view; switching
+        // back to the idle Main turns it off; and once the sub ends,
+        // viewing it shows no spinner.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        // Create the sub box, then start its turn (sub running).
+        pump.handle(
+            &mut tui,
+            &AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "explore".into(),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+
+        // Viewing Main (the default): Main isn't running, so off.
+        assert!(
+            !loader_active(&mut tui),
+            "viewing the idle Main agent, the spinner must be off \
+             even though a sub is running",
+        );
+
+        // Switch to the running sub: spinner on.
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        assert!(
+            loader_active(&mut tui),
+            "viewing the running sub, the spinner must be on",
+        );
+
+        // Back to idle Main: off again.
+        pump.set_active_view(&mut tui, AgentId::Main);
+        assert!(!loader_active(&mut tui));
+
+        // The sub finishes; viewing it now shows no spinner.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        assert!(
+            !loader_active(&mut tui),
+            "viewing the finished sub, the spinner must be off",
+        );
+    }
+
+    #[test]
+    fn footer_count_is_aggregate_across_running_subs() {
+        // The footer's `N agent(s)` indicator is an aggregate over
+        // running `Sub(_)` ids — independent of the active view — so
+        // background activity stays visible while viewing an idle
+        // agent.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        for n in [1usize, 2] {
+            pump.handle(
+                &mut tui,
+                &AgentEvent::SubAgentStart {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(n),
+                    task: format!("task {n}"),
+                },
+            );
+            pump.handle(
+                &mut tui,
+                &AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(n),
+                },
+            );
+        }
+
+        // Viewing Main: the aggregate still reads two.
+        assert!(
+            rendered_footer(&mut tui).contains("2 agents"),
+            "footer should aggregate both running subs; got {:?}",
+            rendered_footer(&mut tui),
+        );
+
+        // Switching the view doesn't change the aggregate.
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        assert!(
+            rendered_footer(&mut tui).contains("2 agents"),
+            "footer count is view-independent; got {:?}",
+            rendered_footer(&mut tui),
+        );
+    }
+
+    #[test]
+    fn mark_idle_removes_agent_and_stops_spinner_when_viewed() {
+        // `mark_idle` is the binary's reconciliation hook: it forces
+        // an agent out of the running set and reconciles everything
+        // derived from it. While viewing that agent the spinner must
+        // stop, and `is_running` must report `false`.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        assert!(loader_active(&mut tui), "viewing the running sub: on");
+
+        pump.mark_idle(&mut tui, AgentId::Sub(1));
+        assert!(
+            !loader_active(&mut tui),
+            "mark_idle stops the spinner of the viewed agent",
+        );
+        assert!(
+            !pump.is_running(AgentId::Sub(1)),
+            "mark_idle removes the agent from the running set",
+        );
+    }
+
+    #[test]
+    fn continuation_restarts_then_finishes_box_status() {
+        // A continuation re-prompt emits no `SubAgentStart`/`End`, so
+        // the box status is driven purely by `AgentStart(Sub n)` →
+        // `Running` and `AgentEnd(Sub n)` → `Done`. Set up an
+        // initial spawn that finishes `Done`, then feed a fresh
+        // start/end pair and assert the box cycles `Running` → `Done`.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        let box_status = |tui: &mut Tui| -> SubAgentStatus {
+            tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                .expect("chat slot")
+                .sub_box_mut(1)
+                .expect("sub box")
+                .status()
+        };
+
+        // Initial spawn: box created, runs, finishes Done.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "explore".into(),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert_eq!(box_status(&mut tui), SubAgentStatus::Done);
+
+        // Continuation: a bare `AgentStart(Sub 1)` flips the box
+        // back to Running.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        assert_eq!(
+            box_status(&mut tui),
+            SubAgentStatus::Running,
+            "a fresh AgentStart re-runs the box",
+        );
+
+        // The continuation's `AgentEnd` flips it back to Done.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert_eq!(box_status(&mut tui), SubAgentStatus::Done);
     }
 
     #[test]
@@ -2025,25 +2262,21 @@ mod tests {
         );
     }
 
-    /// Runtime regression for the CPU-pegging bug the refcount fix
-    /// addresses. The four `#[test]`s above pin the bookkeeping
-    /// — `running_agents` transitions, `Loader::start` / `stop`
+    /// Runtime regression for a CPU-pegging bug: orphaned loader
+    /// animation pumps. The `#[test]`s above pin the bookkeeping
+    /// — `running_agents` membership, `Loader::start` / `stop`
     /// calls, `tool_index` lifetime — but they don't exercise the
     /// thing the user actually feels: the loader's animation pump
     /// spawning a fresh tokio task on every `Loader::start` and
     /// only cancelling it on the matching `stop`.
     ///
-    /// Old behaviour (sub-agent's `AgentEnd` calls `Loader::stop`
-    /// followed by the main turn's continuation re-triggering
-    /// `Loader::start`) would, over a session with many sub-agent
-    /// turns, leak animation pumps whose `request_render` ticks
-    /// kept the throttle saturated even when no visible work was
-    /// in flight. With the fix, `Loader::start` fires exactly once
-    /// per main turn (on the 0 → 1 transition of
-    /// `running_agents`) regardless of how many sub-agent starts /
-    /// ends nest inside it, so the render channel should be driven
-    /// at the loader's own 80 ms interval rather than at the
-    /// throttle's 16 ms cap.
+    /// Under per-view scoping with the default view on Main, a
+    /// nested sub-agent's `AgentStart`/`AgentEnd` never toggles the
+    /// Main-view spinner (Main stays running throughout), so
+    /// `Loader::start` fires exactly once per main turn regardless
+    /// of how many sub-agent starts / ends nest inside it. The
+    /// render channel should therefore be driven at the loader's
+    /// own 80 ms interval rather than at the throttle's 16 ms cap.
     ///
     /// The assertion below counts `TuiEvent::Render`s the
     /// throttle releases over a fixed window after many nested
@@ -2068,7 +2301,7 @@ mod tests {
         //
         //   Main start → Sub start → Sub end → Main end.
         //
-        // With the fix, this produces 100 paired
+        // Viewing Main, this produces 100 paired
         // `Loader::start` / `Loader::stop` calls and the same
         // number of animation-pump task spawns / cancellations
         // — but at any instant only one pump should be alive,
