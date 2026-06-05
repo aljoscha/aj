@@ -257,6 +257,21 @@ per-agent one:
           Ok((id, result)) => {
               turn_cancels.remove(&id);
               pump.mark_idle(&mut tui, id);     // reconcile (idempotent)
+              // Main-turn completion bounds every *nested* initial
+              // spawn it started: those sub-agents are done (or their
+              // run was dropped on cancel). Drain any still marked
+              // running that the binary is NOT independently driving
+              // (∉ turn_cancels) so a leaked sub-agent can't pin the
+              // footer/spinner. Independent continuations are in
+              // turn_cancels and survive. This is the concurrency-safe
+              // replacement for the old "Main AgentEnd drains all subs".
+              if id == AgentId::Main {
+                  for sub in pump.running_agents() {
+                      if matches!(sub, AgentId::Sub(_)) && !turn_cancels.contains_key(&sub) {
+                          pump.mark_idle(&mut tui, sub);
+                      }
+                  }
+              }
               sync_editor_enabled(&mut tui, &pump, &turn_cancels, active_view);
               match result {
                   Ok(()) => {}
@@ -271,7 +286,10 @@ per-agent one:
   ```
 
   `join_next_or_pending` pends forever when the set is empty (mirrors the
-  current `task_done` helper).
+  current `task_done` helper). The Main-completion drain above is where
+  the old CPU-pegging leak fix (a dropped `AgentEnd(Sub n)` leaving the
+  loader's animation pump alive) now lives — concurrency-safe because it
+  only drains sub-agents the binary isn't driving.
 
 ### 4.3 Submit routing
 
@@ -429,15 +447,22 @@ no `SubAgentStart`/`SubAgentEnd`. `SubAgentStart` still creates the box
 + persistence anchor + initial `Running`; `SubAgentEnd` still carries
 the report.
 
-Add `pub fn is_running(&self, id: AgentId) -> bool` and `pub fn
-mark_idle(&mut self, tui, id)` (removes `id`, then `sync_loader`).
-`mark_idle` is the binary's belt-and-suspenders call when a turn task
-completes (idempotent w.r.t. the `AgentEnd` the pump already processed);
-it covers the rare case where a task ends without a clean `AgentEnd`
-(e.g. a spawn that failed before emitting). Leak protection that the
-removed heuristics used to provide is now covered by: reliable per-agent
-`AgentStart`/`AgentEnd` bracketing (one per `prompt`/`run_single_turn`),
-`mark_idle` on completion, and — for the spinner — per-view scoping.
+Add three accessors/mutators:
+- `pub fn is_running(&self, id: AgentId) -> bool` — membership in the set.
+- `pub fn running_agents(&self) -> Vec<AgentId>` — snapshot, so the
+  binary can reconcile leaked nested subs on Main-turn completion (§4.2).
+- `pub fn mark_idle(&mut self, tui, id)` — removes `id` from the set,
+  sets a `Sub(n)` box to `Done`, then `sync_loader` + `sync_agent_indicator`.
+  Idempotent w.r.t. the `AgentEnd` the pump already processed.
+
+The pump keeps `running_agents` as the **literal** truth from
+`AgentStart`/`AgentEnd`; it does not itself special-case Main. Leak
+protection (a dropped `AgentEnd(Sub n)` from a cancelled initial spawn)
+is the binary's job via the Main-completion drain in §4.2 — the binary
+is the only place that knows which running subs are independent
+continuations (in `turn_cancels`) versus nested initial spawns. For the
+spinner specifically, per-view scoping already prevents a leaked sub
+from pinning the Main view.
 
 ### 4.7 Persistence
 
