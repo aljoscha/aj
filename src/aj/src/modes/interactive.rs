@@ -24,13 +24,14 @@ pub mod layout;
 pub mod render_settings;
 pub mod shutdown;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::modes::interactive::components::chat_view::ChatView;
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentEvent, AgentId};
-use aj_agent::{Agent, TurnError};
+use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
 use aj_models::ThinkingConfig;
 use aj_models::auth::AuthStorage;
@@ -49,6 +50,7 @@ use aj_tui::tui::{OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, Tui, 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::SYSTEM_PROMPT;
@@ -605,6 +607,14 @@ impl InteractiveMode {
         // submit-handler spawns a task that holds it across an
         // `agent.prompt(...).await`.
         let mut log = Arc::new(TokioMutex::new(log));
+        // Shared sub-agent registry, injected once onto the main
+        // agent. The `Arc<TokioMutex<Agent>>` is never swapped
+        // (session changes reseed the agent in place), so this single
+        // injection survives `/resume` and `/new`. Kept in scope for
+        // the whole `run` body: the submit handler resolves turn
+        // targets through it.
+        let registry = SubAgentRegistry::default();
+        agent.set_sub_agent_registry(registry.clone());
         let agent = Arc::new(TokioMutex::new(agent));
         // Shared, mutable view of the on-disk config. Selector
         // outcomes (model / thinking, and future settings popups)
@@ -619,21 +629,13 @@ impl InteractiveMode {
         };
 
         // ---- Main event loop ------------------------------------------
-        // `running_task` holds the in-flight `agent.prompt(...)`
-        // future. We poll it concurrently with the TUI's input and
-        // render events; while it's running the editor's
-        // `disable_submit` flag is set so a second submission can't
-        // queue up before steering/follow-up land.
-        //
-        // `current_turn_cancel` holds the per-turn cancellation
-        // handle the binary owns. It's a clone of the same
-        // `CancellationToken` we passed to `agent.prompt` —
-        // `CancellationToken` is `Arc`-backed so cloning shares
-        // cancellation state. Ctrl+C while a turn is running fires
-        // this handle, which the agent's `execute_turn` `select!`s
-        // on; Ctrl+C while idle exits the program.
-        let mut running_task: Option<tokio::task::JoinHandle<Result<(), TurnError>>> = None;
-        let mut current_turn_cancel: Option<CancellationToken> = None;
+        // In-flight turns keyed by the agent running them. `JoinSet`
+        // gives completion-as-they-finish and preserves panic detection
+        // (`join_next` yields `Err(JoinError)`); `turn_cancels` holds the
+        // binary's clone of each turn's cancel token, and its key set is
+        // exactly "agents the binary is currently driving".
+        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
         let mut run_result: Result<()> = Ok(());
 
         // Slash commands like `/thinking` open an overlay selector.
@@ -655,60 +657,65 @@ impl InteractiveMode {
         > = None;
 
         loop {
-            // Build a future that resolves when the agent task
-            // finishes, or pends forever if no task is running.
-            // `tokio::task::JoinHandle: Future` so we can await it
-            // directly under the `tokio::select!` arm; using
-            // `&mut running_task` means we keep the same handle
-            // alive across multiple iterations until it completes.
-            let task_done = async {
-                match running_task.as_mut() {
-                    Some(handle) => handle.await,
-                    None => std::future::pending::<
-                        Result<Result<(), TurnError>, tokio::task::JoinError>,
-                    >()
-                    .await,
-                }
-            };
-
             tokio::select! {
                 biased;
 
                 // --- Agent run finished ---
-                join_outcome = task_done => {
-                    running_task = None;
-                    current_turn_cancel = None;
-                    set_editor_submit_enabled(&mut tui, true);
-                    match join_outcome {
-                        Ok(Ok(())) => {}
-                        Ok(Err(TurnError::Aborted)) => {
-                            // The agent has already emitted the
-                            // synthetic aborted `MessageEnd` and any
-                            // cancelled tool-result `MessageEnd`s, so
-                            // the chat scrollback is consistent.
-                            // Surface a brief notice so the user has
-                            // visible confirmation that Ctrl+C took
-                            // effect; the session stays alive.
-                            pump.handle(&mut tui, &notice_event("Turn cancelled."));
-                        }
-                        Ok(Err(TurnError::Recoverable(err))) => {
-                            // Surface to the user; the chat
-                            // container's notice line keeps the
-                            // session going. The agent's own
-                            // bus already wrote whatever
-                            // partial assistant message it
-                            // produced.
-                            pump.handle(
-                                &mut tui,
-                                &AgentEvent::Error {
-                                    agent_id: aj_agent::events::AgentId::Main,
-                                    text: format!("agent error: {err:#}"),
-                                },
-                            );
-                        }
-                        Ok(Err(TurnError::Fatal(err))) => {
-                            run_result = Err(err);
-                            break;
+                joined = join_next_or_pending(&mut turns) => {
+                    match joined {
+                        Ok((id, result)) => {
+                            turn_cancels.remove(&id);
+                            pump.mark_idle(&mut tui, id);
+                            // Main-turn completion bounds every nested
+                            // initial spawn it started. Drain any sub
+                            // still marked running that the binary is NOT
+                            // independently driving (∉ turn_cancels) so a
+                            // leaked sub-agent can't pin the
+                            // footer/spinner. Independent continuations
+                            // are in turn_cancels and survive.
+                            if id == AgentId::Main {
+                                for sub in pump.running_agents() {
+                                    if matches!(sub, AgentId::Sub(_))
+                                        && !turn_cancels.contains_key(&sub)
+                                    {
+                                        pump.mark_idle(&mut tui, sub);
+                                    }
+                                }
+                            }
+                            // Stage C: editor gating stays global (main-only).
+                            set_editor_submit_enabled(&mut tui, true);
+                            match result {
+                                Ok(()) => {}
+                                Err(TurnError::Aborted) => {
+                                    // The agent has already emitted the
+                                    // synthetic aborted `MessageEnd` and
+                                    // any cancelled tool-result
+                                    // `MessageEnd`s, so the chat scrollback
+                                    // is consistent. Surface a brief notice
+                                    // so the user has visible confirmation
+                                    // that Ctrl+C took effect; the session
+                                    // stays alive.
+                                    pump.handle(&mut tui, &notice_event("Turn cancelled."));
+                                }
+                                Err(TurnError::Recoverable(err)) => {
+                                    // Surface to the user; the chat
+                                    // container's notice line keeps the
+                                    // session going. The agent's own bus
+                                    // already wrote whatever partial
+                                    // assistant message it produced.
+                                    pump.handle(
+                                        &mut tui,
+                                        &AgentEvent::Error {
+                                            agent_id: id,
+                                            text: format!("agent error: {err:#}"),
+                                        },
+                                    );
+                                }
+                                Err(TurnError::Fatal(err)) => {
+                                    run_result = Err(err);
+                                    break;
+                                }
+                            }
                         }
                         Err(join_err) => {
                             run_result = Err(anyhow::anyhow!(
@@ -788,8 +795,8 @@ impl InteractiveMode {
                             //    turn. Signal cancel; the cancel-poll
                             //    below tears the dialog down and
                             //    aborts the task.
-                            // 3. Turn in flight (`current_turn_cancel`
-                            //    is `Some`): cancel the turn. The
+                            // 3. Turn in flight (the main agent is in
+                            //    `turn_cancels`): cancel the turn. The
                             //    cancel handle is the binary's clone
                             //    of the per-turn `CancellationToken`
                             //    we passed to `agent.prompt`; firing
@@ -813,7 +820,8 @@ impl InteractiveMode {
                                 } else if let Some(session) = login_session.as_ref() {
                                     session.cancel.store(true, Ordering::Relaxed);
                                     continue;
-                                } else if let Some(token) = current_turn_cancel.as_ref() {
+                                } else if let Some(token) = turn_cancels.get(&AgentId::Main) {
+                                    // Stage D: generalize to the viewed agent.
                                     token.cancel();
                                     continue;
                                 } else {
@@ -1041,7 +1049,7 @@ impl InteractiveMode {
                                     &theme,
                                     "/palette",
                                     None,
-                                    running_task.is_some(),
+                                    !turns.is_empty(),
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
@@ -1080,7 +1088,7 @@ impl InteractiveMode {
                                     &theme,
                                     "/history",
                                     None,
-                                    running_task.is_some(),
+                                    !turns.is_empty(),
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
@@ -1119,7 +1127,7 @@ impl InteractiveMode {
                                     &theme,
                                     "/agents",
                                     None,
-                                    running_task.is_some(),
+                                    !turns.is_empty(),
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
@@ -1205,7 +1213,7 @@ impl InteractiveMode {
                                                 &theme,
                                                 &follow_up.input,
                                                 Some(follow_up.parent_palette),
-                                                running_task.is_some(),
+                                                !turns.is_empty(),
                                             )
                                             .await
                                             {
@@ -1243,7 +1251,7 @@ impl InteractiveMode {
                                 // mid-turn settings changes go through the
                                 // palette/selectors, which never block on
                                 // the agent. `handle_slash_command` still
-                                // gets the live `running_task` state so it
+                                // gets the live in-flight-turn state so it
                                 // can refuse session-changing commands if
                                 // one ever reaches here mid-turn.
                                 if trimmed.starts_with('/') {
@@ -1265,7 +1273,7 @@ impl InteractiveMode {
                                         &theme,
                                         &trimmed,
                                         None,
-                                        running_task.is_some(),
+                                        !turns.is_empty(),
                                     ).await {
                                         SlashHandled::Continue { selector, notice } => {
                                             if let Some(text) = notice {
@@ -1280,7 +1288,7 @@ impl InteractiveMode {
                                     continue;
                                 }
 
-                                if running_task.is_some() {
+                                if turn_cancels.contains_key(&AgentId::Main) {
                                     // Already running a turn;
                                     // ignore the second submit.
                                     // Steering/follow-up queues
@@ -1298,21 +1306,24 @@ impl InteractiveMode {
                                     editor.add_to_history(&trimmed);
                                 }
                                 set_editor_submit_enabled(&mut tui, false);
-                                let agent_for_run = Arc::clone(&agent);
+                                let target = AgentId::Main; // Stage D: pump.active_view(&mut tui)
+                                let Some(handle) = resolve_agent(target, &agent, &registry)
+                                else {
+                                    continue;
+                                };
                                 let run_config_for_turn = Arc::clone(&run_config);
                                 // Mint a fresh per-turn cancellation
                                 // token. The binary keeps one clone in
-                                // `current_turn_cancel` so the Ctrl+C
-                                // arm can fire `.cancel()` without
-                                // locking the agent mutex; the spawned
-                                // task hands its own clone to
-                                // `agent.prompt`. Both clones share
-                                // cancellation state because the inner
-                                // is `Arc`-backed.
+                                // `turn_cancels` so the Ctrl+C arm can
+                                // fire `.cancel()` without locking the
+                                // agent mutex; the spawned task hands its
+                                // own clone to `agent.prompt`. Both clones
+                                // share cancellation state because the
+                                // inner is `Arc`-backed.
                                 let turn_cancel = CancellationToken::new();
-                                current_turn_cancel = Some(turn_cancel.clone());
-                                running_task = Some(tokio::spawn(async move {
-                                    let mut a = agent_for_run.lock().await;
+                                turn_cancels.insert(target, turn_cancel.clone());
+                                turns.spawn(async move {
+                                    let mut a = handle.lock().await;
                                     // Apply the loop-side run-config
                                     // snapshot before the turn so a
                                     // model / thinking change the user
@@ -1332,8 +1343,9 @@ impl InteractiveMode {
                                         );
                                         a.set_default_thinking(cfg.thinking.clone());
                                     }
-                                    a.prompt(trimmed, turn_cancel).await
-                                }));
+                                    let result = a.prompt(trimmed, turn_cancel).await;
+                                    (target, result)
+                                });
                             }
                         }
                     }
@@ -1372,13 +1384,11 @@ impl InteractiveMode {
             }
         }
 
-        // Give the spawned task a chance to wind down on shutdown.
+        // Give all in-flight turns a chance to wind down on shutdown.
         // We don't wait long: the user has already asked to quit,
-        // and the agent will be stopped by the dropped subscription.
-        if let Some(handle) = running_task {
-            handle.abort();
-            let _ = handle.await;
-        }
+        // and the agents will be stopped by the dropped subscriptions.
+        // `shutdown` aborts every task in the set and awaits them.
+        turns.shutdown().await;
 
         // Drop the watcher guard explicitly so its `Drop`
         // tears down the notify watcher before the runtime exits.
@@ -1439,6 +1449,36 @@ impl InteractiveMode {
 /// that as a transient blip and keeps the TUI alive.
 async fn recv_event(rx: &mut UnboundedReceiver<AgentEvent>) -> Option<AgentEvent> {
     rx.recv().await
+}
+
+/// Resolve an `AgentId` to its live handle: the main agent for
+/// `Main`, a retained sub-agent for `Sub(n)` (None if no live
+/// handle, e.g. a resumed sub-agent).
+fn resolve_agent(
+    id: AgentId,
+    main: &Arc<TokioMutex<Agent>>,
+    registry: &SubAgentRegistry,
+) -> Option<SharedAgent> {
+    match id {
+        AgentId::Main => Some(Arc::clone(main)),
+        AgentId::Sub(n) => registry.get(n),
+    }
+}
+
+/// Await the next completed turn, or pend forever when no turn is
+/// in flight (mirrors the old `task_done` future so the select arm
+/// stays simple).
+async fn join_next_or_pending(
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+) -> Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError> {
+    if turns.is_empty() {
+        std::future::pending().await
+    } else {
+        turns
+            .join_next()
+            .await
+            .expect("non-empty JoinSet yields Some")
+    }
 }
 
 /// Pull one [`Theme`] off the theme-watcher channel. Mirrors the
