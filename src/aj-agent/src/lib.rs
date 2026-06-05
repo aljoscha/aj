@@ -14,8 +14,9 @@ pub mod projection;
 pub mod tool;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use aj_conf::{AgentEnv, ConfigThinkingLevel};
@@ -137,6 +138,13 @@ pub struct Agent {
     /// later in the same thread restores image visibility for
     /// future turns. Set via [`Agent::set_block_images`].
     block_images: bool,
+    /// Shared registry into which this agent inserts each sub-agent it
+    /// spawns, keyed by `Sub(n)` index, so the handle outlives the
+    /// initial `agent` tool call. Default-empty; the binary injects a
+    /// shared instance onto the main agent via
+    /// [`Agent::set_sub_agent_registry`]. Sub-agents never read it
+    /// (they can't spawn), and one-shot callers leave it empty.
+    sub_agent_registry: SubAgentRegistry,
 }
 
 impl Agent {
@@ -211,6 +219,7 @@ impl Agent {
             after_tool_call: None,
             should_stop_after_turn: None,
             block_images: false,
+            sub_agent_registry: SubAgentRegistry::default(),
         }
     }
 
@@ -268,6 +277,17 @@ impl Agent {
     /// spawn time.
     pub fn set_block_images(&mut self, block: bool) {
         self.block_images = block;
+    }
+
+    /// Inject the shared sub-agent registry.
+    ///
+    /// The binary calls this on the main agent so the agent and the
+    /// binary share one map: the agent inserts each sub-agent on spawn
+    /// (see [`SessionContextWrapper::spawn_agent`]) and the binary
+    /// resolves handles to drive continuations. Sub-agents never need
+    /// one set — they can't spawn.
+    pub fn set_sub_agent_registry(&mut self, registry: SubAgentRegistry) {
+        self.sub_agent_registry = registry;
     }
 
     /// Subscribe an async listener to the agent's internal event
@@ -1493,10 +1513,65 @@ impl Agent {
             parent_agent_id: self.agent_id,
             cancellation: self.cancellation.child_token(),
             block_images: self.block_images,
+            sub_agent_registry: self.sub_agent_registry.clone(),
         };
 
         let outcome = (tool_def.func)(&mut session_ctx_wrapper, tool_input).await?;
         Ok(outcome)
+    }
+}
+
+/// A live, re-promptable agent handle shared between the runtime and
+/// the binary. Wrapping in a `tokio::sync::Mutex` lets a turn lock the
+/// agent across `.await` points while other agents run concurrently.
+pub type SharedAgent = Arc<tokio::sync::Mutex<Agent>>;
+
+/// Registry of retained sub-agents keyed by their `Sub(n)` index.
+///
+/// Cheaply cloneable; all clones share one map. The inner
+/// [`std::sync::Mutex`] guards only map lookups and inserts and is
+/// never held across `.await` — a `SharedAgent`'s own
+/// `tokio::sync::Mutex` is what callers lock to drive a turn.
+///
+/// The binary injects one instance onto the main agent so both share
+/// the same map: the main agent inserts each sub-agent on spawn and the
+/// binary resolves handles to drive continuations. Sub-agents never set
+/// one — they can't spawn, since the `agent` tool is filtered out of
+/// their toolset. Callers that never inject one (print mode, tests) get
+/// the default-empty registry; retained sub-agents then live for the
+/// lifetime of the owning `Agent` and drop with it.
+#[derive(Clone, Default)]
+pub struct SubAgentRegistry {
+    inner: Arc<StdMutex<BTreeMap<usize, SharedAgent>>>,
+}
+
+impl SubAgentRegistry {
+    /// Retain `agent` under key `n`. `Sub(n)` indices are minted
+    /// monotonically per session, so each key is inserted exactly once.
+    pub fn insert(&self, n: usize, agent: SharedAgent) {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .insert(n, agent);
+    }
+
+    /// Resolve the live handle for `Sub(n)`, if one is retained.
+    pub fn get(&self, n: usize) -> Option<SharedAgent> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .get(&n)
+            .cloned()
+    }
+
+    /// Retained sub-agent indices in ascending order.
+    pub fn ids(&self) -> Vec<usize> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .keys()
+            .copied()
+            .collect()
     }
 }
 
@@ -1607,6 +1682,11 @@ struct SessionContextWrapper<'a> {
     /// Parent's `image_block` setting; propagated to spawned
     /// sub-agents so the defense-in-depth gate stays uniform.
     block_images: bool,
+    /// Shared registry the parent agent uses to retain spawned
+    /// sub-agents. Cloned from the parent so [`Self::spawn_agent`]
+    /// inserts the new handle into the same map the binary resolves
+    /// continuations against.
+    sub_agent_registry: SubAgentRegistry,
 }
 
 impl<'a> ToolContext for SessionContextWrapper<'a> {
@@ -1699,10 +1779,20 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // streaming inference and tools.
             sub_agent.set_cancellation(self.cancellation.child_token());
 
-            let result = sub_agent.run_single_turn(task).await;
-
-            // Get the sub-agent's accumulated usage
-            let sub_agent_usage = sub_agent.session_state.accumulated_usage.clone();
+            // Retain the sub-agent in the shared registry, then run its
+            // initial turn through that handle. The handle stays in the
+            // registry after the run so the binary can drive later
+            // continuations; the parent's tool result is still the first
+            // report, so the `agent` tool contract is unchanged.
+            let shared: SharedAgent = Arc::new(tokio::sync::Mutex::new(sub_agent));
+            self.sub_agent_registry
+                .insert(agent_id, Arc::clone(&shared));
+            let (result, sub_agent_usage) = {
+                let mut guard = shared.lock().await;
+                let result = guard.run_single_turn(task).await;
+                let usage = guard.session_state.accumulated_usage.clone();
+                (result, usage)
+            };
 
             // Record the usage in the main session state
             self.session_ctx
@@ -3258,5 +3348,100 @@ mod event_protocol_tests {
             .run_single_turn("run ping".to_string())
             .await
             .expect("run_single_turn");
+    }
+
+    /// Minimal stand-in for the production `agent` builtin: forwards
+    /// the task to [`ToolContext::spawn_agent`] and reports the
+    /// sub-agent's id. Lets the retention test exercise the real
+    /// `spawn_agent` path without depending on `aj-tools`.
+    #[derive(Clone)]
+    struct SpawnTool;
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct SpawnInput {
+        // The scripted tool-use carries empty arguments, so default the
+        // task; the spawned sub-agent's prompt content is irrelevant to
+        // retention.
+        #[serde(default)]
+        task: String,
+    }
+
+    impl ToolDefinition for SpawnTool {
+        type Input = SpawnInput;
+
+        fn name(&self) -> &'static str {
+            "agent"
+        }
+
+        fn description(&self) -> &'static str {
+            "Spawn a sub-agent"
+        }
+
+        async fn execute(
+            &self,
+            ctx: &mut dyn ToolContext,
+            input: SpawnInput,
+        ) -> anyhow::Result<ToolOutcome> {
+            let spawned = ctx.spawn_agent(input.task).await?;
+            Ok(ToolOutcome {
+                content: vec![aj_models::types::UserContent::text(spawned.report.clone())],
+                details: ToolDetails::Text {
+                    summary: format!("sub-agent {}", spawned.agent_id),
+                    body: spawned.report,
+                },
+                is_error: false,
+            })
+        }
+    }
+
+    /// After a spawn, the parent's injected registry retains the
+    /// sub-agent and the retained handle's transcript ends on the
+    /// assistant report — i.e. the sub-agent is live and re-promptable,
+    /// not dropped when `spawn_agent` returns.
+    #[tokio::test]
+    async fn spawn_agent_retains_sub_agent_in_registry() {
+        use crate::message::{AgentMessage, AgentMessageKind};
+        use crate::SubAgentRegistry;
+
+        // The parent and the sub-agent share one `ScriptedProvider`,
+        // so scripts are consumed in run order across both:
+        //   0. parent emits the `agent` tool call,
+        //   1. the sub-agent's single-turn text report,
+        //   2. the parent's final text after the tool result.
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "agent")),
+            finalize_script(finalize_text("sub report")),
+            finalize_script(finalize_text("parent done")),
+        ];
+
+        let mut agent = build_agent(scripts, vec![SpawnTool.into()]);
+        let registry = SubAgentRegistry::default();
+        agent.set_sub_agent_registry(registry.clone());
+
+        agent
+            .run_single_turn("delegate work".to_string())
+            .await
+            .expect("run_single_turn");
+
+        // The spawn allocated `Sub(1)`; its handle must outlive the
+        // tool call and stay in the shared registry.
+        assert_eq!(registry.ids(), vec![1]);
+        let sub = registry.get(1).expect("sub-agent retained under id 1");
+
+        let guard = sub.lock().await;
+        let last = guard
+            .messages()
+            .last()
+            .expect("sub-agent transcript is non-empty");
+        assert!(
+            matches!(
+                last,
+                AgentMessage {
+                    kind: AgentMessageKind::Wire(Message::Assistant(_)),
+                    ..
+                }
+            ),
+            "sub-agent transcript should end on the assistant report, got {last:?}"
+        );
     }
 }
