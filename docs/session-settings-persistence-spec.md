@@ -151,6 +151,19 @@ Write sites:
    restores them even if the global default changes in between and
    the session never saw a switch. Buffered like the system prompt —
    no file until the first real message.
+
+   The main-thread seed is deliberately per-axis rather than a
+   snapshot entry like `SubAgentSpawn`. The two kinds answer
+   different needs: a spawn entry exists for *structural* reasons (a
+   sub thread needs a root, and its settings ride along), while the
+   main thread is already rooted by the `SystemPrompt` meta entry,
+   leaving the seed as pure settings data. Keeping seeds and
+   mid-session changes in one per-axis vocabulary makes
+   `settings()` a trivial last-wins fold, lets a future axis ship
+   as just one new entry kind, and makes backfilling a missing axis
+   on old logs the same operation as recording a change. A
+   main-thread snapshot kind would add a second settings encoding
+   for every reader, forever, to save two JSONL lines per session.
 2. **`/model` confirm** (`handle_selector_outcome`, Model arm): after
    staging the swap into `RunConfigSnapshot`, lock `world.log` and
    append a `ModelChange`. The existing `config.toml` persistence
