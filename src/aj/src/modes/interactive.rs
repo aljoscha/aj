@@ -135,6 +135,53 @@ struct RunConfigSnapshot {
     model_key: (String, String),
 }
 
+/// Construct the interactive agent and the loop-side run-config
+/// snapshot from a resolved provider bundle.
+///
+/// The snapshot's `thinking` is read back from the constructed agent
+/// (rather than copied from `config`) so it reflects the config-level
+/// mapping `Agent::with_provider` applies (e.g. `Off` -> `None`).
+fn build_agent_and_run_config(
+    config: &Config,
+    provider: Arc<dyn Provider>,
+    model_info: Arc<ModelInfo>,
+    mut stream_options: StreamOptions,
+    model_key: (String, String),
+) -> (Agent, RunConfigSnapshot) {
+    let mut tools = get_builtin_tools(&BuiltinToolOptions {
+        image_auto_resize: config.image_auto_resize,
+    });
+    if !config.disabled_tools.is_empty() {
+        tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
+    }
+    let env = AgentEnv::new();
+    crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
+    // Clone the run config into the loop-side snapshot before the
+    // agent takes ownership.
+    let snapshot_provider = Arc::clone(&provider);
+    let snapshot_model_info = Arc::clone(&model_info);
+    let snapshot_stream_options = stream_options.clone();
+    let mut agent = Agent::with_provider(
+        env,
+        SYSTEM_PROMPT,
+        tools,
+        config.disabled_tools.clone(),
+        provider,
+        model_info,
+        stream_options,
+        config.thinking,
+    );
+    agent.set_block_images(config.image_block);
+    let run_config = RunConfigSnapshot {
+        provider: snapshot_provider,
+        model_info: snapshot_model_info,
+        stream_options: snapshot_stream_options,
+        thinking: agent.default_thinking(),
+        model_key,
+    };
+    (agent, run_config)
+}
+
 /// User-facing notice shown when a session-changing command
 /// (`/resume`, `/new`) is invoked while a turn is in flight.
 ///
@@ -212,9 +259,7 @@ impl InteractiveMode {
         // without a restart.
         let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
-        let mut agent: Agent;
-        let run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>;
-        if let Some(name) = &self.args.scripted {
+        let (mut agent, run_config) = if let Some(name) = &self.args.scripted {
             let crate::scripted::ResolvedScriptedModel {
                 provider,
                 model_info,
@@ -226,40 +271,13 @@ impl InteractiveMode {
                 .or_else(|| config.model_api.clone())
                 .unwrap_or_else(|| crate::model::DEFAULT_PROVIDER_ID.to_string());
             let current_id = model_info.id.clone();
-            // ---- Tools (legacy / scripted path) -----------------------
-            let mut tools = get_builtin_tools(&BuiltinToolOptions {
-                image_auto_resize: config.image_auto_resize,
-            });
-            if !config.disabled_tools.is_empty() {
-                tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
-            }
-            let env = AgentEnv::new();
-            let mut stream_options = aj_models::types::StreamOptions::default();
-            crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
-            // Clone the run config into the loop-side snapshot before
-            // the agent takes ownership; `thinking` is read back from
-            // the agent below so it reflects the config-level mapping
-            // `Agent::with_provider` applies (e.g. `Off` -> `None`).
-            let snapshot_provider = Arc::clone(&provider);
-            let snapshot_model_info = Arc::clone(&model_info);
-            let snapshot_stream_options = stream_options.clone();
-            agent = Agent::with_provider(
-                env,
-                SYSTEM_PROMPT,
-                tools,
-                config.disabled_tools.clone(),
+            build_agent_and_run_config(
+                &config,
                 provider,
                 model_info,
-                stream_options,
-                config.thinking,
-            );
-            run_config = Arc::new(std::sync::Mutex::new(RunConfigSnapshot {
-                provider: snapshot_provider,
-                model_info: snapshot_model_info,
-                stream_options: snapshot_stream_options,
-                thinking: agent.default_thinking(),
-                model_key: (current_provider, current_id),
-            }));
+                StreamOptions::default(),
+                (current_provider, current_id),
+            )
         } else {
             // Load the registry once at startup; the same handle
             // also feeds the `/model` selector's model catalog.
@@ -285,46 +303,15 @@ impl InteractiveMode {
                 speed,
             )
             .context("failed to resolve model from registry")?;
-            // ---- Tools (registry / real-provider path) ----------------
-            let mut tools = get_builtin_tools(&BuiltinToolOptions {
-                image_auto_resize: config.image_auto_resize,
-            });
-            if !config.disabled_tools.is_empty() {
-                tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
-            }
-            let env = AgentEnv::new();
             let ResolvedModel {
                 provider,
                 model_info,
                 stream_options,
             } = resolved;
-            let mut stream_options = stream_options;
-            crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
             let model_key = (model_info.provider.clone(), model_info.id.clone());
-            // Clone the run config into the loop-side snapshot before
-            // the agent takes ownership (see the scripted branch).
-            let snapshot_provider = Arc::clone(&provider);
-            let snapshot_model_info = Arc::clone(&model_info);
-            let snapshot_stream_options = stream_options.clone();
-            agent = Agent::with_provider(
-                env,
-                SYSTEM_PROMPT,
-                tools,
-                config.disabled_tools.clone(),
-                provider,
-                model_info,
-                stream_options,
-                config.thinking,
-            );
-            run_config = Arc::new(std::sync::Mutex::new(RunConfigSnapshot {
-                provider: snapshot_provider,
-                model_info: snapshot_model_info,
-                stream_options: snapshot_stream_options,
-                thinking: agent.default_thinking(),
-                model_key,
-            }));
-        }
-        agent.set_block_images(config.image_block);
+            build_agent_and_run_config(&config, provider, model_info, stream_options, model_key)
+        };
+        let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
         // Apply a `--api-key` runtime override (if supplied) to the
         // resolved provider, then check whether *any* credential is
@@ -551,15 +538,15 @@ impl InteractiveMode {
         // chat container has a slot to receive them). Replay never
         // hits the bus, so persistence isn't double-written.
         let context_window = agent.model_info().context_window;
-        let mut pump = EventPump::new(
-            chat_theme(&theme),
-            RenderSettings::new(
-                config.hide_thinking_block,
-                false,
-                config.image_show_in_terminal,
-            ),
-            context_window,
+        // One shared handle for the whole process: each session's pump
+        // gets a clone, so `alt+t` / `alt+o` toggles survive `/new` and
+        // `/resume`.
+        let render_settings = RenderSettings::new(
+            config.hide_thinking_block,
+            false,
+            config.image_show_in_terminal,
         );
+        let mut pump = EventPump::new(chat_theme(&theme), render_settings.clone(), context_window);
         // Push the initial `?/<window>` so the indicator is
         // visible before any turn lands. Replay (next) may
         // overwrite the numerator with the last persisted turn's
@@ -1092,6 +1079,7 @@ impl InteractiveMode {
                                     &mut log,
                                     &mut persistence_handle,
                                     &mut pump,
+                                    &render_settings,
                                     &conversation_persistence,
                                     &theme,
                                     "/palette",
@@ -1131,6 +1119,7 @@ impl InteractiveMode {
                                     &mut log,
                                     &mut persistence_handle,
                                     &mut pump,
+                                    &render_settings,
                                     &conversation_persistence,
                                     &theme,
                                     "/history",
@@ -1170,6 +1159,7 @@ impl InteractiveMode {
                                     &mut log,
                                     &mut persistence_handle,
                                     &mut pump,
+                                    &render_settings,
                                     &conversation_persistence,
                                     &theme,
                                     "/agents",
@@ -1203,6 +1193,7 @@ impl InteractiveMode {
                                     &mut log,
                                     &mut persistence_handle,
                                     &mut pump,
+                                    &render_settings,
                                     &conversation_persistence,
                                     &theme,
                                 ).await {
@@ -1256,6 +1247,7 @@ impl InteractiveMode {
                                                 &mut log,
                                                 &mut persistence_handle,
                                                 &mut pump,
+                                                &render_settings,
                                                 &conversation_persistence,
                                                 &theme,
                                                 &follow_up.input,
@@ -1317,6 +1309,7 @@ impl InteractiveMode {
                                         &mut log,
                                         &mut persistence_handle,
                                         &mut pump,
+                                        &render_settings,
                                         &conversation_persistence,
                                         &theme,
                                         &trimmed,
@@ -2194,6 +2187,7 @@ async fn handle_slash_command(
     log: &mut Arc<TokioMutex<ConversationLog>>,
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
+    render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
     text: &str,
@@ -2535,6 +2529,7 @@ async fn handle_slash_command(
             log,
             persistence_handle,
             pump,
+            render_settings,
             conversation_persistence,
             theme,
         )
@@ -2631,6 +2626,7 @@ async fn handle_selector_outcome(
     log: &mut Arc<TokioMutex<ConversationLog>>,
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
+    render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
 ) -> SelectorPollOutcome {
@@ -2853,6 +2849,7 @@ async fn handle_selector_outcome(
                         log,
                         persistence_handle,
                         pump,
+                        render_settings,
                         conversation_persistence,
                         theme,
                         &preview.session_id,
@@ -3183,6 +3180,7 @@ async fn perform_session_swap(
     log: &mut Arc<TokioMutex<ConversationLog>>,
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
+    render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
     session_id: &str,
@@ -3260,23 +3258,16 @@ async fn perform_session_swap(
 
     // 6. Clear the chat container and replay the new log
     //    through a fresh event pump so the user sees the swapped
-    //    transcript in the scrollback. Carry the current
-    //    `hide_thinking_block` mode across the swap so a
-    //    `aj.thinking.toggle` toggle the user pressed before the swap is
-    //    still in effect afterwards.
+    //    transcript in the scrollback. The pump clones the shared
+    //    `render_settings` handle, so display toggles stay in
+    //    effect across the swap.
     if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
         chat.reset();
     }
     // Back to the main view: clear any "observing agent N" marker.
     apply_editor_agent_marker(tui, AgentId::Main);
-    let hide_thinking_block = pump.hide_thinking_block();
-    let show_image_in_terminal = pump.show_image_in_terminal();
     let context_window = agent.lock().await.model_info().context_window;
-    *pump = EventPump::new(
-        chat_theme(theme),
-        RenderSettings::new(hide_thinking_block, false, show_image_in_terminal),
-        context_window,
-    );
+    *pump = EventPump::new(chat_theme(theme), render_settings.clone(), context_window);
     // Seed the footer indicator before replay so the row shows
     // `?/<window>` even for resumed sessions where replay produces
     // no `TurnUsage` events (e.g. a log with only a user prompt).
@@ -3310,12 +3301,14 @@ async fn perform_session_swap(
 ///
 /// Returns the new session id on success so the caller can surface
 /// it in a status notice.
+#[allow(clippy::too_many_arguments)]
 async fn perform_new_session(
     tui: &mut Tui,
     agent: Arc<TokioMutex<Agent>>,
     log: &mut Arc<TokioMutex<ConversationLog>>,
     persistence_handle: &mut SubscriptionHandle,
     pump: &mut EventPump,
+    render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
 ) -> Result<String> {
@@ -3360,21 +3353,15 @@ async fn perform_new_session(
 
     // 5. Clear the chat container and rebuild the event pump so any
     //    in-flight assistant/tool-execution components don't leak
-    //    into the fresh session. Carry `hide_thinking_block` across
-    //    so a prior `aj.thinking.toggle` toggle stays in effect.
+    //    into the fresh session. The pump clones the shared
+    //    `render_settings` handle, so display toggles stay in effect.
     if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
         chat.reset();
     }
     // Back to the main view: clear any "observing agent N" marker.
     apply_editor_agent_marker(tui, AgentId::Main);
-    let hide_thinking_block = pump.hide_thinking_block();
-    let show_image_in_terminal = pump.show_image_in_terminal();
     let context_window = agent.lock().await.model_info().context_window;
-    *pump = EventPump::new(
-        chat_theme(theme),
-        RenderSettings::new(hide_thinking_block, false, show_image_in_terminal),
-        context_window,
-    );
+    *pump = EventPump::new(chat_theme(theme), render_settings.clone(), context_window);
     // Seed the footer indicator so the row shows `?/<window>`
     // on the fresh session before the first turn lands.
     pump.sync_footer(tui);
