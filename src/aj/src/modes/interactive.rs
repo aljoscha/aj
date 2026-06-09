@@ -170,18 +170,18 @@ fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Option<Th
 /// User-facing notice shown when a session-changing command
 /// (`/resume`, `/new`) is invoked while a turn is in flight.
 ///
-/// Those commands reseed the agent's transcript, which requires
-/// locking the agent. The loop must not lock the agent while a turn
-/// holds it (that freezes the `select!`, including its Ctrl+C arm), so
-/// they are refused mid-turn. `what` names the action, e.g.
-/// `"switch sessions"`.
+/// A session change tears down the current world — agent, bus
+/// subscriptions, pump — and rebuilds it from scratch, which must
+/// never abort live work, so the commands are refused mid-turn.
+/// `what` names the action, e.g. `"switch sessions"`.
 fn session_busy_notice(what: &str) -> String {
     format!("Can't {what} while a turn is running — press Ctrl+C to cancel it first.")
 }
 
-/// Driver for a single interactive session. Owns the
-/// [`aj_tui::tui::Tui`], the registered listeners on the agent's
-/// bus, and the [`aj_session::ConversationLog`] for this session.
+/// Driver for the interactive TUI. Startup builds the
+/// process-lifetime [`Shell`]; an outer loop in
+/// [`InteractiveMode::run`] then builds, runs, and tears down one
+/// [`SessionWorld`] per session.
 pub struct InteractiveMode {
     args: Args,
 }
@@ -549,821 +549,119 @@ impl InteractiveMode {
         // (`Config::persist_changed`) done off the guard, never awaited
         // across.
         let config = Arc::new(std::sync::Mutex::new(config));
-        // Usage snapshots of session worlds torn down by `/new` /
-        // `/resume`, in order, for the per-session shutdown banner.
-        let mut completed_sessions: Vec<(String, UsageSummary)> = Vec::new();
 
-        // ---- Main event loop ------------------------------------------
-        // In-flight turns keyed by the agent running them. `JoinSet`
-        // gives completion-as-they-finish and preserves panic detection
-        // (`join_next` yields `Err(JoinError)`); `turn_cancels` holds the
-        // binary's clone of each turn's cancel token, and its key set is
-        // exactly "agents the binary is currently driving".
-        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
-        let mut run_result: Result<()> = Ok(());
-        // Implements the "press Ctrl+C again to quit" guard when the
-        // viewed agent is idle but other agents are still running.
-        let mut quit_armed = false;
+        // Everything with process lifetime moves into the shell;
+        // session worlds are rebuilt around it on every `/new` /
+        // `/resume`.
+        let mut shell = Shell {
+            tui,
+            theme,
+            config,
+            auth,
+            model_catalog,
+            run_config,
+            conversation_persistence,
+            render_settings,
+            completed_sessions: Vec::new(),
+            palette_open_request,
+            close_all_request,
+            history_open_request,
+            agent_picker_open_request,
+        };
 
-        // Slash commands like `/thinking` open an overlay selector.
-        // While an overlay is up the editor is not focused, but
-        // `tui.show_overlay` already routes input to the overlay,
-        // so the main loop's job is just to poll the outcome slot
-        // after every input event and close the overlay on result.
-        let mut open_selector: Option<OpenSelector> = None;
+        // ---- Outer session loop ---------------------------------------
+        // Each iteration drives one session world to completion.
+        // `/new` and `/resume` exit the per-session loop; the world
+        // is torn down wholesale and a fresh one is built and
+        // installed in its place. Quit and fatal errors break out,
+        // carrying the final world (when one is still alive) for the
+        // shutdown banner below.
+        let (final_world, run_result): (Option<SessionWorld>, Result<()>) = loop {
+            let spec = match run_session(&mut shell, &mut world, &mut theme_rx).await {
+                Ok(SessionExit::Quit) => break (Some(world), Ok(())),
+                Err(fatal) => break (Some(world), Err(fatal)),
+                Ok(SessionExit::New) => SessionSpec::Create {
+                    entry: SessionEntry::Switch,
+                },
+                Ok(SessionExit::Switch(session_id)) => SessionSpec::Resume {
+                    session_id,
+                    entry: SessionEntry::Switch,
+                },
+            };
 
-        // An in-flight OAuth login: the dialog overlay + a cancel flag
-        // the dialog (Esc) and Ctrl+C set, plus the spawned login task
-        // whose `JoinHandle` we poll alongside the agent turn. Kept
-        // separate from `open_selector` because the flow is async and
-        // long-running rather than a synchronous confirm/cancel
-        // selector.
-        let mut login_session: Option<LoginSession> = None;
-        let mut login_task: Option<
-            tokio::task::JoinHandle<Result<(), aj_models::auth::AuthError>>,
-        > = None;
+            // Snapshot the outgoing world's usage for the shutdown
+            // banner before it is dropped. The replacement world's
+            // usage starts at zero, so nothing is double-counted —
+            // including on the fallback path below, which resumes the
+            // same session in a brand-new world.
+            let usage = world.usage_summary().await;
+            shell
+                .completed_sessions
+                .push((world.session_id.clone(), usage));
+            let previous_id = world.session_id.clone();
 
-        loop {
-            tokio::select! {
-                biased;
-
-                // --- Agent run finished ---
-                joined = join_next_or_pending(&mut turns) => {
-                    match joined {
-                        Ok((id, result)) => {
-                            turn_cancels.remove(&id);
-                            world.pump.mark_idle(&mut tui, id);
-                            // Main-turn completion bounds every nested
-                            // initial spawn it started. Drain any sub
-                            // still marked running that the binary is NOT
-                            // independently driving (∉ turn_cancels) so a
-                            // leaked sub-agent can't pin the
-                            // footer/spinner. Independent continuations
-                            // are in turn_cancels and survive.
-                            if id == AgentId::Main {
-                                for sub in world.pump.running_agents() {
-                                    if matches!(sub, AgentId::Sub(_))
-                                        && !turn_cancels.contains_key(&sub)
-                                    {
-                                        world.pump.mark_idle(&mut tui, sub);
-                                    }
-                                }
-                            }
-                            sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
-                            match result {
-                                Ok(()) => {}
-                                Err(TurnError::Aborted) => {
-                                    // The agent has already emitted the
-                                    // synthetic aborted `MessageEnd` and
-                                    // any cancelled tool-result
-                                    // `MessageEnd`s, so the chat scrollback
-                                    // is consistent. Surface a brief notice
-                                    // so the user has visible confirmation
-                                    // that Ctrl+C took effect; the session
-                                    // stays alive.
-                                    world.pump.handle(&mut tui, &notice_event("Turn cancelled."));
-                                }
-                                Err(TurnError::Recoverable(err)) => {
-                                    // Surface to the user; the chat
-                                    // container's notice line keeps the
-                                    // session going. The agent's own bus
-                                    // already wrote whatever partial
-                                    // assistant message it produced.
-                                    world.pump.handle(
-                                        &mut tui,
-                                        &AgentEvent::Error {
-                                            agent_id: id,
-                                            text: format!("agent error: {err:#}"),
-                                        },
-                                    );
-                                }
-                                Err(TurnError::Fatal(err)) => {
-                                    run_result = Err(err);
-                                    break;
-                                }
-                            }
+            let config_snapshot = shell.config.lock().expect("config mutex poisoned").clone();
+            match SessionWorld::build(
+                &config_snapshot,
+                &shell.run_config,
+                &shell.render_settings,
+                &shell.theme,
+                &shell.conversation_persistence,
+                &spec,
+            ) {
+                Ok(mut new_world) => {
+                    new_world.install(&mut shell.tui, &spec).await;
+                    let notice = match &spec {
+                        SessionSpec::Create { .. } => {
+                            format!("Started a fresh session ({}).", new_world.session_id)
                         }
-                        Err(join_err) => {
-                            run_result = Err(anyhow::anyhow!(
-                                "agent task panicked: {join_err}"
-                            ));
-                            break;
+                        SessionSpec::Resume { session_id, .. } => {
+                            format!("Switched to session {session_id}.")
                         }
-                    }
-                }
-
-                // --- OAuth login task finished ---
-                login_outcome = async {
-                    match login_task.as_mut() {
-                        Some(handle) => handle.await,
-                        None => std::future::pending::<
-                            Result<Result<(), aj_models::auth::AuthError>, tokio::task::JoinError>,
-                        >()
-                        .await,
-                    }
-                } => {
-                    login_task = None;
-                    if let Some(session) = login_session.take() {
-                        tui.hide_overlay(&session.handle);
-                        let name = session.provider_name;
-                        match login_outcome {
-                            Ok(Ok(())) => {
-                                world.pump.handle(
-                                    &mut tui,
-                                    &notice_event(&format!("Logged in to {name}.")),
-                                );
-                            }
-                            Ok(Err(err)) => {
-                                world.pump.handle(
-                                    &mut tui,
-                                    &warning_event(&format!("Login to {name} failed: {err}")),
-                                );
-                            }
-                            // Aborted on Ctrl+C / Esc: the cancel-poll
-                            // arm already surfaced a "cancelled" notice.
-                            Err(join_err) if join_err.is_cancelled() => {}
-                            Err(join_err) => {
-                                world.pump.handle(
-                                    &mut tui,
-                                    &warning_event(&format!("Login task error: {join_err}")),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // --- TUI input / render ---
-                maybe_event = tui.next_event() => {
-                    let Some(event) = maybe_event else {
-                        // Terminal stream ended: equivalent to
-                        // Ctrl-C/Ctrl-D from the user's POV.
-                        break;
                     };
-                    match event {
-                        TuiEvent::Render => tui.render(),
-                        TuiEvent::Input(input) => {
-                            // Ctrl+C semantics, in priority order.
-                            // A visible overlay always wins: a Ctrl+C
-                            // aimed at a modal dismisses the modal and
-                            // leaves any turn running behind it intact.
-                            //
-                            // 1. Overlay up (`open_selector` is
-                            //    `Some`): dismiss the overlay. Don't
-                            //    break or cancel the turn; fall
-                            //    through to the
-                            //    `ACTION_OVERLAY_CLOSE_ALL`
-                            //    interception below, which matches
-                            //    `ctrl+c` by default and tears the
-                            //    overlay stack down.
-                            // 2. Login dialog up (`login_session` is
-                            //    `Some`): the OAuth dialog is also a
-                            //    modal, so it takes precedence over a
-                            //    turn. Signal cancel; the cancel-poll
-                            //    below tears the dialog down and
-                            //    aborts the task.
-                            // 3. Otherwise act on the agent you are
-                            //    *viewing* (spec §4.5):
-                            //    - Viewed agent has a binary-driven
-                            //      turn (`turn_cancels`): cancel just
-                            //      it. The cancel handle is the
-                            //      binary's clone of the per-turn
-                            //      `CancellationToken` passed to
-                            //      `agent.prompt`; firing it propagates
-                            //      to the agent's `execute_turn`
-                            //      `select!`s and to every provider /
-                            //      tool subscribed to the same token,
-                            //      including the bash tool's process
-                            //      group.
-                            //    - Viewed agent is a sub running its
-                            //      initial spawn (running but not in
-                            //      `turn_cancels`): cancel the main
-                            //      turn that owns it; the child token
-                            //      cascades.
-                            //    - Viewed agent idle but other agents
-                            //      still run: don't cancel them; arm
-                            //      "press Ctrl+C again to quit" and
-                            //      exit on the second press.
-                            //    - Nothing running anywhere: exit.
-                            //
-                            // Ctrl+D always exits regardless. The
-                            // terminal is in raw mode so neither
-                            // chord raises SIGINT; both arrive here
-                            // as ordinary key events.
-
-                            // Any non-Ctrl+C key disarms a pending
-                            // "press again to quit".
-                            if !input.is_ctrl('c') {
-                                quit_armed = false;
-                            }
-                            if input.is_ctrl('c') {
-                                if open_selector.is_some() {
-                                    // Overlay up: fall through to the
-                                    // close-all interception below.
-                                } else if let Some(session) = login_session.as_ref() {
-                                    session.cancel.store(true, Ordering::Relaxed);
-                                    continue;
-                                } else {
-                                    // Per-view Ctrl+C (spec §4.5): act on the agent you're viewing.
-                                    let active = world.pump.active_view(&mut tui);
-                                    if let Some(token) = turn_cancels.get(&active) {
-                                        // Viewed agent has a binary-driven turn: cancel just it.
-                                        token.cancel();
-                                        quit_armed = false;
-                                        continue;
-                                    } else if world.pump.is_running(active) {
-                                        // Viewed agent is a sub running its initial spawn, owned by
-                                        // the main turn: cancel the main turn (the child token
-                                        // cascades to the sub).
-                                        if let Some(token) = turn_cancels.get(&AgentId::Main) {
-                                            token.cancel();
-                                        }
-                                        quit_armed = false;
-                                        continue;
-                                    } else if !turns.is_empty() {
-                                        // Viewed agent idle but other agents still run: don't
-                                        // cancel them — arm/confirm quit instead.
-                                        if quit_armed {
-                                            break;
-                                        }
-                                        quit_armed = true;
-                                        let n = turns.len();
-                                        world.pump.handle(&mut tui, &notice_event(&format!(
-                                            "{n} agent{} still running — press Ctrl+C again to quit",
-                                            if n == 1 { "" } else { "s" },
-                                        )));
-                                        continue;
-                                    } else {
-                                        // Nothing running anywhere: exit.
-                                        break;
-                                    }
-                                }
-                            }
-                            if input.is_ctrl('d') {
-                                break;
-                            }
-                            // Toggle the thinking-block render mode for
-                            // the session. Bound via `aj.thinking.toggle`
-                            // (default `alt+t`); intercepted before
-                            // `tui.handle_input` so the editor never sees
-                            // the keystroke. See `docs/aj-next-plan.md` §4.4.
-                            {
-                                let kb = aj_tui::keybindings::get();
-                                if kb.matches(
-                                    &input,
-                                    crate::config::keybindings::ACTION_THINKING_TOGGLE,
-                                ) {
-                                    drop(kb);
-                                    let new_value = !world.pump.hide_thinking_block();
-                                    world.pump.set_hide_thinking_block(&mut tui, new_value);
-                                    // Don't post a "hidden/visible"
-                                    // notice — the transcript above
-                                    // already shows the new state.
-                                    continue;
-                                }
-                            }
-                            // Toggle the tool-output render mode for the
-                            // session. Bound via `aj.tools.expand`
-                            // (default `alt+o`); intercepted before
-                            // `tui.handle_input` so the editor never sees
-                            // the keystroke.
-                            {
-                                let kb = aj_tui::keybindings::get();
-                                if kb.matches(
-                                    &input,
-                                    crate::config::keybindings::ACTION_TOOLS_EXPAND,
-                                ) {
-                                    drop(kb);
-                                    let new_value = !world.pump.tools_expanded();
-                                    world.pump.set_tools_expanded(&mut tui, new_value);
-                                    continue;
-                                }
-                            }
-                            // Clipboard image paste. Bound via
-                            // `aj.clipboard.paste_image` (default
-                            // `ctrl+v`); intercepted before the editor
-                            // sees the keystroke so it doesn't receive
-                            // a literal control byte. On a successful
-                            // clipboard image read, the temp-file path
-                            // is inserted at the cursor as plain text —
-                            // the model uses `read_file` on submit to
-                            // look at it. Any failure (no image, no
-                            // clipboard backend, etc.) is silent.
-                            //
-                            // Because we bypass `tui.handle_input` for
-                            // this chord, we must request a render
-                            // ourselves; otherwise the inserted path
-                            // sits in the editor buffer until the next
-                            // keystroke happens to trigger a paint.
-                            {
-                                let kb = aj_tui::keybindings::get();
-                                if kb.matches(
-                                    &input,
-                                    crate::config::keybindings::ACTION_CLIPBOARD_PASTE_IMAGE,
-                                ) {
-                                    drop(kb);
-                                    if let Some(path) =
-                                        crate::clipboard::read_image_to_tempfile()
-                                        && let Some(editor) = tui.get_mut_as::<Editor>(
-                                            SlotIndex::Editor.idx(),
-                                        )
-                                    {
-                                        editor.insert_text_at_cursor(
-                                            &path.display().to_string(),
-                                        );
-                                    }
-                                    tui.request_render();
-                                    continue;
-                                }
-                            }
-                            // Global command-palette chord. Bound via
-                            // `aj.palette.open` (default `ctrl+o`).
-                            // Intercepted before `tui.handle_input` so
-                            // no component sees the keystroke. The
-                            // actual overlay mount happens after
-                            // `tui.handle_input` via the shared
-                            // `palette_open_request` flag, so both the
-                            // editor-`/` path and this chord converge
-                            // on the same dispatcher arm. Inert while
-                            // a selector is already up so the chord
-                            // can't interrupt an open modal.
-                            //
-                            // `aj.overlay.close_all` (default `ctrl+c`)
-                            // is the symmetric tear-down chord: when
-                            // an overlay is up, intercept and consume
-                            // the event so the selector's own cancel
-                            // path doesn't also fire.
-                            let mut consume_event = false;
-                            {
-                                let kb = aj_tui::keybindings::get();
-                                if open_selector.is_some()
-                                    && kb.matches(
-                                        &input,
-                                        crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
-                                    )
-                                {
-                                    drop(kb);
-                                    close_all_request.store(true, Ordering::Relaxed);
-                                    // Consume: skip `tui.handle_input`
-                                    // entirely so the selector doesn't
-                                    // also see Ctrl+C as a cancel and
-                                    // write a cancel-outcome that would
-                                    // then drive a stale one-level
-                                    // back-stack restore underneath
-                                    // our explicit teardown.
-                                    consume_event = true;
-                                } else if open_selector.is_none()
-                                    && login_session.is_none()
-                                    && kb.matches(
-                                        &input,
-                                        crate::config::keybindings::ACTION_PALETTE_OPEN,
-                                    )
-                                {
-                                    drop(kb);
-                                    palette_open_request.store(true, Ordering::Relaxed);
-                                    // Fall through to the dispatcher
-                                    // arm below by letting handle_input
-                                    // run (it's a no-op for this chord
-                                    // since no component binds ctrl+o).
-                                } else if open_selector.is_none()
-                                    && login_session.is_none()
-                                    && kb.matches(
-                                        &input,
-                                        crate::config::keybindings::ACTION_HISTORY_OPEN,
-                                    )
-                                {
-                                    drop(kb);
-                                    history_open_request.store(true, Ordering::Relaxed);
-                                    // Consume: the editor binds no
-                                    // ctrl+r, but skipping handle_input
-                                    // keeps the chord from reaching any
-                                    // future binding and matches the
-                                    // close-all interception style.
-                                    consume_event = true;
-                                } else if open_selector.is_none()
-                                    && login_session.is_none()
-                                    && kb.matches(
-                                        &input,
-                                        crate::config::keybindings::ACTION_AGENT_PICKER,
-                                    )
-                                {
-                                    drop(kb);
-                                    agent_picker_open_request.store(true, Ordering::Relaxed);
-                                    // Consume: the editor binds no alt+a;
-                                    // skipping handle_input keeps the
-                                    // chord from reaching any future
-                                    // binding, like the history chord.
-                                    consume_event = true;
-                                }
-                            }
-                            if !consume_event {
-                                tui.handle_input(&input);
-                            }
-
-                            // Close-all: tear down current selector
-                            // and any parent palette in one shot.
-                            // Done before the palette-open dispatch
-                            // and the per-tick outcome poll so we
-                            // never re-enter the back-stack logic
-                            // on a unwound state.
-                            if close_all_request.swap(false, Ordering::Relaxed) {
-                                if let Some(sel) = open_selector.take() {
-                                    close_all_overlays(&mut tui, sel);
-                                }
-                                continue;
-                            }
-
-                            // Login cancellation: the dialog's Esc (or
-                            // Ctrl+C above) flips the shared flag. Tear
-                            // the dialog down and abort the login task;
-                            // the task's `JoinHandle` arm sees the
-                            // cancellation and stays quiet.
-                            if let Some(session) = login_session.as_ref()
-                                && session.cancel.load(Ordering::Relaxed)
-                            {
-                                tui.hide_overlay(&session.handle);
-                                if let Some(task) = login_task.take() {
-                                    task.abort();
-                                }
-                                let name = session.provider_name.clone();
-                                login_session = None;
-                                world.pump.handle(
-                                    &mut tui,
-                                    &notice_event(&format!("Login to {name} cancelled.")),
-                                );
-                                continue;
-                            }
-
-                            // Global palette open: fired either by the
-                            // editor's `/`-at-empty-prompt callback
-                            // (handled inside `tui.handle_input` above)
-                            // or by the `Ctrl+O` chord intercepted
-                            // below. Dispatched here, after routing,
-                            // so the editor's `/` swallow has already
-                            // landed and so we can `await` the slash
-                            // dispatcher. Gated on `open_selector` to
-                            // be inert while another selector is up.
-                            if palette_open_request.swap(false, Ordering::Relaxed)
-                                && open_selector.is_none()
-                                && login_session.is_none()
-                            {
-                                match handle_slash_command(
-                                    &mut tui,
-                                    &auth,
-                                    Arc::clone(&model_catalog),
-                                    Arc::clone(&run_config),
-                                    Arc::clone(&config),
-                                    &mut world,
-                                    &mut completed_sessions,
-                                    &render_settings,
-                                    &conversation_persistence,
-                                    &theme,
-                                    "/palette",
-                                    None,
-                                    !turns.is_empty(),
-                                ).await {
-                                    SlashHandled::Continue { selector, notice } => {
-                                        if let Some(text) = notice {
-                                            world.pump.handle(&mut tui, &notice_event(&text));
-                                        }
-                                        if let Some(sel) = selector {
-                                            open_selector = Some(sel);
-                                        }
-                                    }
-                                    SlashHandled::Quit => break,
-                                }
-                                continue;
-                            }
-
-                            // Global prompt-history open: fired by the
-                            // `Ctrl+R` chord intercepted above. Routes a
-                            // synthetic `/history` through the same
-                            // dispatcher with no parent palette, so the
-                            // overlay's `Esc` closes straight back to
-                            // the editor. Gated on `open_selector` to be
-                            // inert while another selector is up.
-                            if history_open_request.swap(false, Ordering::Relaxed)
-                                && open_selector.is_none()
-                                && login_session.is_none()
-                            {
-                                match handle_slash_command(
-                                    &mut tui,
-                                    &auth,
-                                    Arc::clone(&model_catalog),
-                                    Arc::clone(&run_config),
-                                    Arc::clone(&config),
-                                    &mut world,
-                                    &mut completed_sessions,
-                                    &render_settings,
-                                    &conversation_persistence,
-                                    &theme,
-                                    "/history",
-                                    None,
-                                    !turns.is_empty(),
-                                ).await {
-                                    SlashHandled::Continue { selector, notice } => {
-                                        if let Some(text) = notice {
-                                            world.pump.handle(&mut tui, &notice_event(&text));
-                                        }
-                                        if let Some(sel) = selector {
-                                            open_selector = Some(sel);
-                                        }
-                                    }
-                                    SlashHandled::Quit => break,
-                                }
-                                continue;
-                            }
-
-                            // Global agent-picker open: fired by the
-                            // `Alt+A` chord intercepted above. Routes a
-                            // synthetic `/agents` through the same
-                            // dispatcher with no parent palette, so the
-                            // overlay's `Esc` closes straight back to
-                            // the editor. Gated on `open_selector` to be
-                            // inert while another selector is up.
-                            if agent_picker_open_request.swap(false, Ordering::Relaxed)
-                                && open_selector.is_none()
-                                && login_session.is_none()
-                            {
-                                match handle_slash_command(
-                                    &mut tui,
-                                    &auth,
-                                    Arc::clone(&model_catalog),
-                                    Arc::clone(&run_config),
-                                    Arc::clone(&config),
-                                    &mut world,
-                                    &mut completed_sessions,
-                                    &render_settings,
-                                    &conversation_persistence,
-                                    &theme,
-                                    "/agents",
-                                    None,
-                                    !turns.is_empty(),
-                                ).await {
-                                    SlashHandled::Continue { selector, notice } => {
-                                        if let Some(text) = notice {
-                                            world.pump.handle(&mut tui, &notice_event(&text));
-                                        }
-                                        if let Some(sel) = selector {
-                                            open_selector = Some(sel);
-                                        }
-                                    }
-                                    SlashHandled::Quit => break,
-                                }
-                                continue;
-                            }
-                            // input was just routed to it. Poll
-                            // the overlay's outcome slot; on a
-                            // confirm/cancel, close it and apply
-                            // the result.
-                            if let Some(sel) = open_selector.take() {
-                                match handle_selector_outcome(
-                                    &mut tui,
-                                    sel,
-                                    &auth,
-                                    Arc::clone(&run_config),
-                                    Arc::clone(&config),
-                                    &mut world,
-                                    &mut completed_sessions,
-                                    &render_settings,
-                                    &conversation_persistence,
-                                    &theme,
-                                ).await {
-                                    SelectorPollOutcome::StillOpen(reopened) => {
-                                        open_selector = Some(reopened);
-                                    }
-                                    SelectorPollOutcome::Closed { notice, follow_up, start_login } => {
-                                        if let Some(text) = notice {
-                                            world.pump.handle(&mut tui, &notice_event(&text));
-                                        }
-                                        // A confirmed `/login` provider
-                                        // pick asks the host to launch
-                                        // the async browser flow: mount
-                                        // the dialog overlay and spawn
-                                        // the login task (polled by the
-                                        // login `select!` arm).
-                                        if let Some(provider_id) = start_login {
-                                            match start_login_session(
-                                                &mut tui,
-                                                &auth,
-                                                &theme,
-                                                &provider_id,
-                                            )
-                                            .await
-                                            {
-                                                Ok((session, task)) => {
-                                                    login_session = Some(session);
-                                                    login_task = Some(task);
-                                                }
-                                                Err(err) => world.pump.handle(
-                                                    &mut tui,
-                                                    &warning_event(&format!(
-                                                        "Couldn't start login: {err}"
-                                                    )),
-                                                ),
-                                            }
-                                        }
-                                        // The command palette chains into a
-                                        // real slash command by emitting a
-                                        // `follow_up`. Re-feed it through
-                                        // `handle_slash_command` so the
-                                        // dispatch path is identical to a
-                                        // user-typed `/...` line.
-                                        if let Some(follow_up) = follow_up {
-                                            match handle_slash_command(
-                                                &mut tui,
-                                                &auth,
-                                                Arc::clone(&model_catalog),
-                                                Arc::clone(&run_config),
-                                                Arc::clone(&config),
-                                                &mut world,
-                                                &mut completed_sessions,
-                                                &render_settings,
-                                                &conversation_persistence,
-                                                &theme,
-                                                &follow_up.input,
-                                                Some(follow_up.parent_palette),
-                                                !turns.is_empty(),
-                                            )
-                                            .await
-                                            {
-                                                SlashHandled::Continue { selector, notice } => {
-                                                    if let Some(text) = notice {
-                                                        world.pump.handle(&mut tui, &notice_event(&text));
-                                                    }
-                                                    if let Some(sel) = selector {
-                                                        open_selector = Some(sel);
-                                                    }
-                                                }
-                                                SlashHandled::Quit => break,
-                                            }
-                                        }
-                                    }
-                                }
-                                sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
-                                continue;
-                            }
-
-                            // The editor swallows printable
-                            // input and re-emits a `Submit` when
-                            // the user presses Enter. Drain it
-                            // and dispatch.
-                            if let Some(text) = take_submitted_prompt(&mut tui) {
-                                let trimmed = text.trim().to_string();
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
-
-                                // Slash-command branch: a submitted
-                                // `/...` line is dispatched as a command
-                                // (not queued as a prompt). `disable_submit`
-                                // gates editor submits while a turn runs,
-                                // so this path only fires between turns;
-                                // mid-turn settings changes go through the
-                                // palette/selectors, which never block on
-                                // the agent. `handle_slash_command` still
-                                // gets the live in-flight-turn state so it
-                                // can refuse session-changing commands if
-                                // one ever reaches here mid-turn.
-                                if trimmed.starts_with('/') {
-                                    if let Some(editor) = tui.get_mut_as::<Editor>(
-                                        SlotIndex::Editor.idx()
-                                    ) {
-                                        editor.set_text("");
-                                    }
-                                    match handle_slash_command(
-                                        &mut tui,
-                                        &auth,
-                                        Arc::clone(&model_catalog),
-                                        Arc::clone(&run_config),
-                                        Arc::clone(&config),
-                                        &mut world,
-                                        &mut completed_sessions,
-                                        &render_settings,
-                                        &conversation_persistence,
-                                        &theme,
-                                        &trimmed,
-                                        None,
-                                        !turns.is_empty(),
-                                    ).await {
-                                        SlashHandled::Continue { selector, notice } => {
-                                            if let Some(text) = notice {
-                                                world.pump.handle(&mut tui, &notice_event(&text));
-                                            }
-                                            if let Some(sel) = selector {
-                                                open_selector = Some(sel);
-                                            }
-                                        }
-                                        SlashHandled::Quit => break,
-                                    }
-                                    continue;
-                                }
-
-                                let target = world.pump.active_view(&mut tui);
-
-                                // Per-agent single-turn gate: ignore the submit if the viewed
-                                // agent is already busy (a binary-driven turn or a nested
-                                // initial spawn). Mirrors `sync_editor_enabled`.
-                                if turn_cancels.contains_key(&target) || world.pump.is_running(target) {
-                                    continue;
-                                }
-
-                                // Resolve before touching editor state, so a non-promptable
-                                // target (a resumed sub-agent with no live handle) leaves the
-                                // editor as-is and just surfaces a notice.
-                                let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
-                                    world.pump.handle(&mut tui, &notice_event("This agent can't be prompted."));
-                                    continue;
-                                };
-
-                                if let Some(editor) = tui.get_mut_as::<Editor>(
-                                    SlotIndex::Editor.idx()
-                                ) {
-                                    editor.set_text("");
-                                    editor.add_to_history(&trimmed);
-                                }
-
-                                let run_config_for_turn = Arc::clone(&run_config);
-                                // Mint a fresh per-turn cancellation
-                                // token. The binary keeps one clone in
-                                // `turn_cancels` so the Ctrl+C arm can
-                                // fire `.cancel()` without locking the
-                                // agent mutex; the spawned task hands its
-                                // own clone to `agent.prompt`. Both clones
-                                // share cancellation state because the
-                                // inner is `Arc`-backed.
-                                let turn_cancel = CancellationToken::new();
-                                turn_cancels.insert(target, turn_cancel.clone());
-                                turns.spawn(async move {
-                                    let mut a = handle.lock().await;
-                                    // Apply the loop-side run-config
-                                    // snapshot before the turn so a
-                                    // model / thinking change the user
-                                    // made since the last turn takes
-                                    // effect now. Done under the turn's
-                                    // own lock — uncontended, since no
-                                    // turn is in flight yet — so the
-                                    // loop never blocks on it.
-                                    {
-                                        let cfg = run_config_for_turn
-                                            .lock()
-                                            .expect("run config mutex poisoned");
-                                        a.set_provider(
-                                            Arc::clone(&cfg.provider),
-                                            Arc::clone(&cfg.model_info),
-                                            cfg.stream_options.clone(),
-                                        );
-                                        a.set_default_thinking(cfg.thinking.clone());
-                                    }
-                                    let result = a.prompt(trimmed, turn_cancel).await;
-                                    (target, result)
-                                });
-                                // The viewed agent is now busy; reflect it in the editor.
-                                sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
-                            }
+                    new_world
+                        .pump
+                        .handle(&mut shell.tui, &notice_event(&notice));
+                    world = new_world;
+                }
+                Err(err) => {
+                    // The requested world failed to build. Fall back
+                    // to resuming the session that just ended — its
+                    // log is on disk and current — and surface the
+                    // error in the fallback world's scrollback. If the
+                    // fallback build fails too, that's fatal.
+                    let failure = match &spec {
+                        SessionSpec::Create { .. } => {
+                            format!("Failed to start a fresh session: {err}")
                         }
+                        SessionSpec::Resume { session_id, .. } => {
+                            format!("Failed to switch to session {session_id}: {err}")
+                        }
+                    };
+                    let fallback = SessionSpec::Resume {
+                        session_id: previous_id,
+                        entry: SessionEntry::Switch,
+                    };
+                    match SessionWorld::build(
+                        &config_snapshot,
+                        &shell.run_config,
+                        &shell.render_settings,
+                        &shell.theme,
+                        &shell.conversation_persistence,
+                        &fallback,
+                    ) {
+                        Ok(mut fallback_world) => {
+                            fallback_world.install(&mut shell.tui, &fallback).await;
+                            fallback_world
+                                .pump
+                                .handle(&mut shell.tui, &notice_event(&failure));
+                            world = fallback_world;
+                        }
+                        Err(fatal) => break (None, Err(fatal)),
                     }
-                }
-
-                // --- Agent bus event ---
-                maybe_evt = recv_event(&mut world.event_rx) => {
-                    let Some(event) = maybe_evt else { continue };
-                    world.pump.handle(&mut tui, &event);
-                    sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
-                }
-
-                // --- Theme reload (fs-watcher) ---
-                // Coalesced re-parses of `~/.aj/themes/<name>.json`
-                // flow through here. `theme_rx` is `None` when no
-                // watcher is active (bundled theme name with no
-                // override, missing `$HOME`, or the notify backend
-                // declined to start); the helper folds that into a
-                // pending-forever future so the select arm is
-                // harmless in those cases.
-                maybe_new_theme = recv_theme(theme_rx.as_mut()) => {
-                    let Some(new_theme) = maybe_new_theme else { continue };
-                    let name = new_theme.name().to_string();
-                    theme.replace(new_theme);
-                    // `Tui::invalidate` walks the root + every overlay
-                    // and clears each component's cached render
-                    // output. The closures still in flight resolve
-                    // through the shared lock so the next render
-                    // paints with the new palette automatically.
-                    tui.invalidate();
-                    tui.request_render();
-                    world.pump.handle(
-                        &mut tui,
-                        &notice_event(&format!("Theme '{name}' reloaded.")),
-                    );
                 }
             }
-        }
-
-        // Give all in-flight turns a chance to wind down on shutdown.
-        // We don't wait long: the user has already asked to quit,
-        // and the agents will be stopped by the dropped subscriptions.
-        // `shutdown` aborts every task in the set and awaits them.
-        turns.shutdown().await;
+        };
 
         // Drop the watcher guard explicitly so its `Drop`
         // tears down the notify watcher before the runtime exits.
@@ -1372,7 +670,7 @@ impl InteractiveMode {
         // about meaningless drops if we later wanted to be explicit.
         drop(theme_watcher_guard);
 
-        tui.stop();
+        shell.tui.stop();
 
         // End-of-process banner: token-usage breakdown plus a resume
         // hint pointing at the live session id. Printed *after*
@@ -1380,10 +678,10 @@ impl InteractiveMode {
         // shell scrollback rather than the alternate-screen TUI
         // buffer that gets cleared on exit.
         //
-        // Reading the agent + log behind their `TokioMutex` is
-        // safe here: the running task was aborted above, the
-        // event-channel forwarder lives on its own task that
-        // doesn't touch these mutexes, and the persistence
+        // Reading the agent + log behind their `TokioMutex` is safe
+        // here: in-flight turns were shut down before `run_session`
+        // returned, the event-channel forwarder lives on its own
+        // task that doesn't touch these mutexes, and the persistence
         // listener is no-op-and-quick when no events are firing.
         //
         // When the process spanned several sessions (`/new` /
@@ -1391,35 +689,962 @@ impl InteractiveMode {
         // into `completed_sessions`; itemize them in order, each
         // under a dim `Session: <id>` header, then the live world's
         // block. A single-session process prints one bare block.
-        let summary = world.usage_summary().await;
-        if completed_sessions.is_empty() {
-            print_usage_summary(&summary);
-        } else {
-            for (session_id, completed) in &completed_sessions {
-                print_session_usage(session_id, completed);
-            }
-            print_session_usage(&world.session_id, &summary);
-        }
+        match final_world {
+            Some(world) => {
+                let summary = world.usage_summary().await;
+                if shell.completed_sessions.is_empty() {
+                    print_usage_summary(&summary);
+                } else {
+                    for (session_id, completed) in &shell.completed_sessions {
+                        print_session_usage(session_id, completed);
+                    }
+                    print_session_usage(&world.session_id, &summary);
+                }
 
-        // Resume hint is gated on "the session is worth resuming",
-        // i.e. it has at least one persisted user-thread leaf.
-        // Fresh sessions where the user quit without typing
-        // anything don't get a hint — there's nothing meaningful
-        // to come back to. The check covers both the "user
-        // submitted at least one prompt this session" and "we
-        // resumed a session that already had content" paths in one
-        // shot since the persistence listener writes user
-        // messages inline before the run returns.
-        let resume_eligible = {
-            let l = world.log.lock().await;
-            l.latest_leaf(ThreadFilter::USER).is_some()
-        };
-        if resume_eligible {
-            print_resume_hint(&world.session_id);
+                // Resume hint is gated on "the session is worth resuming",
+                // i.e. it has at least one persisted user-thread leaf.
+                // Fresh sessions where the user quit without typing
+                // anything don't get a hint — there's nothing meaningful
+                // to come back to. The check covers both the "user
+                // submitted at least one prompt this session" and "we
+                // resumed a session that already had content" paths in one
+                // shot since the persistence listener writes user
+                // messages inline before the run returns.
+                let resume_eligible = {
+                    let l = world.log.lock().await;
+                    l.latest_leaf(ThreadFilter::USER).is_some()
+                };
+                if resume_eligible {
+                    print_resume_hint(&world.session_id);
+                }
+            }
+            // A fallback rebuild failed, so no world survived the
+            // loop: print what the completed sessions accumulated and
+            // skip the live block and the resume hint.
+            None => {
+                for (session_id, completed) in &shell.completed_sessions {
+                    print_session_usage(session_id, completed);
+                }
+            }
         }
 
         run_result
     }
+}
+
+/// Process-lifetime state: everything that survives a session
+/// switch. Session worlds ([`SessionWorld`]) are rebuilt around the
+/// shell on every `/new` / `/resume`.
+struct Shell {
+    /// Terminal, layout, and editor. Never torn down on a session
+    /// switch, so the editor draft, prompt-history ring, and raw
+    /// mode survive without flicker.
+    tui: Tui,
+    /// Shared theme handle; a runtime reload re-points it in place.
+    theme: ThemeHandle,
+    /// Shared, mutable view of the on-disk config; selector
+    /// outcomes mutate and persist it.
+    config: Arc<std::sync::Mutex<Config>>,
+    /// Credential store backing API-key resolution and `/login`.
+    auth: AuthStorage,
+    /// Model catalog shared by the `/model` selector and the
+    /// editor's argument completer; loaded once at startup.
+    model_catalog: Arc<Vec<ModelInfo>>,
+    /// Loop-side snapshot of the next turn's run configuration;
+    /// `/model` / `/thinking` choices made mid-process survive
+    /// session switches through it.
+    run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    /// Sessions-directory handle used to build session worlds and
+    /// feed the session / prompt-history overlays.
+    conversation_persistence: ConversationPersistence,
+    /// Render toggles (`alt+t` / `alt+o`); each session's pump gets
+    /// a clone, so the toggles survive switches.
+    render_settings: RenderSettings,
+    /// Usage snapshots of torn-down session worlds, in order, for
+    /// the per-session shutdown banner.
+    completed_sessions: Vec<(String, UsageSummary)>,
+    /// Tripped by the editor's `/`-at-empty-prompt callback and the
+    /// `aj.palette.open` chord; drained by the session loop.
+    palette_open_request: Arc<AtomicBool>,
+    /// Tripped by the `aj.overlay.close_all` chord while an overlay
+    /// is up; drained by the session loop.
+    close_all_request: Arc<AtomicBool>,
+    /// Tripped by the `aj.history.open` chord; drained by the
+    /// session loop.
+    history_open_request: Arc<AtomicBool>,
+    /// Tripped by the `aj.agent.open` chord; drained by the session
+    /// loop.
+    agent_picker_open_request: Arc<AtomicBool>,
+}
+
+/// Why [`run_session`]'s per-session loop returned.
+enum SessionExit {
+    /// The user quit (Ctrl+C / Ctrl+D / `/quit`, or the terminal
+    /// stream ended); the process shuts down.
+    Quit,
+    /// A `/resume` pick: rebuild onto the identified session.
+    Switch(String),
+    /// `/new`: rebuild onto a freshly minted session.
+    New,
+}
+
+/// A session change requested by a slash command or selector. The
+/// per-session loop maps it onto a [`SessionExit`] so the outer
+/// loop in [`InteractiveMode::run`] can tear down the current world
+/// and build the next one. Only emitted with no turn in flight.
+enum SessionRequest {
+    New,
+    Resume(String),
+}
+
+impl SessionRequest {
+    fn into_exit(self) -> SessionExit {
+        match self {
+            SessionRequest::New => SessionExit::New,
+            SessionRequest::Resume(id) => SessionExit::Switch(id),
+        }
+    }
+}
+
+/// Drive one session world until the user quits, a session change
+/// is requested, or a fatal error occurs.
+///
+/// Owns the per-session UI loop state — in-flight turns, the open
+/// selector, an in-flight OAuth login. None of it can outlive the
+/// session: a session change can only be requested while no turn,
+/// overlay, or login is active. Whatever the exit reason, every
+/// in-flight turn is shut down before this returns, so the caller
+/// may drop the world without aborting live work.
+async fn run_session(
+    shell: &mut Shell,
+    world: &mut SessionWorld,
+    theme_rx: &mut Option<UnboundedReceiver<Theme>>,
+) -> Result<SessionExit> {
+    // ---- Main event loop ------------------------------------------
+    // In-flight turns keyed by the agent running them. `JoinSet`
+    // gives completion-as-they-finish and preserves panic detection
+    // (`join_next` yields `Err(JoinError)`); `turn_cancels` holds the
+    // binary's clone of each turn's cancel token, and its key set is
+    // exactly "agents the binary is currently driving".
+    let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+    let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+    // Implements the "press Ctrl+C again to quit" guard when the
+    // viewed agent is idle but other agents are still running.
+    let mut quit_armed = false;
+
+    // Slash commands like `/thinking` open an overlay selector.
+    // While an overlay is up the editor is not focused, but
+    // `shell.tui.show_overlay` already routes input to the overlay,
+    // so the main loop's job is just to poll the outcome slot
+    // after every input event and close the overlay on result.
+    let mut open_selector: Option<OpenSelector> = None;
+
+    // An in-flight OAuth login: the dialog overlay + a cancel flag
+    // the dialog (Esc) and Ctrl+C set, plus the spawned login task
+    // whose `JoinHandle` we poll alongside the agent turn. Kept
+    // separate from `open_selector` because the flow is async and
+    // long-running rather than a synchronous confirm/cancel
+    // selector.
+    let mut login_session: Option<LoginSession> = None;
+    let mut login_task: Option<tokio::task::JoinHandle<Result<(), aj_models::auth::AuthError>>> =
+        None;
+
+    let exit: Result<SessionExit> = loop {
+        tokio::select! {
+            biased;
+
+            // --- Agent run finished ---
+            joined = join_next_or_pending(&mut turns) => {
+                match joined {
+                    Ok((id, result)) => {
+                        turn_cancels.remove(&id);
+                        world.pump.mark_idle(&mut shell.tui, id);
+                        // Main-turn completion bounds every nested
+                        // initial spawn it started. Drain any sub
+                        // still marked running that the binary is NOT
+                        // independently driving (∉ turn_cancels) so a
+                        // leaked sub-agent can't pin the
+                        // footer/spinner. Independent continuations
+                        // are in turn_cancels and survive.
+                        if id == AgentId::Main {
+                            for sub in world.pump.running_agents() {
+                                if matches!(sub, AgentId::Sub(_))
+                                    && !turn_cancels.contains_key(&sub)
+                                {
+                                    world.pump.mark_idle(&mut shell.tui, sub);
+                                }
+                            }
+                        }
+                        sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                        match result {
+                            Ok(()) => {}
+                            Err(TurnError::Aborted) => {
+                                // The agent has already emitted the
+                                // synthetic aborted `MessageEnd` and
+                                // any cancelled tool-result
+                                // `MessageEnd`s, so the chat scrollback
+                                // is consistent. Surface a brief notice
+                                // so the user has visible confirmation
+                                // that Ctrl+C took effect; the session
+                                // stays alive.
+                                world.pump.handle(&mut shell.tui, &notice_event("Turn cancelled."));
+                            }
+                            Err(TurnError::Recoverable(err)) => {
+                                // Surface to the user; the chat
+                                // container's notice line keeps the
+                                // session going. The agent's own bus
+                                // already wrote whatever partial
+                                // assistant message it produced.
+                                world.pump.handle(
+                                    &mut shell.tui,
+                                    &AgentEvent::Error {
+                                        agent_id: id,
+                                        text: format!("agent error: {err:#}"),
+                                    },
+                                );
+                            }
+                            Err(TurnError::Fatal(err)) => {
+                                break Err(err);
+                            }
+                        }
+                    }
+                    Err(join_err) => {
+                        break Err(anyhow::anyhow!("agent task panicked: {join_err}"));
+                    }
+                }
+            }
+
+            // --- OAuth login task finished ---
+            login_outcome = async {
+                match login_task.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending::<
+                        Result<Result<(), aj_models::auth::AuthError>, tokio::task::JoinError>,
+                    >()
+                    .await,
+                }
+            } => {
+                login_task = None;
+                if let Some(session) = login_session.take() {
+                    shell.tui.hide_overlay(&session.handle);
+                    let name = session.provider_name;
+                    match login_outcome {
+                        Ok(Ok(())) => {
+                            world.pump.handle(
+                                &mut shell.tui,
+                                &notice_event(&format!("Logged in to {name}.")),
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            world.pump.handle(
+                                &mut shell.tui,
+                                &warning_event(&format!("Login to {name} failed: {err}")),
+                            );
+                        }
+                        // Aborted on Ctrl+C / Esc: the cancel-poll
+                        // arm already surfaced a "cancelled" notice.
+                        Err(join_err) if join_err.is_cancelled() => {}
+                        Err(join_err) => {
+                            world.pump.handle(
+                                &mut shell.tui,
+                                &warning_event(&format!("Login task error: {join_err}")),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // --- TUI input / render ---
+            maybe_event = shell.tui.next_event() => {
+                let Some(event) = maybe_event else {
+                    // Terminal stream ended: equivalent to
+                    // Ctrl-C/Ctrl-D from the user's POV.
+                    break Ok(SessionExit::Quit);
+                };
+                match event {
+                    TuiEvent::Render => shell.tui.render(),
+                    TuiEvent::Input(input) => {
+                        // Ctrl+C semantics, in priority order.
+                        // A visible overlay always wins: a Ctrl+C
+                        // aimed at a modal dismisses the modal and
+                        // leaves any turn running behind it intact.
+                        //
+                        // 1. Overlay up (`open_selector` is
+                        //    `Some`): dismiss the overlay. Don't
+                        //    break or cancel the turn; fall
+                        //    through to the
+                        //    `ACTION_OVERLAY_CLOSE_ALL`
+                        //    interception below, which matches
+                        //    `ctrl+c` by default and tears the
+                        //    overlay stack down.
+                        // 2. Login dialog up (`login_session` is
+                        //    `Some`): the OAuth dialog is also a
+                        //    modal, so it takes precedence over a
+                        //    turn. Signal cancel; the cancel-poll
+                        //    below tears the dialog down and
+                        //    aborts the task.
+                        // 3. Otherwise act on the agent you are
+                        //    *viewing* (spec §4.5):
+                        //    - Viewed agent has a binary-driven
+                        //      turn (`turn_cancels`): cancel just
+                        //      it. The cancel handle is the
+                        //      binary's clone of the per-turn
+                        //      `CancellationToken` passed to
+                        //      `agent.prompt`; firing it propagates
+                        //      to the agent's `execute_turn`
+                        //      `select!`s and to every provider /
+                        //      tool subscribed to the same token,
+                        //      including the bash tool's process
+                        //      group.
+                        //    - Viewed agent is a sub running its
+                        //      initial spawn (running but not in
+                        //      `turn_cancels`): cancel the main
+                        //      turn that owns it; the child token
+                        //      cascades.
+                        //    - Viewed agent idle but other agents
+                        //      still run: don't cancel them; arm
+                        //      "press Ctrl+C again to quit" and
+                        //      exit on the second press.
+                        //    - Nothing running anywhere: exit.
+                        //
+                        // Ctrl+D always exits regardless. The
+                        // terminal is in raw mode so neither
+                        // chord raises SIGINT; both arrive here
+                        // as ordinary key events.
+
+                        // Any non-Ctrl+C key disarms a pending
+                        // "press again to quit".
+                        if !input.is_ctrl('c') {
+                            quit_armed = false;
+                        }
+                        if input.is_ctrl('c') {
+                            if open_selector.is_some() {
+                                // Overlay up: fall through to the
+                                // close-all interception below.
+                            } else if let Some(session) = login_session.as_ref() {
+                                session.cancel.store(true, Ordering::Relaxed);
+                                continue;
+                            } else {
+                                // Per-view Ctrl+C (spec §4.5): act on the agent you're viewing.
+                                let active = world.pump.active_view(&mut shell.tui);
+                                if let Some(token) = turn_cancels.get(&active) {
+                                    // Viewed agent has a binary-driven turn: cancel just it.
+                                    token.cancel();
+                                    quit_armed = false;
+                                    continue;
+                                } else if world.pump.is_running(active) {
+                                    // Viewed agent is a sub running its initial spawn, owned by
+                                    // the main turn: cancel the main turn (the child token
+                                    // cascades to the sub).
+                                    if let Some(token) = turn_cancels.get(&AgentId::Main) {
+                                        token.cancel();
+                                    }
+                                    quit_armed = false;
+                                    continue;
+                                } else if !turns.is_empty() {
+                                    // Viewed agent idle but other agents still run: don't
+                                    // cancel them — arm/confirm quit instead.
+                                    if quit_armed {
+                                        break Ok(SessionExit::Quit);
+                                    }
+                                    quit_armed = true;
+                                    let n = turns.len();
+                                    world.pump.handle(&mut shell.tui, &notice_event(&format!(
+                                        "{n} agent{} still running — press Ctrl+C again to quit",
+                                        if n == 1 { "" } else { "s" },
+                                    )));
+                                    continue;
+                                } else {
+                                    // Nothing running anywhere: exit.
+                                    break Ok(SessionExit::Quit);
+                                }
+                            }
+                        }
+                        if input.is_ctrl('d') {
+                            break Ok(SessionExit::Quit);
+                        }
+                        // Toggle the thinking-block render mode for
+                        // the session. Bound via `aj.thinking.toggle`
+                        // (default `alt+t`); intercepted before
+                        // `shell.tui.handle_input` so the editor never sees
+                        // the keystroke. See `docs/aj-next-plan.md` §4.4.
+                        {
+                            let kb = aj_tui::keybindings::get();
+                            if kb.matches(
+                                &input,
+                                crate::config::keybindings::ACTION_THINKING_TOGGLE,
+                            ) {
+                                drop(kb);
+                                let new_value = !world.pump.hide_thinking_block();
+                                world.pump.set_hide_thinking_block(&mut shell.tui, new_value);
+                                // Don't post a "hidden/visible"
+                                // notice — the transcript above
+                                // already shows the new state.
+                                continue;
+                            }
+                        }
+                        // Toggle the tool-output render mode for the
+                        // session. Bound via `aj.tools.expand`
+                        // (default `alt+o`); intercepted before
+                        // `shell.tui.handle_input` so the editor never sees
+                        // the keystroke.
+                        {
+                            let kb = aj_tui::keybindings::get();
+                            if kb.matches(
+                                &input,
+                                crate::config::keybindings::ACTION_TOOLS_EXPAND,
+                            ) {
+                                drop(kb);
+                                let new_value = !world.pump.tools_expanded();
+                                world.pump.set_tools_expanded(&mut shell.tui, new_value);
+                                continue;
+                            }
+                        }
+                        // Clipboard image paste. Bound via
+                        // `aj.clipboard.paste_image` (default
+                        // `ctrl+v`); intercepted before the editor
+                        // sees the keystroke so it doesn't receive
+                        // a literal control byte. On a successful
+                        // clipboard image read, the temp-file path
+                        // is inserted at the cursor as plain text —
+                        // the model uses `read_file` on submit to
+                        // look at it. Any failure (no image, no
+                        // clipboard backend, etc.) is silent.
+                        //
+                        // Because we bypass `shell.tui.handle_input` for
+                        // this chord, we must request a render
+                        // ourselves; otherwise the inserted path
+                        // sits in the editor buffer until the next
+                        // keystroke happens to trigger a paint.
+                        {
+                            let kb = aj_tui::keybindings::get();
+                            if kb.matches(
+                                &input,
+                                crate::config::keybindings::ACTION_CLIPBOARD_PASTE_IMAGE,
+                            ) {
+                                drop(kb);
+                                if let Some(path) =
+                                    crate::clipboard::read_image_to_tempfile()
+                                    && let Some(editor) = shell.tui.get_mut_as::<Editor>(
+                                        SlotIndex::Editor.idx(),
+                                    )
+                                {
+                                    editor.insert_text_at_cursor(
+                                        &path.display().to_string(),
+                                    );
+                                }
+                                shell.tui.request_render();
+                                continue;
+                            }
+                        }
+                        // Global command-palette chord. Bound via
+                        // `aj.palette.open` (default `ctrl+o`).
+                        // Intercepted before `shell.tui.handle_input` so
+                        // no component sees the keystroke. The
+                        // actual overlay mount happens after
+                        // `shell.tui.handle_input` via the shared
+                        // `shell.palette_open_request` flag, so both the
+                        // editor-`/` path and this chord converge
+                        // on the same dispatcher arm. Inert while
+                        // a selector is already up so the chord
+                        // can't interrupt an open modal.
+                        //
+                        // `aj.overlay.close_all` (default `ctrl+c`)
+                        // is the symmetric tear-down chord: when
+                        // an overlay is up, intercept and consume
+                        // the event so the selector's own cancel
+                        // path doesn't also fire.
+                        let mut consume_event = false;
+                        {
+                            let kb = aj_tui::keybindings::get();
+                            if open_selector.is_some()
+                                && kb.matches(
+                                    &input,
+                                    crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
+                                )
+                            {
+                                drop(kb);
+                                shell.close_all_request.store(true, Ordering::Relaxed);
+                                // Consume: skip `shell.tui.handle_input`
+                                // entirely so the selector doesn't
+                                // also see Ctrl+C as a cancel and
+                                // write a cancel-outcome that would
+                                // then drive a stale one-level
+                                // back-stack restore underneath
+                                // our explicit teardown.
+                                consume_event = true;
+                            } else if open_selector.is_none()
+                                && login_session.is_none()
+                                && kb.matches(
+                                    &input,
+                                    crate::config::keybindings::ACTION_PALETTE_OPEN,
+                                )
+                            {
+                                drop(kb);
+                                shell.palette_open_request.store(true, Ordering::Relaxed);
+                                // Fall through to the dispatcher
+                                // arm below by letting handle_input
+                                // run (it's a no-op for this chord
+                                // since no component binds ctrl+o).
+                            } else if open_selector.is_none()
+                                && login_session.is_none()
+                                && kb.matches(
+                                    &input,
+                                    crate::config::keybindings::ACTION_HISTORY_OPEN,
+                                )
+                            {
+                                drop(kb);
+                                shell.history_open_request.store(true, Ordering::Relaxed);
+                                // Consume: the editor binds no
+                                // ctrl+r, but skipping handle_input
+                                // keeps the chord from reaching any
+                                // future binding and matches the
+                                // close-all interception style.
+                                consume_event = true;
+                            } else if open_selector.is_none()
+                                && login_session.is_none()
+                                && kb.matches(
+                                    &input,
+                                    crate::config::keybindings::ACTION_AGENT_PICKER,
+                                )
+                            {
+                                drop(kb);
+                                shell.agent_picker_open_request.store(true, Ordering::Relaxed);
+                                // Consume: the editor binds no alt+a;
+                                // skipping handle_input keeps the
+                                // chord from reaching any future
+                                // binding, like the history chord.
+                                consume_event = true;
+                            }
+                        }
+                        if !consume_event {
+                            shell.tui.handle_input(&input);
+                        }
+
+                        // Close-all: tear down current selector
+                        // and any parent palette in one shot.
+                        // Done before the palette-open dispatch
+                        // and the per-tick outcome poll so we
+                        // never re-enter the back-stack logic
+                        // on a unwound state.
+                        if shell.close_all_request.swap(false, Ordering::Relaxed) {
+                            if let Some(sel) = open_selector.take() {
+                                close_all_overlays(&mut shell.tui, sel);
+                            }
+                            continue;
+                        }
+
+                        // Login cancellation: the dialog's Esc (or
+                        // Ctrl+C above) flips the shared flag. Tear
+                        // the dialog down and abort the login task;
+                        // the task's `JoinHandle` arm sees the
+                        // cancellation and stays quiet.
+                        if let Some(session) = login_session.as_ref()
+                            && session.cancel.load(Ordering::Relaxed)
+                        {
+                            shell.tui.hide_overlay(&session.handle);
+                            if let Some(task) = login_task.take() {
+                                task.abort();
+                            }
+                            let name = session.provider_name.clone();
+                            login_session = None;
+                            world.pump.handle(
+                                &mut shell.tui,
+                                &notice_event(&format!("Login to {name} cancelled.")),
+                            );
+                            continue;
+                        }
+
+                        // Global palette open: fired either by the
+                        // editor's `/`-at-empty-prompt callback
+                        // (handled inside `shell.tui.handle_input` above)
+                        // or by the `Ctrl+O` chord intercepted
+                        // below. Dispatched here, after routing,
+                        // so the editor's `/` swallow has already
+                        // landed and so we can `await` the slash
+                        // dispatcher. Gated on `open_selector` to
+                        // be inert while another selector is up.
+                        if shell.palette_open_request.swap(false, Ordering::Relaxed)
+                            && open_selector.is_none()
+                            && login_session.is_none()
+                        {
+                            match handle_slash_command(
+                                &mut shell.tui,
+                                &shell.auth,
+                                Arc::clone(&shell.model_catalog),
+                                Arc::clone(&shell.run_config),
+                                world,
+                                &shell.conversation_persistence,
+                                &shell.theme,
+                                "/palette",
+                                None,
+                                !turns.is_empty(),
+                            ).await {
+                                SlashHandled::Continue { selector, notice } => {
+                                    if let Some(text) = notice {
+                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                    }
+                                    if let Some(sel) = selector {
+                                        open_selector = Some(sel);
+                                    }
+                                }
+                                SlashHandled::SessionChange(request) => {
+                                    debug_assert!(turns.is_empty(), "session change requested mid-turn");
+                                    break Ok(request.into_exit());
+                                }
+                                SlashHandled::Quit => break Ok(SessionExit::Quit),
+                            }
+                            continue;
+                        }
+
+                        // Global prompt-history open: fired by the
+                        // `Ctrl+R` chord intercepted above. Routes a
+                        // synthetic `/history` through the same
+                        // dispatcher with no parent palette, so the
+                        // overlay's `Esc` closes straight back to
+                        // the editor. Gated on `open_selector` to be
+                        // inert while another selector is up.
+                        if shell.history_open_request.swap(false, Ordering::Relaxed)
+                            && open_selector.is_none()
+                            && login_session.is_none()
+                        {
+                            match handle_slash_command(
+                                &mut shell.tui,
+                                &shell.auth,
+                                Arc::clone(&shell.model_catalog),
+                                Arc::clone(&shell.run_config),
+                                world,
+                                &shell.conversation_persistence,
+                                &shell.theme,
+                                "/history",
+                                None,
+                                !turns.is_empty(),
+                            ).await {
+                                SlashHandled::Continue { selector, notice } => {
+                                    if let Some(text) = notice {
+                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                    }
+                                    if let Some(sel) = selector {
+                                        open_selector = Some(sel);
+                                    }
+                                }
+                                SlashHandled::SessionChange(request) => {
+                                    debug_assert!(turns.is_empty(), "session change requested mid-turn");
+                                    break Ok(request.into_exit());
+                                }
+                                SlashHandled::Quit => break Ok(SessionExit::Quit),
+                            }
+                            continue;
+                        }
+
+                        // Global agent-picker open: fired by the
+                        // `Alt+A` chord intercepted above. Routes a
+                        // synthetic `/agents` through the same
+                        // dispatcher with no parent palette, so the
+                        // overlay's `Esc` closes straight back to
+                        // the editor. Gated on `open_selector` to be
+                        // inert while another selector is up.
+                        if shell.agent_picker_open_request.swap(false, Ordering::Relaxed)
+                            && open_selector.is_none()
+                            && login_session.is_none()
+                        {
+                            match handle_slash_command(
+                                &mut shell.tui,
+                                &shell.auth,
+                                Arc::clone(&shell.model_catalog),
+                                Arc::clone(&shell.run_config),
+                                world,
+                                &shell.conversation_persistence,
+                                &shell.theme,
+                                "/agents",
+                                None,
+                                !turns.is_empty(),
+                            ).await {
+                                SlashHandled::Continue { selector, notice } => {
+                                    if let Some(text) = notice {
+                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                    }
+                                    if let Some(sel) = selector {
+                                        open_selector = Some(sel);
+                                    }
+                                }
+                                SlashHandled::SessionChange(request) => {
+                                    debug_assert!(turns.is_empty(), "session change requested mid-turn");
+                                    break Ok(request.into_exit());
+                                }
+                                SlashHandled::Quit => break Ok(SessionExit::Quit),
+                            }
+                            continue;
+                        }
+                        // input was just routed to it. Poll
+                        // the overlay's outcome slot; on a
+                        // confirm/cancel, close it and apply
+                        // the result.
+                        if let Some(sel) = open_selector.take() {
+                            match handle_selector_outcome(
+                                &mut shell.tui,
+                                sel,
+                                &shell.auth,
+                                Arc::clone(&shell.run_config),
+                                Arc::clone(&shell.config),
+                                world,
+                                &shell.theme,
+                            ).await {
+                                SelectorPollOutcome::StillOpen(reopened) => {
+                                    open_selector = Some(reopened);
+                                }
+                                SelectorPollOutcome::Closed {
+                                    notice,
+                                    follow_up,
+                                    start_login,
+                                    session_request,
+                                } => {
+                                    if let Some(text) = notice {
+                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                    }
+                                    // A confirmed session pick exits the
+                                    // per-session loop; the outer loop
+                                    // in `InteractiveMode::run` rebuilds
+                                    // onto the chosen session.
+                                    if let Some(request) = session_request {
+                                        debug_assert!(
+                                            turns.is_empty(),
+                                            "session change requested mid-turn"
+                                        );
+                                        break Ok(request.into_exit());
+                                    }
+                                    // A confirmed `/login` provider
+                                    // pick asks the host to launch
+                                    // the async browser flow: mount
+                                    // the dialog overlay and spawn
+                                    // the login task (polled by the
+                                    // login `select!` arm).
+                                    if let Some(provider_id) = start_login {
+                                        match start_login_session(
+                                            &mut shell.tui,
+                                            &shell.auth,
+                                            &shell.theme,
+                                            &provider_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok((session, task)) => {
+                                                login_session = Some(session);
+                                                login_task = Some(task);
+                                            }
+                                            Err(err) => world.pump.handle(
+                                                &mut shell.tui,
+                                                &warning_event(&format!(
+                                                    "Couldn't start login: {err}"
+                                                )),
+                                            ),
+                                        }
+                                    }
+                                    // The command palette chains into a
+                                    // real slash command by emitting a
+                                    // `follow_up`. Re-feed it through
+                                    // `handle_slash_command` so the
+                                    // dispatch path is identical to a
+                                    // user-typed `/...` line.
+                                    if let Some(follow_up) = follow_up {
+                                        match handle_slash_command(
+                                            &mut shell.tui,
+                                            &shell.auth,
+                                            Arc::clone(&shell.model_catalog),
+                                            Arc::clone(&shell.run_config),
+                                            world,
+                                            &shell.conversation_persistence,
+                                            &shell.theme,
+                                            &follow_up.input,
+                                            Some(follow_up.parent_palette),
+                                            !turns.is_empty(),
+                                        )
+                                        .await
+                                        {
+                                            SlashHandled::Continue { selector, notice } => {
+                                                if let Some(text) = notice {
+                                                    world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                                }
+                                                if let Some(sel) = selector {
+                                                    open_selector = Some(sel);
+                                                }
+                                            }
+                                            SlashHandled::SessionChange(request) => {
+                                                debug_assert!(turns.is_empty(), "session change requested mid-turn");
+                                                break Ok(request.into_exit());
+                                            }
+                                            SlashHandled::Quit => break Ok(SessionExit::Quit),
+                                        }
+                                    }
+                                }
+                            }
+                            sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                            continue;
+                        }
+
+                        // The editor swallows printable
+                        // input and re-emits a `Submit` when
+                        // the user presses Enter. Drain it
+                        // and dispatch.
+                        if let Some(text) = take_submitted_prompt(&mut shell.tui) {
+                            let trimmed = text.trim().to_string();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+
+                            // Slash-command branch: a submitted
+                            // `/...` line is dispatched as a command
+                            // (not queued as a prompt). `disable_submit`
+                            // gates editor submits while a turn runs,
+                            // so this path only fires between turns;
+                            // mid-turn settings changes go through the
+                            // palette/selectors, which never block on
+                            // the agent. `handle_slash_command` still
+                            // gets the live in-flight-turn state so it
+                            // can refuse session-changing commands if
+                            // one ever reaches here mid-turn.
+                            if trimmed.starts_with('/') {
+                                if let Some(editor) = shell.tui.get_mut_as::<Editor>(
+                                    SlotIndex::Editor.idx()
+                                ) {
+                                    editor.set_text("");
+                                }
+                                match handle_slash_command(
+                                    &mut shell.tui,
+                                    &shell.auth,
+                                    Arc::clone(&shell.model_catalog),
+                                    Arc::clone(&shell.run_config),
+                                    world,
+                                    &shell.conversation_persistence,
+                                    &shell.theme,
+                                    &trimmed,
+                                    None,
+                                    !turns.is_empty(),
+                                ).await {
+                                    SlashHandled::Continue { selector, notice } => {
+                                        if let Some(text) = notice {
+                                            world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                        }
+                                        if let Some(sel) = selector {
+                                            open_selector = Some(sel);
+                                        }
+                                    }
+                                    SlashHandled::SessionChange(request) => {
+                                        debug_assert!(turns.is_empty(), "session change requested mid-turn");
+                                        break Ok(request.into_exit());
+                                    }
+                                    SlashHandled::Quit => break Ok(SessionExit::Quit),
+                                }
+                                continue;
+                            }
+
+                            let target = world.pump.active_view(&mut shell.tui);
+
+                            // Per-agent single-turn gate: ignore the submit if the viewed
+                            // agent is already busy (a binary-driven turn or a nested
+                            // initial spawn). Mirrors `sync_editor_enabled`.
+                            if turn_cancels.contains_key(&target) || world.pump.is_running(target) {
+                                continue;
+                            }
+
+                            // Resolve before touching editor state, so a non-promptable
+                            // target (a resumed sub-agent with no live handle) leaves the
+                            // editor as-is and just surfaces a notice.
+                            let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+                                world.pump.handle(&mut shell.tui, &notice_event("This agent can't be prompted."));
+                                continue;
+                            };
+
+                            if let Some(editor) = shell.tui.get_mut_as::<Editor>(
+                                SlotIndex::Editor.idx()
+                            ) {
+                                editor.set_text("");
+                                editor.add_to_history(&trimmed);
+                            }
+
+                            let run_config_for_turn = Arc::clone(&shell.run_config);
+                            // Mint a fresh per-turn cancellation
+                            // token. The binary keeps one clone in
+                            // `turn_cancels` so the Ctrl+C arm can
+                            // fire `.cancel()` without locking the
+                            // agent mutex; the spawned task hands its
+                            // own clone to `agent.prompt`. Both clones
+                            // share cancellation state because the
+                            // inner is `Arc`-backed.
+                            let turn_cancel = CancellationToken::new();
+                            turn_cancels.insert(target, turn_cancel.clone());
+                            turns.spawn(async move {
+                                let mut a = handle.lock().await;
+                                // Apply the loop-side run-config
+                                // snapshot before the turn so a
+                                // model / thinking change the user
+                                // made since the last turn takes
+                                // effect now. Done under the turn's
+                                // own lock — uncontended, since no
+                                // turn is in flight yet — so the
+                                // loop never blocks on it.
+                                {
+                                    let cfg = run_config_for_turn
+                                        .lock()
+                                        .expect("run config mutex poisoned");
+                                    a.set_provider(
+                                        Arc::clone(&cfg.provider),
+                                        Arc::clone(&cfg.model_info),
+                                        cfg.stream_options.clone(),
+                                    );
+                                    a.set_default_thinking(cfg.thinking.clone());
+                                }
+                                let result = a.prompt(trimmed, turn_cancel).await;
+                                (target, result)
+                            });
+                            // The viewed agent is now busy; reflect it in the editor.
+                            sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                        }
+                    }
+                }
+            }
+
+            // --- Agent bus event ---
+            maybe_evt = recv_event(&mut world.event_rx) => {
+                let Some(event) = maybe_evt else { continue };
+                world.pump.handle(&mut shell.tui, &event);
+                sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+            }
+
+            // --- Theme reload (fs-watcher) ---
+            // Coalesced re-parses of `~/.aj/themes/<name>.json`
+            // flow through here. `theme_rx` is `None` when no
+            // watcher is active (bundled shell.theme name with no
+            // override, missing `$HOME`, or the notify backend
+            // declined to start); the helper folds that into a
+            // pending-forever future so the select arm is
+            // harmless in those cases.
+            maybe_new_theme = recv_theme(theme_rx.as_mut()) => {
+                let Some(new_theme) = maybe_new_theme else { continue };
+                let name = new_theme.name().to_string();
+                shell.theme.replace(new_theme);
+                // `Tui::invalidate` walks the root + every overlay
+                // and clears each component's cached render
+                // output. The closures still in flight resolve
+                // through the shared lock so the next render
+                // paints with the new palette automatically.
+                shell.tui.invalidate();
+                shell.tui.request_render();
+                world.pump.handle(
+                    &mut shell.tui,
+                    &notice_event(&format!("Theme '{name}' reloaded.")),
+                );
+            }
+        }
+    };
+
+    // Wind down in-flight turns before handing control back to the
+    // outer session loop. A session change is only requested with no
+    // turn in flight, so this only does work on quit and fatal-error
+    // exits; `shutdown` aborts every task in the set and awaits them.
+    turns.shutdown().await;
+
+    exit
 }
 
 /// Pull one event off the agent's bus channel. Wrapped in a tiny
@@ -1596,12 +1821,16 @@ struct ParentPalette {
 
 /// Result of dispatching a `/...`-prefixed editor submission.
 enum SlashHandled {
-    /// Stay in the main loop. Optionally present a transient notice
-    /// to the chat scrollback and/or open a selector overlay.
+    /// Stay in the session loop. Optionally present a transient
+    /// notice to the chat scrollback and/or open a selector overlay.
     Continue {
         selector: Option<OpenSelector>,
         notice: Option<String>,
     },
+    /// A session change (`/new`) for the outer session loop to
+    /// perform; the per-session loop exits with the matching
+    /// [`SessionExit`]. Only emitted when no turn is in flight.
+    SessionChange(SessionRequest),
     /// User asked to quit; the host breaks out of the loop.
     Quit,
 }
@@ -1631,6 +1860,10 @@ enum SelectorPollOutcome {
         /// task itself — that's the main loop's job, where the login
         /// session state and the task `select!` arm live).
         start_login: Option<String>,
+        /// When set, a confirmed session pick the outer session loop
+        /// should perform by rebuilding the world. Only emitted when
+        /// no turn is in flight.
+        session_request: Option<SessionRequest>,
     },
 }
 
@@ -2117,10 +2350,7 @@ async fn handle_slash_command(
     auth: &AuthStorage,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    config: Arc<std::sync::Mutex<Config>>,
-    world: &mut SessionWorld,
-    completed_sessions: &mut Vec<(String, UsageSummary)>,
-    render_settings: &RenderSettings,
+    world: &SessionWorld,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
     text: &str,
@@ -2320,9 +2550,10 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        // Session-changing commands reseed the agent's transcript
-        // (an agent-locking op), so refuse them mid-turn rather than
-        // freeze the loop. The user can cancel the turn and retry.
+        // Session-changing commands tear down the current world and
+        // rebuild it, which must never abort in-flight work, so
+        // refuse them mid-turn. The user can cancel the turn and
+        // retry.
         SlashAction::OpenSessionSelector if turn_running => SlashHandled::Continue {
             selector: None,
             notice: Some(session_busy_notice("switch sessions")),
@@ -2453,27 +2684,7 @@ async fn handle_slash_command(
             selector: None,
             notice: Some(session_busy_notice("start a new session")),
         },
-        SlashAction::NewSession => match perform_new_session(
-            tui,
-            &run_config,
-            &config,
-            world,
-            completed_sessions,
-            render_settings,
-            conversation_persistence,
-            theme,
-        )
-        .await
-        {
-            Ok(session_id) => SlashHandled::Continue {
-                selector: None,
-                notice: Some(format!("Started a fresh session ({session_id}).")),
-            },
-            Err(err) => SlashHandled::Continue {
-                selector: None,
-                notice: Some(format!("Failed to start a fresh session: {err}")),
-            },
-        },
+        SlashAction::NewSession => SlashHandled::SessionChange(SessionRequest::New),
         SlashAction::Help => {
             use crate::modes::interactive::components::help_overlay::HelpOverlayComponent;
             let inner = HelpOverlayComponent::new(select_list_theme(theme));
@@ -2545,7 +2756,6 @@ async fn handle_slash_command(
 /// pressed Enter or Esc yet; [`SelectorPollOutcome::Closed`] if the
 /// overlay completed, with an optional notice describing what
 /// happened.
-#[allow(clippy::too_many_arguments)]
 async fn handle_selector_outcome(
     tui: &mut Tui,
     selector: OpenSelector,
@@ -2553,9 +2763,6 @@ async fn handle_selector_outcome(
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: Arc<std::sync::Mutex<Config>>,
     world: &mut SessionWorld,
-    completed_sessions: &mut Vec<(String, UsageSummary)>,
-    render_settings: &RenderSettings,
-    conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
 ) -> SelectorPollOutcome {
     match selector {
@@ -2608,6 +2815,7 @@ async fn handle_selector_outcome(
                         notice: Some(notice),
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
                 Some(ThinkingSelectorOutcome::Cancelled) => {
@@ -2629,6 +2837,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
             }
@@ -2713,12 +2922,14 @@ async fn handle_selector_outcome(
                                 notice: Some(notice),
                                 follow_up: None,
                                 start_login: None,
+                                session_request: None,
                             }
                         }
                         Err(err) => SelectorPollOutcome::Closed {
                             notice: Some(format!("Failed to switch to {}: {err}", info.name)),
                             follow_up: None,
                             start_login: None,
+                            session_request: None,
                         },
                     }
                 }
@@ -2735,6 +2946,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
             }
@@ -2765,34 +2977,18 @@ async fn handle_selector_outcome(
                             notice: Some(format!("Already on session {}.", preview.session_id)),
                             follow_up: None,
                             start_login: None,
+                            session_request: None,
                         };
                     }
-                    match perform_session_swap(
-                        tui,
-                        &run_config,
-                        &config,
-                        world,
-                        completed_sessions,
-                        render_settings,
-                        conversation_persistence,
-                        theme,
-                        &preview.session_id,
-                    )
-                    .await
-                    {
-                        Ok(()) => SelectorPollOutcome::Closed {
-                            notice: Some(format!("Switched to session {}.", preview.session_id)),
-                            follow_up: None,
-                            start_login: None,
-                        },
-                        Err(err) => SelectorPollOutcome::Closed {
-                            notice: Some(format!(
-                                "Failed to switch to session {}: {err}",
-                                preview.session_id
-                            )),
-                            follow_up: None,
-                            start_login: None,
-                        },
+                    // Hand the pick to the outer session loop, which
+                    // tears down the current world and rebuilds onto
+                    // the chosen session (and emits the switch notice
+                    // after the new world is installed).
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                        session_request: Some(SessionRequest::Resume(preview.session_id)),
                     }
                 }
                 Some(SessionSelectorOutcome::Cancelled) => {
@@ -2808,6 +3004,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
             }
@@ -2837,6 +3034,7 @@ async fn handle_selector_outcome(
                     notice: None,
                     follow_up: None,
                     start_login: None,
+                    session_request: None,
                 }
             }
             Some(PromptHistoryOutcome::Cancelled) => {
@@ -2852,6 +3050,7 @@ async fn handle_selector_outcome(
                     notice: None,
                     follow_up: None,
                     start_login: None,
+                    session_request: None,
                 }
             }
         },
@@ -2880,6 +3079,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
             }
@@ -2912,6 +3112,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
                 Some(AuthPickerOutcome::Confirmed(provider_id)) => {
@@ -2927,6 +3128,7 @@ async fn handle_selector_outcome(
                             notice: None,
                             follow_up: None,
                             start_login: Some(provider_id),
+                            session_request: None,
                         },
                         // Logout is a quick disk write we can do inline.
                         AuthPickerMode::Logout => {
@@ -2940,6 +3142,7 @@ async fn handle_selector_outcome(
                                 notice: Some(notice),
                                 follow_up: None,
                                 start_login: None,
+                                session_request: None,
                             }
                         }
                     }
@@ -2971,6 +3174,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
             }
@@ -3004,6 +3208,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
                 Some(AgentPickerOutcome::Cancelled) => {
@@ -3019,6 +3224,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
             }
@@ -3033,6 +3239,7 @@ async fn handle_selector_outcome(
                         notice: None,
                         follow_up: None,
                         start_login: None,
+                        session_request: None,
                     }
                 }
                 Some(CommandPaletteOutcome::Confirmed { input }) => {
@@ -3057,126 +3264,12 @@ async fn handle_selector_outcome(
                             },
                         }),
                         start_login: None,
+                        session_request: None,
                     }
                 }
             }
         }
     }
-}
-
-/// Switch to the session identified by `session_id`.
-///
-/// This is the in-process equivalent of `aj continue <id>`: build a
-/// fresh [`SessionWorld`] bound to the resumed log, install it on
-/// the TUI, snapshot the outgoing world's usage for the shutdown
-/// banner, and replace the current world. The outgoing world's
-/// agent, registry, subscriptions, and pump are dropped with it, so
-/// no per-session state survives the switch.
-///
-/// Returns `Err` without touching `*world` if the new world fails to
-/// build, leaving the current session fully intact.
-#[allow(clippy::too_many_arguments)]
-async fn perform_session_swap(
-    tui: &mut Tui,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    config: &Arc<std::sync::Mutex<Config>>,
-    world: &mut SessionWorld,
-    completed_sessions: &mut Vec<(String, UsageSummary)>,
-    render_settings: &RenderSettings,
-    conversation_persistence: &ConversationPersistence,
-    theme: &ThemeHandle,
-    session_id: &str,
-) -> Result<()> {
-    let spec = SessionSpec::Resume {
-        session_id: session_id.to_string(),
-        entry: SessionEntry::Switch,
-    };
-    replace_world(
-        tui,
-        run_config,
-        config,
-        world,
-        completed_sessions,
-        render_settings,
-        conversation_persistence,
-        theme,
-        &spec,
-    )
-    .await
-}
-
-/// Start a fresh session: mint a new [`ConversationLog`] on disk,
-/// build a [`SessionWorld`] around it, install it, and replace the
-/// current world (its usage is snapshotted for the shutdown banner
-/// first). The previous session is preserved on disk untouched.
-///
-/// Returns the new session id on success so the caller can surface
-/// it in a status notice; on build failure the current world is left
-/// fully intact.
-///
-/// [`ConversationLog`]: aj_session::ConversationLog
-#[allow(clippy::too_many_arguments)]
-async fn perform_new_session(
-    tui: &mut Tui,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    config: &Arc<std::sync::Mutex<Config>>,
-    world: &mut SessionWorld,
-    completed_sessions: &mut Vec<(String, UsageSummary)>,
-    render_settings: &RenderSettings,
-    conversation_persistence: &ConversationPersistence,
-    theme: &ThemeHandle,
-) -> Result<String> {
-    let spec = SessionSpec::Create {
-        entry: SessionEntry::Switch,
-    };
-    replace_world(
-        tui,
-        run_config,
-        config,
-        world,
-        completed_sessions,
-        render_settings,
-        conversation_persistence,
-        theme,
-        &spec,
-    )
-    .await?;
-    Ok(world.session_id.clone())
-}
-
-/// Shared build-and-replace step behind [`perform_session_swap`] and
-/// [`perform_new_session`]: build a [`SessionWorld`] for `spec`,
-/// install it on the TUI, push the outgoing world's usage snapshot
-/// onto `completed_sessions`, and assign the new world in place.
-///
-/// The build happens before anything is torn down, so a failure
-/// returns `Err` with the current world untouched.
-#[allow(clippy::too_many_arguments)]
-async fn replace_world(
-    tui: &mut Tui,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    config: &Arc<std::sync::Mutex<Config>>,
-    world: &mut SessionWorld,
-    completed_sessions: &mut Vec<(String, UsageSummary)>,
-    render_settings: &RenderSettings,
-    conversation_persistence: &ConversationPersistence,
-    theme: &ThemeHandle,
-    spec: &SessionSpec,
-) -> Result<()> {
-    let snapshot = config.lock().expect("config mutex poisoned").clone();
-    let mut new_world = SessionWorld::build(
-        &snapshot,
-        run_config,
-        render_settings,
-        theme,
-        conversation_persistence,
-        spec,
-    )?;
-    new_world.install(tui, spec).await;
-    let usage = world.usage_summary().await;
-    completed_sessions.push((world.session_id.clone(), usage));
-    *world = new_world;
-    Ok(())
 }
 
 #[cfg(test)]

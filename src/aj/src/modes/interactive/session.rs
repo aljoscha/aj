@@ -158,8 +158,9 @@ impl SessionWorld {
     /// system-prompt / sub-agent-counter seeding, bus subscriptions,
     /// and pump construction.
     ///
-    /// On error nothing is shared or installed, so a caller swapping
-    /// sessions can keep its current world intact.
+    /// On error nothing is shared or installed; the outer session
+    /// loop in `InteractiveMode::run` falls back to resuming the
+    /// previous session.
     pub(crate) fn build(
         config: &Config,
         run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
