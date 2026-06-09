@@ -250,6 +250,18 @@ pub enum OAuthError {
     Other(String),
 }
 
+/// Summarize an HTTP response body for inclusion in an error message
+/// without exposing its contents.
+///
+/// A token endpoint's success (2xx) body *is* the credential payload
+/// (`access_token`/`refresh_token`), and [`OAuthError`]'s `Display`
+/// reaches logs and stdout, so a raw token-endpoint body must never be
+/// interpolated into an error. Callers pair this with the serde error,
+/// which names the offending field without echoing its value.
+pub(crate) fn redacted_body_summary(body: &str) -> String {
+    format!("{} bytes (redacted)", body.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

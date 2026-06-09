@@ -685,8 +685,12 @@ async fn post_token_request(
         });
     }
 
-    let token: TokenResponse = serde_json::from_str(&text)
-        .map_err(|e| OAuthError::Parse(format!("token response: {e}; body={text}")))?;
+    let token: TokenResponse = serde_json::from_str(&text).map_err(|e| {
+        OAuthError::Parse(format!(
+            "token response: {e}; body={}",
+            crate::oauth::redacted_body_summary(&text)
+        ))
+    })?;
     token_to_credentials(token)
 }
 
@@ -1096,6 +1100,37 @@ mod tests {
             }
             other => panic!("expected Server error, got {other:?}"),
         }
+    }
+
+    /// A 2xx token body that fails to deserialize must not leak the
+    /// live token material into the error string — `OAuthError`'s
+    /// `Display` reaches logs/stdout.
+    #[tokio::test]
+    async fn parse_error_redacts_token_body() {
+        // Valid JSON carrying live tokens but missing `expires_in`, so
+        // it fails to deserialize on a 2xx and hits the `Parse` arm.
+        let mock = MockTokenServer::start(
+            r#"{"access_token":"SECRET-ACCESS","refresh_token":"SECRET-REFRESH"}"#,
+            200,
+        )
+        .await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap();
+
+        let err = refresh_with(&client, &mock.url, "old-refresh")
+            .await
+            .expect_err("a malformed 2xx body must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("SECRET-ACCESS") && !msg.contains("SECRET-REFRESH"),
+            "Parse error leaked token material: {msg}"
+        );
+        assert!(
+            msg.contains("(redacted)"),
+            "Parse error should note the body was redacted: {msg}"
+        );
     }
 
     /// Drive the local callback server end-to-end: bind on a random
