@@ -1,6 +1,6 @@
 # Session lifecycle refactor: clean-slate session worlds
 
-Status: planned. This document specifies how the interactive TUI
+Status: implemented. This document specifies how the interactive TUI
 manages agent and UI state across session boundaries (startup,
 `/new`, `/resume`), replacing in-place mutation with full
 reconstruction.
