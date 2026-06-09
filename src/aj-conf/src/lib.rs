@@ -10,8 +10,7 @@ use thiserror::Error;
 
 /// Thinking level that can be set in `config.toml` as a default baseline.
 ///
-/// When set, this is used for every request unless a trigger word in the user
-/// message overrides it.
+/// When set, this is used for every request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigThinkingLevel {
@@ -602,7 +601,7 @@ pub struct Config {
     pub model_url: Option<String>,
     /// Model name override.
     pub model_name: Option<String>,
-    /// Default thinking level used when no trigger word is present.
+    /// Default thinking level.
     pub thinking: Option<ConfigThinkingLevel>,
     /// How much of the assistant's reasoning channel to surface to
     /// the user. Defaults to `None`, which leaves both providers'
@@ -745,7 +744,7 @@ impl Config {
         },
         ConfigOption {
             name: "thinking",
-            description: "Default thinking level used when no trigger word is present.",
+            description: "Default thinking level.",
             kind: ValueKind::Enum(&["off", "low", "medium", "high", "xhigh", "max"]),
             apply_toml_fn: |v, c| {
                 c.thinking = v.try_into()?;

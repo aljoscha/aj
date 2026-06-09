@@ -512,8 +512,7 @@ impl Agent {
 
     /// Borrow the agent's current default thinking configuration.
     ///
-    /// `None` means "no extended thinking unless a trigger word in
-    /// the user's message escalates it". The selector overlays in
+    /// `None` means "no extended thinking". The selector overlays in
     /// the new TUI read this to highlight the active level when
     /// opening; the binary passes it into the footer for the
     /// startup banner.
@@ -1364,7 +1363,7 @@ impl Agent {
     /// on the stream here: it's returned to the caller, which
     /// polls it inside [`Self::execute_turn`]'s outer retry loop.
     fn run_inference_streaming(&self) -> AssistantMessageEventStream {
-        let thinking = self.determine_thinking();
+        let thinking = self.default_thinking.clone();
 
         tracing::debug!(?thinking, "thinking effort");
 
@@ -1424,66 +1423,6 @@ impl Agent {
 
         self.provider
             .stream_simple(&self.model_info, &context, &options)
-    }
-
-    /// Determine the thinking configuration based on trigger texts in the user
-    /// prompt. Returns thinking configuration based on specific trigger phrases:
-    /// - "think maximum" -> 128,000 tokens
-    /// - "think harder" -> 32,000 tokens
-    /// - "think hard" -> 10,000 tokens
-    /// - "think" -> 4,000 tokens
-    /// - default -> falls back to configured default thinking level
-    fn determine_thinking(&self) -> Option<ThinkingConfig> {
-        // Walk back through the transcript for the most recent
-        // user-role message that contained any text content.
-        // (Tool-result entries don't count: they're synthesized
-        // after a tool batch and shouldn't influence thinking
-        // budget for the follow-up inference.)
-        let last_user_text = self
-            .transcript
-            .iter()
-            .rev()
-            .find_map(|m| match m.as_wire() {
-                Some(Message::User(u)) => {
-                    let has_text = u.content.iter().any(|c| matches!(c, UserContent::Text(_)));
-                    if has_text {
-                        Some(u)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            });
-
-        if let Some(message) = last_user_text {
-            let text_content = message
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    UserContent::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-
-            let text_lower = text_content.to_lowercase();
-
-            // Check for trigger phrases in order of specificity.
-            if text_lower.contains("think maximum") {
-                return Some(ThinkingConfig::Max);
-            } else if text_lower.contains("think hardest") {
-                return Some(ThinkingConfig::XHigh);
-            } else if text_lower.contains("think harder") {
-                return Some(ThinkingConfig::High);
-            } else if text_lower.contains("think hard") {
-                return Some(ThinkingConfig::Medium);
-            } else if text_lower.contains("think") {
-                return Some(ThinkingConfig::Low);
-            }
-        }
-
-        // No trigger word found; fall back to the configured default.
-        self.default_thinking.clone()
     }
 
     async fn execute_tool(
