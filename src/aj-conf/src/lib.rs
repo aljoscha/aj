@@ -2,6 +2,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use std::str::FromStr;
@@ -308,10 +309,14 @@ pub enum ConfigError {
     #[error("home directory not found")]
     HomeNotFound,
     /// The existing `config.toml` could not be parsed while preparing
-    /// to write an update, so [`Config::save`] refused to clobber it.
-    /// Carries the `toml_edit` parse error verbatim.
+    /// to write an update, so [`Config::persist_changed`] refused to
+    /// clobber it. Carries the `toml_edit` parse error verbatim.
     #[error("cannot update config.toml (existing file is not valid TOML): {0}")]
     Update(String),
+    /// Timed out waiting for the `config.toml` write lock — another
+    /// process held it for longer than [`LOCK_ACQUIRE_TIMEOUT`].
+    #[error("timed out acquiring the config.toml lock (another process may be writing it)")]
+    LockTimeout,
 }
 
 /// Severity of a [`ConfigDiagnostic`]. Determines how the diagnostic
@@ -478,10 +483,11 @@ pub struct ConfigOption {
     /// (`<unset>`) from set values.
     display_fn: fn(&Config) -> String,
     /// Serialize the field's current value into a `toml_edit::Item`
-    /// for [`Config::save`], or `None` when the field holds its
-    /// default/unset value. A `None` result tells the writer to drop
-    /// the key from `config.toml` rather than emit a redundant
-    /// at-default line — see [`Config::save`] for the full contract.
+    /// for [`Config::persist_changed`], or `None` when the field holds
+    /// its default/unset value. A `None` result tells the writer to
+    /// drop the key from `config.toml` rather than emit a redundant
+    /// at-default line — see [`Config::persist_changed`] for the full
+    /// contract.
     to_toml_fn: fn(&Config) -> Option<toml_edit::Item>,
 }
 
@@ -500,9 +506,10 @@ impl ConfigOption {
         (self.display_fn)(config)
     }
 
-    /// Serialize the field's current value for [`Config::save`].
-    /// `None` means the field is at its default/unset value and the
-    /// key should be removed from `config.toml`.
+    /// Serialize the field's current value for
+    /// [`Config::persist_changed`]. `None` means the field is at its
+    /// default/unset value and the key should be removed from
+    /// `config.toml`.
     pub fn to_toml(&self, config: &Config) -> Option<toml_edit::Item> {
         (self.to_toml_fn)(config)
     }
@@ -556,6 +563,18 @@ fn string_list_item(value: &[String]) -> Option<toml_edit::Item> {
 /// key is dropped from the file.
 fn bool_item(value: bool, default: bool) -> Option<toml_edit::Item> {
     (value != default).then(|| toml_edit::value(value))
+}
+
+/// Canonical string form of an option's serialized value, or `None`
+/// when the option is at its default/unset (its `to_toml` returns
+/// `None`). Used to detect whether an option changed between two
+/// configs without requiring `toml_edit::Item` to implement equality:
+/// both sides come from the same [`ConfigOption::to_toml`] path, so
+/// equal values render identically (decoration included).
+fn item_value_repr(item: &Option<toml_edit::Item>) -> Option<String> {
+    item.as_ref()
+        .and_then(|i| i.as_value())
+        .map(|v| v.to_string())
 }
 
 /// Application configuration loaded from `~/.aj/config.toml`.
@@ -889,30 +908,38 @@ impl Config {
         Ok(Self::get_config_dir()?.join("config.toml"))
     }
 
-    /// Persist the current configuration to `~/.aj/config.toml`.
+    /// Persist the options this process changed to
+    /// `~/.aj/config.toml`, merging them onto whatever is currently on
+    /// disk so a concurrent writer isn't clobbered.
     ///
-    /// The write round-trips through `toml_edit`, so any existing
-    /// comments, key ordering, and surrounding whitespace in the
-    /// user's file are preserved; only the value items this binary
-    /// owns are rewritten. The schema in [`Config::OPTIONS`] is the
-    /// single source of truth — every option is visited and:
+    /// `baseline` is the configuration as it was before the caller's
+    /// in-memory mutation. Only the options whose value differs between
+    /// `self` and `baseline` are written; every other key is left
+    /// exactly as it appears in the file, so a second `aj` instance
+    /// that changed a *different* key keeps its write instead of the
+    /// last writer winning. The whole read-modify-write runs under a
+    /// cross-process lock ([`ConfigLock`]).
     ///
-    /// - a `Some` from [`ConfigOption::to_toml`] sets (or updates in
-    ///   place) the key. Updating in place preserves the leading
-    ///   comment attached to an existing key; an inline trailing
-    ///   comment on the value itself is not preserved.
-    /// - a `None` removes the key, so a setting reverted to its
-    ///   default leaves no redundant at-default line behind.
-    ///
-    /// Refuses to clobber a `config.toml` that isn't valid TOML,
-    /// returning [`ConfigError::Update`] instead so the caller can
-    /// surface the problem rather than silently overwriting the
-    /// user's file. A missing file is treated as empty and created
-    /// on write.
-    pub fn save(&self) -> Result<(), ConfigError> {
+    /// The write round-trips through `toml_edit`, so existing comments,
+    /// key ordering, and surrounding whitespace are preserved. For a
+    /// changed option, a `Some` from [`ConfigOption::to_toml`] sets (or
+    /// updates in place, keeping its leading comment) the key, and a
+    /// `None` — the value is back at its default — removes it. An
+    /// existing file that isn't valid TOML is refused with
+    /// [`ConfigError::Update`] rather than overwritten; a missing file
+    /// is treated as empty and created on write.
+    pub fn persist_changed(&self, baseline: &Config) -> Result<(), ConfigError> {
         let path = Self::config_file_path()?;
+        self.persist_changed_at(baseline, &path)
+    }
 
-        let existing = match fs::read_to_string(&path) {
+    /// [`Self::persist_changed`] against an explicit path, so the lock
+    /// + merge can be exercised against a scratch file without touching
+    /// `~/.aj`.
+    fn persist_changed_at(&self, baseline: &Config, path: &Path) -> Result<(), ConfigError> {
+        let _lock = ConfigLock::acquire(path)?;
+
+        let existing = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(ConfigError::Io(e)),
@@ -922,20 +949,28 @@ impl Config {
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| ConfigError::Update(e.to_string()))?;
 
-        self.apply_into_document(&mut doc);
+        self.apply_changed_into_document(baseline, &mut doc);
 
-        fs::write(&path, doc.to_string())?;
+        fs::write(path, doc.to_string())?;
         Ok(())
     }
 
-    /// Write every option's current value into `doc`, the in-memory
-    /// representation of an existing `config.toml`. Factored out of
-    /// [`Self::save`] so the round-trip can be exercised without
-    /// touching the filesystem. See [`Self::save`] for the per-option
-    /// set/remove contract.
-    fn apply_into_document(&self, doc: &mut toml_edit::DocumentMut) {
+    /// Apply into `doc` only the options whose serialized value differs
+    /// between `self` and `baseline`, leaving every unchanged option's
+    /// key exactly as it appears in `doc`. This is the merge that keeps
+    /// a concurrent writer's edits: `doc` is parsed from the current
+    /// file, and we touch only what this process actually changed.
+    ///
+    /// For a changed option, a `Some` value sets the key (updating in
+    /// place to preserve a leading comment) and a `None` removes it —
+    /// the same set/remove rule [`ConfigOption::to_toml`] documents.
+    fn apply_changed_into_document(&self, baseline: &Config, doc: &mut toml_edit::DocumentMut) {
         for option in Self::OPTIONS {
-            match option.to_toml(self) {
+            let new_item = option.to_toml(self);
+            if item_value_repr(&new_item) == item_value_repr(&option.to_toml(baseline)) {
+                continue;
+            }
+            match new_item {
                 Some(item) => doc[option.name] = item,
                 None => {
                     doc.remove(option.name);
@@ -1104,6 +1139,123 @@ fn path_to_dir_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process config lock
+// ---------------------------------------------------------------------------
+
+/// Initial backoff between lock-acquisition retries; doubles each
+/// attempt up to [`LOCK_MAX_BACKOFF`].
+const LOCK_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
+const LOCK_MAX_BACKOFF: Duration = Duration::from_millis(250);
+/// Give up acquiring the lock after this long and report
+/// [`ConfigError::LockTimeout`]. A config write is a tiny
+/// read-modify-write, so genuine contention clears in milliseconds;
+/// this ceiling only bounds the pathological "another writer is
+/// wedged" case (a crashed holder is reclaimed sooner via
+/// [`LOCK_STALE_AGE`]). Kept short because the interactive loop calls
+/// the writer synchronously.
+const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+/// A lock directory whose mtime is older than this is assumed
+/// abandoned by a crashed writer and stolen.
+const LOCK_STALE_AGE: Duration = Duration::from_secs(60);
+
+/// Sidecar lock for `config.toml`: an empty directory next to the file
+/// (`config.toml.lock`). `create_dir` is atomic on every supported OS,
+/// so its `AlreadyExists` error is the natural "already locked" signal.
+/// Held across a read-modify-write so two processes editing the config
+/// can't interleave and clobber each other.
+///
+/// Released on `Drop`; a process that aborts before `Drop` runs leaves
+/// the directory behind, which the next acquirer reclaims once it's
+/// older than [`LOCK_STALE_AGE`].
+///
+/// The same sidecar-directory scheme guards `auth.json`; this is its
+/// synchronous twin, since the interactive loop persists config with no
+/// async runtime in scope.
+struct ConfigLock {
+    path: PathBuf,
+}
+
+impl ConfigLock {
+    /// Acquire the lock for `target_path`, retrying with exponential
+    /// backoff up to [`LOCK_ACQUIRE_TIMEOUT`]. Returns
+    /// [`ConfigError::LockTimeout`] if a live sibling holds it the whole
+    /// time.
+    fn acquire(target_path: &Path) -> Result<Self, ConfigError> {
+        let lock_path = lock_path_for(target_path);
+
+        // Make sure the parent exists so `create_dir(lock_path)` has
+        // somewhere to land.
+        if let Some(parent) = lock_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let mut backoff = LOCK_INITIAL_BACKOFF;
+        loop {
+            match fs::create_dir(&lock_path) {
+                Ok(()) => return Ok(Self { path: lock_path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if try_steal_stale_lock(&lock_path, LOCK_STALE_AGE) {
+                        // Stole an abandoned lock; retry immediately. A
+                        // racing acquirer that beat us just re-enters the
+                        // backoff path next iteration.
+                        continue;
+                    }
+                    if start.elapsed() > LOCK_ACQUIRE_TIMEOUT {
+                        return Err(ConfigError::LockTimeout);
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(LOCK_MAX_BACKOFF);
+                }
+                Err(e) => return Err(ConfigError::Io(e)),
+            }
+        }
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // Best-effort cleanup. The lock path is a directory we created,
+        // so `remove_dir` succeeds unless something already tore it down.
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+/// `config.toml` → `config.toml.lock` next to it.
+fn lock_path_for(file_path: &Path) -> PathBuf {
+    let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = match file_path.file_name() {
+        Some(n) => format!("{}.lock", n.to_string_lossy()),
+        None => "config.lock".to_string(),
+    };
+    parent.join(name)
+}
+
+/// Remove `lock_path` if it exists and its mtime is older than
+/// `max_age`, signalling the holder likely crashed. Returns `true` only
+/// when it actually removed the directory, so the caller can retry. Any
+/// I/O error is swallowed — worst case the caller backs off and times
+/// out. `max_age` is a parameter so tests can drive the steal path with
+/// a tiny threshold.
+fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
+    let Ok(meta) = fs::metadata(lock_path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = modified.elapsed() else {
+        return false;
+    };
+    if age <= max_age {
+        return false;
+    }
+    fs::remove_dir(lock_path).is_ok()
 }
 
 #[cfg(test)]
@@ -1692,12 +1844,13 @@ image_block = true
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Apply `config` onto `existing` config-file text via the same
-    /// path [`Config::save`] uses, returning the rewritten text. Lets
-    /// the round-trip be asserted without touching `~/.aj`.
-    fn rewrite(existing: &str, config: &Config) -> String {
+    /// Apply the options that changed between `baseline` and `config`
+    /// onto `existing` config-file text via the same merge
+    /// [`Config::persist_changed`] uses, returning the rewritten text.
+    /// Lets the round-trip be asserted without touching `~/.aj`.
+    fn rewrite_changed(existing: &str, baseline: &Config, config: &Config) -> String {
         let mut doc = existing.parse::<toml_edit::DocumentMut>().unwrap();
-        config.apply_into_document(&mut doc);
+        config.apply_changed_into_document(baseline, &mut doc);
         doc.to_string()
     }
 
@@ -1710,7 +1863,7 @@ thinking = \"low\"
         let mut config = Config::default();
         config.thinking = Some(ConfigThinkingLevel::High);
 
-        let rewritten = rewrite(existing, &config);
+        let rewritten = rewrite_changed(existing, &Config::default(), &config);
         assert!(
             rewritten.contains("# Pick the reasoning effort."),
             "leading comment should survive: {rewritten:?}"
@@ -1732,7 +1885,7 @@ thinking = \"low\"
         config.model_api = Some("anthropic".to_string());
         config.model_name = Some("claude-x".to_string());
 
-        let rewritten = rewrite("", &config);
+        let rewritten = rewrite_changed("", &Config::default(), &config);
         let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
         assert!(diag.is_empty(), "got: {diag:?}");
         assert_eq!(parsed.model_api.as_deref(), Some("anthropic"));
@@ -1741,15 +1894,20 @@ thinking = \"low\"
 
     #[test]
     fn test_save_removes_key_reverted_to_default() {
-        // An unset Option, an emptied list, and a bool back at its
-        // default should all be dropped from the file.
+        // Reverting an option to its default removes its key. The
+        // baseline carries the prior non-default values; `config` is
+        // back at defaults, so the merge drops each key it owns.
         let existing = "\
 thinking = \"low\"
 disabled_tools = [\"bash\"]
 image_block = true
 ";
+        let mut baseline = Config::default();
+        baseline.thinking = Some(ConfigThinkingLevel::Low);
+        baseline.disabled_tools = vec!["bash".to_string()];
+        baseline.image_block = true;
         let config = Config::default();
-        let rewritten = rewrite(existing, &config);
+        let rewritten = rewrite_changed(existing, &baseline, &config);
 
         assert!(!rewritten.contains("thinking"), "got: {rewritten:?}");
         assert!(!rewritten.contains("disabled_tools"), "got: {rewritten:?}");
@@ -1760,7 +1918,7 @@ image_block = true
     fn test_save_omits_default_bools() {
         // A pristine default config writes nothing — defaults never
         // accumulate redundant lines in a fresh file.
-        let rewritten = rewrite("", &Config::default());
+        let rewritten = rewrite_changed("", &Config::default(), &Config::default());
         assert_eq!(rewritten.trim(), "", "got: {rewritten:?}");
     }
 
@@ -1769,7 +1927,7 @@ image_block = true
         let mut config = Config::default();
         // image_auto_resize defaults to true; flipping it off should persist.
         config.image_auto_resize = false;
-        let rewritten = rewrite("", &config);
+        let rewritten = rewrite_changed("", &Config::default(), &config);
         let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
         assert!(diag.is_empty(), "got: {diag:?}");
         assert!(!parsed.image_auto_resize);
@@ -1793,7 +1951,7 @@ image_block = true
         config.image_show_in_terminal = false;
         config.image_block = true;
 
-        let rewritten = rewrite("", &config);
+        let rewritten = rewrite_changed("", &Config::default(), &config);
         let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
         assert!(diag.is_empty(), "got: {diag:?}");
 
@@ -1812,5 +1970,133 @@ image_block = true
         assert!(!parsed.image_auto_resize);
         assert!(!parsed.image_show_in_terminal);
         assert!(parsed.image_block);
+    }
+
+    // ---- persist_changed (lock + merge) ----------------------------------
+
+    #[test]
+    fn persist_changed_does_not_clobber_a_concurrent_writers_key() {
+        // Simulate a second process having written `model_api`. This
+        // process only changed `theme`, so the merge must keep both.
+        let dir = make_temp_dir("persist-no-clobber");
+        let path = dir.join("config.toml");
+        fs::write(&path, "model_api = \"anthropic\"\n").unwrap();
+
+        let baseline = Config::default();
+        let mut config = Config::default();
+        config.theme = Some("dark".to_string());
+        config
+            .persist_changed_at(&baseline, &path)
+            .expect("persist");
+
+        let written = fs::read_to_string(&path).unwrap();
+        let (parsed, diag) = parse_config(&written, &path);
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(
+            parsed.model_api.as_deref(),
+            Some("anthropic"),
+            "concurrent writer's key was clobbered: {written:?}"
+        );
+        assert_eq!(parsed.theme.as_deref(), Some("dark"), "got: {written:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_changed_refuses_to_clobber_invalid_toml() {
+        let dir = make_temp_dir("persist-invalid");
+        let path = dir.join("config.toml");
+        let invalid = "this is = = not valid toml\n";
+        fs::write(&path, invalid).unwrap();
+
+        let mut config = Config::default();
+        config.theme = Some("dark".to_string());
+        let err = config
+            .persist_changed_at(&Config::default(), &path)
+            .expect_err("must refuse invalid TOML");
+        assert!(matches!(err, ConfigError::Update(_)), "got: {err:?}");
+
+        // The original file is left untouched.
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_changed_creates_a_missing_file() {
+        let dir = make_temp_dir("persist-missing");
+        let path = dir.join("config.toml");
+        assert!(!path.exists());
+
+        let mut config = Config::default();
+        config.model_name = Some("gpt-x".to_string());
+        config
+            .persist_changed_at(&Config::default(), &path)
+            .expect("persist");
+
+        let (parsed, diag) = parse_config(&fs::read_to_string(&path).unwrap(), &path);
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(parsed.model_name.as_deref(), Some("gpt-x"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_changed_preserves_comments_across_an_update() {
+        let dir = make_temp_dir("persist-comments");
+        let path = dir.join("config.toml");
+        fs::write(&path, "# keep me\nthinking = \"low\"\n").unwrap();
+
+        let mut baseline = Config::default();
+        baseline.thinking = Some(ConfigThinkingLevel::Low);
+        let mut config = Config::default();
+        config.thinking = Some(ConfigThinkingLevel::High);
+        config
+            .persist_changed_at(&baseline, &path)
+            .expect("persist");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# keep me"), "got: {written:?}");
+        assert!(written.contains("thinking = \"high\""), "got: {written:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_lock_round_trips_and_releases_on_drop() {
+        let dir = make_temp_dir("lock-roundtrip");
+        let target = dir.join("config.toml");
+        let lock_dir = lock_path_for(&target);
+
+        {
+            let _lock = ConfigLock::acquire(&target).expect("acquire");
+            assert!(lock_dir.exists(), "lock dir should exist while held");
+        }
+        assert!(!lock_dir.exists(), "lock dir should be gone after drop");
+
+        // A second acquisition succeeds now that the first released.
+        let _lock = ConfigLock::acquire(&target).expect("re-acquire");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn try_steal_stale_lock_reclaims_only_old_locks() {
+        let dir = make_temp_dir("lock-steal");
+        let lock_dir = dir.join("config.toml.lock");
+        fs::create_dir(&lock_dir).unwrap();
+
+        // A just-created lock (younger than the threshold) is left alone.
+        assert!(!try_steal_stale_lock(&lock_dir, Duration::from_secs(3600)));
+        assert!(lock_dir.exists());
+
+        // A zero threshold treats any existing lock as stale and steals it.
+        assert!(try_steal_stale_lock(&lock_dir, Duration::from_secs(0)));
+        assert!(!lock_dir.exists());
+
+        // Nothing to steal once it's gone.
+        assert!(!try_steal_stale_lock(&lock_dir, Duration::from_secs(0)));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -9,8 +9,11 @@
 //! [`ConversationView`] is a short-lived mutation handle that tracks
 //! a head pointer and routes appends to a specific thread (the
 //! user's main conversation, or one sub-agent subtree). It writes
-//! one JSONL line per call, so every individual event is durable as
-//! soon as the call returns.
+//! one JSONL line per call; the write reaches the OS before the call
+//! returns, so the entry survives a crash of *this* process. It is
+//! deliberately not `fsync`'d, so a host crash or power loss can still
+//! lose the most recent line(s) — [`ConversationLog::resume`] tolerates
+//! a torn final line with a warning.
 //!
 //! [`Conversation`] is the read-only linearized projection consumed
 //! by the wire layer. It carries the materialized [`AgentMessage`]
@@ -443,8 +446,10 @@ impl ConversationLog {
     ///   non-punctuation lines into the file (creating it on first
     ///   use) and then writes the new entry's line, in order, before
     ///   returning. After `Ok(_)`, the entry and everything that
-    ///   preceded it are durable. This preserves the per-line
-    ///   durability the agent loop relies on for `repair_interrupted_tool_uses`.
+    ///   preceded it have been written to the OS — they survive a
+    ///   crash of this process, though they are not `fsync`'d, so a
+    ///   power loss can still lose the tail. This write-before-return
+    ///   is what `repair_interrupted_tool_uses` relies on.
     /// - For a **non-punctuation** entry, this serializes the line
     ///   and queues it in `pending_writes` without touching disk.
     ///   It becomes durable only when a subsequent punctuation
@@ -691,8 +696,9 @@ impl ConversationLog {
 /// append attaches (`head`) and which thread it belongs to.
 ///
 /// Each `add_*` method serializes and writes one line to disk before
-/// advancing the head, so every individual event is durable as soon as the
-/// call returns.
+/// advancing the head, so every individual event reaches the OS as soon
+/// as the call returns (surviving a crash of this process; not
+/// `fsync`'d, so a power loss can lose the most recent line).
 pub struct ConversationView<'a> {
     log: &'a mut ConversationLog,
     head: Option<EntryId>,

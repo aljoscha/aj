@@ -11,9 +11,11 @@
 //!
 //! Edits run sequentially against an in-memory copy of the file —
 //! each edit's `old_string` is matched against the result of all
-//! prior edits. The disk write only happens once every edit has
-//! validated, so a failure mid-batch leaves the file untouched
-//! (the documented "all edits applied atomically" contract).
+//! prior edits. The single disk write happens only after every edit
+//! has validated, so a failure mid-batch leaves the file untouched:
+//! all edits apply together or none do. That all-or-nothing guarantee
+//! is about application order, not durability — the final write itself
+//! is an ordinary in-place `fs::write`, not a crash-atomic replace.
 //!
 //! Recoverable errors (path-not-absolute, file-not-found, read /
 //! write failure, zero or ambiguous matches at any step) come back
@@ -45,7 +47,7 @@ Usage:
 - If there are zero matches or multiple matches for any edit, the operation will fail
 - If replace_all is set to true for an edit, all occurrences of that edit's old_string will be replaced with new_string
 - Edits are applied sequentially, so each subsequent edit works on the state of the file after the previous edit
-- All edits are applied atomically, either all succeed or the whole operation fails
+- Either every edit applies, or — if any edit fails to match — none are written to the file
 - Prefer this tool over edit_file if there are multiple changes to a file that can be batched together in one call to edit_file_multi
 "#;
 

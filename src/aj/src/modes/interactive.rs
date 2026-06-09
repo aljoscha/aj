@@ -620,8 +620,9 @@ impl InteractiveMode {
         // outcomes (model / thinking, and future settings popups)
         // mutate this and persist it via `persist_config` so a choice
         // made in the TUI survives a restart. Held behind a std mutex
-        // because `Config::save` is a quick synchronous file write,
-        // never awaited across.
+        // because the write is a quick synchronous read-merge-write
+        // (`Config::persist_changed`) done off the guard, never awaited
+        // across.
         let config = Arc::new(std::sync::Mutex::new(config));
         let mut persistence_handle: SubscriptionHandle = {
             let a = agent.lock().await;
@@ -1877,17 +1878,28 @@ fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> Config
 /// for the running session; this mirrors the change into the
 /// persisted config so it survives a restart.
 ///
-/// Persistence is best-effort: a save failure returns a user-facing
-/// notice (to append to the action's confirmation) rather than an
-/// error, since the in-memory change already took effect. Returns
-/// `None` on success.
+/// The write goes through [`Config::persist_changed`], which merges
+/// only the options this change touched onto the latest on-disk file
+/// under a cross-process lock — so a second `aj` editing a different
+/// key isn't clobbered. The in-memory mutation is applied first and
+/// the guard dropped before the write, so the live change takes effect
+/// regardless and the (best-effort) persistence never holds the config
+/// mutex across file I/O.
+///
+/// A save failure returns a user-facing notice (to append to the
+/// action's confirmation) rather than an error. Returns `None` on
+/// success.
 fn persist_config(
     config: &Arc<std::sync::Mutex<Config>>,
     mutate: impl FnOnce(&mut Config),
 ) -> Option<String> {
-    let mut cfg = config.lock().expect("config mutex poisoned");
-    mutate(&mut cfg);
-    match cfg.save() {
+    let (baseline, updated) = {
+        let mut cfg = config.lock().expect("config mutex poisoned");
+        let baseline = cfg.clone();
+        mutate(&mut cfg);
+        (baseline, cfg.clone())
+    };
+    match updated.persist_changed(&baseline) {
         Ok(()) => None,
         Err(err) => Some(format!("(couldn't save to config.toml: {err})")),
     }
