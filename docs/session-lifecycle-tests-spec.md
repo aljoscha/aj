@@ -1,6 +1,6 @@
 # Session lifecycle test coverage
 
-Status: planned. Companion to `session-lifecycle-spec.md`: that
+Status: implemented. Companion to `session-lifecycle-spec.md`: that
 document specifies the clean-slate session worlds; this one
 specifies the test coverage that locks their behavior in place.
 

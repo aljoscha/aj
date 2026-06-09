@@ -24,6 +24,8 @@ pub mod layout;
 pub mod render_settings;
 pub mod session;
 pub mod shutdown;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -601,65 +603,25 @@ impl InteractiveMode {
             let previous_id = world.session_id.clone();
 
             let config_snapshot = shell.config.lock().expect("config mutex poisoned").clone();
-            match SessionWorld::build(
+            match build_next_world(
                 &config_snapshot,
                 &shell.run_config,
                 &shell.render_settings,
                 &shell.theme,
                 &shell.conversation_persistence,
-                &spec,
+                spec,
+                &previous_id,
             ) {
-                Ok(mut new_world) => {
-                    new_world.install(&mut shell.tui, &spec).await;
-                    let notice = match &spec {
-                        SessionSpec::Create { .. } => {
-                            format!("Started a fresh session ({}).", new_world.session_id)
-                        }
-                        SessionSpec::Resume { session_id, .. } => {
-                            format!("Switched to session {session_id}.")
-                        }
-                    };
-                    new_world
-                        .pump
-                        .handle(&mut shell.tui, &notice_event(&notice));
-                    world = new_world;
-                }
-                Err(err) => {
-                    // The requested world failed to build. Fall back
-                    // to resuming the session that just ended — its
-                    // log is on disk and current — and surface the
-                    // error in the fallback world's scrollback. If the
-                    // fallback build fails too, that's fatal.
-                    let failure = match &spec {
-                        SessionSpec::Create { .. } => {
-                            format!("Failed to start a fresh session: {err}")
-                        }
-                        SessionSpec::Resume { session_id, .. } => {
-                            format!("Failed to switch to session {session_id}: {err}")
-                        }
-                    };
-                    let fallback = SessionSpec::Resume {
-                        session_id: previous_id,
-                        entry: SessionEntry::Switch,
-                    };
-                    match SessionWorld::build(
-                        &config_snapshot,
-                        &shell.run_config,
-                        &shell.render_settings,
-                        &shell.theme,
-                        &shell.conversation_persistence,
-                        &fallback,
-                    ) {
-                        Ok(mut fallback_world) => {
-                            fallback_world.install(&mut shell.tui, &fallback).await;
-                            fallback_world
-                                .pump
-                                .handle(&mut shell.tui, &notice_event(&failure));
-                            world = fallback_world;
-                        }
-                        Err(fatal) => break (None, Err(fatal)),
+                Ok(mut next) => {
+                    next.world.install(&mut shell.tui, &next.spec).await;
+                    for notice in &next.notices {
+                        next.world
+                            .pump
+                            .handle(&mut shell.tui, &notice_event(notice));
                     }
+                    world = next.world;
                 }
+                Err(err) => break (None, Err(err)),
             }
         };
 
@@ -775,6 +737,89 @@ struct Shell {
     /// Tripped by the `aj.agent.open` chord; drained by the session
     /// loop.
     agent_picker_open_request: Arc<AtomicBool>,
+}
+
+/// Outcome of building the next session world after a switch
+/// request: the world to install, the spec it was built for (the
+/// requested one, or the fallback onto the previous session), and
+/// the chat notices to pump after install (switch confirmation, or
+/// the failure text followed by nothing — the fallback world's
+/// install already announces itself).
+struct NextWorld {
+    world: SessionWorld,
+    spec: SessionSpec,
+    notices: Vec<String>,
+}
+
+/// Build the session world a `/new` or `/resume` request asks for.
+///
+/// If the requested build fails, falls back to resuming
+/// `previous_session_id` — the session that just ended, whose log is
+/// on disk and current — and reports the failure as the notice
+/// instead. Returns `Err` only when the fallback build fails too,
+/// which the outer session loop treats as fatal. Touches no TUI
+/// state: installing the returned world and pumping its notices stay
+/// with the caller.
+fn build_next_world(
+    config: &Config,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    render_settings: &RenderSettings,
+    theme: &ThemeHandle,
+    persistence: &ConversationPersistence,
+    requested: SessionSpec,
+    previous_session_id: &str,
+) -> Result<NextWorld> {
+    match SessionWorld::build(
+        config,
+        run_config,
+        render_settings,
+        theme,
+        persistence,
+        &requested,
+    ) {
+        Ok(world) => {
+            let notice = match &requested {
+                SessionSpec::Create { .. } => {
+                    format!("Started a fresh session ({}).", world.session_id)
+                }
+                SessionSpec::Resume { session_id, .. } => {
+                    format!("Switched to session {session_id}.")
+                }
+            };
+            Ok(NextWorld {
+                world,
+                spec: requested,
+                notices: vec![notice],
+            })
+        }
+        Err(err) => {
+            let failure = match &requested {
+                SessionSpec::Create { .. } => {
+                    format!("Failed to start a fresh session: {err}")
+                }
+                SessionSpec::Resume { session_id, .. } => {
+                    format!("Failed to switch to session {session_id}: {err}")
+                }
+            };
+            let fallback = SessionSpec::Resume {
+                session_id: previous_session_id.to_string(),
+                entry: SessionEntry::Switch,
+            };
+            let world = SessionWorld::build(
+                config,
+                run_config,
+                render_settings,
+                theme,
+                persistence,
+                &fallback,
+            )?;
+            Ok(NextWorld {
+                world,
+                spec: fallback,
+                notices: vec![failure],
+            })
+        }
+    }
 }
 
 /// Why [`run_session`]'s per-session loop returned.
@@ -3277,8 +3322,12 @@ mod tests {
     use std::path::PathBuf;
 
     use aj_conf::{AgentEnv, ContextFile, ContextFileKind};
+    use tempfile::TempDir;
 
     use super::*;
+    use crate::modes::interactive::test_support::{
+        one_turn_session, resume_spec, scripted_run_config,
+    };
 
     /// Build an [`AgentEnv`] for use in the helper tests below.
     /// Working directory / OS / date / git root are all stubbed —
@@ -3418,6 +3467,135 @@ mod tests {
         assert_eq!(
             session_busy_notice("start a new session"),
             "Can't start a new session while a turn is running — press Ctrl+C to cancel it first."
+        );
+    }
+
+    /// [`build_next_world`] with a default config, bundled theme,
+    /// fixed render settings, and a scripted run config with no
+    /// scripted replies — building a world never runs inference.
+    fn next_world(
+        persistence: &ConversationPersistence,
+        requested: SessionSpec,
+        previous_session_id: &str,
+    ) -> Result<NextWorld> {
+        build_next_world(
+            &Config::default(),
+            &scripted_run_config(Vec::new()),
+            &RenderSettings::new(false, false, true),
+            &ThemeHandle::new(Theme::bundled_dark()),
+            persistence,
+            requested,
+            previous_session_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn build_next_world_create_returns_fresh_world_and_notice() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let previous_id = one_turn_session(&persistence, "hello there", "scripted reply").await;
+
+        let next = next_world(
+            &persistence,
+            SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            &previous_id,
+        )
+        .expect("create request succeeds");
+
+        assert!(
+            matches!(
+                next.spec,
+                SessionSpec::Create {
+                    entry: SessionEntry::Switch
+                }
+            ),
+            "requested spec carried through for install"
+        );
+        assert_ne!(
+            next.world.session_id, previous_id,
+            "fresh world gets a new session id"
+        );
+        assert_eq!(
+            next.notices,
+            vec![format!(
+                "Started a fresh session ({}).",
+                next.world.session_id
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_next_world_resume_returns_target_world_and_notice() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let first_id = one_turn_session(&persistence, "first prompt", "first reply").await;
+        let second_id = one_turn_session(&persistence, "second prompt", "second reply").await;
+
+        let next = next_world(&persistence, resume_spec(&first_id), &second_id)
+            .expect("resume request succeeds");
+
+        assert_eq!(
+            next.world.session_id, first_id,
+            "world bound to the requested session"
+        );
+        assert!(
+            matches!(
+                &next.spec,
+                SessionSpec::Resume {
+                    session_id,
+                    entry: SessionEntry::Switch
+                } if *session_id == first_id
+            ),
+            "requested spec carried through for install"
+        );
+        assert_eq!(
+            next.notices,
+            vec![format!("Switched to session {first_id}.")]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_next_world_falls_back_to_previous_on_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let previous_id = one_turn_session(&persistence, "hello there", "scripted reply").await;
+
+        let next = next_world(&persistence, resume_spec("does-not-exist"), &previous_id)
+            .expect("fallback onto the previous session succeeds");
+
+        assert_eq!(
+            next.world.session_id, previous_id,
+            "fallback world resumes the previous session"
+        );
+        assert!(
+            matches!(
+                &next.spec,
+                SessionSpec::Resume {
+                    session_id,
+                    entry: SessionEntry::Switch
+                } if *session_id == previous_id
+            ),
+            "fallback spec carried through for install"
+        );
+        assert_eq!(next.notices.len(), 1, "only the failure notice is pumped");
+        assert!(
+            next.notices[0].starts_with("Failed to switch to session does-not-exist:"),
+            "unexpected failure notice: {:?}",
+            next.notices[0]
+        );
+    }
+
+    #[test]
+    fn build_next_world_is_fatal_when_fallback_also_fails() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        let result = next_world(&persistence, resume_spec("nope"), "also-nope");
+        assert!(
+            result.is_err(),
+            "no fallback world exists, so the transition is fatal"
         );
     }
 }
