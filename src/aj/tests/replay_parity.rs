@@ -50,7 +50,7 @@ use aj::modes::interactive::render_settings::RenderSettings;
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
 use aj_agent::tool::ErasedToolDefinition;
-use aj_agent::{Agent, TurnError};
+use aj_agent::{Agent, AgentSeed, TurnError};
 use aj_conf::AgentEnv;
 use aj_models::provider::Provider;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
@@ -280,7 +280,10 @@ async fn drive_live_turn(
         StreamOptions::default(),
         None,
     );
-    agent.set_assembled_system_prompt("test prompt".to_string());
+    agent.seed_session(AgentSeed {
+        assembled_system_prompt: Some("test prompt".to_string()),
+        ..AgentSeed::default()
+    });
 
     // 1. Persistence — writes terminal-state events to disk.
     let _h_persist = agent.subscribe(persistence_listener(Arc::clone(&log_handle)));

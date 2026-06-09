@@ -1,7 +1,7 @@
 //! Agent-level transcript entries.
 //!
 //! `AgentMessage` is the unit of the agent's in-memory transcript and
-//! the input shape for `Agent::seed_messages` / output shape for
+//! the input shape for `Agent::seed_session` / output shape for
 //! `Agent::messages()`. It wraps wire-level [`Message`]s so the
 //! transcript can later be extended with agent-only entries (e.g.
 //! UI-only annotations, tool batches, system prompt anchors) without

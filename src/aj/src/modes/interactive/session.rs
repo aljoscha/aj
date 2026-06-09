@@ -14,7 +14,7 @@ use std::sync::Arc;
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::types::UsageSummary;
-use aj_agent::{Agent, SubAgentRegistry};
+use aj_agent::{Agent, AgentSeed, SubAgentRegistry};
 use aj_conf::{AgentEnv, Config};
 use aj_models::ThinkingConfig;
 use aj_models::provider::Provider;
@@ -220,16 +220,16 @@ impl SessionWorld {
             }
             assembled
         };
-        agent.set_assembled_system_prompt(system_prompt);
 
-        // Seed the transcript and the sub-agent counter (so freshly
-        // minted ids don't collide with persisted sub-agent
-        // subtrees). The agent isn't shared yet, so these are
-        // construction, not mutation.
-        agent.seed_messages(messages);
-        if let Some(max_id) = log.max_agent_id() {
-            agent.seed_sub_agent_counter(max_id);
-        }
+        // One-shot session seed: transcript, frozen system prompt,
+        // and the sub-agent counter floor (so freshly minted ids
+        // don't collide with persisted sub-agent subtrees; a fresh
+        // log has no subtrees and seeds the counter's initial 0).
+        agent.seed_session(AgentSeed {
+            transcript: messages,
+            assembled_system_prompt: Some(system_prompt),
+            sub_agent_counter: log.max_agent_id().unwrap_or(0),
+        });
 
         // Fresh, empty registry: only sub-agents spawned in this
         // session become promptable.

@@ -50,10 +50,9 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use aj_agent::Agent;
-use aj_agent::TurnError;
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
+use aj_agent::{Agent, AgentSeed, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, Severity};
 use aj_models::registry::ModelRegistry;
 use aj_models::types::Speed;
@@ -257,22 +256,14 @@ pub async fn run(args: Args) -> Result<()> {
         }
         assembled
     };
-    agent.set_assembled_system_prompt(system_prompt);
-
-    // Seed the sub-agent counter so freshly-minted ids in this run
-    // don't collide with sub-agent subtrees already persisted in the
-    // log. Only meaningful on resume; fresh logs return `None`.
-    if let Some(max_id) = log.max_agent_id() {
-        agent.seed_sub_agent_counter(max_id);
-    }
 
     // Resume-time history replay & repair:
     //
     // - Walk the user thread, synthesize tool_results for any
     //   dangling `tool_use` ids the previous run left behind, and
     //   re-linearize so the seed sees the post-repair view.
-    // - Seed the agent's in-memory transcript from the linearized
-    //   user thread so the next `prompt(...)` call sees the same
+    // - Capture the linearized user thread as the agent's seed
+    //   transcript so the next `prompt(...)` call sees the same
     //   transcript the model saw on the previous run.
     // - In JSON mode, replay the same disk events through the JSON
     //   sink **before** subscribing any listeners to the bus, so
@@ -283,6 +274,7 @@ pub async fn run(args: Args) -> Result<()> {
     //   binary's stdout into another process want a clean final
     //   answer, not the prior conversation re-stamped.
     let is_resuming = resume_request.is_some();
+    let mut transcript = Vec::new();
     if is_resuming && let Some(head) = log.latest_leaf(ThreadFilter::USER) {
         let conversation = log.linearize(&head, ThreadFilter::USER);
         repair_interrupted_tool_uses(&mut log, &conversation)?;
@@ -293,8 +285,7 @@ pub async fn run(args: Args) -> Result<()> {
             .latest_leaf(ThreadFilter::USER)
             .expect("post-repair head exists when pre-repair head did");
         let conversation = log.linearize(&head, ThreadFilter::USER);
-        let messages: Vec<_> = conversation.agent_messages();
-        agent.seed_messages(messages);
+        transcript = conversation.agent_messages();
 
         if matches!(args.format, PrintFormat::Json) {
             let json = json_event_listener();
@@ -305,6 +296,17 @@ pub async fn run(args: Args) -> Result<()> {
             }
         }
     }
+
+    // One-shot session seed: the resumed transcript (empty on a
+    // fresh log), the frozen system prompt, and the sub-agent
+    // counter floor so freshly-minted ids in this run don't collide
+    // with sub-agent subtrees already persisted in the log (a fresh
+    // log has no subtrees and seeds the counter's initial 0).
+    agent.seed_session(AgentSeed {
+        transcript,
+        assembled_system_prompt: Some(system_prompt),
+        sub_agent_counter: log.max_agent_id().unwrap_or(0),
+    });
 
     let log = Arc::new(TokioMutex::new(log));
 

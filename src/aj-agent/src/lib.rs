@@ -45,6 +45,31 @@ use std::sync::Arc;
 use tokio_retry2::strategy::{jitter, ExponentialBackoff};
 use tokio_util::sync::CancellationToken;
 
+/// One-shot session seed applied at construction time: the resumed
+/// transcript, the fully-assembled system prompt, and the sub-agent
+/// counter floor derived from sub-agent subtrees already persisted
+/// on the session's log. Passed to [`Agent::seed_session`].
+#[derive(Debug, Default)]
+pub struct AgentSeed {
+    /// Replaces the agent's in-memory transcript. On resume the
+    /// binary opens the log, linearizes the user thread, and passes
+    /// the resulting messages so the next turn sees the prior
+    /// conversation. Empty for a fresh session.
+    pub transcript: Vec<AgentMessage>,
+    /// The fully-assembled system prompt for the session: either
+    /// reused verbatim from the log (cache-warm resume) or freshly
+    /// assembled via [`Agent::assemble_system_prompt`]. Inference
+    /// reads it directly, so it must be seeded before any turn
+    /// runs. `None` leaves the agent's prompt unset (the seed
+    /// targets a fresh agent, where it is unset already).
+    pub assembled_system_prompt: Option<String>,
+    /// Floor for sub-agent ids: subsequently minted ids are
+    /// strictly greater than this value, so freshly spawned
+    /// sub-agents never collide with subtrees already persisted in
+    /// the log. `0` for a fresh session.
+    pub sub_agent_counter: usize,
+}
+
 pub struct Agent {
     env: AgentEnv,
     /// The base system prompt template provided by the host
@@ -52,14 +77,13 @@ pub struct Agent {
     /// prompt sent to the model is derived from this plus
     /// environment-dependent context (`AgentEnv`); the binary
     /// resolves it once and pushes it onto the agent through
-    /// [`Agent::set_assembled_system_prompt`] so resumed threads
-    /// reuse the original assembly verbatim and keep hitting
-    /// Anthropic's prompt cache.
+    /// [`Agent::seed_session`] so resumed threads reuse the
+    /// original assembly verbatim and keep hitting Anthropic's
+    /// prompt cache.
     system_prompt: &'static str,
     /// The fully-assembled system prompt for the current run.
-    /// Populated by [`Agent::set_assembled_system_prompt`] (resume
-    /// path or fresh assembly) before any turn runs; inference
-    /// reads it directly.
+    /// Populated by [`Agent::seed_session`] (resume path or fresh
+    /// assembly) before any turn runs; inference reads it directly.
     assembled_system_prompt: Option<String>,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<Tool>,
@@ -112,7 +136,7 @@ pub struct Agent {
     /// seen, in append order. Replaces the agent's reach into
     /// [`aj_session::ConversationLog`] (per `docs/aj-next-plan.md`
     /// §2.4b): the binary owns the log, resumes it on startup, and
-    /// seeds the transcript via [`Agent::seed_messages`] before the
+    /// seeds the transcript via [`Agent::seed_session`] before the
     /// first turn.
     transcript: Vec<AgentMessage>,
     /// Optional hook fired before every tool call. Set via
@@ -367,20 +391,21 @@ impl Agent {
         &self.transcript
     }
 
-    /// Replace the in-memory transcript with `messages`. Used on
-    /// resume: the binary opens the log, linearizes the user
-    /// thread, and pushes the resulting `Vec<AgentMessage>` into
-    /// the agent so the next turn sees the prior conversation.
-    pub fn seed_messages(&mut self, messages: Vec<AgentMessage>) {
-        self.transcript = messages;
-    }
-
-    /// Seed the sub-agent counter so subsequent
+    /// Apply a session seed: replace the transcript, set the
+    /// assembled system prompt (a `None` prompt leaves the field
+    /// unset), and seed the sub-agent counter so subsequent
     /// [`SessionState::next_sub_agent_id`] calls mint ids strictly
-    /// greater than `value`. Used on resume to avoid colliding with
-    /// sub-agent subtrees already persisted in the log.
-    pub fn seed_sub_agent_counter(&mut self, value: usize) {
-        self.session_state.seed_sub_agent_counter(value);
+    /// greater than the seeded floor.
+    ///
+    /// Contract: call at most once, on a freshly constructed agent,
+    /// before it is shared or drives its first turn.
+    pub fn seed_session(&mut self, seed: AgentSeed) {
+        self.transcript = seed.transcript;
+        if let Some(prompt) = seed.assembled_system_prompt {
+            self.assembled_system_prompt = Some(prompt);
+        }
+        self.session_state
+            .seed_sub_agent_counter(seed.sub_agent_counter);
     }
 
     /// Install a hook fired before every tool call, replacing any
@@ -413,17 +438,8 @@ impl Agent {
         self.should_stop_after_turn = hook;
     }
 
-    /// Provide the freshly-assembled (or persisted) system prompt
-    /// to the agent. Must be called before any turn runs; inference
-    /// reads it directly. Idempotent: subsequent calls overwrite
-    /// the previous value, but in practice the binary calls this
-    /// exactly once per session.
-    pub fn set_assembled_system_prompt(&mut self, prompt: String) {
-        self.assembled_system_prompt = Some(prompt);
-    }
-
     /// Borrow the assembled system prompt. Returns `None` until
-    /// [`Agent::set_assembled_system_prompt`] runs.
+    /// [`Agent::seed_session`] supplies one.
     pub fn assembled_system_prompt(&self) -> Option<&str> {
         self.assembled_system_prompt.as_deref()
     }
@@ -1769,7 +1785,16 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                 None,
             );
             sub_agent.set_agent_id(child_id);
-            sub_agent.set_assembled_system_prompt(self.assembled_system_prompt.clone());
+            // Sub-agents inherit the parent's assembled system
+            // prompt verbatim so the session has a single,
+            // consistent prompt across the hierarchy. The transcript
+            // and counter parts of the seed stay at their defaults:
+            // the child starts with an empty history and mints no
+            // persisted-id collisions of its own.
+            sub_agent.seed_session(AgentSeed {
+                assembled_system_prompt: Some(self.assembled_system_prompt.clone()),
+                ..AgentSeed::default()
+            });
             // Sub-agents inherit the parent's `image_block` setting
             // so the defense-in-depth gate stays uniform across the
             // hierarchy.
@@ -2013,7 +2038,7 @@ mod event_protocol_tests {
     use crate::tool::{
         ErasedToolDefinition, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
     };
-    use crate::Agent;
+    use crate::{Agent, AgentSeed};
     use tokio_util::sync::CancellationToken;
 
     /// Trivial tool that returns a fixed string. Implements the
@@ -2389,6 +2414,14 @@ mod event_protocol_tests {
         scripts: Vec<Vec<AssistantMessageEvent>>,
         tools: Vec<ErasedToolDefinition>,
     ) -> Agent {
+        build_agent_with_transcript(scripts, tools, Vec::new())
+    }
+
+    fn build_agent_with_transcript(
+        scripts: Vec<Vec<AssistantMessageEvent>>,
+        tools: Vec<ErasedToolDefinition>,
+        transcript: Vec<AgentMessage>,
+    ) -> Agent {
         // Strict-mode scripted provider: panic if the agent runs more
         // inferences than the test scripted, which would indicate a
         // regression that adds an unexpected loop iteration.
@@ -2407,7 +2440,11 @@ mod event_protocol_tests {
             StreamOptions::default(),
             None,
         );
-        agent.set_assembled_system_prompt("test system prompt".to_string());
+        agent.seed_session(AgentSeed {
+            transcript,
+            assembled_system_prompt: Some("test system prompt".to_string()),
+            ..AgentSeed::default()
+        });
         agent
     }
 
@@ -2754,13 +2791,16 @@ mod event_protocol_tests {
         // turn without firing any extra User message events.
         let scripts = vec![finalize_script(finalize_text("retried"))];
 
-        let mut agent = build_agent(scripts, Vec::new());
         // Seed a user-role last message — typically the prompt the
         // user already submitted before the previous turn errored
         // out.
-        agent.seed_messages(vec![AgentMessage::wire(Message::User(UserMessage::text(
-            "retry me",
-        )))]);
+        let mut agent = build_agent_with_transcript(
+            scripts,
+            Vec::new(),
+            vec![AgentMessage::wire(Message::User(UserMessage::text(
+                "retry me",
+            )))],
+        );
 
         let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_clone = Arc::clone(&recorded);
@@ -2818,17 +2858,18 @@ mod event_protocol_tests {
         // `continue_run` enforces that precondition with a fatal
         // error rather than letting the model API surface an
         // obscure 4xx.
-        let mut agent = build_agent(Vec::new(), Vec::new());
         // Seed an assistant-role last message.
-        agent.seed_messages(vec![AgentMessage::wire(Message::Assistant(
-            AssistantMessage {
+        let mut agent = build_agent_with_transcript(
+            Vec::new(),
+            Vec::new(),
+            vec![AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::Text(TextContent {
                     text: "hi".into(),
                     text_signature: None,
                 })],
                 ..AssistantMessage::empty()
-            },
-        ))]);
+            }))],
+        );
 
         let err = agent
             .continue_run(CancellationToken::new())
@@ -2995,7 +3036,10 @@ mod event_protocol_tests {
             StreamOptions::default(),
             None,
         );
-        agent.set_assembled_system_prompt("test system prompt".to_string());
+        agent.seed_session(AgentSeed {
+            assembled_system_prompt: Some("test system prompt".to_string()),
+            ..AgentSeed::default()
+        });
 
         let cancel = CancellationToken::new();
         let cancel_for_fire = cancel.clone();
