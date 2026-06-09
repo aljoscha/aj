@@ -126,7 +126,7 @@ When presenting a proposal, cover:
   helper used by both providers (ties to R10's OAuth de-dup); don't fix one
   provider only.
 
-### R5 — Make user-data writes atomic / durable  [bug · TODO]
+### R5 — Make user-data writes atomic / durable  [bug · DONE]
 - **Sources:** C1 (Major), TO2 (Major), SE1 (Major); `_SUMMARY` P1.
 - **Problem:** `Config::save` and the file-edit tools `fs::write`
   truncate-in-place (crash mid-write corrupts the file);
@@ -352,3 +352,29 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   helper in `oauth.rs`, the existing shared seam, so R10's OAuth de-dup
   folds it in. Regression test per provider asserts a token-bearing 2xx
   `Parse` error omits the token material.
+- 2026-06-09 · R5 · DONE · 727d9ce · Reframed (with the user) from the
+  proposed atomic-temp+rename/fsync sweep to a **lock + read-merge-write
+  update primitive** for `config.toml`, after the reference
+  implementation showed its only durability mechanism is a cross-process
+  lock + merge-only-changed-fields (plain write, no fsync anywhere) and
+  AJ's own `auth.json` already does exactly that. The real bug for
+  config was *clobbering*, not crash-truncation: `Config::save` stamped
+  the full stale in-memory snapshot with no lock. Replaced `save` with
+  `Config::persist_changed(baseline)` — a synchronous `ConfigLock`
+  (sidecar `.lock` dir, the sync twin of `auth.rs`'s) wraps a re-read of
+  the file and applies only the options that differ from `baseline`, so
+  a second `aj` editing a different key isn't overwritten; comments,
+  unknown keys, the invalid-TOML clobber guard, and missing-file
+  creation are preserved. `persist_config` applies the mutation to the
+  live config first and persists off the mutex, keeping the
+  best-effort-live-on-failure contract. The other two loci R5 bundled
+  are **ACCEPTED-AS-IS**, matching the reference's plain-write/no-fsync
+  behavior, with overstated docs corrected: `edit_file_multi`'s
+  "atomic" now means all-or-nothing *validation* before one ordinary
+  in-place write (TO2), and the session log's "durable as soon as the
+  call returns" is now "written to the OS (survives a process crash),
+  not fsync'd" (SE1 durability half; the session single-writer lock
+  stays R6). Rejected the new `aj-fs` crate + temp+rename + fsync as
+  over-engineered relative to the reference and the small files
+  involved. Tests: clobber regression, invalid-TOML refusal, missing
+  file, comment preservation, lock acquire/release + stale-steal.
