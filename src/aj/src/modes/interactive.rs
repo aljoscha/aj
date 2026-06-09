@@ -637,6 +637,9 @@ impl InteractiveMode {
         let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
         let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
         let mut run_result: Result<()> = Ok(());
+        // Implements the "press Ctrl+C again to quit" guard when the
+        // viewed agent is idle but other agents are still running.
+        let mut quit_armed = false;
 
         // Slash commands like `/thinking` open an overlay selector.
         // While an overlay is up the editor is not focused, but
@@ -682,8 +685,7 @@ impl InteractiveMode {
                                     }
                                 }
                             }
-                            // Stage C: editor gating stays global (main-only).
-                            set_editor_submit_enabled(&mut tui, true);
+                            sync_editor_enabled(&mut tui, &pump, &turn_cancels);
                             match result {
                                 Ok(()) => {}
                                 Err(TurnError::Aborted) => {
@@ -795,24 +797,40 @@ impl InteractiveMode {
                             //    turn. Signal cancel; the cancel-poll
                             //    below tears the dialog down and
                             //    aborts the task.
-                            // 3. Turn in flight (the main agent is in
-                            //    `turn_cancels`): cancel the turn. The
-                            //    cancel handle is the binary's clone
-                            //    of the per-turn `CancellationToken`
-                            //    we passed to `agent.prompt`; firing
-                            //    it propagates to the agent's
-                            //    `execute_turn` `select!`s and to
-                            //    every provider / tool subscribed to
-                            //    the same token, including the bash
-                            //    tool's process group.
-                            // 4. None of the above: exit the binary.
-                            //    This is the legacy behavior — Ctrl+C
-                            //    with no overlay and no turn quits.
+                            // 3. Otherwise act on the agent you are
+                            //    *viewing* (spec §4.5):
+                            //    - Viewed agent has a binary-driven
+                            //      turn (`turn_cancels`): cancel just
+                            //      it. The cancel handle is the
+                            //      binary's clone of the per-turn
+                            //      `CancellationToken` passed to
+                            //      `agent.prompt`; firing it propagates
+                            //      to the agent's `execute_turn`
+                            //      `select!`s and to every provider /
+                            //      tool subscribed to the same token,
+                            //      including the bash tool's process
+                            //      group.
+                            //    - Viewed agent is a sub running its
+                            //      initial spawn (running but not in
+                            //      `turn_cancels`): cancel the main
+                            //      turn that owns it; the child token
+                            //      cascades.
+                            //    - Viewed agent idle but other agents
+                            //      still run: don't cancel them; arm
+                            //      "press Ctrl+C again to quit" and
+                            //      exit on the second press.
+                            //    - Nothing running anywhere: exit.
                             //
                             // Ctrl+D always exits regardless. The
                             // terminal is in raw mode so neither
                             // chord raises SIGINT; both arrive here
                             // as ordinary key events.
+
+                            // Any non-Ctrl+C key disarms a pending
+                            // "press again to quit".
+                            if !input.is_ctrl('c') {
+                                quit_armed = false;
+                            }
                             if input.is_ctrl('c') {
                                 if open_selector.is_some() {
                                     // Overlay up: fall through to the
@@ -820,12 +838,40 @@ impl InteractiveMode {
                                 } else if let Some(session) = login_session.as_ref() {
                                     session.cancel.store(true, Ordering::Relaxed);
                                     continue;
-                                } else if let Some(token) = turn_cancels.get(&AgentId::Main) {
-                                    // Stage D: generalize to the viewed agent.
-                                    token.cancel();
-                                    continue;
                                 } else {
-                                    break;
+                                    // Per-view Ctrl+C (spec §4.5): act on the agent you're viewing.
+                                    let active = pump.active_view(&mut tui);
+                                    if let Some(token) = turn_cancels.get(&active) {
+                                        // Viewed agent has a binary-driven turn: cancel just it.
+                                        token.cancel();
+                                        quit_armed = false;
+                                        continue;
+                                    } else if pump.is_running(active) {
+                                        // Viewed agent is a sub running its initial spawn, owned by
+                                        // the main turn: cancel the main turn (the child token
+                                        // cascades to the sub).
+                                        if let Some(token) = turn_cancels.get(&AgentId::Main) {
+                                            token.cancel();
+                                        }
+                                        quit_armed = false;
+                                        continue;
+                                    } else if !turns.is_empty() {
+                                        // Viewed agent idle but other agents still run: don't
+                                        // cancel them — arm/confirm quit instead.
+                                        if quit_armed {
+                                            break;
+                                        }
+                                        quit_armed = true;
+                                        let n = turns.len();
+                                        pump.handle(&mut tui, &notice_event(&format!(
+                                            "{n} agent{} still running — press Ctrl+C again to quit",
+                                            if n == 1 { "" } else { "s" },
+                                        )));
+                                        continue;
+                                    } else {
+                                        // Nothing running anywhere: exit.
+                                        break;
+                                    }
                                 }
                             }
                             if input.is_ctrl('d') {
@@ -1230,6 +1276,7 @@ impl InteractiveMode {
                                         }
                                     }
                                 }
+                                sync_editor_enabled(&mut tui, &pump, &turn_cancels);
                                 continue;
                             }
 
@@ -1288,29 +1335,30 @@ impl InteractiveMode {
                                     continue;
                                 }
 
-                                if turn_cancels.contains_key(&AgentId::Main) {
-                                    // Already running a turn;
-                                    // ignore the second submit.
-                                    // Steering/follow-up queues
-                                    // land in a follow-up.
+                                let target = pump.active_view(&mut tui);
+
+                                // Per-agent single-turn gate: ignore the submit if the viewed
+                                // agent is already busy (a binary-driven turn or a nested
+                                // initial spawn). Mirrors `sync_editor_enabled`.
+                                if turn_cancels.contains_key(&target) || pump.is_running(target) {
                                     continue;
                                 }
-                                // Clear the editor's text and
-                                // disable further submits until
-                                // the agent reports the run
-                                // ended.
+
+                                // Resolve before touching editor state, so a non-promptable
+                                // target (a resumed sub-agent with no live handle) leaves the
+                                // editor as-is and just surfaces a notice.
+                                let Some(handle) = resolve_agent(target, &agent, &registry) else {
+                                    pump.handle(&mut tui, &notice_event("This agent can't be prompted."));
+                                    continue;
+                                };
+
                                 if let Some(editor) = tui.get_mut_as::<Editor>(
                                     SlotIndex::Editor.idx()
                                 ) {
                                     editor.set_text("");
                                     editor.add_to_history(&trimmed);
                                 }
-                                set_editor_submit_enabled(&mut tui, false);
-                                let target = AgentId::Main; // Stage D: pump.active_view(&mut tui)
-                                let Some(handle) = resolve_agent(target, &agent, &registry)
-                                else {
-                                    continue;
-                                };
+
                                 let run_config_for_turn = Arc::clone(&run_config);
                                 // Mint a fresh per-turn cancellation
                                 // token. The binary keeps one clone in
@@ -1346,6 +1394,8 @@ impl InteractiveMode {
                                     let result = a.prompt(trimmed, turn_cancel).await;
                                     (target, result)
                                 });
+                                // The viewed agent is now busy; reflect it in the editor.
+                                sync_editor_enabled(&mut tui, &pump, &turn_cancels);
                             }
                         }
                     }
@@ -1355,6 +1405,7 @@ impl InteractiveMode {
                 maybe_evt = recv_event(&mut event_rx) => {
                     let Some(event) = maybe_evt else { continue };
                     pump.handle(&mut tui, &event);
+                    sync_editor_enabled(&mut tui, &pump, &turn_cancels);
                 }
 
                 // --- Theme reload (fs-watcher) ---
@@ -1463,6 +1514,22 @@ fn resolve_agent(
         AgentId::Main => Some(Arc::clone(main)),
         AgentId::Sub(n) => registry.get(n),
     }
+}
+
+/// Match the editor's submit-enabled state to the *viewed* agent:
+/// the editor accepts a submit iff that agent is idle. "Busy" means
+/// the binary is driving a turn for it (`turn_cancels`) or it is
+/// running a turn the binary isn't driving — e.g. a sub-agent's
+/// initial spawn nested in the main turn (`pump.is_running`). This
+/// mirrors the submit gate and the per-view spinner.
+fn sync_editor_enabled(
+    tui: &mut Tui,
+    pump: &EventPump,
+    turn_cancels: &HashMap<AgentId, CancellationToken>,
+) {
+    let active = pump.active_view(tui);
+    let busy = turn_cancels.contains_key(&active) || pump.is_running(active);
+    set_editor_submit_enabled(tui, !busy);
 }
 
 /// Await the next completed turn, or pend forever when no turn is
