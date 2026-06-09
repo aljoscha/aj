@@ -117,7 +117,7 @@ When presenting a proposal, cover:
   text past the limit) inside the markdown component, plus an adversarial
   regression test. Self-contained to `aj-tui`.
 
-### R4 — Stop OAuth token bodies leaking into error strings  [bug · TODO]
+### R4 — Stop OAuth token bodies leaking into error strings  [bug · DONE]
 - **Sources:** M5 (Major); `_SUMMARY` P1.
 - **Problem:** a 2xx token response that fails to deserialize folds the raw
   body (live tokens) into `OAuthError::Parse` (`oauth/anthropic.rs:652`,
@@ -337,3 +337,18 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   (`pulldown-cmark`) is the larger structural option, deferred. Noted
   a separate pre-existing O(n²) blowup on bare `[` runs (not a
   recursion bug) for later.
+- 2026-06-09 · R4 · DONE · 29d8e2f · Added a shared `pub(crate)`
+  `oauth::redacted_body_summary` helper and routed both providers'
+  token-endpoint `Parse` arms through it, so a 2xx token body that
+  fails to deserialize no longer folds live `access`/`refresh` tokens
+  into `OAuthError` (whose `Display` reaches logs/stdout). Kept the
+  serde error in the message — it names the drifted field without
+  echoing its value, the realistic trigger — and replaced the raw body
+  with a byte-length summary. Left the non-2xx `Server { body }` arm
+  unredacted (per the proposal): it carries RFC-6749 error objects, not
+  tokens, and is the key login-failure diagnostic. Rejected the
+  strip-named-fields alternative as unsafe for the exact trigger (a
+  renamed/added token field wouldn't be in the strip-list). Put the
+  helper in `oauth.rs`, the existing shared seam, so R10's OAuth de-dup
+  folds it in. Regression test per provider asserts a token-bearing 2xx
+  `Parse` error omits the token material.
