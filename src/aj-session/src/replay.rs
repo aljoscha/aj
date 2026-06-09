@@ -172,6 +172,9 @@ impl ReplayState {
             ConversationEntryKind::SystemPrompt { .. } => {
                 // Model-facing metadata; not user-visible.
             }
+            ConversationEntryKind::ModelChange { .. }
+            | ConversationEntryKind::ThinkingChange { .. }
+            | ConversationEntryKind::SpeedChange { .. } => {}
             ConversationEntryKind::Message { message: agent_msg } => {
                 let Some(wire) = agent_msg.as_wire() else {
                     return;

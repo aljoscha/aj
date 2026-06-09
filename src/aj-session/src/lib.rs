@@ -27,7 +27,7 @@ pub mod replay;
 pub use listener::persistence_listener;
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
-    ConversationView, EntryId, ThreadFilter, ThreadKind,
+    ConversationView, EntryId, SessionSettings, ThreadFilter, ThreadKind,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
 pub use repair::repair_interrupted_tool_uses;

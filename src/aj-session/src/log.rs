@@ -119,6 +119,19 @@ pub enum ConversationEntryKind {
     /// re-deriving a slightly different one and busting the prompt
     /// cache.
     SystemPrompt { text: String },
+    /// The active model changed (or was first recorded). `provider`
+    /// and `model_id` key into the model catalog.
+    ModelChange { provider: String, model_id: String },
+    /// The active thinking effort changed (or was first recorded).
+    /// `level` is one of "off", "low", "medium", "high", "xhigh",
+    /// "max". Stored as a string so the on-disk format stays stable
+    /// if the effort enum evolves; unknown values are tolerated on
+    /// restore.
+    ThinkingChange { level: String },
+    /// The active speed changed (or was first recorded). `speed` is
+    /// "standard" or "fast". Stored as a string so the on-disk format
+    /// stays stable; unknown values are tolerated on restore.
+    SpeedChange { speed: String },
 }
 
 impl ConversationEntryKind {
@@ -129,7 +142,7 @@ impl ConversationEntryKind {
     /// an assistant turn, a tool result) — anything we want durable
     /// per-line as the agent loop runs, and anything whose existence
     /// proves the session is worth keeping. Non-punctuation entries
-    /// are meta (currently only the system prompt) and buffer
+    /// are meta (the system prompt and settings records) and buffer
     /// in-memory until a punctuation flushes them.
     ///
     /// Net effect: a session the user opens but abandons before
@@ -138,7 +151,10 @@ impl ConversationEntryKind {
     pub fn is_punctuation(&self) -> bool {
         match self {
             Self::Message { .. } => true,
-            Self::SystemPrompt { .. } => false,
+            Self::SystemPrompt { .. }
+            | Self::ModelChange { .. }
+            | Self::ThinkingChange { .. }
+            | Self::SpeedChange { .. } => false,
         }
     }
 }
@@ -177,6 +193,26 @@ impl ThreadFilter {
             ThreadKind::Meta => false,
         }
     }
+}
+
+/// Session settings recorded on one linearized path, extracted by
+/// [`Conversation::settings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    /// Last (provider, model_id) recorded on this path: the most
+    /// recent [`ConversationEntryKind::ModelChange`] entry, falling
+    /// back to the most recent assistant message's (provider, model)
+    /// for logs that carry no settings entries.
+    pub model: Option<(String, String)>,
+    /// Last recorded thinking level string, from the most recent
+    /// [`ConversationEntryKind::ThinkingChange`] entry. `None` means
+    /// "nothing recorded" (inherit the current default) — distinct
+    /// from `Some("off")`.
+    pub thinking: Option<String>,
+    /// Last recorded speed string, from the most recent
+    /// [`ConversationEntryKind::SpeedChange`] entry. `None` means
+    /// "nothing recorded".
+    pub speed: Option<String>,
 }
 
 /// A linearized, read-only view of (a slice of) a conversation log. Produced
@@ -257,6 +293,39 @@ impl Conversation {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Extract the session settings recorded on this path. One
+    /// forward scan over [`Self::entries`], keeping the last value
+    /// seen per axis. Both `ModelChange` entries and assistant-role
+    /// messages update the model; whichever comes later on the path
+    /// wins.
+    pub fn settings(&self) -> SessionSettings {
+        let mut settings = SessionSettings {
+            model: None,
+            thinking: None,
+            speed: None,
+        };
+        for entry in &self.entries {
+            match &entry.entry {
+                ConversationEntryKind::ModelChange { provider, model_id } => {
+                    settings.model = Some((provider.clone(), model_id.clone()));
+                }
+                ConversationEntryKind::ThinkingChange { level } => {
+                    settings.thinking = Some(level.clone());
+                }
+                ConversationEntryKind::SpeedChange { speed } => {
+                    settings.speed = Some(speed.clone());
+                }
+                ConversationEntryKind::Message { message } => {
+                    if let Some(Message::Assistant(a)) = message.as_wire() {
+                        settings.model = Some((a.provider.clone(), a.model.clone()));
+                    }
+                }
+                ConversationEntryKind::SystemPrompt { .. } => {}
+            }
+        }
+        settings
     }
 
     /// Get the last message in the view, if any.
@@ -681,6 +750,70 @@ impl ConversationLog {
         )
     }
 
+    /// Record a model change on the thread selected by `filter`. See
+    /// [`Self::append_settings_entry`] for anchoring and durability.
+    pub fn append_model_change(
+        &mut self,
+        filter: ThreadFilter,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<EntryId, ConversationError> {
+        self.append_settings_entry(
+            filter,
+            ConversationEntryKind::ModelChange {
+                provider: provider.to_string(),
+                model_id: model_id.to_string(),
+            },
+        )
+    }
+
+    /// Record a thinking-effort change on the thread selected by
+    /// `filter`. See [`Self::append_settings_entry`].
+    pub fn append_thinking_change(
+        &mut self,
+        filter: ThreadFilter,
+        level: &str,
+    ) -> Result<EntryId, ConversationError> {
+        self.append_settings_entry(
+            filter,
+            ConversationEntryKind::ThinkingChange {
+                level: level.to_string(),
+            },
+        )
+    }
+
+    /// Record a speed change on the thread selected by `filter`. See
+    /// [`Self::append_settings_entry`].
+    pub fn append_speed_change(
+        &mut self,
+        filter: ThreadFilter,
+        speed: &str,
+    ) -> Result<EntryId, ConversationError> {
+        self.append_settings_entry(
+            filter,
+            ConversationEntryKind::SpeedChange {
+                speed: speed.to_string(),
+            },
+        )
+    }
+
+    /// Append a settings entry at the current leaf of `filter`'s
+    /// thread, anchoring at the system-prompt root when the thread is
+    /// empty (mirroring [`ConversationView::parent_for_next_append`]).
+    /// Settings entries are non-punctuation, so they buffer until the
+    /// next punctuation append (see
+    /// [`ConversationEntryKind::is_punctuation`]).
+    fn append_settings_entry(
+        &mut self,
+        filter: ThreadFilter,
+        entry: ConversationEntryKind,
+    ) -> Result<EntryId, ConversationError> {
+        let parent = self
+            .latest_leaf(filter)
+            .or_else(|| self.system_prompt_id().cloned());
+        self.append(parent, filter.thread, filter.agent_id, entry)
+    }
+
     /// Locate the (single) system-prompt entry by scanning the log. The
     /// system prompt is the root entry on threads that have one, so this
     /// is effectively `O(1)` in the common case but stays correct even
@@ -1093,6 +1226,297 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    fn assistant_from(provider: &str, model: &str) -> AgentMessage {
+        AgentMessage::wire(Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: "ok".to_string(),
+                text_signature: None,
+            })],
+            provider: provider.to_string(),
+            model: model.to_string(),
+            ..AssistantMessage::empty()
+        }))
+    }
+
+    #[test]
+    fn settings_entries_round_trip_through_resume() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let session_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".into()).expect("set sp");
+            log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+                .expect("model change");
+            log.append_thinking_change(ThreadFilter::USER, "high")
+                .expect("thinking change");
+            log.append_speed_change(ThreadFilter::USER, "fast")
+                .expect("speed change");
+            {
+                let head = log.latest_leaf(ThreadFilter::USER);
+                let mut view = ConversationView::user(&mut log, head);
+                view.add_message(user_text("hi")).expect("user msg");
+            }
+            log.session_id().to_string()
+        };
+
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let entries = resumed.entries_in_order();
+        assert_eq!(entries.len(), 5);
+        match &entries[1].entry {
+            ConversationEntryKind::ModelChange { provider, model_id } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model_id, "claude-x");
+            }
+            other => panic!("expected ModelChange, got {other:?}"),
+        }
+        match &entries[2].entry {
+            ConversationEntryKind::ThinkingChange { level } => assert_eq!(level, "high"),
+            other => panic!("expected ThinkingChange, got {other:?}"),
+        }
+        match &entries[3].entry {
+            ConversationEntryKind::SpeedChange { speed } => assert_eq!(speed, "fast"),
+            other => panic!("expected SpeedChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_only_log_does_not_create_file_until_punctuation() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-x")
+            .expect("model change");
+        log.append_thinking_change(ThreadFilter::USER, "off")
+            .expect("thinking change");
+
+        let path = persistence.session_path(log.session_id());
+        assert!(
+            !path.exists(),
+            "settings-only log must not materialise a file"
+        );
+
+        {
+            let head = log.latest_leaf(ThreadFilter::USER);
+            let mut view = ConversationView::user(&mut log, head);
+            view.add_message(user_text("hi")).expect("user msg");
+        }
+        assert!(path.exists(), "file must exist after first punctuation");
+
+        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        let entries = resumed.entries_in_order();
+        assert!(matches!(
+            entries[0].entry,
+            ConversationEntryKind::SystemPrompt { .. }
+        ));
+        assert!(matches!(
+            entries[1].entry,
+            ConversationEntryKind::ModelChange { .. }
+        ));
+        assert!(matches!(
+            entries[2].entry,
+            ConversationEntryKind::ThinkingChange { .. }
+        ));
+        assert!(matches!(
+            entries[3].entry,
+            ConversationEntryKind::Message { .. }
+        ));
+    }
+
+    #[test]
+    fn settings_entries_in_linearize_but_skipped_by_messages() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            .expect("model change");
+        {
+            let head = log.latest_leaf(ThreadFilter::USER);
+            let mut view = ConversationView::user(&mut log, head);
+            view.add_message(user_text("hi")).expect("user msg");
+        }
+
+        let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+        let convo = log.linearize(&head, ThreadFilter::USER);
+        assert_eq!(convo.entries().len(), 2);
+        assert!(matches!(
+            convo.entries()[0].entry,
+            ConversationEntryKind::ModelChange { .. }
+        ));
+        assert_eq!(convo.message_count(), 1);
+        assert_eq!(convo.messages().len(), 1);
+    }
+
+    #[test]
+    fn settings_last_wins_per_axis() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            .expect("mc1");
+        log.append_thinking_change(ThreadFilter::USER, "low")
+            .expect("tc1");
+        log.append_speed_change(ThreadFilter::USER, "standard")
+            .expect("sc1");
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-y")
+            .expect("mc2");
+        log.append_thinking_change(ThreadFilter::USER, "off")
+            .expect("tc2");
+        log.append_speed_change(ThreadFilter::USER, "fast")
+            .expect("sc2");
+
+        let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+        let settings = log.linearize(&head, ThreadFilter::USER).settings();
+        assert_eq!(
+            settings.model,
+            Some(("openai".to_string(), "gpt-y".to_string()))
+        );
+        // "off" was explicitly recorded — distinct from None.
+        assert_eq!(settings.thinking.as_deref(), Some("off"));
+        assert_eq!(settings.speed.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn settings_assistant_message_fallback_for_model() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("hi")).expect("u");
+            view.add_message(assistant_from("anthropic", "claude-a"))
+                .expect("a1");
+            view.add_message(user_text("more")).expect("u2");
+            view.add_message(assistant_from("openai", "gpt-b"))
+                .expect("a2");
+        }
+
+        let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+        let settings = log.linearize(&head, ThreadFilter::USER).settings();
+        assert_eq!(
+            settings.model,
+            Some(("openai".to_string(), "gpt-b".to_string()))
+        );
+        assert_eq!(settings.thinking, None);
+        assert_eq!(settings.speed, None);
+    }
+
+    #[test]
+    fn settings_model_change_after_assistant_message_wins() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("hi")).expect("u");
+            view.add_message(assistant_from("anthropic", "claude-a"))
+                .expect("a");
+        }
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b")
+            .expect("mc");
+
+        let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+        let settings = log.linearize(&head, ThreadFilter::USER).settings();
+        assert_eq!(
+            settings.model,
+            Some(("openai".to_string(), "gpt-b".to_string()))
+        );
+    }
+
+    #[test]
+    fn settings_assistant_message_after_model_change_wins() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b")
+            .expect("mc");
+        {
+            let head = log.latest_leaf(ThreadFilter::USER);
+            let mut view = ConversationView::user(&mut log, head);
+            view.add_message(user_text("hi")).expect("u");
+            view.add_message(assistant_from("anthropic", "claude-a"))
+                .expect("a");
+        }
+
+        let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+        let settings = log.linearize(&head, ThreadFilter::USER).settings();
+        assert_eq!(
+            settings.model,
+            Some(("anthropic".to_string(), "claude-a".to_string()))
+        );
+    }
+
+    #[test]
+    fn subagent_settings_entries_excluded_from_user_linearize() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        let user_id = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("hi")).expect("u")
+        };
+        let sub_id = {
+            let mut view = ConversationView::subagent(&mut log, user_id, 1);
+            view.add_message(user_text("subtask")).expect("sub prompt")
+        };
+        log.append_model_change(ThreadFilter::subagent(1), "openai", "gpt-sub")
+            .expect("sub mc");
+        log.append_thinking_change(ThreadFilter::subagent(1), "low")
+            .expect("sub tc");
+
+        // Sub-agent thread sees its own settings.
+        let sub_head = log
+            .latest_leaf(ThreadFilter::subagent(1))
+            .expect("sub head");
+        let sub_settings = log
+            .linearize(&sub_head, ThreadFilter::subagent(1))
+            .settings();
+        assert_eq!(
+            sub_settings.model,
+            Some(("openai".to_string(), "gpt-sub".to_string()))
+        );
+        assert_eq!(sub_settings.thinking.as_deref(), Some("low"));
+        let _ = sub_id;
+
+        // The user-thread scan does not.
+        let user_head = log.latest_leaf(ThreadFilter::USER).expect("user head");
+        let user_settings = log.linearize(&user_head, ThreadFilter::USER).settings();
+        assert_eq!(user_settings.model, None);
+        assert_eq!(user_settings.thinking, None);
+    }
+
+    #[test]
+    fn append_settings_anchors_to_system_prompt_root_and_chains() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let sp_id = log.set_system_prompt("p".into()).expect("set sp");
+
+        let mc_id = log
+            .append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            .expect("model change");
+        let mc_entry = log.entries.get(&mc_id).expect("entry exists");
+        assert_eq!(mc_entry.parent_id.as_ref(), Some(&sp_id));
+        assert!(matches!(mc_entry.thread, ThreadKind::User));
+        assert!(mc_entry.agent_id.is_none());
+
+        // The next message chains onto the settings entry.
+        let user_id = {
+            let head = log.latest_leaf(ThreadFilter::USER);
+            assert_eq!(head.as_ref(), Some(&mc_id));
+            let mut view = ConversationView::user(&mut log, head);
+            view.add_message(user_text("hi")).expect("user msg")
+        };
+        let user_entry = log.entries.get(&user_id).expect("entry exists");
+        assert_eq!(user_entry.parent_id.as_ref(), Some(&mc_id));
     }
 
     #[test]
