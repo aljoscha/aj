@@ -299,7 +299,153 @@ impl SessionWorld {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    use aj_agent::bus::EventBus;
+    use aj_agent::message::AgentMessage;
+    use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
+    use aj_models::types::{
+        AssistantContent, AssistantMessage, Message, StopReason, TextContent, UserMessage,
+    };
+    use aj_tui::component::Component;
+    use aj_tui::terminal::Terminal;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+    use crate::config::theme::Theme;
+    use crate::modes::interactive::layout::build_layout;
+
+    /// Headless [`Terminal`]: fixed 100×24, writes discarded.
+    /// Component output is read via `Component::render`, not the
+    /// terminal's write buffer, so a no-op sink is sufficient.
+    /// Deliberately duplicates the integration-test stub — unit
+    /// tests cannot import from `tests/`.
+    struct StubTerminal;
+
+    impl Terminal for StubTerminal {
+        fn write(&mut self, _: &str) {}
+        fn columns(&self) -> u16 {
+            100
+        }
+        fn rows(&self) -> u16 {
+            24
+        }
+        fn move_by(&mut self, _: i32) {}
+        fn hide_cursor(&mut self) {}
+        fn show_cursor(&mut self) {}
+        fn clear_line(&mut self) {}
+        fn clear_from_cursor(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn set_title(&mut self, _: &str) {}
+        fn flush(&mut self) {}
+    }
+
+    /// [`ModelInfo`] consistent with the identity [`ScriptedProvider`]
+    /// stamps on every emitted partial, so the agent sees a coherent
+    /// provider identity in tests.
+    fn scripted_model_info() -> ModelInfo {
+        ModelInfo {
+            id: "scripted".to_string(),
+            name: "scripted".to_string(),
+            api: "scripted".to_string(),
+            provider: "scripted".to_string(),
+            base_url: "scripted://internal".to_string(),
+            reasoning: false,
+            supports_adaptive_thinking: false,
+            input: vec![aj_models::registry::InputModality::Text],
+            cost: aj_models::registry::ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+            headers: None,
+        }
+    }
+
+    /// Finalized text-only assistant reply for scripting one-turn
+    /// conversations (no tool calls, `EndTurn`).
+    fn finalized_text_message(text: &str) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            })],
+            api: "scripted".to_string(),
+            provider: "scripted".to_string(),
+            model: "scripted".to_string(),
+            response_id: Some("test-msg".to_string()),
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            error: None,
+            timestamp: 0,
+        }
+    }
+
+    /// Run-config snapshot over a [`ScriptedProvider`] replaying
+    /// `messages`. `ExhaustedBehavior::Panic` makes any unscripted
+    /// extra inference fail loudly.
+    fn scripted_run_config(messages: Vec<AssistantMessage>) -> Arc<StdMutex<RunConfigSnapshot>> {
+        Arc::new(StdMutex::new(RunConfigSnapshot {
+            provider: Arc::new(
+                ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
+                    .on_exhausted(ExhaustedBehavior::Panic),
+            ),
+            model_info: Arc::new(scripted_model_info()),
+            stream_options: StreamOptions::default(),
+            thinking: None,
+            model_key: ("scripted".to_string(), "scripted".to_string()),
+        }))
+    }
+
+    /// [`SessionWorld::build`] with a default config, bundled theme,
+    /// and fixed render settings. The agent's env is read from the
+    /// host (cwd, git, context files); tests therefore never assert
+    /// on prompt *text*, only on persisted-vs-held equality.
+    fn build_test_world(
+        persistence: &ConversationPersistence,
+        run_config: &Arc<StdMutex<RunConfigSnapshot>>,
+        spec: &SessionSpec,
+    ) -> Result<SessionWorld> {
+        SessionWorld::build(
+            &Config::default(),
+            run_config,
+            &RenderSettings::new(false, false, true),
+            &ThemeHandle::new(Theme::bundled_dark()),
+            persistence,
+            spec,
+        )
+    }
+
+    /// Drive one prompt turn against the world's agent so the
+    /// persistence listener writes real entries into the log.
+    async fn drive_turn(world: &SessionWorld, prompt: &str) {
+        world
+            .agent
+            .lock()
+            .await
+            .prompt(prompt.to_string(), CancellationToken::new())
+            .await
+            .expect("scripted turn completes");
+    }
+
+    fn create_spec() -> SessionSpec {
+        SessionSpec::Create {
+            entry: SessionEntry::Startup,
+        }
+    }
+
+    fn resume_spec(session_id: &str) -> SessionSpec {
+        SessionSpec::Resume {
+            session_id: session_id.to_string(),
+            entry: SessionEntry::Switch,
+        }
+    }
+
+    /// Strip the `dim` SGR codes the header wraps its banner in so
+    /// substring assertions see the visible text contiguously.
+    fn strip_dim(line: &str) -> String {
+        line.replace("\x1b[2m", "").replace("\x1b[22m", "")
+    }
 
     #[test]
     fn header_notice_picks_wording_per_entry_and_kind() {
@@ -328,6 +474,236 @@ mod tests {
                 entry: SessionEntry::Switch
             }),
             "Fresh session"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_seeds_the_logs_system_prompt() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+
+        let log = world.log.lock().await;
+        let persisted = log.system_prompt().expect("system prompt frozen on create");
+        let agent = world.agent.lock().await;
+        let held = agent
+            .assembled_system_prompt()
+            .expect("agent holds the assembled prompt");
+        assert_eq!(persisted, held);
+    }
+
+    /// Build a `Create` world on `persistence`, drive one scripted
+    /// text turn, and return the session id. The world is dropped so
+    /// a later resume reads everything from disk.
+    async fn one_turn_session(
+        persistence: &ConversationPersistence,
+        prompt: &str,
+        reply: &str,
+    ) -> String {
+        let run_config = scripted_run_config(vec![finalized_text_message(reply)]);
+        let world =
+            build_test_world(persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world, prompt).await;
+        world.session_id.clone()
+    }
+
+    #[tokio::test]
+    async fn resume_round_trips_transcript_prompt_and_rendering() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = one_turn_session(&persistence, "hello there", "scripted reply").await;
+
+        // Fresh provider: the original script is exhausted, and a
+        // resumed world that never prompts needs no scripts anyway.
+        let run_config = scripted_run_config(Vec::new());
+        let spec = resume_spec(&session_id);
+        let mut world = build_test_world(&persistence, &run_config, &spec).expect("resume world");
+
+        {
+            let agent = world.agent.lock().await;
+            let transcript = format!("{:?}", agent.messages());
+            assert!(!agent.messages().is_empty(), "transcript seeded");
+            assert!(transcript.contains("hello there"), "user prompt seeded");
+            assert!(transcript.contains("scripted reply"), "reply seeded");
+
+            let log = world.log.lock().await;
+            assert_eq!(
+                log.system_prompt().expect("persisted prompt"),
+                agent
+                    .assembled_system_prompt()
+                    .expect("agent holds the persisted prompt"),
+                "resume reuses the persisted prompt byte-for-byte"
+            );
+        }
+
+        // Install renders the prior conversation into the chat slot.
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+        world.install(&mut tui, &spec).await;
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot present");
+        let rendered = chat.render(100).join("\n");
+        assert!(rendered.contains("hello there"), "prompt rendered");
+        assert!(rendered.contains("scripted reply"), "reply rendered");
+    }
+
+    #[tokio::test]
+    async fn rebuild_starts_with_an_empty_registry_and_zero_usage() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        let run_config = scripted_run_config(vec![finalized_text_message("scripted reply")]);
+        let world_a =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world_a, "hello there").await;
+
+        // Pollute world A's registry with a throwaway sub-agent.
+        let throwaway = build_agent(
+            &Config::default(),
+            Arc::new(ScriptedProvider::from_messages(
+                Vec::new(),
+                0,
+                Duration::ZERO,
+            )),
+            Arc::new(scripted_model_info()),
+            StreamOptions::default(),
+            None,
+        );
+        world_a
+            .registry
+            .insert(7, Arc::new(TokioMutex::new(throwaway)));
+        assert_eq!(world_a.registry.ids(), vec![7]);
+
+        let session_id = world_a.session_id.clone();
+        drop(world_a);
+
+        let run_config = scripted_run_config(Vec::new());
+        let world_b = build_test_world(&persistence, &run_config, &resume_spec(&session_id))
+            .expect("resume world");
+
+        assert!(world_b.registry.ids().is_empty(), "registry starts empty");
+        let total = world_b.usage_summary().await.total_usage;
+        assert_eq!(total.input_tokens, 0);
+        assert_eq!(total.output_tokens, 0);
+        assert_eq!(total.cache_write_tokens, 0);
+        assert_eq!(total.cache_read_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_counter_floor_persists_across_resume() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        let run_config = scripted_run_config(vec![finalized_text_message("scripted reply")]);
+        let world_a =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world_a, "hello there").await;
+
+        // Synthesize a persisted sub-agent subtree under id 3 by
+        // driving the persistence listener directly — the same
+        // events a real sub-agent spawn would emit on the bus.
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&world_a.log)));
+        bus.emit(AgentEvent::SubAgentStart {
+            parent: AgentId::Main,
+            child: AgentId::Sub(3),
+            task: "synthetic task".to_string(),
+        })
+        .await
+        .expect("emit start");
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(3),
+            message: AgentMessage::wire(Message::User(UserMessage::text("synthetic task"))),
+        })
+        .await
+        .expect("emit sub message");
+
+        let session_id = world_a.session_id.clone();
+        drop(world_a);
+
+        let run_config = scripted_run_config(Vec::new());
+        let world_b = build_test_world(&persistence, &run_config, &resume_spec(&session_id))
+            .expect("resume world");
+
+        // `build` seeds the agent's counter from this value; the
+        // resumed agent therefore mints ids strictly greater than 3
+        // (mint-side behavior covered by the `SessionState` unit
+        // test in `aj-agent`).
+        assert_eq!(world_b.log.lock().await.max_agent_id(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn install_announces_session_id_and_notice_per_spec() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = one_turn_session(&persistence, "hello there", "scripted reply").await;
+
+        let specs = [
+            (create_spec(), "Chat with AJ — Ctrl+C to quit"),
+            (
+                SessionSpec::Create {
+                    entry: SessionEntry::Switch,
+                },
+                "Fresh session",
+            ),
+            (
+                SessionSpec::Resume {
+                    session_id: session_id.clone(),
+                    entry: SessionEntry::Startup,
+                },
+                "Resuming conversation",
+            ),
+            (resume_spec(&session_id), "Resumed conversation"),
+        ];
+        for (spec, notice) in specs {
+            let run_config = scripted_run_config(Vec::new());
+            let mut world =
+                build_test_world(&persistence, &run_config, &spec).expect("build world");
+            let expected_id = world.session_id.clone();
+
+            let mut tui = Tui::new(Box::new(StubTerminal));
+            build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+            world.install(&mut tui, &spec).await;
+
+            let header = tui
+                .get_mut_as::<Header>(SlotIndex::Header.idx())
+                .expect("header slot present");
+            let banner = header
+                .render(200)
+                .iter()
+                .map(|line| strip_dim(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                banner.contains(notice),
+                "notice {notice:?} missing from banner: {banner:?}"
+            );
+            assert!(
+                banner.contains(&expected_id),
+                "session id {expected_id:?} missing from banner: {banner:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_of_missing_session_fails_without_creating_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+
+        let result = build_test_world(&persistence, &run_config, &resume_spec("does-not-exist"));
+        assert!(result.is_err(), "resuming a missing session must fail");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .map(|entries| entries.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "failed build must not create session files: {leftovers:?}"
         );
     }
 }

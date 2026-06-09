@@ -1592,6 +1592,24 @@ impl SessionState {
     }
 }
 
+#[cfg(test)]
+mod session_state_tests {
+    use std::path::PathBuf;
+
+    use super::SessionState;
+
+    /// Covers the seam behind [`crate::AgentSeed::sub_agent_counter`]:
+    /// a counter seeded to `n` mints ids strictly greater than `n`,
+    /// so a resumed session never reuses persisted sub-agent ids.
+    #[test]
+    fn seeded_counter_mints_strictly_greater_ids() {
+        let mut state = SessionState::new(PathBuf::from("/test"));
+        state.seed_sub_agent_counter(3);
+        assert_eq!(state.next_sub_agent_id(), 4);
+        assert_eq!(state.next_sub_agent_id(), 5);
+    }
+}
+
 /// Wrapper that provides partial access to mutable [`Agent`] state,
 /// while we have partial immutable access to other parts. Used in
 /// [`Agent::execute_tool`].
