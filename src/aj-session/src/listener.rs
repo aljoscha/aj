@@ -160,7 +160,9 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     use super::persistence_listener;
-    use crate::log::{ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter};
+    use crate::log::{
+        ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter,
+    };
     use crate::persistence::ConversationPersistence;
 
     /// Set up a temp sessions dir + a fresh log with a frozen system
@@ -340,6 +342,114 @@ mod tests {
         assert_eq!(entries.len(), 2, "got entries: {entries:#?}");
         let first = &entries[0];
         assert_eq!(first.parent_id.as_ref(), Some(&parent_anchor));
+    }
+
+    #[tokio::test]
+    async fn sub_agent_continuation_chains_on_existing_subthread() {
+        // A re-prompt of a retained sub-agent emits no new
+        // `SubAgentStart`; its `MessageEnd` events must chain onto the
+        // existing sub-thread leaf, not re-anchor at the parent head.
+        let (_dir, log) = fresh_log();
+        {
+            let mut log_guard = log.lock().await;
+            let mut view = ConversationView::user(&mut log_guard, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_text("ack")).expect("a");
+        }
+
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
+
+        // Initial sub-agent run: anchored at the parent head.
+        bus.emit(AgentEvent::SubAgentStart {
+            parent: AgentId::Main,
+            child: AgentId::Sub(1),
+            task: "do thing".into(),
+        })
+        .await
+        .expect("emit start");
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(1),
+            message: user_msg("do it"),
+        })
+        .await
+        .expect("emit user");
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(1),
+            message: assistant_text("done"),
+        })
+        .await
+        .expect("emit assistant");
+
+        // Continuation: no `SubAgentStart`, just more messages.
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(1),
+            message: user_msg("more"),
+        })
+        .await
+        .expect("emit continuation user");
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(1),
+            message: assistant_text("done again"),
+        })
+        .await
+        .expect("emit continuation assistant");
+
+        let log_guard = log.lock().await;
+        let sub_head = log_guard
+            .latest_leaf(ThreadFilter::subagent(1))
+            .expect("sub-agent thread head exists");
+        let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
+        let entries: Vec<_> = convo.entries().to_vec();
+
+        // All four messages live in a single linear sub-thread, in
+        // order: chaining (not re-anchoring) is what keeps the
+        // continuation in the same thread after the initial leaf.
+        assert_eq!(entries.len(), 4, "got entries: {entries:#?}");
+        let texts: Vec<String> = entries.iter().map(entry_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "do it".to_string(),
+                "done".to_string(),
+                "more".to_string(),
+                "done again".to_string(),
+            ]
+        );
+
+        // The continuation's first user message ("more") chains onto
+        // the prior sub-thread leaf (assistant "done"), not the parent.
+        let done = &entries[1];
+        let more = &entries[2];
+        assert_eq!(more.parent_id.as_ref(), Some(&done.id));
+    }
+
+    /// Extract the concatenated text of a wire message entry. Panics on
+    /// non-message entries; the sub-thread tests only enqueue messages.
+    fn entry_text(entry: &ConversationEntry) -> String {
+        let message = match &entry.entry {
+            ConversationEntryKind::Message { message } => message,
+            other => panic!("expected Message entry, got {other:?}"),
+        };
+        match message.as_wire() {
+            Some(Message::User(u)) => u
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    aj_models::types::UserContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            Some(Message::Assistant(a)) => a
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected user/assistant message, got {other:?}"),
+        }
     }
 
     #[tokio::test]

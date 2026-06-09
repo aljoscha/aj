@@ -3444,4 +3444,89 @@ mod event_protocol_tests {
             "sub-agent transcript should end on the assistant report, got {last:?}"
         );
     }
+
+    /// A sub-agent retained in the registry is live and re-promptable:
+    /// re-prompting its handle directly (the capability the binary
+    /// exercises for steering) appends the new user message and the
+    /// continuation assistant message onto its existing transcript.
+    #[tokio::test]
+    async fn re_prompting_retained_sub_agent_extends_its_transcript() {
+        use crate::SubAgentRegistry;
+
+        // One shared `ScriptedProvider` serves scripts in run order
+        // across the parent and the sub-agent:
+        //   0. parent emits the `agent` tool call,
+        //   1. the sub-agent's initial single-turn report,
+        //   2. the parent's final text after the tool result,
+        //   3. the sub-agent's continuation reply to the re-prompt.
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "agent")),
+            finalize_script(finalize_text("sub report")),
+            finalize_script(finalize_text("parent done")),
+            finalize_script(finalize_text("continuation")),
+        ];
+
+        let mut agent = build_agent(scripts, vec![SpawnTool.into()]);
+        let registry = SubAgentRegistry::default();
+        agent.set_sub_agent_registry(registry.clone());
+
+        agent
+            .run_single_turn("delegate work".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let sub = registry.get(1).expect("sub-agent retained under id 1");
+
+        // Transcript length right after the initial spawn, so we can
+        // assert the re-prompt grows it by exactly two messages.
+        let len_after_spawn = {
+            let guard = sub.lock().await;
+            guard.messages().len()
+        };
+
+        // Re-prompt the retained handle directly.
+        {
+            let mut guard = sub.lock().await;
+            guard
+                .prompt("follow up".to_string(), CancellationToken::new())
+                .await
+                .expect("re-prompt");
+        }
+
+        let guard = sub.lock().await;
+        let messages = guard.messages();
+
+        assert_eq!(
+            messages.len(),
+            len_after_spawn + 2,
+            "re-prompt should append the user message and the continuation reply"
+        );
+
+        // The transcript ends on the continuation assistant text.
+        let last_text: String = match messages.last().and_then(|m| m.as_wire()) {
+            Some(Message::Assistant(a)) => a
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected trailing assistant message, got {other:?}"),
+        };
+        assert_eq!(last_text, "continuation");
+
+        // The re-prompt's user message appears in the transcript.
+        let has_follow_up = messages.iter().any(|m| match m.as_wire() {
+            Some(Message::User(u)) => u.content.iter().any(|c| match c {
+                aj_models::types::UserContent::Text(t) => t.text == "follow up",
+                _ => false,
+            }),
+            _ => false,
+        });
+        assert!(
+            has_follow_up,
+            "transcript should contain the re-prompt user message"
+        );
+    }
 }
