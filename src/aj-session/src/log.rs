@@ -755,11 +755,13 @@ impl ConversationLog {
     pub fn append_model_change(
         &mut self,
         filter: ThreadFilter,
+        anchor: Option<EntryId>,
         provider: &str,
         model_id: &str,
     ) -> Result<EntryId, ConversationError> {
         self.append_settings_entry(
             filter,
+            anchor,
             ConversationEntryKind::ModelChange {
                 provider: provider.to_string(),
                 model_id: model_id.to_string(),
@@ -772,10 +774,12 @@ impl ConversationLog {
     pub fn append_thinking_change(
         &mut self,
         filter: ThreadFilter,
+        anchor: Option<EntryId>,
         level: &str,
     ) -> Result<EntryId, ConversationError> {
         self.append_settings_entry(
             filter,
+            anchor,
             ConversationEntryKind::ThinkingChange {
                 level: level.to_string(),
             },
@@ -787,29 +791,35 @@ impl ConversationLog {
     pub fn append_speed_change(
         &mut self,
         filter: ThreadFilter,
+        anchor: Option<EntryId>,
         speed: &str,
     ) -> Result<EntryId, ConversationError> {
         self.append_settings_entry(
             filter,
+            anchor,
             ConversationEntryKind::SpeedChange {
                 speed: speed.to_string(),
             },
         )
     }
 
-    /// Append a settings entry at the current leaf of `filter`'s
-    /// thread, anchoring at the system-prompt root when the thread is
-    /// empty (mirroring [`ConversationView::parent_for_next_append`]).
-    /// Settings entries are non-punctuation, so they buffer until the
-    /// next punctuation append (see
+    /// Append a settings entry on `filter`'s thread. The parent is
+    /// `anchor` when given (used for the first entry of a sub-agent
+    /// thread, whose anchor is the parent thread's head); otherwise
+    /// the thread's current leaf, falling back to the system-prompt
+    /// root when the thread is empty (mirroring
+    /// [`ConversationView::parent_for_next_append`]). Settings
+    /// entries are non-punctuation, so they buffer until the next
+    /// punctuation append (see
     /// [`ConversationEntryKind::is_punctuation`]).
     fn append_settings_entry(
         &mut self,
         filter: ThreadFilter,
+        anchor: Option<EntryId>,
         entry: ConversationEntryKind,
     ) -> Result<EntryId, ConversationError> {
-        let parent = self
-            .latest_leaf(filter)
+        let parent = anchor
+            .or_else(|| self.latest_leaf(filter))
             .or_else(|| self.system_prompt_id().cloned());
         self.append(parent, filter.thread, filter.agent_id, entry)
     }
@@ -1247,11 +1257,11 @@ mod tests {
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("p".into()).expect("set sp");
-            log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            log.append_model_change(ThreadFilter::USER, None, "anthropic", "claude-x")
                 .expect("model change");
-            log.append_thinking_change(ThreadFilter::USER, "high")
+            log.append_thinking_change(ThreadFilter::USER, None, "high")
                 .expect("thinking change");
-            log.append_speed_change(ThreadFilter::USER, "fast")
+            log.append_speed_change(ThreadFilter::USER, None, "fast")
                 .expect("speed change");
             {
                 let head = log.latest_leaf(ThreadFilter::USER);
@@ -1287,9 +1297,9 @@ mod tests {
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-x")
+        log.append_model_change(ThreadFilter::USER, None, "openai", "gpt-x")
             .expect("model change");
-        log.append_thinking_change(ThreadFilter::USER, "off")
+        log.append_thinking_change(ThreadFilter::USER, None, "off")
             .expect("thinking change");
 
         let path = persistence.session_path(log.session_id());
@@ -1331,7 +1341,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+        log.append_model_change(ThreadFilter::USER, None, "anthropic", "claude-x")
             .expect("model change");
         {
             let head = log.latest_leaf(ThreadFilter::USER);
@@ -1356,17 +1366,17 @@ mod tests {
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+        log.append_model_change(ThreadFilter::USER, None, "anthropic", "claude-x")
             .expect("mc1");
-        log.append_thinking_change(ThreadFilter::USER, "low")
+        log.append_thinking_change(ThreadFilter::USER, None, "low")
             .expect("tc1");
-        log.append_speed_change(ThreadFilter::USER, "standard")
+        log.append_speed_change(ThreadFilter::USER, None, "standard")
             .expect("sc1");
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-y")
+        log.append_model_change(ThreadFilter::USER, None, "openai", "gpt-y")
             .expect("mc2");
-        log.append_thinking_change(ThreadFilter::USER, "off")
+        log.append_thinking_change(ThreadFilter::USER, None, "off")
             .expect("tc2");
-        log.append_speed_change(ThreadFilter::USER, "fast")
+        log.append_speed_change(ThreadFilter::USER, None, "fast")
             .expect("sc2");
 
         let head = log.latest_leaf(ThreadFilter::USER).expect("head");
@@ -1418,7 +1428,7 @@ mod tests {
             view.add_message(assistant_from("anthropic", "claude-a"))
                 .expect("a");
         }
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b")
+        log.append_model_change(ThreadFilter::USER, None, "openai", "gpt-b")
             .expect("mc");
 
         let head = log.latest_leaf(ThreadFilter::USER).expect("head");
@@ -1435,7 +1445,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b")
+        log.append_model_change(ThreadFilter::USER, None, "openai", "gpt-b")
             .expect("mc");
         {
             let head = log.latest_leaf(ThreadFilter::USER);
@@ -1467,9 +1477,9 @@ mod tests {
             let mut view = ConversationView::subagent(&mut log, user_id, 1);
             view.add_message(user_text("subtask")).expect("sub prompt")
         };
-        log.append_model_change(ThreadFilter::subagent(1), "openai", "gpt-sub")
+        log.append_model_change(ThreadFilter::subagent(1), None, "openai", "gpt-sub")
             .expect("sub mc");
-        log.append_thinking_change(ThreadFilter::subagent(1), "low")
+        log.append_thinking_change(ThreadFilter::subagent(1), None, "low")
             .expect("sub tc");
 
         // Sub-agent thread sees its own settings.
@@ -1501,7 +1511,7 @@ mod tests {
         let sp_id = log.set_system_prompt("p".into()).expect("set sp");
 
         let mc_id = log
-            .append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            .append_model_change(ThreadFilter::USER, None, "anthropic", "claude-x")
             .expect("model change");
         let mc_entry = log.entries.get(&mc_id).expect("entry exists");
         assert_eq!(mc_entry.parent_id.as_ref(), Some(&sp_id));

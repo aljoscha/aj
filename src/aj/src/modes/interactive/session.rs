@@ -472,6 +472,10 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(3),
             task: "synthetic task".to_string(),
+            provider: "scripted".into(),
+            model_id: "scripted-model".into(),
+            thinking: "off".into(),
+            speed: "standard".into(),
         })
         .await
         .expect("emit start");

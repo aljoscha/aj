@@ -1698,11 +1698,21 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // the parent anchor for the child's first write) can
             // group nested transcripts under the parent's
             // tool-execution component.
+            // The bundle identity carried on the event mirrors the
+            // parent's bundle, which is exactly what the child is
+            // built from below. Speed is baked into the parent's
+            // `StreamOptions` headers by the binary and not tracked
+            // on the agent, so it is reported as "standard".
             self.parent_bus
                 .emit(AgentEvent::SubAgentStart {
                     parent: self.parent_agent_id,
                     child: child_id,
                     task: task.clone(),
+                    provider: self.model_info.provider.clone(),
+                    model_id: self.model_info.id.clone(),
+                    thinking: aj_models::thinking_config_name(self.default_thinking.as_ref())
+                        .to_string(),
+                    speed: "standard".to_string(),
                 })
                 .await?;
 
@@ -2285,6 +2295,7 @@ mod event_protocol_tests {
                 parent,
                 child,
                 task,
+                ..
             } => EventLabel::SubAgentStart {
                 parent: *parent,
                 child: *child,

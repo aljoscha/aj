@@ -45,8 +45,26 @@
 //!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair
 //!   around the tool_result is also emitted so persistence listeners
 //!   replaying the stream see the same shape live runs produce.
+//! - [`ConversationEntryKind::ModelChange`] /
+//!   [`ConversationEntryKind::ThinkingChange`] /
+//!   [`ConversationEntryKind::SpeedChange`]: one
+//!   [`AgentEvent::Notice`] (`Model set to <provider>/<id>.`, etc.),
+//!   but only when at least one `Message` entry precedes the entry
+//!   on the same thread. This renders mid-session switches in
+//!   resumed scrollback while keeping the initial seed entries
+//!   (session creation, sub-agent spawn) silent — they never
+//!   produced a visible notice live either.
+//!
+//! Sub-agent runs are bracketed with synthesized
+//! [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
+//! events. A sub thread leads with its settings entries, so the
+//! start event is deferred until the run's first `Message` entry
+//! (whose user text is the task); the settings values seen up to
+//! that point populate the event's bundle-identity fields, falling
+//! back to empty strings / `"off"` / `"standard"` for legacy logs
+//! that carry no settings entries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::AgentMessage;
@@ -101,11 +119,59 @@ struct ReplayState {
     /// so a single open run is enough to bracket each sub run with
     /// [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`].
     open_sub: Option<usize>,
+    /// Deferred [`AgentEvent::SubAgentStart`] for the open run. A
+    /// sub thread leads with settings entries, so the start event
+    /// (whose task comes from the run's first `Message` entry) is
+    /// accumulated here and emitted when that message arrives — or,
+    /// for a run that ends without any message, when the run closes
+    /// (with an empty task).
+    pending_sub_start: Option<PendingSubStart>,
     /// Concatenated text of the most recent `Sub` assistant message
     /// seen during the open run. After the run's last assistant
     /// message this holds the final report carried on the closing
     /// [`AgentEvent::SubAgentEnd`].
     open_sub_report: String,
+    /// Agents for which at least one `Message` entry has been
+    /// projected. Settings entries emit a [`AgentEvent::Notice`]
+    /// only for agents present here; seed entries (before any
+    /// message on their thread) stay silent.
+    seen_message: HashSet<AgentId>,
+}
+
+/// Accumulator for a deferred [`AgentEvent::SubAgentStart`].
+/// Defaults describe legacy logs whose sub threads carry no
+/// settings entries: empty provider/model, thinking "off", speed
+/// "standard".
+struct PendingSubStart {
+    n: usize,
+    provider: String,
+    model_id: String,
+    thinking: String,
+    speed: String,
+}
+
+impl PendingSubStart {
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            provider: String::new(),
+            model_id: String::new(),
+            thinking: "off".to_string(),
+            speed: "standard".to_string(),
+        }
+    }
+
+    fn into_event(self, task: String) -> AgentEvent {
+        AgentEvent::SubAgentStart {
+            parent: AgentId::Main,
+            child: AgentId::Sub(self.n),
+            task,
+            provider: self.provider,
+            model_id: self.model_id,
+            thinking: self.thinking,
+            speed: self.speed,
+        }
+    }
 }
 
 impl ReplayState {
@@ -115,9 +181,12 @@ impl ReplayState {
     ///
     /// Transitions are keyed off `agent_id_for`: leaving an open
     /// `Sub(k)` (to `Main` or a different sub) closes it with the
-    /// accumulated report; entering a `Sub(n)` with no run open emits
-    /// the start, taking the task from this first entry's user text.
-    /// `Meta` entries carry no agent id and never transition.
+    /// accumulated report. Entering a `Sub(n)` with no run open
+    /// stages a [`PendingSubStart`]; the run's leading settings
+    /// entries fill in its bundle identity, and the start event is
+    /// emitted at the run's first `Message` entry, whose user text
+    /// is the task. `Meta` entries carry no agent id and never
+    /// transition.
     fn bracket_subagent(&mut self, entry: &ConversationEntry, out: &mut Vec<AgentEvent>) {
         let Some(current) = agent_id_for(entry) else {
             return;
@@ -129,26 +198,49 @@ impl ReplayState {
             }
         }
 
-        if let AgentId::Sub(n) = current {
-            if self.open_sub.is_none() {
-                // The first entry of a sub run is its user message,
-                // whose text is the task.
-                let task = subagent_task(entry);
-                out.push(AgentEvent::SubAgentStart {
-                    parent: AgentId::Main,
-                    child: AgentId::Sub(n),
-                    task,
-                });
-                self.open_sub = Some(n);
-                self.open_sub_report.clear();
+        let AgentId::Sub(n) = current else {
+            return;
+        };
+        if self.open_sub.is_none() {
+            self.open_sub = Some(n);
+            self.open_sub_report.clear();
+            self.pending_sub_start = Some(PendingSubStart::new(n));
+        }
+        match &entry.entry {
+            ConversationEntryKind::ModelChange { provider, model_id } => {
+                if let Some(pending) = &mut self.pending_sub_start {
+                    pending.provider = provider.clone();
+                    pending.model_id = model_id.clone();
+                }
             }
+            ConversationEntryKind::ThinkingChange { level } => {
+                if let Some(pending) = &mut self.pending_sub_start {
+                    pending.thinking = level.clone();
+                }
+            }
+            ConversationEntryKind::SpeedChange { speed } => {
+                if let Some(pending) = &mut self.pending_sub_start {
+                    pending.speed = speed.clone();
+                }
+            }
+            ConversationEntryKind::Message { .. } => {
+                if let Some(pending) = self.pending_sub_start.take() {
+                    out.push(pending.into_event(subagent_task(entry)));
+                }
+            }
+            ConversationEntryKind::SystemPrompt { .. } => {}
         }
     }
 
     /// Close the currently open sub-agent run, if any, emitting its
-    /// [`AgentEvent::SubAgentEnd`] with the accumulated report.
+    /// [`AgentEvent::SubAgentEnd`] with the accumulated report. A run
+    /// without any `Message` entry still has its start deferred;
+    /// flush it with an empty task so the bracketing stays balanced.
     fn close_open_sub(&mut self, out: &mut Vec<AgentEvent>) {
         if let Some(k) = self.open_sub.take() {
+            if let Some(pending) = self.pending_sub_start.take() {
+                out.push(pending.into_event(String::new()));
+            }
             out.push(AgentEvent::SubAgentEnd {
                 parent: AgentId::Main,
                 child: AgentId::Sub(k),
@@ -172,10 +264,21 @@ impl ReplayState {
             ConversationEntryKind::SystemPrompt { .. } => {
                 // Model-facing metadata; not user-visible.
             }
-            ConversationEntryKind::ModelChange { .. }
-            | ConversationEntryKind::ThinkingChange { .. }
-            | ConversationEntryKind::SpeedChange { .. } => {}
+            ConversationEntryKind::ModelChange { provider, model_id } => {
+                self.settings_notice(
+                    agent_id,
+                    format!("Model set to {provider}/{model_id}."),
+                    out,
+                );
+            }
+            ConversationEntryKind::ThinkingChange { level } => {
+                self.settings_notice(agent_id, format!("Thinking effort set to {level}."), out);
+            }
+            ConversationEntryKind::SpeedChange { speed } => {
+                self.settings_notice(agent_id, format!("Speed set to {speed}."), out);
+            }
             ConversationEntryKind::Message { message: agent_msg } => {
+                self.seen_message.insert(agent_id);
                 let Some(wire) = agent_msg.as_wire() else {
                     return;
                 };
@@ -200,6 +303,17 @@ impl ReplayState {
                     }
                 }
             }
+        }
+    }
+
+    /// Emit a [`AgentEvent::Notice`] for a settings entry, but only
+    /// when `agent_id`'s thread has already projected a `Message`
+    /// entry — seed entries (session creation, sub-agent spawn)
+    /// precede any message on their thread and stay silent, since
+    /// they never produced a visible notice live either.
+    fn settings_notice(&self, agent_id: AgentId, text: String, out: &mut Vec<AgentEvent>) {
+        if self.seen_message.contains(&agent_id) {
+            out.push(AgentEvent::Notice { agent_id, text });
         }
     }
 
@@ -390,8 +504,8 @@ fn text_fallback(tool_name: &str, content: &[UserContent]) -> ToolDetails {
     }
 }
 
-/// Extract a sub-agent's task from its first entry. The first entry
-/// of a sub-agent run is its user message, whose concatenated text is
+/// Extract a sub-agent's task from its first `Message` entry. That
+/// entry is the sub-agent's user prompt, whose concatenated text is
 /// the task; any other shape yields an empty task.
 fn subagent_task(entry: &ConversationEntry) -> String {
     let ConversationEntryKind::Message { message } = &entry.entry else {
@@ -743,6 +857,7 @@ mod tests {
                 parent,
                 child,
                 task,
+                ..
             } => {
                 assert_eq!(*parent, AgentId::Main);
                 assert_eq!(*child, AgentId::Sub(1));
@@ -1062,5 +1177,208 @@ mod tests {
         assert_eq!(main_turn.turn_input, 10);
         assert_eq!(sub_turn.accumulated_input, 0);
         assert_eq!(sub_turn.turn_input, 40);
+    }
+
+    /// Seed settings entries (preceding any message on their
+    /// thread) emit no Notice.
+    #[test]
+    fn replay_keeps_seed_settings_entries_silent() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+        log.append_model_change(
+            crate::log::ThreadFilter::USER,
+            None,
+            "anthropic",
+            "claude-x",
+        )
+        .expect("mc");
+        log.append_thinking_change(crate::log::ThreadFilter::USER, None, "high")
+            .expect("tc");
+        log.append_speed_change(crate::log::ThreadFilter::USER, None, "fast")
+            .expect("sc");
+        {
+            let head = log.latest_leaf(crate::log::ThreadFilter::USER);
+            let mut view = ConversationView::user(&mut log, head);
+            view.add_message(user_msg("hi")).expect("u");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { .. })),
+            "seed settings entries must be silent, got {events:#?}"
+        );
+    }
+
+    /// A settings entry recorded after a message on the same thread
+    /// emits exactly one Notice with the rendered text.
+    #[test]
+    fn replay_emits_notice_for_mid_session_settings_entries() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+        }
+        log.append_model_change(crate::log::ThreadFilter::USER, None, "openai", "gpt-x")
+            .expect("mc");
+        log.append_thinking_change(crate::log::ThreadFilter::USER, None, "medium")
+            .expect("tc");
+        log.append_speed_change(crate::log::ThreadFilter::USER, None, "fast")
+            .expect("sc");
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        let notices: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice { agent_id, text } => {
+                    assert_eq!(*agent_id, AgentId::Main);
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            vec![
+                "Model set to openai/gpt-x.",
+                "Thinking effort set to medium.",
+                "Speed set to fast.",
+            ]
+        );
+    }
+
+    /// A sub-agent run that leads with settings entries still
+    /// extracts the task from its first message, brackets the run
+    /// correctly, keeps the seed entries silent, and carries the
+    /// recorded settings on the synthesized SubAgentStart.
+    #[test]
+    fn replay_subagent_with_leading_settings_entries() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head present")
+        };
+
+        let sub = crate::log::ThreadFilter::subagent(1);
+        log.append_model_change(sub, Some(user_head), "anthropic", "claude-x")
+            .expect("mc");
+        log.append_thinking_change(sub, None, "high").expect("tc");
+        log.append_speed_change(sub, None, "fast").expect("sc");
+        {
+            let sub_head = log.latest_leaf(sub).expect("sub leaf");
+            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "reply".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { .. })),
+            "sub-thread seed entries must be silent, got {events:#?}"
+        );
+
+        let start_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
+            .expect("SubAgentStart present");
+        match &events[start_idx] {
+            AgentEvent::SubAgentStart {
+                child,
+                task,
+                provider,
+                model_id,
+                thinking,
+                speed,
+                ..
+            } => {
+                assert_eq!(*child, AgentId::Sub(1));
+                assert_eq!(task, "subtask");
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model_id, "claude-x");
+                assert_eq!(thinking, "high");
+                assert_eq!(speed, "fast");
+            }
+            other => panic!("expected SubAgentStart, got {other:?}"),
+        }
+        // The start still precedes every projected Sub(1) event.
+        let first_sub = events
+            .iter()
+            .position(|e| matches!(e.agent_id(), AgentId::Sub(1)))
+            .expect("Sub(1) events present");
+        assert!(start_idx < first_sub);
+        match events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubAgentEnd { .. }))
+            .expect("SubAgentEnd present")
+        {
+            AgentEvent::SubAgentEnd { report, .. } => assert_eq!(report, "reply"),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Legacy logs with no sub-thread settings entries still
+    /// bracket sub runs; the synthesized SubAgentStart falls back
+    /// to empty / "off" / "standard".
+    #[test]
+    fn replay_subagent_legacy_log_uses_fallback_settings() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.head().cloned().expect("head present")
+        };
+        {
+            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        match events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
+            .expect("SubAgentStart present")
+        {
+            AgentEvent::SubAgentStart {
+                task,
+                provider,
+                model_id,
+                thinking,
+                speed,
+                ..
+            } => {
+                assert_eq!(task, "subtask");
+                assert_eq!(provider, "");
+                assert_eq!(model_id, "");
+                assert_eq!(thinking, "off");
+                assert_eq!(speed, "standard");
+            }
+            _ => unreachable!(),
+        }
     }
 }

@@ -191,6 +191,16 @@ pub enum AgentEvent {
         parent: AgentId,
         child: AgentId,
         task: String,
+        /// Provider of the child's model bundle at spawn (e.g.
+        /// "anthropic"). Today sub-agents mirror the parent's bundle.
+        provider: String,
+        /// Catalog id of the child's model at spawn.
+        model_id: String,
+        /// The child's thinking effort: one of "off", "low",
+        /// "medium", "high", "xhigh", "max".
+        thinking: String,
+        /// The child's inference speed: "standard" or "fast".
+        speed: String,
     },
     /// A sub-agent has finished and returned its report.
     SubAgentEnd {
@@ -283,6 +293,10 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(0),
             task: "test".into(),
+            provider: "scripted".into(),
+            model_id: "scripted-model".into(),
+            thinking: "off".into(),
+            speed: "standard".into(),
         };
         assert_eq!(sub_spawn.agent_id(), AgentId::Main);
 

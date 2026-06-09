@@ -45,3 +45,19 @@ pub enum ThinkingConfig {
     XHigh,
     Max,
 }
+
+/// Render an optional [`ThinkingConfig`] as its canonical name:
+/// `"off"` for `None`, otherwise one of `"low"`, `"medium"`,
+/// `"high"`, `"xhigh"`, `"max"`. This vocabulary is shared by the
+/// session log's settings entries, the event protocol, and the
+/// binary's level selector.
+pub fn thinking_config_name(level: Option<&ThinkingConfig>) -> &'static str {
+    match level {
+        None => "off",
+        Some(ThinkingConfig::Low) => "low",
+        Some(ThinkingConfig::Medium) => "medium",
+        Some(ThinkingConfig::High) => "high",
+        Some(ThinkingConfig::XHigh) => "xhigh",
+        Some(ThinkingConfig::Max) => "max",
+    }
+}

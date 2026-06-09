@@ -324,16 +324,10 @@ pub fn parse_thinking_level(name: &str) -> Option<Option<ThinkingConfig>> {
 
 /// Render a [`ThinkingConfig`] back to its catalog name. Used by
 /// the selector to highlight the currently-active level on open
-/// and by status notices like `Thinking level: medium`.
+/// and by status notices like `Thinking level: medium`. Delegates
+/// to [`aj_models::thinking_config_name`], the canonical vocabulary.
 pub fn thinking_level_name(level: &Option<ThinkingConfig>) -> &'static str {
-    match level {
-        None => "off",
-        Some(ThinkingConfig::Low) => "low",
-        Some(ThinkingConfig::Medium) => "medium",
-        Some(ThinkingConfig::High) => "high",
-        Some(ThinkingConfig::XHigh) => "xhigh",
-        Some(ThinkingConfig::Max) => "max",
-    }
+    aj_models::thinking_config_name(level.as_ref())
 }
 
 #[cfg(test)]

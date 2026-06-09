@@ -19,18 +19,25 @@
 //! Sub-agent first-entry anchoring (per `docs/aj-next-plan.md` §1.6)
 //! is the listener's responsibility too: when the agent emits
 //! [`AgentEvent::SubAgentStart`] the listener captures the parent
-//! thread's current head; the next [`AgentEvent::MessageEnd`]
-//! tagged with the spawned `Sub(n)` agent id (whose own thread is
-//! still empty) anchors at that captured head. Subsequent
-//! sub-agent writes follow the chain via
-//! [`ConversationLog::latest_leaf`] like any other thread.
+//! thread's current head and immediately writes the sub-agent's
+//! initial settings record (`ModelChange` / `ThinkingChange` /
+//! `SpeedChange`, from the bundle identity carried on the event)
+//! anchored at that head. The sub-agent's first
+//! [`AgentEvent::MessageEnd`] then chains onto the last settings
+//! entry via [`ConversationLog::latest_leaf`], like every
+//! subsequent sub-agent write. A `Sub(n)` message arriving with no
+//! prior `SubAgentStart` (and hence an empty sub thread) is an
+//! error.
 //!
-//! The agent (after §2.4b) never reaches into the log directly, so
-//! the listener has exclusive write access; the binary takes brief
-//! read locks to resolve the system prompt, snapshot the thread
-//! for replay, and display the final usage summary.
+//! Write ownership is split with the binary: the listener has
+//! exclusive ownership of *message* writes and of sub-agent
+//! settings entries (spawns happen inside the agent); main-thread
+//! settings entries are appended by the binary, which already holds
+//! the log handle and owns the run-config state they record. The
+//! binary additionally takes brief read locks to resolve the system
+//! prompt, snapshot the thread for replay, and display the final
+//! usage summary.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aj_agent::bus::Listener;
@@ -39,51 +46,61 @@ use aj_agent::message::AgentMessage;
 use anyhow::{Result, anyhow};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::log::{ConversationLog, ConversationView, EntryId, ThreadFilter};
+use crate::log::{ConversationLog, ConversationView, ThreadFilter};
 
 /// Build a [`Listener`] that writes every finalized
 /// [`AgentEvent::MessageEnd`] to the given log handle.
 ///
 /// Other event variants are intentional no-ops here, with one
-/// exception: [`AgentEvent::SubAgentStart`] populates an internal
-/// "first-entry anchor" map so the freshly-spawned sub-agent's
-/// initial write can be threaded under the parent's current head.
-/// Without this hook the sub-agent's first write would have no
-/// reachable parent (its own [`ThreadFilter::subagent`] thread is
-/// empty), and the listener would error out.
+/// exception: [`AgentEvent::SubAgentStart`] writes the spawned
+/// sub-agent's initial settings record, anchored at the parent
+/// thread's current head. Without this hook the sub-agent's first
+/// write would have no reachable parent (its own
+/// [`ThreadFilter::subagent`] thread is empty), and the listener
+/// would error out.
 pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
-    // `Sub(n)` ↦ parent's `latest_leaf` at spawn time. Populated by
-    // [`AgentEvent::SubAgentStart`], drained by the first
-    // [`AgentEvent::MessageEnd`] tagged with `Sub(n)`. A tokio mutex
-    // keeps the access points async-friendly even though the map
-    // itself is touched only briefly.
-    let pending_anchors: Arc<TokioMutex<HashMap<usize, EntryId>>> =
-        Arc::new(TokioMutex::new(HashMap::new()));
-
     Arc::new(move |event: &AgentEvent| {
         let log = Arc::clone(&log);
-        let anchors = Arc::clone(&pending_anchors);
         let event = event.clone();
         Box::pin(async move {
             match event {
-                AgentEvent::SubAgentStart { parent, child, .. } => {
+                AgentEvent::SubAgentStart {
+                    parent,
+                    child,
+                    provider,
+                    model_id,
+                    thinking,
+                    speed,
+                    ..
+                } => {
                     let AgentId::Sub(child_n) = child else {
                         return Err(anyhow!("SubAgentStart with non-Sub child {child:?}"));
                     };
                     let parent_filter = filter_for(parent);
-                    let log_guard = log.lock().await;
+                    let mut log_guard = log.lock().await;
                     let parent_head = log_guard.latest_leaf(parent_filter).ok_or_else(|| {
                         anyhow!(
                             "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
                         )
                     })?;
-                    drop(log_guard);
-                    anchors.lock().await.insert(child_n, parent_head);
+                    // Seed the sub thread with its settings record:
+                    // the first entry anchors at the captured parent
+                    // head, the rest chain via `latest_leaf` (passing
+                    // `None`). After this the sub thread has a leaf,
+                    // so the first `MessageEnd` chains normally.
+                    let sub_filter = ThreadFilter::subagent(child_n);
+                    log_guard.append_model_change(
+                        sub_filter,
+                        Some(parent_head),
+                        &provider,
+                        &model_id,
+                    )?;
+                    log_guard.append_thinking_change(sub_filter, None, &thinking)?;
+                    log_guard.append_speed_change(sub_filter, None, &speed)?;
                 }
                 AgentEvent::MessageEnd { agent_id, message } => {
                     let mut log_guard = log.lock().await;
-                    let mut anchors_guard = anchors.lock().await;
-                    persist(&mut log_guard, &mut anchors_guard, agent_id, message)?;
+                    persist(&mut log_guard, agent_id, message)?;
                 }
                 _ => {}
             }
@@ -97,16 +114,10 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// For [`AgentId::Main`] the parent for the new entry is the user
 /// thread's current `latest_leaf` (or `None`, anchoring at the
 /// system-prompt root for fresh threads). For [`AgentId::Sub(n)`]
-/// it's the sub-agent thread's own `latest_leaf` once that thread
-/// has at least one entry, falling back to the captured parent
-/// anchor from [`AgentEvent::SubAgentStart`] for the very first
-/// write.
-fn persist(
-    log: &mut ConversationLog,
-    pending_anchors: &mut HashMap<usize, EntryId>,
-    agent_id: AgentId,
-    message: AgentMessage,
-) -> Result<()> {
+/// it's the sub-agent thread's own `latest_leaf`; the thread is
+/// never empty for a legitimately spawned sub-agent because
+/// [`AgentEvent::SubAgentStart`] seeds it with settings entries.
+fn persist(log: &mut ConversationLog, agent_id: AgentId, message: AgentMessage) -> Result<()> {
     let mut view = match agent_id {
         AgentId::Main => {
             // `latest_leaf` returning `None` is fine here: the user
@@ -118,15 +129,11 @@ fn persist(
             ConversationView::user(log, head)
         }
         AgentId::Sub(n) => {
-            // Sub-agent thread already has an entry: chain on its
-            // current leaf. Otherwise drain the pending anchor
-            // captured from [`AgentEvent::SubAgentStart`].
             let head = log
                 .latest_leaf(ThreadFilter::subagent(n))
-                .or_else(|| pending_anchors.remove(&n))
                 .ok_or_else(|| {
                     anyhow!(
-                        "persistence listener: sub-agent {n} thread has no head entry and no parent anchor was captured"
+                        "persistence listener: sub-agent {n} thread has no head entry; was SubAgentStart emitted?"
                     )
                 })?;
             ConversationView::subagent(log, head, n)
@@ -194,6 +201,20 @@ mod tests {
         AgentMessage::wire(Message::ToolResult(ToolResultMessage::text(
             id, name, body, false,
         )))
+    }
+
+    /// A SubAgentStart event carrying a representative bundle
+    /// identity.
+    fn sub_start(n: usize, task: &str) -> AgentEvent {
+        AgentEvent::SubAgentStart {
+            parent: AgentId::Main,
+            child: AgentId::Sub(n),
+            task: task.to_string(),
+            provider: "anthropic".to_string(),
+            model_id: "claude-x".to_string(),
+            thinking: "medium".to_string(),
+            speed: "standard".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -293,10 +314,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sub_agent_first_message_anchors_at_parent_head() {
-        // The persistence listener must capture the parent's
-        // `latest_leaf` from `SubAgentStart` and use it as the
-        // anchor for the sub-agent's first `MessageEnd` event.
+    async fn sub_agent_start_writes_settings_anchored_at_parent_head() {
+        // `SubAgentStart` must immediately seed the sub thread with
+        // the settings triple, the first entry anchored at the
+        // parent's `latest_leaf`; the sub-agent's first `MessageEnd`
+        // then chains onto the last settings entry.
         let (_dir, log) = fresh_log();
         let parent_anchor = {
             let mut log_guard = log.lock().await;
@@ -311,13 +333,9 @@ mod tests {
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
-        bus.emit(AgentEvent::SubAgentStart {
-            parent: AgentId::Main,
-            child: AgentId::Sub(1),
-            task: "do thing".into(),
-        })
-        .await
-        .expect("emit start");
+        bus.emit(sub_start(1, "do thing"))
+            .await
+            .expect("emit start");
 
         bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Sub(1),
@@ -339,9 +357,33 @@ mod tests {
             .expect("sub-agent thread head exists");
         let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
         let entries: Vec<_> = convo.entries().to_vec();
-        assert_eq!(entries.len(), 2, "got entries: {entries:#?}");
-        let first = &entries[0];
-        assert_eq!(first.parent_id.as_ref(), Some(&parent_anchor));
+        // Three settings entries followed by the two messages.
+        assert_eq!(entries.len(), 5, "got entries: {entries:#?}");
+        match &entries[0].entry {
+            ConversationEntryKind::ModelChange { provider, model_id } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model_id, "claude-x");
+            }
+            other => panic!("expected ModelChange, got {other:?}"),
+        }
+        assert_eq!(entries[0].parent_id.as_ref(), Some(&parent_anchor));
+        match &entries[1].entry {
+            ConversationEntryKind::ThinkingChange { level } => assert_eq!(level, "medium"),
+            other => panic!("expected ThinkingChange, got {other:?}"),
+        }
+        match &entries[2].entry {
+            ConversationEntryKind::SpeedChange { speed } => assert_eq!(speed, "standard"),
+            other => panic!("expected SpeedChange, got {other:?}"),
+        }
+        // Settings entries chain among themselves; the first message
+        // chains onto the last settings entry.
+        assert_eq!(entries[1].parent_id.as_ref(), Some(&entries[0].id));
+        assert_eq!(entries[2].parent_id.as_ref(), Some(&entries[1].id));
+        assert_eq!(entries[3].parent_id.as_ref(), Some(&entries[2].id));
+        assert!(matches!(
+            entries[3].entry,
+            ConversationEntryKind::Message { .. }
+        ));
     }
 
     #[tokio::test]
@@ -361,13 +403,9 @@ mod tests {
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
         // Initial sub-agent run: anchored at the parent head.
-        bus.emit(AgentEvent::SubAgentStart {
-            parent: AgentId::Main,
-            child: AgentId::Sub(1),
-            task: "do thing".into(),
-        })
-        .await
-        .expect("emit start");
+        bus.emit(sub_start(1, "do thing"))
+            .await
+            .expect("emit start");
         bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Sub(1),
             message: user_msg("do it"),
@@ -402,11 +440,12 @@ mod tests {
         let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
         let entries: Vec<_> = convo.entries().to_vec();
 
-        // All four messages live in a single linear sub-thread, in
-        // order: chaining (not re-anchoring) is what keeps the
-        // continuation in the same thread after the initial leaf.
-        assert_eq!(entries.len(), 4, "got entries: {entries:#?}");
-        let texts: Vec<String> = entries.iter().map(entry_text).collect();
+        // Three settings entries + four messages live in a single
+        // linear sub-thread, in order: chaining (not re-anchoring)
+        // is what keeps the continuation in the same thread after
+        // the initial leaf.
+        assert_eq!(entries.len(), 7, "got entries: {entries:#?}");
+        let texts: Vec<String> = entries[3..].iter().map(entry_text).collect();
         assert_eq!(
             texts,
             vec![
@@ -419,8 +458,8 @@ mod tests {
 
         // The continuation's first user message ("more") chains onto
         // the prior sub-thread leaf (assistant "done"), not the parent.
-        let done = &entries[1];
-        let more = &entries[2];
+        let done = &entries[4];
+        let more = &entries[5];
         assert_eq!(more.parent_id.as_ref(), Some(&done.id));
     }
 
@@ -454,9 +493,8 @@ mod tests {
 
     #[tokio::test]
     async fn sub_agent_assistant_without_anchor_returns_error() {
-        // No `SubAgentStart` captured beforehand: the sub-agent
-        // thread has no leaf and no anchor, so the bus call should
-        // fail.
+        // No `SubAgentStart` seeded the sub thread beforehand: the
+        // thread has no leaf, so the bus call should fail.
         let (_dir, log) = fresh_log();
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
