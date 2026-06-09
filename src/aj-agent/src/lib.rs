@@ -26,8 +26,8 @@ use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use aj_models::tools::Tool;
 use aj_models::types::{
     AssistantContent, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
-    StopReason, StreamOptions, ThinkingLevel, ToolCall, ToolDefinition as UnifiedToolDefinition,
-    ToolResultMessage, Usage, UserContent, UserMessage,
+    Speed, StopReason, StreamOptions, ThinkingLevel, ToolCall,
+    ToolDefinition as UnifiedToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use aj_models::ThinkingConfig;
 
@@ -111,6 +111,12 @@ pub struct Agent {
     stream_options: StreamOptions,
     session_state: SessionState,
     default_thinking: Option<ThinkingConfig>,
+    /// Inference speed mode reported on sub-agent spawn events and
+    /// inherited by spawned sub-agents. The speed's wire effect
+    /// (provider-specific headers) is baked into `stream_options` by
+    /// the binary; this field only tracks the user-facing knob.
+    /// `None` means standard.
+    speed: Option<Speed>,
     /// Identifier used on every event emitted by this agent. The
     /// top-level instance constructed by the binary keeps the
     /// default [`AgentId::Main`]; sub-agents created via
@@ -235,6 +241,7 @@ impl Agent {
             stream_options,
             session_state,
             default_thinking,
+            speed: None,
             agent_id: AgentId::Main,
             bus: EventBus::new(),
             cancellation: CancellationToken::new(),
@@ -529,6 +536,16 @@ impl Agent {
     /// whatever they were already configured for.
     pub fn set_default_thinking(&mut self, level: Option<ThinkingConfig>) {
         self.default_thinking = level;
+    }
+
+    /// Replace the agent's inference speed mode. `None` means
+    /// standard. The wire effect (provider-specific headers) travels
+    /// in the [`StreamOptions`] passed to [`Agent::set_provider`];
+    /// this knob keeps the user-facing value observable so
+    /// sub-agent spawn events report it accurately and spawned
+    /// sub-agents inherit it.
+    pub fn set_speed(&mut self, speed: Option<Speed>) {
+        self.speed = speed;
     }
 
     /// Append `message` as a user-role text input to the transcript
@@ -1469,6 +1486,7 @@ impl Agent {
             cancellation: self.cancellation.child_token(),
             block_images: self.block_images,
             default_thinking: self.default_thinking.clone(),
+            speed: self.speed,
             sub_agent_registry: self.sub_agent_registry.clone(),
         };
 
@@ -1661,6 +1679,9 @@ struct SessionContextWrapper<'a> {
     /// (and so non-reasoning models never receive an explicit
     /// `disabled` they reject) rather than always defaulting off.
     default_thinking: Option<ThinkingConfig>,
+    /// Parent's inference speed mode; reported on the
+    /// `SubAgentStart` event and propagated to spawned sub-agents.
+    speed: Option<Speed>,
     /// Shared registry the parent agent uses to retain spawned
     /// sub-agents. Cloned from the parent so [`Self::spawn_agent`]
     /// inserts the new handle into the same map the binary resolves
@@ -1700,9 +1721,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // tool-execution component.
             // The bundle identity carried on the event mirrors the
             // parent's bundle, which is exactly what the child is
-            // built from below. Speed is baked into the parent's
-            // `StreamOptions` headers by the binary and not tracked
-            // on the agent, so it is reported as "standard".
+            // built from below.
             self.parent_bus
                 .emit(AgentEvent::SubAgentStart {
                     parent: self.parent_agent_id,
@@ -1712,7 +1731,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                     model_id: self.model_info.id.clone(),
                     thinking: aj_models::thinking_config_name(self.default_thinking.as_ref())
                         .to_string(),
-                    speed: "standard".to_string(),
+                    speed: aj_models::speed_name(self.speed).to_string(),
                 })
                 .await?;
 
@@ -1771,6 +1790,10 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // gets serialized as an explicit `disabled` for models
             // that reject it.
             sub_agent.set_default_thinking(self.default_thinking.clone());
+            // Sub-agents inherit the parent's speed so their own
+            // spawn events (and the settings record persisted off
+            // them) report the speed they actually run at.
+            sub_agent.set_speed(self.speed);
             // Share the parent's bus per `docs/aj-next-plan.md`
             // §1.6: every event the sub-agent emits during its
             // run reaches the listeners the binary registered on

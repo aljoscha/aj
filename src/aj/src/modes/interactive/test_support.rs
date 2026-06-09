@@ -102,6 +102,7 @@ pub(crate) fn scripted_run_config(
         model_info: Arc::new(scripted_model_info()),
         stream_options: StreamOptions::default(),
         thinking: None,
+        speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
     }))
 }
@@ -122,6 +123,7 @@ pub(crate) fn build_test_world(
         &ThemeHandle::new(Theme::bundled_dark()),
         persistence,
         spec,
+        None,
     )
 }
 

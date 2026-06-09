@@ -93,7 +93,7 @@ use crate::modes::interactive::event_pump::{
 };
 use crate::modes::interactive::layout::{SlotIndex, build_layout};
 use crate::modes::interactive::render_settings::RenderSettings;
-use crate::modes::interactive::session::{SessionEntry, SessionSpec, SessionWorld};
+use crate::modes::interactive::session::{RestoreContext, SessionEntry, SessionSpec, SessionWorld};
 use crate::modes::interactive::shutdown::{
     print_resume_hint, print_session_usage, print_usage_summary,
 };
@@ -124,6 +124,11 @@ pub(crate) struct RunConfigSnapshot {
     stream_options: StreamOptions,
     /// Default thinking effort for the next turn.
     thinking: Option<ThinkingConfig>,
+    /// Inference speed mode baked into `stream_options`' headers.
+    /// Tracked explicitly so bundle rebuilds (`/model` swap, resume
+    /// restore) preserve it and so it can be recorded in the
+    /// session log. `None` means standard.
+    speed: Option<Speed>,
     /// `(provider_id, model_id)` the `/model` selector pre-selects.
     /// Tracked explicitly rather than read off `model_info` because
     /// the scripted path's provider id (from `--model-api`) differs
@@ -143,6 +148,7 @@ fn build_run_config(
     model_info: Arc<ModelInfo>,
     mut stream_options: StreamOptions,
     model_key: (String, String),
+    speed: Option<Speed>,
 ) -> RunConfigSnapshot {
     crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
     RunConfigSnapshot {
@@ -150,6 +156,7 @@ fn build_run_config(
         model_info,
         stream_options,
         thinking: default_thinking_from_config(config.thinking),
+        speed,
         model_key,
     }
 }
@@ -246,6 +253,11 @@ impl InteractiveMode {
         // without a restart.
         let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
+        // Resume-time settings restoration needs the registry +
+        // auth store; scripted mode runs without either and skips
+        // restoration entirely.
+        let mut restore_context: Option<RestoreContext> = None;
+
         let run_config = if let Some(name) = &self.args.scripted {
             let crate::scripted::ResolvedScriptedModel {
                 provider,
@@ -264,13 +276,14 @@ impl InteractiveMode {
                 model_info,
                 StreamOptions::default(),
                 (current_provider, current_id),
+                speed,
             )
         } else {
             // Load the registry once at startup; the same handle
-            // also feeds the `/model` selector's model catalog.
-            // `ModelRegistry::load` is cheap (single JSON read) so
-            // the duplication versus `load_model_catalog` below is
-            // not worth deduplicating today.
+            // also feeds resume-time settings restoration via the
+            // `RestoreContext` below. (`load_model_catalog` further
+            // down does its own cheap JSON read for the `/model`
+            // selector's snapshot.)
             let registry = ModelRegistry::load();
             let resolved = crate::model::resolve(
                 &registry,
@@ -290,13 +303,24 @@ impl InteractiveMode {
                 speed,
             )
             .context("failed to resolve model from registry")?;
+            restore_context = Some(RestoreContext {
+                registry: Arc::new(registry),
+                auth: auth.clone(),
+            });
             let ResolvedModel {
                 provider,
                 model_info,
                 stream_options,
             } = resolved;
             let model_key = (model_info.provider.clone(), model_info.id.clone());
-            build_run_config(&config, provider, model_info, stream_options, model_key)
+            build_run_config(
+                &config,
+                provider,
+                model_info,
+                stream_options,
+                model_key,
+                speed,
+            )
         };
         let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
@@ -408,6 +432,7 @@ impl InteractiveMode {
             &theme,
             &conversation_persistence,
             &spec,
+            restore_context.as_ref(),
         )?;
 
         // ---- Build the TUI --------------------------------------------
@@ -542,6 +567,12 @@ impl InteractiveMode {
         if let Some(warning) = &startup_auth_warning {
             world.pump.handle(&mut tui, &warning_event(warning));
         }
+        // Settings restored from a resumed session's log (or the
+        // reasons restoration fell back) surface like any other
+        // startup notice.
+        for notice in std::mem::take(&mut world.restore_notices) {
+            world.pump.handle(&mut tui, &notice_event(&notice));
+        }
 
         // Shared, mutable view of the on-disk config. Selector
         // outcomes (model / thinking, and future settings popups)
@@ -565,6 +596,7 @@ impl InteractiveMode {
             conversation_persistence,
             render_settings,
             completed_sessions: Vec::new(),
+            restore_context,
             palette_open_request,
             close_all_request,
             history_open_request,
@@ -611,9 +643,26 @@ impl InteractiveMode {
                 &shell.conversation_persistence,
                 spec,
                 &previous_id,
+                shell.restore_context.as_ref(),
             ) {
                 Ok(mut next) => {
                     next.world.install(&mut shell.tui, &next.spec).await;
+                    // A resume may have restored the session's
+                    // recorded settings into the run config; mirror
+                    // them onto the footer and editor border like a
+                    // selector confirm would.
+                    {
+                        let (model_id, thinking) = {
+                            let cfg = shell.run_config.lock().expect("run config mutex poisoned");
+                            (cfg.model_key.1.clone(), cfg.thinking.clone())
+                        };
+                        refresh_footer_model(&mut shell.tui, &model_id, &thinking);
+                        apply_editor_border_for_thinking(
+                            &mut shell.tui,
+                            &shell.theme,
+                            thinking.as_ref(),
+                        );
+                    }
                     for notice in &next.notices {
                         next.world
                             .pump
@@ -725,6 +774,9 @@ struct Shell {
     /// Usage snapshots of torn-down session worlds, in order, for
     /// the per-session shutdown banner.
     completed_sessions: Vec<(String, UsageSummary)>,
+    /// Registry + auth store backing resume-time settings
+    /// restoration; `None` in scripted mode (restoration disabled).
+    restore_context: Option<RestoreContext>,
     /// Tripped by the editor's `/`-at-empty-prompt callback and the
     /// `aj.palette.open` chord; drained by the session loop.
     palette_open_request: Arc<AtomicBool>,
@@ -760,6 +812,7 @@ struct NextWorld {
 /// which the outer session loop treats as fatal. Touches no TUI
 /// state: installing the returned world and pumping its notices stay
 /// with the caller.
+#[allow(clippy::too_many_arguments)]
 fn build_next_world(
     config: &Config,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
@@ -768,6 +821,7 @@ fn build_next_world(
     persistence: &ConversationPersistence,
     requested: SessionSpec,
     previous_session_id: &str,
+    restore: Option<&RestoreContext>,
 ) -> Result<NextWorld> {
     match SessionWorld::build(
         config,
@@ -776,8 +830,9 @@ fn build_next_world(
         theme,
         persistence,
         &requested,
+        restore,
     ) {
-        Ok(world) => {
+        Ok(mut world) => {
             let notice = match &requested {
                 SessionSpec::Create { .. } => {
                     format!("Started a fresh session ({}).", world.session_id)
@@ -786,10 +841,12 @@ fn build_next_world(
                     format!("Switched to session {session_id}.")
                 }
             };
+            let mut notices = vec![notice];
+            notices.append(&mut world.restore_notices);
             Ok(NextWorld {
                 world,
                 spec: requested,
-                notices: vec![notice],
+                notices,
             })
         }
         Err(err) => {
@@ -805,18 +862,21 @@ fn build_next_world(
                 session_id: previous_session_id.to_string(),
                 entry: SessionEntry::Switch,
             };
-            let world = SessionWorld::build(
+            let mut world = SessionWorld::build(
                 config,
                 run_config,
                 render_settings,
                 theme,
                 persistence,
                 &fallback,
+                restore,
             )?;
+            let mut notices = vec![failure];
+            notices.append(&mut world.restore_notices);
             Ok(NextWorld {
                 world,
                 spec: fallback,
-                notices: vec![failure],
+                notices,
             })
         }
     }
@@ -1638,6 +1698,7 @@ async fn run_session(
                                         cfg.stream_options.clone(),
                                     );
                                     a.set_default_thinking(cfg.thinking.clone());
+                                    a.set_speed(cfg.speed);
                                 }
                                 let result = a.prompt(trimmed, turn_cancel).await;
                                 (target, result)
@@ -2848,14 +2909,23 @@ async fn handle_selector_outcome(
                     // waiting for a turn.
                     refresh_footer_model(tui, &model_id, &level);
                     let name = thinking_level_name(&level);
+                    // Record the change on the session log's user
+                    // thread so a later resume restores this level.
+                    let log_note = {
+                        let mut log = world.log.lock().await;
+                        log.append_thinking_change(ThreadFilter::USER, None, name)
+                            .err()
+                            .map(|err| format!("(couldn't record in session log: {err})"))
+                    };
                     // Persist the choice so it survives a restart.
                     let save_note = persist_config(&config, |c| {
                         c.thinking = Some(config_thinking_level(level.as_ref()));
                     });
-                    let notice = match save_note {
-                        Some(note) => format!("Thinking effort set to {name}. {note}"),
-                        None => format!("Thinking effort set to {name}."),
-                    };
+                    let mut notice = format!("Thinking effort set to {name}.");
+                    for note in [save_note, log_note].into_iter().flatten() {
+                        notice.push(' ');
+                        notice.push_str(&note);
+                    }
                     SelectorPollOutcome::Closed {
                         notice: Some(notice),
                         follow_up: None,
@@ -2905,13 +2975,15 @@ async fn handle_selector_outcome(
                         tui.hide_overlay(&parent.handle);
                     }
                     // Construct a fresh provider handle from the
-                    // picked catalog entry. Speed is intentionally
-                    // left unset on selector-driven swaps; users who
-                    // want the Anthropic fast-inference beta pass
-                    // `--speed fast` at startup (it survives the
-                    // swap if they re-pick a model that supports
-                    // it; otherwise it silently degrades).
-                    match from_model_info(auth, info.clone(), None) {
+                    // picked catalog entry, carrying the active
+                    // speed over so e.g. `--speed fast` survives a
+                    // `/model` pick (degrading silently on providers
+                    // that ignore it).
+                    let speed = {
+                        let cfg = run_config.lock().expect("run config mutex poisoned");
+                        cfg.speed
+                    };
+                    match from_model_info(auth, info.clone(), speed) {
                         Ok(ResolvedModel {
                             provider,
                             model_info,
@@ -2944,6 +3016,20 @@ async fn handle_selector_outcome(
                             // size, so update the denominator immediately
                             // rather than waiting for the next turn.
                             world.pump.set_context_window(tui, info.context_window);
+                            // Record the change on the session log's
+                            // user thread so a later resume restores
+                            // this model.
+                            let log_note = {
+                                let mut log = world.log.lock().await;
+                                log.append_model_change(
+                                    ThreadFilter::USER,
+                                    None,
+                                    &info.provider,
+                                    &info.id,
+                                )
+                                .err()
+                                .map(|err| format!("(couldn't record in session log: {err})"))
+                            };
                             // Persist the model choice (provider + id)
                             // so it survives a restart. `model_url` is
                             // intentionally left untouched: it's a
@@ -2959,10 +3045,11 @@ async fn handle_selector_outcome(
                                 "Model set to {} ({}/{}).",
                                 info.name, info.provider, info.id
                             );
-                            let notice = match save_note {
-                                Some(note) => format!("{confirm} {note}"),
-                                None => confirm,
-                            };
+                            let mut notice = confirm;
+                            for note in [save_note, log_note].into_iter().flatten() {
+                                notice.push(' ');
+                                notice.push_str(&note);
+                            }
                             SelectorPollOutcome::Closed {
                                 notice: Some(notice),
                                 follow_up: None,
@@ -3486,6 +3573,7 @@ mod tests {
             persistence,
             requested,
             previous_session_id,
+            None,
         )
     }
 

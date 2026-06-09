@@ -15,11 +15,12 @@ use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, AgentSeed, SubAgentRegistry};
-use aj_conf::{AgentEnv, Config};
-use aj_models::ThinkingConfig;
+use aj_conf::{AgentEnv, Config, ConfigSpeed};
+use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
-use aj_models::registry::ModelInfo;
-use aj_models::types::StreamOptions;
+use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
+use aj_models::types::{Speed, StreamOptions, ThinkingLevel};
+use aj_models::{ThinkingConfig, speed_name, thinking_config_from_name, thinking_config_name};
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
     repair_interrupted_tool_uses, replay,
@@ -56,6 +57,7 @@ fn build_agent(
     model_info: Arc<ModelInfo>,
     stream_options: StreamOptions,
     thinking: Option<ThinkingConfig>,
+    speed: Option<Speed>,
 ) -> Agent {
     let mut tools = get_builtin_tools(&BuiltinToolOptions {
         image_auto_resize: config.image_auto_resize,
@@ -77,7 +79,18 @@ fn build_agent(
     );
     agent.set_block_images(config.image_block);
     agent.set_default_thinking(thinking);
+    agent.set_speed(speed);
     agent
+}
+
+/// Dependencies for resume-time settings restoration: the model
+/// catalog to resolve recorded `(provider, model_id)` pairs against,
+/// and the credential store backing the rebuilt bundle's lazy
+/// API-key resolver. `None` at the [`SessionWorld::build`] call site
+/// (scripted mode, tests) disables restoration.
+pub struct RestoreContext {
+    pub registry: Arc<ModelRegistry>,
+    pub auth: AuthStorage,
 }
 
 /// How a session world comes into being and what the user sees
@@ -121,6 +134,137 @@ fn header_notice(spec: &SessionSpec) -> &'static str {
     }
 }
 
+/// Project a [`ThinkingConfig`] onto the wire-level
+/// [`ThinkingLevel`] for validation against a model's effort
+/// vocabulary. One-to-one, mirroring the projection the agent
+/// applies before each inference.
+fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
+    match level {
+        ThinkingConfig::Low => ThinkingLevel::Low,
+        ThinkingConfig::Medium => ThinkingLevel::Medium,
+        ThinkingConfig::High => ThinkingLevel::High,
+        ThinkingConfig::XHigh => ThinkingLevel::XHigh,
+        ThinkingConfig::Max => ThinkingLevel::Max,
+    }
+}
+
+/// Write a resumed session's recorded settings back into the shared
+/// run config, per the resume precedence: the log's record wins over
+/// the current defaults; an axis the log doesn't record keeps the
+/// current value. Returns the user-facing notices describing what
+/// was restored or why a recorded value was kept out.
+///
+/// Speed is restored first because the model bundle rebuilds below
+/// stamp speed-derived headers. Auth is deliberately not checked:
+/// key resolution is lazy (see `crate::model`), so an uncredentialed
+/// restored provider surfaces at the next turn, where the user can
+/// `/login`.
+fn restore_session_settings(
+    config: &Config,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    settings: &aj_session::SessionSettings,
+    restore: &RestoreContext,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    let mut cfg = run_config.lock().expect("run config mutex poisoned");
+
+    // Speed. `None` and `Some(Standard)` are equivalent on the wire,
+    // so changes are tracked by canonical name.
+    let prior_speed_name = speed_name(cfg.speed);
+    if let Some(s) = settings.speed.as_deref() {
+        match s.parse::<ConfigSpeed>() {
+            Ok(ConfigSpeed::Standard) => cfg.speed = Some(Speed::Standard),
+            Ok(ConfigSpeed::Fast) => cfg.speed = Some(Speed::Fast),
+            Err(_) => notices.push(format!(
+                "Session recorded unknown speed {s:?}; keeping {prior_speed_name}."
+            )),
+        }
+    }
+
+    // Model. Skipped when the record matches the active bundle —
+    // except that a restored speed still needs the bundle's headers
+    // rebuilt to match.
+    let model_changed = settings.model.as_ref().is_some_and(|(prov, id)| {
+        (prov.as_str(), id.as_str()) != (&*cfg.model_key.0, &*cfg.model_key.1)
+    });
+    if model_changed {
+        let (prov, id) = settings.model.as_ref().expect("checked above");
+        let resolved = restore
+            .registry
+            .get(prov, id)
+            .cloned()
+            .context("not in the model catalog")
+            .and_then(|info| crate::model::from_model_info(&restore.auth, info, cfg.speed));
+        match resolved {
+            Ok(resolved) => {
+                let name = resolved.model_info.name.clone();
+                cfg.provider = resolved.provider;
+                cfg.model_info = resolved.model_info;
+                cfg.stream_options = resolved.stream_options;
+                crate::model::apply_thinking_display(
+                    &mut cfg.stream_options,
+                    config.thinking_display,
+                );
+                cfg.model_key = (prov.clone(), id.clone());
+                notices.push(format!("Restored model {name} ({prov}/{id}) from session."));
+            }
+            Err(err) => {
+                tracing::warn!("could not restore session model {prov}/{id}: {err:#}");
+                notices.push(format!(
+                    "Session used {prov}/{id}, which is not available; continuing with {}/{}.",
+                    cfg.model_key.0, cfg.model_key.1
+                ));
+            }
+        }
+    } else if speed_name(cfg.speed) != prior_speed_name {
+        // Same model, different speed: rebuild the bundle so the
+        // stream options carry the restored speed's headers.
+        match crate::model::from_model_info(&restore.auth, (*cfg.model_info).clone(), cfg.speed) {
+            Ok(resolved) => {
+                cfg.provider = resolved.provider;
+                cfg.model_info = resolved.model_info;
+                cfg.stream_options = resolved.stream_options;
+                crate::model::apply_thinking_display(
+                    &mut cfg.stream_options,
+                    config.thinking_display,
+                );
+            }
+            Err(err) => {
+                tracing::warn!("could not rebuild bundle for restored speed: {err:#}");
+                notices.push(format!(
+                    "Couldn't apply the session's recorded speed: {err:#}"
+                ));
+            }
+        }
+    }
+
+    // Thinking, validated against the (possibly just-restored)
+    // model. Clamping rules are provider-specific, so a rejected
+    // level keeps the current one rather than guessing a substitute.
+    if let Some(level_str) = settings.thinking.as_deref() {
+        let current = thinking_config_name(cfg.thinking.as_ref());
+        match thinking_config_from_name(level_str) {
+            None => notices.push(format!(
+                "Session recorded unknown thinking level {level_str:?}; keeping {current}."
+            )),
+            Some(level) => {
+                let validation = match &level {
+                    None => Ok(()),
+                    Some(tc) => validate_thinking_level(&cfg.model_info, &thinking_level_for(tc)),
+                };
+                match validation {
+                    Ok(()) => cfg.thinking = level,
+                    Err(msg) => notices.push(format!(
+                        "Can't restore thinking level {level_str:?} ({msg}); keeping {current}."
+                    )),
+                }
+            }
+        }
+    }
+
+    notices
+}
+
 /// Everything with session lifetime, built fresh on every session
 /// change and never reseeded after construction. Dropping the world
 /// drops the agent, its bus subscriptions, and the pump in one go.
@@ -148,15 +292,23 @@ pub struct SessionWorld {
     /// Keeps the persistence listener subscribed; dropped with the
     /// world.
     _persistence_handle: SubscriptionHandle,
+    /// Notices produced by resume-time settings restoration (what
+    /// was restored, or why a recorded value was kept out). Pumped
+    /// onto the chat scrollback by the caller after `install`.
+    pub restore_notices: Vec<String>,
 }
 
 impl SessionWorld {
     /// Build a world bound to the session `spec` describes. Performs
     /// everything that doesn't touch the TUI: log resolve
-    /// (create/resume), interrupted-tool-use repair, agent
-    /// construction off the live run-config snapshot, transcript /
+    /// (create/resume), interrupted-tool-use repair, resume-time
+    /// settings restoration (when `restore` is supplied, the log's
+    /// recorded model/thinking/speed are written back into the
+    /// shared run-config snapshot before the agent is built), agent
+    /// construction off the run-config snapshot, transcript /
     /// system-prompt / sub-agent-counter seeding, bus subscriptions,
-    /// and pump construction.
+    /// and pump construction. A fresh log additionally gets its
+    /// initial settings record so a later resume can restore it.
     ///
     /// On error nothing is shared or installed; the outer session
     /// loop in `InteractiveMode::run` falls back to resuming the
@@ -168,6 +320,7 @@ impl SessionWorld {
         theme: &ThemeHandle,
         persistence: &ConversationPersistence,
         spec: &SessionSpec,
+        restore: Option<&RestoreContext>,
     ) -> Result<SessionWorld> {
         // Resolve the log.
         let mut log = match spec {
@@ -182,41 +335,71 @@ impl SessionWorld {
         // Repair any interrupted tool uses so the transcript ends
         // cleanly on a user-role message, then re-linearize from the
         // post-repair head to capture any synthesized tool_result
-        // message.
+        // message. On a resume, the linearized path also carries the
+        // session's recorded settings: restore them into the shared
+        // run config (when restoration is enabled) before the agent
+        // is built off it.
+        let mut restore_notices = Vec::new();
         let messages = if let Some(head) = log.latest_leaf(ThreadFilter::USER) {
             let conversation = log.linearize(&head, ThreadFilter::USER);
             repair_interrupted_tool_uses(&mut log, &conversation)?;
             let head = log
                 .latest_leaf(ThreadFilter::USER)
                 .expect("post-repair head exists when pre-repair head did");
-            log.linearize(&head, ThreadFilter::USER).agent_messages()
+            let conversation = log.linearize(&head, ThreadFilter::USER);
+            if let (SessionSpec::Resume { .. }, Some(restore)) = (spec, restore) {
+                restore_notices =
+                    restore_session_settings(config, run_config, &conversation.settings(), restore);
+            }
+            conversation.agent_messages()
         } else {
             Vec::new()
         };
 
-        // Build a fresh agent off the live run-config snapshot so
-        // runtime `/model` and `/thinking` choices carry into the
-        // new session.
-        let (provider, model_info, stream_options, thinking) = {
+        // Build a fresh agent off the run-config snapshot, which at
+        // this point reflects both runtime `/model` / `/thinking`
+        // choices and any settings just restored from the resumed
+        // log.
+        let (provider, model_info, stream_options, thinking, speed, model_key) = {
             let cfg = run_config.lock().expect("run config mutex poisoned");
             (
                 Arc::clone(&cfg.provider),
                 Arc::clone(&cfg.model_info),
                 cfg.stream_options.clone(),
                 cfg.thinking.clone(),
+                cfg.speed,
+                cfg.model_key.clone(),
             )
         };
-        let mut agent = build_agent(config, provider, model_info, stream_options, thinking);
+        let mut agent = build_agent(
+            config,
+            provider,
+            model_info,
+            stream_options,
+            thinking.clone(),
+            speed,
+        );
 
         // Resolve the system prompt: reuse a persisted one
         // (cache-warm resume) or assemble fresh from the env. On a
-        // fresh log, freeze the assembled prompt as the root entry.
+        // fresh log, freeze the assembled prompt as the root entry
+        // and record the active settings so a later resume restores
+        // them even if the defaults change in between. Like the
+        // prompt itself, the settings entries buffer until the
+        // first real message lands.
         let system_prompt = if let Some(persisted) = log.system_prompt() {
             persisted.to_string()
         } else {
             let assembled = agent.assemble_system_prompt();
             if log.is_empty() {
                 log.set_system_prompt(assembled.clone())?;
+                log.append_model_change(ThreadFilter::USER, None, &model_key.0, &model_key.1)?;
+                log.append_thinking_change(
+                    ThreadFilter::USER,
+                    None,
+                    thinking_config_name(thinking.as_ref()),
+                )?;
+                log.append_speed_change(ThreadFilter::USER, None, speed_name(speed))?;
             }
             assembled
         };
@@ -257,6 +440,7 @@ impl SessionWorld {
             event_rx,
             _event_handle: event_handle,
             _persistence_handle: persistence_handle,
+            restore_notices,
         })
     }
 
@@ -432,6 +616,7 @@ mod tests {
             Arc::new(scripted_model_info()),
             StreamOptions::default(),
             None,
+            None,
         );
         world_a
             .registry
@@ -568,6 +753,213 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "failed build must not create session files: {leftovers:?}"
+        );
+    }
+
+    use aj_models::registry::{Catalog, InputModality, ModelCost, OverridesFile};
+
+    /// Catalog row for the restore tests. `anthropic-messages` so
+    /// `from_model_info` finds a registered provider; non-reasoning
+    /// so thinking validation accepts any level as a no-op.
+    fn catalog_model(provider: &str, id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            api: "anthropic-messages".into(),
+            provider: provider.into(),
+            base_url: "https://example.invalid".into(),
+            reasoning: false,
+            supports_adaptive_thinking: false,
+            input: vec![InputModality::Text],
+            cost: ModelCost::default(),
+            context_window: 1_000,
+            max_tokens: 100,
+            headers: None,
+        }
+    }
+
+    /// Restore context over an in-memory registry and a tempdir
+    /// auth store (never touches `~/.aj`).
+    fn restore_ctx(dir: &TempDir, models: Vec<ModelInfo>) -> RestoreContext {
+        let catalog = Catalog {
+            updated_at: 0,
+            source: "test".into(),
+            models,
+        };
+        let overrides = OverridesFile { overrides: vec![] };
+        RestoreContext {
+            registry: Arc::new(ModelRegistry::from_catalog_with_overrides(
+                catalog,
+                overrides,
+                "test-catalog",
+            )),
+            auth: AuthStorage::new(dir.path().join("auth.json")),
+        }
+    }
+
+    fn build_world_with_restore(
+        persistence: &ConversationPersistence,
+        run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+        spec: &SessionSpec,
+        restore: &RestoreContext,
+    ) -> Result<SessionWorld> {
+        SessionWorld::build(
+            &Config::default(),
+            run_config,
+            &crate::modes::interactive::render_settings::RenderSettings::new(false, false, true),
+            &ThemeHandle::new(crate::config::theme::Theme::bundled_dark()),
+            persistence,
+            spec,
+            Some(restore),
+        )
+    }
+
+    /// Assistant reply carrying a non-scripted model identity, so a
+    /// resume sees that identity as the path's last model signal.
+    fn reply_from(provider: &str, model: &str) -> aj_models::types::AssistantMessage {
+        use crate::modes::interactive::test_support::finalized_text_message;
+        let mut msg = finalized_text_message("scripted reply");
+        msg.provider = provider.to_string();
+        msg.model = model.to_string();
+        msg
+    }
+
+    #[tokio::test]
+    async fn create_seeds_initial_settings_record() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+
+        let log = world.log.lock().await;
+        let head = log
+            .latest_leaf(ThreadFilter::USER)
+            .expect("seed entries give the user thread a leaf");
+        let settings = log.linearize(&head, ThreadFilter::USER).settings();
+        assert_eq!(
+            settings.model,
+            Some(("scripted".to_string(), "scripted".to_string()))
+        );
+        assert_eq!(settings.thinking.as_deref(), Some("off"));
+        assert_eq!(settings.speed.as_deref(), Some("standard"));
+    }
+
+    #[tokio::test]
+    async fn resume_restores_recorded_settings_into_run_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        // Record a thinking + speed change, then drive a turn whose
+        // assistant reply carries the anthropic identity: the turn
+        // flushes the buffered settings entries, and the assistant
+        // message is the path's last model signal.
+        let run_config = scripted_run_config(vec![reply_from("anthropic", "claude-x")]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        {
+            let mut log = world.log.lock().await;
+            log.append_thinking_change(ThreadFilter::USER, None, "high")
+                .expect("thinking change");
+            log.append_speed_change(ThreadFilter::USER, None, "fast")
+                .expect("speed change");
+        }
+        drive_turn(&world, "hello there").await;
+        let session_id = world.session_id.clone();
+        drop(world);
+
+        let run_config = scripted_run_config(Vec::new());
+        let ctx = restore_ctx(&dir, vec![catalog_model("anthropic", "claude-x")]);
+        let world =
+            build_world_with_restore(&persistence, &run_config, &resume_spec(&session_id), &ctx)
+                .expect("resume world");
+
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(
+            cfg.model_key,
+            ("anthropic".to_string(), "claude-x".to_string()),
+            "restored model overwrites the run config"
+        );
+        assert_eq!(cfg.model_info.id, "claude-x");
+        assert_eq!(cfg.thinking, Some(ThinkingConfig::High));
+        assert_eq!(cfg.speed, Some(Speed::Fast));
+        assert!(
+            world
+                .restore_notices
+                .iter()
+                .any(|n| n.contains("Restored model claude-x (anthropic/claude-x)")),
+            "restore notice missing: {:?}",
+            world.restore_notices
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_current_model_on_catalog_miss() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        let run_config = scripted_run_config(vec![reply_from("anthropic", "claude-x")]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world, "hello there").await;
+        let session_id = world.session_id.clone();
+        drop(world);
+
+        let run_config = scripted_run_config(Vec::new());
+        let ctx = restore_ctx(&dir, Vec::new());
+        let world =
+            build_world_with_restore(&persistence, &run_config, &resume_spec(&session_id), &ctx)
+                .expect("resume world");
+
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(
+            cfg.model_key,
+            ("scripted".to_string(), "scripted".to_string()),
+            "catalog miss keeps the current bundle"
+        );
+        assert!(
+            world
+                .restore_notices
+                .iter()
+                .any(|n| n.contains("anthropic/claude-x, which is not available")),
+            "fallback notice missing: {:?}",
+            world.restore_notices
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_current_thinking_on_unknown_level() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        let run_config = scripted_run_config(vec![finalized_text_message("scripted reply")]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        {
+            let mut log = world.log.lock().await;
+            log.append_thinking_change(ThreadFilter::USER, None, "bogus")
+                .expect("thinking change");
+        }
+        drive_turn(&world, "hello there").await;
+        let session_id = world.session_id.clone();
+        drop(world);
+
+        let run_config = scripted_run_config(Vec::new());
+        let ctx = restore_ctx(&dir, vec![catalog_model("scripted", "scripted")]);
+        let world =
+            build_world_with_restore(&persistence, &run_config, &resume_spec(&session_id), &ctx)
+                .expect("resume world");
+
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(cfg.thinking, None, "unknown level keeps the current value");
+        assert!(
+            world
+                .restore_notices
+                .iter()
+                .any(|n| n.contains("unknown thinking level \"bogus\"")),
+            "unknown-level notice missing: {:?}",
+            world.restore_notices
         );
     }
 }

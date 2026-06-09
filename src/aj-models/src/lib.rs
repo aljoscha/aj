@@ -61,3 +61,30 @@ pub fn thinking_config_name(level: Option<&ThinkingConfig>) -> &'static str {
         Some(ThinkingConfig::Max) => "max",
     }
 }
+
+/// Parse a canonical level name back into an optional
+/// [`ThinkingConfig`] — the exact inverse of [`thinking_config_name`].
+/// Returns `None` for names outside the vocabulary so callers can
+/// keep their current level and surface a notice.
+pub fn thinking_config_from_name(name: &str) -> Option<Option<ThinkingConfig>> {
+    match name {
+        "off" => Some(None),
+        "low" => Some(Some(ThinkingConfig::Low)),
+        "medium" => Some(Some(ThinkingConfig::Medium)),
+        "high" => Some(Some(ThinkingConfig::High)),
+        "xhigh" => Some(Some(ThinkingConfig::XHigh)),
+        "max" => Some(Some(ThinkingConfig::Max)),
+        _ => None,
+    }
+}
+
+/// Render an optional [`types::Speed`] as its canonical name:
+/// `"standard"` (also for `None`, the default) or `"fast"`. This
+/// vocabulary is shared by the session log's settings entries and
+/// the event protocol.
+pub fn speed_name(speed: Option<types::Speed>) -> &'static str {
+    match speed {
+        None | Some(types::Speed::Standard) => "standard",
+        Some(types::Speed::Fast) => "fast",
+    }
+}
