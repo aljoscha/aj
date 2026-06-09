@@ -1513,6 +1513,7 @@ impl Agent {
             parent_agent_id: self.agent_id,
             cancellation: self.cancellation.child_token(),
             block_images: self.block_images,
+            default_thinking: self.default_thinking.clone(),
             sub_agent_registry: self.sub_agent_registry.clone(),
         };
 
@@ -1682,6 +1683,11 @@ struct SessionContextWrapper<'a> {
     /// Parent's `image_block` setting; propagated to spawned
     /// sub-agents so the defense-in-depth gate stays uniform.
     block_images: bool,
+    /// Parent's default thinking level; propagated to spawned
+    /// sub-agents so they reason at the same effort as the parent
+    /// (and so non-reasoning models never receive an explicit
+    /// `disabled` they reject) rather than always defaulting off.
+    default_thinking: Option<ThinkingConfig>,
     /// Shared registry the parent agent uses to retain spawned
     /// sub-agents. Cloned from the parent so [`Self::spawn_agent`]
     /// inserts the new handle into the same map the binary resolves
@@ -1747,7 +1753,11 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // message inside `run_single_turn`. Sub-agents share the
             // parent's provider / model_info / stream_options triple
             // (per `docs/aj-next-plan.md` §1.6) so the whole
-            // hierarchy talks to the same backend.
+            // hierarchy talks to the same backend. The thinking level
+            // is applied separately below via `set_default_thinking`
+            // because `with_provider` takes a `ConfigThinkingLevel`
+            // while the parent already holds a resolved
+            // `ThinkingConfig`.
             let mut sub_agent = Agent::with_provider(
                 self.env.clone(),
                 self.system_prompt,
@@ -1764,6 +1774,11 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // so the defense-in-depth gate stays uniform across the
             // hierarchy.
             sub_agent.set_block_images(self.block_images);
+            // Sub-agents inherit the parent's thinking level so they
+            // reason at the same effort and so a `None` default never
+            // gets serialized as an explicit `disabled` for models
+            // that reject it.
+            sub_agent.set_default_thinking(self.default_thinking.clone());
             // Share the parent's bus per `docs/aj-next-plan.md`
             // §1.6: every event the sub-agent emits during its
             // run reaches the listeners the binary registered on
