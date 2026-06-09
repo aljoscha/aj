@@ -393,13 +393,12 @@ impl SessionWorld {
             let assembled = agent.assemble_system_prompt();
             if log.is_empty() {
                 log.set_system_prompt(assembled.clone())?;
-                log.append_model_change(ThreadFilter::USER, None, &model_key.0, &model_key.1)?;
+                log.append_model_change(ThreadFilter::USER, &model_key.0, &model_key.1)?;
                 log.append_thinking_change(
                     ThreadFilter::USER,
-                    None,
                     thinking_config_name(thinking.as_ref()),
                 )?;
-                log.append_speed_change(ThreadFilter::USER, None, speed_name(speed))?;
+                log.append_speed_change(ThreadFilter::USER, speed_name(speed))?;
             }
             assembled
         };
@@ -486,6 +485,7 @@ mod tests {
     use std::time::Duration;
 
     use aj_agent::bus::EventBus;
+    use aj_agent::events::AgentSettings;
     use aj_agent::message::AgentMessage;
     use aj_models::scripted::ScriptedProvider;
     use aj_models::types::{Message, UserMessage};
@@ -657,10 +657,12 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(3),
             task: "synthetic task".to_string(),
-            provider: "scripted".into(),
-            model_id: "scripted-model".into(),
-            thinking: "off".into(),
-            speed: "standard".into(),
+            settings: AgentSettings {
+                provider: "scripted".into(),
+                model_id: "scripted-model".into(),
+                thinking: "off".into(),
+                speed: "standard".into(),
+            },
         })
         .await
         .expect("emit start");
@@ -860,9 +862,9 @@ mod tests {
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         {
             let mut log = world.log.lock().await;
-            log.append_thinking_change(ThreadFilter::USER, None, "high")
+            log.append_thinking_change(ThreadFilter::USER, "high")
                 .expect("thinking change");
-            log.append_speed_change(ThreadFilter::USER, None, "fast")
+            log.append_speed_change(ThreadFilter::USER, "fast")
                 .expect("speed change");
         }
         drive_turn(&world, "hello there").await;
@@ -938,7 +940,7 @@ mod tests {
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         {
             let mut log = world.log.lock().await;
-            log.append_thinking_change(ThreadFilter::USER, None, "bogus")
+            log.append_thinking_change(ThreadFilter::USER, "bogus")
                 .expect("thinking change");
         }
         drive_turn(&world, "hello there").await;

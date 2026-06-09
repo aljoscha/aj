@@ -21,7 +21,7 @@ restore fallback for logs that predate this work.
 
 ## 1. On-disk format (`aj-session`)
 
-Three new variants on `ConversationEntryKind`:
+Four new variants on `ConversationEntryKind`:
 
 ```rust
 /// The active model changed (or was first recorded). `provider` and
@@ -39,11 +39,21 @@ ThinkingChange { level: String },
 /// "standard" or "fast" (the `ConfigSpeed` Display vocabulary);
 /// unknown values are ignored on restore with a notice.
 SpeedChange { speed: String },
+
+/// The structural root of a sub-agent thread: written at spawn,
+/// anchored at the parent thread's head (the assistant message
+/// carrying the spawning tool call). Carries the task and the
+/// child's `AgentSettings` snapshot (see §2.4) so the log is
+/// self-describing and replay can synthesize the spawn event
+/// without look-ahead.
+SubAgentSpawn { task: String, settings: AgentSettings },
 ```
 
 Serialized with the existing `#[serde(tag = "type")]` scheme as
 `"type": "model_change"` / `"type": "thinking_change"` /
-`"type": "speed_change"` lines.
+`"type": "speed_change"` / `"type": "sub_agent_spawn"` lines. The
+spawn entry's `settings` is a nested field (not flattened) so the
+line layout stays unambiguous.
 
 Framing:
 
@@ -54,10 +64,10 @@ Framing:
   thread's timeline, so a linearize from any head sees exactly the
   settings that were active on that path, and each thread's settings
   are independent.
-- **Punctuation**: `is_punctuation() == false`. Settings entries
-  buffer in `pending_writes` like the system prompt, so a session
-  where the user only opens the TUI and flips the model — but never
-  submits — still leaves no file on disk.
+- **Punctuation**: `is_punctuation() == false`. Settings and spawn
+  entries buffer in `pending_writes` like the system prompt, so a
+  session where the user only opens the TUI and flips the model —
+  but never submits — still leaves no file on disk.
 
 Read-side consumers checked against the new variants:
 
@@ -65,7 +75,8 @@ Read-side consumers checked against the new variants:
   filter on `Message { .. }` — unaffected.
 - `repair_interrupted_tool_uses` walks `Message` entries with a
   let-else — unaffected.
-- `replay` renders settings entries as notices (see §2.5).
+- `replay` renders settings entries as notices and synthesizes the
+  sub-agent bracketing off `SubAgentSpawn` entries (see §2.5).
 - `SessionPreview` walk matches `Message` — unaffected.
 
 ### `SessionSettings` extraction
@@ -95,7 +106,10 @@ impl Conversation {
 
 One forward scan over `entries()`, keeping the last value seen per
 axis. A `ModelChange` entry and an assistant message both update the
-model; whichever comes later on the path wins.
+model; a `SubAgentSpawn` entry updates all three axes from its
+settings snapshot (so a future per-sub-agent restore can call
+`settings()` on a sub-agent-thread linearize); whichever comes later
+on the path wins.
 
 ## 2. Writing entries
 
@@ -103,10 +117,10 @@ The persistence listener keeps exclusive ownership of *message*
 writes. Main-thread settings entries are appended by the binary,
 which already holds the log handle — they originate from binary-level
 state (`RunConfigSnapshot`), not from agent activity. Sub-agent
-settings entries are the one exception: they are written by the
+spawn entries are the one exception: they are written by the
 persistence listener off `AgentEvent::SubAgentStart` (§2.4), since
 spawns happen inside the agent. The module docs in
-`aj-session/src/listener.rs` are updated to state this split.
+`aj-session/src/listener.rs` state this split.
 
 Append path: new `ConversationLog` helpers
 (`append_model_change` / `append_thinking_change` /
@@ -158,34 +172,37 @@ old settings — matching what the next inference will actually use.
 
 ### 2.4 Sub-agent threads
 
-Sub-agent threads get the same initial settings record as the main
-thread, so per-sub-agent model/effort settings can be layered on
-later without a format change, and so the log is self-describing
-about what each sub-agent actually ran with.
+Every sub-agent thread is rooted in one `SubAgentSpawn` entry that
+records the task and the child's settings snapshot, so per-sub-agent
+model/effort settings can be layered on later without a format
+change, and so the log is self-describing about what each sub-agent
+actually ran with.
 
 Sub-agents are spawned inside the agent, so the binary isn't the
 writer here. Instead:
 
-- `AgentEvent::SubAgentStart` gains the child's bundle identity:
-  `provider: String`, `model_id: String`, `thinking: String`, and
-  `speed: String` (same vocabularies as the entry kinds). The agent
-  populates these from the child's bundle when it emits the event.
-  Today these always mirror the parent's bundle; when per-sub-agent
-  settings land, the same fields carry the sub-agent-specific values
-  with no event change.
-- The persistence listener, on `SubAgentStart`, appends the
-  `ModelChange` / `ThinkingChange` / `SpeedChange` triple on the
-  sub-agent's thread, anchored at the captured parent head — before
-  any of the sub-agent's messages. The first `MessageEnd` for that
-  sub-agent then chains onto the settings entries via
-  `latest_leaf(ThreadFilter::subagent(n))`, so the pending-anchor
-  map is consumed at `SubAgentStart` time rather than at the first
-  message.
+- `AgentEvent::SubAgentStart` carries the child's bundle identity as
+  an `AgentSettings` snapshot (`provider`, `model_id`, `thinking`,
+  `speed` — the same vocabularies as the entry kinds), flattened
+  with `#[serde(flatten)]` so the event's JSON wire shape keeps the
+  four fields at the top level. The agent populates the snapshot
+  from the child's bundle when it emits the event. Today it always
+  mirrors the parent's bundle; when per-sub-agent settings land, the
+  same snapshot carries the sub-agent-specific values with no event
+  change.
+- The persistence listener, on `SubAgentStart`, writes one
+  `SubAgentSpawn` entry on the sub-agent's thread via
+  `ConversationLog::append_subagent_spawn(agent_id, parent_head,
+  task, settings)`, anchored at the captured parent head — the
+  parent anchor is consumed at spawn time. The first `MessageEnd`
+  for that sub-agent then chains onto the spawn entry via
+  `latest_leaf(ThreadFilter::subagent(n))`.
 
-Restore-side, sub-agent settings entries are recorded but not acted
-on today: the registry starts empty on resume (resumed sub-agents
-are not re-promptable), and fresh sub-agents take the main bundle.
-When per-sub-agent settings ship, restore can read these entries.
+Restore-side, the spawn snapshot is recorded but not acted on today:
+the registry starts empty on resume (resumed sub-agents are not
+re-promptable), and fresh sub-agents take the main bundle. When
+per-sub-agent settings ship, restore can read the snapshot through
+`Conversation::settings()` on a sub-agent-thread linearize.
 
 Main-thread restore is unaffected: `Conversation::settings()`
 operates on a `ThreadFilter::USER` linearization, which excludes
@@ -193,25 +210,26 @@ sub-agent entries.
 
 ### 2.5 Replay rendering
 
-`replay` projects a settings entry to one `AgentEvent::Notice`
+`replay` projects a settings entry (`ModelChange` /
+`ThinkingChange` / `SpeedChange`) to one `AgentEvent::Notice`
 (e.g. `Model set to <prov>/<id>.`, `Thinking effort set to high.`,
 `Speed set to fast.`) **only when at least one `Message` entry
 precedes it on the same thread**. This renders mid-session switches
 in resumed scrollback — mirroring the notice the selector showed
-live — while keeping the initial seed entries (session creation,
-sub-agent spawn) silent, since those never produced a visible notice
-live either.
+live — while keeping the initial seed entries (session creation)
+silent, since those never produced a visible notice live either.
 
-This also requires two small adjustments to replay's sub-agent
-bracketing, since a sub-thread's first entries are now settings
-entries rather than the task message:
-
-- `bracket_subagent` / `subagent_task` take the task from the
-  run's first `Message` entry instead of its first entry.
-- The synthesized `AgentEvent::SubAgentStart` populates the new
-  `provider` / `model_id` / `thinking` fields from the sub-thread's
-  settings entries (falling back to the first sub-assistant
-  message's `provider`/`model` and an empty level for legacy logs).
+Sub-agent bracketing: a sub thread leads with its `SubAgentSpawn`
+entry, so replay emits the synthesized `AgentEvent::SubAgentStart`
+directly from it — the task and the `AgentSettings` snapshot come
+straight off the entry, with no look-ahead. The spawn entry never
+produces a notice; its only projection is the start event. Legacy
+logs whose sub threads lead with the task user message instead get
+the start event at the run's first `Message` entry, with the task
+taken from its user text and default settings (empty
+provider/model, thinking "off", speed "standard"). A run that ends
+with neither a spawn entry nor a message still emits a default
+start at close so the start/end bracketing stays balanced.
 
 ## 3. Restore on resume
 
@@ -325,14 +343,17 @@ three initial settings entries like the interactive path.
   - `Conversation::settings()`: last-wins ordering, assistant-message
     fallback, `None` vs `Some("off")` for thinking, branch-awareness
     (settings entry on one path not visible from a head on another),
-    sub-agent entries excluded from the user-thread scan.
-  - persistence listener: `SubAgentStart` writes the sub-thread
-    settings triple anchored at the parent head; the sub-agent's
-    first message chains onto them.
+    sub-agent entries excluded from the user-thread scan, the
+    `SubAgentSpawn` snapshot feeding all three axes on a sub-agent
+    linearize.
+  - persistence listener: `SubAgentStart` writes one `SubAgentSpawn`
+    entry anchored at the parent head, carrying the task and the
+    settings snapshot; the sub-agent's first message chains onto it.
   - replay: seed entries (pre-message) are silent; mid-session
-    entries emit one `Notice` each; sub-agent task extraction and
-    `SubAgentStart` field population work with settings entries
-    leading the sub-thread, and with legacy logs lacking them.
+    entries emit one `Notice` each; a spawn-entry-led sub run emits
+    `SubAgentStart` with the recorded task and settings before the
+    first sub message; legacy task-message-led runs bracket with
+    default settings.
 - `aj` integration tests (scripted provider where possible):
   - fresh session writes the three initial entries.
   - `/model` / `/thinking` confirms append entries; `/model` swap

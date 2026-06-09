@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantMessage, ToolResultMessage, UserContent};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::message::AgentMessage;
@@ -38,6 +38,27 @@ where
         seq.serialize_element(block)?;
     }
     seq.end()
+}
+
+/// Snapshot of an agent's bundle identity: which model it talks to
+/// and at what thinking effort and inference speed.
+///
+/// `thinking` uses the "off" / "low" / "medium" / "high" / "xhigh" /
+/// "max" vocabulary; `speed` is "standard" or "fast". Carried on
+/// [`AgentEvent::SubAgentStart`] and persisted verbatim in the
+/// conversation log's sub-agent spawn entries, so the strings are
+/// part of the on-disk contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSettings {
+    /// Provider of the model bundle (e.g. "anthropic").
+    pub provider: String,
+    /// Catalog id of the model.
+    pub model_id: String,
+    /// Thinking effort: one of "off", "low", "medium", "high",
+    /// "xhigh", "max".
+    pub thinking: String,
+    /// Inference speed: "standard" or "fast".
+    pub speed: String,
 }
 
 /// Identifier for the agent emitting an event.
@@ -191,16 +212,12 @@ pub enum AgentEvent {
         parent: AgentId,
         child: AgentId,
         task: String,
-        /// Provider of the child's model bundle at spawn (e.g.
-        /// "anthropic"). Today sub-agents mirror the parent's bundle.
-        provider: String,
-        /// Catalog id of the child's model at spawn.
-        model_id: String,
-        /// The child's thinking effort: one of "off", "low",
-        /// "medium", "high", "xhigh", "max".
-        thinking: String,
-        /// The child's inference speed: "standard" or "fast".
-        speed: String,
+        /// The child's bundle identity at spawn. Today sub-agents
+        /// mirror the parent's bundle. Flattened so the JSON wire
+        /// shape keeps the four settings fields at the top level of
+        /// the event object.
+        #[serde(flatten)]
+        settings: AgentSettings,
     },
     /// A sub-agent has finished and returned its report.
     SubAgentEnd {
@@ -293,10 +310,12 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(0),
             task: "test".into(),
-            provider: "scripted".into(),
-            model_id: "scripted-model".into(),
-            thinking: "off".into(),
-            speed: "standard".into(),
+            settings: AgentSettings {
+                provider: "scripted".into(),
+                model_id: "scripted-model".into(),
+                thinking: "off".into(),
+                speed: "standard".into(),
+            },
         };
         assert_eq!(sub_spawn.agent_id(), AgentId::Main);
 
@@ -368,5 +387,28 @@ mod tests {
         assert_eq!(json["event"]["type"], "text_delta");
         assert_eq!(json["event"]["delta"], "abc");
         assert_eq!(json["event"]["content_index"], 0);
+
+        // The flattened `AgentSettings` keeps the four settings
+        // fields at the top level of the SubAgentStart object, not
+        // nested under a `settings` key.
+        let spawn = AgentEvent::SubAgentStart {
+            parent: AgentId::Main,
+            child: AgentId::Sub(2),
+            task: "explore".into(),
+            settings: AgentSettings {
+                provider: "anthropic".into(),
+                model_id: "claude-x".into(),
+                thinking: "medium".into(),
+                speed: "fast".into(),
+            },
+        };
+        let json = serde_json::to_value(&spawn).expect("SubAgentStart serializes");
+        assert_eq!(json["type"], "sub_agent_start");
+        assert_eq!(json["task"], "explore");
+        assert_eq!(json["provider"], "anthropic");
+        assert_eq!(json["model_id"], "claude-x");
+        assert_eq!(json["thinking"], "medium");
+        assert_eq!(json["speed"], "fast");
+        assert!(json.get("settings").is_none());
     }
 }

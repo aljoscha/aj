@@ -20,21 +20,20 @@
 //! is the listener's responsibility too: when the agent emits
 //! [`AgentEvent::SubAgentStart`] the listener captures the parent
 //! thread's current head and immediately writes the sub-agent's
-//! initial settings record (`ModelChange` / `ThinkingChange` /
-//! `SpeedChange`, from the bundle identity carried on the event)
+//! [`crate::log::ConversationEntryKind::SubAgentSpawn`] root entry
+//! (carrying the task and the settings snapshot from the event)
 //! anchored at that head. The sub-agent's first
-//! [`AgentEvent::MessageEnd`] then chains onto the last settings
-//! entry via [`ConversationLog::latest_leaf`], like every
-//! subsequent sub-agent write. A `Sub(n)` message arriving with no
-//! prior `SubAgentStart` (and hence an empty sub thread) is an
-//! error.
+//! [`AgentEvent::MessageEnd`] then chains onto the spawn entry via
+//! [`ConversationLog::latest_leaf`], like every subsequent
+//! sub-agent write. A `Sub(n)` message arriving with no prior
+//! `SubAgentStart` (and hence an empty sub thread) is an error.
 //!
 //! Write ownership is split with the binary: the listener has
-//! exclusive ownership of *message* writes and of sub-agent
-//! settings entries (spawns happen inside the agent); main-thread
-//! settings entries are appended by the binary, which already holds
-//! the log handle and owns the run-config state they record. The
-//! binary additionally takes brief read locks to resolve the system
+//! exclusive ownership of *message* writes and of sub-agent spawn
+//! entries (spawns happen inside the agent); main-thread settings
+//! entries are appended by the binary, which already holds the log
+//! handle and owns the run-config state they record. The binary
+//! additionally takes brief read locks to resolve the system
 //! prompt, snapshot the thread for replay, and display the final
 //! usage summary.
 
@@ -53,7 +52,7 @@ use crate::log::{ConversationLog, ConversationView, ThreadFilter};
 ///
 /// Other event variants are intentional no-ops here, with one
 /// exception: [`AgentEvent::SubAgentStart`] writes the spawned
-/// sub-agent's initial settings record, anchored at the parent
+/// sub-agent's `SubAgentSpawn` root entry, anchored at the parent
 /// thread's current head. Without this hook the sub-agent's first
 /// write would have no reachable parent (its own
 /// [`ThreadFilter::subagent`] thread is empty), and the listener
@@ -67,11 +66,8 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
                 AgentEvent::SubAgentStart {
                     parent,
                     child,
-                    provider,
-                    model_id,
-                    thinking,
-                    speed,
-                    ..
+                    task,
+                    settings,
                 } => {
                     let AgentId::Sub(child_n) = child else {
                         return Err(anyhow!("SubAgentStart with non-Sub child {child:?}"));
@@ -83,20 +79,7 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
                             "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
                         )
                     })?;
-                    // Seed the sub thread with its settings record:
-                    // the first entry anchors at the captured parent
-                    // head, the rest chain via `latest_leaf` (passing
-                    // `None`). After this the sub thread has a leaf,
-                    // so the first `MessageEnd` chains normally.
-                    let sub_filter = ThreadFilter::subagent(child_n);
-                    log_guard.append_model_change(
-                        sub_filter,
-                        Some(parent_head),
-                        &provider,
-                        &model_id,
-                    )?;
-                    log_guard.append_thinking_change(sub_filter, None, &thinking)?;
-                    log_guard.append_speed_change(sub_filter, None, &speed)?;
+                    log_guard.append_subagent_spawn(child_n, parent_head, &task, &settings)?;
                 }
                 AgentEvent::MessageEnd { agent_id, message } => {
                     let mut log_guard = log.lock().await;
@@ -116,7 +99,8 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// system-prompt root for fresh threads). For [`AgentId::Sub(n)`]
 /// it's the sub-agent thread's own `latest_leaf`; the thread is
 /// never empty for a legitimately spawned sub-agent because
-/// [`AgentEvent::SubAgentStart`] seeds it with settings entries.
+/// [`AgentEvent::SubAgentStart`] seeds it with a `SubAgentSpawn`
+/// entry.
 fn persist(log: &mut ConversationLog, agent_id: AgentId, message: AgentMessage) -> Result<()> {
     let mut view = match agent_id {
         AgentId::Main => {
@@ -158,7 +142,7 @@ mod tests {
     use std::sync::Arc;
 
     use aj_agent::bus::EventBus;
-    use aj_agent::events::{AgentEvent, AgentId};
+    use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
     use aj_agent::message::AgentMessage;
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, TextContent, ToolResultMessage, UserMessage,
@@ -210,10 +194,12 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(n),
             task: task.to_string(),
-            provider: "anthropic".to_string(),
-            model_id: "claude-x".to_string(),
-            thinking: "medium".to_string(),
-            speed: "standard".to_string(),
+            settings: AgentSettings {
+                provider: "anthropic".to_string(),
+                model_id: "claude-x".to_string(),
+                thinking: "medium".to_string(),
+                speed: "standard".to_string(),
+            },
         }
     }
 
@@ -314,11 +300,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sub_agent_start_writes_settings_anchored_at_parent_head() {
+    async fn sub_agent_start_writes_spawn_entry_anchored_at_parent_head() {
         // `SubAgentStart` must immediately seed the sub thread with
-        // the settings triple, the first entry anchored at the
-        // parent's `latest_leaf`; the sub-agent's first `MessageEnd`
-        // then chains onto the last settings entry.
+        // one `SubAgentSpawn` entry anchored at the parent's
+        // `latest_leaf`; the sub-agent's first `MessageEnd` then
+        // chains onto it.
         let (_dir, log) = fresh_log();
         let parent_anchor = {
             let mut log_guard = log.lock().await;
@@ -357,33 +343,26 @@ mod tests {
             .expect("sub-agent thread head exists");
         let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
         let entries: Vec<_> = convo.entries().to_vec();
-        // Three settings entries followed by the two messages.
-        assert_eq!(entries.len(), 5, "got entries: {entries:#?}");
+        // One spawn entry followed by the two messages.
+        assert_eq!(entries.len(), 3, "got entries: {entries:#?}");
         match &entries[0].entry {
-            ConversationEntryKind::ModelChange { provider, model_id } => {
-                assert_eq!(provider, "anthropic");
-                assert_eq!(model_id, "claude-x");
+            ConversationEntryKind::SubAgentSpawn { task, settings } => {
+                assert_eq!(task, "do thing");
+                assert_eq!(settings.provider, "anthropic");
+                assert_eq!(settings.model_id, "claude-x");
+                assert_eq!(settings.thinking, "medium");
+                assert_eq!(settings.speed, "standard");
             }
-            other => panic!("expected ModelChange, got {other:?}"),
+            other => panic!("expected SubAgentSpawn, got {other:?}"),
         }
         assert_eq!(entries[0].parent_id.as_ref(), Some(&parent_anchor));
-        match &entries[1].entry {
-            ConversationEntryKind::ThinkingChange { level } => assert_eq!(level, "medium"),
-            other => panic!("expected ThinkingChange, got {other:?}"),
-        }
-        match &entries[2].entry {
-            ConversationEntryKind::SpeedChange { speed } => assert_eq!(speed, "standard"),
-            other => panic!("expected SpeedChange, got {other:?}"),
-        }
-        // Settings entries chain among themselves; the first message
-        // chains onto the last settings entry.
+        // The first message chains onto the spawn entry.
         assert_eq!(entries[1].parent_id.as_ref(), Some(&entries[0].id));
-        assert_eq!(entries[2].parent_id.as_ref(), Some(&entries[1].id));
-        assert_eq!(entries[3].parent_id.as_ref(), Some(&entries[2].id));
         assert!(matches!(
-            entries[3].entry,
+            entries[1].entry,
             ConversationEntryKind::Message { .. }
         ));
+        assert_eq!(entries[2].parent_id.as_ref(), Some(&entries[1].id));
     }
 
     #[tokio::test]
@@ -440,12 +419,12 @@ mod tests {
         let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
         let entries: Vec<_> = convo.entries().to_vec();
 
-        // Three settings entries + four messages live in a single
-        // linear sub-thread, in order: chaining (not re-anchoring)
-        // is what keeps the continuation in the same thread after
-        // the initial leaf.
-        assert_eq!(entries.len(), 7, "got entries: {entries:#?}");
-        let texts: Vec<String> = entries[3..].iter().map(entry_text).collect();
+        // One spawn entry + four messages live in a single linear
+        // sub-thread, in order: chaining (not re-anchoring) is what
+        // keeps the continuation in the same thread after the
+        // initial leaf.
+        assert_eq!(entries.len(), 5, "got entries: {entries:#?}");
+        let texts: Vec<String> = entries[1..].iter().map(entry_text).collect();
         assert_eq!(
             texts,
             vec![
@@ -458,8 +437,8 @@ mod tests {
 
         // The continuation's first user message ("more") chains onto
         // the prior sub-thread leaf (assistant "done"), not the parent.
-        let done = &entries[4];
-        let more = &entries[5];
+        let done = &entries[2];
+        let more = &entries[3];
         assert_eq!(more.parent_id.as_ref(), Some(&done.id));
     }
 

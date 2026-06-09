@@ -376,18 +376,12 @@ pub async fn run(args: Args) -> Result<()> {
         if log.is_empty() {
             log.set_system_prompt(assembled.clone())?;
             let model_info = agent.model_info();
-            log.append_model_change(
-                ThreadFilter::USER,
-                None,
-                &model_info.provider,
-                &model_info.id,
-            )?;
+            log.append_model_change(ThreadFilter::USER, &model_info.provider, &model_info.id)?;
             log.append_thinking_change(
                 ThreadFilter::USER,
-                None,
                 aj_models::thinking_config_name(agent.default_thinking().as_ref()),
             )?;
-            log.append_speed_change(ThreadFilter::USER, None, aj_models::speed_name(speed))?;
+            log.append_speed_change(ThreadFilter::USER, aj_models::speed_name(speed))?;
         }
         assembled
     };

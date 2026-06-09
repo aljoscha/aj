@@ -989,6 +989,7 @@ pub fn set_editor_submit_enabled(tui: &mut Tui, enabled: bool) {
 mod tests {
     use super::*;
 
+    use aj_agent::events::AgentSettings;
     use aj_tui::component::Component;
     use aj_tui::terminal::ProcessTerminal;
 
@@ -1849,10 +1850,12 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
-                provider: "scripted".into(),
-                model_id: "scripted-model".into(),
-                thinking: "off".into(),
-                speed: "standard".into(),
+                settings: AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted-model".into(),
+                    thinking: "off".into(),
+                    speed: "standard".into(),
+                },
             },
         );
         pump.handle(
@@ -1910,10 +1913,12 @@ mod tests {
                     parent: AgentId::Main,
                     child: AgentId::Sub(n),
                     task: format!("task {n}"),
-                    provider: "scripted".into(),
-                    model_id: "scripted-model".into(),
-                    thinking: "off".into(),
-                    speed: "standard".into(),
+                    settings: AgentSettings {
+                        provider: "scripted".into(),
+                        model_id: "scripted-model".into(),
+                        thinking: "off".into(),
+                        speed: "standard".into(),
+                    },
                 },
             );
             pump.handle(
@@ -1992,10 +1997,12 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
-                provider: "scripted".into(),
-                model_id: "scripted-model".into(),
-                thinking: "off".into(),
-                speed: "standard".into(),
+                settings: AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted-model".into(),
+                    thinking: "off".into(),
+                    speed: "standard".into(),
+                },
             },
         );
         pump.handle(
@@ -2063,10 +2070,12 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "summarize".into(),
-                provider: "scripted".into(),
-                model_id: "scripted-model".into(),
-                thinking: "off".into(),
-                speed: "standard".into(),
+                settings: AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted-model".into(),
+                    thinking: "off".into(),
+                    speed: "standard".into(),
+                },
             },
         );
         // A sub-agent tool call routes into the box.
@@ -2145,10 +2154,12 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
-                provider: "scripted".into(),
-                model_id: "scripted-model".into(),
-                thinking: "off".into(),
-                speed: "standard".into(),
+                settings: AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted-model".into(),
+                    thinking: "off".into(),
+                    speed: "standard".into(),
+                },
             },
         );
         // Observe the sub-agent (its box becomes the full view).
@@ -2218,10 +2229,12 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
-                provider: "scripted".into(),
-                model_id: "scripted-model".into(),
-                thinking: "off".into(),
-                speed: "standard".into(),
+                settings: AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted-model".into(),
+                    thinking: "off".into(),
+                    speed: "standard".into(),
+                },
             },
         );
         // Stay on main: the tool is collected header-only.

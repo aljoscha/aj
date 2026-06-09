@@ -32,7 +32,7 @@ use aj_models::types::{
 use aj_models::ThinkingConfig;
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
-use crate::events::{AgentEvent, AgentId};
+use crate::events::{AgentEvent, AgentId, AgentSettings};
 use crate::message::AgentMessage;
 use crate::projection::transcript_to_messages;
 use crate::tool::{
@@ -708,10 +708,10 @@ impl Agent {
 
     async fn run_single_turn_inner(&mut self, prompt: String) -> Result<String, anyhow::Error> {
         // Append the prompt as the sub-agent's first user message.
-        // The persistence listener anchors this entry under the
-        // parent's spawning assistant message via the
-        // `SubAgentStart` hook (see
-        // `aj_session::listener::persistence_listener`).
+        // The persistence listener chains this entry onto the
+        // sub-agent's spawn entry, which the `SubAgentStart` hook
+        // anchored under the parent's spawning assistant message
+        // (see `aj_session::listener::persistence_listener`).
         let user_message = AgentMessage::wire(Message::User(UserMessage::text(prompt)));
         self.transcript.push(user_message.clone());
         self.bus
@@ -1727,11 +1727,13 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                     parent: self.parent_agent_id,
                     child: child_id,
                     task: task.clone(),
-                    provider: self.model_info.provider.clone(),
-                    model_id: self.model_info.id.clone(),
-                    thinking: aj_models::thinking_config_name(self.default_thinking.as_ref())
-                        .to_string(),
-                    speed: aj_models::speed_name(self.speed).to_string(),
+                    settings: AgentSettings {
+                        provider: self.model_info.provider.clone(),
+                        model_id: self.model_info.id.clone(),
+                        thinking: aj_models::thinking_config_name(self.default_thinking.as_ref())
+                            .to_string(),
+                        speed: aj_models::speed_name(self.speed).to_string(),
+                    },
                 })
                 .await?;
 
@@ -1791,8 +1793,8 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // that reject it.
             sub_agent.set_default_thinking(self.default_thinking.clone());
             // Sub-agents inherit the parent's speed so their own
-            // spawn events (and the settings record persisted off
-            // them) report the speed they actually run at.
+            // spawn events (and the spawn entry persisted off them)
+            // report the speed they actually run at.
             sub_agent.set_speed(self.speed);
             // Share the parent's bus per `docs/aj-next-plan.md`
             // §1.6: every event the sub-agent emits during its

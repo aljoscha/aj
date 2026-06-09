@@ -2913,7 +2913,7 @@ async fn handle_selector_outcome(
                     // thread so a later resume restores this level.
                     let log_note = {
                         let mut log = world.log.lock().await;
-                        log.append_thinking_change(ThreadFilter::USER, None, name)
+                        log.append_thinking_change(ThreadFilter::USER, name)
                             .err()
                             .map(|err| format!("(couldn't record in session log: {err})"))
                     };
@@ -3023,7 +3023,6 @@ async fn handle_selector_outcome(
                                 let mut log = world.log.lock().await;
                                 log.append_model_change(
                                     ThreadFilter::USER,
-                                    None,
                                     &info.provider,
                                     &info.id,
                                 )

@@ -51,22 +51,25 @@
 //!   [`AgentEvent::Notice`] (`Model set to <provider>/<id>.`, etc.),
 //!   but only when at least one `Message` entry precedes the entry
 //!   on the same thread. This renders mid-session switches in
-//!   resumed scrollback while keeping the initial seed entries
-//!   (session creation, sub-agent spawn) silent — they never
-//!   produced a visible notice live either.
+//!   resumed scrollback while keeping seed entries (session
+//!   creation) silent — they never produced a visible notice live
+//!   either.
+//! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
+//!   feeds the sub-agent bracketing below.
 //!
 //! Sub-agent runs are bracketed with synthesized
 //! [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
-//! events. A sub thread leads with its settings entries, so the
-//! start event is deferred until the run's first `Message` entry
-//! (whose user text is the task); the settings values seen up to
-//! that point populate the event's bundle-identity fields, falling
-//! back to empty strings / `"off"` / `"standard"` for legacy logs
-//! that carry no settings entries.
+//! events. A sub thread leads with its `SubAgentSpawn` entry, which
+//! carries the task and the child's settings snapshot, so the start
+//! event is emitted directly from it. Legacy logs whose sub threads
+//! lead with the task user message instead get the start event at
+//! that first `Message` entry, with the task taken from its user
+//! text and default settings (empty provider/model, thinking "off",
+//! speed "standard").
 
 use std::collections::{HashMap, HashSet};
 
-use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::message::AgentMessage;
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::TokenUsage;
@@ -119,13 +122,12 @@ struct ReplayState {
     /// so a single open run is enough to bracket each sub run with
     /// [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`].
     open_sub: Option<usize>,
-    /// Deferred [`AgentEvent::SubAgentStart`] for the open run. A
-    /// sub thread leads with settings entries, so the start event
-    /// (whose task comes from the run's first `Message` entry) is
-    /// accumulated here and emitted when that message arrives — or,
-    /// for a run that ends without any message, when the run closes
-    /// (with an empty task).
-    pending_sub_start: Option<PendingSubStart>,
+    /// Whether the open run's [`AgentEvent::SubAgentStart`] has been
+    /// emitted yet. Set by the run's `SubAgentSpawn` entry or, for
+    /// logs without one, by the legacy fallback at the run's first
+    /// `Message` entry; checked again at run close so a run with
+    /// neither still gets a balanced bracket.
+    open_sub_started: bool,
     /// Concatenated text of the most recent `Sub` assistant message
     /// seen during the open run. After the run's last assistant
     /// message this holds the final report carried on the closing
@@ -138,39 +140,27 @@ struct ReplayState {
     seen_message: HashSet<AgentId>,
 }
 
-/// Accumulator for a deferred [`AgentEvent::SubAgentStart`].
-/// Defaults describe legacy logs whose sub threads carry no
-/// settings entries: empty provider/model, thinking "off", speed
+/// Default settings for a synthesized [`AgentEvent::SubAgentStart`]
+/// when the run carries no [`ConversationEntryKind::SubAgentSpawn`]
+/// entry (legacy logs): empty provider/model, thinking "off", speed
 /// "standard".
-struct PendingSubStart {
-    n: usize,
-    provider: String,
-    model_id: String,
-    thinking: String,
-    speed: String,
+fn fallback_settings() -> AgentSettings {
+    AgentSettings {
+        provider: String::new(),
+        model_id: String::new(),
+        thinking: "off".to_string(),
+        speed: "standard".to_string(),
+    }
 }
 
-impl PendingSubStart {
-    fn new(n: usize) -> Self {
-        Self {
-            n,
-            provider: String::new(),
-            model_id: String::new(),
-            thinking: "off".to_string(),
-            speed: "standard".to_string(),
-        }
-    }
-
-    fn into_event(self, task: String) -> AgentEvent {
-        AgentEvent::SubAgentStart {
-            parent: AgentId::Main,
-            child: AgentId::Sub(self.n),
-            task,
-            provider: self.provider,
-            model_id: self.model_id,
-            thinking: self.thinking,
-            speed: self.speed,
-        }
+/// Build the synthesized [`AgentEvent::SubAgentStart`] for sub-agent
+/// `n`.
+fn sub_start_event(n: usize, task: String, settings: AgentSettings) -> AgentEvent {
+    AgentEvent::SubAgentStart {
+        parent: AgentId::Main,
+        child: AgentId::Sub(n),
+        task,
+        settings,
     }
 }
 
@@ -182,11 +172,12 @@ impl ReplayState {
     /// Transitions are keyed off `agent_id_for`: leaving an open
     /// `Sub(k)` (to `Main` or a different sub) closes it with the
     /// accumulated report. Entering a `Sub(n)` with no run open
-    /// stages a [`PendingSubStart`]; the run's leading settings
-    /// entries fill in its bundle identity, and the start event is
-    /// emitted at the run's first `Message` entry, whose user text
-    /// is the task. `Meta` entries carry no agent id and never
-    /// transition.
+    /// opens one. The run's [`AgentEvent::SubAgentStart`] is emitted
+    /// from its `SubAgentSpawn` entry (task + settings snapshot);
+    /// legacy logs whose sub threads lead with the task user message
+    /// instead emit it at the run's first `Message` entry, with the
+    /// task from its user text and default settings. `Meta` entries
+    /// carry no agent id and never transition.
     fn bracket_subagent(&mut self, entry: &ConversationEntry, out: &mut Vec<AgentEvent>) {
         let Some(current) = agent_id_for(entry) else {
             return;
@@ -203,44 +194,48 @@ impl ReplayState {
         };
         if self.open_sub.is_none() {
             self.open_sub = Some(n);
+            self.open_sub_started = false;
             self.open_sub_report.clear();
-            self.pending_sub_start = Some(PendingSubStart::new(n));
+        }
+        if self.open_sub_started {
+            return;
         }
         match &entry.entry {
-            ConversationEntryKind::ModelChange { provider, model_id } => {
-                if let Some(pending) = &mut self.pending_sub_start {
-                    pending.provider = provider.clone();
-                    pending.model_id = model_id.clone();
-                }
-            }
-            ConversationEntryKind::ThinkingChange { level } => {
-                if let Some(pending) = &mut self.pending_sub_start {
-                    pending.thinking = level.clone();
-                }
-            }
-            ConversationEntryKind::SpeedChange { speed } => {
-                if let Some(pending) = &mut self.pending_sub_start {
-                    pending.speed = speed.clone();
-                }
+            ConversationEntryKind::SubAgentSpawn { task, settings } => {
+                out.push(sub_start_event(n, task.clone(), settings.clone()));
+                self.open_sub_started = true;
             }
             ConversationEntryKind::Message { .. } => {
-                if let Some(pending) = self.pending_sub_start.take() {
-                    out.push(pending.into_event(subagent_task(entry)));
-                }
+                // Legacy fallback: no spawn entry preceded this
+                // message, so the run's first message (the task
+                // user prompt) opens the bracket.
+                out.push(sub_start_event(
+                    n,
+                    subagent_task(entry),
+                    fallback_settings(),
+                ));
+                self.open_sub_started = true;
             }
-            ConversationEntryKind::SystemPrompt { .. } => {}
+            // Settings entries ahead of any message don't open the
+            // bracket; the first `Message` entry does.
+            ConversationEntryKind::ModelChange { .. }
+            | ConversationEntryKind::ThinkingChange { .. }
+            | ConversationEntryKind::SpeedChange { .. }
+            | ConversationEntryKind::SystemPrompt { .. } => {}
         }
     }
 
     /// Close the currently open sub-agent run, if any, emitting its
-    /// [`AgentEvent::SubAgentEnd`] with the accumulated report. A run
-    /// without any `Message` entry still has its start deferred;
-    /// flush it with an empty task so the bracketing stays balanced.
+    /// [`AgentEvent::SubAgentEnd`] with the accumulated report. A
+    /// run that produced neither a `SubAgentSpawn` entry nor a
+    /// `Message` entry has no start yet; emit one with an empty task
+    /// and default settings so the bracketing stays balanced.
     fn close_open_sub(&mut self, out: &mut Vec<AgentEvent>) {
         if let Some(k) = self.open_sub.take() {
-            if let Some(pending) = self.pending_sub_start.take() {
-                out.push(pending.into_event(String::new()));
+            if !self.open_sub_started {
+                out.push(sub_start_event(k, String::new(), fallback_settings()));
             }
+            self.open_sub_started = false;
             out.push(AgentEvent::SubAgentEnd {
                 parent: AgentId::Main,
                 child: AgentId::Sub(k),
@@ -277,6 +272,11 @@ impl ReplayState {
             ConversationEntryKind::SpeedChange { speed } => {
                 self.settings_notice(agent_id, format!("Speed set to {speed}."), out);
             }
+            ConversationEntryKind::SubAgentSpawn { .. } => {
+                // Seed entry: projected as the synthesized
+                // SubAgentStart by `bracket_subagent`, never as a
+                // notice.
+            }
             ConversationEntryKind::Message { message: agent_msg } => {
                 self.seen_message.insert(agent_id);
                 let Some(wire) = agent_msg.as_wire() else {
@@ -308,9 +308,9 @@ impl ReplayState {
 
     /// Emit a [`AgentEvent::Notice`] for a settings entry, but only
     /// when `agent_id`'s thread has already projected a `Message`
-    /// entry — seed entries (session creation, sub-agent spawn)
-    /// precede any message on their thread and stay silent, since
-    /// they never produced a visible notice live either.
+    /// entry — seed entries (session creation) precede any message
+    /// on their thread and stay silent, since they never produced a
+    /// visible notice live either.
     fn settings_notice(&self, agent_id: AgentId, text: String, out: &mut Vec<AgentEvent>) {
         if self.seen_message.contains(&agent_id) {
             out.push(AgentEvent::Notice { agent_id, text });
@@ -504,9 +504,10 @@ fn text_fallback(tool_name: &str, content: &[UserContent]) -> ToolDetails {
     }
 }
 
-/// Extract a sub-agent's task from its first `Message` entry. That
-/// entry is the sub-agent's user prompt, whose concatenated text is
-/// the task; any other shape yields an empty task.
+/// Extract a sub-agent's task from its first `Message` entry, for
+/// legacy logs without a `SubAgentSpawn` entry. That entry is the
+/// sub-agent's user prompt, whose concatenated text is the task; any
+/// other shape yields an empty task.
 fn subagent_task(entry: &ConversationEntry) -> String {
     let ConversationEntryKind::Message { message } = &entry.entry else {
         return String::new();
@@ -1187,16 +1188,11 @@ mod tests {
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
-        log.append_model_change(
-            crate::log::ThreadFilter::USER,
-            None,
-            "anthropic",
-            "claude-x",
-        )
-        .expect("mc");
-        log.append_thinking_change(crate::log::ThreadFilter::USER, None, "high")
+        log.append_model_change(crate::log::ThreadFilter::USER, "anthropic", "claude-x")
+            .expect("mc");
+        log.append_thinking_change(crate::log::ThreadFilter::USER, "high")
             .expect("tc");
-        log.append_speed_change(crate::log::ThreadFilter::USER, None, "fast")
+        log.append_speed_change(crate::log::ThreadFilter::USER, "fast")
             .expect("sc");
         {
             let head = log.latest_leaf(crate::log::ThreadFilter::USER);
@@ -1225,11 +1221,11 @@ mod tests {
             let mut view = ConversationView::user(&mut log, None);
             view.add_message(user_msg("hi")).expect("u");
         }
-        log.append_model_change(crate::log::ThreadFilter::USER, None, "openai", "gpt-x")
+        log.append_model_change(crate::log::ThreadFilter::USER, "openai", "gpt-x")
             .expect("mc");
-        log.append_thinking_change(crate::log::ThreadFilter::USER, None, "medium")
+        log.append_thinking_change(crate::log::ThreadFilter::USER, "medium")
             .expect("tc");
-        log.append_speed_change(crate::log::ThreadFilter::USER, None, "fast")
+        log.append_speed_change(crate::log::ThreadFilter::USER, "fast")
             .expect("sc");
 
         let events: Vec<AgentEvent> = replay(&log).collect();
@@ -1253,12 +1249,12 @@ mod tests {
         );
     }
 
-    /// A sub-agent run that leads with settings entries still
-    /// extracts the task from its first message, brackets the run
-    /// correctly, keeps the seed entries silent, and carries the
-    /// recorded settings on the synthesized SubAgentStart.
+    /// A sub-agent run led by its `SubAgentSpawn` entry emits a
+    /// SubAgentStart carrying the recorded task and settings before
+    /// the first sub message, and stays silent (no notice) for the
+    /// spawn entry itself.
     #[test]
-    fn replay_subagent_with_leading_settings_entries() {
+    fn replay_subagent_spawn_entry_drives_sub_agent_start() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -1275,11 +1271,106 @@ mod tests {
             view.head().cloned().expect("head present")
         };
 
+        let settings = AgentSettings {
+            provider: "anthropic".into(),
+            model_id: "claude-x".into(),
+            thinking: "high".into(),
+            speed: "fast".into(),
+        };
+        log.append_subagent_spawn(1, user_head, "subtask", &settings)
+            .expect("spawn entry");
+        {
+            let sub_head = log
+                .latest_leaf(crate::log::ThreadFilter::subagent(1))
+                .expect("sub leaf");
+            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "reply".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { .. })),
+            "the spawn entry must not render a notice, got {events:#?}"
+        );
+
+        let start_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
+            .expect("SubAgentStart present");
+        match &events[start_idx] {
+            AgentEvent::SubAgentStart {
+                child,
+                task,
+                settings: s,
+                ..
+            } => {
+                assert_eq!(*child, AgentId::Sub(1));
+                assert_eq!(task, "subtask");
+                assert_eq!(*s, settings);
+            }
+            other => panic!("expected SubAgentStart, got {other:?}"),
+        }
+        // The start precedes every projected Sub(1) event.
+        let first_sub = events
+            .iter()
+            .position(|e| matches!(e.agent_id(), AgentId::Sub(1)))
+            .expect("Sub(1) events present");
+        assert!(start_idx < first_sub);
+        match events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubAgentEnd { .. }))
+            .expect("SubAgentEnd present")
+        {
+            AgentEvent::SubAgentEnd { report, .. } => assert_eq!(report, "reply"),
+            _ => unreachable!(),
+        }
+    }
+
+    /// A sub-agent run led by loose settings entries (no
+    /// `SubAgentSpawn`) still brackets sanely via the legacy path:
+    /// the seed entries stay silent, the start opens at the run's
+    /// first message with default settings, and the end carries the
+    /// report.
+    #[test]
+    fn replay_subagent_with_leading_settings_entries_brackets_via_legacy_path() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head present")
+        };
+
+        // Seed the sub thread with a settings triple via raw
+        // appends, then the task message and a reply.
+        log.append(
+            Some(user_head),
+            crate::log::ThreadKind::Subagent,
+            Some(1),
+            ConversationEntryKind::ModelChange {
+                provider: "anthropic".into(),
+                model_id: "claude-x".into(),
+            },
+        )
+        .expect("mc");
         let sub = crate::log::ThreadFilter::subagent(1);
-        log.append_model_change(sub, Some(user_head), "anthropic", "claude-x")
-            .expect("mc");
-        log.append_thinking_change(sub, None, "high").expect("tc");
-        log.append_speed_change(sub, None, "fast").expect("sc");
+        log.append_thinking_change(sub, "high").expect("tc");
+        log.append_speed_change(sub, "fast").expect("sc");
         {
             let sub_head = log.latest_leaf(sub).expect("sub leaf");
             let mut view = ConversationView::subagent(&mut log, sub_head, 1);
@@ -1307,18 +1398,12 @@ mod tests {
             AgentEvent::SubAgentStart {
                 child,
                 task,
-                provider,
-                model_id,
-                thinking,
-                speed,
+                settings,
                 ..
             } => {
                 assert_eq!(*child, AgentId::Sub(1));
                 assert_eq!(task, "subtask");
-                assert_eq!(provider, "anthropic");
-                assert_eq!(model_id, "claude-x");
-                assert_eq!(thinking, "high");
-                assert_eq!(speed, "fast");
+                assert_eq!(*settings, super::fallback_settings());
             }
             other => panic!("expected SubAgentStart, got {other:?}"),
         }
@@ -1338,9 +1423,9 @@ mod tests {
         }
     }
 
-    /// Legacy logs with no sub-thread settings entries still
-    /// bracket sub runs; the synthesized SubAgentStart falls back
-    /// to empty / "off" / "standard".
+    /// Legacy logs whose sub threads lead with the task user
+    /// message still bracket sub runs; the synthesized
+    /// SubAgentStart falls back to empty / "off" / "standard".
     #[test]
     fn replay_subagent_legacy_log_uses_fallback_settings() {
         let dir = fresh_sessions_dir();
@@ -1364,19 +1449,9 @@ mod tests {
             .find(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
             .expect("SubAgentStart present")
         {
-            AgentEvent::SubAgentStart {
-                task,
-                provider,
-                model_id,
-                thinking,
-                speed,
-                ..
-            } => {
+            AgentEvent::SubAgentStart { task, settings, .. } => {
                 assert_eq!(task, "subtask");
-                assert_eq!(provider, "");
-                assert_eq!(model_id, "");
-                assert_eq!(thinking, "off");
-                assert_eq!(speed, "standard");
+                assert_eq!(*settings, super::fallback_settings());
             }
             _ => unreachable!(),
         }
