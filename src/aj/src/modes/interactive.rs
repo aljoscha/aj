@@ -22,15 +22,15 @@ pub mod footer_data;
 pub mod keys;
 pub mod layout;
 pub mod render_settings;
+pub mod session;
 pub mod shutdown;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::modes::interactive::components::chat_view::ChatView;
-use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
 use aj_models::ThinkingConfig;
@@ -38,11 +38,7 @@ use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, ModelRegistry};
 use aj_models::types::{Speed, StreamOptions};
-use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
-    repair_interrupted_tool_uses, replay,
-};
-use aj_tools::{BuiltinToolOptions, get_builtin_tools};
+use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_tui::EditorComponent;
 use aj_tui::components::editor::Editor;
 use aj_tui::terminal::ProcessTerminal;
@@ -53,14 +49,12 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command};
 use crate::config::slash_commands::{
     SlashAction, dispatch as slash_dispatch, load_model_catalog, thinking_level_name,
 };
 use crate::config::theme::{
-    Theme, ThemeHandle, chat_theme, editor_border_color_for_thinking, select_list_theme,
-    watch_user_theme,
+    Theme, ThemeHandle, editor_border_color_for_thinking, select_list_theme, watch_user_theme,
 };
 use crate::model::{ResolvedModel, from_model_info};
 use crate::modes::interactive::components::agent_picker::{
@@ -74,7 +68,6 @@ use crate::modes::interactive::components::auth_status::{
 };
 use crate::modes::interactive::components::command_palette::CommandPaletteOutcomeHandle;
 use crate::modes::interactive::components::footer::Footer;
-use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::login_dialog::{
     LoginDialogComponent, LoginDialogState, LoginLine, TuiOAuthCallbacks,
 };
@@ -98,8 +91,9 @@ use crate::modes::interactive::event_pump::{
 };
 use crate::modes::interactive::layout::{SlotIndex, build_layout};
 use crate::modes::interactive::render_settings::RenderSettings;
+use crate::modes::interactive::session::{SessionEntry, SessionSpec, SessionWorld};
 use crate::modes::interactive::shutdown::{
-    build_usage_summary, print_resume_hint, print_usage_summary,
+    print_resume_hint, print_session_usage, print_usage_summary,
 };
 
 /// Loop-side snapshot of the agent's run configuration.
@@ -119,7 +113,7 @@ use crate::modes::interactive::shutdown::{
 /// in the footer — immediately, but only takes effect on the *next*
 /// turn: the in-flight turn keeps the config it captured when it
 /// started.
-struct RunConfigSnapshot {
+pub(crate) struct RunConfigSnapshot {
     /// Provider handle the next turn streams against.
     provider: Arc<dyn Provider>,
     /// Registry (or scripted) metadata for `provider`'s model.
@@ -135,51 +129,42 @@ struct RunConfigSnapshot {
     model_key: (String, String),
 }
 
-/// Construct the interactive agent and the loop-side run-config
-/// snapshot from a resolved provider bundle.
+/// Construct the loop-side run-config snapshot from a resolved
+/// provider bundle.
 ///
-/// The snapshot's `thinking` is read back from the constructed agent
-/// (rather than copied from `config`) so it reflects the config-level
-/// mapping `Agent::with_provider` applies (e.g. `Off` -> `None`).
-fn build_agent_and_run_config(
+/// The snapshot lives for the whole process and is the source of
+/// truth both for the next turn's configuration and for the agents
+/// built per session world (see [`session::SessionWorld::build`]).
+fn build_run_config(
     config: &Config,
     provider: Arc<dyn Provider>,
     model_info: Arc<ModelInfo>,
     mut stream_options: StreamOptions,
     model_key: (String, String),
-) -> (Agent, RunConfigSnapshot) {
-    let mut tools = get_builtin_tools(&BuiltinToolOptions {
-        image_auto_resize: config.image_auto_resize,
-    });
-    if !config.disabled_tools.is_empty() {
-        tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
-    }
-    let env = AgentEnv::new();
+) -> RunConfigSnapshot {
     crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
-    // Clone the run config into the loop-side snapshot before the
-    // agent takes ownership.
-    let snapshot_provider = Arc::clone(&provider);
-    let snapshot_model_info = Arc::clone(&model_info);
-    let snapshot_stream_options = stream_options.clone();
-    let mut agent = Agent::with_provider(
-        env,
-        SYSTEM_PROMPT,
-        tools,
-        config.disabled_tools.clone(),
+    RunConfigSnapshot {
         provider,
         model_info,
         stream_options,
-        config.thinking,
-    );
-    agent.set_block_images(config.image_block);
-    let run_config = RunConfigSnapshot {
-        provider: snapshot_provider,
-        model_info: snapshot_model_info,
-        stream_options: snapshot_stream_options,
-        thinking: agent.default_thinking(),
+        thinking: default_thinking_from_config(config.thinking),
         model_key,
-    };
-    (agent, run_config)
+    }
+}
+
+/// Map a persisted `config.toml` thinking level onto the wire-level
+/// default. Mirrors the mapping `Agent::with_provider` applies
+/// (`Off` collapses to `None`); [`config_thinking_level`] is the
+/// exact inverse.
+fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Option<ThinkingConfig> {
+    level.and_then(|level| match level {
+        ConfigThinkingLevel::Off => None,
+        ConfigThinkingLevel::Low => Some(ThinkingConfig::Low),
+        ConfigThinkingLevel::Medium => Some(ThinkingConfig::Medium),
+        ConfigThinkingLevel::High => Some(ThinkingConfig::High),
+        ConfigThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
+        ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
+    })
 }
 
 /// User-facing notice shown when a session-changing command
@@ -259,7 +244,7 @@ impl InteractiveMode {
         // without a restart.
         let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
-        let (mut agent, run_config) = if let Some(name) = &self.args.scripted {
+        let run_config = if let Some(name) = &self.args.scripted {
             let crate::scripted::ResolvedScriptedModel {
                 provider,
                 model_info,
@@ -271,7 +256,7 @@ impl InteractiveMode {
                 .or_else(|| config.model_api.clone())
                 .unwrap_or_else(|| crate::model::DEFAULT_PROVIDER_ID.to_string());
             let current_id = model_info.id.clone();
-            build_agent_and_run_config(
+            build_run_config(
                 &config,
                 provider,
                 model_info,
@@ -309,7 +294,7 @@ impl InteractiveMode {
                 stream_options,
             } = resolved;
             let model_key = (model_info.provider.clone(), model_info.id.clone());
-            build_agent_and_run_config(&config, provider, model_info, stream_options, model_key)
+            build_run_config(&config, provider, model_info, stream_options, model_key)
         };
         let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
@@ -351,73 +336,38 @@ impl InteractiveMode {
         let model_catalog = load_model_catalog();
 
         // ---- Conversation log: resume or create -----------------------
+        // `aj continue` with neither an explicit id nor a latest
+        // session on disk degrades to a fresh session; that
+        // resolution happens here, before the spec is built.
         let sessions_dir = Config::get_sessions_dir_path()?;
         let conversation_persistence = ConversationPersistence::new(sessions_dir);
-        let resuming = matches!(self.args.command, Some(Command::Continue { .. }));
-        let mut log = match self.args.command {
+        let spec = match self.args.command {
             Some(Command::Continue {
                 session_id: Some(id),
                 prompt: _,
-            }) => ConversationLog::resume(&conversation_persistence, &id)?,
+            }) => SessionSpec::Resume {
+                session_id: id,
+                entry: SessionEntry::Startup,
+            },
             Some(Command::Continue {
                 session_id: None,
                 prompt: _,
             }) => match conversation_persistence.get_latest_session_id()? {
-                Some(latest) => ConversationLog::resume(&conversation_persistence, &latest)?,
+                Some(latest) => SessionSpec::Resume {
+                    session_id: latest,
+                    entry: SessionEntry::Startup,
+                },
                 None => {
                     eprintln!("No latest conversation to resume; starting a fresh session.");
-                    ConversationLog::create(&conversation_persistence)?
+                    SessionSpec::Create {
+                        entry: SessionEntry::Startup,
+                    }
                 }
             },
-            _ => ConversationLog::create(&conversation_persistence)?,
+            _ => SessionSpec::Create {
+                entry: SessionEntry::Startup,
+            },
         };
-
-        // (The agent was built above alongside the model resolution
-        // step so the legacy / registry split could pick its own
-        // tool list and env. Nothing else to do here.)
-
-        // Resolve system prompt: reuse a persisted one (cache-warm
-        // resume) or assemble fresh from the env. On a fresh log,
-        // freeze the assembled prompt as the root entry.
-        let system_prompt = if let Some(persisted) = log.system_prompt() {
-            persisted.to_string()
-        } else {
-            let assembled = agent.assemble_system_prompt();
-            if log.is_empty() {
-                log.set_system_prompt(assembled.clone())?;
-            }
-            assembled
-        };
-        agent.set_assembled_system_prompt(system_prompt);
-
-        // Seed the sub-agent counter so freshly-minted ids in this
-        // session don't collide with persisted sub-agent subtrees.
-        if let Some(max_id) = log.max_agent_id() {
-            agent.seed_sub_agent_counter(max_id);
-        }
-
-        // ---- Bus subscriptions: channel forwarder + persistence ------
-        // The channel forwarder feeds the event pump in the main
-        // loop; subscribing on `&self` doesn't disturb the agent's
-        // mutability so we can still call `seed_messages` below.
-        let (_event_handle, mut event_rx) = agent.subscribe_channel();
-
-        // Replay persisted history through the event pump *before*
-        // wrapping the log in an Arc<Mutex>; the binary writes a
-        // few synchronous repair-tool-use entries during this phase
-        // and we keep exclusive access to the log until that's done.
-        if let Some(head) = log.latest_leaf(ThreadFilter::USER) {
-            let conversation = log.linearize(&head, ThreadFilter::USER);
-            repair_interrupted_tool_uses(&mut log, &conversation)?;
-            // Re-linearize after repair to capture any synthesized
-            // tool_result message.
-            let head = log
-                .latest_leaf(ThreadFilter::USER)
-                .expect("post-repair head exists when pre-repair head did");
-            let conversation = log.linearize(&head, ThreadFilter::USER);
-            let messages: Vec<_> = conversation.agent_messages();
-            agent.seed_messages(messages);
-        }
 
         // ---- Theme ----------------------------------------------------
         // Loaded once at startup from `config.theme` (default `light`).
@@ -440,27 +390,52 @@ impl InteractiveMode {
             None => (None, None),
         };
 
+        // ---- First session world --------------------------------------
+        // One shared render-settings handle for the whole process:
+        // each session's pump gets a clone, so `alt+t` / `alt+o`
+        // toggles survive `/new` and `/resume`.
+        let render_settings = RenderSettings::new(
+            config.hide_thinking_block,
+            false,
+            config.image_show_in_terminal,
+        );
+        let mut world = SessionWorld::build(
+            &config,
+            &run_config,
+            &render_settings,
+            &theme,
+            &conversation_persistence,
+            &spec,
+        )?;
+
         // ---- Build the TUI --------------------------------------------
         let mut tui = Tui::new(Box::new(ProcessTerminal::new()));
         tui.start()
             .map_err(|e| anyhow::anyhow!("failed to start terminal: {e}"))?;
         build_layout(&mut tui, &theme);
 
-        // Tint the editor border to match the agent's initial
-        // thinking level so the user sees the active reasoning mode
-        // at a glance the moment the TUI comes up. Updates flow
-        // through the same helper on every `/thinking` change.
-        apply_editor_border_for_thinking(&mut tui, &theme, agent.default_thinking().as_ref());
+        // Tint the editor border to match the initial thinking level
+        // so the user sees the active reasoning mode at a glance the
+        // moment the TUI comes up. Updates flow through the same
+        // helper on every `/thinking` change.
+        let startup_thinking = {
+            let cfg = run_config.lock().expect("run config mutex poisoned");
+            cfg.thinking.clone()
+        };
+        apply_editor_border_for_thinking(&mut tui, &theme, startup_thinking.as_ref());
 
         // Install the path/symbol autocomplete provider on the
         // editor. The `@filename` fuzzy file picker and direct
         // path completion live here; slash commands no longer have
         // an inline popup (typing `/` at the empty prompt opens
         // the command palette overlay instead).
+        let working_directory = {
+            let a = world.agent.lock().await;
+            a.env().working_directory.clone()
+        };
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
-            let provider = aj_tui::autocomplete::CombinedAutocompleteProvider::new(
-                agent.env().working_directory.clone(),
-            );
+            let provider =
+                aj_tui::autocomplete::CombinedAutocompleteProvider::new(working_directory);
             editor.set_autocomplete_provider(Arc::new(provider));
         }
 
@@ -514,47 +489,25 @@ impl InteractiveMode {
             }
         }
 
-        // Header: session id + resume/start banner. Footer: model +
-        // working directory (initial snapshot; richer state lands
-        // alongside `footer_data` in a follow-up).
-        if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
-            header.set_session_id(Some(log.session_id().to_string()));
-            header.set_notice(Some(if resuming {
-                "Resuming conversation".to_string()
-            } else {
-                "Chat with AJ — Ctrl+C to quit".to_string()
-            }));
-        }
+        // Footer: model + working directory (initial snapshot;
+        // richer state lands alongside `footer_data` in a
+        // follow-up). The header's session id + banner are set by
+        // `SessionWorld::install` below.
+        let (footer_model, footer_cwd) = {
+            let a = world.agent.lock().await;
+            (
+                format_footer_model(&a.model_info().id, &a.default_thinking()),
+                format!("{}", a.env().working_directory.display()),
+            )
+        };
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
-            let info = agent.model_info();
-            footer.set_model(Some(format_footer_model(
-                &info.id,
-                &agent.default_thinking(),
-            )));
-            footer.set_cwd(Some(format!("{}", agent.env().working_directory.display())));
+            footer.set_model(Some(footer_model));
+            footer.set_cwd(Some(footer_cwd));
         }
 
-        // Drive replay events through the pump (post-layout so the
-        // chat container has a slot to receive them). Replay never
-        // hits the bus, so persistence isn't double-written.
-        let context_window = agent.model_info().context_window;
-        // One shared handle for the whole process: each session's pump
-        // gets a clone, so `alt+t` / `alt+o` toggles survive `/new` and
-        // `/resume`.
-        let render_settings = RenderSettings::new(
-            config.hide_thinking_block,
-            false,
-            config.image_show_in_terminal,
-        );
-        let mut pump = EventPump::new(chat_theme(&theme), render_settings.clone(), context_window);
-        // Push the initial `?/<window>` so the indicator is
-        // visible before any turn lands. Replay (next) may
-        // overwrite the numerator with the last persisted turn's
-        // prompt size; the denominator stays as set here.
-        pump.sync_footer(&mut tui);
-        for event in replay(&log) {
-            pump.handle(&mut tui, &event);
-        }
+        // Bind the world to the TUI: chat reset, replay of any
+        // resumed history, header session id + banner.
+        world.install(&mut tui, &spec).await;
 
         // Startup notices: surface config-load diagnostics (parse
         // errors, unknown keys) first so a user with a broken
@@ -574,35 +527,20 @@ impl InteractiveMode {
                 Severity::Warning => warning_event(&text),
                 Severity::Error => error_event(&text),
             };
-            pump.handle(&mut tui, &event);
+            world.pump.handle(&mut tui, &event);
         }
-        pump.handle(&mut tui, &notice_event(&build_context_notice(agent.env())));
+        let context_notice = {
+            let a = world.agent.lock().await;
+            build_context_notice(a.env())
+        };
+        world.pump.handle(&mut tui, &notice_event(&context_notice));
         if sandbox_warning_enabled() {
-            pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
+            world.pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
         }
         if let Some(warning) = &startup_auth_warning {
-            pump.handle(&mut tui, &warning_event(warning));
+            world.pump.handle(&mut tui, &warning_event(warning));
         }
 
-        // ---- Wrap log + agent in shared handles -----------------------
-        // After replay we hand the log to the persistence listener
-        // and to any future code path that wants to read the session
-        // id back. Both `log` and `persistence_handle` are bound
-        // mutably so the `/resume` selector can swap them out for
-        // the resumed session without restarting the binary.
-        // The agent goes behind a TokioMutex because the
-        // submit-handler spawns a task that holds it across an
-        // `agent.prompt(...).await`.
-        let mut log = Arc::new(TokioMutex::new(log));
-        // Shared sub-agent registry, injected once onto the main
-        // agent. The `Arc<TokioMutex<Agent>>` is never swapped
-        // (session changes reseed the agent in place), so this single
-        // injection survives `/resume` and `/new`. Kept in scope for
-        // the whole `run` body: the submit handler resolves turn
-        // targets through it.
-        let registry = SubAgentRegistry::default();
-        agent.set_sub_agent_registry(registry.clone());
-        let agent = Arc::new(TokioMutex::new(agent));
         // Shared, mutable view of the on-disk config. Selector
         // outcomes (model / thinking, and future settings popups)
         // mutate this and persist it via `persist_config` so a choice
@@ -611,10 +549,9 @@ impl InteractiveMode {
         // (`Config::persist_changed`) done off the guard, never awaited
         // across.
         let config = Arc::new(std::sync::Mutex::new(config));
-        let mut persistence_handle: SubscriptionHandle = {
-            let a = agent.lock().await;
-            a.subscribe(persistence_listener(Arc::clone(&log)))
-        };
+        // Usage snapshots of session worlds torn down by `/new` /
+        // `/resume`, in order, for the per-session shutdown banner.
+        let mut completed_sessions: Vec<(String, UsageSummary)> = Vec::new();
 
         // ---- Main event loop ------------------------------------------
         // In-flight turns keyed by the agent running them. `JoinSet`
@@ -656,7 +593,7 @@ impl InteractiveMode {
                     match joined {
                         Ok((id, result)) => {
                             turn_cancels.remove(&id);
-                            pump.mark_idle(&mut tui, id);
+                            world.pump.mark_idle(&mut tui, id);
                             // Main-turn completion bounds every nested
                             // initial spawn it started. Drain any sub
                             // still marked running that the binary is NOT
@@ -665,15 +602,15 @@ impl InteractiveMode {
                             // footer/spinner. Independent continuations
                             // are in turn_cancels and survive.
                             if id == AgentId::Main {
-                                for sub in pump.running_agents() {
+                                for sub in world.pump.running_agents() {
                                     if matches!(sub, AgentId::Sub(_))
                                         && !turn_cancels.contains_key(&sub)
                                     {
-                                        pump.mark_idle(&mut tui, sub);
+                                        world.pump.mark_idle(&mut tui, sub);
                                     }
                                 }
                             }
-                            sync_editor_enabled(&mut tui, &pump, &turn_cancels);
+                            sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
                             match result {
                                 Ok(()) => {}
                                 Err(TurnError::Aborted) => {
@@ -685,7 +622,7 @@ impl InteractiveMode {
                                     // so the user has visible confirmation
                                     // that Ctrl+C took effect; the session
                                     // stays alive.
-                                    pump.handle(&mut tui, &notice_event("Turn cancelled."));
+                                    world.pump.handle(&mut tui, &notice_event("Turn cancelled."));
                                 }
                                 Err(TurnError::Recoverable(err)) => {
                                     // Surface to the user; the chat
@@ -693,7 +630,7 @@ impl InteractiveMode {
                                     // session going. The agent's own bus
                                     // already wrote whatever partial
                                     // assistant message it produced.
-                                    pump.handle(
+                                    world.pump.handle(
                                         &mut tui,
                                         &AgentEvent::Error {
                                             agent_id: id,
@@ -732,13 +669,13 @@ impl InteractiveMode {
                         let name = session.provider_name;
                         match login_outcome {
                             Ok(Ok(())) => {
-                                pump.handle(
+                                world.pump.handle(
                                     &mut tui,
                                     &notice_event(&format!("Logged in to {name}.")),
                                 );
                             }
                             Ok(Err(err)) => {
-                                pump.handle(
+                                world.pump.handle(
                                     &mut tui,
                                     &warning_event(&format!("Login to {name} failed: {err}")),
                                 );
@@ -747,7 +684,7 @@ impl InteractiveMode {
                             // arm already surfaced a "cancelled" notice.
                             Err(join_err) if join_err.is_cancelled() => {}
                             Err(join_err) => {
-                                pump.handle(
+                                world.pump.handle(
                                     &mut tui,
                                     &warning_event(&format!("Login task error: {join_err}")),
                                 );
@@ -828,13 +765,13 @@ impl InteractiveMode {
                                     continue;
                                 } else {
                                     // Per-view Ctrl+C (spec §4.5): act on the agent you're viewing.
-                                    let active = pump.active_view(&mut tui);
+                                    let active = world.pump.active_view(&mut tui);
                                     if let Some(token) = turn_cancels.get(&active) {
                                         // Viewed agent has a binary-driven turn: cancel just it.
                                         token.cancel();
                                         quit_armed = false;
                                         continue;
-                                    } else if pump.is_running(active) {
+                                    } else if world.pump.is_running(active) {
                                         // Viewed agent is a sub running its initial spawn, owned by
                                         // the main turn: cancel the main turn (the child token
                                         // cascades to the sub).
@@ -851,7 +788,7 @@ impl InteractiveMode {
                                         }
                                         quit_armed = true;
                                         let n = turns.len();
-                                        pump.handle(&mut tui, &notice_event(&format!(
+                                        world.pump.handle(&mut tui, &notice_event(&format!(
                                             "{n} agent{} still running — press Ctrl+C again to quit",
                                             if n == 1 { "" } else { "s" },
                                         )));
@@ -877,8 +814,8 @@ impl InteractiveMode {
                                     crate::config::keybindings::ACTION_THINKING_TOGGLE,
                                 ) {
                                     drop(kb);
-                                    let new_value = !pump.hide_thinking_block();
-                                    pump.set_hide_thinking_block(&mut tui, new_value);
+                                    let new_value = !world.pump.hide_thinking_block();
+                                    world.pump.set_hide_thinking_block(&mut tui, new_value);
                                     // Don't post a "hidden/visible"
                                     // notice — the transcript above
                                     // already shows the new state.
@@ -897,8 +834,8 @@ impl InteractiveMode {
                                     crate::config::keybindings::ACTION_TOOLS_EXPAND,
                                 ) {
                                     drop(kb);
-                                    let new_value = !pump.tools_expanded();
-                                    pump.set_tools_expanded(&mut tui, new_value);
+                                    let new_value = !world.pump.tools_expanded();
+                                    world.pump.set_tools_expanded(&mut tui, new_value);
                                     continue;
                                 }
                             }
@@ -1050,7 +987,7 @@ impl InteractiveMode {
                                 }
                                 let name = session.provider_name.clone();
                                 login_session = None;
-                                pump.handle(
+                                world.pump.handle(
                                     &mut tui,
                                     &notice_event(&format!("Login to {name} cancelled.")),
                                 );
@@ -1073,12 +1010,11 @@ impl InteractiveMode {
                                 match handle_slash_command(
                                     &mut tui,
                                     &auth,
-                                    Arc::clone(&agent),
                                     Arc::clone(&model_catalog),
                                     Arc::clone(&run_config),
-                                    &mut log,
-                                    &mut persistence_handle,
-                                    &mut pump,
+                                    Arc::clone(&config),
+                                    &mut world,
+                                    &mut completed_sessions,
                                     &render_settings,
                                     &conversation_persistence,
                                     &theme,
@@ -1088,7 +1024,7 @@ impl InteractiveMode {
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
-                                            pump.handle(&mut tui, &notice_event(&text));
+                                            world.pump.handle(&mut tui, &notice_event(&text));
                                         }
                                         if let Some(sel) = selector {
                                             open_selector = Some(sel);
@@ -1113,12 +1049,11 @@ impl InteractiveMode {
                                 match handle_slash_command(
                                     &mut tui,
                                     &auth,
-                                    Arc::clone(&agent),
                                     Arc::clone(&model_catalog),
                                     Arc::clone(&run_config),
-                                    &mut log,
-                                    &mut persistence_handle,
-                                    &mut pump,
+                                    Arc::clone(&config),
+                                    &mut world,
+                                    &mut completed_sessions,
                                     &render_settings,
                                     &conversation_persistence,
                                     &theme,
@@ -1128,7 +1063,7 @@ impl InteractiveMode {
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
-                                            pump.handle(&mut tui, &notice_event(&text));
+                                            world.pump.handle(&mut tui, &notice_event(&text));
                                         }
                                         if let Some(sel) = selector {
                                             open_selector = Some(sel);
@@ -1153,12 +1088,11 @@ impl InteractiveMode {
                                 match handle_slash_command(
                                     &mut tui,
                                     &auth,
-                                    Arc::clone(&agent),
                                     Arc::clone(&model_catalog),
                                     Arc::clone(&run_config),
-                                    &mut log,
-                                    &mut persistence_handle,
-                                    &mut pump,
+                                    Arc::clone(&config),
+                                    &mut world,
+                                    &mut completed_sessions,
                                     &render_settings,
                                     &conversation_persistence,
                                     &theme,
@@ -1168,7 +1102,7 @@ impl InteractiveMode {
                                 ).await {
                                     SlashHandled::Continue { selector, notice } => {
                                         if let Some(text) = notice {
-                                            pump.handle(&mut tui, &notice_event(&text));
+                                            world.pump.handle(&mut tui, &notice_event(&text));
                                         }
                                         if let Some(sel) = selector {
                                             open_selector = Some(sel);
@@ -1187,12 +1121,10 @@ impl InteractiveMode {
                                     &mut tui,
                                     sel,
                                     &auth,
-                                    Arc::clone(&agent),
                                     Arc::clone(&run_config),
                                     Arc::clone(&config),
-                                    &mut log,
-                                    &mut persistence_handle,
-                                    &mut pump,
+                                    &mut world,
+                                    &mut completed_sessions,
                                     &render_settings,
                                     &conversation_persistence,
                                     &theme,
@@ -1202,7 +1134,7 @@ impl InteractiveMode {
                                     }
                                     SelectorPollOutcome::Closed { notice, follow_up, start_login } => {
                                         if let Some(text) = notice {
-                                            pump.handle(&mut tui, &notice_event(&text));
+                                            world.pump.handle(&mut tui, &notice_event(&text));
                                         }
                                         // A confirmed `/login` provider
                                         // pick asks the host to launch
@@ -1223,7 +1155,7 @@ impl InteractiveMode {
                                                     login_session = Some(session);
                                                     login_task = Some(task);
                                                 }
-                                                Err(err) => pump.handle(
+                                                Err(err) => world.pump.handle(
                                                     &mut tui,
                                                     &warning_event(&format!(
                                                         "Couldn't start login: {err}"
@@ -1241,12 +1173,11 @@ impl InteractiveMode {
                                             match handle_slash_command(
                                                 &mut tui,
                                                 &auth,
-                                                Arc::clone(&agent),
                                                 Arc::clone(&model_catalog),
                                                 Arc::clone(&run_config),
-                                                &mut log,
-                                                &mut persistence_handle,
-                                                &mut pump,
+                                                Arc::clone(&config),
+                                                &mut world,
+                                                &mut completed_sessions,
                                                 &render_settings,
                                                 &conversation_persistence,
                                                 &theme,
@@ -1258,7 +1189,7 @@ impl InteractiveMode {
                                             {
                                                 SlashHandled::Continue { selector, notice } => {
                                                     if let Some(text) = notice {
-                                                        pump.handle(&mut tui, &notice_event(&text));
+                                                        world.pump.handle(&mut tui, &notice_event(&text));
                                                     }
                                                     if let Some(sel) = selector {
                                                         open_selector = Some(sel);
@@ -1269,7 +1200,7 @@ impl InteractiveMode {
                                         }
                                     }
                                 }
-                                sync_editor_enabled(&mut tui, &pump, &turn_cancels);
+                                sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
                                 continue;
                             }
 
@@ -1303,12 +1234,11 @@ impl InteractiveMode {
                                     match handle_slash_command(
                                         &mut tui,
                                         &auth,
-                                        Arc::clone(&agent),
                                         Arc::clone(&model_catalog),
                                         Arc::clone(&run_config),
-                                        &mut log,
-                                        &mut persistence_handle,
-                                        &mut pump,
+                                        Arc::clone(&config),
+                                        &mut world,
+                                        &mut completed_sessions,
                                         &render_settings,
                                         &conversation_persistence,
                                         &theme,
@@ -1318,7 +1248,7 @@ impl InteractiveMode {
                                     ).await {
                                         SlashHandled::Continue { selector, notice } => {
                                             if let Some(text) = notice {
-                                                pump.handle(&mut tui, &notice_event(&text));
+                                                world.pump.handle(&mut tui, &notice_event(&text));
                                             }
                                             if let Some(sel) = selector {
                                                 open_selector = Some(sel);
@@ -1329,20 +1259,20 @@ impl InteractiveMode {
                                     continue;
                                 }
 
-                                let target = pump.active_view(&mut tui);
+                                let target = world.pump.active_view(&mut tui);
 
                                 // Per-agent single-turn gate: ignore the submit if the viewed
                                 // agent is already busy (a binary-driven turn or a nested
                                 // initial spawn). Mirrors `sync_editor_enabled`.
-                                if turn_cancels.contains_key(&target) || pump.is_running(target) {
+                                if turn_cancels.contains_key(&target) || world.pump.is_running(target) {
                                     continue;
                                 }
 
                                 // Resolve before touching editor state, so a non-promptable
                                 // target (a resumed sub-agent with no live handle) leaves the
                                 // editor as-is and just surfaces a notice.
-                                let Some(handle) = resolve_agent(target, &agent, &registry) else {
-                                    pump.handle(&mut tui, &notice_event("This agent can't be prompted."));
+                                let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+                                    world.pump.handle(&mut tui, &notice_event("This agent can't be prompted."));
                                     continue;
                                 };
 
@@ -1389,17 +1319,17 @@ impl InteractiveMode {
                                     (target, result)
                                 });
                                 // The viewed agent is now busy; reflect it in the editor.
-                                sync_editor_enabled(&mut tui, &pump, &turn_cancels);
+                                sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
                             }
                         }
                     }
                 }
 
                 // --- Agent bus event ---
-                maybe_evt = recv_event(&mut event_rx) => {
+                maybe_evt = recv_event(&mut world.event_rx) => {
                     let Some(event) = maybe_evt else { continue };
-                    pump.handle(&mut tui, &event);
-                    sync_editor_enabled(&mut tui, &pump, &turn_cancels);
+                    world.pump.handle(&mut tui, &event);
+                    sync_editor_enabled(&mut tui, &world.pump, &turn_cancels);
                 }
 
                 // --- Theme reload (fs-watcher) ---
@@ -1421,7 +1351,7 @@ impl InteractiveMode {
                     // paints with the new palette automatically.
                     tui.invalidate();
                     tui.request_render();
-                    pump.handle(
+                    world.pump.handle(
                         &mut tui,
                         &notice_event(&format!("Theme '{name}' reloaded.")),
                     );
@@ -1444,25 +1374,32 @@ impl InteractiveMode {
 
         tui.stop();
 
-        // End-of-session banner: token-usage breakdown plus a
-        // resume hint pointing at the active session id. Printed
-        // *after* [`Tui::stop`] so the bytes land in the user's
-        // regular shell scrollback rather than the alternate-screen
-        // TUI buffer that gets cleared on exit. Mirrors the legacy
-        // `aj` binary's shutdown output (see
-        // `aj/src/main.rs::display_usage_summary` + the
-        // `Session:` notice it emits right after).
+        // End-of-process banner: token-usage breakdown plus a resume
+        // hint pointing at the live session id. Printed *after*
+        // [`Tui::stop`] so the bytes land in the user's regular
+        // shell scrollback rather than the alternate-screen TUI
+        // buffer that gets cleared on exit.
         //
         // Reading the agent + log behind their `TokioMutex` is
         // safe here: the running task was aborted above, the
         // event-channel forwarder lives on its own task that
         // doesn't touch these mutexes, and the persistence
         // listener is no-op-and-quick when no events are firing.
-        let summary = {
-            let a = agent.lock().await;
-            build_usage_summary(&a)
-        };
-        print_usage_summary(&summary);
+        //
+        // When the process spanned several sessions (`/new` /
+        // `/resume`), each torn-down world's usage was snapshotted
+        // into `completed_sessions`; itemize them in order, each
+        // under a dim `Session: <id>` header, then the live world's
+        // block. A single-session process prints one bare block.
+        let summary = world.usage_summary().await;
+        if completed_sessions.is_empty() {
+            print_usage_summary(&summary);
+        } else {
+            for (session_id, completed) in &completed_sessions {
+                print_session_usage(session_id, completed);
+            }
+            print_session_usage(&world.session_id, &summary);
+        }
 
         // Resume hint is gated on "the session is worth resuming",
         // i.e. it has at least one persisted user-thread leaf.
@@ -1473,15 +1410,12 @@ impl InteractiveMode {
         // resumed a session that already had content" paths in one
         // shot since the persistence listener writes user
         // messages inline before the run returns.
-        let (resume_eligible, session_id) = {
-            let l = log.lock().await;
-            (
-                l.latest_leaf(ThreadFilter::USER).is_some(),
-                l.session_id().to_string(),
-            )
+        let resume_eligible = {
+            let l = world.log.lock().await;
+            l.latest_leaf(ThreadFilter::USER).is_some()
         };
         if resume_eligible {
-            print_resume_hint(&session_id);
+            print_resume_hint(&world.session_id);
         }
 
         run_result
@@ -2181,12 +2115,11 @@ async fn start_login_session(
 async fn handle_slash_command(
     tui: &mut Tui,
     auth: &AuthStorage,
-    agent: Arc<TokioMutex<Agent>>,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    log: &mut Arc<TokioMutex<ConversationLog>>,
-    persistence_handle: &mut SubscriptionHandle,
-    pump: &mut EventPump,
+    config: Arc<std::sync::Mutex<Config>>,
+    world: &mut SessionWorld,
+    completed_sessions: &mut Vec<(String, UsageSummary)>,
     render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
@@ -2395,12 +2328,9 @@ async fn handle_slash_command(
             notice: Some(session_busy_notice("switch sessions")),
         },
         SlashAction::OpenSessionSelector => {
-            // Read the current session id so the overlay pre-selects
-            // the active row once it streams in.
-            let current_session_id = {
-                let l = log.lock().await;
-                l.session_id().to_string()
-            };
+            // The current session id lets the overlay pre-select the
+            // active row once it streams in.
+            let current_session_id = world.session_id.clone();
 
             // Scan previews on a blocking thread so the overlay opens
             // immediately and fills in incrementally as files are read.
@@ -2498,8 +2428,8 @@ async fn handle_slash_command(
             // Snapshot the known agents and the active view from the
             // pump (reads through the `ChatView`); never touches the
             // agent, so it's safe mid-turn.
-            let agents = pump.agents(tui);
-            let active = pump.active_view(tui);
+            let agents = world.pump.agents(tui);
+            let active = world.pump.active_view(tui);
             let inner = AgentPickerComponent::new(select_list_theme(theme), agents, active);
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
@@ -2525,10 +2455,10 @@ async fn handle_slash_command(
         },
         SlashAction::NewSession => match perform_new_session(
             tui,
-            Arc::clone(&agent),
-            log,
-            persistence_handle,
-            pump,
+            &run_config,
+            &config,
+            world,
+            completed_sessions,
             render_settings,
             conversation_persistence,
             theme,
@@ -2620,12 +2550,10 @@ async fn handle_selector_outcome(
     tui: &mut Tui,
     selector: OpenSelector,
     auth: &AuthStorage,
-    agent: Arc<TokioMutex<Agent>>,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: Arc<std::sync::Mutex<Config>>,
-    log: &mut Arc<TokioMutex<ConversationLog>>,
-    persistence_handle: &mut SubscriptionHandle,
-    pump: &mut EventPump,
+    world: &mut SessionWorld,
+    completed_sessions: &mut Vec<(String, UsageSummary)>,
     render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
@@ -2761,7 +2689,7 @@ async fn handle_selector_outcome(
                             // indicator: the new model has its own window
                             // size, so update the denominator immediately
                             // rather than waiting for the next turn.
-                            pump.set_context_window(tui, info.context_window);
+                            world.pump.set_context_window(tui, info.context_window);
                             // Persist the model choice (provider + id)
                             // so it survives a restart. `model_url` is
                             // intentionally left untouched: it's a
@@ -2829,14 +2757,10 @@ async fn handle_selector_outcome(
                         tui.hide_overlay(&parent.handle);
                     }
                     // No-op when the user picks the row that's
-                    // already active. Saves the swap dance (and
-                    // the chat-container clear that would briefly
-                    // hide the user's scrollback).
-                    let is_current = {
-                        let l = log.lock().await;
-                        l.session_id() == preview.session_id
-                    };
-                    if is_current {
+                    // already active. Saves the rebuild (and the
+                    // chat-container clear that would briefly hide
+                    // the user's scrollback).
+                    if world.session_id == preview.session_id {
                         return SelectorPollOutcome::Closed {
                             notice: Some(format!("Already on session {}.", preview.session_id)),
                             follow_up: None,
@@ -2845,10 +2769,10 @@ async fn handle_selector_outcome(
                     }
                     match perform_session_swap(
                         tui,
-                        Arc::clone(&agent),
-                        log,
-                        persistence_handle,
-                        pump,
+                        &run_config,
+                        &config,
+                        world,
+                        completed_sessions,
                         render_settings,
                         conversation_persistence,
                         theme,
@@ -3074,7 +2998,7 @@ async fn handle_selector_outcome(
                     // Switch the chat view to the chosen agent and mark
                     // the editor so the user sees which agent they're
                     // observing (cleared when switching back to main).
-                    pump.set_active_view(tui, id);
+                    world.pump.set_active_view(tui, id);
                     apply_editor_agent_marker(tui, id);
                     SelectorPollOutcome::Closed {
                         notice: None,
@@ -3140,241 +3064,119 @@ async fn handle_selector_outcome(
     }
 }
 
-/// Swap the agent + log + persistence wiring over to the session
-/// identified by `session_id`.
+/// Switch to the session identified by `session_id`.
 ///
-/// This is the in-process equivalent of `aj continue <id>`:
-/// the binary stays up and the user keeps their open editor, but
-/// the agent's transcript and the persistence target both rebind
-/// to the new session file.
+/// This is the in-process equivalent of `aj continue <id>`: build a
+/// fresh [`SessionWorld`] bound to the resumed log, install it on
+/// the TUI, snapshot the outgoing world's usage for the shutdown
+/// banner, and replace the current world. The outgoing world's
+/// agent, registry, subscriptions, and pump are dropped with it, so
+/// no per-session state survives the switch.
 ///
-/// Steps:
-/// 1. Resume the new [`ConversationLog`] from disk.
-/// 2. Repair any interrupted tool uses recorded in that log so
-///    the resumed transcript ends cleanly on a user-role message.
-/// 3. Build a fresh `Conversation` view from the repaired log and
-///    seed it into the agent (`seed_messages`,
-///    `seed_sub_agent_counter`).
-/// 4. Resolve a system prompt for the new session: reuse the one
-///    persisted at the log's root if present, otherwise assemble
-///    fresh from the current environment and freeze it onto the
-///    log so subsequent resumes hit the same cache.
-/// 5. Replace `*log` with the new `Arc<TokioMutex<…>>` and
-///    `*persistence_handle` with a fresh subscription so future
-///    events flow into the new file. The old handle's `Drop` runs
-///    here, detaching the previous persistence listener.
-/// 6. Clear the chat container, build a fresh [`EventPump`], and
-///    re-replay the new log through it so the user sees the
-///    swapped transcript.
-/// 7. Refresh the header's session-id line.
-///
-/// Returns `Err` if any of the file-level operations fail; in
-/// that case the agent's previous bindings are left intact (we
-/// only replace `*log` and `*persistence_handle` after the new
-/// log has been built and the seed/system-prompt steps have
-/// succeeded).
+/// Returns `Err` without touching `*world` if the new world fails to
+/// build, leaving the current session fully intact.
 #[allow(clippy::too_many_arguments)]
 async fn perform_session_swap(
     tui: &mut Tui,
-    agent: Arc<TokioMutex<Agent>>,
-    log: &mut Arc<TokioMutex<ConversationLog>>,
-    persistence_handle: &mut SubscriptionHandle,
-    pump: &mut EventPump,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    world: &mut SessionWorld,
+    completed_sessions: &mut Vec<(String, UsageSummary)>,
     render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
     session_id: &str,
 ) -> Result<()> {
-    // 1. Resume the new log from disk.
-    let mut new_log = ConversationLog::resume(conversation_persistence, session_id)
-        .with_context(|| format!("failed to resume session {session_id}"))?;
-
-    // 2. Repair any interrupted tool uses so the resumed
-    //    transcript ends on a user-role message — same dance the
-    //    startup path does.
-    if let Some(head) = new_log.latest_leaf(ThreadFilter::USER) {
-        let conversation = new_log.linearize(&head, ThreadFilter::USER);
-        repair_interrupted_tool_uses(&mut new_log, &conversation)?;
-    }
-
-    // 3. Build the post-repair transcript and seed it into the
-    //    agent. Also reseed the sub-agent counter so freshly-
-    //    minted ids in this session don't collide with any
-    //    sub-agent subtrees already on the log.
-    let messages: Vec<_> = if let Some(head) = new_log.latest_leaf(ThreadFilter::USER) {
-        new_log
-            .linearize(&head, ThreadFilter::USER)
-            .agent_messages()
-    } else {
-        Vec::new()
+    let spec = SessionSpec::Resume {
+        session_id: session_id.to_string(),
+        entry: SessionEntry::Switch,
     };
-    let max_agent_id = new_log.max_agent_id();
-
-    // 4. Resolve the system prompt for the new session. If the
-    //    log already carries one (persisted at the root entry),
-    //    reuse it verbatim to keep the model's prompt-cache warm.
-    //    Otherwise assemble fresh from the agent's env and
-    //    freeze it onto the new log so subsequent resumes hit
-    //    the same cache.
-    let prompt = if let Some(persisted) = new_log.system_prompt() {
-        persisted.to_string()
-    } else {
-        let assembled = {
-            let a = agent.lock().await;
-            a.assemble_system_prompt()
-        };
-        if new_log.is_empty() {
-            new_log.set_system_prompt(assembled.clone())?;
-        }
-        assembled
-    };
-
-    {
-        let mut a = agent.lock().await;
-        a.seed_messages(messages);
-        if let Some(max_id) = max_agent_id {
-            a.seed_sub_agent_counter(max_id);
-        }
-        a.set_assembled_system_prompt(prompt);
-    }
-
-    // 5. Swap the shared log + persistence handle. Order matters:
-    //    build the new persistence subscription *before* dropping
-    //    the old `persistence_handle`, otherwise a stray bus
-    //    event landing in the window would have no listener and
-    //    silently fail to persist. In practice the bus is quiet
-    //    here: `handle_slash_command` refuses `/resume` while a turn
-    //    is running, and a turn can't start while the session
-    //    selector is open (the editor isn't focused), so no turn is
-    //    in flight during a swap. The ordering keeps the invariant
-    //    honest regardless.
-    let new_log_arc = Arc::new(TokioMutex::new(new_log));
-    let new_handle = {
-        let a = agent.lock().await;
-        a.subscribe(persistence_listener(Arc::clone(&new_log_arc)))
-    };
-    *persistence_handle = new_handle;
-    *log = new_log_arc;
-
-    // 6. Clear the chat container and replay the new log
-    //    through a fresh event pump so the user sees the swapped
-    //    transcript in the scrollback. The pump clones the shared
-    //    `render_settings` handle, so display toggles stay in
-    //    effect across the swap.
-    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
-        chat.reset();
-    }
-    // Back to the main view: clear any "observing agent N" marker.
-    apply_editor_agent_marker(tui, AgentId::Main);
-    let context_window = agent.lock().await.model_info().context_window;
-    *pump = EventPump::new(chat_theme(theme), render_settings.clone(), context_window);
-    // Seed the footer indicator before replay so the row shows
-    // `?/<window>` even for resumed sessions where replay produces
-    // no `TurnUsage` events (e.g. a log with only a user prompt).
-    pump.sync_footer(tui);
-    {
-        let l = log.lock().await;
-        for event in replay(&l) {
-            pump.handle(tui, &event);
-        }
-    }
-
-    // 7. Refresh the header so the new session id is visible in
-    //    the top bar without waiting for the next turn boundary.
-    if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
-        header.set_session_id(Some(session_id.to_string()));
-        header.set_notice(Some("Resumed conversation".to_string()));
-    }
-
-    tui.request_render();
-    Ok(())
+    replace_world(
+        tui,
+        run_config,
+        config,
+        world,
+        completed_sessions,
+        render_settings,
+        conversation_persistence,
+        theme,
+        &spec,
+    )
+    .await
 }
 
-/// Start a fresh session.
-///
-/// Symmetric to [`perform_session_swap`] but creates instead of
-/// resuming: mint a new [`ConversationLog`], freeze a fresh
-/// system prompt onto it, swap it into the shared `log` slot,
-/// rebind the persistence subscription, clear the chat, and
-/// refresh the header. The previous session is preserved on disk
-/// untouched.
+/// Start a fresh session: mint a new [`ConversationLog`] on disk,
+/// build a [`SessionWorld`] around it, install it, and replace the
+/// current world (its usage is snapshotted for the shutdown banner
+/// first). The previous session is preserved on disk untouched.
 ///
 /// Returns the new session id on success so the caller can surface
-/// it in a status notice.
+/// it in a status notice; on build failure the current world is left
+/// fully intact.
+///
+/// [`ConversationLog`]: aj_session::ConversationLog
 #[allow(clippy::too_many_arguments)]
 async fn perform_new_session(
     tui: &mut Tui,
-    agent: Arc<TokioMutex<Agent>>,
-    log: &mut Arc<TokioMutex<ConversationLog>>,
-    persistence_handle: &mut SubscriptionHandle,
-    pump: &mut EventPump,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    world: &mut SessionWorld,
+    completed_sessions: &mut Vec<(String, UsageSummary)>,
     render_settings: &RenderSettings,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
 ) -> Result<String> {
-    // 1. Mint a new log on disk.
-    let mut new_log = ConversationLog::create(conversation_persistence)
-        .context("failed to create a fresh conversation log")?;
-    let new_session_id = new_log.session_id().to_string();
-
-    // 2. Assemble a system prompt from the agent's env and freeze
-    //    it onto the new log so a future resume picks it up.
-    let prompt = {
-        let a = agent.lock().await;
-        a.assemble_system_prompt()
+    let spec = SessionSpec::Create {
+        entry: SessionEntry::Switch,
     };
-    new_log
-        .set_system_prompt(prompt.clone())
-        .context("failed to persist system prompt on new session")?;
+    replace_world(
+        tui,
+        run_config,
+        config,
+        world,
+        completed_sessions,
+        render_settings,
+        conversation_persistence,
+        theme,
+        &spec,
+    )
+    .await?;
+    Ok(world.session_id.clone())
+}
 
-    // 3. Reset the agent's in-memory state: empty transcript, the
-    //    freshly-assembled system prompt, sub-agent counter back
-    //    to zero (no persisted subtrees on this new log).
-    {
-        let mut a = agent.lock().await;
-        a.seed_messages(Vec::new());
-        a.set_assembled_system_prompt(prompt);
-        a.seed_sub_agent_counter(0);
-    }
-
-    // 4. Swap the shared log and persistence handle. Same ordering
-    //    rule as [`perform_session_swap`]: build the new subscription
-    //    before dropping the old one so a stray bus event can't
-    //    arrive without a listener. `handle_slash_command` refuses
-    //    `/new` while a turn is running, so we can't be mid-turn
-    //    here, but the ordering keeps the invariant honest regardless.
-    let new_log_arc = Arc::new(TokioMutex::new(new_log));
-    let new_handle = {
-        let a = agent.lock().await;
-        a.subscribe(persistence_listener(Arc::clone(&new_log_arc)))
-    };
-    *persistence_handle = new_handle;
-    *log = new_log_arc;
-
-    // 5. Clear the chat container and rebuild the event pump so any
-    //    in-flight assistant/tool-execution components don't leak
-    //    into the fresh session. The pump clones the shared
-    //    `render_settings` handle, so display toggles stay in effect.
-    if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
-        chat.reset();
-    }
-    // Back to the main view: clear any "observing agent N" marker.
-    apply_editor_agent_marker(tui, AgentId::Main);
-    let context_window = agent.lock().await.model_info().context_window;
-    *pump = EventPump::new(chat_theme(theme), render_settings.clone(), context_window);
-    // Seed the footer indicator so the row shows `?/<window>`
-    // on the fresh session before the first turn lands.
-    pump.sync_footer(tui);
-
-    // 6. Refresh the header with the new session id and a friendly
-    //    notice so the user sees the swap in the top bar.
-    if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
-        header.set_session_id(Some(new_session_id.clone()));
-        header.set_notice(Some("Fresh session".to_string()));
-    }
-
-    tui.request_render();
-    Ok(new_session_id)
+/// Shared build-and-replace step behind [`perform_session_swap`] and
+/// [`perform_new_session`]: build a [`SessionWorld`] for `spec`,
+/// install it on the TUI, push the outgoing world's usage snapshot
+/// onto `completed_sessions`, and assign the new world in place.
+///
+/// The build happens before anything is torn down, so a failure
+/// returns `Err` with the current world untouched.
+#[allow(clippy::too_many_arguments)]
+async fn replace_world(
+    tui: &mut Tui,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    world: &mut SessionWorld,
+    completed_sessions: &mut Vec<(String, UsageSummary)>,
+    render_settings: &RenderSettings,
+    conversation_persistence: &ConversationPersistence,
+    theme: &ThemeHandle,
+    spec: &SessionSpec,
+) -> Result<()> {
+    let snapshot = config.lock().expect("config mutex poisoned").clone();
+    let mut new_world = SessionWorld::build(
+        &snapshot,
+        run_config,
+        render_settings,
+        theme,
+        conversation_persistence,
+        spec,
+    )?;
+    new_world.install(tui, spec).await;
+    let usage = world.usage_summary().await;
+    completed_sessions.push((world.session_id.clone(), usage));
+    *world = new_world;
+    Ok(())
 }
 
 #[cfg(test)]

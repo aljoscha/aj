@@ -154,7 +154,33 @@ pub fn format_resume_hint(session_id: &str) -> String {
 /// - A trailing blank gives the resume hint that may follow (or
 ///   the returning shell prompt) breathing room below the block.
 pub fn print_usage_summary(summary: &UsageSummary) {
+    print_usage_block(None, summary);
+}
+
+/// Format the per-session header line printed above a usage block
+/// when more than one session ran in the process. Exposed as a pure
+/// formatter so tests can lock the exact shape.
+pub fn format_session_usage_header(session_id: &str) -> String {
+    format!("Session: {session_id}")
+}
+
+/// Print one session's usage block preceded by a dim
+/// `Session: <id>` header line. Used when a process spans several
+/// sessions and the shutdown banner itemizes each one; the shared
+/// indent/dim rhythm matches [`print_usage_summary`].
+pub fn print_session_usage(session_id: &str, summary: &UsageSummary) {
+    print_usage_block(Some(&format_session_usage_header(session_id)), summary);
+}
+
+/// Shared printer behind [`print_usage_summary`] and
+/// [`print_session_usage`]: leading blank row, optional dim header
+/// line, dim usage rows, trailing blank row — all with the
+/// one-space left indent that aligns with the chat scrollback.
+fn print_usage_block(header: Option<&str>, summary: &UsageSummary) {
     println!();
+    if let Some(header) = header {
+        println!(" {}", style::dim(header));
+    }
     for line in format_usage_summary(summary).lines() {
         println!(" {}", style::dim(line));
     }
@@ -296,6 +322,11 @@ mod tests {
              Sub-agent 2 - Input: 30 | Output: 15 | Cache Creation: 0 | Cache Read: 0\n\
              TOTAL - Input: 150 | Output: 75 | Cache Creation: 0 | Cache Read: 0";
         assert_eq!(format_usage_summary(&summary), expected);
+    }
+
+    #[test]
+    fn format_session_usage_header_round_trips_session_id() {
+        assert_eq!(format_session_usage_header("abc123"), "Session: abc123");
     }
 
     #[test]
