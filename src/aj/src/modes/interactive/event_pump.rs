@@ -217,6 +217,21 @@ impl EventPump {
         self.sync_footer(tui);
     }
 
+    /// Replace `id`'s footer entry with a settings identity known
+    /// only as strings, resolving the context window internally
+    /// (catalog scan, Main-identity fallback, else 0). Exists for
+    /// resume-time reconciliation, where the caller folds settings
+    /// out of the session log and holds no `ModelInfo`.
+    pub fn reconcile_agent_settings(
+        &mut self,
+        tui: &mut Tui,
+        id: AgentId,
+        settings: AgentSettings,
+    ) {
+        let window = self.resolve_window(&settings);
+        self.note_agent_settings(tui, id, settings, window);
+    }
+
     /// Read back the stored settings snapshot for `id`. `None`
     /// when the agent has no entry.
     pub fn agent_settings(&self, id: AgentId) -> Option<&AgentSettings> {

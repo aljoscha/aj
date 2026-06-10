@@ -483,16 +483,60 @@ impl SessionWorld {
         // it is visible even when replay produces no usage events.
         self.pump.sync_footer(tui);
         {
-            let log = self.log.lock().await;
+            // Clone the handle so the guard doesn't borrow `self`,
+            // which the pump calls below need mutably.
+            let log = Arc::clone(&self.log);
+            let log = log.lock().await;
             for event in replay(&log) {
                 self.pump.handle(tui, &event);
             }
+            self.reconcile_sub_agent_settings(tui, &log);
         }
         if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
             header.set_session_id(Some(self.session_id.clone()));
             header.set_notice(Some(header_notice(spec).to_string()));
         }
         tui.request_render();
+    }
+
+    /// Overwrite each replayed sub-agent's footer entry with the
+    /// last-wins settings fold of its log thread. Replay seeds the
+    /// entries from the spawn-time snapshot only; later
+    /// `ModelChange` / `ThinkingChange` / `SpeedChange` entries on a
+    /// sub thread are projected as plain notices, so without this
+    /// pass a resumed footer would show stale spawn-time settings.
+    ///
+    /// Axes the log doesn't record keep the replayed entry's value
+    /// (the spawn snapshot, or replay's fallback defaults for
+    /// legacy logs). Sub ids with no thread entries are skipped.
+    fn reconcile_sub_agent_settings(&mut self, tui: &mut Tui, log: &ConversationLog) {
+        let Some(max_id) = log.max_agent_id() else {
+            return;
+        };
+        for n in 1..=max_id {
+            let filter = ThreadFilter::subagent(n);
+            let Some(head) = log.latest_leaf(filter) else {
+                continue;
+            };
+            let folded = log.linearize(&head, filter).settings();
+            let id = AgentId::Sub(n);
+            let base = self.pump.agent_settings(id).cloned().unwrap_or_else(|| {
+                aj_agent::events::AgentSettings {
+                    provider: String::new(),
+                    model_id: String::new(),
+                    thinking: "off".to_string(),
+                    speed: "standard".to_string(),
+                }
+            });
+            let (provider, model_id) = folded.model.unwrap_or((base.provider, base.model_id));
+            let settings = aj_agent::events::AgentSettings {
+                provider,
+                model_id,
+                thinking: folded.thinking.unwrap_or(base.thinking),
+                speed: folded.speed.unwrap_or(base.speed),
+            };
+            self.pump.reconcile_agent_settings(tui, id, settings);
+        }
     }
 
     /// Snapshot this world's accumulated token usage for the
@@ -709,6 +753,88 @@ mod tests {
         // (mint-side behavior covered by the `SessionState` unit
         // test in `aj-agent`).
         assert_eq!(world_b.log.lock().await.max_agent_id(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn install_reconciles_sub_agent_footer_settings_from_log() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        let run_config = scripted_run_config(vec![finalized_text_message("scripted reply")]);
+        let world_a =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world_a, "hello there").await;
+
+        // Persist two sub-agent threads via the same events a live
+        // spawn would emit on the bus, both with the spawn-time
+        // settings snapshot.
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&world_a.log)));
+        for n in [1usize, 2] {
+            bus.emit(AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(n),
+                task: format!("task {n}"),
+                settings: AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted-model".into(),
+                    thinking: "off".into(),
+                    speed: "standard".into(),
+                },
+            })
+            .await
+            .expect("emit start");
+            bus.emit(AgentEvent::MessageEnd {
+                agent_id: AgentId::Sub(n),
+                message: AgentMessage::wire(Message::User(UserMessage::text(format!("task {n}")))),
+            })
+            .await
+            .expect("emit sub message");
+        }
+        // Mid-session settings changes recorded on sub 1's thread
+        // only; sub 2 keeps its spawn snapshot. Settings entries are
+        // non-punctuation and only reach disk with the next
+        // punctuation append, so a follow-up message flushes them.
+        {
+            let mut log = world_a.log.lock().await;
+            log.append_thinking_change(ThreadFilter::subagent(1), "high")
+                .expect("append thinking change");
+            log.append_model_change(ThreadFilter::subagent(1), "anthropic", "claude-x")
+                .expect("append model change");
+        }
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(1),
+            message: AgentMessage::wire(Message::User(UserMessage::text("follow-up"))),
+        })
+        .await
+        .expect("emit flush message");
+        let session_id = world_a.session_id.clone();
+        drop(world_a);
+
+        let run_config = scripted_run_config(Vec::new());
+        let spec = resume_spec(&session_id);
+        let mut world = build_test_world(&persistence, &run_config, &spec).expect("resume world");
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+        world.install(&mut tui, &spec).await;
+
+        let changed = world
+            .pump
+            .agent_settings(AgentId::Sub(1))
+            .expect("sub 1 footer entry");
+        assert_eq!(changed.provider, "anthropic");
+        assert_eq!(changed.model_id, "claude-x");
+        assert_eq!(changed.thinking, "high");
+        assert_eq!(changed.speed, "standard");
+
+        let unchanged = world
+            .pump
+            .agent_settings(AgentId::Sub(2))
+            .expect("sub 2 footer entry");
+        assert_eq!(unchanged.provider, "scripted");
+        assert_eq!(unchanged.model_id, "scripted-model");
+        assert_eq!(unchanged.thinking, "off");
+        assert_eq!(unchanged.speed, "standard");
     }
 
     #[tokio::test]

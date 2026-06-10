@@ -672,17 +672,15 @@ impl InteractiveMode {
                     // recorded settings into the run config; the
                     // install's footer sync already mirrors them, so
                     // only the editor border needs re-applying here.
-                    {
-                        let thinking = {
-                            let cfg = shell.run_config.lock().expect("run config mutex poisoned");
-                            cfg.thinking.clone()
-                        };
-                        apply_editor_border_for_thinking(
-                            &mut shell.tui,
-                            &shell.theme,
-                            thinking.as_ref(),
-                        );
-                    }
+                    // The view is Main after an install, so this
+                    // resolves to the run config's thinking.
+                    apply_editor_border_for_view(
+                        &mut shell.tui,
+                        &shell.theme,
+                        &next.world.pump,
+                        &shell.run_config,
+                        AgentId::Main,
+                    );
                     for notice in &next.notices {
                         next.world
                             .pump
@@ -2162,6 +2160,40 @@ fn apply_editor_border_for_thinking(
     if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
         editor.set_border_color(editor_border_color_for_thinking(theme, level));
     }
+}
+
+/// Resolve the thinking effort the editor border should display
+/// for the agent under view: the agent's footer-settings thinking
+/// string when an entry exists and parses, else the run config's
+/// session default. The fallback covers agents with no footer entry
+/// and replayed legacy entries whose thinking string is empty.
+fn resolve_view_thinking(
+    settings: Option<&aj_agent::events::AgentSettings>,
+    fallback: &Option<ThinkingConfig>,
+) -> Option<ThinkingConfig> {
+    settings
+        .and_then(|s| thinking_config_from_name(&s.thinking))
+        .unwrap_or_else(|| fallback.clone())
+}
+
+/// Re-tint the editor border for the agent the chat view observes:
+/// resolve the view's thinking via [`resolve_view_thinking`] and
+/// push it through [`apply_editor_border_for_thinking`]. Called on
+/// view switches and after a session install (where the view is
+/// Main).
+fn apply_editor_border_for_view(
+    tui: &mut Tui,
+    theme: &ThemeHandle,
+    pump: &crate::modes::interactive::event_pump::EventPump,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    id: AgentId,
+) {
+    let fallback = {
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        cfg.thinking.clone()
+    };
+    let level = resolve_view_thinking(pump.agent_settings(id), &fallback);
+    apply_editor_border_for_thinking(tui, theme, level.as_ref());
 }
 
 /// Reflect the observed agent in the editor's top-bar label: an
@@ -3644,6 +3676,7 @@ async fn handle_selector_outcome(
                     // observing (cleared when switching back to main).
                     world.pump.set_active_view(tui, id);
                     apply_editor_agent_marker(tui, id);
+                    apply_editor_border_for_view(tui, theme, &world.pump, &run_config, id);
                     SelectorPollOutcome::Closed {
                         notice: None,
                         follow_up: None,
@@ -3742,6 +3775,49 @@ mod tests {
     #[test]
     fn resolve_theme_name_defaults_to_light_when_unset() {
         assert_eq!(resolve_theme_name(None), "light");
+    }
+
+    #[test]
+    fn resolve_view_thinking_prefers_parsed_settings_over_fallback() {
+        let settings = aj_agent::events::AgentSettings {
+            provider: "anthropic".into(),
+            model_id: "claude-x".into(),
+            thinking: "high".into(),
+            speed: "standard".into(),
+        };
+        let fallback = Some(ThinkingConfig::Low);
+        assert_eq!(
+            resolve_view_thinking(Some(&settings), &fallback),
+            Some(ThinkingConfig::High)
+        );
+        // An explicit "off" wins over the fallback: the parse
+        // yields `Some(None)`.
+        let off = aj_agent::events::AgentSettings {
+            thinking: "off".into(),
+            ..settings.clone()
+        };
+        assert_eq!(resolve_view_thinking(Some(&off), &fallback), None);
+    }
+
+    #[test]
+    fn resolve_view_thinking_falls_back_on_missing_or_unparseable_entry() {
+        let fallback = Some(ThinkingConfig::Medium);
+        assert_eq!(
+            resolve_view_thinking(None, &fallback),
+            Some(ThinkingConfig::Medium)
+        );
+        // Replayed legacy entries can carry an empty thinking
+        // string; that parses to nothing and falls back too.
+        let garbage = aj_agent::events::AgentSettings {
+            provider: String::new(),
+            model_id: String::new(),
+            thinking: String::new(),
+            speed: "standard".into(),
+        };
+        assert_eq!(
+            resolve_view_thinking(Some(&garbage), &fallback),
+            Some(ThinkingConfig::Medium)
+        );
     }
 
     #[test]
