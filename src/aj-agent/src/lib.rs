@@ -72,15 +72,6 @@ pub struct AgentSeed {
 
 pub struct Agent {
     env: AgentEnv,
-    /// The base system prompt template provided by the host
-    /// (compile-time constant, ships with the binary). The full
-    /// prompt sent to the model is derived from this plus
-    /// environment-dependent context (`AgentEnv`); the binary
-    /// resolves it once and pushes it onto the agent through
-    /// [`Agent::seed_session`] so resumed threads reuse the
-    /// original assembly verbatim and keep hitting Anthropic's
-    /// prompt cache.
-    system_prompt: &'static str,
     /// The fully-assembled system prompt for the current run.
     /// Populated by [`Agent::seed_session`] (resume path or fresh
     /// assembly) before any turn runs; inference reads it directly.
@@ -193,7 +184,6 @@ impl Agent {
     /// the same backend.
     pub fn with_provider(
         env: AgentEnv,
-        system_prompt: &'static str,
         tools: Vec<ErasedToolDefinition>,
         disabled_tools: Vec<String>,
         provider: Arc<dyn Provider>,
@@ -231,7 +221,6 @@ impl Agent {
 
         Self {
             env,
-            system_prompt,
             assembled_system_prompt: None,
             tool_definitions,
             tools: api_tools,
@@ -451,12 +440,12 @@ impl Agent {
         self.assembled_system_prompt.as_deref()
     }
 
-    /// Assemble the system prompt from the constant template plus
+    /// Assemble the system prompt from the env's base prompt plus
     /// the agent's environment context. The binary calls this when
     /// no persisted prompt exists on the log and uses the result
     /// as the freshly-frozen system prompt for the session.
     pub fn assemble_system_prompt(&self) -> String {
-        let mut text = self.system_prompt.to_string();
+        let mut text = self.env.system_prompt.content.clone();
 
         // Stitch in every context file, in order. Each file is
         // wrapped in an `<agents-md>` block so the model can
@@ -1475,7 +1464,6 @@ impl Agent {
                 .assembled_system_prompt
                 .clone()
                 .expect("system prompt must be resolved before sub-agent spawn"),
-            system_prompt: self.system_prompt,
             disabled_tools: &self.disabled_tools,
             provider: Arc::clone(&self.provider),
             model_info: Arc::clone(&self.model_info),
@@ -1640,7 +1628,6 @@ struct SessionContextWrapper<'a> {
     /// session has a single, consistent system prompt across all
     /// agents.
     assembled_system_prompt: String,
-    system_prompt: &'static str,
     disabled_tools: &'a [String],
     /// Unified provider handle threaded into sub-agents. Cloned from
     /// the parent's handle so the whole hierarchy talks to the same
@@ -1764,7 +1751,6 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // `ThinkingConfig`.
             let mut sub_agent = Agent::with_provider(
                 self.env.clone(),
-                self.system_prompt,
                 sub_agent_tools,
                 disabled_tools,
                 Arc::clone(&self.provider),
@@ -2013,7 +1999,7 @@ mod event_protocol_tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use aj_conf::AgentEnv;
+    use aj_conf::{AgentEnv, SystemPrompt, SystemPromptSource};
     use aj_models::provider::Provider;
     use aj_models::registry::{InputModality, ModelCost, ModelInfo};
     use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
@@ -2399,6 +2385,10 @@ mod event_protocol_tests {
             git_root_directory: None,
             operating_system: "test".to_string(),
             today_date: "2024-01-01".to_string(),
+            system_prompt: SystemPrompt {
+                content: "irrelevant".to_string(),
+                source: SystemPromptSource::Builtin,
+            },
             context_files: Vec::new(),
         }
     }
@@ -2425,7 +2415,6 @@ mod event_protocol_tests {
         let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::with_provider(
             env,
-            "irrelevant",
             tools,
             Vec::new(),
             provider,
@@ -3021,7 +3010,6 @@ mod event_protocol_tests {
         let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::with_provider(
             env,
-            "irrelevant",
             Vec::new(),
             Vec::new(),
             provider,

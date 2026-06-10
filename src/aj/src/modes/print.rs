@@ -147,7 +147,7 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::info!(disabled = ?config.disabled_tools, "filtered disabled tools");
     }
 
-    let env = AgentEnv::new();
+    let env = AgentEnv::new(SYSTEM_PROMPT);
 
     // Resolve the [`ConversationLog`] for this run before the model:
     // a resumed session's recorded settings take precedence over the
@@ -232,7 +232,6 @@ pub async fn run(args: Args) -> Result<()> {
         crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
         let mut agent = Agent::with_provider(
             env,
-            SYSTEM_PROMPT,
             tools,
             config.disabled_tools.clone(),
             provider,
@@ -319,7 +318,6 @@ pub async fn run(args: Args) -> Result<()> {
         crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
         let mut agent = Agent::with_provider(
             env,
-            SYSTEM_PROMPT,
             tools,
             config.disabled_tools.clone(),
             provider,

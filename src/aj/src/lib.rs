@@ -16,9 +16,11 @@
 //!
 //! [`AgentEvent`]: aj_agent::events::AgentEvent
 
-// The system prompt is embedded at compile time so `aj` ships as a
-// single self-contained binary. The file lives next to `Cargo.toml`
-// in this crate.
+// The default system prompt is embedded at compile time so `aj` ships
+// as a single self-contained binary. The file lives next to
+// `Cargo.toml` in this crate. At runtime, a `~/.agents/SYSTEM_PROMPT.md`
+// (or `~/.claude/SYSTEM_PROMPT.md`) override file replaces it; see
+// `AgentEnv` in `aj-conf`.
 pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
 
 pub mod auth;

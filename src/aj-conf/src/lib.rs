@@ -186,6 +186,23 @@ impl ContextFileKind {
     }
 }
 
+/// The agent's base system prompt and where it came from.
+#[derive(Debug, Clone)]
+pub struct SystemPrompt {
+    pub content: String,
+    pub source: SystemPromptSource,
+}
+
+/// Where the base system prompt was loaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemPromptSource {
+    /// The prompt compiled into the binary.
+    Builtin,
+    /// An override file from the user's home directory. Its content fully
+    /// replaces the builtin prompt.
+    Override(PathBuf),
+}
+
 /// The working environment of the agent, includes configuration, the system
 /// prompt, working directories, etc.
 #[derive(Debug, Clone)]
@@ -194,17 +211,25 @@ pub struct AgentEnv {
     pub git_root_directory: Option<PathBuf>,
     pub operating_system: String,
     pub today_date: String,
+    /// The base system prompt: the builtin one or an override file from the
+    /// user's home directory. Context files are appended to this when the
+    /// full prompt is assembled.
+    pub system_prompt: SystemPrompt,
     /// Files that get stitched into the agent's system prompt. Ordered from
     /// most general (user-level) to most specific (project-level).
     pub context_files: Vec<ContextFile>,
 }
 
 impl AgentEnv {
-    pub fn new() -> Self {
+    /// Read the environment: working directory, git root, instruction
+    /// files, and the base system prompt (`builtin_system_prompt` unless an
+    /// override file exists, see [`AgentEnv::load_system_prompt`]).
+    pub fn new(builtin_system_prompt: &str) -> Self {
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let git_root_directory = find_git_root(&working_directory);
         let operating_system = env::consts::OS.to_string();
         let today_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let system_prompt = Self::load_system_prompt(builtin_system_prompt);
 
         let mut context_files = Vec::new();
         if let Some(file) = Self::load_user_instructions() {
@@ -219,7 +244,39 @@ impl AgentEnv {
             git_root_directory,
             operating_system,
             today_date,
+            system_prompt,
             context_files,
+        }
+    }
+
+    /// Resolve the base system prompt: an override file fully replaces the
+    /// builtin prompt. Falls back to `builtin` when `HOME` is unset or no
+    /// override file exists.
+    fn load_system_prompt(builtin: &str) -> SystemPrompt {
+        let home = env::var("HOME").ok().map(PathBuf::from);
+        Self::resolve_system_prompt(home.as_deref(), builtin)
+    }
+
+    fn resolve_system_prompt(home: Option<&Path>, builtin: &str) -> SystemPrompt {
+        if let Some(home) = home {
+            // Prefer .agents over .claude, mirroring the precedence for
+            // user-level instruction files.
+            let candidates = [
+                home.join(".agents").join("SYSTEM_PROMPT.md"),
+                home.join(".claude").join("SYSTEM_PROMPT.md"),
+            ];
+            for path in candidates {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    return SystemPrompt {
+                        content,
+                        source: SystemPromptSource::Override(path),
+                    };
+                }
+            }
+        }
+        SystemPrompt {
+            content: builtin.to_string(),
+            source: SystemPromptSource::Builtin,
         }
     }
 
@@ -281,12 +338,6 @@ pub fn display_path(path: &Path) -> String {
         }
     }
     path.display().to_string()
-}
-
-impl Default for AgentEnv {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl fmt::Display for AgentEnv {
@@ -1263,7 +1314,7 @@ mod tests {
 
     #[test]
     fn test_agent_env_creation() {
-        let env = AgentEnv::new();
+        let env = AgentEnv::new("builtin prompt");
         assert!(!env.working_directory.as_os_str().is_empty());
         assert!(!env.operating_system.is_empty());
         assert!(!env.today_date.is_empty());
@@ -1734,7 +1785,7 @@ image_block = true
 
     #[test]
     fn test_agent_env_display() {
-        let env = AgentEnv::new();
+        let env = AgentEnv::new("builtin prompt");
         let display_output = format!("{}", env);
         assert!(display_output.contains("Working directory:"));
         assert!(display_output.contains("Git root directory:"));
@@ -1841,6 +1892,53 @@ image_block = true
         let dir = make_temp_dir("none-missing");
         assert!(AgentEnv::load_project_instructions(&dir).is_none());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_system_prompt_prefers_agents_override() {
+        let home = make_temp_dir("sysprompt-prefers-agents");
+        fs::create_dir_all(home.join(".agents")).unwrap();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".agents/SYSTEM_PROMPT.md"), "agents prompt").unwrap();
+        fs::write(home.join(".claude/SYSTEM_PROMPT.md"), "claude prompt").unwrap();
+
+        let prompt = AgentEnv::resolve_system_prompt(Some(&home), "builtin prompt");
+        assert_eq!(prompt.content, "agents prompt");
+        assert_eq!(
+            prompt.source,
+            SystemPromptSource::Override(home.join(".agents/SYSTEM_PROMPT.md"))
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_resolve_system_prompt_falls_back_to_claude_override() {
+        let home = make_temp_dir("sysprompt-claude");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/SYSTEM_PROMPT.md"), "claude prompt").unwrap();
+
+        let prompt = AgentEnv::resolve_system_prompt(Some(&home), "builtin prompt");
+        assert_eq!(prompt.content, "claude prompt");
+        assert_eq!(
+            prompt.source,
+            SystemPromptSource::Override(home.join(".claude/SYSTEM_PROMPT.md"))
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_resolve_system_prompt_builtin_when_no_override() {
+        let home = make_temp_dir("sysprompt-builtin");
+        let prompt = AgentEnv::resolve_system_prompt(Some(&home), "builtin prompt");
+        assert_eq!(prompt.content, "builtin prompt");
+        assert_eq!(prompt.source, SystemPromptSource::Builtin);
+        fs::remove_dir_all(&home).ok();
+
+        let prompt = AgentEnv::resolve_system_prompt(None, "builtin prompt");
+        assert_eq!(prompt.content, "builtin prompt");
+        assert_eq!(prompt.source, SystemPromptSource::Builtin);
     }
 
     /// Apply the options that changed between `baseline` and `config`

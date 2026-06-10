@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
-use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
+use aj_conf::{
+    AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, SystemPromptSource, display_path,
+};
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
@@ -559,9 +561,10 @@ impl InteractiveMode {
         // Startup notices: surface config-load diagnostics (parse
         // errors, unknown keys) first so a user with a broken
         // `config.toml` sees that before any other chrome, then
-        // list the AGENTS.md / CLAUDE.md files stitched into the
-        // system prompt, then (unless suppressed) print the sandbox
-        // warning. All flow through the pump's existing
+        // report the base system prompt in use and list the
+        // AGENTS.md / CLAUDE.md files stitched into it, then (unless
+        // suppressed) print the sandbox warning. All flow through
+        // the pump's existing
         // `Notice` / `Warning` / `Error` arms so they appear as dim
         // chat-scrollback rows just above the editor — close enough
         // to where the user starts typing that they're hard to
@@ -576,10 +579,16 @@ impl InteractiveMode {
             };
             world.pump.handle(&mut tui, &event);
         }
-        let context_notice = {
+        let (system_prompt_notice, context_notice) = {
             let a = world.agent.lock().await;
-            build_context_notice(a.env())
+            (
+                build_system_prompt_notice(a.env()),
+                build_context_notice(a.env()),
+            )
         };
+        world
+            .pump
+            .handle(&mut tui, &notice_event(&system_prompt_notice));
         world.pump.handle(&mut tui, &notice_event(&context_notice));
         if sandbox_warning_enabled() {
             world.pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
@@ -2100,6 +2109,20 @@ fn error_event(text: &str) -> AgentEvent {
 /// the bundled `dark` palette.)
 fn resolve_theme_name(configured: Option<&str>) -> &str {
     configured.unwrap_or("light")
+}
+
+/// Build the chat-scrollback notice reporting the base system prompt
+/// in use: the builtin one (with a hint on how to override it) or the
+/// override file it was loaded from.
+fn build_system_prompt_notice(env: &AgentEnv) -> String {
+    match &env.system_prompt.source {
+        SystemPromptSource::Builtin => {
+            "System prompt: builtin (override with ~/.agents/SYSTEM_PROMPT.md)".to_string()
+        }
+        SystemPromptSource::Override(path) => {
+            format!("System prompt: {} (replaces builtin)", display_path(path))
+        }
+    }
 }
 
 /// Build the chat-scrollback "Context:" notice listing every
@@ -3749,7 +3772,7 @@ async fn handle_selector_outcome(
 mod tests {
     use std::path::PathBuf;
 
-    use aj_conf::{AgentEnv, ContextFile, ContextFileKind};
+    use aj_conf::{AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource};
     use tempfile::TempDir;
 
     use super::*;
@@ -3760,14 +3783,18 @@ mod tests {
 
     /// Build an [`AgentEnv`] for use in the helper tests below.
     /// Working directory / OS / date / git root are all stubbed —
-    /// only `context_files` matters for the `Context:` notice
-    /// builder.
+    /// only `system_prompt` and `context_files` matter for the
+    /// startup-notice builders.
     fn env_with(context_files: Vec<ContextFile>) -> AgentEnv {
         AgentEnv {
             working_directory: PathBuf::from("/tmp"),
             git_root_directory: None,
             operating_system: "linux".to_string(),
             today_date: "2025-01-01".to_string(),
+            system_prompt: SystemPrompt {
+                content: "builtin prompt".to_string(),
+                source: SystemPromptSource::Builtin,
+            },
             context_files,
         }
     }
@@ -3857,6 +3884,33 @@ mod tests {
         let expected = "Context:\n  - ~/.agents/AGENTS.md (user instructions)\n  \
              - /var/project/AGENTS.md (project instructions)";
         assert_eq!(notice, expected);
+    }
+
+    #[test]
+    fn build_system_prompt_notice_builtin_includes_override_hint() {
+        let env = env_with(Vec::new());
+        assert_eq!(
+            build_system_prompt_notice(&env),
+            "System prompt: builtin (override with ~/.agents/SYSTEM_PROMPT.md)"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_notice_override_shows_tildified_path() {
+        // `display_path` tildifies under `$HOME`, so build the path
+        // off the live `HOME` env var to keep the assertion stable
+        // across machines.
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let path = PathBuf::from(&home).join(".agents/SYSTEM_PROMPT.md");
+        let mut env = env_with(Vec::new());
+        env.system_prompt = SystemPrompt {
+            content: "override prompt".to_string(),
+            source: SystemPromptSource::Override(path),
+        };
+        assert_eq!(
+            build_system_prompt_notice(&env),
+            "System prompt: ~/.agents/SYSTEM_PROMPT.md (replaces builtin)"
+        );
     }
 
     #[test]

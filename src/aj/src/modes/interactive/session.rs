@@ -49,8 +49,8 @@ use crate::modes::interactive::{RunConfigSnapshot, SubAgentOverrides};
 /// `thinking` comes from the run-config snapshot rather than from
 /// `config.thinking`, so a runtime `/thinking` change carries into
 /// agents built for later sessions. The `AgentEnv` is read fresh,
-/// so a new session picks up edits to AGENTS.md files and the
-/// current date.
+/// so a new session picks up edits to AGENTS.md files, a system
+/// prompt override, and the current date.
 fn build_agent(
     config: &Config,
     provider: Arc<dyn Provider>,
@@ -66,8 +66,7 @@ fn build_agent(
         tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
     }
     let mut agent = Agent::with_provider(
-        AgentEnv::new(),
-        SYSTEM_PROMPT,
+        AgentEnv::new(SYSTEM_PROMPT),
         tools,
         config.disabled_tools.clone(),
         provider,

@@ -51,7 +51,7 @@ use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::{AgentEvent, AgentSettings};
 use aj_agent::tool::ErasedToolDefinition;
 use aj_agent::{Agent, AgentSeed, TurnError};
-use aj_conf::AgentEnv;
+use aj_conf::{AgentEnv, SystemPrompt, SystemPromptSource};
 use aj_models::provider::Provider;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
@@ -123,6 +123,10 @@ fn empty_env(working_directory: PathBuf) -> AgentEnv {
         git_root_directory: None,
         operating_system: "test".to_string(),
         today_date: "2024-01-01".to_string(),
+        system_prompt: SystemPrompt {
+            content: "system prompt".to_string(),
+            source: SystemPromptSource::Builtin,
+        },
         context_files: Vec::new(),
     }
 }
@@ -279,7 +283,6 @@ async fn drive_live_turn(
     let env = empty_env(working_dir.to_path_buf());
     let mut agent = Agent::with_provider(
         env,
-        "system prompt",
         vec![tool],
         Vec::new(),
         provider,
