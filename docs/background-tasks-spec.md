@@ -4,9 +4,12 @@ Let the model run `bash` commands and sub-agents **in the background**:
 the tool call returns immediately with a task id, the work continues on
 a detached task, and the model observes it through a small family of
 `task_*` tools (incremental output, wait, kill) plus automatic
-completion notices injected into its transcript. The user observes
-background work through the existing footer / agent-picker surfaces,
-extended to cover bash tasks, with live output in the transcript.
+completion notices injected into its transcript. When a task finishes
+while the owning agent is idle, the notice **wakes** it — a turn is
+triggered so the agent reacts to the result without polling and
+without waiting for the user. The user observes background work
+through the existing footer / agent-picker surfaces, extended to
+cover bash tasks, with live output in the transcript.
 
 This builds directly on the retention + concurrency foundation from
 `docs/subagent-steering-spec.md` (§7 there sketches background spawn as
@@ -84,9 +87,14 @@ at the end for orchestration.
    owning agent's transcript at the next natural point (before the
    next inference step, or at the start of the next turn) so the model
    never has to busy-poll and cannot forget a task.
-5. Background tasks survive turn end but **not process exit**: they
+5. **Auto-wake**: a notice arriving while the owning agent is idle
+   triggers a turn on that agent (main *and* sub-agents alike) — the
+   agent reads the result and keeps working. Waking without polling is
+   what makes backgrounding genuine parallelism rather than deferred
+   reads.
+6. Background tasks survive turn end but **not process exit**: they
    are killed on shutdown.
-6. The user sees background bash tasks in the footer and the alt+a
+7. The user sees background bash tasks in the footer and the alt+a
    picker, with live output in the transcript (the same treatment
    sub-agents already get).
 
@@ -94,9 +102,6 @@ at the end for orchestration.
 
 - **Detach-from-process**: no nohup-style tasks that outlive aj. Exit
   kills everything.
-- **Auto-waking an idle agent**: a completion notice delivered while
-  the owner is idle waits for the next user prompt; it does not start
-  a turn by itself. (The TUI shows completion immediately regardless.)
 - **Resurrecting tasks on `/resume`**: tasks are process-scoped.
   Persisted launch results and notices stand alone in the transcript.
 - **Live transcript reads of a running background agent** through
@@ -128,21 +133,28 @@ at the end for orchestration.
    `execute_turn` (i.e. immediately before every inference step). They
    are persisted like any other message so resumed transcripts read
    coherently.
-5. **Cursor-based incremental reads.** Each task keeps one
+5. **Notices wake idle owners.** The binary reacts to `TaskEnd` (and
+   to turn completion with notices still queued) by driving a wake
+   turn on the owner through the same per-agent turn machinery user
+   prompts use. A wake turn is an ordinary turn: gated per-agent,
+   cancellable per-view, visible in spinner/footer. Sub-agent wakes
+   run in the sub-agent's own chat; the user inspects what they came
+   up with by switching to that view (steering-spec semantics).
+6. **Cursor-based incremental reads.** Each task keeps one
    model-facing cursor; `task_output` returns only output since the
    last read. The notice for a finished bash task carries the unread
    tail (capped by the standard bash budgets), advancing the cursor —
    it behaves like an implicit final `task_output`, so short commands
    need no extra round-trip.
-6. **Tasks hang off a session-level cancellation root**, not the
+7. **Tasks hang off a session-level cancellation root**, not the
    per-turn token. The registry owns the root; the binary cancels it
    on shutdown. `task_kill` and the TUI cancel per-task child tokens.
-7. **Task lifecycle events** (`TaskStart` / `TaskOutput` / `TaskEnd`)
+8. **Task lifecycle events** (`TaskStart` / `TaskOutput` / `TaskEnd`)
    are new bus variants, transient like `ToolExecutionUpdate` (not
    persisted). They carry the originating `call_id` so the TUI updates
    the existing bash tool cell in place — no new box type for live
    output.
-8. **Sub-agents may start background bash tasks** (they inherit the
+9. **Sub-agents may start background bash tasks** (they inherit the
    toolset); ownership and notices are scoped to the spawning agent.
    Background *agent* spawns remain main-only because the `agent` tool
    stays filtered out of sub-agent toolsets.
@@ -201,10 +213,12 @@ Key operations (all lock-only, never held across `.await`):
   cursor (advances it). See §4.4.
 - `kill(id)` — cancels the entry's token; the driver flips status.
 - `snapshot() -> Vec<TaskSummary>` — for `task_list` and the picker.
-- `push_notice(notice)` / `drain_notices(owner) -> Vec<TaskNotice>` —
-  per-owner completion-notice queue (§4.6).
+- `push_notice(notice)` / `drain_notices(owner) -> Vec<TaskNotice>` /
+  `has_notices(owner) -> bool` — per-owner completion-notice queue
+  (§4.6); `has_notices` is what the binary's wake triggers poll
+  (§4.7).
 - `shutdown()` — cancels `root_cancel`; callers then await driver
-  quiescence (§4.7).
+  quiescence (§4.8).
 
 Output is type-erased behind a small trait so `aj-agent` stays free of
 process details while `aj-tools` keeps the buffering implementation:
@@ -272,7 +286,7 @@ impl TaskEventSink {
 
 The sink captures the `call_id` of the originating tool call so
 `TaskStart` / `TaskOutput` / `TaskEnd` correlate with the transcript
-cell (§4.8). Because drivers are plain tokio tasks, emits are properly
+cell (§4.9). Because drivers are plain tokio tasks, emits are properly
 `.await`ed — the `emit_update` sync/async impasse does not apply here.
 Bus listener errors are logged and swallowed by the sink: a task
 finishing outside any turn has no turn to abort, and persistence never
@@ -451,11 +465,59 @@ Sub-agent drain points are identical (`run_single_turn_inner` shares
 `execute_turn`), so a sub-agent that backgrounded a command hears
 about it inside its own run or on its next continuation.
 
-If the turn ends with notices still queued, they wait — completion
-visibility for the *user* is the TUI's job via `TaskEnd` (§4.8); the
-model hears about it next turn. No auto-wake (§2 non-goals).
+Notices arriving while the owner is idle (or surviving past a turn's
+end) do not wait for the user — they wake the owner (§4.7).
 
-### 4.7 Cancellation & lifecycle
+### 4.7 Auto-wake
+
+The agent runtime cannot start its own turns — the binary owns turn
+driving (per-agent `turns: JoinSet` + `turn_cancels` gating from the
+steering spec). So wake is split between a new entry point on `Agent`
+and two triggers in the binary.
+
+**`Agent::wake(cancel) -> Result<WakeOutcome, TurnError>`** — drains
+the owner's notice queue; if nothing was drained (a concurrent prompt
+or wake already consumed it) it returns `WakeOutcome::Empty` without
+emitting any event. Otherwise it appends the drained notice messages
+(same `MessageStart`/`MessageEnd` emission as §4.6), brackets the run
+with `AgentStart`/`AgentEnd` like every other top-level run, and
+drives `execute_turn`. This is `continue_run` minus the
+ends-in-user-message precondition — the drained notices *are* the
+user-role messages that make the transcript valid for inference.
+
+**Binary triggers**, both funneling into the same spawn path user
+submits use (resolve handle → gate → insert `turn_cancels` → spawn
+onto `turns`):
+
+1. **On `TaskEnd`**: if the owner is idle (`!turn_cancels.contains` &&
+   `!pump.is_running(owner)`), spawn a wake turn on it. If the owner
+   is busy, do nothing — the mid-run drain point or trigger 2 picks
+   the notice up.
+2. **On turn completion** (the `JoinSet` arm): if
+   `registry.has_notices(id)` for the agent that just finished, spawn
+   a wake turn on it. This closes the race where a task finishes
+   after the last mid-run drain point but before the turn ends.
+
+Because wake turns ride the normal machinery, everything composes
+without special cases: per-agent single-turn gating (a user submit
+and a wake can't overlap), Ctrl+C on the viewed agent cancels its
+wake turn, the editor disables while the viewed agent is woken, and a
+wake turn that itself backgrounds more tasks just continues the
+cycle. `WakeOutcome::Empty` makes the triggers idempotent — both may
+fire for the same notice and the second wake is a cheap no-op (the
+binary skips spawning when the gate is closed anyway).
+
+Sub-agent wakes need a live handle; owners always have one because
+task ownership is only acquired by a live run in this process
+(resumed, handle-less sub-agents cannot have started tasks).
+
+Wake turns apply the current run-config and count usage like any
+other turn. In print mode there is no trigger loop: the run ends when
+the main turn (and any `task_wait`s the model issued) complete, and
+remaining tasks are killed at exit — noted in the tool description so
+the model waits explicitly before finishing there.
+
+### 4.8 Cancellation & lifecycle
 
 Token hierarchy:
 
@@ -480,7 +542,7 @@ limitation, called out in the bash tool description so the model
 prefers proper foreground supervision (`background: true` on the
 supervisor) over `nohup`-style detachment.
 
-### 4.8 TUI
+### 4.9 TUI
 
 - **Pump**: track `tasks: BTreeMap<TaskId, TaskInfo>` from `TaskStart`
   / `TaskEnd` (`TaskInfo`: kind, label, owner, call_id, status).
@@ -505,7 +567,7 @@ supervisor) over `nohup`-style detachment.
   transcript shows the persisted launch cell (launch-window snapshot +
   task id badge) and any persisted notices; the registry starts empty.
 
-### 4.9 Events
+### 4.10 Events
 
 New `AgentEvent` variants, all carrying the owner's `agent_id` plus
 `task_id` and the originating `call_id`:
@@ -540,12 +602,24 @@ produces today, so renderers share one code path.
   as the standard cancelled outcome; tasks unaffected.
 - **Unknown / already-terminal ids** → `is_error` outcome listing
   live ids (unknown), or an immediate normal report (terminal).
-- **Owner never runs again** (sub-agent finished its turn and is never
-  re-prompted, or the user quits) → notices sit in the queue; the TUI
-  still showed `TaskEnd`; shutdown kills the task tree. Escalating
-  orphaned sub-agent notices to Main is an open question (§7).
+- **Sub-agent-owned task finishes after the sub-agent's run ended** →
+  trigger 1 wakes the sub-agent in its own chat; the user inspects the
+  result by switching views. No escalation to Main.
+- **Task finishes while the owner's turn is ending** (after the last
+  mid-run drain point) → trigger 2 catches it on turn completion.
+- **Wake races a user submit** → per-agent gating serializes them;
+  whichever runs first drains the queue, and the loser's wake is an
+  `Empty` no-op (or the prompt path's drain delivers the notices
+  before the user's message).
 - **Turn aborts mid-batch with notices pending** → the drain point is
-  skipped with the rest of the loop; notices survive for the next run.
+  skipped with the rest of the loop; trigger 2 fires on the aborted
+  turn's completion, so the notices still wake the owner. If the user
+  cancelled deliberately and also wants the tasks gone, that's
+  `task_kill` / the picker's kill — cancelling a turn has never
+  implied killing its children.
+- **User quits with notices queued** → the TUI already showed
+  `TaskEnd`; shutdown kills the task tree; queued notices die with the
+  process (they are only persisted once drained into a transcript).
 - **Print mode** → works (registry defaults), but tasks pending when
   the run ends are killed at exit; the model should `task_wait` before
   finishing. Worth one line in the tool description.
@@ -564,7 +638,8 @@ produces today, so renderers share one code path.
 - `src/aj-agent/src/lib.rs`: `TaskRegistry` + notice queue;
   `Agent::set_task_registry`; wrapper plumbing; background path in
   `spawn_agent`; drain points in `run_top_level_turn_inner` /
-  `execute_turn`; usage folding at drain.
+  `execute_turn`; `Agent::wake` + `WakeOutcome`; usage folding at
+  drain.
 - `src/aj-agent/src/events.rs`: `TaskStart` / `TaskOutput` / `TaskEnd`.
 - `src/aj-tools/src/tools/bash.rs`: `background` input, driver
   extraction (the run loop becomes shared between foreground and
@@ -574,29 +649,30 @@ produces today, so renderers share one code path.
   outcome.
 - `src/aj-tools/src/tools/`: new `task.rs` with the four `task_*`
   tools.
-- `src/aj/src/modes/interactive.rs`: registry injection; shutdown
-  ordering (`registry.shutdown()` + grace before `turns.shutdown()`);
-  Ctrl+C arming text.
+- `src/aj/src/modes/interactive.rs`: registry injection; wake
+  triggers (on `TaskEnd` in the bus arm, on turn completion in the
+  `JoinSet` arm); shutdown ordering (`registry.shutdown()` + grace
+  before `turns.shutdown()`); Ctrl+C arming text.
 - `src/aj/src/modes/interactive/event_pump.rs` + `components/footer.rs`
-  + `components/agent_picker.rs` + chat-view cell updates: §4.8.
+  + `components/agent_picker.rs` + chat-view cell updates: §4.9.
 
 ---
 
-## 7. Open questions
+## 7. Resolved decisions
 
-1. **Orphaned sub-agent notices**: should a notice owned by a
-   sub-agent that is never re-prompted escalate to Main after some
-   time, or is TUI visibility enough? Shipping with owner-scoped only;
-   revisit with usage data.
-2. **Auto-continue on completion**: injecting a notice and immediately
-   driving a `continue_run` when the owner is idle would close the
-   loop fully autonomously. Deliberately out of scope until we trust
-   the notice path; the design leaves room (notices are already in the
-   transcript when the next run starts).
-3. **Per-task output budget for the TUI**: live cells currently keep
-   whatever the snapshot carries; a very long-running task may warrant
-   a dedicated full-screen view (generalizing `ChatView`'s active id
-   to `Agent|Task`). Deferred; the spill file covers full history.
+1. **Sub-agent notices stay in the sub-agent's chat** and wake the
+   sub-agent there — no escalation to Main. The user inspects the
+   woken sub-agent's output by switching to its view; if its
+   conclusions matter to Main, the user (or a future report-to-parent
+   action) carries them over.
+2. **Auto-wake is in scope** (§4.7). Waking without polling is the
+   point of backgrounding; without it a notice can rot until the next
+   user prompt.
+3. **No dedicated full-screen task view this iteration.** The inline
+   live cell plus the always-persisted spill file is the v1
+   observation surface; we revisit after test-driving (a `ChatView`
+   active-id generalization to `Agent|Task` is the sketched path if
+   the inline cell proves too cramped).
 
 ---
 
@@ -608,15 +684,17 @@ statuses, notice queue, `ToolContext` additions, `Task*` events,
 scripted provider: queue a notice, assert the injected user message
 and its `MessageStart`/`MessageEnd` pair). No tool uses it yet.
 
-**Stage B — background bash + read/wait/kill/list.** Extract the bash
-driver, implement the launch window, `TaskOutputSource` over
-`StreamState` (always-persisted spill), and the four `task_*` tools.
-End-to-end: start, poll, wait, kill, notice-on-completion.
+**Stage B — background bash + read/wait/kill/list + wake.** Extract
+the bash driver, implement the launch window, `TaskOutputSource` over
+`StreamState` (always-persisted spill), the four `task_*` tools,
+`Agent::wake`, and the binary's two wake triggers. End-to-end: start,
+poll, wait, kill, notice-on-completion, idle owner wakes and reacts.
 
 **Stage C — background agent spawn.** `SpawnMode` plumbing, detached
 run driver, usage folding at drain, started outcome. Verify the
 steering-spec gating (submit-to-running-sub refused) holds for
-background initial runs.
+background initial runs, and that wake works for sub-agent owners in
+their own chats.
 
 **Stage D — TUI.** Pump task tracking, footer aggregate, picker
 entries + kill action, live cell updates off `TaskOutput`, frozen
@@ -633,8 +711,10 @@ arming text, print-mode kill-at-exit, tool-description notes
 - **aj-agent**: registry insert/read/kill/snapshot; cursor semantics
   incl. eviction marker; notice drain at both injection points (idle →
   prompt-start; mid-run → post-batch) with persistence-shaped
-  `MessageEnd`s; suppressed notice after cursor-at-EOF read; task ids
-  monotonic; shutdown cancels all task tokens.
+  `MessageEnd`s; suppressed notice after cursor-at-EOF read;
+  `Agent::wake` drains-then-runs with full event bracketing and
+  returns `Empty` (no events) on an empty queue; task ids monotonic;
+  shutdown cancels all task tokens.
 - **aj-tools**: launch-window fast-exit returns foreground shape;
   started shape carries id + window output; `task_output` incremental
   reads (twice → second read empty), truncation markers, unknown id;
@@ -644,7 +724,9 @@ arming text, print-mode kill-at-exit, tool-description notes
 - **agent tool**: background spawn returns started; report arrives as
   a notice; `SubAgentEnd` still emitted; usage folded at drain;
   killing the task cancels the child's run.
-- **aj (pump/UI)**: footer counts agents + bash tasks separately; cell
-  live-updates off `TaskOutput` and freezes on `TaskEnd`; picker shows
-  and kills tasks; resume renders persisted launch cells without a
-  registry.
+- **aj (pump/UI/wake)**: footer counts agents + bash tasks separately;
+  cell live-updates off `TaskOutput` and freezes on `TaskEnd`; picker
+  shows and kills tasks; resume renders persisted launch cells without
+  a registry; `TaskEnd` with an idle owner spawns a wake turn; a busy
+  owner defers to the turn-completion trigger; wake vs. user-submit
+  gating; Ctrl+C cancels a viewed wake turn.
