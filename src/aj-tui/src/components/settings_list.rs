@@ -168,6 +168,12 @@ pub struct SettingsList {
     on_cancel: CancelCallback,
     focused: bool,
     active_submenu: Option<ActiveSubmenu>,
+    /// Height budget pushed by the host via
+    /// [`Component::set_available_height`]. Remembered so a submenu
+    /// opened later starts with the same budget. `None` until the
+    /// host pushes one; `max_visible` then stays at its constructor
+    /// value.
+    available_height: Option<usize>,
 }
 
 impl SettingsList {
@@ -195,6 +201,7 @@ impl SettingsList {
             on_cancel: Box::new(on_cancel),
             focused: false,
             active_submenu: None,
+            available_height: None,
         }
     }
 
@@ -288,7 +295,11 @@ impl SettingsList {
             .as_ref()
             .expect("open_submenu called on item without submenu");
         let current = self.items[item_idx].current_value.clone();
-        let component = factory(&current, done);
+        let mut component = factory(&current, done);
+
+        if let Some(rows) = self.available_height {
+            component.set_available_height(rows);
+        }
 
         self.active_submenu = Some(ActiveSubmenu {
             component,
@@ -391,6 +402,18 @@ impl SettingsList {
             .max()
             .unwrap_or(0)
             .min(30)
+    }
+
+    /// Rows `render` may emit around the visible item window: the
+    /// search input + its trailing blank (when enabled), the scroll
+    /// indicator, a two-row reserve for the selected item's
+    /// description, and the blank + trailing hint. The description
+    /// reserve is a heuristic — a long description can wrap further
+    /// and push past the budget, in which case the host (e.g. an
+    /// overlay window) truncates the overflow.
+    fn chrome_rows(&self) -> usize {
+        let search = if self.search.is_some() { 2 } else { 0 };
+        search + 1 + 2 + 2
     }
 }
 
@@ -615,6 +638,14 @@ impl Component for SettingsList {
         self.focused = focused;
         if let Some(ref mut search) = self.search {
             search.set_focused(focused);
+        }
+    }
+
+    fn set_available_height(&mut self, rows: usize) {
+        self.available_height = Some(rows);
+        self.max_visible = rows.saturating_sub(self.chrome_rows()).max(1);
+        if let Some(active) = self.active_submenu.as_mut() {
+            active.component.set_available_height(rows);
         }
     }
 

@@ -35,7 +35,8 @@ use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
 use aj_conf::{
-    AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, SystemPromptSource, display_path,
+    AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel, Severity,
+    SystemPromptSource, display_path,
 };
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
@@ -43,6 +44,7 @@ use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
 use aj_models::types::{Speed, StreamOptions};
 use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, ThreadFilter};
+use aj_tools::{BuiltinToolOptions, get_builtin_tools};
 use aj_tui::EditorComponent;
 use aj_tui::components::editor::Editor;
 use aj_tui::terminal::ProcessTerminal;
@@ -58,7 +60,8 @@ use crate::config::slash_commands::{
     SlashAction, dispatch as slash_dispatch, load_model_catalog, thinking_level_name,
 };
 use crate::config::theme::{
-    Theme, ThemeHandle, editor_border_color_for_thinking, select_list_theme, watch_user_theme,
+    Theme, ThemeHandle, ThemeWatcherGuard, editor_border_color_for_thinking, select_list_theme,
+    settings_list_theme, watch_user_theme,
 };
 use crate::model::{ResolvedModel, from_model_info};
 use crate::modes::interactive::components::agent_picker::{
@@ -85,6 +88,11 @@ use crate::modes::interactive::components::prompt_history::{
 };
 use crate::modes::interactive::components::session_selector::{
     OutcomeHandle as SessionOutcomeHandle, SessionSelectorComponent, SessionSelectorOutcome,
+};
+use crate::modes::interactive::components::settings_window::{
+    ChangesHandle as SettingsChangesHandle, CorrectionsHandle as SettingsCorrectionsHandle,
+    MODEL_SETTING_ID, OutcomeHandle as SettingsOutcomeHandle, SettingsCurrentValues,
+    SettingsWindowComponent, SettingsWindowOutcome, UNSET_VALUE,
 };
 use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
@@ -431,15 +439,10 @@ impl InteractiveMode {
         let theme = ThemeHandle::new(Theme::load(&configured_theme));
 
         // ---- Theme file watcher (hot-reload) -------------------------
-        // Only user-supplied themes get a watcher; bundled `dark` /
-        // `light` palettes live inside the binary and have no on-disk
-        // source to edit. `watch_user_theme` short-circuits on missing
-        // file / unset `$HOME` and silently degrades to "no
-        // hot-reload" when the notify backend can't start.
-        let (theme_watcher_guard, mut theme_rx) = match watch_user_theme(&configured_theme) {
-            Some((guard, rx)) => (Some(guard), Some(rx)),
-            None => (None, None),
-        };
+        // The watcher follows the *configured* theme; a runtime theme
+        // switch through the settings window reinstalls it for the
+        // newly chosen name.
+        let mut theme_watch = ThemeWatch::install(&configured_theme);
 
         // ---- First session world --------------------------------------
         // One shared render-settings handle for the whole process:
@@ -604,9 +607,9 @@ impl InteractiveMode {
         }
 
         // Shared, mutable view of the on-disk config. Selector
-        // outcomes (model / thinking, and future settings popups)
-        // mutate this and persist it via `persist_config` so a choice
-        // made in the TUI survives a restart. Held behind a std mutex
+        // outcomes (model / thinking / the settings window) mutate
+        // this and persist it via `persist_config` so a choice made
+        // in the TUI survives a restart. Held behind a std mutex
         // because the write is a quick synchronous read-merge-write
         // (`Config::persist_changed`) done off the guard, never awaited
         // across.
@@ -640,7 +643,7 @@ impl InteractiveMode {
         // carrying the final world (when one is still alive) for the
         // shutdown banner below.
         let (final_world, run_result): (Option<SessionWorld>, Result<()>) = loop {
-            let spec = match run_session(&mut shell, &mut world, &mut theme_rx).await {
+            let spec = match run_session(&mut shell, &mut world, &mut theme_watch).await {
                 Ok(SessionExit::Quit) => break (Some(world), Ok(())),
                 Err(fatal) => break (Some(world), Err(fatal)),
                 Ok(SessionExit::New) => SessionSpec::Create {
@@ -701,12 +704,12 @@ impl InteractiveMode {
             }
         };
 
-        // Drop the watcher guard explicitly so its `Drop`
-        // tears down the notify watcher before the runtime exits.
-        // Without this the variable would still be live across the
+        // Drop the watcher explicitly so its guard's `Drop` tears
+        // down the notify watcher before the runtime exits. Without
+        // this the variable would still be live across the
         // `tui.stop()` call below and trigger a clippy warning
         // about meaningless drops if we later wanted to be explicit.
-        drop(theme_watcher_guard);
+        drop(theme_watch);
 
         shell.tui.stop();
 
@@ -953,7 +956,7 @@ impl SessionRequest {
 async fn run_session(
     shell: &mut Shell,
     world: &mut SessionWorld,
-    theme_rx: &mut Option<UnboundedReceiver<Theme>>,
+    theme_watch: &mut ThemeWatch,
 ) -> Result<SessionExit> {
     // ---- Main event loop ------------------------------------------
     // In-flight turns keyed by the agent running them. `JoinSet`
@@ -1408,6 +1411,8 @@ async fn run_session(
                                 &shell.auth,
                                 Arc::clone(&shell.model_catalog),
                                 Arc::clone(&shell.run_config),
+                                &shell.config,
+                                &shell.render_settings,
                                 world,
                                 &shell.conversation_persistence,
                                 &shell.theme,
@@ -1448,6 +1453,8 @@ async fn run_session(
                                 &shell.auth,
                                 Arc::clone(&shell.model_catalog),
                                 Arc::clone(&shell.run_config),
+                                &shell.config,
+                                &shell.render_settings,
                                 world,
                                 &shell.conversation_persistence,
                                 &shell.theme,
@@ -1488,6 +1495,8 @@ async fn run_session(
                                 &shell.auth,
                                 Arc::clone(&shell.model_catalog),
                                 Arc::clone(&shell.run_config),
+                                &shell.config,
+                                &shell.render_settings,
                                 world,
                                 &shell.conversation_persistence,
                                 &shell.theme,
@@ -1525,6 +1534,8 @@ async fn run_session(
                                 &shell.model_catalog,
                                 world,
                                 &shell.theme,
+                                &shell.render_settings,
+                                theme_watch,
                             ).await {
                                 SelectorPollOutcome::StillOpen(reopened) => {
                                     open_selector = Some(reopened);
@@ -1588,6 +1599,8 @@ async fn run_session(
                                             &shell.auth,
                                             Arc::clone(&shell.model_catalog),
                                             Arc::clone(&shell.run_config),
+                                            &shell.config,
+                                            &shell.render_settings,
                                             world,
                                             &shell.conversation_persistence,
                                             &shell.theme,
@@ -1650,6 +1663,8 @@ async fn run_session(
                                     &shell.auth,
                                     Arc::clone(&shell.model_catalog),
                                     Arc::clone(&shell.run_config),
+                                    &shell.config,
+                                    &shell.render_settings,
                                     world,
                                     &shell.conversation_persistence,
                                     &shell.theme,
@@ -1743,13 +1758,13 @@ async fn run_session(
 
             // --- Theme reload (fs-watcher) ---
             // Coalesced re-parses of `~/.aj/themes/<name>.json`
-            // flow through here. `theme_rx` is `None` when no
-            // watcher is active (bundled shell.theme name with no
+            // flow through here. The receiver is `None` when no
+            // watcher is active (bundled theme name with no
             // override, missing `$HOME`, or the notify backend
             // declined to start); the helper folds that into a
             // pending-forever future so the select arm is
             // harmless in those cases.
-            maybe_new_theme = recv_theme(theme_rx.as_mut()) => {
+            maybe_new_theme = recv_theme(theme_watch.rx.as_mut()) => {
                 let Some(new_theme) = maybe_new_theme else { continue };
                 let name = new_theme.name().to_string();
                 shell.theme.replace(new_theme);
@@ -1973,6 +1988,18 @@ enum OpenSelector {
         outcome: AuthStatusOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
+    /// Settings window (`/settings`). Stays open across changes: the
+    /// host drains `changes` after every input event, applying and
+    /// persisting each entry (and pushing a display fix through
+    /// `corrections` when an apply fails); `outcome` only ever
+    /// reports the close.
+    Settings {
+        handle: OverlayHandle,
+        outcome: SettingsOutcomeHandle,
+        changes: SettingsChangesHandle,
+        corrections: SettingsCorrectionsHandle,
+        parent_palette: Option<ParentPalette>,
+    },
 }
 
 /// What confirming a provider in the [`OpenSelector::AuthPicker`]
@@ -2109,6 +2136,40 @@ fn error_event(text: &str) -> AgentEvent {
 /// the bundled `dark` palette.)
 fn resolve_theme_name(configured: Option<&str>) -> &str {
     configured.unwrap_or("light")
+}
+
+/// The live theme file watcher: the notify guard plus the receiver
+/// the main loop's reload arm polls. Bundled to a single owner so a
+/// runtime theme switch (the settings window) can re-point the
+/// watcher at the new theme's file by reinstalling the pair in
+/// place.
+struct ThemeWatch {
+    /// Keeps the notify watcher alive; dropping it tears the
+    /// watcher down. Never read — held purely for its `Drop`.
+    _guard: Option<ThemeWatcherGuard>,
+    rx: Option<UnboundedReceiver<Theme>>,
+}
+
+impl ThemeWatch {
+    /// Install a watcher for `name`. Only user-supplied themes get
+    /// one; bundled `dark` / `light` palettes live inside the binary
+    /// and have no on-disk source to edit. `watch_user_theme`
+    /// short-circuits on missing file / unset `$HOME` and silently
+    /// degrades to "no hot-reload" when the notify backend can't
+    /// start — both fields are then `None` and the reload arm is
+    /// inert.
+    fn install(name: &str) -> Self {
+        match watch_user_theme(name) {
+            Some((guard, rx)) => Self {
+                _guard: Some(guard),
+                rx: Some(rx),
+            },
+            None => Self {
+                _guard: None,
+                rx: None,
+            },
+        }
+    }
 }
 
 /// Build the chat-scrollback "Context:" notice listing everything
@@ -2462,6 +2523,11 @@ fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
             handle,
             parent_palette,
             ..
+        }
+        | OpenSelector::Settings {
+            handle,
+            parent_palette,
+            ..
         } => {
             tui.hide_overlay(&handle);
             if let Some(parent) = parent_palette {
@@ -2564,6 +2630,8 @@ async fn handle_slash_command(
     auth: &AuthStorage,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    render_settings: &RenderSettings,
     world: &SessionWorld,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
@@ -2918,6 +2986,68 @@ async fn handle_slash_command(
             notice: Some(session_busy_notice("start a new session")),
         },
         SlashAction::NewSession => SlashHandled::SessionChange(SessionRequest::New),
+        SlashAction::OpenSettings => {
+            // Snapshot the live values the window opens with. Model /
+            // thinking / speed come from the run config (the loop-side
+            // truth for the next turn); the render toggles from the
+            // shared handle; the rest from the persisted config.
+            let current = {
+                let run_cfg = run_config.lock().expect("run config mutex poisoned");
+                let cfg = config.lock().expect("config mutex poisoned");
+                SettingsCurrentValues {
+                    model_key: run_cfg.model_key.clone(),
+                    model_url: cfg.model_url.clone(),
+                    thinking: thinking_level_name(&run_cfg.thinking).to_string(),
+                    thinking_display: cfg.thinking_display.map(|d| d.to_string()),
+                    speed: speed_name(run_cfg.speed).to_string(),
+                    theme: resolve_theme_name(cfg.theme.as_deref()).to_string(),
+                    disabled_tools: cfg.disabled_tools.clone(),
+                    hide_thinking_block: render_settings.hide_thinking_block(),
+                    image_auto_resize: cfg.image_auto_resize,
+                    image_show_in_terminal: render_settings.show_image_in_terminal(),
+                    image_block: cfg.image_block,
+                }
+            };
+            // Builtin tool names for the disabled-tools toggle list.
+            // Constructing the tools just for their names is mildly
+            // wasteful but matches what a session build does, and
+            // keeps the list sourced from the actual registry.
+            let tool_names: Vec<String> = get_builtin_tools(&BuiltinToolOptions::default())
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            let inner = SettingsWindowComponent::new(
+                settings_list_theme(theme),
+                select_list_theme(theme),
+                (*model_catalog).clone(),
+                Theme::available(),
+                tool_names,
+                current,
+            );
+            let outcome = inner.outcome_handle();
+            let changes = inner.changes_handle();
+            let corrections = inner.corrections_handle();
+            let initial_inner_rows = large_overlay_inner_rows(usize::from(tui.terminal().rows()));
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Settings",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                initial_inner_rows,
+            )
+            .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
+            .with_subtitle(&subtitle_close());
+            let handle = tui.show_overlay(Box::new(window), large_overlay_options());
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::Settings {
+                    handle,
+                    outcome,
+                    changes,
+                    corrections,
+                    parent_palette: parent_palette.clone(),
+                }),
+                notice: None,
+            }
+        }
         SlashAction::Help => {
             use crate::modes::interactive::components::help_overlay::HelpOverlayComponent;
             let inner = HelpOverlayComponent::new(select_list_theme(theme));
@@ -2971,7 +3101,8 @@ async fn handle_slash_command(
                         | OpenSelector::AgentPicker { .. }
                         | OpenSelector::Help { .. }
                         | OpenSelector::AuthPicker { .. }
-                        | OpenSelector::AuthStatus { .. },
+                        | OpenSelector::AuthStatus { .. }
+                        | OpenSelector::Settings { .. },
                 ),
                 ..
             },
@@ -3157,8 +3288,16 @@ async fn confirm_model_for_main(
         Ok(ResolvedModel {
             provider,
             model_info,
-            stream_options,
+            mut stream_options,
         }) => {
+            // Re-apply the configured thinking-display mode: the
+            // rebuilt baseline options would otherwise silently drop
+            // it on every model swap.
+            let display = config
+                .lock()
+                .expect("config mutex poisoned")
+                .thinking_display;
+            crate::model::apply_thinking_display(&mut stream_options, display);
             // Stage the swap into the loop-side snapshot (provider +
             // model + options + the pre-select key); the next turn
             // applies it. Never locks the agent, so it's safe
@@ -3308,12 +3447,314 @@ async fn confirm_model_for_sub(
     }
 }
 
+/// Apply one settings-window change to the running session and
+/// persist it. Returns the user-facing notice.
+///
+/// Live-appliable settings reuse the same confirm paths as their
+/// dedicated selectors (`/model`, `/thinking`) or stage into the run
+/// config / render settings; the agent- and tool-construction
+/// settings are persisted with a "takes effect for new sessions /
+/// on restart" note. When an apply fails the row's displayed value
+/// is reverted through `corrections` so the window never shows a
+/// value that isn't actually active.
+#[allow(clippy::too_many_arguments)]
+async fn apply_setting_change(
+    tui: &mut Tui,
+    id: &str,
+    value: &str,
+    auth: &AuthStorage,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    model_catalog: &[ModelInfo],
+    world: &mut SessionWorld,
+    theme: &ThemeHandle,
+    theme_watch: &mut ThemeWatch,
+    render_settings: &RenderSettings,
+    corrections: &SettingsCorrectionsHandle,
+) -> Option<String> {
+    match id {
+        MODEL_SETTING_ID => {
+            // The picker only emits catalog rows, so the lookup is
+            // effectively infallible; degrade with a notice anyway.
+            let Some(info) = value.split_once('/').and_then(|(provider, model_id)| {
+                model_catalog
+                    .iter()
+                    .find(|m| m.provider == provider && m.id == model_id)
+                    .cloned()
+            }) else {
+                let active = {
+                    let cfg = run_config.lock().expect("run config mutex poisoned");
+                    format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
+                };
+                push_correction(corrections, tui, MODEL_SETTING_ID, active);
+                return Some(format!("Unknown model {value}."));
+            };
+            let notice = confirm_model_for_main(tui, info, auth, run_config, config, world).await;
+            // `confirm_model_for_main` reports a rebuild failure only
+            // as notice text; compare the staged key instead so the
+            // row reverts to the model that's actually active.
+            let active = {
+                let cfg = run_config.lock().expect("run config mutex poisoned");
+                format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
+            };
+            if active != value {
+                push_correction(corrections, tui, MODEL_SETTING_ID, active);
+            }
+            Some(notice)
+        }
+        "thinking" => match thinking_config_from_name(value) {
+            Some(level) => {
+                Some(confirm_thinking_for_main(tui, level, run_config, config, world, theme).await)
+            }
+            None => Some(format!("Unknown thinking level {value:?}.")),
+        },
+        "thinking_display" => {
+            let display = if value == UNSET_VALUE {
+                None
+            } else {
+                match value.parse::<ConfigThinkingDisplay>() {
+                    Ok(d) => Some(d),
+                    Err(err) => return Some(format!("Can't set thinking_display: {err}")),
+                }
+            };
+            {
+                let mut cfg = run_config.lock().expect("run config mutex poisoned");
+                crate::model::apply_thinking_display(&mut cfg.stream_options, display);
+            }
+            let save_note = persist_config(config, |c| c.thinking_display = display);
+            Some(join_notice(
+                format!("Thinking display set to {value}. Takes effect next turn."),
+                save_note,
+            ))
+        }
+        "speed" => match speed_from_name(value) {
+            Some(speed) => Some(
+                confirm_speed_for_main(tui, speed, auth, run_config, config, world, corrections)
+                    .await,
+            ),
+            None => Some(format!("Unknown speed {value:?}.")),
+        },
+        "theme" => {
+            // Strict load so a broken user theme surfaces instead of
+            // silently falling back to the bundled dark palette.
+            match Theme::load_strict(value) {
+                Ok(loaded) => {
+                    theme.replace(loaded);
+                    tui.invalidate();
+                    tui.request_render();
+                    // Re-point the hot-reload watcher at the newly
+                    // configured theme's file.
+                    *theme_watch = ThemeWatch::install(value);
+                    let save_note = persist_config(config, |c| c.theme = Some(value.to_string()));
+                    Some(join_notice(format!("Theme set to {value}."), save_note))
+                }
+                Err(err) => {
+                    let active = {
+                        let cfg = config.lock().expect("config mutex poisoned");
+                        resolve_theme_name(cfg.theme.as_deref()).to_string()
+                    };
+                    push_correction(corrections, tui, "theme", active);
+                    Some(format!("Couldn't load theme {value:?}: {err}"))
+                }
+            }
+        }
+        "hide_thinking_block" => {
+            let hide = value == "true";
+            render_settings.set_hide_thinking_block(hide);
+            tui.request_render();
+            let save_note = persist_config(config, |c| c.hide_thinking_block = hide);
+            Some(join_notice(
+                format!(
+                    "Thinking blocks {}.",
+                    if hide { "hidden" } else { "expanded" }
+                ),
+                save_note,
+            ))
+        }
+        "image_show_in_terminal" => {
+            let show = value == "true";
+            render_settings.set_show_image_in_terminal(show);
+            tui.request_render();
+            let save_note = persist_config(config, |c| c.image_show_in_terminal = show);
+            Some(join_notice(
+                format!("image_show_in_terminal set to {show}."),
+                save_note,
+            ))
+        }
+        "image_auto_resize" => {
+            let on = value == "true";
+            let save_note = persist_config(config, |c| c.image_auto_resize = on);
+            Some(join_notice(
+                format!("image_auto_resize set to {on}. Takes effect for new sessions."),
+                save_note,
+            ))
+        }
+        "image_block" => {
+            let on = value == "true";
+            let save_note = persist_config(config, |c| c.image_block = on);
+            Some(join_notice(
+                format!("image_block set to {on}. Takes effect for new sessions."),
+                save_note,
+            ))
+        }
+        "model_url" => {
+            let url = (!value.is_empty()).then(|| value.to_string());
+            let save_note = persist_config(config, |c| c.model_url = url.clone());
+            let what = match &url {
+                Some(u) => format!("set to {u}"),
+                None => "unset".to_string(),
+            };
+            Some(join_notice(
+                format!("model_url {what}. Takes effect on restart."),
+                save_note,
+            ))
+        }
+        "disabled_tools" => {
+            let tools: Vec<String> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let save_note = persist_config(config, |c| c.disabled_tools = tools.clone());
+            let what = if tools.is_empty() {
+                "cleared".to_string()
+            } else {
+                format!("set to {}", tools.join(", "))
+            };
+            Some(join_notice(
+                format!("disabled_tools {what}. Takes effect for new sessions."),
+                save_note,
+            ))
+        }
+        other => Some(format!("Unknown setting {other:?}.")),
+    }
+}
+
+/// Apply a speed change to the main agent: rebuild the provider
+/// bundle at the current model so the speed-derived headers are
+/// re-stamped, stage it into the run config, persist to
+/// `config.toml`, record on the session log's user thread, and
+/// refresh the footer. On a rebuild failure (e.g. scripted mode,
+/// whose provider isn't in the registry) nothing is staged and the
+/// settings row is reverted via `corrections`. Returns the
+/// user-facing notice.
+async fn confirm_speed_for_main(
+    tui: &mut Tui,
+    speed: Option<Speed>,
+    auth: &AuthStorage,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    world: &mut SessionWorld,
+    corrections: &SettingsCorrectionsHandle,
+) -> String {
+    let name = speed_name(speed);
+    let (model_info, prev_speed) = {
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        ((*cfg.model_info).clone(), cfg.speed)
+    };
+    match from_model_info(auth, model_info, speed) {
+        Ok(ResolvedModel {
+            provider,
+            model_info,
+            mut stream_options,
+        }) => {
+            // The rebuilt baseline options would otherwise drop the
+            // configured thinking-display mode.
+            let display = config
+                .lock()
+                .expect("config mutex poisoned")
+                .thinking_display;
+            crate::model::apply_thinking_display(&mut stream_options, display);
+            // Stage into the loop-side snapshot; the next turn
+            // applies it. Never locks the agent, so it's safe
+            // mid-turn.
+            let (settings, window) = {
+                let mut cfg = run_config.lock().expect("run config mutex poisoned");
+                cfg.provider = provider;
+                cfg.model_info = model_info;
+                cfg.stream_options = stream_options;
+                cfg.speed = speed;
+                (
+                    aj_agent::events::AgentSettings {
+                        provider: cfg.model_key.0.clone(),
+                        model_id: cfg.model_key.1.clone(),
+                        thinking: thinking_level_name(&cfg.thinking).to_string(),
+                        speed: name.to_string(),
+                    },
+                    cfg.model_info.context_window,
+                )
+            };
+            world
+                .pump
+                .note_agent_settings(tui, AgentId::Main, settings, window);
+            // Record the change on the session log's user thread so a
+            // later resume restores this speed.
+            let log_note = {
+                let mut log = world.log.lock().await;
+                log.append_speed_change(ThreadFilter::USER, name)
+                    .err()
+                    .map(|err| format!("(couldn't record in session log: {err})"))
+            };
+            // "standard" persists as key removal: it's the default,
+            // and `speed_from_name` maps it to `None` on the wire.
+            let save_note = persist_config(config, |c| {
+                c.speed = match speed {
+                    None | Some(Speed::Standard) => None,
+                    Some(Speed::Fast) => Some(ConfigSpeed::Fast),
+                };
+            });
+            let mut notice = format!("Speed set to {name}. Takes effect next turn.");
+            for note in [save_note, log_note].into_iter().flatten() {
+                notice.push(' ');
+                notice.push_str(&note);
+            }
+            notice
+        }
+        Err(err) => {
+            push_correction(
+                corrections,
+                tui,
+                "speed",
+                speed_name(prev_speed).to_string(),
+            );
+            format!("Failed to set speed {name}: {err}")
+        }
+    }
+}
+
+/// Queue a display fix for a settings-window row and schedule a
+/// repaint so the component drains it promptly.
+fn push_correction(
+    corrections: &SettingsCorrectionsHandle,
+    tui: &mut Tui,
+    id: &str,
+    value: String,
+) {
+    corrections
+        .lock()
+        .expect("settings corrections poisoned")
+        .push((id.to_string(), value));
+    tui.request_render();
+}
+
+/// Append an optional follow-up note (e.g. a persist failure) to a
+/// confirmation notice.
+fn join_notice(mut notice: String, note: Option<String>) -> String {
+    if let Some(note) = note {
+        notice.push(' ');
+        notice.push_str(&note);
+    }
+    notice
+}
+
 /// Poll an open selector for its outcome and apply the result.
 ///
 /// Returns [`SelectorPollOutcome::StillOpen`] if the user hasn't
 /// pressed Enter or Esc yet; [`SelectorPollOutcome::Closed`] if the
 /// overlay completed, with an optional notice describing what
 /// happened.
+#[allow(clippy::too_many_arguments)]
 async fn handle_selector_outcome(
     tui: &mut Tui,
     selector: OpenSelector,
@@ -3323,6 +3764,8 @@ async fn handle_selector_outcome(
     model_catalog: &[ModelInfo],
     world: &mut SessionWorld,
     theme: &ThemeHandle,
+    render_settings: &RenderSettings,
+    theme_watch: &mut ThemeWatch,
 ) -> SelectorPollOutcome {
     match selector {
         OpenSelector::Thinking {
@@ -3705,6 +4148,65 @@ async fn handle_selector_outcome(
                     }
                 }
                 Some(AgentPickerOutcome::Cancelled) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                        session_request: None,
+                    }
+                }
+            }
+        }
+        OpenSelector::Settings {
+            handle,
+            outcome,
+            changes,
+            corrections,
+            parent_palette,
+        } => {
+            // Apply queued changes first — the window stays open
+            // while the user keeps editing, so changes and the
+            // eventual close arrive through separate channels.
+            let drained: Vec<(String, String)> =
+                std::mem::take(&mut *changes.lock().expect("settings changes poisoned"));
+            for (id, value) in drained {
+                let notice = apply_setting_change(
+                    tui,
+                    &id,
+                    &value,
+                    auth,
+                    &run_config,
+                    &config,
+                    model_catalog,
+                    world,
+                    theme,
+                    theme_watch,
+                    render_settings,
+                    &corrections,
+                )
+                .await;
+                if let Some(text) = notice {
+                    world.pump.handle(tui, &notice_event(&text));
+                }
+            }
+            let outcome_value = outcome.lock().expect("settings outcome poisoned").take();
+            match outcome_value {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Settings {
+                    handle,
+                    outcome,
+                    changes,
+                    corrections,
+                    parent_palette,
+                }),
+                Some(SettingsWindowOutcome::Closed) => {
                     tui.hide_overlay(&handle);
                     if let Some(parent) = parent_palette {
                         tui.set_overlay_hidden(&parent.handle, false);
@@ -4335,6 +4837,11 @@ mod tests {
             &[],
             world,
             &theme,
+            &RenderSettings::new(false, false, true),
+            &mut ThemeWatch {
+                _guard: None,
+                rx: None,
+            },
         )
         .await
     }
@@ -4483,6 +4990,11 @@ mod tests {
             &[],
             &mut world,
             &theme,
+            &RenderSettings::new(false, false, true),
+            &mut ThemeWatch {
+                _guard: None,
+                rx: None,
+            },
         )
         .await;
 

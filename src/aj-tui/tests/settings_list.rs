@@ -839,3 +839,95 @@ fn invalidate_forwards_to_the_active_submenu() {
     list.invalidate();
     assert_eq!(*invalidate_count.borrow(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Available-height propagation
+// ---------------------------------------------------------------------------
+
+/// Build many cycleable items so the visible-row window is what
+/// bounds the render, not the item count.
+fn many_items(count: usize) -> Vec<SettingItem> {
+    (0..count)
+        .map(|i| {
+            SettingItem::cycleable(
+                format!("item-{i}"),
+                format!("Item {i}"),
+                "a",
+                vec!["a".to_string(), "b".to_string()],
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn set_available_height_grows_the_visible_window() {
+    let (mut list, _changes, _cancels) =
+        make_settings_list(many_items(20), SettingsListOptions::default());
+
+    // Constructor budget: 5 visible rows.
+    let before = list.render(60).len();
+
+    // A generous budget should surface more rows than the
+    // constructor's max_visible.
+    list.set_available_height(24);
+    let after = list.render(60).len();
+    assert!(
+        after > before,
+        "expected the visible window to grow with available height: {before} -> {after}"
+    );
+}
+
+/// Submenu component that records every height budget pushed into it.
+struct HeightRecordingSubmenu {
+    heights: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Component for HeightRecordingSubmenu {
+    impl_component_any!();
+
+    fn render(&mut self, _width: usize) -> Vec<String> {
+        vec!["height submenu".to_string()]
+    }
+
+    fn handle_input(&mut self, _event: &InputEvent) -> bool {
+        false
+    }
+
+    fn set_available_height(&mut self, rows: usize) {
+        self.heights.borrow_mut().push(rows);
+    }
+}
+
+#[test]
+fn available_height_reaches_submenus_on_open_and_on_later_pushes() {
+    let heights = Rc::new(RefCell::new(Vec::<usize>::new()));
+    let heights_for_factory = Rc::clone(&heights);
+    let factory = Box::new(move |_current: &str, _done: SubmenuDoneCallback| {
+        let boxed: Box<dyn Component> = Box::new(HeightRecordingSubmenu {
+            heights: Rc::clone(&heights_for_factory),
+        });
+        boxed
+    });
+    let items = vec![SettingItem::with_submenu(
+        "picker", "Picker", "one", factory,
+    )];
+    let mut list = SettingsList::new(
+        items,
+        5,
+        identity_theme(),
+        |_, _| {},
+        || {},
+        SettingsListOptions::default(),
+    );
+
+    // Budget pushed before the submenu opens is replayed to the
+    // freshly built submenu component.
+    list.set_available_height(17);
+    list.handle_input(&Key::enter());
+    assert!(list.has_active_submenu());
+    assert_eq!(*heights.borrow(), vec![17]);
+
+    // A later push (e.g. terminal resize) reaches the open submenu.
+    list.set_available_height(23);
+    assert_eq!(*heights.borrow(), vec![17, 23]);
+}

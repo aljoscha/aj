@@ -99,6 +99,10 @@ impl RenderSettings {
         self.set(&self.0.hide_thinking_block, hide);
     }
 
+    pub fn set_show_image_in_terminal(&self, show: bool) {
+        self.set(&self.0.show_image_in_terminal, show);
+    }
+
     /// Write `value` into `cell`, bumping the generation only on an
     /// actual change so a redundant toggle doesn't make every
     /// component re-reconcile.

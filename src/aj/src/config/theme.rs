@@ -1126,6 +1126,45 @@ pub fn select_list_theme(theme: &ThemeHandle) -> SelectListTheme {
     }
 }
 
+/// Build the [`aj_tui::components::settings_list::SettingsListTheme`]
+/// used by the `/settings` overlay. Mirrors the select-list palette:
+/// accent for the selected row (bold label, plain accent value),
+/// muted descriptions and hints.
+pub fn settings_list_theme(
+    theme: &ThemeHandle,
+) -> aj_tui::components::settings_list::SettingsListTheme {
+    let accent = theme.fg_closure(ThemeColor::Accent);
+    let accent_for_label = Arc::clone(&accent);
+    let muted = theme.fg_closure(ThemeColor::Muted);
+    // The `aj-tui` theme structs hold `Arc<dyn Fn(&str) -> String>`
+    // without `Send + Sync` bounds; match the surrounding API by
+    // using `Arc` for the composed closures as well.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let label: Arc<dyn Fn(&str, bool) -> String> = Arc::new(move |s: &str, selected: bool| {
+        if selected {
+            style::bold(&accent_for_label(s))
+        } else {
+            s.to_string()
+        }
+    });
+    #[allow(clippy::arc_with_non_send_sync)]
+    let value: Arc<dyn Fn(&str, bool) -> String> =
+        Arc::new(
+            move |s: &str, selected: bool| {
+                if selected { accent(s) } else { muted(s) }
+            },
+        );
+    aj_tui::components::settings_list::SettingsListTheme {
+        label,
+        value,
+        description: theme.fg_closure(ThemeColor::Muted),
+        hint: theme.fg_closure(ThemeColor::Dim),
+        // Two columns wide so unselected rows' two-space gutter
+        // lines up; matches the component's own row layout.
+        cursor: "→ ".to_string(),
+    }
+}
+
 /// Build the overlay-window chrome theme used by the command palette
 /// and the model / thinking / session selectors. The border picks up
 /// [`ThemeColor::BorderMuted`] (light grey, matches the editor's

@@ -130,6 +130,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         action_id: Some(crate::config::keybindings::ACTION_AGENT_PICKER),
     },
     BuiltinCommand {
+        name: "settings",
+        title: "settings",
+        category: "aj",
+        description: "Open the settings window.",
+        action_id: None,
+    },
+    BuiltinCommand {
         name: "help",
         title: "help",
         category: "aj",
@@ -204,6 +211,9 @@ pub enum SlashAction {
     /// Open the agent picker overlay. `Enter` switches the chat view
     /// to the chosen agent's transcript; `Esc` cancels.
     OpenAgentPicker,
+    /// Open the settings window overlay. Changes apply (and persist
+    /// to `config.toml`) as the user makes them; `Esc` closes.
+    OpenSettings,
     /// Start a fresh session. The current session is preserved on
     /// disk; the host creates a new [`ConversationLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the
@@ -253,6 +263,7 @@ pub fn dispatch(input: &str) -> SlashAction {
         "resume" => SlashAction::OpenSessionSelector,
         "history" => SlashAction::OpenPromptHistory,
         "agents" => SlashAction::OpenAgentPicker,
+        "settings" => SlashAction::OpenSettings,
         "palette" => SlashAction::OpenCommandPalette,
         "new" => SlashAction::NewSession,
         "help" => SlashAction::Help,
@@ -380,6 +391,14 @@ mod tests {
     fn dispatch_agents_opens_agent_picker() {
         assert_eq!(dispatch("/agents"), SlashAction::OpenAgentPicker);
         assert_eq!(dispatch("  /agents  "), SlashAction::OpenAgentPicker);
+    }
+
+    #[test]
+    fn dispatch_settings_opens_settings_window() {
+        assert_eq!(dispatch("/settings"), SlashAction::OpenSettings);
+        assert_eq!(dispatch("  /settings  "), SlashAction::OpenSettings);
+        // Trailing tokens are ignored — commands are zero-argument.
+        assert_eq!(dispatch("/settings theme"), SlashAction::OpenSettings);
     }
 
     #[test]

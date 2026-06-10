@@ -528,7 +528,8 @@ impl fmt::Display for ValueKind {
 pub struct ConfigOption {
     /// Key as it appears in `config.toml` and on the CLI.
     pub name: &'static str,
-    /// One-line user-facing description, suitable for `aj settings show`.
+    /// One-line user-facing description, shown in the interactive
+    /// settings window.
     pub description: &'static str,
     /// What the option accepts. Used for help text and (future) tab
     /// completion.
@@ -759,12 +760,12 @@ impl FromStr for ConfigSpeed {
 
 impl Config {
     /// Schema for every option this binary understands. The file
-    /// parser, the unknown-key suggester, and (eventually) the
-    /// `settings` command all walk this table — there is no other
+    /// parser, the unknown-key suggester, and the interactive
+    /// settings window all walk this table — there is no other
     /// source of truth for what `~/.aj/config.toml` accepts.
     ///
     /// Each entry's `description` is the user-facing one-liner shown
-    /// by the settings command; the field-level doc comments on
+    /// by the settings window; the field-level doc comments on
     /// [`Config`] are the developer-facing reference. Keep them
     /// roughly consistent but they don't need to match verbatim.
     pub const OPTIONS: &'static [ConfigOption] = &[
