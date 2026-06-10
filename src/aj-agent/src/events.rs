@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::message::AgentMessage;
-use crate::tool::ToolDetails;
+use crate::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
 use crate::types::TokenUsage;
 
 /// Serialize an `Arc<[UserContent]>` as a JSON sequence so the
@@ -226,6 +226,38 @@ pub enum AgentEvent {
         report: String,
     },
 
+    // --- Background tasks ----------------------------------------------------
+    /// A background task has been registered and its detached driver
+    /// started. Transient — not persisted. `call_id` correlates the
+    /// task with the originating tool call's transcript cell.
+    TaskStart {
+        agent_id: AgentId,
+        task_id: TaskId,
+        call_id: String,
+        kind: TaskKind,
+        label: String,
+    },
+    /// Throttled output snapshot from a running background task.
+    /// `partial` is a cumulative snapshot (same [`ToolDetails`] shape
+    /// the tool's foreground updates use), not a delta. Transient —
+    /// not persisted.
+    TaskOutput {
+        agent_id: AgentId,
+        task_id: TaskId,
+        call_id: String,
+        partial: ToolDetails,
+    },
+    /// A background task reached a terminal status. Transient — not
+    /// persisted; the completion notice drained into the owner's
+    /// transcript is the persisted record.
+    TaskEnd {
+        agent_id: AgentId,
+        task_id: TaskId,
+        call_id: String,
+        status: TaskStatus,
+        label: String,
+    },
+
     // --- Notices -----------------------------------------------------------
     /// Informational notice. Transient — not persisted.
     Notice { agent_id: AgentId, text: String },
@@ -286,6 +318,9 @@ impl AgentEvent {
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
             | Self::TurnUsage { agent_id, .. }
+            | Self::TaskStart { agent_id, .. }
+            | Self::TaskOutput { agent_id, .. }
+            | Self::TaskEnd { agent_id, .. }
             | Self::QueueUpdate { agent_id, .. } => *agent_id,
             Self::SubAgentStart { parent, .. } | Self::SubAgentEnd { parent, .. } => *parent,
         }

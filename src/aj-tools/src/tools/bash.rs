@@ -314,6 +314,7 @@ impl ToolDefinition for BashTool {
                 full_output_path,
                 stdout_truncation,
                 stderr_truncation,
+                task_id: None,
             },
             is_error,
         })
@@ -585,6 +586,7 @@ fn snapshot_partial(
         full_output_path: None,
         stdout_truncation: None,
         stderr_truncation: None,
+        task_id: None,
     }
 }
 
@@ -729,6 +731,7 @@ fn spawn_error_outcome(command: &str, error: String) -> ToolOutcome {
             full_output_path: None,
             stdout_truncation: None,
             stderr_truncation: None,
+            task_id: None,
         },
         is_error: true,
     }
@@ -828,6 +831,19 @@ mod tests {
         fn cancellation(&self) -> CancellationToken {
             self.inner.cancellation.clone()
         }
+
+        fn task_registry(&self) -> aj_agent::TaskRegistry {
+            self.inner.task_registry()
+        }
+
+        fn start_background_task(
+            &mut self,
+            kind: aj_agent::tool::TaskKind,
+            label: String,
+            output: Arc<dyn aj_agent::tool::TaskOutputSource>,
+        ) -> aj_agent::tool::StartedTask {
+            self.inner.start_background_task(kind, label, output)
+        }
     }
 
     fn extract_text(content: &[UserContent]) -> String {
@@ -879,6 +895,7 @@ mod tests {
                 full_output_path,
                 stdout_truncation,
                 stderr_truncation,
+                task_id: _,
             } => {
                 assert_eq!(command, "echo hello");
                 assert_eq!(stdout, "hello\n");

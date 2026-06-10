@@ -115,9 +115,11 @@ impl ToolDefinition for AgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aj_agent::tool::{SpawnedAgent, TodoItem};
+    use aj_agent::TaskRegistry;
+    use aj_agent::tool::{SpawnedAgent, StartedTask, TaskKind, TaskOutputSource, TodoItem};
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     /// A `ToolContext` that records the task it was asked to spawn
@@ -126,6 +128,7 @@ mod tests {
     struct StubSpawnContext {
         last_task: Option<String>,
         response: SpawnedAgent,
+        tasks: crate::testing::DummyToolContext,
     }
 
     impl ToolContext for StubSpawnContext {
@@ -154,12 +157,27 @@ mod tests {
         fn cancellation(&self) -> CancellationToken {
             CancellationToken::new()
         }
+
+        fn task_registry(&self) -> TaskRegistry {
+            self.tasks.task_registry()
+        }
+
+        fn start_background_task(
+            &mut self,
+            kind: TaskKind,
+            label: String,
+            output: Arc<dyn TaskOutputSource>,
+        ) -> StartedTask {
+            self.tasks.start_background_task(kind, label, output)
+        }
     }
 
     /// A `ToolContext` whose `spawn_agent` always fails. Lets us
     /// exercise the bubbled-error path without standing up a real
     /// agent runtime.
-    struct FailingSpawnContext;
+    struct FailingSpawnContext {
+        tasks: crate::testing::DummyToolContext,
+    }
 
     impl ToolContext for FailingSpawnContext {
         fn working_directory(&self) -> PathBuf {
@@ -185,6 +203,19 @@ mod tests {
         fn cancellation(&self) -> CancellationToken {
             CancellationToken::new()
         }
+
+        fn task_registry(&self) -> TaskRegistry {
+            self.tasks.task_registry()
+        }
+
+        fn start_background_task(
+            &mut self,
+            kind: TaskKind,
+            label: String,
+            output: Arc<dyn TaskOutputSource>,
+        ) -> StartedTask {
+            self.tasks.start_background_task(kind, label, output)
+        }
     }
 
     /// On success, the tool wires the sub-agent's report into both
@@ -195,6 +226,7 @@ mod tests {
     async fn execute_returns_sub_agent_report_outcome() {
         let mut ctx = StubSpawnContext {
             last_task: None,
+            tasks: Default::default(),
             response: SpawnedAgent {
                 agent_id: 7,
                 report: "investigation complete".to_string(),
@@ -253,6 +285,7 @@ mod tests {
     async fn description_input_does_not_affect_outcome() {
         let mut ctx = StubSpawnContext {
             last_task: None,
+            tasks: Default::default(),
             response: SpawnedAgent {
                 agent_id: 1,
                 report: "ok".to_string(),
@@ -284,7 +317,9 @@ mod tests {
     /// matching the legacy contract.
     #[tokio::test]
     async fn spawn_failure_bubbles_up_as_error() {
-        let mut ctx = FailingSpawnContext;
+        let mut ctx = FailingSpawnContext {
+            tasks: Default::default(),
+        };
         let result = AgentTool
             .execute(
                 &mut ctx,

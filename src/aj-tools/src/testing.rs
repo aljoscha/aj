@@ -5,8 +5,15 @@
 //! without standing up a full agent runtime.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use aj_agent::tool::{SpawnedAgent, TodoItem, ToolContext, ToolDetails};
+use aj_agent::TaskRegistry;
+use aj_agent::bus::EventBus;
+use aj_agent::events::AgentId;
+use aj_agent::tool::{
+    SpawnedAgent, StartedTask, TaskEventSink, TaskKind, TaskOutputSource, TodoItem, ToolContext,
+    ToolDetails,
+};
 use tokio_util::sync::CancellationToken;
 
 /// No-op [`ToolContext`] for exercising new-shape
@@ -16,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 /// public field if a test needs a fixed directory. Todos are stored
 /// in-memory; `spawn_agent` returns an error; `emit_update` discards
 /// snapshots; `cancellation` returns a fresh token that never fires.
+/// Background tasks register against the (default) `task_registry`
+/// and emit on a bus with no subscribers.
 pub struct DummyToolContext {
     /// Working directory returned by [`ToolContext::working_directory`].
     pub working_directory: PathBuf,
@@ -24,6 +33,12 @@ pub struct DummyToolContext {
     pub todos: Vec<TodoItem>,
     /// Cancellation token surfaced by [`ToolContext::cancellation`].
     pub cancellation: CancellationToken,
+    /// Registry surfaced by [`ToolContext::task_registry`] and used
+    /// by [`ToolContext::start_background_task`].
+    pub task_registry: TaskRegistry,
+    /// Bus the task event sinks emit on. Fresh (no subscribers) by
+    /// default; tests can subscribe to observe task events.
+    pub bus: EventBus,
 }
 
 impl Default for DummyToolContext {
@@ -32,6 +47,8 @@ impl Default for DummyToolContext {
             working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             todos: Vec::new(),
             cancellation: CancellationToken::new(),
+            task_registry: TaskRegistry::default(),
+            bus: EventBus::new(),
         }
     }
 }
@@ -68,5 +85,29 @@ impl ToolContext for DummyToolContext {
 
     fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    fn task_registry(&self) -> TaskRegistry {
+        self.task_registry.clone()
+    }
+
+    fn start_background_task(
+        &mut self,
+        kind: TaskKind,
+        label: String,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> StartedTask {
+        let (id, cancel) = self
+            .task_registry
+            .register(AgentId::Main, kind, label.clone(), output);
+        let events = TaskEventSink::new(
+            self.bus.clone(),
+            self.task_registry.clone(),
+            AgentId::Main,
+            id,
+            "dummy-call".to_string(),
+            label,
+        );
+        StartedTask { id, cancel, events }
     }
 }

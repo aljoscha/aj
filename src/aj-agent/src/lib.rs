@@ -14,10 +14,10 @@ pub mod projection;
 pub mod tool;
 pub mod types;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aj_conf::{AgentEnv, ConfigThinkingLevel};
 use aj_models::provider::Provider;
@@ -36,7 +36,8 @@ use crate::events::{AgentEvent, AgentId, AgentSettings};
 use crate::message::AgentMessage;
 use crate::projection::transcript_to_messages;
 use crate::tool::{
-    ErasedToolDefinition, SpawnedAgent, TodoItem, ToolContext, ToolDetails, ToolOutcome,
+    ErasedToolDefinition, SpawnedAgent, StartedTask, TaskEventSink, TaskId, TaskKind, TaskNotice,
+    TaskOutputSource, TaskRead, TaskStatus, TodoItem, ToolContext, ToolDetails, ToolOutcome,
 };
 use crate::types::TokenUsage;
 use anyhow::anyhow;
@@ -166,6 +167,12 @@ pub struct Agent {
     /// [`Agent::set_sub_agent_registry`]. Sub-agents never read it
     /// (they can't spawn), and one-shot callers leave it empty.
     sub_agent_registry: SubAgentRegistry,
+    /// Shared registry of background tasks this agent (and its
+    /// sub-agents) started. Default; the binary injects a shared
+    /// instance via [`Agent::set_task_registry`] so it can observe
+    /// and kill tasks. Tasks in a default registry die with the
+    /// process — same caveats as [`SubAgentRegistry`].
+    task_registry: TaskRegistry,
 }
 
 impl Agent {
@@ -240,6 +247,7 @@ impl Agent {
             should_stop_after_turn: None,
             block_images: false,
             sub_agent_registry: SubAgentRegistry::default(),
+            task_registry: TaskRegistry::default(),
         }
     }
 
@@ -308,6 +316,17 @@ impl Agent {
     /// one set — they can't spawn.
     pub fn set_sub_agent_registry(&mut self, registry: SubAgentRegistry) {
         self.sub_agent_registry = registry;
+    }
+
+    /// Inject the shared background-task registry.
+    ///
+    /// The binary calls this on the main agent so the agent and the
+    /// binary share one map; the agent threads a clone into every tool
+    /// call and every spawned sub-agent (so sub-agent-owned tasks land
+    /// in the same map the binary observes). Callers that never inject
+    /// one get the default registry, whose tasks die with the process.
+    pub fn set_task_registry(&mut self, registry: TaskRegistry) {
+        self.task_registry = registry;
     }
 
     /// Subscribe an async listener to the agent's internal event
@@ -649,6 +668,10 @@ impl Agent {
     }
 
     async fn run_top_level_turn_inner(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
+        // Notices that arrived while the agent was idle land before
+        // the user's new message, in arrival order.
+        self.drain_task_notices().await?;
+
         if let Some(text) = prompt {
             // Append the user message to the in-memory transcript
             // and emit a `MessageStart` / `MessageEnd` pair so
@@ -708,6 +731,11 @@ impl Agent {
     }
 
     async fn run_single_turn_inner(&mut self, prompt: String) -> Result<String, anyhow::Error> {
+        // Same prompt-top drain point as the top-level path: a
+        // sub-agent that backgrounded a command hears about it on its
+        // next continuation even when the task finished between runs.
+        self.drain_task_notices().await?;
+
         // Append the prompt as the sub-agent's first user message.
         // The persistence listener chains this entry onto the
         // sub-agent's spawn entry, which the `SubAgentStart` hook
@@ -1258,6 +1286,11 @@ impl Agent {
                     }
                 }
 
+                // Notices that arrived while the tool batch ran reach
+                // the model immediately before the next inference
+                // step.
+                self.drain_task_notices().await?;
+
                 // Continue the conversation loop to get the model's
                 // response to tool results.
                 continue;
@@ -1269,6 +1302,43 @@ impl Agent {
             }
         }
 
+        Ok(())
+    }
+
+    /// Drain this agent's queued task-completion notices into the
+    /// transcript.
+    ///
+    /// Each notice becomes one user-role message whose body is wrapped
+    /// in a `<task-notification>` tag (marking it as harness-injected,
+    /// not a user reply), emitted with the same `MessageStart` /
+    /// `MessageEnd` pair the prompt path uses so it persists and
+    /// renders like any other message.
+    async fn drain_task_notices(&mut self) -> Result<(), TurnError> {
+        let notices = self.task_registry.drain_notices(self.agent_id);
+        for notice in notices {
+            // TODO(aljoscha): once agent-backed background tasks land,
+            // fold the child's recorded usage into
+            // `SessionState.sub_agent_usage` here — the drain holds
+            // `&mut self`, so usage accounting needs no shared
+            // mutability.
+            let text = format!("<task-notification>{}</task-notification>", notice.body);
+            let message = AgentMessage::wire(Message::User(UserMessage::text(text)));
+            self.transcript.push(message.clone());
+            self.bus
+                .emit(AgentEvent::MessageStart {
+                    agent_id: self.agent_id,
+                    message: message.clone(),
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
+            self.bus
+                .emit(AgentEvent::MessageEnd {
+                    agent_id: self.agent_id,
+                    message,
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
+        }
         Ok(())
     }
 
@@ -1445,7 +1515,7 @@ impl Agent {
 
     async fn execute_tool(
         &mut self,
-        _call_id: &str,
+        call_id: &str,
         tool_name: &str,
         tool_input: serde_json::Value,
     ) -> Result<ToolOutcome, anyhow::Error> {
@@ -1488,6 +1558,8 @@ impl Agent {
             default_thinking: self.default_thinking.clone(),
             speed: self.speed,
             sub_agent_registry: self.sub_agent_registry.clone(),
+            task_registry: self.task_registry.clone(),
+            call_id: call_id.to_string(),
         };
 
         let outcome = (tool_def.func)(&mut session_ctx_wrapper, tool_input).await?;
@@ -1546,6 +1618,181 @@ impl SubAgentRegistry {
             .keys()
             .copied()
             .collect()
+    }
+}
+
+/// One live background task tracked by the [`TaskRegistry`].
+struct TaskEntry {
+    owner: AgentId,
+    kind: TaskKind,
+    label: String,
+    status: TaskStatus,
+    started_at: Instant,
+    /// Child of the registry's root token. Cancelled by
+    /// [`TaskRegistry::kill`] or transitively by
+    /// [`TaskRegistry::shutdown`]; the task's driver observes it and
+    /// flips the status via [`TaskRegistry::set_status`].
+    cancel: CancellationToken,
+    output: Arc<dyn TaskOutputSource>,
+}
+
+/// Display snapshot of one task, for the picker and the footer.
+#[derive(Clone, Debug)]
+pub struct TaskSummary {
+    /// Task id.
+    pub id: TaskId,
+    /// Agent that owns the task and receives its notices.
+    pub owner: AgentId,
+    /// What kind of work the task runs.
+    pub kind: TaskKind,
+    /// Display label (command / task description).
+    pub label: String,
+    /// Current lifecycle status.
+    pub status: TaskStatus,
+    /// When the task was registered.
+    pub started_at: Instant,
+}
+
+#[derive(Default)]
+struct TaskRegistryInner {
+    entries: BTreeMap<TaskId, TaskEntry>,
+    /// Per-owner completion-notice queues, drained by the owning
+    /// agent at its drain points in arrival order.
+    notices: HashMap<AgentId, VecDeque<TaskNotice>>,
+    /// Last minted task id; ids start at 1 and are monotonic per
+    /// session.
+    last_id: TaskId,
+}
+
+/// Shared registry of background tasks, sibling of
+/// [`SubAgentRegistry`].
+///
+/// Cheaply cloneable; all clones share one map. The inner mutex guards
+/// short map operations only and is never held across `.await`. Task
+/// cancel tokens are children of `root_cancel`, which is
+/// session-scoped: the binary cancels it on shutdown so background
+/// tasks survive turn end but not process exit.
+#[derive(Clone, Default)]
+pub struct TaskRegistry {
+    inner: Arc<StdMutex<TaskRegistryInner>>,
+    root_cancel: CancellationToken,
+}
+
+impl TaskRegistry {
+    /// Mint a task id and insert a `Running` entry for it. Returns the
+    /// id plus the task's cancel token (a child of the registry root)
+    /// for the detached driver.
+    pub fn register(
+        &self,
+        owner: AgentId,
+        kind: TaskKind,
+        label: String,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> (TaskId, CancellationToken) {
+        let cancel = self.root_cancel.child_token();
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.last_id += 1;
+        let id = inner.last_id;
+        inner.entries.insert(
+            id,
+            TaskEntry {
+                owner,
+                kind,
+                label,
+                status: TaskStatus::Running,
+                started_at: Instant::now(),
+                cancel: cancel.clone(),
+                output,
+            },
+        );
+        (id, cancel)
+    }
+
+    /// Current status plus a stateless output snapshot for task `id`.
+    /// `None` for unknown ids.
+    pub fn read(&self, id: TaskId) -> Option<(TaskStatus, TaskRead)> {
+        // Snapshot outside the lock: the source's own locking is its
+        // business and we keep registry lock hold times minimal.
+        let (status, output) = {
+            let inner = self.inner.lock().expect("task registry mutex poisoned");
+            let entry = inner.entries.get(&id)?;
+            (entry.status, Arc::clone(&entry.output))
+        };
+        Some((status, output.snapshot()))
+    }
+
+    /// Cancel task `id`'s token. The driver observes the cancellation
+    /// and flips the status. Returns `false` for unknown ids.
+    pub fn kill(&self, id: TaskId) -> bool {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        match inner.entries.get(&id) {
+            Some(entry) => {
+                entry.cancel.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record task `id`'s new status. Called by the driver (through
+    /// [`TaskEventSink::finished`]) when the task terminates. No-op
+    /// for unknown ids.
+    pub fn set_status(&self, id: TaskId, status: TaskStatus) {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        if let Some(entry) = inner.entries.get_mut(&id) {
+            entry.status = status;
+        }
+    }
+
+    /// Snapshot of every tracked task, in id order.
+    pub fn snapshot(&self) -> Vec<TaskSummary> {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner
+            .entries
+            .iter()
+            .map(|(id, entry)| TaskSummary {
+                id: *id,
+                owner: entry.owner,
+                kind: entry.kind.clone(),
+                label: entry.label.clone(),
+                status: entry.status,
+                started_at: entry.started_at,
+            })
+            .collect()
+    }
+
+    /// Queue a completion notice on its owner's queue.
+    pub fn push_notice(&self, notice: TaskNotice) {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner
+            .notices
+            .entry(notice.owner)
+            .or_default()
+            .push_back(notice);
+    }
+
+    /// Take all queued notices for `owner`, in arrival order.
+    pub fn drain_notices(&self, owner: AgentId) -> Vec<TaskNotice> {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner
+            .notices
+            .remove(&owner)
+            .map(Vec::from)
+            .unwrap_or_default()
+    }
+
+    /// Whether `owner` has notices queued. The binary's wake triggers
+    /// poll this.
+    pub fn has_notices(&self, owner: AgentId) -> bool {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.notices.get(&owner).is_some_and(|q| !q.is_empty())
+    }
+
+    /// Cancel the session-scoped root token, which cancels every
+    /// task's child token. Callers then await driver quiescence with
+    /// a bounded grace.
+    pub fn shutdown(&self) {
+        self.root_cancel.cancel();
     }
 }
 
@@ -1628,6 +1875,141 @@ mod session_state_tests {
     }
 }
 
+#[cfg(test)]
+mod task_registry_tests {
+    use std::sync::Arc;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::TaskRegistry;
+    use crate::events::AgentId;
+    use crate::tool::{TaskKind, TaskNotice, TaskOutputSource, TaskRead, TaskStatus};
+
+    struct StubOutput;
+
+    impl TaskOutputSource for StubOutput {
+        fn snapshot(&self) -> TaskRead {
+            TaskRead {
+                stdout_tail: "tail".to_string(),
+                stdout_total_bytes: 4,
+                ..TaskRead::default()
+            }
+        }
+    }
+
+    fn register(
+        registry: &TaskRegistry,
+        owner: AgentId,
+        command: &str,
+    ) -> (usize, CancellationToken) {
+        registry.register(
+            owner,
+            TaskKind::Bash {
+                command: command.to_string(),
+            },
+            command.to_string(),
+            Arc::new(StubOutput),
+        )
+    }
+
+    fn notice(owner: AgentId, task_id: usize, body: &str) -> TaskNotice {
+        TaskNotice {
+            owner,
+            task_id,
+            kind: TaskKind::Bash {
+                command: "cmd".to_string(),
+            },
+            label: "cmd".to_string(),
+            status: TaskStatus::Exited(Some(0)),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn register_read_kill_snapshot() {
+        let registry = TaskRegistry::default();
+        let (id, cancel) = register(&registry, AgentId::Main, "sleep 5");
+        assert_eq!(id, 1);
+
+        let (status, read) = registry.read(id).expect("registered task is readable");
+        assert_eq!(status, TaskStatus::Running);
+        assert_eq!(read.stdout_tail, "tail");
+        assert_eq!(read.stdout_total_bytes, 4);
+        assert!(registry.read(999).is_none());
+
+        let summaries = registry.snapshot();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, 1);
+        assert_eq!(summaries[0].owner, AgentId::Main);
+        assert_eq!(summaries[0].label, "sleep 5");
+        assert_eq!(summaries[0].status, TaskStatus::Running);
+
+        // `kill` cancels the task's token; the driver is responsible
+        // for flipping the status, mirrored here via `set_status`.
+        assert!(registry.kill(id));
+        assert!(cancel.is_cancelled());
+        assert!(!registry.kill(999));
+        registry.set_status(id, TaskStatus::Killed);
+        let (status, _) = registry.read(id).expect("killed task stays readable");
+        assert_eq!(status, TaskStatus::Killed);
+        assert_eq!(registry.snapshot()[0].status, TaskStatus::Killed);
+    }
+
+    #[test]
+    fn task_ids_are_monotonic_across_owners() {
+        let registry = TaskRegistry::default();
+        let (a, _) = register(&registry, AgentId::Main, "a");
+        let (b, _) = register(&registry, AgentId::Sub(1), "b");
+        let (c, _) = register(&registry, AgentId::Main, "c");
+        assert_eq!((a, b, c), (1, 2, 3));
+    }
+
+    #[test]
+    fn shutdown_cancels_all_task_tokens() {
+        let registry = TaskRegistry::default();
+        let (_, cancel_a) = register(&registry, AgentId::Main, "a");
+        let (_, cancel_b) = register(&registry, AgentId::Sub(3), "b");
+        assert!(!cancel_a.is_cancelled());
+        assert!(!cancel_b.is_cancelled());
+
+        registry.shutdown();
+        assert!(cancel_a.is_cancelled());
+        assert!(cancel_b.is_cancelled());
+
+        // Tasks registered after shutdown are born cancelled — the
+        // root is already fired.
+        let (_, cancel_c) = register(&registry, AgentId::Main, "c");
+        assert!(cancel_c.is_cancelled());
+    }
+
+    #[test]
+    fn notices_queue_per_owner_in_arrival_order() {
+        let registry = TaskRegistry::default();
+        assert!(!registry.has_notices(AgentId::Main));
+        assert!(registry.drain_notices(AgentId::Main).is_empty());
+
+        registry.push_notice(notice(AgentId::Main, 1, "first"));
+        registry.push_notice(notice(AgentId::Sub(2), 2, "sub"));
+        registry.push_notice(notice(AgentId::Main, 3, "second"));
+
+        assert!(registry.has_notices(AgentId::Main));
+        assert!(registry.has_notices(AgentId::Sub(2)));
+
+        let drained: Vec<String> = registry
+            .drain_notices(AgentId::Main)
+            .into_iter()
+            .map(|n| n.body)
+            .collect();
+        assert_eq!(drained, vec!["first", "second"]);
+
+        // Draining one owner leaves the other's queue intact, and a
+        // second drain returns nothing.
+        assert!(!registry.has_notices(AgentId::Main));
+        assert!(registry.drain_notices(AgentId::Main).is_empty());
+        assert_eq!(registry.drain_notices(AgentId::Sub(2)).len(), 1);
+    }
+}
+
 /// Wrapper that provides partial access to mutable [`Agent`] state,
 /// while we have partial immutable access to other parts. Used in
 /// [`Agent::execute_tool`].
@@ -1686,6 +2068,14 @@ struct SessionContextWrapper<'a> {
     /// inserts the new handle into the same map the binary resolves
     /// continuations against.
     sub_agent_registry: SubAgentRegistry,
+    /// Shared background-task registry, cloned from the parent so
+    /// tasks started by this tool call (and by spawned sub-agents)
+    /// land in the same map the binary observes.
+    task_registry: TaskRegistry,
+    /// Id of the tool call this wrapper was built for. Captured on the
+    /// [`TaskEventSink`] so task lifecycle events correlate with the
+    /// originating transcript cell.
+    call_id: String,
 }
 
 impl<'a> ToolContext for SessionContextWrapper<'a> {
@@ -1808,6 +2198,11 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // top-level `cancel()` reaches the sub-agent's
             // streaming inference and tools.
             sub_agent.set_cancellation(self.cancellation.child_token());
+            // Share the background-task registry so tasks the
+            // sub-agent starts land in the same map the binary
+            // observes, with notices scoped to the sub-agent's own
+            // id.
+            sub_agent.set_task_registry(self.task_registry.clone());
 
             // Retain the sub-agent in the shared registry, then run its
             // initial turn through that handle. The handle stays in the
@@ -1870,6 +2265,30 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
 
     fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    fn task_registry(&self) -> TaskRegistry {
+        self.task_registry.clone()
+    }
+
+    fn start_background_task(
+        &mut self,
+        kind: TaskKind,
+        label: String,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> StartedTask {
+        let (id, cancel) =
+            self.task_registry
+                .register(self.parent_agent_id, kind, label.clone(), output);
+        let events = TaskEventSink::new(
+            self.parent_bus.clone(),
+            self.task_registry.clone(),
+            self.parent_agent_id,
+            id,
+            self.call_id.clone(),
+            label,
+        );
+        StartedTask { id, cancel, events }
     }
 }
 
@@ -2009,7 +2428,7 @@ mod event_protocol_tests {
     //! observes events directly.
 
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use aj_conf::{AgentEnv, SystemPrompt, SystemPromptSource};
     use aj_models::provider::Provider;
@@ -2020,16 +2439,16 @@ mod event_protocol_tests {
         AssistantContent, AssistantMessage, Message, StopReason, StreamOptions, TextContent,
         ToolCall, UserMessage,
     };
-    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     use crate::bus::listener_from_sync;
     use crate::events::{AgentEvent, AgentId};
     use crate::message::AgentMessage;
     use crate::tool::{
-        ErasedToolDefinition, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+        ErasedToolDefinition, TaskKind, TaskNotice, TaskStatus, ToolContext, ToolDefinition,
+        ToolDetails, ToolOutcome,
     };
-    use crate::{Agent, AgentSeed};
-    use tokio_util::sync::CancellationToken;
+    use crate::{Agent, AgentSeed, TaskRegistry};
 
     /// Trivial tool that returns a fixed string. Implements the
     /// [`ToolDefinition`] trait so the test exercises the same
@@ -2351,6 +2770,9 @@ mod event_protocol_tests {
             },
             AgentEvent::ToolExecutionUpdate { .. } => EventLabel::Other("ToolExecutionUpdate"),
             AgentEvent::QueueUpdate { .. } => EventLabel::Other("QueueUpdate"),
+            AgentEvent::TaskStart { .. } => EventLabel::Other("TaskStart"),
+            AgentEvent::TaskOutput { .. } => EventLabel::Other("TaskOutput"),
+            AgentEvent::TaskEnd { .. } => EventLabel::Other("TaskEnd"),
         }
     }
 
@@ -3659,5 +4081,257 @@ mod event_protocol_tests {
             has_follow_up,
             "transcript should contain the re-prompt user message"
         );
+    }
+
+    // ---- Task-notice drain points ----------------------------------------
+
+    /// Extract the concatenated text of a user-role [`AgentMessage`],
+    /// `None` for other roles.
+    fn user_text(message: &AgentMessage) -> Option<String> {
+        match message.as_wire() {
+            Some(Message::User(u)) => Some(
+                u.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        aj_models::types::UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn bash_notice(owner: AgentId, task_id: usize, body: &str) -> TaskNotice {
+        TaskNotice {
+            owner,
+            task_id,
+            kind: TaskKind::Bash {
+                command: "cargo build".to_string(),
+            },
+            label: "cargo build".to_string(),
+            status: TaskStatus::Exited(Some(0)),
+            body: body.to_string(),
+        }
+    }
+
+    /// Idle drain point: a notice queued while the agent is idle is
+    /// injected as a `<task-notification>` user message *before* the
+    /// user's new prompt, with a persistence-shaped `MessageStart` /
+    /// `MessageEnd` pair like any other message.
+    #[tokio::test]
+    async fn queued_notice_drains_before_prompt_user_message() {
+        let scripts = vec![finalize_script(finalize_text("ok"))];
+        let mut agent = build_agent(scripts, Vec::new());
+        let registry = TaskRegistry::default();
+        agent.set_task_registry(registry.clone());
+        registry.push_notice(bash_notice(
+            AgentId::Main,
+            3,
+            "Background task #3 finished: cargo build — exit code 0",
+        ));
+
+        let starts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let starts_clone = Arc::clone(&starts);
+        let ends_clone = Arc::clone(&ends);
+        let _handle = agent.subscribe(listener_from_sync(move |event| match event {
+            AgentEvent::MessageStart { message, .. } => {
+                if let Some(text) = user_text(message) {
+                    starts_clone.lock().unwrap().push(text);
+                }
+            }
+            AgentEvent::MessageEnd { message, .. } => {
+                if let Some(text) = user_text(message) {
+                    ends_clone.lock().unwrap().push(text);
+                }
+            }
+            _ => {}
+        }));
+
+        agent
+            .prompt("hello".to_string(), CancellationToken::new())
+            .await
+            .expect("prompt");
+
+        let expected = vec![
+            "<task-notification>Background task #3 finished: cargo build — exit code 0\
+             </task-notification>"
+                .to_string(),
+            "hello".to_string(),
+        ];
+        assert_eq!(*ends.lock().unwrap(), expected);
+        // Every drained notice gets the full MessageStart/MessageEnd
+        // bracket — the same shape the persistence listener consumes.
+        assert_eq!(*starts.lock().unwrap(), expected);
+
+        // The queue is consumed and the notice is on the transcript.
+        assert!(!registry.has_notices(AgentId::Main));
+        let first = user_text(&agent.messages()[0]).expect("first transcript message is user");
+        assert!(first.starts_with("<task-notification>"));
+    }
+
+    /// Tool that queues a completion notice for `Main` through the
+    /// shared registry, standing in for a background driver finishing
+    /// while a tool batch runs.
+    #[derive(Clone)]
+    struct FinishTaskTool;
+
+    impl ToolDefinition for FinishTaskTool {
+        type Input = PingInput;
+
+        fn name(&self) -> &'static str {
+            "finish_task"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that queues a task notice"
+        }
+
+        async fn execute(
+            &self,
+            ctx: &mut dyn ToolContext,
+            _input: PingInput,
+        ) -> anyhow::Result<ToolOutcome> {
+            ctx.task_registry().push_notice(TaskNotice {
+                owner: AgentId::Main,
+                task_id: 1,
+                kind: TaskKind::Bash {
+                    command: "sleep 1".to_string(),
+                },
+                label: "sleep 1".to_string(),
+                status: TaskStatus::Exited(Some(0)),
+                body: "Background task #1 finished: sleep 1 — exit code 0".to_string(),
+            });
+            Ok(ToolOutcome {
+                content: vec![aj_models::types::UserContent::text("queued".to_string())],
+                details: ToolDetails::Text {
+                    summary: "finish_task".to_string(),
+                    body: "queued".to_string(),
+                },
+                is_error: false,
+            })
+        }
+    }
+
+    /// Mid-run drain point: a notice queued while a tool batch runs is
+    /// injected after the batch's tool results and before the next
+    /// inference step.
+    #[tokio::test]
+    async fn notice_queued_mid_run_drains_after_tool_batch() {
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "finish_task")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![FinishTaskTool.into()]);
+        let registry = TaskRegistry::default();
+        agent.set_task_registry(registry.clone());
+
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            captured_clone.lock().unwrap().push(event.clone());
+        }));
+
+        agent
+            .prompt("go".to_string(), CancellationToken::new())
+            .await
+            .expect("prompt");
+
+        let events = captured.lock().unwrap().clone();
+        let tool_end_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .expect("tool batch finished");
+        let notice_end_idx = events
+            .iter()
+            .position(|e| match e {
+                AgentEvent::MessageEnd { message, .. } => {
+                    user_text(message).is_some_and(|t| t.starts_with("<task-notification>"))
+                }
+                _ => false,
+            })
+            .expect("notice user message emitted");
+        let second_inference_idx = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    AgentEvent::MessageStart { message, .. }
+                        if matches!(message.as_wire(), Some(Message::Assistant(_)))
+                )
+            })
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("second inference started");
+
+        assert!(
+            tool_end_idx < notice_end_idx && notice_end_idx < second_inference_idx,
+            "notice must land after the tool batch and before the next inference \
+             (tool_end={tool_end_idx}, notice={notice_end_idx}, \
+             inference={second_inference_idx})"
+        );
+
+        // Body shape: the pre-rendered body verbatim inside the tag.
+        let AgentEvent::MessageEnd { message, .. } = &events[notice_end_idx] else {
+            unreachable!()
+        };
+        assert_eq!(
+            user_text(message).unwrap(),
+            "<task-notification>Background task #1 finished: sleep 1 — exit code 0\
+             </task-notification>"
+        );
+        // The matching MessageStart fired right before the end.
+        assert!(matches!(
+            &events[notice_end_idx - 1],
+            AgentEvent::MessageStart { message, .. }
+                if user_text(message).is_some_and(|t| t.starts_with("<task-notification>"))
+        ));
+        assert!(!registry.has_notices(AgentId::Main));
+    }
+
+    /// Sub-agent runs share the prompt-top drain: notices owned by the
+    /// sub-agent land at the start of its run, while other owners'
+    /// queues are untouched.
+    #[tokio::test]
+    async fn sub_agent_drains_its_own_notices_at_run_start() {
+        let scripts = vec![finalize_script(finalize_text("sub done"))];
+        let mut agent = build_agent(scripts, Vec::new());
+        agent.set_agent_id(AgentId::Sub(2));
+        let registry = TaskRegistry::default();
+        agent.set_task_registry(registry.clone());
+
+        registry.push_notice(bash_notice(AgentId::Sub(2), 5, "task #5 done"));
+        registry.push_notice(bash_notice(AgentId::Main, 6, "task #6 done"));
+
+        let ends: Arc<Mutex<Vec<(AgentId, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ends_clone = Arc::clone(&ends);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::MessageEnd { agent_id, message } = event {
+                if let Some(text) = user_text(message) {
+                    ends_clone.lock().unwrap().push((*agent_id, text));
+                }
+            }
+        }));
+
+        agent
+            .run_single_turn("work".to_string())
+            .await
+            .expect("run_single_turn");
+
+        assert_eq!(
+            *ends.lock().unwrap(),
+            vec![
+                (
+                    AgentId::Sub(2),
+                    "<task-notification>task #5 done</task-notification>".to_string()
+                ),
+                (AgentId::Sub(2), "work".to_string()),
+            ]
+        );
+        // The other owner's queue is untouched.
+        assert!(registry.has_notices(AgentId::Main));
+        assert!(!registry.has_notices(AgentId::Sub(2)));
     }
 }

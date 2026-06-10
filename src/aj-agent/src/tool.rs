@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::bus::EventBus;
+use crate::events::{AgentEvent, AgentId};
+use crate::TaskRegistry;
+
 // ---------------------------------------------------------------------------
 // Execution mode
 // ---------------------------------------------------------------------------
@@ -129,6 +133,13 @@ pub enum ToolDetails {
         /// `stdout_truncation`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stderr_truncation: Option<BashStreamTruncation>,
+        /// Background-task id when this call launched the command as a
+        /// background task; `None` for foreground runs. Renderers use
+        /// it to badge the cell and correlate task events. Default
+        /// `None` keeps the serialized form stable for sessions
+        /// captured before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<TaskId>,
     },
     /// Sub-agent run report — emitted by the `agent` tool when it
     /// runs as a child agent and returns a final report.
@@ -303,6 +314,220 @@ pub struct SpawnedAgent {
 }
 
 // ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+/// Identifier of a background task. Minted per session by the
+/// [`TaskRegistry`], shared between bash tasks and background agent
+/// spawns (`#1`, `#2`, …).
+pub type TaskId = usize;
+
+/// Lifecycle status of a background task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    /// The task's driver is still running.
+    Running,
+    /// Process exited (code is `None` when signal-killed), or the
+    /// agent-backed run completed/failed.
+    Exited(Option<i32>),
+    /// Killed via `task_stop`, the TUI, or shutdown.
+    Killed,
+}
+
+impl TaskStatus {
+    /// Whether the task has reached a terminal status.
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, TaskStatus::Running)
+    }
+}
+
+/// What kind of work a background task runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// A detached `bash -c` child.
+    Bash {
+        /// The exact command line executed.
+        command: String,
+    },
+    /// A background sub-agent run.
+    Agent {
+        /// The sub-agent's `Sub(n)` index.
+        agent_id: usize,
+        /// Task description supplied by the parent.
+        task: String,
+    },
+}
+
+/// Status-independent snapshot of a background task's output.
+///
+/// Stateless: repeated snapshots return overlapping content. The
+/// rolling tails are bounded; `spill_path` points at the canonical
+/// full output on disk (always persisted for background tasks) so
+/// callers can read past the tail with `read_file`. Byte totals are
+/// exact even when the tail has been trimmed.
+#[derive(Clone, Debug, Default)]
+pub struct TaskRead {
+    /// Rolling tail of standard output.
+    pub stdout_tail: String,
+    /// Rolling tail of standard error.
+    pub stderr_tail: String,
+    /// Total bytes that flowed through stdout.
+    pub stdout_total_bytes: u64,
+    /// Total bytes that flowed through stderr.
+    pub stderr_total_bytes: u64,
+    /// Path of the spill file carrying the full interleaved output.
+    pub spill_path: Option<PathBuf>,
+}
+
+/// Type-erased handle to a background task's output buffer.
+///
+/// Keeps `aj-agent` free of process details while the tool crate owns
+/// the buffering implementation.
+pub trait TaskOutputSource: Send + Sync {
+    /// Snapshot of the rolling output tail per stream, exact byte
+    /// totals, and the spill path. Stateless: repeated calls return
+    /// overlapping content; the *caller* applies display truncation.
+    fn snapshot(&self) -> TaskRead;
+}
+
+/// Plumbing handed to a background task's detached driver by
+/// [`ToolContext::start_background_task`].
+pub struct StartedTask {
+    /// The freshly minted task id.
+    pub id: TaskId,
+    /// Cancellation token for the driver — a child of the registry's
+    /// session-scoped root, NOT of the per-turn token, so the task
+    /// outlives the originating turn but dies on shutdown.
+    pub cancel: CancellationToken,
+    /// Event sink the driver reports through.
+    pub events: TaskEventSink,
+}
+
+/// Completion notice queued when a background task reaches a terminal
+/// status, drained into the owner's transcript at the next drain
+/// point as a `<task-notification>` user message.
+#[derive(Clone, Debug)]
+pub struct TaskNotice {
+    /// The agent that started the task and receives the notice.
+    pub owner: AgentId,
+    /// Id of the finished task.
+    pub task_id: TaskId,
+    /// What kind of work the task ran.
+    pub kind: TaskKind,
+    /// Display label (command / task description).
+    pub label: String,
+    /// Terminal status the task ended with.
+    pub status: TaskStatus,
+    /// Pre-rendered notice body. For bash: exit status, final output
+    /// tail, and the spill path; for agents: the report verbatim.
+    pub body: String,
+}
+
+/// How a detached task driver reaches the bus and the notice queue
+/// without holding the whole agent.
+///
+/// Drivers are plain tokio tasks, so emits are properly awaited. Bus
+/// listener errors are logged and swallowed: a task finishing outside
+/// any turn has no turn to abort, and persistence never subscribes to
+/// task events.
+#[derive(Clone)]
+pub struct TaskEventSink {
+    bus: EventBus,
+    registry: TaskRegistry,
+    owner: AgentId,
+    task_id: TaskId,
+    call_id: String,
+    label: String,
+}
+
+impl TaskEventSink {
+    /// Build a sink for the task `task_id` owned by `owner`,
+    /// correlated to the originating tool call `call_id`.
+    pub fn new(
+        bus: EventBus,
+        registry: TaskRegistry,
+        owner: AgentId,
+        task_id: TaskId,
+        call_id: String,
+        label: String,
+    ) -> Self {
+        Self {
+            bus,
+            registry,
+            owner,
+            task_id,
+            call_id,
+            label,
+        }
+    }
+
+    /// Emit [`AgentEvent::TaskStart`] announcing the task to the bus.
+    pub async fn started(&self, kind: TaskKind) {
+        let result = self
+            .bus
+            .emit(AgentEvent::TaskStart {
+                agent_id: self.owner,
+                task_id: self.task_id,
+                call_id: self.call_id.clone(),
+                kind,
+                label: self.label.clone(),
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                task_id = self.task_id,
+                "task start listener failed: {err:#}"
+            );
+        }
+    }
+
+    /// Emit a [`AgentEvent::TaskOutput`] snapshot (drivers
+    /// self-throttle, ~10/s).
+    pub async fn output(&self, partial: ToolDetails) {
+        let result = self
+            .bus
+            .emit(AgentEvent::TaskOutput {
+                agent_id: self.owner,
+                task_id: self.task_id,
+                call_id: self.call_id.clone(),
+                partial,
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                task_id = self.task_id,
+                "task output listener failed: {err:#}"
+            );
+        }
+    }
+
+    /// Flip the registry status to `status`, queue `notice`, and emit
+    /// [`AgentEvent::TaskEnd`].
+    pub async fn finished(&self, status: TaskStatus, notice: TaskNotice) {
+        self.registry.set_status(self.task_id, status);
+        // Queue the notice before announcing TaskEnd: the binary's
+        // wake trigger fires off TaskEnd, and the woken agent must
+        // find the notice already queued.
+        self.registry.push_notice(notice);
+        let result = self
+            .bus
+            .emit(AgentEvent::TaskEnd {
+                agent_id: self.owner,
+                task_id: self.task_id,
+                call_id: self.call_id.clone(),
+                status,
+                label: self.label.clone(),
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(task_id = self.task_id, "task end listener failed: {err:#}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool trait + erased shape
 // ---------------------------------------------------------------------------
 
@@ -446,6 +671,23 @@ pub trait ToolContext: Send {
     /// Cancellation propagates from `Agent::cancel` and from a parent
     /// agent's cancellation when this is a sub-agent.
     fn cancellation(&self) -> CancellationToken;
+
+    /// Shared task registry handle (for the `task_*` tools).
+    fn task_registry(&self) -> TaskRegistry;
+
+    /// Register a background task and get the plumbing its detached
+    /// driver needs: the task id, a cancel token (child of the
+    /// registry root, NOT of the per-turn token), and an event sink.
+    ///
+    /// NOTE: ids are allocated by the registry, not by session state,
+    /// so detached drivers never need the `&mut SessionState` borrow
+    /// that makes foreground tools block.
+    fn start_background_task(
+        &mut self,
+        kind: TaskKind,
+        label: String,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> StartedTask;
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +751,7 @@ mod tests {
                 full_output_path: None,
                 stdout_truncation: None,
                 stderr_truncation: None,
+                task_id: None,
             },
             ToolDetails::SubAgentReport {
                 agent_id: 1,

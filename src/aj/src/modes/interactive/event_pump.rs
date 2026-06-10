@@ -572,9 +572,15 @@ impl EventPump {
             }
 
             // ---- Placeholders: events whose UI work isn't yet wired. ----
-            AgentEvent::TurnEnd { .. } | AgentEvent::QueueUpdate { .. } => {
-                // Queue indicators and the `TurnEnd` summary land in
-                // follow-up commits. Holding the arms here keeps the
+            AgentEvent::TurnEnd { .. }
+            | AgentEvent::QueueUpdate { .. }
+            | AgentEvent::TaskStart { .. }
+            | AgentEvent::TaskOutput { .. }
+            | AgentEvent::TaskEnd { .. } => {
+                // Queue indicators, the `TurnEnd` summary, and the
+                // background-task surfaces (footer count, picker
+                // entries, live cell updates) land in follow-up
+                // commits. Holding the arms here keeps the
                 // exhaustiveness check active so a newly-emitted
                 // event variant shows up as a compile error.
             }

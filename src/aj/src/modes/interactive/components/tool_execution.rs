@@ -764,6 +764,7 @@ fn render_details_body(details: &ToolDetails, expanded: bool) -> Vec<String> {
             full_output_path,
             stdout_truncation,
             stderr_truncation,
+            task_id: _,
         } => {
             let command = sanitize_terminal_output(command);
             // `stdout` / `stderr` are already sanitised at the bash
@@ -1071,6 +1072,7 @@ mod tests {
                 full_output_path: None,
                 stdout_truncation: None,
                 stderr_truncation: None,
+                task_id: None,
             },
             &[],
             false,
@@ -1102,6 +1104,7 @@ mod tests {
                 full_output_path: None,
                 stdout_truncation: None,
                 stderr_truncation: None,
+                task_id: None,
             },
             &[],
             false,
@@ -1136,6 +1139,7 @@ mod tests {
                 full_output_path: None,
                 stdout_truncation: None,
                 stderr_truncation: None,
+                task_id: None,
             },
             &[],
             false,
@@ -1384,6 +1388,7 @@ mod tests {
                 full_output_path: None,
                 stdout_truncation: None,
                 stderr_truncation: None,
+                task_id: None,
             },
             &[],
             false,
@@ -1497,6 +1502,7 @@ mod tests {
                 full_output_path: None,
                 stdout_truncation: None,
                 stderr_truncation: None,
+                task_id: None,
             },
             &[],
             false,
