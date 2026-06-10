@@ -144,6 +144,12 @@ impl AgentPickerComponent {
         Arc::clone(&self.outcome)
     }
 
+    /// Whether the picker is currently showing all agents (as opposed
+    /// to only running ones), for the border key-hint.
+    pub fn showing_all(&self) -> bool {
+        self.scope == Scope::All
+    }
+
     /// Rebuild the inner list after a scope change.
     fn rebuild(&mut self) {
         self.inner = Self::build_list(

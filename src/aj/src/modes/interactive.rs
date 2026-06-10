@@ -92,7 +92,7 @@ use crate::modes::interactive::components::session_selector::{
 use crate::modes::interactive::components::settings_window::{
     ChangesHandle as SettingsChangesHandle, CorrectionsHandle as SettingsCorrectionsHandle,
     MODEL_SETTING_ID, OutcomeHandle as SettingsOutcomeHandle, SettingsCurrentValues,
-    SettingsWindowComponent, SettingsWindowOutcome, UNSET_VALUE,
+    SettingsSubmenu, SettingsWindowComponent, SettingsWindowOutcome, UNSET_VALUE,
 };
 use crate::modes::interactive::components::skills_window::{
     ChangesHandle as SkillsChangesHandle, OutcomeHandle as SkillsOutcomeHandle, SkillRow,
@@ -2485,9 +2485,14 @@ fn subtitle_confirm_close() -> String {
     }
 }
 
-/// Subtitle for the agent picker: how to observe, toggle scope, and
-/// close, with key labels resolved from the keybindings manager.
-fn subtitle_agent_picker() -> String {
+/// Per-frame subtitle for the agent picker, resolved by the overlay
+/// via `with_dynamic_subtitle`: the scope-toggle hint names the scope
+/// the chord would switch *to*, so it flips along with the list.
+fn subtitle_agent_picker(child: &dyn aj_tui::component::Component) -> String {
+    let showing_all = child
+        .as_any()
+        .downcast_ref::<AgentPickerComponent>()
+        .is_some_and(AgentPickerComponent::showing_all);
     let confirm = aj_tui::keybindings::format_action_shortcut("tui.input.submit")
         .unwrap_or_else(|| "Enter".to_string());
     let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
@@ -2496,7 +2501,37 @@ fn subtitle_agent_picker() -> String {
         crate::config::keybindings::ACTION_AGENT_TOGGLE_SCOPE,
     )
     .unwrap_or_else(|| "Ctrl+T".to_string());
-    format!("{confirm} to observe  \u{2022}  {scope} all agents  \u{2022}  {cancel} to close")
+    let scope_target = if showing_all {
+        "running agents"
+    } else {
+        "all agents"
+    };
+    format!("{confirm} to observe  \u{2022}  {scope} {scope_target}  \u{2022}  {cancel} to close")
+}
+
+/// Per-frame subtitle for the prompt-history overlay, resolved by the
+/// overlay via `with_dynamic_subtitle`: the scope-toggle hint names
+/// the scope the chord would switch *to*, so it flips along with the
+/// list.
+fn subtitle_prompt_history(child: &dyn aj_tui::component::Component) -> String {
+    let showing_all = child
+        .as_any()
+        .downcast_ref::<PromptHistorySearchComponent>()
+        .is_some_and(PromptHistorySearchComponent::showing_all_workspaces);
+    let confirm = aj_tui::keybindings::format_action_shortcut("tui.input.submit")
+        .unwrap_or_else(|| "Enter".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    let scope = aj_tui::keybindings::format_action_shortcut(
+        crate::config::keybindings::ACTION_HISTORY_TOGGLE_SCOPE,
+    )
+    .unwrap_or_else(|| "Ctrl+T".to_string());
+    let scope_target = if showing_all {
+        "this workspace"
+    } else {
+        "all workspaces"
+    };
+    format!("{confirm} to recall  \u{2022}  {scope} {scope_target}  \u{2022}  {cancel} to close")
 }
 
 /// Subtitle for read-only overlays (the help screen): just the
@@ -2510,6 +2545,56 @@ fn subtitle_close() -> String {
     match close_all {
         Some(k) if k != cancel => format!("{cancel} back  \u{2022}  {k} close"),
         _ => format!("{cancel} to close"),
+    }
+}
+
+/// Subtitle for stay-open editing overlays (settings, skills): how to
+/// change/toggle the highlighted value and how to close. `verb` is the
+/// per-window activation word (`"change"`, `"toggle"`). Space is a
+/// hardcoded activation alias in the settings list, so it's surfaced
+/// alongside the resolved confirm key.
+fn subtitle_change_close(verb: &str) -> String {
+    let confirm = aj_tui::keybindings::format_action_shortcut("tui.select.confirm")
+        .unwrap_or_else(|| "Enter".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    let close_all = aj_tui::keybindings::format_action_shortcut(
+        crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
+    );
+    match close_all {
+        Some(k) if k != cancel => {
+            format!("{confirm}/Space to {verb}  \u{2022}  {cancel} back  \u{2022}  {k} close")
+        }
+        _ => format!("{confirm}/Space to {verb}  \u{2022}  {cancel} to close"),
+    }
+}
+
+/// Per-frame subtitle for the settings window, resolved by the overlay
+/// via [`OverlayWindow::with_dynamic_subtitle`]: while a submenu is
+/// open the keys mean different things than on the main list, so the
+/// hint follows the active submenu kind.
+///
+/// [`OverlayWindow::with_dynamic_subtitle`]:
+///     aj_tui::components::overlay_window::OverlayWindow::with_dynamic_subtitle
+fn subtitle_settings_window(child: &dyn aj_tui::component::Component) -> String {
+    let submenu = child
+        .as_any()
+        .downcast_ref::<SettingsWindowComponent>()
+        .map(SettingsWindowComponent::active_submenu)
+        .unwrap_or(SettingsSubmenu::None);
+    let confirm = aj_tui::keybindings::format_action_shortcut("tui.select.confirm")
+        .unwrap_or_else(|| "Enter".to_string());
+    let submit = aj_tui::keybindings::format_action_shortcut("tui.input.submit")
+        .unwrap_or_else(|| "Enter".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    match submenu {
+        SettingsSubmenu::None => subtitle_change_close("change"),
+        SettingsSubmenu::Picker => format!("{confirm} to confirm  \u{2022}  {cancel} back"),
+        SettingsSubmenu::TextEdit => format!("{submit} to apply  \u{2022}  {cancel} back"),
+        SettingsSubmenu::Toggles => {
+            format!("{confirm}/Space to toggle  \u{2022}  {cancel} back")
+        }
     }
 }
 
@@ -2992,7 +3077,7 @@ async fn handle_slash_command(
                 initial_inner_rows,
             )
             .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
-            .with_subtitle(&subtitle_confirm_close());
+            .with_dynamic_subtitle(subtitle_prompt_history);
             let handle = tui.show_overlay(Box::new(window), large_overlay_options());
             SlashHandled::Continue {
                 selector: Some(OpenSelector::PromptHistory {
@@ -3017,7 +3102,7 @@ async fn handle_slash_command(
                 crate::config::theme::overlay_window_theme(theme),
                 PALETTE_OVERLAY_INNER_ROWS,
             )
-            .with_subtitle(&subtitle_agent_picker());
+            .with_dynamic_subtitle(subtitle_agent_picker);
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             SlashHandled::Continue {
                 selector: Some(OpenSelector::AgentPicker {
@@ -3092,7 +3177,7 @@ async fn handle_slash_command(
                 initial_inner_rows,
             )
             .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
-            .with_subtitle(&subtitle_close());
+            .with_dynamic_subtitle(subtitle_settings_window);
             let handle = tui.show_overlay(Box::new(window), large_overlay_options());
             SlashHandled::Continue {
                 selector: Some(OpenSelector::Settings {
@@ -3146,7 +3231,7 @@ async fn handle_slash_command(
                     initial_inner_rows,
                 )
                 .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
-                .with_subtitle(&subtitle_close());
+                .with_subtitle(subtitle_change_close("toggle"));
                 let handle = tui.show_overlay(Box::new(window), large_overlay_options());
                 SlashHandled::Continue {
                     selector: Some(OpenSelector::Skills {

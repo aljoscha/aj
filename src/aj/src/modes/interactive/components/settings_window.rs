@@ -60,6 +60,21 @@ pub enum SettingsWindowOutcome {
     Closed,
 }
 
+/// Which kind of submenu is currently active inside the window. The
+/// host uses this to render a matching key-hint on the overlay border
+/// (the keys mean different things while a submenu is open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSubmenu {
+    /// No submenu open; the main settings list has the input.
+    None,
+    /// A pick-one list (thinking level, theme, model picker).
+    Picker,
+    /// The one-line free-form text editor (`model_url`).
+    TextEdit,
+    /// The nested enabled/disabled toggle list (tools, skills).
+    Toggles,
+}
+
 /// Cheap-to-clone handle pointing at the same outcome slot the
 /// overlay component writes into.
 pub type OutcomeHandle = Arc<Mutex<Option<SettingsWindowOutcome>>>;
@@ -178,6 +193,18 @@ impl SettingsWindowComponent {
     pub fn corrections_handle(&self) -> CorrectionsHandle {
         Arc::clone(&self.corrections)
     }
+
+    /// Which submenu kind is currently open, for border key-hints.
+    pub fn active_submenu(&self) -> SettingsSubmenu {
+        match self.inner.active_submenu() {
+            None => SettingsSubmenu::None,
+            Some(c) if c.as_any().is::<TextEditSubmenu>() => SettingsSubmenu::TextEdit,
+            Some(c) if c.as_any().is::<SettingsList>() => SettingsSubmenu::Toggles,
+            // Everything else picks one value: a plain `SelectList`
+            // or the embedded model picker.
+            Some(_) => SettingsSubmenu::Picker,
+        }
+    }
 }
 
 impl Component for SettingsWindowComponent {
@@ -254,7 +281,7 @@ fn build_items(
                     option.name,
                     option.name,
                     current.model_url.clone().unwrap_or_default(),
-                    text_submenu_factory(Arc::clone(&settings_theme.hint)),
+                    text_submenu_factory(),
                 );
                 item.description = Some(describe(
                     option,
@@ -537,14 +564,13 @@ impl Component for ModelPickerSubmenu {
 
 /// Submenu factory for free-form string options (`model_url`): a
 /// one-line editor pre-filled with the current value.
-fn text_submenu_factory(hint: Arc<dyn Fn(&str) -> String>) -> SubmenuFactory {
+fn text_submenu_factory() -> SubmenuFactory {
     Box::new(move |current: &str, done: SubmenuDoneCallback| {
         let mut input = TextInput::new("> ");
         input.set_value(current);
         input.set_focused(true);
         Box::new(TextEditSubmenu {
             input,
-            hint: Arc::clone(&hint),
             done: Some(done),
         })
     })
@@ -554,7 +580,6 @@ fn text_submenu_factory(hint: Arc<dyn Fn(&str) -> String>) -> SubmenuFactory {
 /// (empty meaning "unset"), `Esc` cancels.
 struct TextEditSubmenu {
     input: TextInput,
-    hint: Arc<dyn Fn(&str) -> String>,
     done: Option<SubmenuDoneCallback>,
 }
 
@@ -562,10 +587,7 @@ impl Component for TextEditSubmenu {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        let mut lines = self.input.render(width);
-        lines.push(String::new());
-        lines.push((self.hint)("  Enter to apply · Esc to cancel"));
-        lines
+        self.input.render(width)
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {

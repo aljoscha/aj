@@ -201,6 +201,12 @@ impl PromptHistorySearchComponent {
         PromptHistoryOutcomeHandle(Arc::clone(&self.outcome.0))
     }
 
+    /// Whether the overlay is currently showing the all-workspaces
+    /// scope, for the border key-hint.
+    pub fn showing_all_workspaces(&self) -> bool {
+        self.scope == Scope::All
+    }
+
     /// Entries backing the currently-selected scope. The all-workspaces
     /// scope is empty until its scan streams in (the loading indicator
     /// covers that window).
@@ -313,16 +319,15 @@ impl PromptHistorySearchComponent {
         self.outcome.set(PromptHistoryOutcome::Cancelled);
     }
 
-    /// Dim status line advertising the current scope and the toggle
-    /// chord, rendered between the search box and the list. While the
-    /// visible scope is still streaming results it also carries a
+    /// Dim status line advertising the current scope, rendered between
+    /// the search box and the list. The toggle chord itself is
+    /// advertised on the overlay border, not here. While the visible
+    /// scope is still streaming results the line also carries a
     /// `loading…` hint so partial lists don't look complete.
     fn scope_line(&self) -> String {
-        let key = aj_tui::keybindings::format_action_shortcut(ACTION_HISTORY_TOGGLE_SCOPE)
-            .unwrap_or_else(|| "Ctrl+T".to_string());
         let mut text = match self.scope {
-            Scope::Workspace => format!("this workspace  \u{2022}  {key} all workspaces"),
-            Scope::All => format!("all workspaces  \u{2022}  {key} this workspace"),
+            Scope::Workspace => "Showing: this workspace".to_string(),
+            Scope::All => "Showing: all workspaces".to_string(),
         };
         if self.is_current_loading() {
             text.push_str("  \u{2022}  loading\u{2026}");

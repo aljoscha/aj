@@ -321,8 +321,9 @@ fn typing_a_printable_recomputes_the_filter_after_each_keystroke() {
 fn render_shows_cursor_on_selected_item_and_description_below() {
     let (mut list, _, _) = make_settings_list(sample_items(), SettingsListOptions::default());
     let rendered = plain_lines_trim_end(&list.render(80));
-    // Three item rows + blank + hint (no description because default
-    // selected item is "theme" which has none).
+    // Three item rows, nothing else (no description because the
+    // default selected item is "theme" which has none; key hints are
+    // the hosting overlay's job, not the list's).
     assert!(
         rendered[0].starts_with("> Theme"),
         "cursor should mark the first item; got {:?}",
@@ -331,8 +332,8 @@ fn render_shows_cursor_on_selected_item_and_description_below() {
     assert!(rendered[1].starts_with("  Confirm Exit"));
     assert!(rendered[2].starts_with("  Read Only"));
     assert!(
-        rendered.iter().any(|line| line.contains("Enter/Space")),
-        "hint line should be present",
+        !rendered.iter().any(|line| line.contains("Enter/Space")),
+        "the list must not render its own key-hint line",
     );
 }
 
@@ -659,9 +660,8 @@ fn enter_on_submenu_item_opens_the_submenu_and_render_delegates() {
         "submenu should open on Enter when the item has a submenu factory",
     );
 
-    // While open, render delegates to the submenu component. The
-    // parent list's own hint ("Enter/Space to change…") should be
-    // absent.
+    // While open, render delegates to the submenu component; none of
+    // the parent list's own rows should leak through.
     let rendered = plain_lines_trim_end(&list.render(80));
     assert_eq!(rendered, vec!["submenu open, current=one"]);
 }

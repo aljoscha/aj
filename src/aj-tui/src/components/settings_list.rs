@@ -343,6 +343,13 @@ impl SettingsList {
         self.active_submenu.is_some()
     }
 
+    /// The currently-open submenu component, if any. Hosts can downcast
+    /// it via `as_any` to tailor surrounding chrome (e.g. a key-hint on
+    /// an overlay border) to the submenu kind.
+    pub fn active_submenu(&self) -> Option<&dyn Component> {
+        self.active_submenu.as_ref().map(|a| a.component.as_ref())
+    }
+
     fn move_up(&mut self) {
         if self.filtered.is_empty() {
             return;
@@ -387,14 +394,6 @@ impl SettingsList {
         self.selected = 0;
     }
 
-    fn hint_text(&self) -> &'static str {
-        if self.search.is_some() {
-            "  Type to search · Enter/Space to change · Esc to cancel"
-        } else {
-            "  Enter/Space to change · Esc to cancel"
-        }
-    }
-
     fn compute_label_width(&self) -> usize {
         self.items
             .iter()
@@ -406,14 +405,13 @@ impl SettingsList {
 
     /// Rows `render` may emit around the visible item window: the
     /// search input + its trailing blank (when enabled), the scroll
-    /// indicator, a two-row reserve for the selected item's
-    /// description, and the blank + trailing hint. The description
-    /// reserve is a heuristic — a long description can wrap further
-    /// and push past the budget, in which case the host (e.g. an
-    /// overlay window) truncates the overflow.
+    /// indicator, and a two-row reserve for the selected item's
+    /// description. The description reserve is a heuristic — a long
+    /// description can wrap further and push past the budget, in which
+    /// case the host (e.g. an overlay window) truncates the overflow.
     fn chrome_rows(&self) -> usize {
         let search = if self.search.is_some() { 2 } else { 0 };
-        search + 1 + 2 + 2
+        search + 1 + 2
     }
 }
 
@@ -437,28 +435,12 @@ impl Component for SettingsList {
 
         if self.items.is_empty() {
             lines.push((self.theme.hint)("  No settings available"));
-            if self.search.is_some() {
-                lines.push(String::new());
-                lines.push(truncate_to_width(
-                    &(self.theme.hint)(self.hint_text()),
-                    width,
-                    "",
-                    false,
-                ));
-            }
             return lines;
         }
 
         if self.filtered.is_empty() {
             lines.push(truncate_to_width(
                 &(self.theme.hint)("  No matching settings"),
-                width,
-                "",
-                false,
-            ));
-            lines.push(String::new());
-            lines.push(truncate_to_width(
-                &(self.theme.hint)(self.hint_text()),
                 width,
                 "",
                 false,
@@ -528,15 +510,6 @@ impl Component for SettingsList {
                 }
             }
         }
-
-        // Trailing hint.
-        lines.push(String::new());
-        lines.push(truncate_to_width(
-            &(self.theme.hint)(self.hint_text()),
-            width,
-            "",
-            false,
-        ));
 
         lines
     }

@@ -34,10 +34,19 @@ pub struct OverlayWindow {
     title: String,
     /// Optional bottom-border subtitle (e.g. a key-hint). Right-aligned
     /// on the bottom edge, mirroring the title-on-top-border layout.
-    subtitle: Option<String>,
+    subtitle: Option<Subtitle>,
     child: Box<dyn Component>,
     theme: OverlayWindowTheme,
     height: InnerHeight,
+}
+
+/// Source of the bottom-border subtitle text.
+enum Subtitle {
+    /// Constant text set at construction.
+    Static(String),
+    /// Recomputed each frame from the child component, so the hint can
+    /// track child state (e.g. a submenu changing what the keys do).
+    Dynamic(Box<dyn Fn(&dyn Component) -> String>),
 }
 
 /// How the [`OverlayWindow`]'s inner content height is determined.
@@ -120,7 +129,20 @@ impl OverlayWindow {
     /// policy as the title; omitted entirely when the box is too
     /// narrow to fit it.
     pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
-        self.subtitle = Some(subtitle.into());
+        self.subtitle = Some(Subtitle::Static(subtitle.into()));
+        self
+    }
+
+    /// Set a bottom-border subtitle that is re-resolved from the child
+    /// every frame. Use this when the right hint depends on the child's
+    /// state — the closure typically downcasts the child via `as_any`
+    /// and picks a hint accordingly. Same truncation policy as
+    /// [`OverlayWindow::with_subtitle`].
+    pub fn with_dynamic_subtitle(
+        mut self,
+        subtitle: impl Fn(&dyn Component) -> String + 'static,
+    ) -> Self {
+        self.subtitle = Some(Subtitle::Dynamic(Box::new(subtitle)));
         self
     }
 
@@ -141,8 +163,12 @@ impl OverlayWindow {
     }
 
     fn render_bottom(&self, width: usize) -> String {
-        let subtitle = self.subtitle.as_deref().unwrap_or("");
-        self.render_edge(width, '╰', '╯', subtitle, &self.theme.subtitle, true)
+        let subtitle = match &self.subtitle {
+            None => String::new(),
+            Some(Subtitle::Static(text)) => text.clone(),
+            Some(Subtitle::Dynamic(resolve)) => resolve(self.child.as_ref()),
+        };
+        self.render_edge(width, '╰', '╯', &subtitle, &self.theme.subtitle, true)
     }
 
     /// Shared top/bottom edge renderer. `right_align` controls inline
@@ -440,6 +466,23 @@ mod tests {
         assert!(bottom.starts_with('╰'), "bottom: {bottom:?}");
         assert!(bottom.ends_with('╯'), "bottom: {bottom:?}");
         assert_eq!(visible_width(bottom), 40);
+    }
+
+    #[test]
+    fn dynamic_subtitle_is_resolved_from_child_state_each_frame() {
+        let child = Box::new(MockChild::new(vec!["x"]));
+        let mut ov = OverlayWindow::new("T", child, identity_theme(), 5).with_dynamic_subtitle(
+            |child: &dyn Component| {
+                let mc = child.as_any().downcast_ref::<MockChild>().expect("mock");
+                format!("inputs:{}", mc.input_count)
+            },
+        );
+        let r = ov.render(40);
+        assert!(r.last().unwrap().contains("inputs:0"));
+
+        ov.handle_input(&InputEvent::Paste(String::new()));
+        let r = ov.render(40);
+        assert!(r.last().unwrap().contains("inputs:1"));
     }
 
     #[test]
