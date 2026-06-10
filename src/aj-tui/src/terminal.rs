@@ -359,10 +359,15 @@ fn progress_keepalive_loop(stop: Arc<AtomicBool>, log_path: Option<PathBuf>) {
 pub struct ProcessTerminal {
     /// Whether `start()` has run and `stop()` has not yet been called.
     started: bool,
-    /// `Some` until the first call to [`ProcessTerminal::take_input_stream`];
-    /// holds the crossterm-backed input stream waiting to be handed to
-    /// the [`crate::tui::Tui`] event loop.
+    /// Crossterm-backed input stream waiting to be handed to the
+    /// [`crate::tui::Tui`] event loop. `None` until the first
+    /// successful [`Terminal::start`] creates it, then `Some` until
+    /// [`ProcessTerminal::take_input_stream`] moves it out.
     input_stream: Option<InputStream>,
+    /// Whether the input stream has ever been created. Keeps a
+    /// stop/start cycle from building a second stream after the first
+    /// one was taken.
+    input_stream_created: bool,
     /// Destination for the optional [`WRITE_LOG_ENV`] write-log. `None`
     /// means the env var was unset, so writes bypass the disk logger
     /// entirely.
@@ -380,16 +385,15 @@ pub struct ProcessTerminal {
 
 impl ProcessTerminal {
     pub fn new() -> Self {
-        // Build the crossterm-backed input stream up front so it's
-        // available before `start()` is called. The underlying
-        // `EventStream` doesn't actually read from stdin until polled,
-        // so creating it early is cheap and side-effect-free.
-        let events = crossterm::event::EventStream::new()
-            .filter_map(|ev| async move { ev.ok().and_then(|e| InputEvent::try_from(e).ok()) });
-        let input_stream: InputStream = Box::pin(events);
+        // Construction must not touch the process's terminal: building
+        // a crossterm `EventStream` here would panic in environments
+        // without any usable TTY (crossterm's "reader source not set").
+        // The input stream is created in `start()`, once raw mode has
+        // proven a TTY exists.
         Self {
             started: false,
-            input_stream: Some(input_stream),
+            input_stream: None,
+            input_stream_created: false,
             write_log_path: resolve_write_log_path(),
             progress_stop: Arc::new(AtomicBool::new(false)),
             progress_thread: None,
@@ -462,6 +466,18 @@ impl Terminal for ProcessTerminal {
 
         enable_raw_mode()?;
         RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
+
+        // Raw mode succeeding proves a usable TTY exists, so building
+        // the crossterm `EventStream` is safe now (it panics when no
+        // event source is available). `Tui::start` calls
+        // `take_input_stream` only after this method returns, so the
+        // stream is always ready in time.
+        if !self.input_stream_created {
+            let events = crossterm::event::EventStream::new()
+                .filter_map(|ev| async move { ev.ok().and_then(|e| InputEvent::try_from(e).ok()) });
+            self.input_stream = Some(Box::pin(events));
+            self.input_stream_created = true;
+        }
 
         let mut stdout = io::stdout();
         execute!(stdout, EnableBracketedPaste)?;
