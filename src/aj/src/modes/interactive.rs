@@ -579,17 +579,23 @@ impl InteractiveMode {
             };
             world.pump.handle(&mut tui, &event);
         }
-        let (system_prompt_notice, context_notice) = {
-            let a = world.agent.lock().await;
-            (
-                build_system_prompt_notice(a.env()),
-                build_context_notice(a.env()),
-            )
-        };
-        world
-            .pump
-            .handle(&mut tui, &notice_event(&system_prompt_notice));
-        world.pump.handle(&mut tui, &notice_event(&context_notice));
+        // The system-prompt and context notices only apply to fresh
+        // sessions: a resumed session keeps the assembled prompt
+        // persisted in its log, so the freshly-loaded env these
+        // notices describe doesn't govern what's actually sent.
+        if matches!(spec, SessionSpec::Create { .. }) {
+            let (system_prompt_notice, context_notice) = {
+                let a = world.agent.lock().await;
+                (
+                    build_system_prompt_notice(a.env()),
+                    build_context_notice(a.env()),
+                )
+            };
+            world
+                .pump
+                .handle(&mut tui, &notice_event(&system_prompt_notice));
+            world.pump.handle(&mut tui, &notice_event(&context_notice));
+        }
         if sandbox_warning_enabled() {
             world.pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
         }
