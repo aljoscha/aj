@@ -147,7 +147,10 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::info!(disabled = ?config.disabled_tools, "filtered disabled tools");
     }
 
-    let env = AgentEnv::new(SYSTEM_PROMPT);
+    let env = AgentEnv::new(SYSTEM_PROMPT, &config.disabled_skills);
+    for d in &env.skill_diagnostics {
+        eprintln!("aj: warning: {d}");
+    }
 
     // Resolve the [`ConversationLog`] for this run before the model:
     // a resumed session's recorded settings take precedence over the

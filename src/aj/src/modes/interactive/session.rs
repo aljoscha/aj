@@ -66,7 +66,7 @@ fn build_agent(
         tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
     }
     let mut agent = Agent::with_provider(
-        AgentEnv::new(SYSTEM_PROMPT),
+        AgentEnv::new(SYSTEM_PROMPT, &config.disabled_skills),
         tools,
         config.disabled_tools.clone(),
         provider,

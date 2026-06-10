@@ -52,8 +52,11 @@ Persistent state lives under `~/.aj/`:
 
 - `.env` — secrets (API keys); loaded before the project-local `.env`.
 - `config.toml` — defaults (model, thinking level, speed, theme,
-  disabled tools).
+  disabled tools/skills).
 - `models.json` — model catalog; refresh with `aj models update`.
+- `skills/` — user-level skills (SKILL.md directories); also discovered
+  from `~/.agents/skills/`, `~/.claude/skills/`, and project-level
+  `.aj/`/`.agents/`/`.claude/` `skills/` dirs up to the git root.
 - `themes/<name>.json` — optional user themes layered on top of the
   bundled `dark` / `light` palettes. Hot-reloads on file changes.
 - `threads/<project>/` — JSONL conversation logs, one file per thread.

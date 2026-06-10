@@ -137,6 +137,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         action_id: None,
     },
     BuiltinCommand {
+        name: "skills",
+        title: "skills",
+        category: "aj",
+        description: "List discovered skills; toggle to enable or disable.",
+        action_id: None,
+    },
+    BuiltinCommand {
         name: "help",
         title: "help",
         category: "aj",
@@ -214,6 +221,10 @@ pub enum SlashAction {
     /// Open the settings window overlay. Changes apply (and persist
     /// to `config.toml`) as the user makes them; `Esc` closes.
     OpenSettings,
+    /// Open the skills window overlay listing every discovered skill.
+    /// Toggles persist to the `disabled_skills` config option as the
+    /// user makes them; `Esc` closes.
+    OpenSkills,
     /// Start a fresh session. The current session is preserved on
     /// disk; the host creates a new [`ConversationLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the
@@ -264,6 +275,7 @@ pub fn dispatch(input: &str) -> SlashAction {
         "history" => SlashAction::OpenPromptHistory,
         "agents" => SlashAction::OpenAgentPicker,
         "settings" => SlashAction::OpenSettings,
+        "skills" => SlashAction::OpenSkills,
         "palette" => SlashAction::OpenCommandPalette,
         "new" => SlashAction::NewSession,
         "help" => SlashAction::Help,
@@ -399,6 +411,14 @@ mod tests {
         assert_eq!(dispatch("  /settings  "), SlashAction::OpenSettings);
         // Trailing tokens are ignored — commands are zero-argument.
         assert_eq!(dispatch("/settings theme"), SlashAction::OpenSettings);
+    }
+
+    #[test]
+    fn dispatch_skills_opens_skills_window() {
+        assert_eq!(dispatch("/skills"), SlashAction::OpenSkills);
+        assert_eq!(dispatch("  /skills  "), SlashAction::OpenSkills);
+        // Trailing tokens are ignored — commands are zero-argument.
+        assert_eq!(dispatch("/skills tmux"), SlashAction::OpenSkills);
     }
 
     #[test]

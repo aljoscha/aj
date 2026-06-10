@@ -94,6 +94,10 @@ use crate::modes::interactive::components::settings_window::{
     MODEL_SETTING_ID, OutcomeHandle as SettingsOutcomeHandle, SettingsCurrentValues,
     SettingsWindowComponent, SettingsWindowOutcome, UNSET_VALUE,
 };
+use crate::modes::interactive::components::skills_window::{
+    ChangesHandle as SkillsChangesHandle, OutcomeHandle as SkillsOutcomeHandle, SkillRow,
+    SkillsWindowComponent, SkillsWindowOutcome,
+};
 use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
 };
@@ -585,13 +589,23 @@ impl InteractiveMode {
         // The context notice only applies to fresh sessions: a
         // resumed session keeps the assembled prompt persisted in
         // its log, so the freshly-loaded env the notice describes
-        // doesn't govern what's actually sent.
+        // doesn't govern what's actually sent. Skill-discovery
+        // warnings ride along under the same rule.
         if matches!(spec, SessionSpec::Create { .. }) {
-            let context_notice = {
+            let (context_notice, skill_warnings) = {
                 let a = world.agent.lock().await;
-                build_context_notice(a.env())
+                let env = a.env();
+                let warnings: Vec<String> = env
+                    .skill_diagnostics
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect();
+                (build_context_notice(env), warnings)
             };
             world.pump.handle(&mut tui, &notice_event(&context_notice));
+            for warning in &skill_warnings {
+                world.pump.handle(&mut tui, &warning_event(warning));
+            }
         }
         if sandbox_warning_enabled() {
             world.pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
@@ -2000,6 +2014,16 @@ enum OpenSelector {
         corrections: SettingsCorrectionsHandle,
         parent_palette: Option<ParentPalette>,
     },
+    /// Skills window (`/skills`). Stays open across changes: the host
+    /// drains `changes` after every input event, persisting each
+    /// enable/disable toggle into the `disabled_skills` config option;
+    /// `outcome` only ever reports the close.
+    Skills {
+        handle: OverlayHandle,
+        outcome: SkillsOutcomeHandle,
+        changes: SkillsChangesHandle,
+        parent_palette: Option<ParentPalette>,
+    },
 }
 
 /// What confirming a provider in the [`OpenSelector::AuthPicker`]
@@ -2174,9 +2198,13 @@ impl ThemeWatch {
 
 /// Build the chat-scrollback "Context:" notice listing everything
 /// stitched into the agent's system prompt: the base prompt (builtin
-/// or override file) followed by every agents.md-style instruction
-/// file, one row each formatted as `  - <tildified path> (<label>)`
-/// so the user can verify which guidance is actually active.
+/// or override file), every agents.md-style instruction file, and
+/// every discovered skill, one row each formatted as
+/// `  - <tildified path> (<label>)` so the user can verify which
+/// guidance is actually active. Skill rows carry the skill name and a
+/// marker when the skill is excluded from the model's listing — either
+/// `disabled` (the user's `disabled_skills` config) or
+/// `model-invocation disabled` (the skill's own frontmatter).
 fn build_context_notice(env: &AgentEnv) -> String {
     let mut lines = String::from("Context:");
     let source = &env.system_prompt.source;
@@ -2200,6 +2228,20 @@ fn build_context_notice(env: &AgentEnv) -> String {
             "\n  - {} ({})",
             display_path(&file.path),
             file.kind.label()
+        ));
+    }
+    for skill in &env.skills {
+        let marker = if !skill.enabled {
+            ", disabled"
+        } else if skill.disable_model_invocation {
+            ", model-invocation disabled"
+        } else {
+            ""
+        };
+        lines.push_str(&format!(
+            "\n  - {} (skill: {}{marker})",
+            display_path(&skill.path),
+            skill.name,
         ));
     }
     lines
@@ -2525,6 +2567,11 @@ fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
             ..
         }
         | OpenSelector::Settings {
+            handle,
+            parent_palette,
+            ..
+        }
+        | OpenSelector::Skills {
             handle,
             parent_palette,
             ..
@@ -3002,6 +3049,7 @@ async fn handle_slash_command(
                     speed: speed_name(run_cfg.speed).to_string(),
                     theme: resolve_theme_name(cfg.theme.as_deref()).to_string(),
                     disabled_tools: cfg.disabled_tools.clone(),
+                    disabled_skills: cfg.disabled_skills.clone(),
                     hide_thinking_block: render_settings.hide_thinking_block(),
                     image_auto_resize: cfg.image_auto_resize,
                     image_show_in_terminal: render_settings.show_image_in_terminal(),
@@ -3016,12 +3064,21 @@ async fn handle_slash_command(
                 .into_iter()
                 .map(|tool| tool.name)
                 .collect();
+            // Skill names for the disabled-skills toggle list, from a
+            // fresh discovery scan so newly added skills are togglable
+            // without restarting.
+            let skill_names: Vec<String> = aj_conf::skills::discover_skills(&[])
+                .0
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect();
             let inner = SettingsWindowComponent::new(
                 settings_list_theme(theme),
                 select_list_theme(theme),
                 (*model_catalog).clone(),
                 Theme::available(),
                 tool_names,
+                skill_names,
                 current,
             );
             let outcome = inner.outcome_handle();
@@ -3046,6 +3103,60 @@ async fn handle_slash_command(
                     parent_palette: parent_palette.clone(),
                 }),
                 notice: None,
+            }
+        }
+        SlashAction::OpenSkills => {
+            // Rediscover skills at open time so the window reflects the
+            // on-disk state (and the current `disabled_skills` value)
+            // rather than the session-frozen env snapshot. Discovery is
+            // a small directory scan, cheap enough to redo per open.
+            let (skills, _diagnostics) = {
+                let cfg = config.lock().expect("config mutex poisoned");
+                aj_conf::skills::discover_skills(&cfg.disabled_skills)
+            };
+            if skills.is_empty() {
+                SlashHandled::Continue {
+                    selector: None,
+                    notice: Some(
+                        "No skills found. Put skills in ~/.agents/skills/ or \
+                         .agents/skills/ (also: .aj/, .claude/)."
+                            .to_string(),
+                    ),
+                }
+            } else {
+                let rows: Vec<SkillRow> = skills
+                    .into_iter()
+                    .map(|s| SkillRow {
+                        name: s.name,
+                        description: s.description,
+                        path: display_path(&s.path),
+                        enabled: s.enabled,
+                        disable_model_invocation: s.disable_model_invocation,
+                    })
+                    .collect();
+                let inner = SkillsWindowComponent::new(settings_list_theme(theme), rows);
+                let outcome = inner.outcome_handle();
+                let changes = inner.changes_handle();
+                let initial_inner_rows =
+                    large_overlay_inner_rows(usize::from(tui.terminal().rows()));
+                let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                    "Skills",
+                    Box::new(inner),
+                    crate::config::theme::overlay_window_theme(theme),
+                    initial_inner_rows,
+                )
+                .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
+                .with_subtitle(&subtitle_close());
+                let handle = tui.show_overlay(Box::new(window), large_overlay_options());
+                SlashHandled::Continue {
+                    selector: Some(OpenSelector::Skills {
+                        handle,
+                        outcome,
+                        changes,
+                        parent_palette: parent_palette.clone(),
+                    }),
+                    notice: None,
+                }
             }
         }
         SlashAction::Help => {
@@ -3102,7 +3213,8 @@ async fn handle_slash_command(
                         | OpenSelector::Help { .. }
                         | OpenSelector::AuthPicker { .. }
                         | OpenSelector::AuthStatus { .. }
-                        | OpenSelector::Settings { .. },
+                        | OpenSelector::Settings { .. }
+                        | OpenSelector::Skills { .. },
                 ),
                 ..
             },
@@ -3624,6 +3736,24 @@ async fn apply_setting_change(
             };
             Some(join_notice(
                 format!("disabled_tools {what}. Takes effect for new sessions."),
+                save_note,
+            ))
+        }
+        "disabled_skills" => {
+            let skills: Vec<String> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let save_note = persist_config(config, |c| c.disabled_skills = skills.clone());
+            let what = if skills.is_empty() {
+                "cleared".to_string()
+            } else {
+                format!("set to {}", skills.join(", "))
+            };
+            Some(join_notice(
+                format!("disabled_skills {what}. Takes effect for new sessions."),
                 save_note,
             ))
         }
@@ -4224,6 +4354,60 @@ async fn handle_selector_outcome(
                 }
             }
         }
+        OpenSelector::Skills {
+            handle,
+            outcome,
+            changes,
+            parent_palette,
+        } => {
+            // Persist queued toggles first — the window stays open
+            // while the user keeps toggling, so changes and the
+            // eventual close arrive through separate channels.
+            let drained: Vec<(String, String)> =
+                std::mem::take(&mut *changes.lock().expect("skills changes poisoned"));
+            for (name, value) in drained {
+                let disable = value == "disabled";
+                let save_note = persist_config(&config, |c| {
+                    if disable {
+                        if !c.disabled_skills.contains(&name) {
+                            c.disabled_skills.push(name.clone());
+                        }
+                    } else {
+                        c.disabled_skills.retain(|n| n != &name);
+                    }
+                });
+                let notice = join_notice(
+                    format!("Skill {name} {value}. Takes effect for new sessions."),
+                    save_note,
+                );
+                world.pump.handle(tui, &notice_event(&notice));
+            }
+            let outcome_value = outcome.lock().expect("skills outcome poisoned").take();
+            match outcome_value {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::Skills {
+                    handle,
+                    outcome,
+                    changes,
+                    parent_palette,
+                }),
+                Some(SkillsWindowOutcome::Closed) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                        session_request: None,
+                    }
+                }
+            }
+        }
         OpenSelector::Palette { handle, outcome } => {
             use crate::modes::interactive::components::command_palette::CommandPaletteOutcome;
             match outcome.take() {
@@ -4295,6 +4479,8 @@ mod tests {
                 source: SystemPromptSource::Builtin,
             },
             context_files,
+            skills: Vec::new(),
+            skill_diagnostics: Vec::new(),
         }
     }
 
@@ -4406,6 +4592,31 @@ mod tests {
             build_context_notice(&env),
             "Context:\n  - ~/.agents/SYSTEM_PROMPT.md (system prompt)"
         );
+    }
+
+    #[test]
+    fn build_context_notice_lists_skills_with_status_markers() {
+        let skill = |name: &str, enabled: bool, dmi: bool| aj_conf::skills::Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            path: PathBuf::from(format!("/var/skills/{name}/SKILL.md")),
+            enabled,
+            disable_model_invocation: dmi,
+        };
+        let mut env = env_with(Vec::new());
+        env.skills = vec![
+            skill("alpha", true, false),
+            skill("beta", false, false),
+            skill("gamma", true, true),
+        ];
+
+        let notice = build_context_notice(&env);
+        let expected = "Context:\n  \
+             - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
+             - /var/skills/alpha/SKILL.md (skill: alpha)\n  \
+             - /var/skills/beta/SKILL.md (skill: beta, disabled)\n  \
+             - /var/skills/gamma/SKILL.md (skill: gamma, model-invocation disabled)";
+        assert_eq!(notice, expected);
     }
 
     #[test]

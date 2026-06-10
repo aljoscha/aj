@@ -31,6 +31,7 @@ pub mod model_selector;
 pub mod prompt_history;
 pub mod session_selector;
 pub mod settings_window;
+pub mod skills_window;
 pub mod subagent_box;
 pub mod thinking_selector;
 pub mod tool_execution;

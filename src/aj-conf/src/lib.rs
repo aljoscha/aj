@@ -1,3 +1,5 @@
+pub mod skills;
+
 use std::env;
 use std::fmt;
 use std::fs;
@@ -7,6 +9,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use std::str::FromStr;
 use thiserror::Error;
+
+use crate::skills::{Skill, SkillDiagnostic};
 
 /// Thinking level that can be set in `config.toml` as a default baseline.
 ///
@@ -139,9 +143,10 @@ or ~/.claude/CLAUDE.md). These instructions override default behavior and
 you must follow them exactly as written:
 "#;
 
-/// A file that contributes to the agent's context (system prompt). Today this
-/// covers user-level and project-level `AGENTS.md` / `CLAUDE.md`. In the
-/// future this is the place to plug in additional context (e.g. skills).
+/// A file that contributes to the agent's context (system prompt). Covers
+/// user-level and project-level `AGENTS.md` / `CLAUDE.md`; the whole file
+/// content is stitched into the prompt (unlike skills, which are listed by
+/// name and read on demand — see [`skills`]).
 #[derive(Debug, Clone)]
 pub struct ContextFile {
     /// Path to the file on disk.
@@ -226,13 +231,23 @@ pub struct AgentEnv {
     /// Files that get stitched into the agent's system prompt. Ordered from
     /// most general (user-level) to most specific (project-level).
     pub context_files: Vec<ContextFile>,
+    /// Skills discovered at env load time, in precedence order (most
+    /// specific first). Includes disabled and model-invocation-disabled
+    /// skills so the UI can show them; only those with
+    /// [`Skill::in_model_context`] reach the system prompt.
+    pub skills: Vec<Skill>,
+    /// Non-fatal problems hit while discovering skills, for the binary to
+    /// surface alongside its other startup diagnostics.
+    pub skill_diagnostics: Vec<SkillDiagnostic>,
 }
 
 impl AgentEnv {
     /// Read the environment: working directory, git root, instruction
-    /// files, and the base system prompt (`builtin_system_prompt` unless an
-    /// override file exists, see [`AgentEnv::load_system_prompt`]).
-    pub fn new(builtin_system_prompt: &str) -> Self {
+    /// files, skills, and the base system prompt (`builtin_system_prompt`
+    /// unless an override file exists, see [`AgentEnv::load_system_prompt`]).
+    /// `disabled_skills` carries the `disabled_skills` config value;
+    /// matching skills are discovered but marked disabled.
+    pub fn new(builtin_system_prompt: &str, disabled_skills: &[String]) -> Self {
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let git_root_directory = find_git_root(&working_directory);
         let operating_system = env::consts::OS.to_string();
@@ -243,9 +258,18 @@ impl AgentEnv {
         if let Some(file) = Self::load_user_instructions() {
             context_files.push(file);
         }
-        if let Some(file) = Self::load_project_instructions(&working_directory) {
-            context_files.push(file);
-        }
+        context_files.extend(Self::load_project_instructions(
+            &working_directory,
+            git_root_directory.as_deref(),
+        ));
+
+        let home = env::var("HOME").ok().map(PathBuf::from);
+        let (skills, skill_diagnostics) = skills::discover_skills_at(
+            home.as_deref(),
+            &working_directory,
+            git_root_directory.as_deref(),
+            disabled_skills,
+        );
 
         AgentEnv {
             working_directory,
@@ -254,6 +278,8 @@ impl AgentEnv {
             today_date,
             system_prompt,
             context_files,
+            skills,
+            skill_diagnostics,
         }
     }
 
@@ -313,14 +339,32 @@ impl AgentEnv {
         None
     }
 
-    /// Load project-level instructions from the working directory. Prefers
-    /// `AGENTS.md` (open standard), falling back to `agents.md` and then to
-    /// `CLAUDE.md` (Claude Code convention).
-    fn load_project_instructions(working_directory: &Path) -> Option<ContextFile> {
+    /// Load project-level instructions: one file per directory from the
+    /// git root down to the working directory, so a repo-level AGENTS.md
+    /// and a subproject-level one both apply (general first, specific
+    /// last). Outside a git repository only the working directory is
+    /// consulted.
+    fn load_project_instructions(
+        working_directory: &Path,
+        git_root: Option<&Path>,
+    ) -> Vec<ContextFile> {
+        let mut dirs = project_dirs_upward(working_directory, git_root);
+        // The walk is most-specific-first; context files are stitched
+        // most-general-first so the specific file overrides.
+        dirs.reverse();
+        dirs.iter()
+            .filter_map(|dir| Self::load_project_instructions_in(dir))
+            .collect()
+    }
+
+    /// Load the instructions file of a single directory. Prefers
+    /// `AGENTS.md` (open standard), falling back to `agents.md` and then
+    /// to `CLAUDE.md` (Claude Code convention).
+    fn load_project_instructions_in(dir: &Path) -> Option<ContextFile> {
         let candidates = [
-            working_directory.join("AGENTS.md"),
-            working_directory.join("agents.md"),
-            working_directory.join("CLAUDE.md"),
+            dir.join("AGENTS.md"),
+            dir.join("agents.md"),
+            dir.join("CLAUDE.md"),
         ];
 
         for path in candidates {
@@ -334,6 +378,35 @@ impl AgentEnv {
         }
         None
     }
+}
+
+/// Directories from `working_directory` up to `git_root` (inclusive), most
+/// specific first. Just the working directory when there is no git root.
+/// `git_root` normally comes from [`find_git_root`] and is therefore an
+/// ancestor of the working directory; one that isn't degrades to the
+/// working directory only.
+pub(crate) fn project_dirs_upward(
+    working_directory: &Path,
+    git_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = vec![working_directory.to_path_buf()];
+    let Some(git_root) = git_root else {
+        return dirs;
+    };
+    if !working_directory.starts_with(git_root) {
+        return dirs;
+    }
+    let mut current = working_directory;
+    while current != git_root {
+        match current.parent() {
+            Some(parent) => {
+                dirs.push(parent.to_path_buf());
+                current = parent;
+            }
+            None => break,
+        }
+    }
+    dirs
 }
 
 /// Render `path` for display. If it lives under `$HOME`, abbreviate the home
@@ -651,6 +724,7 @@ fn item_value_repr(item: &Option<toml_edit::Item>) -> Option<String> {
 /// thinking_display = "summarized"
 /// theme = "dark"
 /// disabled_tools = ["todo_read", "todo_write"]
+/// disabled_skills = ["tmux-subagents"]
 /// hide_thinking_block = false
 /// ```
 #[derive(Debug, Clone)]
@@ -680,6 +754,10 @@ pub struct Config {
     /// List of builtin tool names to disable. Tools in this list will not be
     /// available to the agent.
     pub disabled_tools: Vec<String>,
+    /// List of skill names to disable. Disabled skills are still discovered
+    /// (so the UI can show them) but excluded from the model-visible skill
+    /// listing in the system prompt.
+    pub disabled_skills: Vec<String>,
     /// Replace expanded thinking blocks with a single italic
     /// "Thinking…" placeholder line in the interactive TUI.
     /// Defaults to `false` (expanded). Toggled at runtime with
@@ -719,6 +797,7 @@ impl Default for Config {
             speed: None,
             theme: None,
             disabled_tools: Vec::new(),
+            disabled_skills: Vec::new(),
             hide_thinking_block: false,
             // Image features: resize and inline-render by default;
             // blocking is opt-in.
@@ -856,6 +935,17 @@ impl Config {
             },
             display_fn: |c| display_string_list(&c.disabled_tools),
             to_toml_fn: |c| string_list_item(&c.disabled_tools),
+        },
+        ConfigOption {
+            name: "disabled_skills",
+            description: "Skill names to hide from the model's skill listing.",
+            kind: ValueKind::StringList,
+            apply_toml_fn: |v, c| {
+                c.disabled_skills = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_string_list(&c.disabled_skills),
+            to_toml_fn: |c| string_list_item(&c.disabled_skills),
         },
         ConfigOption {
             name: "hide_thinking_block",
@@ -1323,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_agent_env_creation() {
-        let env = AgentEnv::new("builtin prompt");
+        let env = AgentEnv::new("builtin prompt", &[]);
         assert!(!env.working_directory.as_os_str().is_empty());
         assert!(!env.operating_system.is_empty());
         assert!(!env.today_date.is_empty());
@@ -1656,6 +1746,7 @@ thinking_display = "summarized"
 speed = "fast"
 theme = "dark"
 disabled_tools = ["bash"]
+disabled_skills = ["scratch"]
 hide_thinking_block = true
 "#;
         let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
@@ -1673,6 +1764,7 @@ hide_thinking_block = true
         assert_eq!(config.speed, Some(ConfigSpeed::Fast));
         assert_eq!(config.theme.as_deref(), Some("dark"));
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
+        assert_eq!(config.disabled_skills, vec!["scratch".to_string()]);
         assert!(config.hide_thinking_block);
     }
 
@@ -1794,7 +1886,7 @@ image_block = true
 
     #[test]
     fn test_agent_env_display() {
-        let env = AgentEnv::new("builtin prompt");
+        let env = AgentEnv::new("builtin prompt", &[]);
         let display_output = format!("{}", env);
         assert!(display_output.contains("Working directory:"));
         assert!(display_output.contains("Git root directory:"));
@@ -1876,7 +1968,7 @@ image_block = true
         fs::write(dir.join("agents.md"), "lowercase content").unwrap();
         fs::write(dir.join("CLAUDE.md"), "claude content").unwrap();
 
-        let file = AgentEnv::load_project_instructions(&dir).expect("file should load");
+        let file = AgentEnv::load_project_instructions_in(&dir).expect("file should load");
         assert_eq!(file.kind, ContextFileKind::ProjectInstructions);
         assert_eq!(file.content, "agents content");
         assert_eq!(file.path, dir.join("AGENTS.md"));
@@ -1889,7 +1981,7 @@ image_block = true
         let dir = make_temp_dir("falls-back-claude");
         fs::write(dir.join("CLAUDE.md"), "claude content").unwrap();
 
-        let file = AgentEnv::load_project_instructions(&dir).expect("file should load");
+        let file = AgentEnv::load_project_instructions_in(&dir).expect("file should load");
         assert_eq!(file.content, "claude content");
         assert_eq!(file.path, dir.join("CLAUDE.md"));
 
@@ -1899,8 +1991,56 @@ image_block = true
     #[test]
     fn test_load_project_instructions_none_when_missing() {
         let dir = make_temp_dir("none-missing");
-        assert!(AgentEnv::load_project_instructions(&dir).is_none());
+        assert!(AgentEnv::load_project_instructions_in(&dir).is_none());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_project_instructions_walks_up_to_git_root() {
+        let root = make_temp_dir("walk-instructions");
+        let mid = root.join("mid");
+        let cwd = mid.join("leaf");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(root.join("AGENTS.md"), "root content").unwrap();
+        fs::write(cwd.join("CLAUDE.md"), "leaf content").unwrap();
+
+        let files = AgentEnv::load_project_instructions(&cwd, Some(&root));
+        // General (git root) first, specific (cwd) last; the
+        // instruction-less middle directory contributes nothing.
+        let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(contents, vec!["root content", "leaf content"]);
+
+        // Without a git root only the working directory is consulted.
+        let files = AgentEnv::load_project_instructions(&cwd, None);
+        let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(contents, vec!["leaf content"]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_project_dirs_upward() {
+        let root = Path::new("/repo");
+        let cwd = Path::new("/repo/a/b");
+        assert_eq!(
+            project_dirs_upward(cwd, Some(root)),
+            vec![
+                PathBuf::from("/repo/a/b"),
+                PathBuf::from("/repo/a"),
+                PathBuf::from("/repo"),
+            ]
+        );
+        // cwd == git root.
+        assert_eq!(
+            project_dirs_upward(root, Some(root)),
+            vec![root.to_path_buf()]
+        );
+        // No git root, or one that isn't an ancestor.
+        assert_eq!(project_dirs_upward(cwd, None), vec![cwd.to_path_buf()]);
+        assert_eq!(
+            project_dirs_upward(cwd, Some(Path::new("/elsewhere"))),
+            vec![cwd.to_path_buf()]
+        );
     }
 
     #[test]

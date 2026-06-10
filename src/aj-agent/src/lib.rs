@@ -459,6 +459,18 @@ impl Agent {
             ));
         }
 
+        // Skills are progressive disclosure: the listing carries only
+        // name/description/location and the model loads the full
+        // SKILL.md with `read_file` when a task matches. Without a
+        // `read_file` tool the listing is unreachable, so it is
+        // omitted entirely.
+        if self.tools.iter().any(|t| t.name == "read_file") {
+            if let Some(block) = aj_conf::skills::format_skills_for_prompt(&self.env.skills) {
+                text.push_str("\n\n");
+                text.push_str(&block);
+            }
+        }
+
         text.push_str(&format!(
             "\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
             self.env
@@ -2390,6 +2402,8 @@ mod event_protocol_tests {
                 source: SystemPromptSource::Builtin,
             },
             context_files: Vec::new(),
+            skills: Vec::new(),
+            skill_diagnostics: Vec::new(),
         }
     }
 
@@ -2428,6 +2442,83 @@ mod event_protocol_tests {
             ..AgentSeed::default()
         });
         agent
+    }
+
+    /// Stub with the builtin `read_file` tool's name, so prompt-assembly
+    /// tests can flip the skills listing's read-tool gate without pulling
+    /// in `aj-tools`.
+    #[derive(Clone)]
+    struct ReadFileStubTool;
+
+    impl ToolDefinition for ReadFileStubTool {
+        type Input = PingInput;
+
+        fn name(&self) -> &'static str {
+            "read_file"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test stub"
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &mut dyn ToolContext,
+            _input: PingInput,
+        ) -> anyhow::Result<ToolOutcome> {
+            unreachable!("never executed in prompt-assembly tests")
+        }
+    }
+
+    #[test]
+    fn assemble_system_prompt_lists_skills_behind_read_file_gate() {
+        let skill = |name: &str, enabled: bool, dmi: bool| aj_conf::skills::Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            path: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            enabled,
+            disable_model_invocation: dmi,
+        };
+        let mut env = empty_env(std::env::temp_dir());
+        env.skills = vec![
+            skill("alpha", true, false),
+            skill("beta", false, false),
+            skill("gamma", true, true),
+        ];
+
+        let agent_with_tools = |env: AgentEnv, tools: Vec<ErasedToolDefinition>| {
+            let provider: Arc<dyn Provider> = Arc::new(
+                ScriptedProvider::from_event_vecs(vec![]).on_exhausted(ExhaustedBehavior::Panic),
+            );
+            Agent::with_provider(
+                env,
+                tools,
+                Vec::new(),
+                provider,
+                Arc::new(scripted_model_info()),
+                StreamOptions::default(),
+                None,
+            )
+        };
+
+        // With a read_file tool: only the enabled, model-visible skill
+        // is listed.
+        let agent = agent_with_tools(env.clone(), vec![ReadFileStubTool.into()]);
+        let prompt = agent.assemble_system_prompt();
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>alpha</name>"));
+        assert!(!prompt.contains("beta"));
+        assert!(!prompt.contains("gamma"));
+        // The listing precedes the trailing <env> block.
+        assert!(
+            prompt.find("</available_skills>").unwrap() < prompt.find("<env>").unwrap(),
+            "skills listing must come before the env block"
+        );
+
+        // Without a read_file tool the listing is omitted.
+        let agent = agent_with_tools(env, vec![PingTool.into()]);
+        let prompt = agent.assemble_system_prompt();
+        assert!(!prompt.contains("<available_skills>"));
     }
 
     #[tokio::test]

@@ -128,6 +128,8 @@ fn empty_env(working_directory: PathBuf) -> AgentEnv {
             source: SystemPromptSource::Builtin,
         },
         context_files: Vec::new(),
+        skills: Vec::new(),
+        skill_diagnostics: Vec::new(),
     }
 }
 

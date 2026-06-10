@@ -90,6 +90,7 @@ pub struct SettingsCurrentValues {
     /// loaded theme's display label).
     pub theme: String,
     pub disabled_tools: Vec<String>,
+    pub disabled_skills: Vec<String>,
     pub hide_thinking_block: bool,
     pub image_auto_resize: bool,
     pub image_show_in_terminal: bool,
@@ -112,6 +113,7 @@ impl SettingsWindowComponent {
         model_catalog: Vec<ModelInfo>,
         theme_names: Vec<String>,
         tool_names: Vec<String>,
+        skill_names: Vec<String>,
         current: SettingsCurrentValues,
     ) -> Self {
         let items = build_items(
@@ -120,6 +122,7 @@ impl SettingsWindowComponent {
             model_catalog,
             theme_names,
             tool_names,
+            skill_names,
             &current,
         );
 
@@ -224,6 +227,7 @@ fn build_items(
     model_catalog: Vec<ModelInfo>,
     theme_names: Vec<String>,
     tool_names: Vec<String>,
+    skill_names: Vec<String>,
     current: &SettingsCurrentValues,
 ) -> Vec<SettingItem> {
     let mut items = Vec::with_capacity(Config::OPTIONS.len());
@@ -311,8 +315,22 @@ fn build_items(
                 let mut item = SettingItem::with_submenu(
                     option.name,
                     option.name,
-                    join_tools(&initial),
-                    tools_submenu_factory(settings_theme.clone(), tool_names.clone()),
+                    join_names(&initial),
+                    name_toggle_submenu_factory(settings_theme.clone(), tool_names.clone()),
+                );
+                item.description = Some(describe(
+                    option,
+                    "Toggles apply when the picker closes; takes effect for new sessions.",
+                ));
+                items.push(item);
+            }
+            "disabled_skills" => {
+                let initial: BTreeSet<String> = current.disabled_skills.iter().cloned().collect();
+                let mut item = SettingItem::with_submenu(
+                    option.name,
+                    option.name,
+                    join_names(&initial),
+                    name_toggle_submenu_factory(settings_theme.clone(), skill_names.clone()),
                 );
                 item.description = Some(describe(
                     option,
@@ -577,22 +595,23 @@ impl Component for TextEditSubmenu {
     }
 }
 
-/// Submenu factory for `disabled_tools`: a nested [`SettingsList`]
-/// with one enabled/disabled toggle per builtin tool. Closing the
-/// picker (`Esc`) commits the aggregate when it changed — there is no
-/// cancel, since each toggle is itself an edit.
+/// Submenu factory for the name-set toggle rows (`disabled_tools`,
+/// `disabled_skills`): a nested [`SettingsList`] with one
+/// enabled/disabled toggle per name. Closing the picker (`Esc`) commits
+/// the aggregate when it changed — there is no cancel, since each
+/// toggle is itself an edit.
 ///
-/// Disabled names that aren't in `tool_names` (e.g. stale entries
-/// from an older binary) have no row, so they can't be re-enabled
-/// here — but they are preserved verbatim in the committed list
-/// rather than silently dropped.
-fn tools_submenu_factory(theme: SettingsListTheme, tool_names: Vec<String>) -> SubmenuFactory {
+/// Disabled names that aren't in `names` (e.g. stale entries from an
+/// older binary, or a skill directory that was deleted) have no row, so
+/// they can't be re-enabled here — but they are preserved verbatim in
+/// the committed list rather than silently dropped.
+fn name_toggle_submenu_factory(theme: SettingsListTheme, names: Vec<String>) -> SubmenuFactory {
     Box::new(move |current: &str, done: SubmenuDoneCallback| {
-        let disabled: BTreeSet<String> = split_tools(current);
-        let initial = join_tools(&disabled);
+        let disabled: BTreeSet<String> = split_names(current);
+        let initial = join_names(&disabled);
         let shared: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(disabled));
 
-        let items: Vec<SettingItem> = tool_names
+        let items: Vec<SettingItem> = names
             .iter()
             .map(|name| {
                 let value = if shared.borrow().contains(name) {
@@ -613,7 +632,7 @@ fn tools_submenu_factory(theme: SettingsListTheme, tool_names: Vec<String>) -> S
         let shared_for_change = Rc::clone(&shared);
         let mut list = SettingsList::new(
             items,
-            tool_names.len().max(1),
+            names.len().max(1),
             theme.clone(),
             move |id: &str, value: &str| {
                 let mut set = shared_for_change.borrow_mut();
@@ -625,7 +644,7 @@ fn tools_submenu_factory(theme: SettingsListTheme, tool_names: Vec<String>) -> S
             },
             move || {
                 if let Some(done) = done_slot.borrow_mut().take() {
-                    let joined = join_tools(&shared.borrow());
+                    let joined = join_names(&shared.borrow());
                     // No-op close stays silent: committing an
                     // unchanged list would still fire the parent's
                     // on-change and produce a pointless notice.
@@ -643,9 +662,9 @@ fn tools_submenu_factory(theme: SettingsListTheme, tool_names: Vec<String>) -> S
     })
 }
 
-/// Parse a `", "`-joined tool list back into a set. Inverse of
-/// [`join_tools`]; tolerant of stray whitespace and empty segments.
-fn split_tools(joined: &str) -> BTreeSet<String> {
+/// Parse a `", "`-joined name list back into a set. Inverse of
+/// [`join_names`]; tolerant of stray whitespace and empty segments.
+fn split_names(joined: &str) -> BTreeSet<String> {
     joined
         .split(',')
         .map(str::trim)
@@ -654,9 +673,9 @@ fn split_tools(joined: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Canonical display/commit form of a disabled-tools set: sorted,
+/// Canonical display/commit form of a disabled-names set: sorted,
 /// `", "`-joined, empty string for "none disabled".
-fn join_tools(set: &BTreeSet<String>) -> String {
+fn join_names(set: &BTreeSet<String>) -> String {
     set.iter().cloned().collect::<Vec<_>>().join(", ")
 }
 
@@ -717,6 +736,7 @@ mod tests {
             speed: "standard".to_string(),
             theme: "dark".to_string(),
             disabled_tools: vec![],
+            disabled_skills: vec![],
             hide_thinking_block: false,
             image_auto_resize: true,
             image_show_in_terminal: true,
@@ -734,6 +754,7 @@ mod tests {
             ],
             vec!["dark".to_string(), "light".to_string()],
             vec!["bash".to_string(), "read_file".to_string()],
+            vec!["tmux-subagents".to_string()],
             current_values(),
         )
     }
@@ -890,7 +911,7 @@ mod tests {
     fn tools_submenu_commits_aggregate_on_close() {
         let mut component = test_component();
         let changes = component.changes_handle();
-        search_for(&mut component, "disabled");
+        search_for(&mut component, "disabled_to");
         component.handle_input(&enter());
         assert!(component.inner.has_active_submenu());
         // Toggle the first tool (bash) to disabled, then close.
@@ -904,10 +925,27 @@ mod tests {
     }
 
     #[test]
+    fn skills_submenu_commits_aggregate_on_close() {
+        let mut component = test_component();
+        let changes = component.changes_handle();
+        search_for(&mut component, "disabled_sk");
+        component.handle_input(&enter());
+        assert!(component.inner.has_active_submenu());
+        // Toggle the only skill (tmux-subagents) to disabled, then close.
+        component.handle_input(&enter());
+        component.handle_input(&escape());
+        let queued = std::mem::take(&mut *changes.lock().unwrap());
+        assert_eq!(
+            queued,
+            vec![("disabled_skills".to_string(), "tmux-subagents".to_string())]
+        );
+    }
+
+    #[test]
     fn tools_submenu_unchanged_close_commits_nothing() {
         let mut component = test_component();
         let changes = component.changes_handle();
-        search_for(&mut component, "disabled");
+        search_for(&mut component, "disabled_to");
         component.handle_input(&enter());
         // Toggle bash off and back on, then close: net no change.
         component.handle_input(&enter());
