@@ -35,11 +35,11 @@ use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingLevel, Severity, display_path};
-use aj_models::ThinkingConfig;
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
-use aj_models::registry::{ModelInfo, ModelRegistry};
+use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
 use aj_models::types::{Speed, StreamOptions};
+use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_tui::EditorComponent;
 use aj_tui::components::editor::Editor;
@@ -134,6 +134,29 @@ pub(crate) struct RunConfigSnapshot {
     /// the scripted path's provider id (from `--model-api`) differs
     /// from `model_info.provider`, which is always `"scripted"`.
     model_key: (String, String),
+}
+
+/// Loop-side staged settings for one sub-agent. Each axis is
+/// `Some(..)` only if the user changed it for this agent; axes left
+/// `None` keep whatever the agent itself holds (its spawn-time
+/// inheritance). The `Option<Option<..>>` split on thinking/speed
+/// matters: `Some(None)` means "explicitly set to off/standard".
+///
+/// Entries live in `SessionWorld::sub_overrides` and are re-applied
+/// idempotently at every turn start of the agent they belong to —
+/// an entry is the user's standing choice for that agent.
+#[derive(Default)]
+pub(crate) struct SubAgentOverrides {
+    /// Full bundle swap from a `/model` confirm: provider handle,
+    /// model info, stream options, and the `(provider, id)` key.
+    pub(crate) bundle: Option<(
+        Arc<dyn Provider>,
+        Arc<ModelInfo>,
+        StreamOptions,
+        (String, String),
+    )>,
+    pub(crate) thinking: Option<Option<ThinkingConfig>>,
+    pub(crate) speed: Option<Option<Speed>>,
 }
 
 /// Construct the loop-side run-config snapshot from a resolved
@@ -1492,6 +1515,7 @@ async fn run_session(
                                 &shell.auth,
                                 Arc::clone(&shell.run_config),
                                 Arc::clone(&shell.config),
+                                &shell.model_catalog,
                                 world,
                                 &shell.theme,
                             ).await {
@@ -1668,6 +1692,7 @@ async fn run_session(
                             }
 
                             let run_config_for_turn = Arc::clone(&shell.run_config);
+                            let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
                             // Mint a fresh per-turn cancellation
                             // token. The binary keeps one clone in
                             // `turn_cancels` so the Ctrl+C arm can
@@ -1686,7 +1711,12 @@ async fn run_session(
                                 // uncontended, since no turn is in
                                 // flight yet — so the loop never
                                 // blocks on it.
-                                apply_turn_config(target, &mut a, &run_config_for_turn);
+                                apply_turn_config(
+                                    target,
+                                    &mut a,
+                                    &run_config_for_turn,
+                                    &sub_overrides_for_turn,
+                                );
                                 let result = a.prompt(trimmed, turn_cancel).await;
                                 (target, result)
                             });
@@ -1748,31 +1778,57 @@ async fn recv_event(rx: &mut UnboundedReceiver<AgentEvent>) -> Option<AgentEvent
     rx.recv().await
 }
 
-/// Apply the loop-side run-config snapshot to the agent about to run
-/// a turn — for the **main** agent only. The run config is the main
-/// agent's configuration: the selectors stage into it and it persists
-/// to `config.toml`, so stamping it onto a main turn picks up any
-/// model / thinking change made since the last turn. Sub-agents own
-/// their settings (inherited from the parent at spawn) and only
-/// explicit per-agent changes, staged loop-side, may alter them — so
-/// a sub-agent continuation stamps nothing and runs with whatever
-/// the agent already holds.
+/// Apply the loop-side staged settings to the agent about to run a
+/// turn.
+///
+/// **Main** stamps the full [`RunConfigSnapshot`]: the run config is
+/// the main agent's configuration — the selectors stage into it and
+/// it persists to `config.toml` — so a main turn picks up any model /
+/// thinking change made since the last turn.
+///
+/// **Sub-agents** own their settings (inherited from the parent at
+/// spawn); only the axes the user explicitly staged in
+/// `sub_overrides` are applied. Entries are kept (not drained) and
+/// re-applied idempotently each turn — an entry is the user's
+/// standing choice for that agent. A sub-agent with no entry stamps
+/// nothing and runs with whatever it already holds.
 fn apply_turn_config(
     target: AgentId,
     agent: &mut Agent,
     run_config: &std::sync::Mutex<RunConfigSnapshot>,
+    sub_overrides: &std::sync::Mutex<HashMap<usize, SubAgentOverrides>>,
 ) {
-    if target != AgentId::Main {
-        return;
+    match target {
+        AgentId::Main => {
+            let cfg = run_config.lock().expect("run config mutex poisoned");
+            agent.set_provider(
+                Arc::clone(&cfg.provider),
+                Arc::clone(&cfg.model_info),
+                cfg.stream_options.clone(),
+            );
+            agent.set_default_thinking(cfg.thinking.clone());
+            agent.set_speed(cfg.speed);
+        }
+        AgentId::Sub(n) => {
+            let overrides = sub_overrides.lock().expect("sub overrides mutex poisoned");
+            let Some(entry) = overrides.get(&n) else {
+                return;
+            };
+            if let Some((provider, model_info, stream_options, _)) = &entry.bundle {
+                agent.set_provider(
+                    Arc::clone(provider),
+                    Arc::clone(model_info),
+                    stream_options.clone(),
+                );
+            }
+            if let Some(thinking) = &entry.thinking {
+                agent.set_default_thinking(thinking.clone());
+            }
+            if let Some(speed) = entry.speed {
+                agent.set_speed(speed);
+            }
+        }
     }
-    let cfg = run_config.lock().expect("run config mutex poisoned");
-    agent.set_provider(
-        Arc::clone(&cfg.provider),
-        Arc::clone(&cfg.model_info),
-        cfg.stream_options.clone(),
-    );
-    agent.set_default_thinking(cfg.thinking.clone());
-    agent.set_speed(cfg.speed);
 }
 
 /// Resolve an `AgentId` to its live handle: the main agent for
@@ -1844,6 +1900,10 @@ enum OpenSelector {
     Thinking {
         handle: OverlayHandle,
         outcome: ThinkingOutcomeHandle,
+        /// Agent the confirm applies to, captured from the active
+        /// view at open time so a view switch while the overlay is
+        /// up doesn't redirect the change.
+        target: AgentId,
         /// When opened via the command palette, the (hidden)
         /// palette's handle + outcome slot. On cancel we un-hide
         /// it and restore host-side polling so the palette stays
@@ -1854,6 +1914,9 @@ enum OpenSelector {
     Model {
         handle: OverlayHandle,
         outcome: ModelOutcomeHandle,
+        /// Agent the confirm applies to, captured at open time
+        /// like [`OpenSelector::Thinking::target`].
+        target: AgentId,
         parent_palette: Option<ParentPalette>,
     },
     Session {
@@ -2479,11 +2542,22 @@ async fn handle_slash_command(
             }
         }
         SlashAction::OpenThinkingSelector => {
-            let current = run_config
-                .lock()
-                .expect("run config mutex poisoned")
-                .thinking
-                .clone();
+            // The selector targets the agent the user is viewing;
+            // pre-select its tracked thinking level, falling back to
+            // the run config for ids with no footer entry (which
+            // shouldn't happen, but degrade gracefully).
+            let target = world.pump.active_view(tui);
+            let current = world
+                .pump
+                .agent_settings(target)
+                .and_then(|s| thinking_config_from_name(&s.thinking))
+                .unwrap_or_else(|| {
+                    run_config
+                        .lock()
+                        .expect("run config mutex poisoned")
+                        .thinking
+                        .clone()
+                });
             let inner = ThinkingSelectorComponent::new(select_list_theme(theme), current);
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
@@ -2498,19 +2572,26 @@ async fn handle_slash_command(
                 selector: Some(OpenSelector::Thinking {
                     handle,
                     outcome,
+                    target,
                     parent_palette: parent_palette.clone(),
                 }),
                 notice: None,
             }
         }
         SlashAction::OpenModelSelector => {
-            // Read the active (provider, id) pair from the loop-side
-            // snapshot so the overlay can pre-select the active row.
+            // The selector targets the agent the user is viewing;
+            // pre-select its tracked (provider, id) pair, falling
+            // back to the run config for ids with no footer entry.
             // Never touches the agent, so it's safe mid-turn.
-            let (provider, id) = {
-                let cfg = run_config.lock().expect("run config mutex poisoned");
-                (cfg.model_key.0.clone(), cfg.model_key.1.clone())
-            };
+            let target = world.pump.active_view(tui);
+            let (provider, id) = world
+                .pump
+                .agent_settings(target)
+                .map(|s| (s.provider.clone(), s.model_id.clone()))
+                .unwrap_or_else(|| {
+                    let cfg = run_config.lock().expect("run config mutex poisoned");
+                    cfg.model_key.clone()
+                });
             let identity = ModelIdentityRef {
                 provider: &provider,
                 id: &id,
@@ -2537,6 +2618,7 @@ async fn handle_slash_command(
                 selector: Some(OpenSelector::Model {
                     handle,
                     outcome,
+                    target,
                     parent_palette: parent_palette.clone(),
                 }),
                 notice: None,
@@ -2849,6 +2931,331 @@ async fn handle_slash_command(
     result
 }
 
+/// Apply a confirmed `/thinking` pick to the main agent: stage into
+/// the run config, persist to `config.toml`, record on the session
+/// log's user thread, and refresh footer + border. Returns the
+/// user-facing notice.
+async fn confirm_thinking_for_main(
+    tui: &mut Tui,
+    level: Option<ThinkingConfig>,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    world: &mut SessionWorld,
+    theme: &ThemeHandle,
+) -> String {
+    // Stage the new thinking effort into the loop-side snapshot; the
+    // next turn applies it. Never locks the agent, so it's safe while
+    // a turn is running (the in-flight turn keeps its effort; the
+    // change takes effect next turn). Read the rest of the settings
+    // identity back for the footer entry.
+    let (settings, window) = {
+        let mut cfg = run_config.lock().expect("run config mutex poisoned");
+        cfg.thinking = level.clone();
+        (
+            aj_agent::events::AgentSettings {
+                provider: cfg.model_key.0.clone(),
+                model_id: cfg.model_key.1.clone(),
+                thinking: thinking_level_name(&level).to_string(),
+                speed: speed_name(cfg.speed).to_string(),
+            },
+            cfg.model_info.context_window,
+        )
+    };
+    // Mirror the change onto the editor's border tint so the visual
+    // cue tracks the active reasoning mode — but only when the user
+    // is viewing the agent the change applies to.
+    if world.pump.active_view(tui) == AgentId::Main {
+        apply_editor_border_for_thinking(tui, theme, level.as_ref());
+    }
+    // Footer surfaces the active thinking effort; record the new
+    // settings so the change is visible without waiting for a turn.
+    world
+        .pump
+        .note_agent_settings(tui, AgentId::Main, settings, window);
+    let name = thinking_level_name(&level);
+    // Record the change on the session log's user thread so a later
+    // resume restores this level.
+    let log_note = {
+        let mut log = world.log.lock().await;
+        log.append_thinking_change(ThreadFilter::USER, name)
+            .err()
+            .map(|err| format!("(couldn't record in session log: {err})"))
+    };
+    // Persist the choice so it survives a restart.
+    let save_note = persist_config(config, |c| {
+        c.thinking = Some(config_thinking_level(level.as_ref()));
+    });
+    let mut notice = format!("Thinking effort set to {name}.");
+    for note in [save_note, log_note].into_iter().flatten() {
+        notice.push(' ');
+        notice.push_str(&note);
+    }
+    notice
+}
+
+/// Apply a confirmed `/thinking` pick to sub-agent `n`: validate
+/// against the target's model, stage into the world's override map
+/// (applied at the sub's next turn start), record on the sub's log
+/// thread, and refresh its footer entry. Deliberately does not touch
+/// `config.toml` or the run config — those record the session
+/// default, which is main's concern. Returns the user-facing notice.
+async fn confirm_thinking_for_sub(
+    tui: &mut Tui,
+    level: Option<ThinkingConfig>,
+    n: usize,
+    model_catalog: &[ModelInfo],
+    world: &mut SessionWorld,
+    theme: &ThemeHandle,
+) -> String {
+    let target = AgentId::Sub(n);
+    if resolve_agent(target, &world.agent, &world.registry).is_none() {
+        return "This agent can't be prompted.".to_string();
+    }
+    let name = thinking_level_name(&level);
+    // Validate against the target's model: the staged bundle
+    // override's info if present, else a catalog lookup by the
+    // target's settings keys, else skip (same lenient posture as
+    // scripted mode).
+    if let Some(tc) = level.as_ref() {
+        let target_info: Option<Arc<ModelInfo>> = {
+            let overrides = world
+                .sub_overrides
+                .lock()
+                .expect("sub overrides mutex poisoned");
+            overrides
+                .get(&n)
+                .and_then(|o| o.bundle.as_ref())
+                .map(|(_, info, _, _)| Arc::clone(info))
+        }
+        .or_else(|| {
+            world.pump.agent_settings(target).and_then(|s| {
+                model_catalog
+                    .iter()
+                    .find(|m| m.provider == s.provider && m.id == s.model_id)
+                    .cloned()
+                    .map(Arc::new)
+            })
+        });
+        if let Some(info) = target_info
+            && let Err(msg) = validate_thinking_level(
+                &info,
+                &crate::modes::interactive::session::thinking_level_for(tc),
+            )
+        {
+            return format!("Can't set thinking level {name:?} for agent {n}: {msg}");
+        }
+    }
+    // Stage the standing choice; the sub's next turn applies it.
+    world
+        .sub_overrides
+        .lock()
+        .expect("sub overrides mutex poisoned")
+        .entry(n)
+        .or_default()
+        .thinking = Some(level.clone());
+    // Refresh the target's footer entry: same identity, new
+    // thinking string, window unchanged.
+    if let Some(mut settings) = world.pump.agent_settings(target).cloned() {
+        settings.thinking = name.to_string();
+        let window = world.pump.agent_context_window(target);
+        world
+            .pump
+            .note_agent_settings(tui, target, settings, window);
+    }
+    if world.pump.active_view(tui) == target {
+        apply_editor_border_for_thinking(tui, theme, level.as_ref());
+    }
+    // Record the change on the sub-agent's log thread so a resumed
+    // transcript reflects it.
+    let log_note = {
+        let mut log = world.log.lock().await;
+        log.append_thinking_change(ThreadFilter::subagent(n), name)
+            .err()
+            .map(|err| format!("(couldn't record in session log: {err})"))
+    };
+    let mut notice = format!("Thinking effort set to {name} for agent {n}.");
+    if let Some(note) = log_note {
+        notice.push(' ');
+        notice.push_str(&note);
+    }
+    notice
+}
+
+/// Apply a confirmed `/model` pick to the main agent: rebuild the
+/// bundle, stage into the run config, persist to `config.toml`,
+/// record on the session log's user thread, and refresh the footer.
+/// Returns the user-facing notice.
+async fn confirm_model_for_main(
+    tui: &mut Tui,
+    info: ModelInfo,
+    auth: &AuthStorage,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    world: &mut SessionWorld,
+) -> String {
+    // Construct a fresh provider handle from the picked catalog
+    // entry, carrying the active speed over so e.g. `--speed fast`
+    // survives a `/model` pick (degrading silently on providers
+    // that ignore it).
+    let speed = {
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        cfg.speed
+    };
+    match from_model_info(auth, info.clone(), speed) {
+        Ok(ResolvedModel {
+            provider,
+            model_info,
+            stream_options,
+        }) => {
+            // Stage the swap into the loop-side snapshot (provider +
+            // model + options + the pre-select key); the next turn
+            // applies it. Never locks the agent, so it's safe
+            // mid-turn — the in-flight turn keeps its model and the
+            // swap takes effect next turn. Thinking effort is
+            // preserved; read it back for the footer entry.
+            let current_thinking = {
+                let mut cfg = run_config.lock().expect("run config mutex poisoned");
+                cfg.provider = provider;
+                cfg.model_info = model_info;
+                cfg.stream_options = stream_options;
+                cfg.model_key = (info.provider.clone(), info.id.clone());
+                cfg.thinking.clone()
+            };
+            // Record the new settings identity so the footer's model
+            // line and context-window denominator reflect the swap
+            // immediately rather than waiting for the next turn.
+            let settings = aj_agent::events::AgentSettings {
+                provider: info.provider.clone(),
+                model_id: info.id.clone(),
+                thinking: thinking_level_name(&current_thinking).to_string(),
+                speed: speed_name(speed).to_string(),
+            };
+            world
+                .pump
+                .note_agent_settings(tui, AgentId::Main, settings, info.context_window);
+            // Record the change on the session log's user thread so a
+            // later resume restores this model.
+            let log_note = {
+                let mut log = world.log.lock().await;
+                log.append_model_change(ThreadFilter::USER, &info.provider, &info.id)
+                    .err()
+                    .map(|err| format!("(couldn't record in session log: {err})"))
+            };
+            // Persist the model choice (provider + id) so it survives
+            // a restart. `model_url` is intentionally left untouched:
+            // it's a user-supplied endpoint override, not part of
+            // "which model", and pinning the catalog's base URL into
+            // it would freeze out future `models.json` updates.
+            let save_note = persist_config(config, |c| {
+                c.model_api = Some(info.provider.clone());
+                c.model_name = Some(info.id.clone());
+            });
+            let mut notice = format!(
+                "Model set to {} ({}/{}).",
+                info.name, info.provider, info.id
+            );
+            for note in [save_note, log_note].into_iter().flatten() {
+                notice.push(' ');
+                notice.push_str(&note);
+            }
+            notice
+        }
+        Err(err) => format!("Failed to switch to {}: {err}", info.name),
+    }
+}
+
+/// Apply a confirmed `/model` pick to sub-agent `n`: rebuild the
+/// bundle at the target's effective speed, stage it into the world's
+/// override map (applied at the sub's next turn start), record on
+/// the sub's log thread, and refresh its footer entry. Deliberately
+/// does not touch `config.toml` or the run config. Returns the
+/// user-facing notice.
+async fn confirm_model_for_sub(
+    tui: &mut Tui,
+    info: ModelInfo,
+    n: usize,
+    auth: &AuthStorage,
+    world: &mut SessionWorld,
+) -> String {
+    let target = AgentId::Sub(n);
+    if resolve_agent(target, &world.agent, &world.registry).is_none() {
+        return "This agent can't be prompted.".to_string();
+    }
+    // Effective speed: the staged override for this agent if
+    // present, else the target's tracked settings string.
+    let staged_speed = {
+        let overrides = world
+            .sub_overrides
+            .lock()
+            .expect("sub overrides mutex poisoned");
+        overrides.get(&n).and_then(|o| o.speed)
+    };
+    let effective_speed = match staged_speed {
+        Some(speed) => speed,
+        None => world
+            .pump
+            .agent_settings(target)
+            .and_then(|s| speed_from_name(&s.speed))
+            .flatten(),
+    };
+    match from_model_info(auth, info.clone(), effective_speed) {
+        Ok(ResolvedModel {
+            provider,
+            model_info,
+            stream_options,
+        }) => {
+            // Stage the standing bundle choice; the sub's next turn
+            // applies it.
+            world
+                .sub_overrides
+                .lock()
+                .expect("sub overrides mutex poisoned")
+                .entry(n)
+                .or_default()
+                .bundle = Some((
+                provider,
+                model_info,
+                stream_options,
+                (info.provider.clone(), info.id.clone()),
+            ));
+            // Refresh the target's footer entry: new identity, the
+            // catalog entry's window, thinking string preserved.
+            let preserved_thinking = world
+                .pump
+                .agent_settings(target)
+                .map(|s| s.thinking.clone())
+                .unwrap_or_else(|| "off".to_string());
+            let settings = aj_agent::events::AgentSettings {
+                provider: info.provider.clone(),
+                model_id: info.id.clone(),
+                thinking: preserved_thinking,
+                speed: speed_name(effective_speed).to_string(),
+            };
+            world
+                .pump
+                .note_agent_settings(tui, target, settings, info.context_window);
+            // Record the change on the sub-agent's log thread so a
+            // resumed transcript reflects it.
+            let log_note = {
+                let mut log = world.log.lock().await;
+                log.append_model_change(ThreadFilter::subagent(n), &info.provider, &info.id)
+                    .err()
+                    .map(|err| format!("(couldn't record in session log: {err})"))
+            };
+            let mut notice = format!(
+                "Model set to {} ({}/{}) for agent {n}.",
+                info.name, info.provider, info.id
+            );
+            if let Some(note) = log_note {
+                notice.push(' ');
+                notice.push_str(&note);
+            }
+            notice
+        }
+        Err(err) => format!("Failed to switch to {}: {err}", info.name),
+    }
+}
+
 /// Poll an open selector for its outcome and apply the result.
 ///
 /// Returns [`SelectorPollOutcome::StillOpen`] if the user hasn't
@@ -2861,6 +3268,7 @@ async fn handle_selector_outcome(
     auth: &AuthStorage,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: Arc<std::sync::Mutex<Config>>,
+    model_catalog: &[ModelInfo],
     world: &mut SessionWorld,
     theme: &ThemeHandle,
 ) -> SelectorPollOutcome {
@@ -2868,6 +3276,7 @@ async fn handle_selector_outcome(
         OpenSelector::Thinking {
             handle,
             outcome,
+            target,
             parent_palette,
         } => {
             let outcome_value = outcome.lock().expect("thinking outcome poisoned").take();
@@ -2875,6 +3284,7 @@ async fn handle_selector_outcome(
                 None => SelectorPollOutcome::StillOpen(OpenSelector::Thinking {
                     handle,
                     outcome,
+                    target,
                     parent_palette,
                 }),
                 Some(ThinkingSelectorOutcome::Confirmed(level)) => {
@@ -2882,53 +3292,23 @@ async fn handle_selector_outcome(
                     if let Some(parent) = parent_palette {
                         tui.hide_overlay(&parent.handle);
                     }
-                    // Stage the new thinking effort into the loop-side
-                    // snapshot; the next turn applies it. Never locks
-                    // the agent, so it's safe while a turn is running
-                    // (the in-flight turn keeps its effort; the change
-                    // takes effect next turn). Read the rest of the
-                    // settings identity back for the footer entry.
-                    let (settings, window) = {
-                        let mut cfg = run_config.lock().expect("run config mutex poisoned");
-                        cfg.thinking = level.clone();
-                        (
-                            aj_agent::events::AgentSettings {
-                                provider: cfg.model_key.0.clone(),
-                                model_id: cfg.model_key.1.clone(),
-                                thinking: thinking_level_name(&level).to_string(),
-                                speed: aj_models::speed_name(cfg.speed).to_string(),
-                            },
-                            cfg.model_info.context_window,
-                        )
+                    let notice = match target {
+                        AgentId::Main => {
+                            confirm_thinking_for_main(
+                                tui,
+                                level,
+                                &run_config,
+                                &config,
+                                world,
+                                theme,
+                            )
+                            .await
+                        }
+                        AgentId::Sub(n) => {
+                            confirm_thinking_for_sub(tui, level, n, model_catalog, world, theme)
+                                .await
+                        }
                     };
-                    // Mirror the change onto the editor's border
-                    // tint so the visual cue tracks the active
-                    // reasoning mode.
-                    apply_editor_border_for_thinking(tui, theme, level.as_ref());
-                    // Footer surfaces the active thinking effort;
-                    // record the new settings so the change is
-                    // visible without waiting for a turn.
-                    world
-                        .pump
-                        .note_agent_settings(tui, AgentId::Main, settings, window);
-                    let name = thinking_level_name(&level);
-                    // Record the change on the session log's user
-                    // thread so a later resume restores this level.
-                    let log_note = {
-                        let mut log = world.log.lock().await;
-                        log.append_thinking_change(ThreadFilter::USER, name)
-                            .err()
-                            .map(|err| format!("(couldn't record in session log: {err})"))
-                    };
-                    // Persist the choice so it survives a restart.
-                    let save_note = persist_config(&config, |c| {
-                        c.thinking = Some(config_thinking_level(level.as_ref()));
-                    });
-                    let mut notice = format!("Thinking effort set to {name}.");
-                    for note in [save_note, log_note].into_iter().flatten() {
-                        notice.push(' ');
-                        notice.push_str(&note);
-                    }
                     SelectorPollOutcome::Closed {
                         notice: Some(notice),
                         follow_up: None,
@@ -2963,6 +3343,7 @@ async fn handle_selector_outcome(
         OpenSelector::Model {
             handle,
             outcome,
+            target,
             parent_palette,
         } => {
             let outcome_value = outcome.lock().expect("model outcome poisoned").take();
@@ -2970,6 +3351,7 @@ async fn handle_selector_outcome(
                 None => SelectorPollOutcome::StillOpen(OpenSelector::Model {
                     handle,
                     outcome,
+                    target,
                     parent_palette,
                 }),
                 Some(ModelSelectorOutcome::Confirmed(info)) => {
@@ -2977,99 +3359,18 @@ async fn handle_selector_outcome(
                     if let Some(parent) = parent_palette {
                         tui.hide_overlay(&parent.handle);
                     }
-                    // Construct a fresh provider handle from the
-                    // picked catalog entry, carrying the active
-                    // speed over so e.g. `--speed fast` survives a
-                    // `/model` pick (degrading silently on providers
-                    // that ignore it).
-                    let speed = {
-                        let cfg = run_config.lock().expect("run config mutex poisoned");
-                        cfg.speed
-                    };
-                    match from_model_info(auth, info.clone(), speed) {
-                        Ok(ResolvedModel {
-                            provider,
-                            model_info,
-                            stream_options,
-                        }) => {
-                            // Stage the swap into the loop-side snapshot
-                            // (provider + model + options + the
-                            // pre-select key); the next turn applies it.
-                            // Never locks the agent, so it's safe
-                            // mid-turn — the in-flight turn keeps its
-                            // model and the swap takes effect next turn.
-                            // Thinking effort is preserved; read it back
-                            // for the footer entry.
-                            let current_thinking = {
-                                let mut cfg = run_config.lock().expect("run config mutex poisoned");
-                                cfg.provider = provider;
-                                cfg.model_info = model_info;
-                                cfg.stream_options = stream_options;
-                                cfg.model_key = (info.provider.clone(), info.id.clone());
-                                cfg.thinking.clone()
-                            };
-                            // Record the new settings identity so the
-                            // footer's model line and context-window
-                            // denominator reflect the swap immediately
-                            // rather than waiting for the next turn.
-                            let settings = aj_agent::events::AgentSettings {
-                                provider: info.provider.clone(),
-                                model_id: info.id.clone(),
-                                thinking: thinking_level_name(&current_thinking).to_string(),
-                                speed: aj_models::speed_name(speed).to_string(),
-                            };
-                            world.pump.note_agent_settings(
-                                tui,
-                                AgentId::Main,
-                                settings,
-                                info.context_window,
-                            );
-                            // Record the change on the session log's
-                            // user thread so a later resume restores
-                            // this model.
-                            let log_note = {
-                                let mut log = world.log.lock().await;
-                                log.append_model_change(
-                                    ThreadFilter::USER,
-                                    &info.provider,
-                                    &info.id,
-                                )
-                                .err()
-                                .map(|err| format!("(couldn't record in session log: {err})"))
-                            };
-                            // Persist the model choice (provider + id)
-                            // so it survives a restart. `model_url` is
-                            // intentionally left untouched: it's a
-                            // user-supplied endpoint override, not part
-                            // of "which model", and pinning the
-                            // catalog's base URL into it would freeze
-                            // out future `models.json` updates.
-                            let save_note = persist_config(&config, |c| {
-                                c.model_api = Some(info.provider.clone());
-                                c.model_name = Some(info.id.clone());
-                            });
-                            let confirm = format!(
-                                "Model set to {} ({}/{}).",
-                                info.name, info.provider, info.id
-                            );
-                            let mut notice = confirm;
-                            for note in [save_note, log_note].into_iter().flatten() {
-                                notice.push(' ');
-                                notice.push_str(&note);
-                            }
-                            SelectorPollOutcome::Closed {
-                                notice: Some(notice),
-                                follow_up: None,
-                                start_login: None,
-                                session_request: None,
-                            }
+                    let notice = match target {
+                        AgentId::Main => {
+                            confirm_model_for_main(tui, info, auth, &run_config, &config, world)
+                                .await
                         }
-                        Err(err) => SelectorPollOutcome::Closed {
-                            notice: Some(format!("Failed to switch to {}: {err}", info.name)),
-                            follow_up: None,
-                            start_login: None,
-                            session_request: None,
-                        },
+                        AgentId::Sub(n) => confirm_model_for_sub(tui, info, n, auth, world).await,
+                    };
+                    SelectorPollOutcome::Closed {
+                        notice: Some(notice),
+                        follow_up: None,
+                        start_login: None,
+                        session_request: None,
                     }
                 }
                 Some(ModelSelectorOutcome::Cancelled) => {
@@ -3757,10 +4058,11 @@ mod tests {
             cfg.thinking = Some(ThinkingConfig::High);
         }
 
-        // A sub continuation turn stamps nothing.
+        // A sub continuation turn stamps nothing without overrides.
+        let no_overrides = std::sync::Mutex::new(HashMap::new());
         {
             let mut s = sub.lock().await;
-            apply_turn_config(AgentId::Sub(1), &mut s, &run_config);
+            apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &no_overrides);
             assert_eq!(s.model_info().id, "scripted", "sub keeps its model");
             assert_eq!(s.default_thinking(), None, "sub keeps its thinking");
         }
@@ -3768,9 +4070,331 @@ mod tests {
         // A main turn picks up the new config.
         {
             let mut m = world.agent.lock().await;
-            apply_turn_config(AgentId::Main, &mut m, &run_config);
+            apply_turn_config(AgentId::Main, &mut m, &run_config, &no_overrides);
             assert_eq!(m.model_info().id, "changed");
             assert_eq!(m.default_thinking(), Some(ThinkingConfig::High));
         }
+    }
+
+    /// Staged per-sub overrides are applied at the sub's turn start,
+    /// axis by axis: an entry with only a thinking override leaves
+    /// the spawn-time model alone, a later bundle override swaps the
+    /// model, and entries are re-applied idempotently.
+    #[tokio::test]
+    async fn apply_turn_config_applies_staged_sub_overrides() {
+        use std::time::Duration;
+
+        use aj_models::scripted::ScriptedProvider;
+
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![
+            agent_tool_call_message("look into it"),
+            finalized_text_message("sub report"),
+            finalized_text_message("parent done"),
+        ]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world, "delegate").await;
+        let sub = world
+            .registry
+            .get(1)
+            .expect("sub-agent retained under id 1");
+
+        // Stage a thinking + speed override only: the model axis is
+        // untouched.
+        {
+            let mut overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            let entry = overrides.entry(1).or_default();
+            entry.thinking = Some(Some(ThinkingConfig::High));
+            entry.speed = Some(Some(Speed::Fast));
+        }
+        {
+            let mut s = sub.lock().await;
+            apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &world.sub_overrides);
+            assert_eq!(s.default_thinking(), Some(ThinkingConfig::High));
+            assert_eq!(
+                s.model_info().id,
+                "scripted",
+                "no bundle override: spawn-time model kept"
+            );
+        }
+
+        // Stage a bundle override on top: the model swaps too.
+        {
+            let mut overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            overrides.entry(1).or_default().bundle = Some((
+                Arc::new(ScriptedProvider::from_messages(
+                    Vec::new(),
+                    0,
+                    Duration::ZERO,
+                )),
+                Arc::new(ModelInfo {
+                    id: "override-model".to_string(),
+                    ..scripted_model_info()
+                }),
+                StreamOptions::default(),
+                ("scripted".to_string(), "override-model".to_string()),
+            ));
+        }
+        {
+            let mut s = sub.lock().await;
+            // Applied twice: the entry is a standing choice and
+            // re-applies idempotently.
+            apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &world.sub_overrides);
+            apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &world.sub_overrides);
+            assert_eq!(s.model_info().id, "override-model");
+            assert_eq!(s.default_thinking(), Some(ThinkingConfig::High));
+        }
+
+        // The global run config never moved.
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(cfg.thinking, None);
+        assert_eq!(cfg.model_info.id, "scripted");
+    }
+
+    use aj_session::ConversationLog;
+
+    use crate::modes::interactive::components::thinking_selector::ThinkingSelectorComponent;
+    use crate::modes::interactive::layout::build_layout;
+    use crate::modes::interactive::test_support::StubTerminal;
+
+    /// Build a world whose main turn spawned sub-agent 1, plus a
+    /// headless TUI with the layout installed and every bus event
+    /// pumped (so the pump holds the sub's footer entry).
+    async fn world_with_sub(
+        persistence: &ConversationPersistence,
+    ) -> (SessionWorld, Arc<std::sync::Mutex<RunConfigSnapshot>>, Tui) {
+        let run_config = scripted_run_config(vec![
+            agent_tool_call_message("look into it"),
+            finalized_text_message("sub report"),
+            finalized_text_message("parent done"),
+        ]);
+        let mut world =
+            build_test_world(persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world, "delegate").await;
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+        while let Ok(event) = world.event_rx.try_recv() {
+            world.pump.handle(&mut tui, &event);
+        }
+        (world, run_config, tui)
+    }
+
+    /// Mount a thinking selector with a pre-filled outcome and poll
+    /// it through [`handle_selector_outcome`] for `target`.
+    async fn confirm_thinking(
+        tui: &mut Tui,
+        world: &mut SessionWorld,
+        run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+        target: AgentId,
+        level: Option<ThinkingConfig>,
+    ) -> SelectorPollOutcome {
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let inner = ThinkingSelectorComponent::new(select_list_theme(&theme), None);
+        let outcome = inner.outcome_handle();
+        let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
+        *outcome.lock().expect("outcome poisoned") =
+            Some(ThinkingSelectorOutcome::Confirmed(level));
+        let dir = TempDir::new().expect("tempdir");
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        handle_selector_outcome(
+            tui,
+            OpenSelector::Thinking {
+                handle,
+                outcome,
+                target,
+                parent_palette: None,
+            },
+            &auth,
+            Arc::clone(run_config),
+            Arc::new(std::sync::Mutex::new(Config::default())),
+            &[],
+            world,
+            &theme,
+        )
+        .await
+    }
+
+    /// Read the settings the sub-agent's log thread folds to.
+    async fn sub_thread_settings(
+        log: &Arc<TokioMutex<ConversationLog>>,
+        n: usize,
+    ) -> aj_session::SessionSettings {
+        let log = log.lock().await;
+        let filter = ThreadFilter::subagent(n);
+        let head = log.latest_leaf(filter).expect("sub thread has a leaf");
+        log.linearize(&head, filter).settings()
+    }
+
+    /// Confirming `/thinking` while targeting a live sub-agent
+    /// stages an override, records the change on the sub's log
+    /// thread, refreshes the sub's footer entry, and leaves the run
+    /// config alone.
+    #[tokio::test]
+    async fn thinking_confirm_for_sub_stages_override_and_logs_on_sub_thread() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let (mut world, run_config, mut tui) = world_with_sub(&persistence).await;
+
+        let outcome = confirm_thinking(
+            &mut tui,
+            &mut world,
+            &run_config,
+            AgentId::Sub(1),
+            Some(ThinkingConfig::High),
+        )
+        .await;
+
+        match outcome {
+            SelectorPollOutcome::Closed { notice, .. } => assert_eq!(
+                notice.as_deref(),
+                Some("Thinking effort set to high for agent 1.")
+            ),
+            _ => panic!("expected the selector to close"),
+        }
+        {
+            let overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            assert_eq!(
+                overrides.get(&1).and_then(|o| o.thinking.clone()),
+                Some(Some(ThinkingConfig::High)),
+                "override staged for sub 1"
+            );
+        }
+        assert_eq!(
+            world
+                .pump
+                .agent_settings(AgentId::Sub(1))
+                .map(|s| s.thinking.clone()),
+            Some("high".to_string()),
+            "footer entry updated"
+        );
+        assert_eq!(
+            sub_thread_settings(&world.log, 1).await.thinking.as_deref(),
+            Some("high"),
+            "change recorded on the sub thread"
+        );
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(cfg.thinking, None, "run config untouched");
+    }
+
+    /// A non-promptable target (no live registry entry) yields the
+    /// can't-be-prompted notice and stages nothing.
+    #[tokio::test]
+    async fn thinking_confirm_for_unpromptable_sub_stages_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let (mut world, run_config, mut tui) = world_with_sub(&persistence).await;
+
+        let outcome = confirm_thinking(
+            &mut tui,
+            &mut world,
+            &run_config,
+            AgentId::Sub(99),
+            Some(ThinkingConfig::High),
+        )
+        .await;
+
+        match outcome {
+            SelectorPollOutcome::Closed { notice, .. } => {
+                assert_eq!(notice.as_deref(), Some("This agent can't be prompted."));
+            }
+            _ => panic!("expected the selector to close"),
+        }
+        assert!(
+            world
+                .sub_overrides
+                .lock()
+                .expect("overrides poisoned")
+                .is_empty(),
+            "nothing staged"
+        );
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(cfg.thinking, None, "run config untouched");
+    }
+
+    /// Confirming `/model` while targeting a live sub-agent stages a
+    /// bundle override keyed to the picked model, records the change
+    /// on the sub's log thread, and refreshes the sub's footer entry
+    /// (preserving its thinking string) without touching the run
+    /// config.
+    #[tokio::test]
+    async fn model_confirm_for_sub_stages_bundle_and_logs_on_sub_thread() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let (mut world, run_config, mut tui) = world_with_sub(&persistence).await;
+
+        // A pickable catalog entry whose api has a registered
+        // provider; key resolution is lazy, so no credentials are
+        // needed to build the bundle.
+        let info = ModelInfo {
+            id: "claude-x".to_string(),
+            name: "claude-x".to_string(),
+            api: "anthropic-messages".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            context_window: 1_000,
+            ..scripted_model_info()
+        };
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        use crate::modes::interactive::components::model_selector::ModelSelectorComponent;
+        let inner =
+            ModelSelectorComponent::new(select_list_theme(&theme), vec![info.clone()], None, None);
+        let outcome = inner.outcome_handle();
+        let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
+        *outcome.lock().expect("outcome poisoned") =
+            Some(ModelSelectorOutcome::Confirmed(info.clone()));
+
+        let result = handle_selector_outcome(
+            &mut tui,
+            OpenSelector::Model {
+                handle,
+                outcome,
+                target: AgentId::Sub(1),
+                parent_palette: None,
+            },
+            &auth,
+            Arc::clone(&run_config),
+            Arc::new(std::sync::Mutex::new(Config::default())),
+            &[],
+            &mut world,
+            &theme,
+        )
+        .await;
+
+        match result {
+            SelectorPollOutcome::Closed { notice, .. } => assert_eq!(
+                notice.as_deref(),
+                Some("Model set to claude-x (anthropic/claude-x) for agent 1.")
+            ),
+            _ => panic!("expected the selector to close"),
+        }
+        {
+            let overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            let bundle = overrides
+                .get(&1)
+                .and_then(|o| o.bundle.as_ref())
+                .expect("bundle staged for sub 1");
+            assert_eq!(
+                bundle.3,
+                ("anthropic".to_string(), "claude-x".to_string()),
+                "staged bundle carries the picked key"
+            );
+        }
+        let settings = world
+            .pump
+            .agent_settings(AgentId::Sub(1))
+            .cloned()
+            .expect("footer entry present");
+        assert_eq!(settings.model_id, "claude-x");
+        assert_eq!(settings.thinking, "off", "thinking string preserved");
+        assert_eq!(
+            sub_thread_settings(&world.log, 1).await.model,
+            Some(("anthropic".to_string(), "claude-x".to_string())),
+            "change recorded on the sub thread"
+        );
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(cfg.model_info.id, "scripted", "run config untouched");
     }
 }

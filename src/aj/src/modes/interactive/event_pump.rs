@@ -223,6 +223,14 @@ impl EventPump {
         self.footer_data.settings(id)
     }
 
+    /// Context-window denominator currently stored for `id` (falls
+    /// back to the Main entry like the footer's usage view; `0`
+    /// means unknown). Lets settings stagers replace one axis of an
+    /// agent's footer entry while preserving its window.
+    pub fn agent_context_window(&self, id: AgentId) -> u64 {
+        self.footer_data.context_usage(id).context_window
+    }
+
     /// Resolve the context window for a settings identity known
     /// only as `(provider, model_id)` strings:
     ///

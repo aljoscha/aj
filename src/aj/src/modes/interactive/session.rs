@@ -33,7 +33,6 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::SYSTEM_PROMPT;
 use crate::config::theme::{ThemeHandle, chat_theme};
-use crate::modes::interactive::RunConfigSnapshot;
 use crate::modes::interactive::apply_editor_agent_marker;
 use crate::modes::interactive::components::chat_view::ChatView;
 use crate::modes::interactive::components::header::Header;
@@ -41,6 +40,7 @@ use crate::modes::interactive::event_pump::EventPump;
 use crate::modes::interactive::layout::SlotIndex;
 use crate::modes::interactive::render_settings::RenderSettings;
 use crate::modes::interactive::shutdown::build_usage_summary;
+use crate::modes::interactive::{RunConfigSnapshot, SubAgentOverrides};
 
 /// Construct a fresh, not-yet-shared [`Agent`] from the persisted
 /// config and a provider bundle cloned out of the live run-config
@@ -138,7 +138,7 @@ fn header_notice(spec: &SessionSpec) -> &'static str {
 /// [`ThinkingLevel`] for validation against a model's effort
 /// vocabulary. One-to-one, mirroring the projection the agent
 /// applies before each inference.
-fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
+pub(crate) fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
     match level {
         ThinkingConfig::Low => ThinkingLevel::Low,
         ThinkingConfig::Medium => ThinkingLevel::Medium,
@@ -276,6 +276,15 @@ pub struct SessionWorld {
     /// Sub-agent registry injected into `agent`; starts empty, so
     /// only sub-agents spawned in this session are promptable.
     pub registry: SubAgentRegistry,
+    /// Loop-side staged settings overrides, keyed by sub-agent id.
+    /// The `/model` / `/thinking` selectors write entries when the
+    /// user changes a sub-agent's settings; the submit handler's
+    /// turn task re-applies them at every turn start (see
+    /// `apply_turn_config`). Sub ids are per-session, so the map
+    /// resets naturally with the world. A sub-agent with no entry
+    /// runs with whatever it already holds (spawn-time inheritance).
+    pub(crate) sub_overrides:
+        Arc<std::sync::Mutex<std::collections::HashMap<usize, SubAgentOverrides>>>,
     /// The session's on-disk conversation log, shared with the
     /// persistence listener.
     pub log: Arc<TokioMutex<ConversationLog>>,
@@ -446,6 +455,7 @@ impl SessionWorld {
         Ok(SessionWorld {
             agent: Arc::new(TokioMutex::new(agent)),
             registry,
+            sub_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             log,
             session_id,
             pump,

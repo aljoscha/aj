@@ -88,3 +88,16 @@ pub fn speed_name(speed: Option<types::Speed>) -> &'static str {
         Some(types::Speed::Fast) => "fast",
     }
 }
+
+/// Parse a canonical speed name back into an optional
+/// [`types::Speed`] — the inverse of [`speed_name`], with
+/// `"standard"` mapping to `None` (the wire-equivalent default).
+/// Returns `None` for names outside the vocabulary so callers can
+/// keep their current speed.
+pub fn speed_from_name(name: &str) -> Option<Option<types::Speed>> {
+    match name {
+        "standard" => Some(None),
+        "fast" => Some(Some(types::Speed::Fast)),
+        _ => None,
+    }
+}
