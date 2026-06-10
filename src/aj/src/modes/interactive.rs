@@ -561,8 +561,8 @@ impl InteractiveMode {
         // Startup notices: surface config-load diagnostics (parse
         // errors, unknown keys) first so a user with a broken
         // `config.toml` sees that before any other chrome, then
-        // report the base system prompt in use and list the
-        // AGENTS.md / CLAUDE.md files stitched into it, then (unless
+        // list the context stitched into the system prompt (base
+        // prompt plus AGENTS.md / CLAUDE.md files), then (unless
         // suppressed) print the sandbox warning. All flow through
         // the pump's existing
         // `Notice` / `Warning` / `Error` arms so they appear as dim
@@ -579,21 +579,15 @@ impl InteractiveMode {
             };
             world.pump.handle(&mut tui, &event);
         }
-        // The system-prompt and context notices only apply to fresh
-        // sessions: a resumed session keeps the assembled prompt
-        // persisted in its log, so the freshly-loaded env these
-        // notices describe doesn't govern what's actually sent.
+        // The context notice only applies to fresh sessions: a
+        // resumed session keeps the assembled prompt persisted in
+        // its log, so the freshly-loaded env the notice describes
+        // doesn't govern what's actually sent.
         if matches!(spec, SessionSpec::Create { .. }) {
-            let (system_prompt_notice, context_notice) = {
+            let context_notice = {
                 let a = world.agent.lock().await;
-                (
-                    build_system_prompt_notice(a.env()),
-                    build_context_notice(a.env()),
-                )
+                build_context_notice(a.env())
             };
-            world
-                .pump
-                .handle(&mut tui, &notice_event(&system_prompt_notice));
             world.pump.handle(&mut tui, &notice_event(&context_notice));
         }
         if sandbox_warning_enabled() {
@@ -2117,40 +2111,31 @@ fn resolve_theme_name(configured: Option<&str>) -> &str {
     configured.unwrap_or("light")
 }
 
-/// Build the chat-scrollback notice reporting the base system prompt
-/// in use: the builtin one (with a hint on how to override it) or the
-/// override file it was loaded from.
-fn build_system_prompt_notice(env: &AgentEnv) -> String {
+/// Build the chat-scrollback "Context:" notice listing everything
+/// stitched into the agent's system prompt: the base prompt (builtin
+/// or override file) followed by every agents.md-style instruction
+/// file, one row each formatted as `  - <tildified path> (<label>)`
+/// so the user can verify which guidance is actually active.
+fn build_context_notice(env: &AgentEnv) -> String {
+    let mut lines = String::from("Context:");
     match &env.system_prompt.source {
         SystemPromptSource::Builtin => {
-            "System prompt: builtin (override with ~/.agents/SYSTEM_PROMPT.md)".to_string()
+            lines.push_str(
+                "\n  - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)",
+            );
         }
         SystemPromptSource::Override(path) => {
-            format!("System prompt: {} (replaces builtin)", display_path(path))
+            lines.push_str(&format!("\n  - {} (system prompt)", display_path(path)));
         }
     }
-}
-
-/// Build the chat-scrollback "Context:" notice listing every
-/// agents.md-style file the agent injected into its system prompt.
-/// Returns either `"Context: (none)"` (when no instruction files
-/// were discovered) or a multi-line listing with one row per file
-/// formatted as `  - <tildified path> (<kind label>)` so the user
-/// can verify which guidance is actually active.
-fn build_context_notice(env: &AgentEnv) -> String {
-    if env.context_files.is_empty() {
-        "Context: (none)".to_string()
-    } else {
-        let mut lines = String::from("Context:");
-        for file in &env.context_files {
-            lines.push_str(&format!(
-                "\n  - {} ({})",
-                display_path(&file.path),
-                file.kind.label()
-            ));
-        }
-        lines
+    for file in &env.context_files {
+        lines.push_str(&format!(
+            "\n  - {} ({})",
+            display_path(&file.path),
+            file.kind.label()
+        ));
     }
+    lines
 }
 
 /// The exact sandbox-warning string the binary emits at startup
@@ -3860,9 +3845,12 @@ mod tests {
     }
 
     #[test]
-    fn build_context_notice_empty_renders_none_marker() {
+    fn build_context_notice_without_files_lists_only_the_system_prompt() {
         let env = env_with(Vec::new());
-        assert_eq!(build_context_notice(&env), "Context: (none)");
+        assert_eq!(
+            build_context_notice(&env),
+            "Context:\n  - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)"
+        );
     }
 
     #[test]
@@ -3887,22 +3875,15 @@ mod tests {
         ]);
 
         let notice = build_context_notice(&env);
-        let expected = "Context:\n  - ~/.agents/AGENTS.md (user instructions)\n  \
+        let expected = "Context:\n  \
+             - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
+             - ~/.agents/AGENTS.md (user instructions)\n  \
              - /var/project/AGENTS.md (project instructions)";
         assert_eq!(notice, expected);
     }
 
     #[test]
-    fn build_system_prompt_notice_builtin_includes_override_hint() {
-        let env = env_with(Vec::new());
-        assert_eq!(
-            build_system_prompt_notice(&env),
-            "System prompt: builtin (override with ~/.agents/SYSTEM_PROMPT.md)"
-        );
-    }
-
-    #[test]
-    fn build_system_prompt_notice_override_shows_tildified_path() {
+    fn build_context_notice_override_shows_tildified_prompt_path() {
         // `display_path` tildifies under `$HOME`, so build the path
         // off the live `HOME` env var to keep the assertion stable
         // across machines.
@@ -3914,8 +3895,8 @@ mod tests {
             source: SystemPromptSource::Override(path),
         };
         assert_eq!(
-            build_system_prompt_notice(&env),
-            "System prompt: ~/.agents/SYSTEM_PROMPT.md (replaces builtin)"
+            build_context_notice(&env),
+            "Context:\n  - ~/.agents/SYSTEM_PROMPT.md (system prompt)"
         );
     }
 
