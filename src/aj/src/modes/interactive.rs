@@ -1680,26 +1680,13 @@ async fn run_session(
                             turn_cancels.insert(target, turn_cancel.clone());
                             turns.spawn(async move {
                                 let mut a = handle.lock().await;
-                                // Apply the loop-side run-config
-                                // snapshot before the turn so a
-                                // model / thinking change the user
-                                // made since the last turn takes
-                                // effect now. Done under the turn's
-                                // own lock — uncontended, since no
-                                // turn is in flight yet — so the
-                                // loop never blocks on it.
-                                {
-                                    let cfg = run_config_for_turn
-                                        .lock()
-                                        .expect("run config mutex poisoned");
-                                    a.set_provider(
-                                        Arc::clone(&cfg.provider),
-                                        Arc::clone(&cfg.model_info),
-                                        cfg.stream_options.clone(),
-                                    );
-                                    a.set_default_thinking(cfg.thinking.clone());
-                                    a.set_speed(cfg.speed);
-                                }
+                                // Stamp the run config before the turn
+                                // (main only; see `apply_turn_config`).
+                                // Done under the turn's own lock —
+                                // uncontended, since no turn is in
+                                // flight yet — so the loop never
+                                // blocks on it.
+                                apply_turn_config(target, &mut a, &run_config_for_turn);
                                 let result = a.prompt(trimmed, turn_cancel).await;
                                 (target, result)
                             });
@@ -1759,6 +1746,33 @@ async fn run_session(
 /// that as a transient blip and keeps the TUI alive.
 async fn recv_event(rx: &mut UnboundedReceiver<AgentEvent>) -> Option<AgentEvent> {
     rx.recv().await
+}
+
+/// Apply the loop-side run-config snapshot to the agent about to run
+/// a turn — for the **main** agent only. The run config is the main
+/// agent's configuration: the selectors stage into it and it persists
+/// to `config.toml`, so stamping it onto a main turn picks up any
+/// model / thinking change made since the last turn. Sub-agents own
+/// their settings (inherited from the parent at spawn) and only
+/// explicit per-agent changes, staged loop-side, may alter them — so
+/// a sub-agent continuation stamps nothing and runs with whatever
+/// the agent already holds.
+fn apply_turn_config(
+    target: AgentId,
+    agent: &mut Agent,
+    run_config: &std::sync::Mutex<RunConfigSnapshot>,
+) {
+    if target != AgentId::Main {
+        return;
+    }
+    let cfg = run_config.lock().expect("run config mutex poisoned");
+    agent.set_provider(
+        Arc::clone(&cfg.provider),
+        Arc::clone(&cfg.model_info),
+        cfg.stream_options.clone(),
+    );
+    agent.set_default_thinking(cfg.thinking.clone());
+    agent.set_speed(cfg.speed);
 }
 
 /// Resolve an `AgentId` to its live handle: the main agent for
@@ -3406,7 +3420,8 @@ mod tests {
 
     use super::*;
     use crate::modes::interactive::test_support::{
-        one_turn_session, resume_spec, scripted_run_config,
+        build_test_world, create_spec, drive_turn, finalized_text_message, one_turn_session,
+        resume_spec, scripted_model_info, scripted_run_config,
     };
 
     /// Build an [`AgentEnv`] for use in the helper tests below.
@@ -3679,5 +3694,83 @@ mod tests {
             result.is_err(),
             "no fallback world exists, so the transition is fatal"
         );
+    }
+
+    /// Scripted assistant message that calls the `agent` tool, so a
+    /// driven turn spawns a sub-agent off the world's main agent.
+    fn agent_tool_call_message(task: &str) -> aj_models::types::AssistantMessage {
+        use aj_models::types::{AssistantContent, StopReason, ToolCall};
+        aj_models::types::AssistantMessage {
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: "tu-1".to_string(),
+                name: "agent".to_string(),
+                arguments: serde_json::json!({ "task": task }),
+            })],
+            api: "scripted".to_string(),
+            provider: "scripted".to_string(),
+            model: "scripted".to_string(),
+            response_id: Some("test-tool-msg".to_string()),
+            usage: Default::default(),
+            stop_reason: StopReason::ToolUse,
+            error: None,
+            timestamp: 0,
+        }
+    }
+
+    /// The pre-turn config stamp is main-only: after the global run
+    /// config changes, a sub-agent continuation keeps its spawn-time
+    /// settings while a main turn picks up the new config.
+    #[tokio::test]
+    async fn apply_turn_config_stamps_main_and_leaves_subs_alone() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        // Shared scripted provider, consumed in run order: the
+        // parent's tool call, the sub-agent's report, the parent's
+        // wrap-up.
+        let run_config = scripted_run_config(vec![
+            agent_tool_call_message("look into it"),
+            finalized_text_message("sub report"),
+            finalized_text_message("parent done"),
+        ]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        drive_turn(&world, "delegate").await;
+
+        let sub = world
+            .registry
+            .get(1)
+            .expect("sub-agent retained under id 1");
+        {
+            let s = sub.lock().await;
+            assert_eq!(s.model_info().id, "scripted", "spawn-time model inherited");
+            assert_eq!(s.default_thinking(), None, "spawn-time thinking inherited");
+        }
+
+        // The user changes the global run config after the spawn.
+        {
+            let mut cfg = run_config.lock().expect("run config mutex poisoned");
+            cfg.model_info = Arc::new(ModelInfo {
+                id: "changed".to_string(),
+                ..scripted_model_info()
+            });
+            cfg.thinking = Some(ThinkingConfig::High);
+        }
+
+        // A sub continuation turn stamps nothing.
+        {
+            let mut s = sub.lock().await;
+            apply_turn_config(AgentId::Sub(1), &mut s, &run_config);
+            assert_eq!(s.model_info().id, "scripted", "sub keeps its model");
+            assert_eq!(s.default_thinking(), None, "sub keeps its thinking");
+        }
+
+        // A main turn picks up the new config.
+        {
+            let mut m = world.agent.lock().await;
+            apply_turn_config(AgentId::Main, &mut m, &run_config);
+            assert_eq!(m.model_info().id, "changed");
+            assert_eq!(m.default_thinking(), Some(ThinkingConfig::High));
+        }
     }
 }
