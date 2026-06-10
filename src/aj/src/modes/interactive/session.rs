@@ -321,6 +321,7 @@ impl SessionWorld {
         persistence: &ConversationPersistence,
         spec: &SessionSpec,
         restore: Option<&RestoreContext>,
+        catalog: Arc<Vec<ModelInfo>>,
     ) -> Result<SessionWorld> {
         // Resolve the log.
         let mut log = match spec {
@@ -427,8 +428,20 @@ impl SessionWorld {
         let log = Arc::new(TokioMutex::new(log));
         let persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
 
+        let main_settings = aj_agent::events::AgentSettings {
+            provider: model_key.0.clone(),
+            model_id: model_key.1.clone(),
+            thinking: thinking_config_name(thinking.as_ref()).to_string(),
+            speed: speed_name(speed).to_string(),
+        };
         let context_window = agent.model_info().context_window;
-        let pump = EventPump::new(chat_theme(theme), render_settings.clone(), context_window);
+        let pump = EventPump::new(
+            chat_theme(theme),
+            render_settings.clone(),
+            main_settings,
+            context_window,
+            catalog,
+        );
 
         Ok(SessionWorld {
             agent: Arc::new(TokioMutex::new(agent)),
@@ -444,9 +457,10 @@ impl SessionWorld {
     }
 
     /// Bind this world to the TUI: clear the chat scrollback, reset
-    /// the editor's agent marker to the main agent, seed the footer,
-    /// replay the log through the pump, and refresh the header with
-    /// the session id and the entry notice.
+    /// the editor's agent marker to the main agent, seed the footer
+    /// (model line and `?/<window>` indicator), replay the log
+    /// through the pump, and refresh the header with the session id
+    /// and the entry notice.
     ///
     /// Replay never hits the bus, so persistence isn't
     /// double-written.
@@ -813,6 +827,7 @@ mod tests {
             persistence,
             spec,
             Some(restore),
+            Arc::new(Vec::new()),
         )
     }
 

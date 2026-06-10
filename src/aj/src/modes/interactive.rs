@@ -433,6 +433,7 @@ impl InteractiveMode {
             &conversation_persistence,
             &spec,
             restore_context.as_ref(),
+            Arc::clone(&model_catalog),
         )?;
 
         // ---- Build the TUI --------------------------------------------
@@ -516,19 +517,15 @@ impl InteractiveMode {
             }
         }
 
-        // Footer: model + working directory (initial snapshot;
-        // richer state lands alongside `footer_data` in a
-        // follow-up). The header's session id + banner are set by
-        // `SessionWorld::install` below.
-        let (footer_model, footer_cwd) = {
+        // Footer: working directory. The model line and context
+        // indicator are pushed by `SessionWorld::install`'s footer
+        // sync; the header's session id + banner are set by
+        // `install` below as well.
+        let footer_cwd = {
             let a = world.agent.lock().await;
-            (
-                format_footer_model(&a.model_info().id, &a.default_thinking()),
-                format!("{}", a.env().working_directory.display()),
-            )
+            format!("{}", a.env().working_directory.display())
         };
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
-            footer.set_model(Some(footer_model));
             footer.set_cwd(Some(footer_cwd));
         }
 
@@ -644,19 +641,19 @@ impl InteractiveMode {
                 spec,
                 &previous_id,
                 shell.restore_context.as_ref(),
+                Arc::clone(&shell.model_catalog),
             ) {
                 Ok(mut next) => {
                     next.world.install(&mut shell.tui, &next.spec).await;
                     // A resume may have restored the session's
-                    // recorded settings into the run config; mirror
-                    // them onto the footer and editor border like a
-                    // selector confirm would.
+                    // recorded settings into the run config; the
+                    // install's footer sync already mirrors them, so
+                    // only the editor border needs re-applying here.
                     {
-                        let (model_id, thinking) = {
+                        let thinking = {
                             let cfg = shell.run_config.lock().expect("run config mutex poisoned");
-                            (cfg.model_key.1.clone(), cfg.thinking.clone())
+                            cfg.thinking.clone()
                         };
-                        refresh_footer_model(&mut shell.tui, &model_id, &thinking);
                         apply_editor_border_for_thinking(
                             &mut shell.tui,
                             &shell.theme,
@@ -822,6 +819,7 @@ fn build_next_world(
     requested: SessionSpec,
     previous_session_id: &str,
     restore: Option<&RestoreContext>,
+    catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
 ) -> Result<NextWorld> {
     match SessionWorld::build(
         config,
@@ -831,6 +829,7 @@ fn build_next_world(
         persistence,
         &requested,
         restore,
+        Arc::clone(&catalog),
     ) {
         Ok(mut world) => {
             let notice = match &requested {
@@ -870,6 +869,7 @@ fn build_next_world(
                 persistence,
                 &fallback,
                 restore,
+                catalog,
             )?;
             let mut notices = vec![failure];
             notices.append(&mut world.restore_notices);
@@ -2101,27 +2101,6 @@ fn apply_editor_agent_marker(tui: &mut Tui, id: AgentId) {
     }
 }
 
-/// Format the footer's model field as `"<model-id> <thinking-effort>"`.
-///
-/// The thinking effort (e.g. `"off"`, `"medium"`, `"max"`) is more
-/// useful to surface persistently than the base URL — the URL is
-/// stable per provider, while the effort changes per session.
-fn format_footer_model(model_id: &str, thinking: &Option<aj_models::ThinkingConfig>) -> String {
-    format!("{} {}", model_id, thinking_level_name(thinking))
-}
-
-/// Refresh the footer's model line so it reflects the agent's current
-/// `(model id, thinking effort)`. No-op if the footer slot is missing.
-fn refresh_footer_model(
-    tui: &mut Tui,
-    model_id: &str,
-    thinking: &Option<aj_models::ThinkingConfig>,
-) {
-    if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
-        footer.set_model(Some(format_footer_model(model_id, thinking)));
-    }
-}
-
 /// Map the agent's live default thinking back onto its persisted
 /// `config.toml` representation. The forward map in
 /// `Agent::with_provider` collapses [`ConfigThinkingLevel::Off`] to
@@ -2893,21 +2872,31 @@ async fn handle_selector_outcome(
                     // snapshot; the next turn applies it. Never locks
                     // the agent, so it's safe while a turn is running
                     // (the in-flight turn keeps its effort; the change
-                    // takes effect next turn). Read the model id back
-                    // for the footer from the same snapshot.
-                    let model_id = {
+                    // takes effect next turn). Read the rest of the
+                    // settings identity back for the footer entry.
+                    let (settings, window) = {
                         let mut cfg = run_config.lock().expect("run config mutex poisoned");
                         cfg.thinking = level.clone();
-                        cfg.model_key.1.clone()
+                        (
+                            aj_agent::events::AgentSettings {
+                                provider: cfg.model_key.0.clone(),
+                                model_id: cfg.model_key.1.clone(),
+                                thinking: thinking_level_name(&level).to_string(),
+                                speed: aj_models::speed_name(cfg.speed).to_string(),
+                            },
+                            cfg.model_info.context_window,
+                        )
                     };
                     // Mirror the change onto the editor's border
                     // tint so the visual cue tracks the active
                     // reasoning mode.
                     apply_editor_border_for_thinking(tui, theme, level.as_ref());
                     // Footer surfaces the active thinking effort;
-                    // refresh it so the change is visible without
-                    // waiting for a turn.
-                    refresh_footer_model(tui, &model_id, &level);
+                    // record the new settings so the change is
+                    // visible without waiting for a turn.
+                    world
+                        .pump
+                        .note_agent_settings(tui, AgentId::Main, settings, window);
                     let name = thinking_level_name(&level);
                     // Record the change on the session log's user
                     // thread so a later resume restores this level.
@@ -2989,7 +2978,6 @@ async fn handle_selector_outcome(
                             model_info,
                             stream_options,
                         }) => {
-                            let new_id = model_info.id.clone();
                             // Stage the swap into the loop-side snapshot
                             // (provider + model + options + the
                             // pre-select key); the next turn applies it.
@@ -2997,7 +2985,7 @@ async fn handle_selector_outcome(
                             // mid-turn — the in-flight turn keeps its
                             // model and the swap takes effect next turn.
                             // Thinking effort is preserved; read it back
-                            // for the footer format.
+                            // for the footer entry.
                             let current_thinking = {
                                 let mut cfg = run_config.lock().expect("run config mutex poisoned");
                                 cfg.provider = provider;
@@ -3006,16 +2994,22 @@ async fn handle_selector_outcome(
                                 cfg.model_key = (info.provider.clone(), info.id.clone());
                                 cfg.thinking.clone()
                             };
-                            // Refresh the footer's model line so
-                            // the user has visual confirmation of
-                            // the swap without waiting for the next
-                            // turn boundary.
-                            refresh_footer_model(tui, &new_id, &current_thinking);
-                            // Same idea for the footer's context-occupancy
-                            // indicator: the new model has its own window
-                            // size, so update the denominator immediately
+                            // Record the new settings identity so the
+                            // footer's model line and context-window
+                            // denominator reflect the swap immediately
                             // rather than waiting for the next turn.
-                            world.pump.set_context_window(tui, info.context_window);
+                            let settings = aj_agent::events::AgentSettings {
+                                provider: info.provider.clone(),
+                                model_id: info.id.clone(),
+                                thinking: thinking_level_name(&current_thinking).to_string(),
+                                speed: aj_models::speed_name(speed).to_string(),
+                            };
+                            world.pump.note_agent_settings(
+                                tui,
+                                AgentId::Main,
+                                settings,
+                                info.context_window,
+                            );
                             // Record the change on the session log's
                             // user thread so a later resume restores
                             // this model.
@@ -3573,6 +3567,7 @@ mod tests {
             requested,
             previous_session_id,
             None,
+            Arc::new(Vec::new()),
         )
     }
 

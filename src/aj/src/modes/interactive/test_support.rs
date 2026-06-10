@@ -124,6 +124,7 @@ pub(crate) fn build_test_world(
         persistence,
         spec,
         None,
+        Arc::new(Vec::new()),
     )
 }
 

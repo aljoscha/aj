@@ -24,10 +24,12 @@
 //! [`SubAgentBox`]: crate::modes::interactive::components::subagent_box::SubAgentBox
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::types::TokenUsage;
+use aj_models::registry::ModelInfo;
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{AssistantContent, Message, UserContent};
 use aj_tui::components::editor::Editor;
@@ -46,7 +48,7 @@ use crate::modes::interactive::components::loader_status::LoaderStatus;
 use crate::modes::interactive::components::subagent_box::SubAgentStatus;
 use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
 use crate::modes::interactive::components::user_message::UserMessageComponent;
-use crate::modes::interactive::footer_data::FooterData;
+use crate::modes::interactive::footer_data::AgentFooters;
 use crate::modes::interactive::layout::SlotIndex;
 use crate::modes::interactive::render_settings::RenderSettings;
 
@@ -118,14 +120,16 @@ pub struct EventPump {
     /// bumps the shared generation and the components reconcile on
     /// their next render, so the pump never walks the transcript.
     render_settings: RenderSettings,
-    /// Snapshot fed to the [`Footer`] component's context-usage
-    /// indicator. Updated from main-agent
-    /// [`AgentEvent::TurnUsage`] events and on model swaps; the
-    /// pump pushes a fresh view into the footer after each
-    /// mutation. Sub-agent turns are tracked through their box
-    /// only and do not move the main footer (their context
-    /// windows are independent).
-    footer_data: FooterData,
+    /// Per-agent store feeding the [`Footer`]'s model line and
+    /// context-usage indicator. The footer is view-scoped: after
+    /// every mutation the pump pushes the *active view's* entry
+    /// into the footer, so switching views (or a settings change
+    /// on the viewed agent) repaints immediately.
+    footer_data: AgentFooters,
+    /// Model catalog used to resolve a `(provider, model_id)`
+    /// settings identity to its context window (see
+    /// [`Self::resolve_window`]).
+    catalog: Arc<Vec<ModelInfo>>,
 }
 
 impl EventPump {
@@ -137,27 +141,40 @@ impl EventPump {
     /// `~/.aj/config.toml` on startup and the components clone the
     /// handle so a runtime toggle reaches them on their next render.
     ///
-    /// `context_window` seeds the footer's context-usage
-    /// denominator (in tokens). Pass `agent.model_info().context_window`;
-    /// keep it in sync across model swaps via
-    /// [`Self::set_context_window`].
-    pub fn new(theme: ChatTheme, render_settings: RenderSettings, context_window: u64) -> Self {
+    /// `main_settings` and `main_context_window` seed the Main
+    /// agent's footer entry (model line + context-usage
+    /// denominator); later changes flow through
+    /// [`Self::note_agent_settings`]. `catalog` is the model
+    /// catalog used to resolve sub-agent context windows from
+    /// their settings identity.
+    pub fn new(
+        theme: ChatTheme,
+        render_settings: RenderSettings,
+        main_settings: AgentSettings,
+        main_context_window: u64,
+        catalog: Arc<Vec<ModelInfo>>,
+    ) -> Self {
         Self {
             theme,
             agents: HashMap::new(),
             running_agents: HashSet::new(),
             render_settings,
-            footer_data: FooterData::new(context_window),
+            footer_data: AgentFooters::new(main_settings, main_context_window),
+            catalog,
         }
     }
 
-    /// Push the current footer snapshot into the [`Footer`]
-    /// component. Called after every mutation that affects the
-    /// rendered indicator so the row stays in sync.
+    /// Push the active view's footer state — model line and
+    /// context usage — into the [`Footer`] component. Called after
+    /// every mutation that affects the rendered state so the row
+    /// stays in sync with the viewed agent.
     pub fn sync_footer(&self, tui: &mut Tui) {
-        let snapshot = self.footer_data.context_usage();
+        let active = self.active_view(tui);
+        let model_line = self.footer_data.model_line(active);
+        let usage = self.footer_data.context_usage(active);
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
-            footer.set_context_usage(Some(snapshot));
+            footer.set_model(model_line);
+            footer.set_context_usage(Some(usage));
         }
         tui.request_render();
     }
@@ -184,13 +201,55 @@ impl EventPump {
         tui.request_render();
     }
 
-    /// Swap the model context window used as the indicator's
-    /// denominator. Pushes the refreshed snapshot into the footer
-    /// so the user sees the change immediately rather than after
-    /// the next turn lands.
-    pub fn set_context_window(&mut self, tui: &mut Tui, context_window: u64) {
-        self.footer_data.set_context_window(context_window);
+    /// Record `id`'s next-turn settings (and context-window
+    /// denominator) and refresh the footer. The sync is
+    /// unconditional — it renders from the active view and is
+    /// idempotent, so a change to a non-viewed agent simply
+    /// repaints the viewed agent's unchanged state.
+    pub fn note_agent_settings(
+        &mut self,
+        tui: &mut Tui,
+        id: AgentId,
+        settings: AgentSettings,
+        context_window: u64,
+    ) {
+        self.footer_data.note_settings(id, settings, context_window);
         self.sync_footer(tui);
+    }
+
+    /// Read back the stored settings snapshot for `id`. `None`
+    /// when the agent has no entry.
+    pub fn agent_settings(&self, id: AgentId) -> Option<&AgentSettings> {
+        self.footer_data.settings(id)
+    }
+
+    /// Resolve the context window for a settings identity known
+    /// only as `(provider, model_id)` strings:
+    ///
+    /// 1. Catalog scan — the catalog is the authoritative source
+    ///    and is loaded once at startup.
+    /// 2. On a miss, an identity equal to the Main entry's
+    ///    settings (provider and model_id) resolves to Main's
+    ///    window. This covers scripted runs and `--model-url`
+    ///    bundles absent from the catalog: sub-agents inherit the
+    ///    parent's bundle, so the identity match is exact in
+    ///    practice.
+    /// 3. Otherwise `0`, which suppresses the indicator.
+    fn resolve_window(&self, settings: &AgentSettings) -> u64 {
+        if let Some(info) = self
+            .catalog
+            .iter()
+            .find(|m| m.provider == settings.provider && m.id == settings.model_id)
+        {
+            return info.context_window;
+        }
+        if let Some(main) = self.footer_data.settings(AgentId::Main)
+            && main.provider == settings.provider
+            && main.model_id == settings.model_id
+        {
+            return self.footer_data.context_usage(AgentId::Main).context_window;
+        }
+        0
     }
 
     /// Current thinking-block render mode. Exposed so the host's
@@ -263,8 +322,10 @@ impl EventPump {
         }
         // The spinner is scoped to the viewed agent, so a view
         // switch must immediately reflect the new agent's running
-        // state.
+        // state. The footer is view-scoped too: repaint it with the
+        // new view's model line and context usage.
         self.sync_loader(tui);
+        self.sync_footer(tui);
         tui.invalidate();
         tui.request_render();
     }
@@ -445,20 +506,23 @@ impl EventPump {
             // ---- Per-turn token usage. ----
             AgentEvent::TurnUsage { agent_id, usage } => {
                 self.append_turn_usage(tui, *agent_id, usage);
-                // Only main-agent turns drive the footer's
-                // context-occupancy indicator. Sub-agents run in
-                // their own context window and surface their usage
-                // through their box; mixing their counts into the
-                // main footer would make the percentage jump
-                // unpredictably during a turn.
-                if *agent_id == AgentId::Main {
-                    self.footer_data.record_turn_usage(usage);
+                // Every agent's usage folds into its own footer
+                // entry; the footer itself tracks the viewed agent,
+                // so a sub's usage moves it only when that sub's
+                // view is active.
+                self.footer_data.record_turn_usage(*agent_id, usage);
+                if *agent_id == self.active_view(tui) {
                     self.sync_footer(tui);
                 }
             }
 
             // ---- Sub-agent boxes. ----
-            AgentEvent::SubAgentStart { child, task, .. } => {
+            AgentEvent::SubAgentStart {
+                child,
+                task,
+                settings,
+                ..
+            } => {
                 if let AgentId::Sub(n) = child
                     && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
                 {
@@ -468,6 +532,12 @@ impl EventPump {
                     // `AgentStart(Sub n)`, not from here.
                     chat.ensure_sub_box(*n, task);
                 }
+                // Seed the child's footer entry with its spawn-time
+                // settings so its view shows a model line and (when
+                // resolvable) a context window.
+                let window = self.resolve_window(settings);
+                self.footer_data
+                    .note_settings(*child, settings.clone(), window);
             }
             AgentEvent::SubAgentEnd { child, .. } => {
                 if let AgentId::Sub(n) = child
@@ -1110,8 +1180,18 @@ mod tests {
     /// Build a fresh `Tui` + layout pair for event-pump tests.
     /// Returns the populated `Tui` and a paired `EventPump` so the
     /// caller can dispatch events and inspect the chat container's
-    /// contents afterwards.
+    /// contents afterwards. The pump is seeded with an empty
+    /// catalog; tests exercising window resolution use
+    /// [`fresh_tui_with_catalog`].
     fn fresh_tui_with_layout() -> (aj_tui::tui::Tui, EventPump, ChatTheme) {
+        fresh_tui_with_catalog(Vec::new())
+    }
+
+    /// [`fresh_tui_with_layout`] with a caller-supplied model
+    /// catalog for the pump's window resolution.
+    fn fresh_tui_with_catalog(
+        catalog: Vec<aj_models::registry::ModelInfo>,
+    ) -> (aj_tui::tui::Tui, EventPump, ChatTheme) {
         let mut tui = aj_tui::tui::Tui::new(Box::new(ProcessTerminal::new()));
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
         build_layout(&mut tui, &theme);
@@ -1122,9 +1202,60 @@ mod tests {
         let pump = EventPump::new(
             chat.clone(),
             RenderSettings::new(false, false, true),
+            main_settings(),
             200_000,
+            Arc::new(catalog),
         );
         (tui, pump, chat)
+    }
+
+    /// The Main agent's seed settings for the test pump.
+    fn main_settings() -> AgentSettings {
+        AgentSettings {
+            provider: "anthropic".into(),
+            model_id: "claude-main".into(),
+            thinking: "off".into(),
+            speed: "standard".into(),
+        }
+    }
+
+    /// Catalog row with only the identity + window fields the
+    /// pump's resolution reads.
+    fn catalog_model(
+        provider: &str,
+        id: &str,
+        context_window: u64,
+    ) -> aj_models::registry::ModelInfo {
+        aj_models::registry::ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            api: "anthropic-messages".into(),
+            provider: provider.into(),
+            base_url: "https://example.invalid".into(),
+            reasoning: false,
+            supports_adaptive_thinking: false,
+            input: vec![aj_models::registry::InputModality::Text],
+            cost: aj_models::registry::ModelCost::default(),
+            context_window,
+            max_tokens: 100,
+            headers: None,
+        }
+    }
+
+    /// `SubAgentStart` for `Sub(n)` carrying the given settings
+    /// identity (thinking "off", speed "standard").
+    fn sub_agent_start(n: usize, provider: &str, model_id: &str) -> AgentEvent {
+        AgentEvent::SubAgentStart {
+            parent: AgentId::Main,
+            child: AgentId::Sub(n),
+            task: format!("task {n}"),
+            settings: AgentSettings {
+                provider: provider.into(),
+                model_id: model_id.into(),
+                thinking: "off".into(),
+                speed: "standard".into(),
+            },
+        }
     }
 
     /// Render the footer and return the rendered row as a single
@@ -1179,8 +1310,9 @@ mod tests {
 
     #[test]
     fn sub_agent_turn_usage_leaves_the_footer_alone() {
-        // Sub-agents share the bus but run in their own context
-        // window; their usage must not move the main footer.
+        // The footer tracks the *viewed* agent; Main is viewed
+        // here, so a sub-agent's usage folds into the sub's own
+        // entry without moving the rendered footer.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         pump.sync_footer(&mut tui);
         let before = rendered_footer(&mut tui);
@@ -1201,9 +1333,10 @@ mod tests {
     }
 
     #[test]
-    fn set_context_window_repaints_with_new_denominator() {
-        // Swap the model and confirm the denominator updates
-        // immediately rather than waiting for the next turn.
+    fn note_agent_settings_repaints_model_line_and_denominator() {
+        // A settings change for the viewed agent updates both the
+        // model line and the indicator's denominator immediately
+        // rather than waiting for the next turn.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         pump.handle(
             &mut tui,
@@ -1212,12 +1345,161 @@ mod tests {
                 usage: token_usage([10_000, 0, 0, 0], [0, 0, 0, 0]),
             },
         );
-        assert!(rendered_footer(&mut tui).contains("10k/200k"));
+        let line = rendered_footer(&mut tui);
+        assert!(line.contains("10k/200k"));
+        assert!(line.contains("claude-main off"));
 
-        pump.set_context_window(&mut tui, 100_000);
+        pump.note_agent_settings(
+            &mut tui,
+            AgentId::Main,
+            AgentSettings {
+                provider: "anthropic".into(),
+                model_id: "claude-next".into(),
+                thinking: "high".into(),
+                speed: "standard".into(),
+            },
+            100_000,
+        );
+        let line = rendered_footer(&mut tui);
         assert!(
-            rendered_footer(&mut tui).contains("10k/100k"),
-            "denominator should follow the new context window",
+            line.contains("10k/100k"),
+            "denominator should follow the new context window; got {line:?}",
+        );
+        assert!(
+            line.contains("claude-next high"),
+            "model line should follow the new settings; got {line:?}",
+        );
+    }
+
+    #[test]
+    fn switching_views_swaps_the_footer_between_agents() {
+        // SubAgentStart seeds the sub's entry (window from the
+        // catalog); viewing it shows its model line + `?/<window>`,
+        // its usage updates live, and switching back restores
+        // main's line and usage.
+        let (mut tui, mut pump, _theme) =
+            fresh_tui_with_catalog(vec![catalog_model("openai", "gpt-sub", 400_000)]);
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Main,
+                usage: token_usage([10_000, 0, 0, 0], [0, 0, 0, 0]),
+            },
+        );
+        pump.handle(&mut tui, &sub_agent_start(1, "openai", "gpt-sub"));
+
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        let line = rendered_footer(&mut tui);
+        assert!(
+            line.contains("gpt-sub off") && line.contains("?/400k"),
+            "sub view should show the sub's line and seeded window; got {line:?}",
+        );
+
+        // A sub turn updates the viewed footer live.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Sub(1),
+                usage: token_usage([4_000, 0, 0, 0], [0, 0, 0, 0]),
+            },
+        );
+        let line = rendered_footer(&mut tui);
+        assert!(
+            line.contains("4.0k/400k"),
+            "viewed sub's usage should move the footer; got {line:?}",
+        );
+
+        // Switching back restores main's line and usage.
+        pump.set_active_view(&mut tui, AgentId::Main);
+        let line = rendered_footer(&mut tui);
+        assert!(
+            line.contains("claude-main off") && line.contains("10k/200k"),
+            "main view should restore main's line and usage; got {line:?}",
+        );
+    }
+
+    #[test]
+    fn window_resolution_catalog_hit_identity_match_and_full_miss() {
+        let (mut tui, mut pump, _theme) =
+            fresh_tui_with_catalog(vec![catalog_model("openai", "gpt-sub", 400_000)]);
+
+        // Catalog hit.
+        pump.handle(&mut tui, &sub_agent_start(1, "openai", "gpt-sub"));
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        assert!(rendered_footer(&mut tui).contains("?/400k"));
+
+        // Catalog miss, identity equals Main's settings: Main's
+        // window.
+        pump.handle(&mut tui, &sub_agent_start(2, "anthropic", "claude-main"));
+        pump.set_active_view(&mut tui, AgentId::Sub(2));
+        assert!(rendered_footer(&mut tui).contains("?/200k"));
+
+        // Full miss: window 0 suppresses the indicator.
+        pump.handle(&mut tui, &sub_agent_start(3, "mystery", "unknown-model"));
+        pump.set_active_view(&mut tui, AgentId::Sub(3));
+        let line = rendered_footer(&mut tui);
+        assert!(
+            !line.contains('/'),
+            "unknown window should suppress the indicator; got {line:?}",
+        );
+        assert!(line.contains("unknown-model off"));
+    }
+
+    #[test]
+    fn note_main_settings_while_viewing_a_sub_does_not_repaint() {
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(&mut tui, &sub_agent_start(1, "anthropic", "claude-main"));
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        let before = rendered_footer(&mut tui);
+
+        pump.note_agent_settings(
+            &mut tui,
+            AgentId::Main,
+            AgentSettings {
+                provider: "anthropic".into(),
+                model_id: "claude-next".into(),
+                thinking: "max".into(),
+                speed: "standard".into(),
+            },
+            100_000,
+        );
+        assert_eq!(
+            rendered_footer(&mut tui),
+            before,
+            "a Main settings change must not repaint a sub view",
+        );
+
+        // The new line shows after switching back to main.
+        pump.set_active_view(&mut tui, AgentId::Main);
+        let line = rendered_footer(&mut tui);
+        assert!(
+            line.contains("claude-next max"),
+            "main view should show the new line; got {line:?}",
+        );
+    }
+
+    #[test]
+    fn replayed_spawn_and_usage_populate_the_sub_views_footer() {
+        // Replay synthesizes `SubAgentStart` with the recorded
+        // settings followed by per-agent `TurnUsage` events; pumping
+        // them through `handle` must populate the sub view's footer
+        // like a live run.
+        let (mut tui, mut pump, _theme) =
+            fresh_tui_with_catalog(vec![catalog_model("openai", "gpt-sub", 400_000)]);
+        pump.handle(&mut tui, &sub_agent_start(1, "openai", "gpt-sub"));
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Sub(1),
+                usage: token_usage([4_000, 0, 0, 0], [0, 0, 0, 0]),
+            },
+        );
+
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        let line = rendered_footer(&mut tui);
+        assert!(
+            line.contains("gpt-sub off") && line.contains("4.0k/400k"),
+            "resumed sub view should carry its recorded footer state; got {line:?}",
         );
     }
 

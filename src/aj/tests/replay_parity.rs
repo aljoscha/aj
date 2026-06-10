@@ -48,7 +48,7 @@ use aj::modes::interactive::event_pump::EventPump;
 use aj::modes::interactive::layout::{SlotIndex, build_layout};
 use aj::modes::interactive::render_settings::RenderSettings;
 use aj_agent::bus::{Listener, listener_from_sync};
-use aj_agent::events::AgentEvent;
+use aj_agent::events::{AgentEvent, AgentSettings};
 use aj_agent::tool::ErasedToolDefinition;
 use aj_agent::{Agent, AgentSeed, TurnError};
 use aj_conf::AgentEnv;
@@ -200,7 +200,14 @@ fn build_tui_and_pump() -> (Tui, EventPump) {
     let pump = EventPump::new(
         chat_theme(&theme),
         RenderSettings::new(false, false, true),
+        AgentSettings {
+            provider: SCRIPT_PROVIDER.to_string(),
+            model_id: SCRIPT_MODEL.to_string(),
+            thinking: "off".to_string(),
+            speed: "standard".to_string(),
+        },
         200_000,
+        Arc::new(Vec::new()),
     );
     (tui, pump)
 }
