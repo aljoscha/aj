@@ -605,6 +605,32 @@ impl Agent {
         self.run_top_level_turn(Some(message)).await
     }
 
+    /// Wake the agent on queued task notices: drain them into the
+    /// transcript and run a turn so the model reacts to finished
+    /// background work without waiting for the user.
+    ///
+    /// Returns [`WakeOutcome::Empty`] — emitting no events at all —
+    /// when the queue is empty, which makes the binary's wake
+    /// triggers idempotent: both may fire for the same notice and the
+    /// loser is a cheap no-op. Otherwise this is
+    /// [`Agent::continue_run`] minus the ends-in-user-message
+    /// precondition — the drained notices are themselves the
+    /// user-role messages that make the transcript valid for
+    /// inference.
+    pub async fn wake(&mut self, cancel: CancellationToken) -> Result<WakeOutcome, TurnError> {
+        // Only the owner drains its own notice queue, and every drain
+        // point holds `&mut self`, so nothing can consume the queue
+        // between this check and the drain inside
+        // `run_top_level_turn_inner`.
+        if !self.task_registry.has_notices(self.agent_id) {
+            return Ok(WakeOutcome::Empty);
+        }
+        self.cancellation = cancel;
+        self.run_top_level_turn(None)
+            .await
+            .map(|()| WakeOutcome::Ran)
+    }
+
     /// Run one assistant turn against the existing transcript
     /// without appending a new user message.
     ///
@@ -633,11 +659,13 @@ impl Agent {
         self.run_top_level_turn(None).await
     }
 
-    /// Shared driver for [`Agent::prompt`] / [`Agent::continue_run`].
+    /// Shared driver for [`Agent::prompt`] / [`Agent::continue_run`]
+    /// / [`Agent::wake`].
     ///
     /// `prompt` is `Some` for [`Agent::prompt`] (a fresh user
     /// message is appended before inference) and `None` for
-    /// [`Agent::continue_run`] (the existing transcript is fed back
+    /// [`Agent::continue_run`] and [`Agent::wake`] (the existing
+    /// transcript — including any just-drained notices — is fed back
     /// to the model unchanged).
     async fn run_top_level_turn(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
@@ -1653,6 +1681,17 @@ pub struct TaskSummary {
     pub started_at: Instant,
 }
 
+/// Outcome of [`Agent::wake`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeOutcome {
+    /// The notice queue was empty; nothing ran and no events were
+    /// emitted.
+    Empty,
+    /// Queued notices were drained into the transcript and a turn ran
+    /// against them.
+    Ran,
+}
+
 #[derive(Default)]
 struct TaskRegistryInner {
     entries: BTreeMap<TaskId, TaskEntry>,
@@ -1676,6 +1715,12 @@ struct TaskRegistryInner {
 pub struct TaskRegistry {
     inner: Arc<StdMutex<TaskRegistryInner>>,
     root_cancel: CancellationToken,
+    /// Signalled on every status flip; [`TaskRegistry::wait_terminal`]
+    /// waiters wake and re-check under the lock. One registry-wide
+    /// `Notify` (rather than a channel per entry) keeps `TaskEntry`
+    /// simple — status flips happen once per task lifetime, so the
+    /// herd of re-checking waiters is tiny.
+    status_changed: Arc<tokio::sync::Notify>,
 }
 
 impl TaskRegistry {
@@ -1738,9 +1783,52 @@ impl TaskRegistry {
     /// [`TaskEventSink::finished`]) when the task terminates. No-op
     /// for unknown ids.
     pub fn set_status(&self, id: TaskId, status: TaskStatus) {
-        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
-        if let Some(entry) = inner.entries.get_mut(&id) {
-            entry.status = status;
+        {
+            let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            if let Some(entry) = inner.entries.get_mut(&id) {
+                entry.status = status;
+            }
+        }
+        self.status_changed.notify_waiters();
+    }
+
+    /// Current status of task `id`, `None` for unknown ids.
+    pub fn status(&self, id: TaskId) -> Option<TaskStatus> {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.entries.get(&id).map(|entry| entry.status)
+    }
+
+    /// Display snapshot of task `id`, `None` for unknown ids.
+    pub fn summary(&self, id: TaskId) -> Option<TaskSummary> {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.entries.get(&id).map(|entry| TaskSummary {
+            id,
+            owner: entry.owner,
+            kind: entry.kind.clone(),
+            label: entry.label.clone(),
+            status: entry.status,
+            started_at: entry.started_at,
+        })
+    }
+
+    /// Resolve once task `id` reaches a terminal status, returning
+    /// that status. Resolves immediately for already-terminal tasks;
+    /// returns `None` for unknown ids. Callers bound the wait
+    /// themselves (`select!` against a timeout or a cancellation
+    /// token).
+    pub async fn wait_terminal(&self, id: TaskId) -> Option<TaskStatus> {
+        loop {
+            // Create the `Notified` future before checking status: a
+            // `Notified` receives `notify_waiters` wakeups from the
+            // moment it is created, so a flip landing between the
+            // check and the await cannot be lost.
+            let notified = self.status_changed.notified();
+            match self.status(id) {
+                None => return None,
+                Some(status) if status.is_terminal() => return Some(status),
+                Some(_) => {}
+            }
+            notified.await;
         }
     }
 
@@ -2007,6 +2095,53 @@ mod task_registry_tests {
         assert!(!registry.has_notices(AgentId::Main));
         assert!(registry.drain_notices(AgentId::Main).is_empty());
         assert_eq!(registry.drain_notices(AgentId::Sub(2)).len(), 1);
+    }
+
+    /// `read` is a pure observation: an explicit terminal read does
+    /// not consume the completion notice — the lifecycle is
+    /// unconditional (task ends → notice queued → notice drained).
+    #[test]
+    fn terminal_read_does_not_consume_notices() {
+        let registry = TaskRegistry::default();
+        let (id, _) = register(&registry, AgentId::Main, "echo hi");
+        registry.set_status(id, TaskStatus::Exited(Some(0)));
+        registry.push_notice(notice(AgentId::Main, id, "done"));
+
+        let (status, _) = registry.read(id).expect("terminal task stays readable");
+        assert!(status.is_terminal());
+        assert!(registry.has_notices(AgentId::Main));
+        assert_eq!(registry.drain_notices(AgentId::Main).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_resolves_on_status_flip() {
+        let registry = TaskRegistry::default();
+        let (id, _) = register(&registry, AgentId::Main, "sleep 5");
+
+        // Unknown ids resolve immediately with `None`.
+        assert_eq!(registry.wait_terminal(999).await, None);
+
+        let flipper = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                registry.set_status(id, TaskStatus::Exited(Some(0)));
+            })
+        };
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            registry.wait_terminal(id),
+        )
+        .await
+        .expect("wait_terminal resolves once the status flips");
+        assert_eq!(status, Some(TaskStatus::Exited(Some(0))));
+        flipper.await.expect("flipper joined");
+
+        // Already-terminal tasks resolve immediately.
+        assert_eq!(
+            registry.wait_terminal(id).await,
+            Some(TaskStatus::Exited(Some(0)))
+        );
     }
 }
 
@@ -4333,5 +4468,109 @@ mod event_protocol_tests {
         // The other owner's queue is untouched.
         assert!(registry.has_notices(AgentId::Main));
         assert!(!registry.has_notices(AgentId::Sub(2)));
+    }
+
+    // ---- Agent::wake ------------------------------------------------------
+
+    /// A wake drains the queued notices and runs a full turn with the
+    /// same event bracketing every top-level run gets: AgentStart,
+    /// the notice's user-message pair, TurnStart, the assistant
+    /// stream, TurnUsage, AgentEnd.
+    #[tokio::test]
+    async fn wake_drains_notices_and_runs_bracketed_turn() {
+        let scripts = vec![finalize_script(finalize_text("reacted"))];
+        let mut agent = build_agent(scripts, Vec::new());
+        let registry = TaskRegistry::default();
+        agent.set_task_registry(registry.clone());
+        registry.push_notice(bash_notice(
+            AgentId::Main,
+            2,
+            "Background task #2 finished: cargo build — exit code 0",
+        ));
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        let outcome = agent
+            .wake(CancellationToken::new())
+            .await
+            .expect("wake runs the turn");
+        assert_eq!(outcome, crate::WakeOutcome::Ran);
+
+        let events = recorded.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                EventLabel::AgentStart(AgentId::Main),
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "start",
+                    kind: "User",
+                },
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "end",
+                    kind: "User",
+                },
+                EventLabel::TurnStart(AgentId::Main),
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "start",
+                    kind: "Assistant",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Main,
+                    event_kind: "start",
+                },
+                EventLabel::MessageStream {
+                    agent_id: AgentId::Main,
+                    event_kind: "done",
+                },
+                EventLabel::Message {
+                    agent_id: AgentId::Main,
+                    phase: "end",
+                    kind: "Assistant",
+                },
+                EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::AgentEnd(AgentId::Main),
+            ],
+            "unexpected event sequence: {events:#?}"
+        );
+
+        // The drained notice is the turn's user-role message.
+        let first = user_text(&agent.messages()[0]).expect("first message is the notice");
+        assert!(first.starts_with("<task-notification>Background task #2"));
+        assert!(!registry.has_notices(AgentId::Main));
+    }
+
+    /// An empty queue makes wake a pure no-op: `Empty` outcome, no
+    /// events, no inference (the strict-mode provider would panic on
+    /// an unscripted inference).
+    #[tokio::test]
+    async fn wake_on_empty_queue_returns_empty_without_events() {
+        let mut agent = build_agent(Vec::new(), Vec::new());
+        let registry = TaskRegistry::default();
+        agent.set_task_registry(registry.clone());
+
+        let recorded: Arc<Mutex<Vec<EventLabel>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            recorded_clone.lock().unwrap().push(label(event));
+        }));
+
+        let outcome = agent
+            .wake(CancellationToken::new())
+            .await
+            .expect("empty wake succeeds");
+        assert_eq!(outcome, crate::WakeOutcome::Empty);
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "empty wake must not emit events: {:#?}",
+            recorded.lock().unwrap()
+        );
+        assert!(agent.messages().is_empty());
     }
 }

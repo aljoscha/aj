@@ -30,7 +30,10 @@
 //!   with prefix `aj-bash-` and suffix `.log`; both reader tasks tee
 //!   into it as bytes flow. If no truncation occurred at completion the
 //!   `NamedTempFile` is dropped (cleaning up the file). Otherwise
-//!   `keep()` persists it and we surface the resulting path.
+//!   `keep()` persists it and we surface the resulting path. Background
+//!   tasks persist it unconditionally — the spill is the canonical
+//!   full output named in the started result and the completion
+//!   notice.
 //! - **Progress updates.** While the child runs the implementation
 //!   self-throttles `ToolContext::emit_update` to one snapshot per
 //!   [`UPDATE_DEBOUNCE`] (~10/s) using a leading-edge fire so the first
@@ -54,7 +57,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aj_agent::tool::{
-    BashStreamTruncation, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+    BashStreamTruncation, ExecutionMode, StartedTask, TaskEventSink, TaskId, TaskKind, TaskNotice,
+    TaskOutputSource, TaskRead, TaskStatus, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
 };
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
@@ -63,6 +67,7 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::truncate::{BASH_MAX_BYTES, BASH_MAX_LINES, TruncatedBy, format_size, truncate_tail};
 
@@ -80,6 +85,21 @@ working directory of the agent session.
 - For file search, prefer `rg` (ripgrep) over `grep`/`find` — it's faster and
   respects `.gitignore` by default. Use `read_file` for reading file contents
   rather than `cat`.
+- Set `run_in_background: true` for long-running work: the call returns
+  immediately with a task id and the path the output is written to; read it
+  with read_file (supports offset/limit) or task_output, kill it with
+  task_stop. `timeout` is ignored in background mode — the task runs until it
+  exits or is stopped, and you are notified when it completes.
+- For "wait until X is ready", background a command that exits when the
+  condition holds (e.g. `until grep -q "Ready" dev.log; do sleep 0.5; done`)
+  — one task, one completion notice — instead of polling in the foreground.
+- Don't babysit a background task with blocking task_output calls; keep
+  working, the completion notice arrives on its own.
+- Double-forking daemons escape the process group, so task_stop can't kill
+  them. Prefer supervising the process in the foreground of a background task
+  over nohup-style detachment.
+- In print mode there is no auto-wake: wait for outstanding tasks explicitly
+  (task_output with block) before finishing, or they are killed at exit.
 "#;
 
 /// Maximum bytes preserved per stream in the in-memory rolling tail
@@ -111,6 +131,12 @@ pub struct BashInput {
     pub timeout: u64,
     /// A description explaining what the command does and why you want to run it.
     pub description: String,
+    /// Run the command in the background. The call returns immediately
+    /// with a task id and the output path; use task_output to read or
+    /// wait, task_stop to kill. `timeout` is ignored in background mode —
+    /// the task runs until it exits or is stopped.
+    #[serde(default)]
+    pub run_in_background: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -207,6 +233,75 @@ impl ToolDefinition for BashTool {
             Arc::clone(&spill),
         ));
 
+        if input.run_in_background {
+            // Background mode: the spill file is the canonical full
+            // output — it must stay reachable for `read_file`, task
+            // reads, and the completion notice even when nothing ever
+            // overflows the rolling tails — so it is persisted
+            // up-front, not just on truncation. Writes keep flowing
+            // to the same fd after `persist`.
+            let persisted = spill.lock().unwrap().persist();
+            let spill_path = match persisted {
+                Ok(path) => path,
+                Err(err) => {
+                    // The child is already running but has no registry
+                    // entry yet — bailing without killing it would
+                    // leak a process that task_stop and shutdown can
+                    // never reach.
+                    kill_process_group(child_pid);
+                    let _ = child.wait().await;
+                    return Err(err.into());
+                }
+            };
+            let output = Arc::new(BashTaskOutput {
+                stdout: Arc::clone(&stdout_state),
+                stderr: Arc::clone(&stderr_state),
+                spill_path: spill_path.clone(),
+            });
+            let kind = TaskKind::Bash {
+                command: command.clone(),
+            };
+            let StartedTask { id, cancel, events } =
+                ctx.start_background_task(kind.clone(), command.clone(), output);
+            events.started(kind).await;
+            tokio::spawn(drive_background_bash(BackgroundBash {
+                child,
+                child_pid,
+                stdout_reader,
+                stderr_reader,
+                stdout_state,
+                stderr_state,
+                spill_path: spill_path.clone(),
+                command: command.clone(),
+                task_id: id,
+                cancel,
+                events,
+            }));
+
+            let wire = format!(
+                "Started background task #{id}: {command}\n\
+                 Output is being written to {path}; read it with read_file \
+                 (supports offset/limit) or task_output({id}). You will be \
+                 notified when it completes.",
+                path = spill_path.display(),
+            );
+            return Ok(ToolOutcome {
+                content: vec![UserContent::text(wire)],
+                details: ToolDetails::Bash {
+                    command,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                    truncated: false,
+                    full_output_path: Some(spill_path),
+                    stdout_truncation: None,
+                    stderr_truncation: None,
+                    task_id: Some(id),
+                },
+                is_error: false,
+            });
+        }
+
         let timeout_at = Instant::now() + timeout;
         // `last_update - UPDATE_DEBOUNCE` triggers a leading-edge fire
         // on the first iteration, so a renderer can show the running
@@ -260,12 +355,12 @@ impl ToolDefinition for BashTool {
         // model-facing stdout/stderr strings plus optional structured
         // truncation summaries.
         let (stdout_str, stdout_truncation) = {
-            let mut s = stdout_state.lock().unwrap();
-            finalize_stream(&mut s)
+            let s = stdout_state.lock().unwrap();
+            finalize_stream(&s)
         };
         let (stderr_str, stderr_truncation) = {
-            let mut s = stderr_state.lock().unwrap();
-            finalize_stream(&mut s)
+            let s = stderr_state.lock().unwrap();
+            finalize_stream(&s)
         };
 
         let truncated = stdout_truncation.is_some() || stderr_truncation.is_some();
@@ -426,11 +521,24 @@ impl StreamState {
     }
 }
 
-/// Spill-file state: a `NamedTempFile` we tee both streams into. When
-/// truncation occurs we hand its path to the caller; otherwise dropping
-/// `Self` unlinks the file.
+/// Spill-file state: a temp file we tee both streams into.
+///
+/// Foreground runs persist it only when truncation occurred
+/// (otherwise dropping `Self` unlinks it); background runs persist it
+/// up-front — the spill is the canonical full output — and keep
+/// writing to the same fd afterwards.
 struct SpillState {
-    file: Option<NamedTempFile>,
+    /// `None` only transiently inside `persist` (and after a failed
+    /// `keep`, in which case further writes are dropped — the caller
+    /// already surfaced the error).
+    file: Option<SpillFile>,
+}
+
+enum SpillFile {
+    /// Unlinked on drop unless persisted.
+    Temp(NamedTempFile),
+    /// Persisted at `path`; writes keep flowing to `file`.
+    Kept { file: std::fs::File, path: PathBuf },
 }
 
 impl SpillState {
@@ -439,27 +547,40 @@ impl SpillState {
             .prefix("aj-bash-")
             .suffix(".log")
             .tempfile()?;
-        Ok(Self { file: Some(file) })
+        Ok(Self {
+            file: Some(SpillFile::Temp(file)),
+        })
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
-        if let Some(f) = self.file.as_mut() {
-            f.as_file_mut().write_all(bytes)?;
+        match self.file.as_mut() {
+            Some(SpillFile::Temp(f)) => f.as_file_mut().write_all(bytes),
+            Some(SpillFile::Kept { file, .. }) => file.write_all(bytes),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Persist the spill file at its current path, returning that path
-    /// for the caller to surface in the structured payload. After this
-    /// call the file is no longer cleaned up on drop.
+    /// for the caller to surface. Idempotent; the open handle is kept
+    /// so reader tasks can continue teeing into the persisted file.
     fn persist(&mut self) -> std::io::Result<PathBuf> {
-        let f = self
-            .file
-            .take()
-            .expect("spill file already persisted or discarded");
-        let (_, path) = f.keep()?;
-        Ok(path)
+        match self.file.take() {
+            Some(SpillFile::Temp(tmp)) => {
+                let (file, path) = tmp.keep().map_err(|e| e.error)?;
+                self.file = Some(SpillFile::Kept {
+                    file,
+                    path: path.clone(),
+                });
+                Ok(path)
+            }
+            Some(SpillFile::Kept { file, path }) => {
+                let out = path.clone();
+                self.file = Some(SpillFile::Kept { file, path });
+                Ok(out)
+            }
+            None => unreachable!("spill file present unless a prior persist failed"),
+        }
     }
 }
 
@@ -497,17 +618,213 @@ async fn read_stream<R>(
     }
 }
 
+/// [`TaskOutputSource`] over a background bash task's shared stream
+/// states. Snapshots are stateless reads of the rolling tails; the
+/// always-persisted spill file is the canonical full output.
+struct BashTaskOutput {
+    stdout: Arc<Mutex<StreamState>>,
+    stderr: Arc<Mutex<StreamState>>,
+    spill_path: PathBuf,
+}
+
+impl TaskOutputSource for BashTaskOutput {
+    fn snapshot(&self) -> TaskRead {
+        let (stdout_tail, stdout_total_bytes) = tail_snapshot(&self.stdout);
+        let (stderr_tail, stderr_total_bytes) = tail_snapshot(&self.stderr);
+        TaskRead {
+            stdout_tail,
+            stderr_tail,
+            stdout_total_bytes,
+            stderr_total_bytes,
+            spill_path: Some(self.spill_path.clone()),
+        }
+    }
+}
+
+/// Decode a stream's rolling tail plus its exact byte total. Mirrors
+/// `finalize_stream`'s whole-line policy: a leading partial line left
+/// by a mid-line trim is dropped, except when the tail has no newline
+/// at all (a single huge line stays visible).
+fn tail_snapshot(state: &Arc<Mutex<StreamState>>) -> (String, u64) {
+    let (bytes, at_boundary, total) = {
+        let s = state.lock().unwrap();
+        (
+            s.tail.clone(),
+            s.tail_starts_at_boundary,
+            s.total_bytes_seen,
+        )
+    };
+    let decoded = decode_stream_output(bytes);
+    let text = if at_boundary {
+        decoded
+    } else {
+        match decoded.find('\n') {
+            None => decoded,
+            Some(idx) => decoded[idx + 1..].to_string(),
+        }
+    };
+    (text, total)
+}
+
+/// Everything a detached background-bash driver owns.
+struct BackgroundBash {
+    child: tokio::process::Child,
+    child_pid: i32,
+    stdout_reader: tokio::task::JoinHandle<()>,
+    stderr_reader: tokio::task::JoinHandle<()>,
+    stdout_state: Arc<Mutex<StreamState>>,
+    stderr_state: Arc<Mutex<StreamState>>,
+    spill_path: PathBuf,
+    command: String,
+    task_id: TaskId,
+    cancel: CancellationToken,
+    events: TaskEventSink,
+}
+
+/// Drive a background bash task to completion: emit throttled
+/// `TaskOutput` snapshots, kill the process group on cancellation,
+/// and finish with the registry status flip + completion notice.
+async fn drive_background_bash(task: BackgroundBash) {
+    let BackgroundBash {
+        mut child,
+        child_pid,
+        stdout_reader,
+        stderr_reader,
+        stdout_state,
+        stderr_state,
+        spill_path,
+        command,
+        task_id,
+        cancel,
+        events,
+    } = task;
+
+    let mut last_update = Instant::now() - UPDATE_DEBOUNCE;
+    // `None` forces the leading-edge emit so the TUI cell shows the
+    // running command immediately.
+    let mut last_totals: Option<(u64, u64)> = None;
+    let status = loop {
+        let now = Instant::now();
+        if now.duration_since(last_update) >= UPDATE_DEBOUNCE {
+            let totals = (
+                stdout_state.lock().unwrap().total_bytes_seen,
+                stderr_state.lock().unwrap().total_bytes_seen,
+            );
+            // Skip the emit while the streams are quiet: an idle
+            // watcher task would otherwise push identical snapshots
+            // (each cloning both rolling tails) onto the bus at the
+            // throttle rate for as long as it runs.
+            if last_totals != Some(totals) {
+                let mut partial = snapshot_partial(&command, &stdout_state, &stderr_state);
+                if let ToolDetails::Bash {
+                    task_id: tid,
+                    full_output_path,
+                    ..
+                } = &mut partial
+                {
+                    *tid = Some(task_id);
+                    *full_output_path = Some(spill_path.clone());
+                }
+                events.output(partial).await;
+                last_totals = Some(totals);
+            }
+            last_update = now;
+        }
+
+        tokio::select! {
+            biased;
+            // The task token (a child of the registry's session root)
+            // is the only cancellation that reaches a background
+            // task: task_stop, the picker's kill action, and shutdown
+            // all fire it. The originating turn's token is
+            // deliberately not wired in — outliving the turn is the
+            // point.
+            _ = cancel.cancelled() => {
+                kill_process_group(child_pid);
+                let _ = child.wait().await;
+                break TaskStatus::Killed;
+            }
+            res = child.wait() => {
+                break TaskStatus::Exited(res.ok().and_then(|s| s.code()));
+            }
+            _ = tokio::time::sleep(UPDATE_DEBOUNCE) => {}
+        }
+    };
+
+    // Readers exit when their pipe closes; awaiting them guarantees
+    // the final tails and the spill file are complete before the
+    // notice renders.
+    let _ = stdout_reader.await;
+    let _ = stderr_reader.await;
+
+    let (stdout_str, stdout_truncation) = {
+        let s = stdout_state.lock().unwrap();
+        finalize_stream(&s)
+    };
+    let (stderr_str, stderr_truncation) = {
+        let s = stderr_state.lock().unwrap();
+        finalize_stream(&s)
+    };
+
+    let mut body = format!(
+        "Background task #{task_id} finished: {command} — {}",
+        task_status_text(status)
+    );
+    let tail = render_stream_block(
+        &stdout_str,
+        &stderr_str,
+        stdout_truncation.as_ref(),
+        stderr_truncation.as_ref(),
+        Some(&spill_path),
+    );
+    if !tail.is_empty() {
+        body.push('\n');
+        body.push_str(&tail);
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!("Full output: {}", spill_path.display()));
+
+    let notice = TaskNotice {
+        owner: events.owner(),
+        task_id,
+        kind: TaskKind::Bash {
+            command: command.clone(),
+        },
+        label: command,
+        status,
+        body,
+    };
+    events.finished(status, notice).await;
+}
+
+/// Human-readable terminal-status phrase shared by completion notices
+/// and `task_output` / `task_stop` reports.
+pub(crate) fn task_status_text(status: TaskStatus) -> String {
+    match status {
+        TaskStatus::Running => "still running".to_string(),
+        TaskStatus::Exited(Some(code)) => format!("exit code {code}"),
+        TaskStatus::Exited(None) => "terminated by signal".to_string(),
+        TaskStatus::Killed => "killed".to_string(),
+    }
+}
+
 /// Resolve a stream's rolling tail into a (possibly-truncated)
 /// display string plus an optional structured truncation summary.
 /// When the source overflowed either cap we drop any leading partial
 /// line from the rolling tail and then apply [`truncate_tail`] to fit
 /// the per-stream byte/line cap exactly.
+///
+/// Reads the state without consuming it: background tasks finalize
+/// for the completion notice while `task_output` snapshots must keep
+/// seeing the tail afterwards.
 #[allow(clippy::as_conversions)]
-fn finalize_stream(state: &mut StreamState) -> (String, Option<BashStreamTruncation>) {
+fn finalize_stream(state: &StreamState) -> (String, Option<BashStreamTruncation>) {
     let total_lines = state.total_lines();
     let total_bytes = state.total_bytes_seen;
 
-    let tail_decoded = decode_stream_output(std::mem::take(&mut state.tail));
+    let tail_decoded = decode_stream_output(state.tail.clone());
 
     let overflowed = total_lines > BASH_MAX_LINES as u64 || total_bytes > BASH_MAX_BYTES as u64;
     if !overflowed {
@@ -606,24 +923,13 @@ fn build_wire_content(
     timeout_secs: u64,
     full_output_path: Option<&std::path::Path>,
 ) -> String {
-    let mut wire = String::new();
-
-    if !stdout.is_empty() {
-        wire.push_str(stdout);
-    }
-    if let Some(t) = stdout_truncation {
-        push_marker(&mut wire, &stream_marker("stdout", t, full_output_path));
-    }
-    if !stderr.is_empty() {
-        if !wire.is_empty() && !wire.ends_with('\n') {
-            wire.push('\n');
-        }
-        wire.push_str("STDERR:\n");
-        wire.push_str(stderr);
-    }
-    if let Some(t) = stderr_truncation {
-        push_marker(&mut wire, &stream_marker("stderr", t, full_output_path));
-    }
+    let mut wire = render_stream_block(
+        stdout,
+        stderr,
+        stdout_truncation,
+        stderr_truncation,
+        full_output_path,
+    );
     match outcome {
         ChildExit::Exited(_) => {
             if let Some(code) = exit_code {
@@ -656,6 +962,36 @@ fn build_wire_content(
         }
     }
     wire
+}
+
+/// Render the two streams plus their truncation markers — the shared
+/// body of foreground wire content, background completion notices,
+/// and `task_output` reports.
+pub(crate) fn render_stream_block(
+    stdout: &str,
+    stderr: &str,
+    stdout_truncation: Option<&BashStreamTruncation>,
+    stderr_truncation: Option<&BashStreamTruncation>,
+    full_output_path: Option<&std::path::Path>,
+) -> String {
+    let mut out = String::new();
+    if !stdout.is_empty() {
+        out.push_str(stdout);
+    }
+    if let Some(t) = stdout_truncation {
+        push_marker(&mut out, &stream_marker("stdout", t, full_output_path));
+    }
+    if !stderr.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("STDERR:\n");
+        out.push_str(stderr);
+    }
+    if let Some(t) = stderr_truncation {
+        push_marker(&mut out, &stream_marker("stderr", t, full_output_path));
+    }
+    out
 }
 
 /// Append `marker` to `wire` on its own line, inserting a separating
@@ -878,6 +1214,7 @@ mod tests {
                     command: "echo hello".to_string(),
                     timeout: 30,
                     description: "test echo".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -925,6 +1262,7 @@ mod tests {
                     command: "echo fail; exit 7".to_string(),
                     timeout: 30,
                     description: "test failing exit".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -957,6 +1295,7 @@ mod tests {
                     command: "echo to-stdout; echo to-stderr 1>&2".to_string(),
                     timeout: 30,
                     description: "test stderr".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -996,6 +1335,7 @@ mod tests {
                     command: "yes ABCDEFGH | head -c 200000".to_string(),
                     timeout: 30,
                     description: "test truncation".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -1071,6 +1411,7 @@ mod tests {
                     command: "head -c 120000 /dev/zero | tr '\\0' 'x'".to_string(),
                     timeout: 30,
                     description: "test last_line_partial".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -1127,6 +1468,7 @@ mod tests {
                     command: "sleep 30".to_string(),
                     timeout: 60,
                     description: "test cancellation".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -1162,6 +1504,7 @@ mod tests {
                     command: "sleep 30".to_string(),
                     timeout: 1,
                     description: "test timeout".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -1199,6 +1542,7 @@ mod tests {
                     command: "echo hi; sleep 0.3; echo bye".to_string(),
                     timeout: 30,
                     description: "test progress".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -1251,6 +1595,7 @@ mod tests {
                     command: "this-binary-does-not-exist-aj".to_string(),
                     timeout: 30,
                     description: "test missing binary".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -1283,6 +1628,7 @@ mod tests {
                     command: "pwd".to_string(),
                     timeout: 30,
                     description: "test cwd".to_string(),
+                    run_in_background: false,
                 },
             )
             .await
@@ -1347,5 +1693,183 @@ mod tests {
             m,
             "[Showing last 50.0KB of stdout line 1 (line is 200.0KB). Full output at /tmp/aj-bash-xyz.log]"
         );
+    }
+
+    // ---- Background mode --------------------------------------------------
+
+    /// Execute `command` as a background task on `ctx`, returning the
+    /// minted task id and the spill path from the started result.
+    async fn start_background(
+        ctx: &mut DummyToolContext,
+        command: &str,
+        timeout: u64,
+    ) -> (aj_agent::tool::TaskId, PathBuf) {
+        let outcome = BashTool
+            .execute(
+                ctx,
+                BashInput {
+                    command: command.to_string(),
+                    timeout,
+                    description: "test background".to_string(),
+                    run_in_background: true,
+                },
+            )
+            .await
+            .expect("execute");
+        assert!(!outcome.is_error);
+        match &outcome.details {
+            ToolDetails::Bash {
+                task_id: Some(id),
+                full_output_path: Some(path),
+                exit_code: None,
+                ..
+            } => (*id, path.clone()),
+            other => panic!("expected started Bash details with task id + spill path: {other:?}"),
+        }
+    }
+
+    /// Await terminality with a test-level bound so a wedged driver
+    /// fails the test instead of hanging it.
+    async fn await_terminal(
+        registry: &aj_agent::TaskRegistry,
+        id: aj_agent::tool::TaskId,
+    ) -> aj_agent::tool::TaskStatus {
+        tokio::time::timeout(Duration::from_secs(10), registry.wait_terminal(id))
+            .await
+            .expect("task should reach a terminal status")
+            .expect("task id is known")
+    }
+
+    /// Poll `cond` until it holds (bounded), yielding to the runtime
+    /// so detached drivers and reader tasks make progress.
+    async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The started result returns immediately with the task id and
+    /// the always-persisted spill path; the real outcome arrives as a
+    /// completion notice carrying exit status, tail, and spill path.
+    #[tokio::test]
+    async fn background_started_result_carries_id_and_spill_path() {
+        let mut ctx = DummyToolContext::default();
+        let outcome = BashTool
+            .execute(
+                &mut ctx,
+                BashInput {
+                    command: "echo hello; sleep 0.2".to_string(),
+                    timeout: 30,
+                    description: "test background start".to_string(),
+                    run_in_background: true,
+                },
+            )
+            .await
+            .expect("execute");
+        // Immediacy is proven structurally: the started result has no
+        // exit code while the 200ms child is still sleeping.
+
+        assert!(!outcome.is_error);
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.starts_with("Started background task #1: echo hello; sleep 0.2"),
+            "wire: {wire:?}"
+        );
+        assert!(wire.contains("task_output(1)"), "wire: {wire:?}");
+        let spill_path = match &outcome.details {
+            ToolDetails::Bash {
+                task_id: Some(1),
+                full_output_path: Some(path),
+                exit_code: None,
+                truncated: false,
+                ..
+            } => path.clone(),
+            other => panic!("expected started Bash details, got {other:?}"),
+        };
+        assert!(
+            wire.contains(&spill_path.display().to_string()),
+            "wire names the spill path: {wire:?}"
+        );
+
+        let registry = ctx.task_registry();
+        let status = await_terminal(&registry, 1).await;
+        assert_eq!(status, aj_agent::tool::TaskStatus::Exited(Some(0)));
+
+        // The spill file holds the full output even though nothing
+        // truncated.
+        let on_disk = std::fs::read_to_string(&spill_path).expect("spill readable");
+        assert_eq!(on_disk, "hello\n");
+
+        // The completion notice carries exit status, tail, and path.
+        let notices = registry.drain_notices(aj_agent::events::AgentId::Main);
+        assert_eq!(notices.len(), 1);
+        let body = &notices[0].body;
+        assert!(
+            body.starts_with("Background task #1 finished: echo hello; sleep 0.2 — exit code 0"),
+            "notice body: {body:?}"
+        );
+        assert!(body.contains("hello"), "notice body: {body:?}");
+        assert!(
+            body.contains(&format!("Full output: {}", spill_path.display())),
+            "notice body: {body:?}"
+        );
+
+        std::fs::remove_file(&spill_path).ok();
+    }
+
+    /// `timeout` is ignored in background mode: a command outliving
+    /// the configured timeout still runs to completion.
+    #[tokio::test]
+    async fn background_ignores_timeout() {
+        let mut ctx = DummyToolContext::default();
+        // A zero-second timeout would kill the foreground path
+        // immediately; the background task must run to its natural
+        // exit anyway.
+        let (id, spill_path) = start_background(&mut ctx, "sleep 0.3; echo done", 0).await;
+
+        let registry = ctx.task_registry();
+        let status = await_terminal(&registry, id).await;
+        assert_eq!(status, aj_agent::tool::TaskStatus::Exited(Some(0)));
+        let on_disk = std::fs::read_to_string(&spill_path).expect("spill readable");
+        assert_eq!(on_disk, "done\n");
+
+        std::fs::remove_file(&spill_path).ok();
+    }
+
+    /// The spill file is live: it can be read (e.g. via `read_file`
+    /// with offset/limit) while the task is still running.
+    #[tokio::test]
+    async fn background_spill_file_readable_while_running() {
+        let mut ctx = DummyToolContext::default();
+        let (id, spill_path) = start_background(&mut ctx, "echo first; sleep 30", 30).await;
+
+        let registry = ctx.task_registry();
+        let path = spill_path.clone();
+        wait_for(
+            || {
+                std::fs::read_to_string(&path)
+                    .map(|s| s.contains("first"))
+                    .unwrap_or(false)
+            },
+            "spill file to carry early output",
+        )
+        .await;
+        assert_eq!(
+            registry.status(id),
+            Some(aj_agent::tool::TaskStatus::Running),
+            "task still running while the spill is readable"
+        );
+
+        // Kill via the registry (the picker path) and confirm the
+        // driver flips the status to Killed.
+        assert!(registry.kill(id));
+        let status = await_terminal(&registry, id).await;
+        assert_eq!(status, aj_agent::tool::TaskStatus::Killed);
+
+        std::fs::remove_file(&spill_path).ok();
     }
 }

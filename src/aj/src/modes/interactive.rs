@@ -1028,6 +1028,21 @@ async fn run_session(
                             }
                         }
                         sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                        // Wake trigger 2: notices that arrived after
+                        // the last mid-run drain point (or during an
+                        // aborted turn) are still queued — wake the
+                        // same agent so they reach the model without
+                        // waiting for the user.
+                        if world.task_registry.has_notices(id) {
+                            spawn_wake_turn(
+                                id,
+                                world,
+                                &shell.run_config,
+                                &mut turns,
+                                &mut turn_cancels,
+                            );
+                            sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                        }
                         match result {
                             Ok(()) => {}
                             Err(TurnError::Aborted) => {
@@ -1767,6 +1782,38 @@ async fn run_session(
             maybe_evt = recv_event(&mut world.event_rx) => {
                 let Some(event) = maybe_evt else { continue };
                 world.pump.handle(&mut shell.tui, &event);
+                // Wake trigger 1: a background task finished. If its
+                // owner is idle, wake it so the completion notice
+                // reaches the model; a busy owner picks the notice up
+                // at its next drain point instead.
+                if let AgentEvent::TaskEnd { agent_id, .. } = &event {
+                    spawn_wake_turn(
+                        *agent_id,
+                        world,
+                        &shell.run_config,
+                        &mut turns,
+                        &mut turn_cancels,
+                    );
+                }
+                // A sub-agent's initial run is nested inside the
+                // parent's turn, not driven through the JoinSet, so
+                // the turn-completion trigger never sees it end. If a
+                // task notice arrived after that run's last drain
+                // point it would rot until the next prompt — catch it
+                // here on the run's AgentEnd. The pump has already
+                // processed the event, so the owner reads as idle and
+                // the gate inside spawn_wake_turn is open.
+                if let AgentEvent::AgentEnd { agent_id, .. } = &event
+                    && world.task_registry.has_notices(*agent_id)
+                {
+                    spawn_wake_turn(
+                        *agent_id,
+                        world,
+                        &shell.run_config,
+                        &mut turns,
+                        &mut turn_cancels,
+                    );
+                }
                 sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
             }
 
@@ -1796,6 +1843,14 @@ async fn run_session(
             }
         }
     };
+
+    // Kill the background-task tree before tearing down turns:
+    // cancelling the registry root makes every detached driver
+    // SIGKILL its process group promptly.
+    //
+    // TODO(aljoscha): await driver quiescence with a bounded grace
+    // here so process groups are reliably reaped before exit.
+    world.task_registry.shutdown();
 
     // Wind down in-flight turns before handing control back to the
     // outer session loop. A session change is only requested with no
@@ -1879,6 +1934,46 @@ fn resolve_agent(
         AgentId::Main => Some(Arc::clone(main)),
         AgentId::Sub(n) => registry.get(n),
     }
+}
+
+/// Spawn a wake turn on `owner` if it is idle, driving
+/// [`Agent::wake`] through the same per-agent turn machinery user
+/// submits use (resolve handle → gate → insert cancel token → spawn
+/// onto `turns`).
+///
+/// A busy owner is left alone — the mid-run drain point or the
+/// turn-completion trigger delivers its notices instead. Both wake
+/// triggers may fire for the same notice; `Agent::wake` returns
+/// `Empty` (emitting nothing) when the queue was already drained, so
+/// the loser is a cheap no-op.
+fn spawn_wake_turn(
+    owner: AgentId,
+    world: &SessionWorld,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) {
+    if turn_cancels.contains_key(&owner) || world.pump.is_running(owner) {
+        return;
+    }
+    // Owners normally hold a live handle — task ownership is only
+    // acquired by a live run in this process — so a miss just means
+    // there is nothing left to wake.
+    let Some(handle) = resolve_agent(owner, &world.agent, &world.registry) else {
+        return;
+    };
+    let run_config_for_turn = Arc::clone(run_config);
+    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
+    let turn_cancel = CancellationToken::new();
+    turn_cancels.insert(owner, turn_cancel.clone());
+    turns.spawn(async move {
+        let mut a = handle.lock().await;
+        // Wake turns apply the current run config and count usage
+        // like any other turn.
+        apply_turn_config(owner, &mut a, &run_config_for_turn, &sub_overrides_for_turn);
+        let result = a.wake(turn_cancel).await.map(|_| ());
+        (owner, result)
+    });
 }
 
 /// Match the editor's submit-enabled state to the *viewed* agent:
@@ -5327,5 +5422,135 @@ mod tests {
         );
         let cfg = run_config.lock().expect("run config mutex poisoned");
         assert_eq!(cfg.model_info.id, "scripted", "run config untouched");
+    }
+
+    // ---- Wake triggers ----------------------------------------------------
+
+    fn bash_notice(owner: AgentId, task_id: usize, body: &str) -> aj_agent::tool::TaskNotice {
+        aj_agent::tool::TaskNotice {
+            owner,
+            task_id,
+            kind: aj_agent::tool::TaskKind::Bash {
+                command: "cargo build".to_string(),
+            },
+            label: "cargo build".to_string(),
+            status: aj_agent::tool::TaskStatus::Exited(Some(0)),
+            body: body.to_string(),
+        }
+    }
+
+    /// An idle owner with a queued notice gets a wake turn through
+    /// the normal per-agent machinery: gated via `turn_cancels`,
+    /// spawned on the `turns` JoinSet, and the wake drains the notice
+    /// into the transcript before the scripted reply.
+    #[tokio::test]
+    async fn spawn_wake_turn_wakes_idle_owner() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("woke and reacted")]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        world
+            .task_registry
+            .push_notice(bash_notice(AgentId::Main, 1, "task #1 done"));
+
+        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        spawn_wake_turn(
+            AgentId::Main,
+            &world,
+            &run_config,
+            &mut turns,
+            &mut turn_cancels,
+        );
+
+        assert!(
+            turn_cancels.contains_key(&AgentId::Main),
+            "wake turn registered in turn_cancels"
+        );
+        let (id, result) = turns
+            .join_next()
+            .await
+            .expect("one wake turn spawned")
+            .expect("wake turn did not panic");
+        assert_eq!(id, AgentId::Main);
+        result.expect("wake turn succeeds");
+
+        let agent = world.agent.lock().await;
+        let transcript = format!("{:?}", agent.messages());
+        assert!(
+            transcript.contains("<task-notification>task #1 done</task-notification>"),
+            "notice drained into the transcript: {transcript}"
+        );
+        assert!(
+            transcript.contains("woke and reacted"),
+            "wake turn ran inference: {transcript}"
+        );
+        assert!(!world.task_registry.has_notices(AgentId::Main));
+    }
+
+    /// A busy owner (already in `turn_cancels`) is left alone — the
+    /// in-flight turn's drain points or the turn-completion trigger
+    /// deliver the notice instead.
+    #[tokio::test]
+    async fn spawn_wake_turn_skips_busy_owner() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        world
+            .task_registry
+            .push_notice(bash_notice(AgentId::Main, 1, "task #1 done"));
+
+        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        turn_cancels.insert(AgentId::Main, CancellationToken::new());
+
+        spawn_wake_turn(
+            AgentId::Main,
+            &world,
+            &run_config,
+            &mut turns,
+            &mut turn_cancels,
+        );
+        assert!(turns.is_empty(), "busy owner must not get a wake turn");
+        assert!(
+            world.task_registry.has_notices(AgentId::Main),
+            "notice stays queued for the busy owner's next drain point"
+        );
+    }
+
+    /// Racing triggers are safe: a wake spawned after the queue was
+    /// already drained resolves as `WakeOutcome::Empty` — no
+    /// inference, no transcript change (the strict-mode provider
+    /// would panic on an unscripted inference).
+    #[tokio::test]
+    async fn spawn_wake_turn_with_empty_queue_is_a_noop() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+
+        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        spawn_wake_turn(
+            AgentId::Main,
+            &world,
+            &run_config,
+            &mut turns,
+            &mut turn_cancels,
+        );
+
+        let (id, result) = turns
+            .join_next()
+            .await
+            .expect("wake turn spawned")
+            .expect("wake turn did not panic");
+        assert_eq!(id, AgentId::Main);
+        result.expect("empty wake succeeds");
+        let agent = world.agent.lock().await;
+        assert!(agent.messages().is_empty(), "no-op wake leaves no trace");
     }
 }

@@ -27,6 +27,7 @@ pub use tools::bash::BashTool;
 pub use tools::edit_file::EditFileTool;
 pub use tools::edit_file_multi::EditFileMultiTool;
 pub use tools::read_file::ReadFileTool;
+pub use tools::task::{TaskOutputTool, TaskStopTool};
 pub use tools::todo::{TodoReadTool, TodoWriteTool};
 pub use tools::write_file::WriteFileTool;
 
@@ -63,6 +64,8 @@ pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefiniti
         WriteFileTool.into(),
         EditFileTool.into(),
         EditFileMultiTool.into(),
+        TaskOutputTool.into(),
+        TaskStopTool.into(),
         TodoReadTool.into(),
         TodoWriteTool.into(),
     ]

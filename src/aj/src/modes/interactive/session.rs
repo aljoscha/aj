@@ -14,7 +14,7 @@ use std::sync::Arc;
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::types::UsageSummary;
-use aj_agent::{Agent, AgentSeed, SubAgentRegistry};
+use aj_agent::{Agent, AgentSeed, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
@@ -275,6 +275,11 @@ pub struct SessionWorld {
     /// Sub-agent registry injected into `agent`; starts empty, so
     /// only sub-agents spawned in this session are promptable.
     pub registry: SubAgentRegistry,
+    /// Background-task registry injected into `agent`; shared with
+    /// the main loop so the wake triggers can poll notices and
+    /// shutdown can kill the task tree. Per-world, so tasks never
+    /// leak across session switches.
+    pub task_registry: TaskRegistry,
     /// Loop-side staged settings overrides, keyed by sub-agent id.
     /// The `/model` / `/thinking` selectors write entries when the
     /// user changes a sub-agent's settings; the submit handler's
@@ -427,6 +432,12 @@ impl SessionWorld {
         let registry = SubAgentRegistry::default();
         agent.set_sub_agent_registry(registry.clone());
 
+        // Fresh task registry, shared with the main loop's wake
+        // triggers; its session-scoped cancellation root is fired
+        // when the world winds down.
+        let task_registry = TaskRegistry::default();
+        agent.set_task_registry(task_registry.clone());
+
         // Bus subscriptions: the channel forwarder feeds the pump in
         // the main loop; the persistence listener writes events into
         // the log. Seeding never emits bus events, so subscription
@@ -454,6 +465,7 @@ impl SessionWorld {
         Ok(SessionWorld {
             agent: Arc::new(TokioMutex::new(agent)),
             registry,
+            task_registry,
             sub_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             log,
             session_id,

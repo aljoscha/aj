@@ -511,6 +511,11 @@ onto `turns`):
    `registry.has_notices(id)` for the agent that just finished, spawn
    a wake turn on it. This closes the race where a task finishes
    after the last mid-run drain point but before the turn ends.
+3. **On `AgentEnd` with notices queued**: a sub-agent's initial run is
+   nested inside the parent's turn rather than driven through the
+   `JoinSet`, so trigger 2 never observes it ending. The bus arm
+   catches that run's `AgentEnd` and wakes the owner if
+   `registry.has_notices(owner)`.
 
 Because wake turns ride the normal machinery, everything composes
 without special cases: per-agent single-turn gating (a user submit

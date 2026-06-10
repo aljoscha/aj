@@ -463,6 +463,16 @@ impl TaskEventSink {
         }
     }
 
+    /// The agent that owns the task (the notice recipient).
+    pub fn owner(&self) -> AgentId {
+        self.owner
+    }
+
+    /// The task this sink reports for.
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+
     /// Emit [`AgentEvent::TaskStart`] announcing the task to the bus.
     pub async fn started(&self, kind: TaskKind) {
         let result = self
