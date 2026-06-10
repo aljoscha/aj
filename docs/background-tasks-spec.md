@@ -1,9 +1,10 @@
 # Background tasks — spec
 
 Let the model run `bash` commands and sub-agents **in the background**:
-the tool call returns immediately with a task id, the work continues on
-a detached task, and the model observes it through a small family of
-`task_*` tools (incremental output, wait, kill) plus automatic
+the tool call returns immediately with a task id (and, for bash, the
+path output is being written to), the work continues on a detached
+task, and the model observes it through two `task_*` tools
+(`task_output` to read or wait, `task_stop` to kill) plus automatic
 completion notices injected into its transcript. When a task finishes
 while the owning agent is idle, the notice **wakes** it — a turn is
 triggered so the agent reacts to the result without polling and
@@ -52,8 +53,11 @@ at the end for orchestration.
   can emit on the bus without the `emit_update` sync problem — they
   run on their own tokio tasks and can `.await` the emit.
 - **Output buffering**: bash's rolling tail + spill file is exactly
-  the shape a background job's output buffer needs; it only lacks
-  cursored reads.
+  the shape a background job's output buffer needs; it only lacks a
+  way to read it after the originating call returned.
+- **Incremental file reads**: `read_file` supports line-based
+  `offset` / `limit` and tells the caller the next offset to continue
+  from — reading a growing spill file in slices works today.
 
 ### 1.3 What's missing
 
@@ -73,28 +77,24 @@ at the end for orchestration.
 
 **Goals**
 
-1. `bash` and `agent` accept `background: true`; the call returns
-   quickly with a task id while the work continues detached.
-2. A background bash launch waits a short window (~2s) before
-   returning: commands that die instantly (typo, missing binary, bound
-   port) surface their failure inline instead of costing a poll
-   round-trip; commands that finish inside the window return the
-   normal foreground result.
-3. The model can read **incremental** output (`task_output`), block
-   until something finishes (`task_wait`), kill a task (`task_kill`),
-   and list tasks (`task_list`).
-4. When a task finishes, a **completion notice** is injected into the
+1. `bash` and `agent` accept `run_in_background: true`; the call
+   returns immediately with a task id while the work continues
+   detached. Background bash results carry the spill path so the full
+   output is always one `read_file` away.
+2. The model can read output and/or block until the task finishes
+   (`task_output`, with a `block` flag) and kill a task (`task_stop`).
+3. When a task finishes, a **completion notice** is injected into the
    owning agent's transcript at the next natural point (before the
    next inference step, or at the start of the next turn) so the model
    never has to busy-poll and cannot forget a task.
-5. **Auto-wake**: a notice arriving while the owning agent is idle
+4. **Auto-wake**: a notice arriving while the owning agent is idle
    triggers a turn on that agent (main *and* sub-agents alike) — the
    agent reads the result and keeps working. Waking without polling is
    what makes backgrounding genuine parallelism rather than deferred
    reads.
-6. Background tasks survive turn end but **not process exit**: they
+5. Background tasks survive turn end but **not process exit**: they
    are killed on shutdown.
-7. The user sees background bash tasks in the footer and the alt+a
+6. The user sees background bash tasks in the footer and the alt+a
    picker, with live output in the transcript (the same treatment
    sub-agents already get).
 
@@ -116,48 +116,68 @@ at the end for orchestration.
 
 ## 3. Locked decisions
 
-1. **A `background` parameter on the existing tools**, not new
+1. **A `run_in_background` parameter on the existing tools**, not new
    `bash_background` / `agent_background` tools. The decision is made
    at call time; near-duplicate tool descriptions would just burn
    context.
-2. **One unified task id space** for bash tasks and background agent
+2. **A minimal, conventional model-facing surface.** Two tools
+   (`task_output`, `task_stop`), the parameter name
+   `run_in_background`, path-first output retrieval, and tagged
+   notices follow the conventions frontier coding models have strong
+   priors for. Strong priors mean less tool-description budget and
+   fewer misuses; everything else (listing, multi-task waits,
+   incremental reads) is covered by ids in results/notices, auto-wake,
+   and `read_file` on the spill path.
+3. **One unified task id space** for bash tasks and background agent
    spawns, minted per session (`#1`, `#2`, …). One concept — "things
    running in the background" — one set of `task_*` tools. Agent-backed
    tasks additionally reference their `Sub(n)` id in metadata.
-3. **The original tool result is the "started" result.** The real
-   outcome arrives later via `task_output` / `task_wait` / the
-   completion notice. This keeps the tool_use/tool_result batch
-   invariant untouched.
-4. **Completion notices are injected user-role messages**, drained at
-   two points: the top of `prompt()` and after each tool batch in
-   `execute_turn` (i.e. immediately before every inference step). They
-   are persisted like any other message so resumed transcripts read
-   coherently.
-5. **Notices wake idle owners.** The binary reacts to `TaskEnd` (and
+4. **The original tool result is the "started" result**, returned
+   immediately — there is no launch window. A command that dies 50ms
+   in surfaces through its completion notice at the next drain point,
+   which is at worst one inference step later than an inline result;
+   in exchange there is exactly one result shape, no watch channel,
+   and no notice-suppression logic. For bash the started result
+   carries the spill path; the real outcome arrives later via
+   `task_output` / the completion notice.
+5. **Completion notices are injected user-role messages wrapped in a
+   `<task-notification>` tag**, drained at two points: the top of
+   `prompt()` and after each tool batch in `execute_turn` (i.e.
+   immediately before every inference step). The tag marks the
+   message as harness-injected so the model does not mistake it for a
+   user reply (e.g. a notice landing while the model is waiting for
+   the user to answer a question is not the answer). Notices are
+   **always delivered** — even when the model already read everything
+   via `task_output`, a duplicated tail costs a few tokens and keeps
+   the lifecycle unconditional: task ends → notice queued → notice
+   drained. They are persisted like any other message so resumed
+   transcripts read coherently.
+6. **Notices wake idle owners.** The binary reacts to `TaskEnd` (and
    to turn completion with notices still queued) by driving a wake
    turn on the owner through the same per-agent turn machinery user
    prompts use. A wake turn is an ordinary turn: gated per-agent,
    cancellable per-view, visible in spinner/footer. Sub-agent wakes
    run in the sub-agent's own chat; the user inspects what they came
    up with by switching to that view (steering-spec semantics).
-6. **Cursor-based incremental reads.** Each task keeps one
-   model-facing cursor; `task_output` returns only output since the
-   last read. The notice for a finished bash task carries the unread
-   tail (capped by the standard bash budgets), advancing the cursor —
-   it behaves like an implicit final `task_output`, so short commands
-   need no extra round-trip.
-7. **Tasks hang off a session-level cancellation root**, not the
+7. **Stateless reads, path-first retrieval.** `task_output` returns
+   the task's status plus the current rolling tail — repeated calls
+   return overlapping content; there are no per-task cursors. The
+   spill file (always persisted for background tasks) is the canonical
+   full output; the model consumes long or fast-moving output
+   incrementally with `read_file` and its `offset` / `limit`
+   parameters, tracking its own position.
+8. **Tasks hang off a session-level cancellation root**, not the
    per-turn token. The registry owns the root; the binary cancels it
-   on shutdown. `task_kill` and the TUI cancel per-task child tokens.
-8. **Task lifecycle events** (`TaskStart` / `TaskOutput` / `TaskEnd`)
+   on shutdown. `task_stop` and the TUI cancel per-task child tokens.
+9. **Task lifecycle events** (`TaskStart` / `TaskOutput` / `TaskEnd`)
    are new bus variants, transient like `ToolExecutionUpdate` (not
    persisted). They carry the originating `call_id` so the TUI updates
    the existing bash tool cell in place — no new box type for live
    output.
-9. **Sub-agents may start background bash tasks** (they inherit the
-   toolset); ownership and notices are scoped to the spawning agent.
-   Background *agent* spawns remain main-only because the `agent` tool
-   stays filtered out of sub-agent toolsets.
+10. **Sub-agents may start background bash tasks** (they inherit the
+    toolset); ownership and notices are scoped to the spawning agent.
+    Background *agent* spawns remain main-only because the `agent`
+    tool stays filtered out of sub-agent toolsets.
 
 ---
 
@@ -176,7 +196,7 @@ pub enum TaskStatus {
     /// Process exited (code is `None` when signal-killed), or the
     /// agent-backed run completed/failed.
     Exited(Option<i32>),
-    /// Killed via `task_kill`, the TUI, or shutdown.
+    /// Killed via `task_stop`, the TUI, or shutdown.
     Killed,
 }
 
@@ -194,7 +214,6 @@ pub struct TaskEntry {
     pub started_at: Instant,
     cancel: CancellationToken,  // child of the registry root
     output: Arc<dyn TaskOutputSource>,
-    cursor: TaskCursor,         // model-facing read position
 }
 
 #[derive(Clone, Default)]
@@ -209,10 +228,10 @@ Key operations (all lock-only, never held across `.await`):
 - `register(owner, kind, label, output) -> StartedTask` — mints the
   id, inserts the entry as `Running`, returns the id plus a child
   cancel token for the driver.
-- `read(id) -> TaskRead` — status + everything since the entry's
-  cursor (advances it). See §4.4.
+- `read(id) -> TaskRead` — status + the current output snapshot. See
+  §4.4.
 - `kill(id)` — cancels the entry's token; the driver flips status.
-- `snapshot() -> Vec<TaskSummary>` — for `task_list` and the picker.
+- `snapshot() -> Vec<TaskSummary>` — for the picker and the footer.
 - `push_notice(notice)` / `drain_notices(owner) -> Vec<TaskNotice>` /
   `has_notices(owner) -> bool` — per-owner completion-notice queue
   (§4.6); `has_notices` is what the binary's wake triggers poll
@@ -225,12 +244,10 @@ process details while `aj-tools` keeps the buffering implementation:
 
 ```rust
 pub trait TaskOutputSource: Send + Sync {
-    /// Output accumulated since `cursor`, advancing it. Returns raw
-    /// (sanitized) text per stream plus totals; the *caller* applies
-    /// display truncation. If the cursor has fallen behind the rolling
-    /// tail's eviction horizon the read reports the elided byte count
-    /// and the spill path.
-    fn read_new(&self, cursor: &mut TaskCursor) -> TaskRead;
+    /// Snapshot of the rolling output tail per stream, exact byte
+    /// totals, and the spill path. Stateless: repeated calls return
+    /// overlapping content; the *caller* applies display truncation.
+    fn snapshot(&self) -> TaskRead;
 }
 ```
 
@@ -301,96 +318,91 @@ SessionState` borrow that makes foreground tools block today.
 `BashInput` gains:
 
 ```rust
-/// Run the command in the background. The call returns once the
-/// launch window passes (or earlier if the command finishes); use
-/// task_output / task_wait to follow it. `timeout` is ignored in
-/// background mode — the task runs until it exits or is killed.
+/// Run the command in the background. The call returns immediately
+/// with a task id and the output path; use task_output to read or
+/// wait, task_stop to kill. `timeout` is ignored in background mode —
+/// the task runs until it exits or is stopped.
 #[serde(default)]
-pub background: bool,
+pub run_in_background: bool,
 ```
 
 Execution in background mode:
 
 1. Spawn the child and reader tasks exactly as today (`process_group`,
    `StreamState`, spill file). The spill file is **always persisted**
-   for background tasks — the process outlives the tool call and the
-   full transcript must stay reachable for the TUI and for
-   cursor-eviction markers.
-2. Call `start_background_task`; move child + states + sink into a
-   detached driver task that `select!`s on the task cancel token vs
-   `child.wait()`, emits throttled `TaskOutput` snapshots, kills the
-   process group on cancellation, and ends with
+   for background tasks — it is the canonical full output, named in
+   the started result and the completion notice, and must stay
+   reachable for `read_file` and the TUI.
+2. Call `start_background_task` and emit `TaskStart`; move child +
+   states + sink into a detached driver task that `select!`s on the
+   task cancel token vs `child.wait()`, emits throttled `TaskOutput`
+   snapshots, kills the process group on cancellation, and ends with
    `events.finished(status, notice)`.
-3. The tool-side waits up to `LAUNCH_WINDOW` (2s) for the driver to
-   report a terminal status (a `watch` channel on the entry):
-   - **Finished inside the window**: return the normal
-     foreground-shaped outcome (same wire content, same
-     `ToolDetails::Bash`); the entry is finalized with its cursor at
-     the end and the notice suppressed — from the model's perspective
-     this was a foreground call.
-   - **Still running**: return the started outcome. Wire content:
+3. Return the started result immediately. Wire content:
 
-     ```
-     Started background task #3: cargo build --release
-     <output captured during the launch window>
-     Still running. Use task_output(3) to read new output, task_wait
-     to block until it finishes. You will be notified when it
-     completes.
-     ```
-
-     The launch-window output advances the task cursor (the model has
-     seen it). `TaskStart` is emitted at this point, not at spawn, so
-     the TUI only tracks tasks that actually went to the background.
+   ```
+   Started background task #3: cargo build --release
+   Output is being written to <spill path>; read it with read_file
+   (supports offset/limit) or task_output(3). You will be notified
+   when it completes.
+   ```
 
 `ToolDetails::Bash` gains `task_id: Option<TaskId>` (serde-defaulted
 `None`, preserving the persisted shape) so renderers can badge the
 cell and correlate task events. Foreground behavior, including
 `execution_mode() == Sequential`, is unchanged.
 
-### 4.4 `task_output`, `task_wait`, `task_kill`, `task_list` (`aj-tools`)
+The tool description steers usage (models follow these patterns well
+when they are spelled out):
 
-All four are thin wrappers over the registry; default
+- For "wait until X is ready", background a command that *exits when
+  the condition holds* (`until grep -q "Ready" dev.log; do sleep 0.5;
+  done`) — one task, one notice — instead of polling in the
+  foreground.
+- Don't babysit a task with blocking `task_output` calls; keep
+  working, the completion notice arrives on its own.
+- Double-forking daemons escape the process group and our kill —
+  prefer supervising the process in the foreground of a background
+  task over `nohup`-style detachment.
+- In print mode there is no auto-wake; wait for outstanding tasks
+  explicitly (`task_output` with `block`) before finishing, or they
+  are killed at exit.
+
+### 4.4 `task_output`, `task_stop` (`aj-tools`)
+
+Both are thin wrappers over the registry; default
 `ExecutionMode::Parallel`.
 
-- **`task_output { id }`** — status plus new-since-cursor output.
-  For bash tasks the raw segments from `read_new` are run through
-  `truncate_tail` with the standard bash budgets and the existing
-  marker phrasing; if the cursor fell behind the rolling tail an
-  `[N bytes elided. Full output at <spill path>]` marker leads the
-  stream. Details: `ToolDetails::Bash` with `task_id` set, `exit_code`
-  populated once terminal. For agent tasks: status while running, the
-  final report once done (`ToolDetails::Text`). Unknown id → `is_error`
-  outcome listing live ids.
-- **`task_wait { ids, timeout: u64 = 120 }`** — resolves when **any**
-  listed task reaches a terminal status, or when the timeout fires,
-  whichever is first; returns immediately if one already terminal.
-  Must `select!` on `ctx.cancellation()` so Ctrl+C cancels the wait
-  (not the tasks). The result reports every listed task's status and
-  folds in an implicit `task_output` for the finished ones. A timeout
-  is **not** an error (`is_error: false`) — it's a normal "still
-  running, here's where things stand" report, so the model doesn't
-  misread patience as failure. Waiting on all of several tasks is just
-  calling `task_wait` again with the survivors.
-- **`task_kill { id }`** — cancels the task token, awaits the terminal
-  status (bounded), returns the final unread tail. Killing an
-  agent-backed task cancels the child's run token; the sub-agent's
+- **`task_output { id, block: bool = true, timeout: u64 = 30 }`** —
+  with `block`, resolves when the task reaches a terminal status or
+  the timeout fires, whichever is first (immediately if already
+  terminal); with `block: false`, an immediate status check. Must
+  `select!` on `ctx.cancellation()` so Ctrl+C cancels the wait (not
+  the task). A timeout is **not** an error (`is_error: false`) — it's
+  a normal "still running, here's where things stand" report, so the
+  model doesn't misread patience as failure.
+
+  The result is the task's status plus the current rolling tail, run
+  through `truncate_tail` with the standard bash budgets and marker
+  phrasing, plus the spill path. Stateless: repeated calls return
+  overlapping content; incremental consumption goes through
+  `read_file` on the spill path. Details: `ToolDetails::Bash` with
+  `task_id` set, `exit_code` populated once terminal. For agent
+  tasks: status while running, the final report once done
+  (`ToolDetails::Text`). Unknown id → `is_error` outcome listing live
+  ids.
+- **`task_stop { id }`** — cancels the task token, awaits the terminal
+  status (bounded), returns the final status and output tail. Stopping
+  an agent-backed task cancels the child's run token; the sub-agent's
   handle stays in `SubAgentRegistry` (it's re-promptable, per the
   steering spec).
-- **`task_list {}`** — id, kind, label, status, runtime, unread
-  line/byte counts for every task this session. `ToolDetails::Text`.
-
-Completion races are benign: a task may finish between the started
-result and the first `task_output`; the read simply reports the
-terminal status. If a notice for that task is still queued it is
-dropped at drain time when its content has already been consumed via
-an explicit read (the entry tracks whether the cursor reached EOF
-before the drain).
 
 ### 4.5 `agent` background mode
 
-`AgentInput` gains the same `background: bool` (default `false`).
-`ToolContext::spawn_agent` grows a mode so the wrapper can implement
-both shapes (signature change; the trait has few implementors):
+`AgentInput` gains the same `run_in_background: bool` (default
+`false`). `ToolContext::spawn_agent` grows a mode so the wrapper can
+implement both shapes (signature change; the trait has few
+implementors):
 
 ```rust
 fn spawn_agent(&mut self, task: String, mode: SpawnMode)
@@ -409,7 +421,7 @@ configure, and retain the sub-agent exactly as today (same
 and running inline:
 
 1. `start_background_task(TaskKind::Agent { .. })` — the task cancel
-   token becomes the child's run cancellation (so `task_kill`, the
+   token becomes the child's run cancellation (so `task_stop`, the
    TUI, and shutdown reach the run; the parent's turn token explicitly
    does **not**, because outliving the parent's turn is the point).
 2. `tokio::spawn` a driver that locks the `SharedAgent`, runs
@@ -436,9 +448,9 @@ gated, and the footer counts it.
 ### 4.6 Completion notices
 
 `TaskNotice` carries owner, task id, kind, label, terminal status, and
-a pre-rendered body (for bash: exit status plus the unread tail,
-truncated with the standard budgets and markers; for agents: the
-report verbatim).
+a pre-rendered body (for bash: exit status, the final output tail
+truncated with the standard budgets and markers, and the spill path;
+for agents: the report verbatim, no file path).
 
 Drain points, both holding `&mut self` on the owning agent:
 
@@ -452,8 +464,10 @@ Drain points, both holding `&mut self` on the owning agent:
 Each drained notice becomes one user-role wire message:
 
 ```
-[background task #3 finished: cargo build --release — exit code 0]
-<unread output tail, if any>
+<task-notification>Background task #3 finished: cargo build --release
+— exit code 0
+<output tail, if any>
+Full output: <spill path></task-notification>
 ```
 
 appended to the transcript with the same `MessageStart` / `MessageEnd`
@@ -513,9 +527,9 @@ task ownership is only acquired by a live run in this process
 
 Wake turns apply the current run-config and count usage like any
 other turn. In print mode there is no trigger loop: the run ends when
-the main turn (and any `task_wait`s the model issued) complete, and
-remaining tasks are killed at exit — noted in the tool description so
-the model waits explicitly before finishing there.
+the main turn (and any blocking `task_output`s the model issued)
+complete, and remaining tasks are killed at exit — noted in the tool
+description so the model waits explicitly before finishing there.
 
 ### 4.8 Cancellation & lifecycle
 
@@ -523,11 +537,11 @@ Token hierarchy:
 
 - `TaskRegistry.root_cancel` — session-scoped, cancelled by the binary
   on shutdown.
-- per-task child tokens — cancelled by `task_kill`, the picker's kill
+- per-task child tokens — cancelled by `task_stop`, the picker's kill
   action, or the root.
 - The per-turn token never reaches task drivers. Cancelling a turn
-  cancels an in-flight `task_wait` (it selects on the turn token) but
-  not the tasks themselves.
+  cancels an in-flight blocking `task_output` (it selects on the turn
+  token) but not the tasks themselves.
 
 Shutdown: the binary calls `registry.shutdown()` before exit, then
 awaits driver quiescence with a short bounded grace (drivers respond
@@ -539,8 +553,8 @@ limitation as today's foreground bash, recorded as known.
 
 Double-forking daemons escape the process group and our kill — known
 limitation, called out in the bash tool description so the model
-prefers proper foreground supervision (`background: true` on the
-supervisor) over `nohup`-style detachment.
+prefers proper foreground supervision (`run_in_background: true` on
+the supervisor) over `nohup`-style detachment.
 
 ### 4.9 TUI
 
@@ -564,8 +578,8 @@ supervisor) over `nohup`-style detachment.
   task. (The full scrollback is always one keypress away via the spill
   path shown in the cell.)
 - **Persistence/resume**: task events are transient. A resumed
-  transcript shows the persisted launch cell (launch-window snapshot +
-  task id badge) and any persisted notices; the registry starts empty.
+  transcript shows the persisted launch cell (started snapshot + task
+  id badge) and any persisted notices; the registry starts empty.
 
 ### 4.10 Events
 
@@ -587,19 +601,23 @@ produces today, so renderers share one code path.
 
 ## 5. Edge cases
 
-- **Command dies inside the launch window** → foreground-shaped result,
-  no task, no notice, no `TaskStart`. The typo/`command not found`
-  case costs zero extra round-trips.
-- **Task finishes between "started" result and first read** → reads
-  report the terminal status; the queued notice is dropped at drain
-  time iff the model already consumed everything (cursor at EOF on a
-  terminal task).
-- **Cursor falls behind the rolling tail** (chatty process, infrequent
-  reads) → the read leads with an elision marker and the spill path;
-  totals stay exact because `StreamState` already tracks them.
-- **`task_wait` timeout** → normal (non-error) status report.
-- **`task_wait` cancelled by Ctrl+C** → the wait's tool call resolves
-  as the standard cancelled outcome; tasks unaffected.
+- **Command dies right after launch** (typo, missing binary, bound
+  port) → the started result has already returned; `TaskEnd` fires
+  and the notice lands at the next drain point — at worst one
+  inference step after launch. No special casing.
+- **Task finishes between "started" result and first read** → the
+  read reports the terminal status; the notice still arrives. A
+  duplicated tail is a few tokens — the price of an unconditional
+  notice lifecycle.
+- **Chatty process outruns the rolling tail** → `task_output` and the
+  notice show the truncated tail with the standard markers plus the
+  spill path; the full output is on disk and `read_file` slices it
+  with `offset`/`limit`. Totals stay exact because `StreamState`
+  already tracks them.
+- **Blocking `task_output` timeout** → normal (non-error) status
+  report.
+- **Blocking `task_output` cancelled by Ctrl+C** → the tool call
+  resolves as the standard cancelled outcome; the task is unaffected.
 - **Unknown / already-terminal ids** → `is_error` outcome listing
   live ids (unknown), or an immediate normal report (terminal).
 - **Sub-agent-owned task finishes after the sub-agent's run ended** →
@@ -615,14 +633,15 @@ produces today, so renderers share one code path.
   skipped with the rest of the loop; trigger 2 fires on the aborted
   turn's completion, so the notices still wake the owner. If the user
   cancelled deliberately and also wants the tasks gone, that's
-  `task_kill` / the picker's kill — cancelling a turn has never
+  `task_stop` / the picker's kill — cancelling a turn has never
   implied killing its children.
 - **User quits with notices queued** → the TUI already showed
   `TaskEnd`; shutdown kills the task tree; queued notices die with the
   process (they are only persisted once drained into a transcript).
 - **Print mode** → works (registry defaults), but tasks pending when
-  the run ends are killed at exit; the model should `task_wait` before
-  finishing. Worth one line in the tool description.
+  the run ends are killed at exit; the model should wait with a
+  blocking `task_output` before finishing. Worth one line in the tool
+  description.
 - **Notice content vs. context budget** → notice bodies use the same
   per-stream budgets as bash results; a misbehaving firehose costs at
   most one bash-result's worth of context per notice.
@@ -632,8 +651,8 @@ produces today, so renderers share one code path.
 ## 6. Touch list
 
 - `src/aj-agent/src/tool.rs`: `TaskId`, `TaskStatus`, `TaskKind`,
-  `TaskOutputSource`, `TaskCursor`/`TaskRead`, `StartedTask`,
-  `TaskEventSink`, `SpawnMode`/`SpawnResult`; `ToolContext` methods;
+  `TaskOutputSource`, `TaskRead`, `StartedTask`, `TaskEventSink`,
+  `SpawnMode`/`SpawnResult`; `ToolContext` methods;
   `ToolDetails::Bash.task_id`.
 - `src/aj-agent/src/lib.rs`: `TaskRegistry` + notice queue;
   `Agent::set_task_registry`; wrapper plumbing; background path in
@@ -641,14 +660,14 @@ produces today, so renderers share one code path.
   `execute_turn`; `Agent::wake` + `WakeOutcome`; usage folding at
   drain.
 - `src/aj-agent/src/events.rs`: `TaskStart` / `TaskOutput` / `TaskEnd`.
-- `src/aj-tools/src/tools/bash.rs`: `background` input, driver
+- `src/aj-tools/src/tools/bash.rs`: `run_in_background` input, driver
   extraction (the run loop becomes shared between foreground and
-  detached modes), `TaskOutputSource` impl over `StreamState`, launch
-  window.
-- `src/aj-tools/src/tools/agent.rs`: `background` input, started
-  outcome.
-- `src/aj-tools/src/tools/`: new `task.rs` with the four `task_*`
-  tools.
+  detached modes), `TaskOutputSource` impl over `StreamState`
+  (always-persisted spill), tool-description guidance.
+- `src/aj-tools/src/tools/agent.rs`: `run_in_background` input,
+  started outcome.
+- `src/aj-tools/src/tools/`: new `task.rs` with `task_output` and
+  `task_stop`.
 - `src/aj/src/modes/interactive.rs`: registry injection; wake
   triggers (on `TaskEnd` in the bus arm, on turn completion in the
   `JoinSet` arm); shutdown ordering (`registry.shutdown()` + grace
@@ -673,6 +692,14 @@ produces today, so renderers share one code path.
    observation surface; we revisit after test-driving (a `ChatView`
    active-id generalization to `Agent|Task` is the sketched path if
    the inline cell proves too cramped).
+4. **No `task_list` tool.** Ids arrive in started results and notices,
+   the unknown-id error lists live ids, and the alt+a picker covers
+   the human side. A list tool would mostly duplicate what the model
+   already holds in context.
+5. **No multi-task wait.** Blocking `task_output` takes one id;
+   auto-wake covers "react to whichever finishes first", and print
+   mode waits serially. An any-of wait is the first thing to add back
+   if serial waiting proves painful in practice.
 
 ---
 
@@ -681,14 +708,15 @@ produces today, so renderers share one code path.
 **Stage A — registry + protocol (aj-agent).** `TaskRegistry`, ids,
 statuses, notice queue, `ToolContext` additions, `Task*` events,
 `ToolDetails::Bash.task_id`, drain points (drain logic testable with a
-scripted provider: queue a notice, assert the injected user message
-and its `MessageStart`/`MessageEnd` pair). No tool uses it yet.
+scripted provider: queue a notice, assert the injected
+`<task-notification>` user message and its
+`MessageStart`/`MessageEnd` pair). No tool uses it yet.
 
-**Stage B — background bash + read/wait/kill/list + wake.** Extract
-the bash driver, implement the launch window, `TaskOutputSource` over
-`StreamState` (always-persisted spill), the four `task_*` tools,
-`Agent::wake`, and the binary's two wake triggers. End-to-end: start,
-poll, wait, kill, notice-on-completion, idle owner wakes and reacts.
+**Stage B — background bash + output/stop + wake.** Extract the bash
+driver, implement `TaskOutputSource` over `StreamState`
+(always-persisted spill), the two `task_*` tools, `Agent::wake`, and
+the binary's two wake triggers. End-to-end: start, read, block, stop,
+notice-on-completion, idle owner wakes and reacts.
 
 **Stage C — background agent spawn.** `SpawnMode` plumbing, detached
 run driver, usage folding at drain, started outcome. Verify the
@@ -702,28 +730,28 @@ badge off `TaskEnd`.
 
 **Stage E — lifecycle polish.** Shutdown ordering + grace, Ctrl+C
 arming text, print-mode kill-at-exit, tool-description notes
-(daemons, print mode), docs touch-up.
+(daemons, print mode, exits-when-ready pattern), docs touch-up.
 
 ---
 
 ## 9. Testing
 
-- **aj-agent**: registry insert/read/kill/snapshot; cursor semantics
-  incl. eviction marker; notice drain at both injection points (idle →
-  prompt-start; mid-run → post-batch) with persistence-shaped
-  `MessageEnd`s; suppressed notice after cursor-at-EOF read;
-  `Agent::wake` drains-then-runs with full event bracketing and
+- **aj-agent**: registry insert/read/kill/snapshot; notice drain at
+  both injection points (idle → prompt-start; mid-run → post-batch)
+  with the `<task-notification>` body shape and persistence-shaped
+  `MessageEnd`s; notice delivered even after an explicit terminal
+  read; `Agent::wake` drains-then-runs with full event bracketing and
   returns `Empty` (no events) on an empty queue; task ids monotonic;
   shutdown cancels all task tokens.
-- **aj-tools**: launch-window fast-exit returns foreground shape;
-  started shape carries id + window output; `task_output` incremental
-  reads (twice → second read empty), truncation markers, unknown id;
-  `task_wait` any-of / timeout-not-error / turn-cancel; `task_kill`
-  kills the process group (no surviving grandchildren); background
-  ignores `timeout`.
+- **aj-tools**: started result carries id + spill path; `task_output`
+  stateless reads (two reads → overlapping tails), truncation markers,
+  unknown id, block-until-terminal, timeout-not-error, turn-cancel;
+  `task_stop` kills the process group (no surviving grandchildren);
+  background ignores `timeout`; spill file readable via `read_file`
+  with `offset` while the task runs.
 - **agent tool**: background spawn returns started; report arrives as
   a notice; `SubAgentEnd` still emitted; usage folded at drain;
-  killing the task cancels the child's run.
+  stopping the task cancels the child's run.
 - **aj (pump/UI/wake)**: footer counts agents + bash tasks separately;
   cell live-updates off `TaskOutput` and freezes on `TaskEnd`; picker
   shows and kills tasks; resume renders persisted launch cells without
