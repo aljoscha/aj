@@ -1,5 +1,7 @@
 # View-scoped footer & per-agent settings — spec
 
+Status: implemented.
+
 ## Motivation
 
 The footer always renders the **main agent's** state, regardless of
