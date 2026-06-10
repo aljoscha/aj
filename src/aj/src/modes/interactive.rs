@@ -2118,14 +2118,20 @@ fn resolve_theme_name(configured: Option<&str>) -> &str {
 /// so the user can verify which guidance is actually active.
 fn build_context_notice(env: &AgentEnv) -> String {
     let mut lines = String::from("Context:");
-    match &env.system_prompt.source {
+    let source = &env.system_prompt.source;
+    match source {
         SystemPromptSource::Builtin => {
-            lines.push_str(
-                "\n  - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)",
-            );
+            lines.push_str(&format!(
+                "\n  - builtin ({}; override with ~/.agents/SYSTEM_PROMPT.md)",
+                source.label()
+            ));
         }
         SystemPromptSource::Override(path) => {
-            lines.push_str(&format!("\n  - {} (system prompt)", display_path(path)));
+            lines.push_str(&format!(
+                "\n  - {} ({})",
+                display_path(path),
+                source.label()
+            ));
         }
     }
     for file in &env.context_files {

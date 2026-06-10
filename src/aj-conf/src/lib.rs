@@ -203,6 +203,14 @@ pub enum SystemPromptSource {
     Override(PathBuf),
 }
 
+impl SystemPromptSource {
+    /// Short human-readable label, used when displaying the context to the
+    /// user. Parallel to [`ContextFileKind::label`].
+    pub fn label(&self) -> &'static str {
+        "system prompt"
+    }
+}
+
 /// The working environment of the agent, includes configuration, the system
 /// prompt, working directories, etc.
 #[derive(Debug, Clone)]
