@@ -11,8 +11,8 @@ use aj_agent::TaskRegistry;
 use aj_agent::bus::EventBus;
 use aj_agent::events::AgentId;
 use aj_agent::tool::{
-    SpawnedAgent, StartedTask, TaskEventSink, TaskKind, TaskOutputSource, TodoItem, ToolContext,
-    ToolDetails,
+    SpawnMode, SpawnResult, StartedTask, TaskEventSink, TaskKind, TaskOutputSource, TodoItem,
+    ToolContext, ToolDetails,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -69,9 +69,9 @@ impl ToolContext for DummyToolContext {
     fn spawn_agent<'a>(
         &'a mut self,
         _task: String,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'a>,
-    > {
+        _mode: SpawnMode,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>
+    {
         Box::pin(async move {
             Err(anyhow::anyhow!(
                 "spawn_agent not supported in DummyToolContext"

@@ -173,10 +173,15 @@ fn report_outcome(registry: &TaskRegistry, id: TaskId) -> ToolOutcome {
     };
 
     if let TaskKind::Agent { agent_id, .. } = &summary.kind {
-        // Agent-backed tasks have no process streams to tail while
-        // running; the final report is delivered through the
-        // completion notice.
-        let body = format!("Sub-agent {agent_id} runs this task in its own chat.");
+        // Agent-backed tasks have no process streams to tail. While
+        // the run is live the body points at the sub-agent's chat;
+        // once terminal the driver has stored the final report on the
+        // output source, so a read returns it (the same text the
+        // completion notice delivers).
+        let body = match read.report {
+            Some(report) if status.is_terminal() => report,
+            _ => format!("Sub-agent {agent_id} runs this task in its own chat."),
+        };
         return ToolOutcome {
             content: vec![UserContent::text(format!("{header}\n{body}"))],
             details: ToolDetails::Text {
@@ -588,5 +593,73 @@ mod tests {
         assert!(wire.contains("exit code 0"), "wire: {wire:?}");
 
         std::fs::remove_file(spill).ok();
+    }
+
+    /// Output source standing in for an agent-backed task: no
+    /// streams, just an optional report like the production driver
+    /// stores at finish.
+    struct StubAgentOutput {
+        report: std::sync::Mutex<Option<String>>,
+    }
+
+    impl aj_agent::tool::TaskOutputSource for StubAgentOutput {
+        fn snapshot(&self) -> aj_agent::tool::TaskRead {
+            aj_agent::tool::TaskRead {
+                report: self.report.lock().unwrap().clone(),
+                ..aj_agent::tool::TaskRead::default()
+            }
+        }
+    }
+
+    /// Agent-backed tasks read as a status line while running and as
+    /// the final report (`ToolDetails::Text`) once terminal.
+    #[tokio::test]
+    async fn agent_task_reads_status_then_report() {
+        use aj_agent::events::AgentId;
+        use aj_agent::tool::{TaskKind, TaskStatus};
+        use std::sync::Arc;
+
+        let mut ctx = DummyToolContext::default();
+        let registry = ctx.task_registry();
+        let output = Arc::new(StubAgentOutput {
+            report: std::sync::Mutex::new(None),
+        });
+        let output_dyn: Arc<dyn aj_agent::tool::TaskOutputSource> =
+            Arc::<StubAgentOutput>::clone(&output);
+        let (id, _cancel) = registry.register(
+            AgentId::Main,
+            TaskKind::Agent {
+                agent_id: 2,
+                task: "investigate".to_string(),
+            },
+            "agent 2".to_string(),
+            output_dyn,
+        );
+
+        // Running: a status line pointing at the sub-agent's chat.
+        let running = read_task(&mut ctx, id, false, 30).await;
+        assert!(!running.is_error);
+        let wire = extract_text(&running.content);
+        assert!(wire.contains("still running: agent 2"), "wire: {wire:?}");
+        assert!(
+            wire.contains("runs this task in its own chat"),
+            "wire: {wire:?}"
+        );
+
+        // Terminal: the stored report is the body.
+        *output.report.lock().unwrap() = Some("the final report".to_string());
+        registry.set_status(id, TaskStatus::Exited(Some(0)));
+        let finished = read_task(&mut ctx, id, false, 30).await;
+        assert!(!finished.is_error);
+        let wire = extract_text(&finished.content);
+        assert!(
+            wire.contains("finished: agent 2 \u{2014} exit code 0"),
+            "wire: {wire:?}"
+        );
+        assert!(wire.contains("the final report"), "wire: {wire:?}");
+        match &finished.details {
+            ToolDetails::Text { body, .. } => assert_eq!(body, "the final report"),
+            other => panic!("expected Text details, got {other:?}"),
+        }
     }
 }

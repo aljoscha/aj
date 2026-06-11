@@ -27,7 +27,9 @@
 //!
 //! [`Parallel`]: aj_agent::tool::ExecutionMode::Parallel
 
-use aj_agent::tool::{ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
+use aj_agent::tool::{
+    SpawnMode, SpawnResult, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -51,6 +53,12 @@ Use this tool when you need to:
 - Get a fresh perspective on code organization
 
 The sub-agent will return a comprehensive report that you can use to inform your next steps.
+
+Set run_in_background: true to keep working while the sub-agent runs: the call
+returns immediately with a task id, and the sub-agent's report is delivered to
+you as a completion notice when it finishes. Don't babysit a background
+sub-agent with task_output calls — the notice arrives on its own; use
+task_stop(id) if you need to stop it early.
 "#;
 
 #[derive(Debug, Clone)]
@@ -69,6 +77,12 @@ pub struct AgentInput {
     /// the sub-agent is working. If not provided, a generic description will be
     /// used.
     pub description: Option<String>,
+
+    /// Run the sub-agent in the background. The call returns immediately with
+    /// a task id; the report arrives as a completion notice when the run
+    /// finishes. Use task_output to check on it or task_stop to stop it.
+    #[serde(default)]
+    pub run_in_background: bool,
 }
 
 impl ToolDefinition for AgentTool {
@@ -93,22 +107,48 @@ impl ToolDefinition for AgentTool {
         // catches it and synthesizes a generic error tool_result so
         // the model still sees the failure.
         let task = input.task.clone();
-        let spawned = ctx.spawn_agent(task.clone()).await?;
-
-        // Wire content goes back to the parent model verbatim — it's
-        // the text the sub-agent produced and what the parent expects
-        // to read as the tool result. The `details` payload is the
-        // structured triple the renderer / persistence listener uses
-        // to group nested transcripts under this tool call.
-        Ok(ToolOutcome {
-            content: vec![UserContent::text(spawned.report.clone())],
-            details: ToolDetails::SubAgentReport {
-                agent_id: spawned.agent_id,
-                task,
-                report: spawned.report,
-            },
-            is_error: false,
-        })
+        let mode = if input.run_in_background {
+            SpawnMode::Background
+        } else {
+            SpawnMode::Blocking
+        };
+        match ctx.spawn_agent(task.clone(), mode).await? {
+            // Wire content goes back to the parent model verbatim —
+            // it's the text the sub-agent produced and what the parent
+            // expects to read as the tool result. The `details`
+            // payload is the structured triple the renderer /
+            // persistence listener uses to group nested transcripts
+            // under this tool call.
+            SpawnResult::Completed(spawned) => Ok(ToolOutcome {
+                content: vec![UserContent::text(spawned.report.clone())],
+                details: ToolDetails::SubAgentReport {
+                    agent_id: spawned.agent_id,
+                    task,
+                    report: spawned.report,
+                },
+                is_error: false,
+            }),
+            // A background spawn needs no rich details variant: the
+            // `SubAgentStart` event already created the transcript
+            // box, and the report reaches the transcript through the
+            // completion notice.
+            SpawnResult::Started { agent_id, task_id } => {
+                let summary = format!("agent {agent_id} started in background (task #{task_id})");
+                let wire = format!(
+                    "{summary}. You will be notified when it completes and \
+                     delivers its report; use task_output({task_id}) to check on it or \
+                     task_stop({task_id}) to stop it."
+                );
+                Ok(ToolOutcome {
+                    content: vec![UserContent::text(wire)],
+                    details: ToolDetails::Text {
+                        summary,
+                        body: String::new(),
+                    },
+                    is_error: false,
+                })
+            }
+        }
     }
 }
 
@@ -122,12 +162,14 @@ mod tests {
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
-    /// A `ToolContext` that records the task it was asked to spawn
-    /// and returns a canned [`SpawnedAgent`]. Pure unit-test plumbing
-    /// — none of the production code paths reach these methods.
+    /// A `ToolContext` that records the task and mode it was asked to
+    /// spawn and returns a canned [`SpawnResult`]. Pure unit-test
+    /// plumbing — none of the production code paths reach these
+    /// methods.
     struct StubSpawnContext {
         last_task: Option<String>,
-        response: SpawnedAgent,
+        last_mode: Option<SpawnMode>,
+        response: SpawnResult,
         tasks: crate::testing::DummyToolContext,
     }
 
@@ -145,9 +187,11 @@ mod tests {
         fn spawn_agent<'a>(
             &'a mut self,
             task: String,
-        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'a>>
+            mode: SpawnMode,
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>
         {
             self.last_task = Some(task);
+            self.last_mode = Some(mode);
             let response = self.response.clone();
             Box::pin(async move { Ok(response) })
         }
@@ -193,7 +237,8 @@ mod tests {
         fn spawn_agent<'a>(
             &'a mut self,
             _task: String,
-        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'a>>
+            _mode: SpawnMode,
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>
         {
             Box::pin(async move { Err(anyhow::anyhow!("model exploded")) })
         }
@@ -226,11 +271,12 @@ mod tests {
     async fn execute_returns_sub_agent_report_outcome() {
         let mut ctx = StubSpawnContext {
             last_task: None,
+            last_mode: None,
             tasks: Default::default(),
-            response: SpawnedAgent {
+            response: SpawnResult::Completed(SpawnedAgent {
                 agent_id: 7,
                 report: "investigation complete".to_string(),
-            },
+            }),
         };
 
         let outcome = AgentTool
@@ -239,6 +285,7 @@ mod tests {
                 AgentInput {
                     task: "scan the codebase".to_string(),
                     description: None,
+                    run_in_background: false,
                 },
             )
             .await
@@ -247,6 +294,8 @@ mod tests {
         // The task we forwarded to spawn_agent must round-trip through
         // the input verbatim — the tool hasn't started rewriting it.
         assert_eq!(ctx.last_task.as_deref(), Some("scan the codebase"));
+        // The default is a blocking spawn.
+        assert_eq!(ctx.last_mode, Some(SpawnMode::Blocking));
 
         assert!(!outcome.is_error);
 
@@ -285,11 +334,12 @@ mod tests {
     async fn description_input_does_not_affect_outcome() {
         let mut ctx = StubSpawnContext {
             last_task: None,
+            last_mode: None,
             tasks: Default::default(),
-            response: SpawnedAgent {
+            response: SpawnResult::Completed(SpawnedAgent {
                 agent_id: 1,
                 report: "ok".to_string(),
-            },
+            }),
         };
 
         let outcome = AgentTool
@@ -298,6 +348,7 @@ mod tests {
                 AgentInput {
                     task: "do thing".to_string(),
                     description: Some("a friendly headline".to_string()),
+                    run_in_background: false,
                 },
             )
             .await
@@ -326,6 +377,7 @@ mod tests {
                 AgentInput {
                     task: "doomed".to_string(),
                     description: None,
+                    run_in_background: false,
                 },
             )
             .await;
@@ -336,5 +388,59 @@ mod tests {
             err.to_string().contains("model exploded"),
             "unexpected error string: {err}"
         );
+    }
+
+    /// `run_in_background: true` requests a background spawn and maps
+    /// the `Started` result onto the started outcome: a plain-text
+    /// summary naming both ids, with the "you will be notified" hint
+    /// on the wire.
+    #[tokio::test]
+    async fn background_input_returns_started_outcome() {
+        let mut ctx = StubSpawnContext {
+            last_task: None,
+            last_mode: None,
+            tasks: Default::default(),
+            response: SpawnResult::Started {
+                agent_id: 2,
+                task_id: 5,
+            },
+        };
+
+        let outcome = AgentTool
+            .execute(
+                &mut ctx,
+                AgentInput {
+                    task: "long research".to_string(),
+                    description: None,
+                    run_in_background: true,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(ctx.last_mode, Some(SpawnMode::Background));
+        assert!(!outcome.is_error);
+
+        let wire = outcome
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::Text(t) => Some(t.text.as_str()),
+                UserContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            wire.starts_with("agent 2 started in background (task #5)"),
+            "wire: {wire:?}"
+        );
+        assert!(wire.contains("You will be notified"), "wire: {wire:?}");
+
+        match outcome.details {
+            ToolDetails::Text { summary, .. } => {
+                assert_eq!(summary, "agent 2 started in background (task #5)");
+            }
+            other => panic!("expected Text details, got {other:?}"),
+        }
     }
 }

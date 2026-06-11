@@ -36,8 +36,9 @@ use crate::events::{AgentEvent, AgentId, AgentSettings};
 use crate::message::AgentMessage;
 use crate::projection::transcript_to_messages;
 use crate::tool::{
-    ErasedToolDefinition, SpawnedAgent, StartedTask, TaskEventSink, TaskId, TaskKind, TaskNotice,
-    TaskOutputSource, TaskRead, TaskStatus, TodoItem, ToolContext, ToolDetails, ToolOutcome,
+    ErasedToolDefinition, SpawnMode, SpawnResult, SpawnedAgent, StartedTask, TaskEventSink, TaskId,
+    TaskKind, TaskNotice, TaskOutputSource, TaskRead, TaskStatus, TodoItem, ToolContext,
+    ToolDetails, ToolOutcome,
 };
 use crate::types::TokenUsage;
 use anyhow::anyhow;
@@ -1344,11 +1345,15 @@ impl Agent {
     async fn drain_task_notices(&mut self) -> Result<(), TurnError> {
         let notices = self.task_registry.drain_notices(self.agent_id);
         for notice in notices {
-            // TODO(aljoscha): once agent-backed background tasks land,
-            // fold the child's recorded usage into
-            // `SessionState.sub_agent_usage` here — the drain holds
-            // `&mut self`, so usage accounting needs no shared
-            // mutability.
+            // An agent-backed task's detached driver parked the
+            // child's accumulated usage on the registry entry; fold
+            // it into session state here, where we hold `&mut self`,
+            // so no shared mutability is needed.
+            if let TaskKind::Agent { agent_id, .. } = &notice.kind {
+                if let Some(usage) = self.task_registry.usage(notice.task_id) {
+                    self.session_state.record_sub_agent_usage(*agent_id, usage);
+                }
+            }
             let text = format!("<task-notification>{}</task-notification>", notice.body);
             let message = AgentMessage::wire(Message::User(UserMessage::text(text)));
             self.transcript.push(message.clone());
@@ -1662,6 +1667,11 @@ struct TaskEntry {
     /// flips the status via [`TaskRegistry::set_status`].
     cancel: CancellationToken,
     output: Arc<dyn TaskOutputSource>,
+    /// Usage accumulated by an agent-backed task's run, recorded by
+    /// the driver at finish. The detached driver has no access to the
+    /// owner's `SessionState`, so the value parks here until the
+    /// completion notice drains and the owner folds it in.
+    usage: Option<Usage>,
 }
 
 /// Display snapshot of one task, for the picker and the footer.
@@ -1748,6 +1758,7 @@ impl TaskRegistry {
                 started_at: Instant::now(),
                 cancel: cancel.clone(),
                 output,
+                usage: None,
             },
         );
         (id, cancel)
@@ -1796,6 +1807,22 @@ impl TaskRegistry {
     pub fn status(&self, id: TaskId) -> Option<TaskStatus> {
         let inner = self.inner.lock().expect("task registry mutex poisoned");
         inner.entries.get(&id).map(|entry| entry.status)
+    }
+
+    /// Record the usage accumulated by task `id`'s agent run. No-op
+    /// for unknown ids.
+    pub fn record_usage(&self, id: TaskId, usage: Usage) {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        if let Some(entry) = inner.entries.get_mut(&id) {
+            entry.usage = Some(usage);
+        }
+    }
+
+    /// Usage recorded for task `id`, if any. `None` for unknown ids,
+    /// bash tasks, and agent tasks whose run hasn't finished.
+    pub fn usage(&self, id: TaskId) -> Option<Usage> {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.entries.get(&id).and_then(|entry| entry.usage.clone())
     }
 
     /// Display snapshot of task `id`, `None` for unknown ids.
@@ -2229,9 +2256,9 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
     fn spawn_agent<'b>(
         &'b mut self,
         task: String,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'b>,
-    > {
+        mode: SpawnMode,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'b>>
+    {
         Box::pin(async move {
             // Get the next agent ID
             let agent_id = self.session_ctx.next_sub_agent_id();
@@ -2319,6 +2346,11 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // spawn events (and the spawn entry persisted off them)
             // report the speed they actually run at.
             sub_agent.set_speed(self.speed);
+            // Share the background-task registry so tasks the
+            // sub-agent starts land in the same map the binary
+            // observes, with notices scoped to the sub-agent's own
+            // id.
+            sub_agent.set_task_registry(self.task_registry.clone());
             // Share the parent's bus per `docs/aj-next-plan.md`
             // §1.6: every event the sub-agent emits during its
             // run reaches the listeners the binary registered on
@@ -2327,26 +2359,71 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // own bus and the binary's bridge listener never sees
             // its activity.
             sub_agent.set_bus(self.parent_bus.clone());
-            // Share the parent's cancellation token (via a
-            // `child_token` so a future per-sub-agent cancel is
-            // possible) per `docs/aj-next-plan.md` §1.6, so a
-            // top-level `cancel()` reaches the sub-agent's
-            // streaming inference and tools.
-            sub_agent.set_cancellation(self.cancellation.child_token());
-            // Share the background-task registry so tasks the
-            // sub-agent starts land in the same map the binary
-            // observes, with notices scoped to the sub-agent's own
-            // id.
-            sub_agent.set_task_registry(self.task_registry.clone());
 
-            // Retain the sub-agent in the shared registry, then run its
-            // initial turn through that handle. The handle stays in the
-            // registry after the run so the binary can drive later
-            // continuations; the parent's tool result is still the first
-            // report, so the `agent` tool contract is unchanged.
+            // Wire the run's cancellation per mode. A blocking run is
+            // nested in the parent's turn, so it derives from the
+            // parent's token (via `child_token` so a future
+            // per-sub-agent cancel stays possible). A background run
+            // must outlive the parent's turn, so it hangs off the
+            // background task's token instead: `task_stop`, the TUI's
+            // kill action, and shutdown all reach the run through it,
+            // while cancelling the parent's turn deliberately does
+            // not.
+            let background = match mode {
+                SpawnMode::Blocking => {
+                    sub_agent.set_cancellation(self.cancellation.child_token());
+                    None
+                }
+                SpawnMode::Background => {
+                    let output = Arc::new(AgentTaskOutput::default());
+                    let output_dyn: Arc<dyn TaskOutputSource> =
+                        Arc::<AgentTaskOutput>::clone(&output);
+                    let kind = TaskKind::Agent {
+                        agent_id,
+                        task: task.clone(),
+                    };
+                    let started = self.start_background_task(
+                        kind.clone(),
+                        format!("agent {agent_id}"),
+                        output_dyn,
+                    );
+                    sub_agent.set_cancellation(started.cancel.clone());
+                    Some((started, kind, output))
+                }
+            };
+
+            // Retain the sub-agent in the shared registry (both
+            // modes) so the binary can drive later continuations.
             let shared: SharedAgent = Arc::new(tokio::sync::Mutex::new(sub_agent));
             self.sub_agent_registry
                 .insert(agent_id, Arc::clone(&shared));
+
+            if let Some((started, kind, output)) = background {
+                let StartedTask { id, cancel, events } = started;
+                events.started(kind.clone()).await;
+                tokio::spawn(drive_background_agent(BackgroundAgentRun {
+                    shared,
+                    task,
+                    kind,
+                    agent_id,
+                    task_id: id,
+                    parent: self.parent_agent_id,
+                    parent_bus: self.parent_bus.clone(),
+                    registry: self.task_registry.clone(),
+                    cancel,
+                    events,
+                    output,
+                }));
+                return Ok(SpawnResult::Started {
+                    agent_id,
+                    task_id: id,
+                });
+            }
+
+            // Blocking mode: run the initial turn through the
+            // retained handle. The handle stays in the registry after
+            // the run; the parent's tool result is still the first
+            // report, so the `agent` tool contract is unchanged.
             let (result, sub_agent_usage) = {
                 let mut guard = shared.lock().await;
                 let result = guard.run_single_turn(task).await;
@@ -2380,7 +2457,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // propagate via `?` so the agent runtime keeps
             // synthesizing a generic tool-error result for failed
             // spawns.
-            result.map(|report| SpawnedAgent { agent_id, report })
+            result.map(|report| SpawnResult::Completed(SpawnedAgent { agent_id, report }))
         })
     }
 
@@ -2425,6 +2502,148 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         );
         StartedTask { id, cancel, events }
     }
+}
+
+/// [`TaskOutputSource`] for agent-backed background tasks.
+///
+/// Agent runs have no process streams to tail; the only output is the
+/// final report, which the driver stores here right before flipping
+/// the task terminal so a terminal `task_output` read always sees it.
+#[derive(Default)]
+struct AgentTaskOutput {
+    report: StdMutex<Option<String>>,
+}
+
+impl AgentTaskOutput {
+    fn set_report(&self, report: String) {
+        *self
+            .report
+            .lock()
+            .expect("agent task output mutex poisoned") = Some(report);
+    }
+}
+
+impl TaskOutputSource for AgentTaskOutput {
+    fn snapshot(&self) -> TaskRead {
+        TaskRead {
+            report: self
+                .report
+                .lock()
+                .expect("agent task output mutex poisoned")
+                .clone(),
+            ..TaskRead::default()
+        }
+    }
+}
+
+/// Everything the detached driver of a background agent spawn needs,
+/// moved off [`SessionContextWrapper::spawn_agent`] into
+/// [`drive_background_agent`].
+struct BackgroundAgentRun {
+    shared: SharedAgent,
+    task: String,
+    kind: TaskKind,
+    agent_id: usize,
+    task_id: TaskId,
+    parent: AgentId,
+    parent_bus: EventBus,
+    registry: TaskRegistry,
+    cancel: CancellationToken,
+    events: TaskEventSink,
+    output: Arc<AgentTaskOutput>,
+}
+
+/// Drive a background agent spawn to completion: run the child's
+/// initial turn, park its usage on the registry entry, emit
+/// `SubAgentEnd`, and finish the task with the report as the notice
+/// body.
+async fn drive_background_agent(run: BackgroundAgentRun) {
+    let BackgroundAgentRun {
+        shared,
+        task,
+        kind,
+        agent_id,
+        task_id,
+        parent,
+        parent_bus,
+        registry,
+        cancel,
+        events,
+        output,
+    } = run;
+
+    let (result, usage) = {
+        let mut guard = shared.lock().await;
+        let result = guard.run_single_turn(task).await;
+        let usage = guard.session_state.accumulated_usage.clone();
+        (result, usage)
+    };
+    // The owner folds this into `SessionState.sub_agent_usage` when
+    // the completion notice drains; a detached driver has no `&mut`
+    // access to the owner's session state.
+    registry.record_usage(task_id, usage);
+
+    // Emit `SubAgentEnd` regardless of success — same contract as the
+    // blocking path; listeners need to clean up nested-transcript
+    // framing on errors too. Listener failures are logged and
+    // swallowed like the sink does: a run finishing outside any turn
+    // has no turn to abort.
+    //
+    // NOTE: this emit happens after the child's own `AgentEnd` and
+    // after the lock is released, so a wake on the sub-agent (for a
+    // task it owns itself) can interleave as `AgentEnd(Sub)` →
+    // `AgentStart(Sub)` → `SubAgentEnd`. Benign: the pump's running
+    // set keys off the `Agent*` pair, and persistence tolerates
+    // post-`SubAgentEnd` continuations.
+    let report = match &result {
+        Ok(text) => text.clone(),
+        Err(err) => format!("sub-agent failed: {err:#}"),
+    };
+    let emit_result = parent_bus
+        .emit(AgentEvent::SubAgentEnd {
+            parent,
+            child: AgentId::Sub(agent_id),
+            report: report.clone(),
+        })
+        .await;
+    if let Err(err) = emit_result {
+        tracing::warn!(task_id, "sub-agent end listener failed: {err:#}");
+    }
+
+    // Status mapping: agent runs have no process exit code, so we
+    // borrow the process conventions the shared status rendering
+    // reads naturally — a completed run is `Exited(Some(0))`, a
+    // failed one `Exited(Some(1))`, and a run cancelled through the
+    // task token (task_stop / TUI kill / shutdown) is `Killed`. A
+    // run that completed before a late cancel still counts as
+    // completed. Any *error* under a fired token classifies as
+    // `Killed` — a genuine run failure racing a concurrent kill
+    // loses its error text, which is acceptable: the kill was
+    // requested and the run is gone either way.
+    let (status, report_text) = match &result {
+        Ok(text) => (TaskStatus::Exited(Some(0)), Some(text.clone())),
+        Err(_) if cancel.is_cancelled() => (TaskStatus::Killed, None),
+        Err(_) => (TaskStatus::Exited(Some(1)), Some(report)),
+    };
+    // Store the report before the status flips terminal so a
+    // terminal `task_output` read never observes a finished task
+    // without its report. A killed run stores none — the status line
+    // already says everything.
+    if let Some(text) = &report_text {
+        output.set_report(text.clone());
+    }
+
+    let outcome_text = report_text.as_deref().unwrap_or("killed");
+    let label = events.label().to_string();
+    let notice = TaskNotice {
+        owner: events.owner(),
+        task_id,
+        kind,
+        label: label.clone(),
+        status,
+        body: format!("Background task #{task_id} finished: {label} — {outcome_text}"),
+    };
+    events.finished(status, notice).await;
 }
 
 /// Inspect a freshly-seeded transcript for `tool_call` blocks that
@@ -2568,7 +2787,7 @@ mod event_protocol_tests {
     use aj_conf::{AgentEnv, SystemPrompt, SystemPromptSource};
     use aj_models::provider::Provider;
     use aj_models::registry::{InputModality, ModelCost, ModelInfo};
-    use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
+    use aj_models::scripted::{ExhaustedBehavior, ProviderScript, ScriptedProvider};
     use aj_models::streaming::{AssistantMessageEvent, DoneReason};
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, StopReason, StreamOptions, TextContent,
@@ -2976,12 +3195,33 @@ mod event_protocol_tests {
         tools: Vec<ErasedToolDefinition>,
         transcript: Vec<AgentMessage>,
     ) -> Agent {
+        let scripts = scripts
+            .into_iter()
+            .map(ProviderScript::from_events)
+            .collect();
+        build_agent_scripts_with_transcript(scripts, tools, transcript)
+    }
+
+    /// Like [`build_agent`], but takes full [`ProviderScript`]s so
+    /// tests can script per-step delays (e.g. a child inference that
+    /// stalls until cancelled).
+    fn build_agent_scripts(
+        scripts: Vec<ProviderScript>,
+        tools: Vec<ErasedToolDefinition>,
+    ) -> Agent {
+        build_agent_scripts_with_transcript(scripts, tools, Vec::new())
+    }
+
+    fn build_agent_scripts_with_transcript(
+        scripts: Vec<ProviderScript>,
+        tools: Vec<ErasedToolDefinition>,
+        transcript: Vec<AgentMessage>,
+    ) -> Agent {
         // Strict-mode scripted provider: panic if the agent runs more
         // inferences than the test scripted, which would indicate a
         // regression that adds an unexpected loop iteration.
-        let provider: Arc<dyn Provider> = Arc::new(
-            ScriptedProvider::from_event_vecs(scripts).on_exhausted(ExhaustedBehavior::Panic),
-        );
+        let provider: Arc<dyn Provider> =
+            Arc::new(ScriptedProvider::new(scripts).on_exhausted(ExhaustedBehavior::Panic));
         let model_info = Arc::new(scripted_model_info());
         let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::with_provider(
@@ -4039,11 +4279,37 @@ mod event_protocol_tests {
     }
 
     /// Minimal stand-in for the production `agent` builtin: forwards
-    /// the task to [`ToolContext::spawn_agent`] and reports the
-    /// sub-agent's id. Lets the retention test exercise the real
-    /// `spawn_agent` path without depending on `aj-tools`.
+    /// the task to [`ToolContext::spawn_agent`] with a configured
+    /// [`SpawnMode`] and reports the result. Lets the retention and
+    /// background-spawn tests exercise the real `spawn_agent` path
+    /// without depending on `aj-tools`.
     #[derive(Clone)]
-    struct SpawnTool;
+    struct SpawnTool {
+        mode: crate::tool::SpawnMode,
+        /// `(agent_id, task_id)` pairs recorded off
+        /// [`crate::tool::SpawnResult::Started`] results.
+        started: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl SpawnTool {
+        fn blocking() -> Self {
+            Self {
+                mode: crate::tool::SpawnMode::Blocking,
+                started: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn background() -> (Self, Arc<Mutex<Vec<(usize, usize)>>>) {
+            let started = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    mode: crate::tool::SpawnMode::Background,
+                    started: Arc::clone(&started),
+                },
+                started,
+            )
+        }
+    }
 
     #[derive(serde::Deserialize, schemars::JsonSchema)]
     struct SpawnInput {
@@ -4070,15 +4336,28 @@ mod event_protocol_tests {
             ctx: &mut dyn ToolContext,
             input: SpawnInput,
         ) -> anyhow::Result<ToolOutcome> {
-            let spawned = ctx.spawn_agent(input.task).await?;
-            Ok(ToolOutcome {
-                content: vec![aj_models::types::UserContent::text(spawned.report.clone())],
-                details: ToolDetails::Text {
-                    summary: format!("sub-agent {}", spawned.agent_id),
-                    body: spawned.report,
-                },
-                is_error: false,
-            })
+            match ctx.spawn_agent(input.task, self.mode).await? {
+                crate::tool::SpawnResult::Completed(spawned) => Ok(ToolOutcome {
+                    content: vec![aj_models::types::UserContent::text(spawned.report.clone())],
+                    details: ToolDetails::Text {
+                        summary: format!("sub-agent {}", spawned.agent_id),
+                        body: spawned.report,
+                    },
+                    is_error: false,
+                }),
+                crate::tool::SpawnResult::Started { agent_id, task_id } => {
+                    self.started.lock().unwrap().push((agent_id, task_id));
+                    let text = format!("agent {agent_id} started in background (task #{task_id})");
+                    Ok(ToolOutcome {
+                        content: vec![aj_models::types::UserContent::text(text.clone())],
+                        details: ToolDetails::Text {
+                            summary: text,
+                            body: String::new(),
+                        },
+                        is_error: false,
+                    })
+                }
+            }
         }
     }
 
@@ -4102,7 +4381,7 @@ mod event_protocol_tests {
             finalize_script(finalize_text("parent done")),
         ];
 
-        let mut agent = build_agent(scripts, vec![SpawnTool.into()]);
+        let mut agent = build_agent(scripts, vec![SpawnTool::blocking().into()]);
         let registry = SubAgentRegistry::default();
         agent.set_sub_agent_registry(registry.clone());
 
@@ -4154,7 +4433,7 @@ mod event_protocol_tests {
             finalize_script(finalize_text("continuation")),
         ];
 
-        let mut agent = build_agent(scripts, vec![SpawnTool.into()]);
+        let mut agent = build_agent(scripts, vec![SpawnTool::blocking().into()]);
         let registry = SubAgentRegistry::default();
         agent.set_sub_agent_registry(registry.clone());
 
@@ -4216,6 +4495,198 @@ mod event_protocol_tests {
             has_follow_up,
             "transcript should contain the re-prompt user message"
         );
+    }
+
+    // ---- Background agent spawns ------------------------------------------
+
+    /// Poll `cond` until it holds (bounded), yielding so detached
+    /// drivers make progress.
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        for _ in 0..500 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A background spawn returns a `Started` result with both ids,
+    /// retains the handle like a blocking spawn, still emits
+    /// `SubAgentEnd`, delivers the child's report as a completion
+    /// notice, and folds the child's usage into the parent's session
+    /// state when the notice drains.
+    #[tokio::test]
+    async fn background_spawn_delivers_report_notice_and_folds_usage() {
+        use crate::SubAgentRegistry;
+
+        // Script consumption is deterministic: the stop-after-turn
+        // hook ends the parent's turn right after the tool batch, so
+        // only the detached child consumes script 1, and the wake
+        // afterwards consumes script 2.
+        let mut sub_report = finalize_text("sub report");
+        sub_report.usage.input = 7;
+        sub_report.usage.output = 3;
+        sub_report.usage.total_tokens = 10;
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "agent")),
+            finalize_script(sub_report),
+            finalize_script(finalize_text("reacted")),
+        ];
+
+        let (tool, started) = SpawnTool::background();
+        let mut agent = build_agent(scripts, vec![tool.into()]);
+        let sub_registry = SubAgentRegistry::default();
+        agent.set_sub_agent_registry(sub_registry.clone());
+        let tasks = TaskRegistry::default();
+        agent.set_task_registry(tasks.clone());
+        let stop_hook: crate::hooks::ShouldStopAfterTurnHook =
+            Arc::new(|| Box::pin(async { true }));
+        agent.set_should_stop_after_turn(Some(stop_hook));
+
+        let sub_agent_ends: Arc<Mutex<Vec<(AgentId, AgentId, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sub_agent_ends_clone = Arc::clone(&sub_agent_ends);
+        // The binary's submit/wake gating keys off the `Agent*`
+        // bracketing of the child's run; record it so the test pins
+        // that contract for background initial runs.
+        let sub_lifecycle: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let sub_lifecycle_clone = Arc::clone(&sub_lifecycle);
+        let _handle = agent.subscribe(listener_from_sync(move |event| match event {
+            AgentEvent::SubAgentEnd {
+                parent,
+                child,
+                report,
+            } => {
+                sub_agent_ends_clone
+                    .lock()
+                    .unwrap()
+                    .push((*parent, *child, report.clone()));
+            }
+            AgentEvent::AgentStart { agent_id, .. } if *agent_id == AgentId::Sub(1) => {
+                sub_lifecycle_clone.lock().unwrap().push("start");
+            }
+            AgentEvent::AgentEnd { agent_id, .. } if *agent_id == AgentId::Sub(1) => {
+                sub_lifecycle_clone.lock().unwrap().push("end");
+            }
+            _ => {}
+        }));
+
+        agent
+            .prompt("delegate".to_string(), CancellationToken::new())
+            .await
+            .expect("prompt");
+
+        // The tool observed the Started result with both ids.
+        assert_eq!(*started.lock().unwrap(), vec![(1, 1)]);
+        // The handle is retained exactly like a blocking spawn's.
+        assert_eq!(sub_registry.ids(), vec![1]);
+
+        // The detached driver outlives the parent's turn; wait for
+        // the completion notice it queues.
+        wait_until(|| tasks.has_notices(AgentId::Main), "completion notice").await;
+        assert_eq!(tasks.status(1), Some(TaskStatus::Exited(Some(0))));
+        assert_eq!(
+            *sub_agent_ends.lock().unwrap(),
+            vec![(AgentId::Main, AgentId::Sub(1), "sub report".to_string())]
+        );
+        // The detached run bracketed itself with `AgentStart(Sub 1)` /
+        // `AgentEnd(Sub 1)` on the shared bus — while it ran, the
+        // pump's running set covered it, so user submits to the
+        // sub-agent stayed gated exactly like a blocking spawn's.
+        assert_eq!(*sub_lifecycle.lock().unwrap(), vec!["start", "end"]);
+        // The terminal read surfaces the report — what task_output
+        // renders for finished agent tasks.
+        let (_, read) = tasks.read(1).expect("task readable");
+        assert_eq!(read.report.as_deref(), Some("sub report"));
+        // Usage stays parked on the registry until the drain.
+        assert!(agent.sub_agent_usage().is_empty());
+
+        // Wake drains the notice into the transcript and folds usage.
+        let outcome = agent
+            .wake(CancellationToken::new())
+            .await
+            .expect("wake runs");
+        assert_eq!(outcome, crate::WakeOutcome::Ran);
+        let usage = agent
+            .sub_agent_usage()
+            .get(&1)
+            .expect("usage folded at drain");
+        assert_eq!((usage.input, usage.output, usage.total_tokens), (7, 3, 10));
+
+        let notice_text = agent
+            .messages()
+            .iter()
+            .filter_map(user_text)
+            .find(|t| t.starts_with("<task-notification>"))
+            .expect("notice injected into transcript");
+        assert_eq!(
+            notice_text,
+            "<task-notification>Background task #1 finished: agent 1 — sub report\
+             </task-notification>"
+        );
+    }
+
+    /// Killing an agent-backed task cancels the child's run through
+    /// the task token: the run aborts, the task ends `Killed` with a
+    /// kill notice, and the sub-agent handle stays retained (it's
+    /// re-promptable per the steering contract).
+    #[tokio::test]
+    async fn killing_background_agent_task_cancels_child_run() {
+        use crate::SubAgentRegistry;
+
+        // The child's script stalls before its terminal event so the
+        // kill lands mid-inference; on cancel the scripted provider
+        // emits an aborted terminal and the run errors out.
+        let scripts = vec![
+            ProviderScript::from_events(finalize_script(finalize_tool_use("tu-1", "agent"))),
+            ProviderScript::new().push(
+                std::time::Duration::from_secs(30),
+                AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: finalize_text("never delivered"),
+                },
+            ),
+        ];
+
+        let (tool, started) = SpawnTool::background();
+        let mut agent = build_agent_scripts(scripts, vec![tool.into()]);
+        let sub_registry = SubAgentRegistry::default();
+        agent.set_sub_agent_registry(sub_registry.clone());
+        let tasks = TaskRegistry::default();
+        agent.set_task_registry(tasks.clone());
+        let stop_hook: crate::hooks::ShouldStopAfterTurnHook =
+            Arc::new(|| Box::pin(async { true }));
+        agent.set_should_stop_after_turn(Some(stop_hook));
+
+        agent
+            .prompt("delegate".to_string(), CancellationToken::new())
+            .await
+            .expect("prompt");
+        assert_eq!(*started.lock().unwrap(), vec![(1, 1)]);
+
+        // Kill through the registry — the same path task_stop and the
+        // TUI's kill action take.
+        assert!(tasks.kill(1));
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(10), tasks.wait_terminal(1))
+                .await
+                .expect("driver reacts to the kill promptly");
+        assert_eq!(status, Some(TaskStatus::Killed));
+        // A killed run stores no report — the status line already
+        // says everything a terminal read needs.
+        let (_, read) = tasks.read(1).expect("task readable");
+        assert_eq!(read.report, None);
+
+        let notices = tasks.drain_notices(AgentId::Main);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].body,
+            "Background task #1 finished: agent 1 — killed"
+        );
+        // The kill stops the run, not the agent: the handle stays in
+        // the registry.
+        assert!(sub_registry.get(1).is_some());
     }
 
     // ---- Task-notice drain points ----------------------------------------

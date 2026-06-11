@@ -297,7 +297,7 @@ pub struct ToolOutcome {
     pub is_error: bool,
 }
 
-/// Result of [`ToolContext::spawn_agent`].
+/// Result of a blocking [`ToolContext::spawn_agent`].
 ///
 /// Carries enough information for callers (currently the `agent`
 /// builtin) to construct a [`ToolDetails::SubAgentReport`] without
@@ -311,6 +311,33 @@ pub struct SpawnedAgent {
     pub agent_id: usize,
     /// Final assistant text returned by the sub-agent.
     pub report: String,
+}
+
+/// How [`ToolContext::spawn_agent`] runs the child's initial turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnMode {
+    /// Run the child inline; the call resolves with its report.
+    Blocking,
+    /// Register a background task and return once the child's run is
+    /// started on a detached driver.
+    Background,
+}
+
+/// Result of [`ToolContext::spawn_agent`], shaped by the requested
+/// [`SpawnMode`].
+#[derive(Clone, Debug)]
+pub enum SpawnResult {
+    /// A blocking spawn ran the child to completion.
+    Completed(SpawnedAgent),
+    /// A background spawn started the child's run on a detached
+    /// driver; the report arrives later through the task's completion
+    /// notice (and `task_output` once terminal).
+    Started {
+        /// The sub-agent's id within the current session.
+        agent_id: usize,
+        /// Id of the background task driving the run.
+        task_id: TaskId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +406,10 @@ pub struct TaskRead {
     pub stderr_total_bytes: u64,
     /// Path of the spill file carrying the full interleaved output.
     pub spill_path: Option<PathBuf>,
+    /// Final report of an agent-backed run, set by the driver right
+    /// before the task turns terminal. `None` for bash tasks and
+    /// while an agent task is still running.
+    pub report: Option<String>,
 }
 
 /// Type-erased handle to a background task's output buffer.
@@ -471,6 +502,11 @@ impl TaskEventSink {
     /// The task this sink reports for.
     pub fn task_id(&self) -> TaskId {
         self.task_id
+    }
+
+    /// The display label the task was registered with.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Emit [`AgentEvent::TaskStart`] announcing the task to the bus.
@@ -660,16 +696,19 @@ pub trait ToolContext: Send {
 
     /// Spawn a sub-agent on the current bus.
     ///
-    /// Resolves to a [`SpawnedAgent`] carrying the freshly-allocated
-    /// sub-agent id and the child's final assistant text. The child
-    /// shares the parent's event bus tagged with a fresh
-    /// [`crate::events::AgentId::Sub`] and inherits a child
-    /// cancellation token derived from the parent's
-    /// [`Self::cancellation`].
+    /// The child shares the parent's event bus tagged with a fresh
+    /// [`crate::events::AgentId::Sub`]. With [`SpawnMode::Blocking`]
+    /// the call runs the child's initial turn inline (run cancellation
+    /// derives from the parent's [`Self::cancellation`]) and resolves
+    /// to [`SpawnResult::Completed`]. With [`SpawnMode::Background`]
+    /// the run continues on a detached task whose cancellation is the
+    /// background task's token, and the call resolves to
+    /// [`SpawnResult::Started`] immediately.
     fn spawn_agent<'a>(
         &'a mut self,
         task: String,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpawnedAgent>> + Send + 'a>>;
+        mode: SpawnMode,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>;
 
     /// Emit a partial [`ToolDetails`] snapshot through the bus as a
     /// [`crate::events::AgentEvent::ToolExecutionUpdate`]. Tools that

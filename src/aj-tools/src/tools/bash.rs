@@ -637,6 +637,7 @@ impl TaskOutputSource for BashTaskOutput {
             stdout_total_bytes,
             stderr_total_bytes,
             spill_path: Some(self.spill_path.clone()),
+            report: None,
         }
     }
 }
@@ -1150,14 +1151,15 @@ mod tests {
         fn spawn_agent<'a>(
             &'a mut self,
             task: String,
+            mode: aj_agent::tool::SpawnMode,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = anyhow::Result<aj_agent::tool::SpawnedAgent>>
+                dyn std::future::Future<Output = anyhow::Result<aj_agent::tool::SpawnResult>>
                     + Send
                     + 'a,
             >,
         > {
-            self.inner.spawn_agent(task)
+            self.inner.spawn_agent(task, mode)
         }
 
         fn emit_update(&mut self, partial: ToolDetails) {
