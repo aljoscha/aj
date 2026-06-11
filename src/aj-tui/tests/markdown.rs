@@ -817,6 +817,49 @@ fn does_not_add_a_trailing_blank_line_when_code_block_is_last() {
     }
 }
 
+#[test]
+fn longer_fence_nests_shorter_fences_as_content() {
+    // CommonMark fence-length rule: a ```` fence is only closed by a
+    // backtick run of at least four, so a ``` block quoted inside it
+    // stays literal code content instead of terminating the block.
+    let mut m = md("````\n```rust\nlet x = 1;\n```\n````\n\nafter");
+    let lines = m.render(80);
+    let plain = plain_lines_trim_end(&lines);
+
+    // The inner fences and code body survive as indented content rows.
+    for needle in ["```rust", "let x = 1;"] {
+        assert!(
+            plain
+                .iter()
+                .any(|l| l.starts_with("  ") && l.contains(needle)),
+            "expected {needle:?} as code content, got: {plain:?}",
+        );
+    }
+    // The trailing paragraph renders outside the block, flush left.
+    assert!(
+        plain.iter().any(|l| l == "after"),
+        "expected paragraph after the block, got: {plain:?}",
+    );
+}
+
+#[test]
+fn fence_with_info_string_does_not_close_an_open_block() {
+    // A closing fence may not carry an info string, so a nested
+    // opener like ```rust inside a ``` block is content, not a close.
+    let mut m = md("```\n```rust\nstill code\n```\n\nafter");
+    let lines = m.render(80);
+    let plain = plain_lines_trim_end(&lines);
+
+    for needle in ["```rust", "still code"] {
+        assert!(
+            plain
+                .iter()
+                .any(|l| l.starts_with("  ") && l.contains(needle)),
+            "expected {needle:?} as code content, got: {plain:?}",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Horizontal-rule width basis
 // ---------------------------------------------------------------------------

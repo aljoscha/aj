@@ -356,6 +356,13 @@ enum Inline {
 /// keeping the worst-case render stack to a few hundred frames.
 const MAX_NESTING_DEPTH: usize = 64;
 
+/// Length of the backtick run opening `trimmed`, if it qualifies as a
+/// code fence (three or more backticks).
+fn fence_len(trimmed: &str) -> Option<usize> {
+    let n = trimmed.chars().take_while(|&c| c == '`').count();
+    (n >= 3).then_some(n)
+}
+
 /// Parse markdown text into blocks.
 ///
 /// `depth` tracks block-nesting (incremented per blockquote level,
@@ -401,14 +408,21 @@ fn parse_markdown(text: &str, depth: usize) -> Vec<Block> {
             continue;
         }
 
-        // Fenced code block.
-        if trimmed.starts_with("```") {
-            let lang = trimmed[3..].trim().to_string();
+        // Fenced code block. CommonMark fence semantics: the opener
+        // is a run of three or more backticks, optionally followed by
+        // an info string; the closer is a run of at least as many
+        // backticks with nothing else on the line. Tracking the fence
+        // length is what makes nesting work: a ``` block quoted
+        // inside a ```` fence stays inside it, and an opener-looking
+        // line with an info string never closes a block.
+        if let Some(open_len) = fence_len(trimmed) {
+            let lang = trimmed[open_len..].trim().to_string();
             let lang = if lang.is_empty() { None } else { Some(lang) };
             let mut code_lines: Vec<&str> = Vec::new();
             i += 1;
             while i < lines.len() {
-                if lines[i].trim().starts_with("```") {
+                let t = lines[i].trim();
+                if fence_len(t).is_some_and(|n| n >= open_len) && t.chars().all(|c| c == '`') {
                     i += 1;
                     break;
                 }
