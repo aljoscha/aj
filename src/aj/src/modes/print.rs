@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
-use aj_agent::{Agent, AgentSeed, TurnError};
+use aj_agent::{Agent, AgentSeed, TaskRegistry, TurnError};
 use aj_conf::{AgentEnv, Config, ConfigSpeed, Severity};
 use aj_models::registry::ModelRegistry;
 use aj_models::types::Speed;
@@ -362,6 +362,15 @@ pub async fn run(args: Args) -> Result<()> {
     };
     agent.set_block_images(config.image_block);
 
+    // Inject a task registry so background tasks started during the
+    // run can be killed at exit instead of orphaned. Print mode has
+    // no wake-trigger loop: a notice queued after the final turn is
+    // never drained, and whatever still runs when the prompt returns
+    // is killed below — the bash tool description tells the model to
+    // wait with a blocking `task_output` before finishing here.
+    let task_registry = TaskRegistry::default();
+    agent.set_task_registry(task_registry.clone());
+
     // Resolve the system prompt: reuse a persisted one on resume
     // (cache-warm — the model has the same bytes from the previous
     // run), or assemble fresh from the env and freeze it as the
@@ -457,6 +466,12 @@ pub async fn run(args: Args) -> Result<()> {
     // Stop listening for SIGINT before we return so a stray Ctrl+C
     // during shutdown doesn't trigger a phantom cancel.
     ctrl_c_handler.abort();
+
+    // Kill the background-task tree and reap the process groups
+    // before observing the prompt result, so the early error returns
+    // below can't orphan tasks.
+    crate::modes::shutdown_background_tasks(&task_registry).await;
+
     match prompt_result {
         Ok(()) => {}
         Err(TurnError::Aborted) => {

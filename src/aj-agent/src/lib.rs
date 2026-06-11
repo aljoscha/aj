@@ -1905,9 +1905,40 @@ impl TaskRegistry {
 
     /// Cancel the session-scoped root token, which cancels every
     /// task's child token. Callers then await driver quiescence with
-    /// a bounded grace.
+    /// a bounded grace via [`TaskRegistry::quiesce`].
     pub fn shutdown(&self) {
         self.root_cancel.cancel();
+    }
+
+    /// Wait until every tracked task reaches a terminal status,
+    /// bounded by `grace`.
+    ///
+    /// Returns `true` when the registry is quiescent (every entry
+    /// terminal, or nothing tracked), `false` when the grace expired
+    /// with a task still running. Callers fire
+    /// [`TaskRegistry::shutdown`] first; drivers respond promptly to
+    /// the root cancel (SIGKILL on the process group + reap, or a
+    /// cancelled child run), so an expiry means a wedged driver and
+    /// the caller should proceed with teardown anyway.
+    pub async fn quiesce(&self, grace: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            // Create the `Notified` future before the check so a flip
+            // landing between the check and the await cannot be lost
+            // (same pattern as `wait_terminal`).
+            let notified = self.status_changed.notified();
+            if self.all_terminal() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.all_terminal();
+            }
+        }
+    }
+
+    fn all_terminal(&self) -> bool {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.entries.values().all(|e| e.status.is_terminal())
     }
 }
 
@@ -2169,6 +2200,42 @@ mod task_registry_tests {
             registry.wait_terminal(id).await,
             Some(TaskStatus::Exited(Some(0)))
         );
+    }
+
+    #[tokio::test]
+    async fn quiesce_resolves_when_all_entries_are_terminal() {
+        let registry = TaskRegistry::default();
+        // An empty registry is trivially quiescent.
+        assert!(registry.quiesce(std::time::Duration::from_millis(10)).await);
+
+        let (a, _) = register(&registry, AgentId::Main, "a");
+        let (b, _) = register(&registry, AgentId::Sub(1), "b");
+        registry.set_status(a, TaskStatus::Exited(Some(0)));
+        registry.set_status(b, TaskStatus::Killed);
+        assert!(registry.quiesce(std::time::Duration::from_millis(10)).await);
+
+        // A driver flipping its status during the wait resolves the
+        // quiesce before the grace expires.
+        let (c, _) = register(&registry, AgentId::Main, "c");
+        let flipper = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                registry.set_status(c, TaskStatus::Killed);
+            })
+        };
+        assert!(registry.quiesce(std::time::Duration::from_secs(5)).await);
+        flipper.await.expect("flipper joined");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_times_out_gracefully_on_a_wedged_driver() {
+        let registry = TaskRegistry::default();
+        // The entry never flips terminal — a wedged driver. Quiesce
+        // must return `false` once the grace expires rather than
+        // hang.
+        let (_, _cancel) = register(&registry, AgentId::Main, "wedged");
+        assert!(!registry.quiesce(std::time::Duration::from_secs(2)).await);
     }
 }
 

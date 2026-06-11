@@ -277,8 +277,9 @@ pub struct SessionWorld {
     pub registry: SubAgentRegistry,
     /// Background-task registry injected into `agent`; shared with
     /// the main loop so the wake triggers can poll notices and
-    /// shutdown can kill the task tree. Per-world, so tasks never
-    /// leak across session switches.
+    /// shutdown can kill the task tree. Per-world; `run_session`
+    /// shuts it down on every exit (quit, fatal error, session
+    /// switch), so tasks never outlive their world.
     pub task_registry: TaskRegistry,
     /// Loop-side staged settings overrides, keyed by sub-agent id.
     /// The `/model` / `/thinking` selectors write entries when the

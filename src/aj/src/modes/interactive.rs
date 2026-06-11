@@ -224,6 +224,52 @@ fn session_busy_notice(what: &str) -> String {
     format!("Can't {what} while a turn is running — press Ctrl+C to cancel it first.")
 }
 
+/// Counts of running work a quit would tear down, for the Ctrl+C
+/// quit-arming guard: (agents, bash tasks).
+///
+/// Binary-driven turns plus running agent-backed tasks (background
+/// sub-agent runs, which the `turns` JoinSet doesn't track) make up
+/// the agent count; running bash tasks the task count. The
+/// classification mirrors the footer's — an agent-backed task counts
+/// as an agent, never as a task — though the agent counts can differ
+/// (the footer counts running agents from pump events; this counts
+/// the work a quit tears down).
+fn running_work_counts(driven_turns: usize, tasks: &[aj_agent::TaskSummary]) -> (usize, usize) {
+    let mut agents = driven_turns;
+    let mut bash = 0;
+    for task in tasks {
+        if task.status != aj_agent::tool::TaskStatus::Running {
+            continue;
+        }
+        match task.kind {
+            aj_agent::tool::TaskKind::Agent { .. } => agents += 1,
+            aj_agent::tool::TaskKind::Bash { .. } => bash += 1,
+        }
+    }
+    (agents, bash)
+}
+
+/// Quit-arming notice for a Ctrl+C on an idle view while other work
+/// runs: `"N agents / M tasks still running — press Ctrl+C again to
+/// quit"`, each part present only when nonzero. Callers ensure at
+/// least one count is nonzero.
+fn quit_arm_notice(agents: usize, tasks: usize) -> String {
+    let mut parts = Vec::new();
+    if agents > 0 {
+        parts.push(format!(
+            "{agents} agent{}",
+            if agents == 1 { "" } else { "s" }
+        ));
+    }
+    if tasks > 0 {
+        parts.push(format!("{tasks} task{}", if tasks == 1 { "" } else { "s" }));
+    }
+    format!(
+        "{} still running — press Ctrl+C again to quit",
+        parts.join(" / ")
+    )
+}
+
 /// Driver for the interactive TUI. Startup builds the
 /// process-lifetime [`Shell`]; an outer loop in
 /// [`InteractiveMode::run`] then builds, runs, and tears down one
@@ -981,7 +1027,8 @@ async fn run_session(
     let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
     let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
     // Implements the "press Ctrl+C again to quit" guard when the
-    // viewed agent is idle but other agents are still running.
+    // viewed agent is idle but other agents or background tasks are
+    // still running.
     let mut quit_armed = false;
 
     // Slash commands like `/thinking` open an overlay selector.
@@ -1169,9 +1216,10 @@ async fn run_session(
                         //      turn that owns it; the child token
                         //      cascades.
                         //    - Viewed agent idle but other agents
-                        //      still run: don't cancel them; arm
-                        //      "press Ctrl+C again to quit" and
-                        //      exit on the second press.
+                        //      or background tasks still run:
+                        //      don't cancel them; arm "press
+                        //      Ctrl+C again to quit" and exit on
+                        //      the second press.
                         //    - Nothing running anywhere: exit.
                         //
                         // Ctrl+D always exits regardless. The
@@ -1208,18 +1256,27 @@ async fn run_session(
                                     }
                                     quit_armed = false;
                                     continue;
-                                } else if !turns.is_empty() {
-                                    // Viewed agent idle but other agents still run: don't
-                                    // cancel them — arm/confirm quit instead.
+                                }
+                                // Viewed agent idle: anything else
+                                // still running — other agents'
+                                // turns, background agent runs, or
+                                // background bash tasks — arms the
+                                // quit guard instead of being
+                                // cancelled; a bare exit only when
+                                // nothing runs anywhere.
+                                let (agents, tasks) = running_work_counts(
+                                    turns.len(),
+                                    &world.task_registry.snapshot(),
+                                );
+                                if agents + tasks > 0 {
                                     if quit_armed {
                                         break Ok(SessionExit::Quit);
                                     }
                                     quit_armed = true;
-                                    let n = turns.len();
-                                    world.pump.handle(&mut shell.tui, &notice_event(&format!(
-                                        "{n} agent{} still running — press Ctrl+C again to quit",
-                                        if n == 1 { "" } else { "s" },
-                                    )));
+                                    world.pump.handle(
+                                        &mut shell.tui,
+                                        &notice_event(&quit_arm_notice(agents, tasks)),
+                                    );
                                     continue;
                                 } else {
                                     // Nothing running anywhere: exit.
@@ -1846,11 +1903,11 @@ async fn run_session(
 
     // Kill the background-task tree before tearing down turns:
     // cancelling the registry root makes every detached driver
-    // SIGKILL its process group promptly.
-    //
-    // TODO(aljoscha): await driver quiescence with a bounded grace
-    // here so process groups are reliably reaped before exit.
-    world.task_registry.shutdown();
+    // SIGKILL its process group promptly; the bounded quiesce makes
+    // sure those groups are actually killed and reaped before we
+    // proceed. Runs on every exit — quit, fatal error, *and* session
+    // switches — so an abandoned world never leaks tasks.
+    crate::modes::shutdown_background_tasks(&world.task_registry).await;
 
     // Wind down in-flight turns before handing control back to the
     // outer session loop. A session change is only requested with no
@@ -4738,6 +4795,81 @@ mod tests {
     #[test]
     fn resolve_theme_name_defaults_to_light_when_unset() {
         assert_eq!(resolve_theme_name(None), "light");
+    }
+
+    #[test]
+    fn quit_arm_notice_shows_each_part_only_when_nonzero() {
+        assert_eq!(
+            quit_arm_notice(1, 0),
+            "1 agent still running — press Ctrl+C again to quit"
+        );
+        assert_eq!(
+            quit_arm_notice(2, 0),
+            "2 agents still running — press Ctrl+C again to quit"
+        );
+        assert_eq!(
+            quit_arm_notice(0, 1),
+            "1 task still running — press Ctrl+C again to quit"
+        );
+        assert_eq!(
+            quit_arm_notice(0, 3),
+            "3 tasks still running — press Ctrl+C again to quit"
+        );
+        assert_eq!(
+            quit_arm_notice(2, 1),
+            "2 agents / 1 task still running — press Ctrl+C again to quit"
+        );
+    }
+
+    #[test]
+    fn running_work_counts_splits_agents_and_bash_tasks() {
+        use aj_agent::TaskSummary;
+        use aj_agent::tool::{TaskKind, TaskStatus};
+
+        let summary = |id: usize, kind: TaskKind, status: TaskStatus| TaskSummary {
+            id,
+            owner: AgentId::Main,
+            kind,
+            label: "label".to_string(),
+            status,
+            started_at: std::time::Instant::now(),
+        };
+        let bash = |id, status| {
+            summary(
+                id,
+                TaskKind::Bash {
+                    command: "sleep 5".to_string(),
+                },
+                status,
+            )
+        };
+        let agent_task = |id, status| {
+            summary(
+                id,
+                TaskKind::Agent {
+                    agent_id: id,
+                    task: "explore".to_string(),
+                },
+                status,
+            )
+        };
+
+        assert_eq!(running_work_counts(0, &[]), (0, 0));
+        // Running bash tasks count as tasks; terminal ones don't
+        // count at all.
+        let tasks = vec![
+            bash(1, TaskStatus::Running),
+            bash(2, TaskStatus::Exited(Some(0))),
+            bash(3, TaskStatus::Killed),
+        ];
+        assert_eq!(running_work_counts(1, &tasks), (1, 1));
+        // A running agent-backed task counts as an agent (matching
+        // the footer), on top of the binary-driven turns.
+        let tasks = vec![
+            agent_task(4, TaskStatus::Running),
+            bash(5, TaskStatus::Running),
+        ];
+        assert_eq!(running_work_counts(2, &tasks), (3, 1));
     }
 
     #[test]

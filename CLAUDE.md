@@ -31,7 +31,9 @@ aj-models  ←  aj-agent  ←  aj-tools
 - `aj-models` — wire layer: provider SDKs, unified `Message` /
   `AssistantMessage` / streaming types, model registry.
 - `aj-agent` — the `Agent` runtime, the typed `AgentEvent` bus, the
-  tool trait, and `ToolDetails` for structured tool rendering.
+  tool trait, `ToolDetails` for structured tool rendering, and the
+  `TaskRegistry` for background tasks (detached bash commands and
+  sub-agent runs that outlive their turn).
 - `aj-session` — on-disk thread format, `ConversationLog`, replay.
 - `aj-tools` — the builtin tool implementations.
 - `aj-tui` — in-process text-UI framework (layout, components, theming).
