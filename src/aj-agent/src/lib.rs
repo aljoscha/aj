@@ -1354,7 +1354,13 @@ impl Agent {
                     self.session_state.record_sub_agent_usage(*agent_id, usage);
                 }
             }
-            let text = format!("<task-notification>{}</task-notification>", notice.body);
+            // The tag delimiters sit on their own lines so the body
+            // renders as regular markdown between them instead of
+            // being glued to the tag text.
+            let text = format!(
+                "<task-notification>\n{}\n</task-notification>",
+                notice.body.trim_end()
+            );
             let message = AgentMessage::wire(Message::User(UserMessage::text(text)));
             self.transcript.push(message.clone());
             self.bus
@@ -4689,8 +4695,8 @@ mod event_protocol_tests {
             .expect("notice injected into transcript");
         assert_eq!(
             notice_text,
-            "<task-notification>Background task #1 finished: agent 1 — sub report\
-             </task-notification>"
+            "<task-notification>\nBackground task #1 finished: agent 1 — sub report\
+             \n</task-notification>"
         );
     }
 
@@ -4828,8 +4834,8 @@ mod event_protocol_tests {
             .expect("prompt");
 
         let expected = vec![
-            "<task-notification>Background task #3 finished: cargo build — exit code 0\
-             </task-notification>"
+            "<task-notification>\nBackground task #3 finished: cargo build — exit code 0\
+             \n</task-notification>"
                 .to_string(),
             "hello".to_string(),
         ];
@@ -4946,14 +4952,15 @@ mod event_protocol_tests {
              inference={second_inference_idx})"
         );
 
-        // Body shape: the pre-rendered body verbatim inside the tag.
+        // Body shape: the pre-rendered body verbatim inside the tag,
+        // with the tag delimiters on their own lines.
         let AgentEvent::MessageEnd { message, .. } = &events[notice_end_idx] else {
             unreachable!()
         };
         assert_eq!(
             user_text(message).unwrap(),
-            "<task-notification>Background task #1 finished: sleep 1 — exit code 0\
-             </task-notification>"
+            "<task-notification>\nBackground task #1 finished: sleep 1 — exit code 0\
+             \n</task-notification>"
         );
         // The matching MessageStart fired right before the end.
         assert!(matches!(
@@ -4998,7 +5005,7 @@ mod event_protocol_tests {
             vec![
                 (
                     AgentId::Sub(2),
-                    "<task-notification>task #5 done</task-notification>".to_string()
+                    "<task-notification>\ntask #5 done\n</task-notification>".to_string()
                 ),
                 (AgentId::Sub(2), "work".to_string()),
             ]
@@ -5080,7 +5087,7 @@ mod event_protocol_tests {
 
         // The drained notice is the turn's user-role message.
         let first = user_text(&agent.messages()[0]).expect("first message is the notice");
-        assert!(first.starts_with("<task-notification>Background task #2"));
+        assert!(first.starts_with("<task-notification>\nBackground task #2"));
         assert!(!registry.has_notices(AgentId::Main));
     }
 
