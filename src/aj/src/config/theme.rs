@@ -652,6 +652,18 @@ pub struct Theme {
     bg: HashMap<ThemeBg, String>,
 }
 
+/// Re-emit a background SGR `prefix` after every escape in `text`
+/// that clears the background: `\x1b[0m` (full reset) and `\x1b[49m`
+/// (bg reset). Without this, embedded resets would drop the row tint
+/// for the rest of the line.
+fn reassert_bg(prefix: &str, text: &str) -> String {
+    if prefix.is_empty() {
+        return text.to_string();
+    }
+    text.replace("\x1b[0m", &format!("\x1b[0m{prefix}"))
+        .replace("\x1b[49m", &format!("\x1b[49m{prefix}"))
+}
+
 impl Theme {
     /// The name carried in the JSON `name` field. Useful for
     /// "selected theme" indicators in any future settings UI.
@@ -674,9 +686,14 @@ impl Theme {
 
     /// Wrap `text` in the SGR escape for the given background
     /// token plus the matching reset.
+    ///
+    /// The background is re-asserted after any embedded escape that
+    /// clears it, so `text` may carry full SGR resets (e.g. syntect-
+    /// highlighted code lines end in `\x1b[0m`) without punching
+    /// holes in a tinted row.
     pub fn bg(&self, token: ThemeBg, text: &str) -> String {
         let prefix = self.bg.get(&token).map(|s| s.as_str()).unwrap_or("");
-        format!("{prefix}{text}\x1b[49m")
+        format!("{prefix}{}\x1b[49m", reassert_bg(prefix, text))
     }
 
     /// Build a closure that applies the given foreground token to
@@ -689,10 +706,10 @@ impl Theme {
     }
 
     /// Build a closure that applies the given background token to
-    /// arbitrary text.
+    /// arbitrary text. Same embedded-reset handling as [`Self::bg`].
     pub fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String> {
         let prefix = self.bg.get(&token).cloned().unwrap_or_default();
-        Arc::new(move |s: &str| format!("{prefix}{s}\x1b[49m"))
+        Arc::new(move |s: &str| format!("{prefix}{}\x1b[49m", reassert_bg(&prefix, s)))
     }
 
     /// Parse a JSON theme document. The default [`ColorMode`] is
@@ -1347,6 +1364,34 @@ pub fn editor_border_color_for_bash_mode(theme: &ThemeHandle) -> Arc<dyn Fn(&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bg_is_reasserted_after_embedded_resets() {
+        let theme = Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
+            .expect("dark.json must parse");
+        // Extract the raw bg prefix by painting an empty string.
+        let prefix = theme
+            .bg(ThemeBg::UserMessageBg, "")
+            .strip_suffix("\x1b[49m")
+            .expect("bg paint ends in bg reset")
+            .to_string();
+        assert!(!prefix.is_empty(), "test needs a token with a concrete bg");
+
+        // A full SGR reset mid-row (the shape syntect-highlighted code
+        // lines carry) must not drop the tint for the rest of the row.
+        let painted = theme.bg(ThemeBg::UserMessageBg, "code\x1b[0m padding");
+        assert!(
+            painted.contains(&format!("\x1b[0m{prefix}")),
+            "bg prefix re-asserted after full reset: {painted:?}",
+        );
+
+        // Same for an explicit bg reset embedded in the content.
+        let painted = theme.bg(ThemeBg::UserMessageBg, "span\x1b[49m tail");
+        assert!(
+            painted.contains(&format!("\x1b[49m{prefix}")),
+            "bg prefix re-asserted after bg reset: {painted:?}",
+        );
+    }
 
     #[test]
     fn dark_palette_loads() {
