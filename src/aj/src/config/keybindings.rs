@@ -90,6 +90,12 @@ pub const ACTION_AGENT_PICKER: &str = "aj.agent.open";
 /// toggle's key and feel.
 pub const ACTION_AGENT_TOGGLE_SCOPE: &str = "aj.agent.toggle_scope";
 
+/// Kills the background task selected in the agent picker. Default
+/// binding: `ctrl+k`. Handled inside the agent-picker overlay
+/// (contextual; only the focused picker reads it); the host routes
+/// the resulting outcome to the task registry's kill.
+pub const ACTION_TASK_KILL: &str = "aj.task.kill";
+
 /// Built-in `aj`-level keybinding definitions.
 ///
 /// Returned as a fresh `Vec` so callers can extend or filter before
@@ -132,6 +138,10 @@ pub fn aj_keybindings() -> KeybindingDefinitions {
         (
             ACTION_AGENT_TOGGLE_SCOPE.to_string(),
             K::new("ctrl+t", "Toggle agent-picker scope (running / all)"),
+        ),
+        (
+            ACTION_TASK_KILL.to_string(),
+            K::new("ctrl+k", "Kill the selected background task"),
         ),
     ]
 }
@@ -228,6 +238,12 @@ mod tests {
             kbm.get_keys(ACTION_AGENT_TOGGLE_SCOPE),
             &["ctrl+t".to_string()]
         );
+    }
+
+    #[test]
+    fn aj_task_kill_defaults_to_ctrl_k() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(kbm.get_keys(ACTION_TASK_KILL), &["ctrl+k".to_string()]);
     }
 
     #[test]

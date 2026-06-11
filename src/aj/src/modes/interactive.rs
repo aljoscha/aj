@@ -2582,12 +2582,13 @@ fn subtitle_confirm_close() -> String {
 
 /// Per-frame subtitle for the agent picker, resolved by the overlay
 /// via `with_dynamic_subtitle`: the scope-toggle hint names the scope
-/// the chord would switch *to*, so it flips along with the list.
+/// the chord would switch *to*, so it flips along with the list, and
+/// the task-kill hint only appears when the picker has a running
+/// task row the chord could act on.
 fn subtitle_agent_picker(child: &dyn aj_tui::component::Component) -> String {
-    let showing_all = child
-        .as_any()
-        .downcast_ref::<AgentPickerComponent>()
-        .is_some_and(AgentPickerComponent::showing_all);
+    let picker = child.as_any().downcast_ref::<AgentPickerComponent>();
+    let showing_all = picker.is_some_and(AgentPickerComponent::showing_all);
+    let has_tasks = picker.is_some_and(AgentPickerComponent::has_killable_tasks);
     let confirm = aj_tui::keybindings::format_action_shortcut("tui.input.submit")
         .unwrap_or_else(|| "Enter".to_string());
     let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
@@ -2601,7 +2602,18 @@ fn subtitle_agent_picker(child: &dyn aj_tui::component::Component) -> String {
     } else {
         "all agents"
     };
-    format!("{confirm} to observe  \u{2022}  {scope} {scope_target}  \u{2022}  {cancel} to close")
+    let kill_hint = if has_tasks {
+        let kill = aj_tui::keybindings::format_action_shortcut(
+            crate::config::keybindings::ACTION_TASK_KILL,
+        )
+        .unwrap_or_else(|| "Ctrl+K".to_string());
+        format!("{kill} kill task  \u{2022}  ")
+    } else {
+        String::new()
+    };
+    format!(
+        "{confirm} to observe  \u{2022}  {scope} {scope_target}  \u{2022}  {kill_hint}{cancel} to close"
+    )
 }
 
 /// Per-frame subtitle for the prompt-history overlay, resolved by the
@@ -3186,10 +3198,12 @@ async fn handle_slash_command(
         SlashAction::OpenAgentPicker => {
             // Snapshot the known agents and the active view from the
             // pump (reads through the `ChatView`); never touches the
-            // agent, so it's safe mid-turn.
+            // agent, so it's safe mid-turn. Tasks come from the
+            // pump's transient task tracking (registry-independent).
             let agents = world.pump.agents(tui);
+            let tasks = world.pump.tasks();
             let active = world.pump.active_view(tui);
-            let inner = AgentPickerComponent::new(select_list_theme(theme), agents, active);
+            let inner = AgentPickerComponent::new(select_list_theme(theme), agents, tasks, active);
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Agents",
@@ -4457,6 +4471,63 @@ async fn handle_selector_outcome(
                         session_request: None,
                     }
                 }
+                Some(AgentPickerOutcome::ConfirmedTask(id)) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.hide_overlay(&parent.handle);
+                    }
+                    // Jump to the owning agent's transcript, which
+                    // holds the task's live launch cell. The chat is
+                    // terminal scrollback, so there is no app-side
+                    // viewport to position; the live-tailing cell is
+                    // at (or near) the bottom of the view.
+                    if let Some(owner) = world.pump.task_owner(id) {
+                        world.pump.set_active_view(tui, owner);
+                        apply_editor_agent_marker(tui, owner);
+                        apply_editor_border_for_view(tui, theme, &world.pump, &run_config, owner);
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                        session_request: None,
+                    }
+                }
+                Some(AgentPickerOutcome::KillTask(id)) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.hide_overlay(&parent.handle);
+                    }
+                    // The registry cancels the task's token; the
+                    // driver kills the process group, flips the
+                    // status, and the resulting `TaskEnd` freezes the
+                    // cell — no pump bookkeeping to update here. The
+                    // picker rows are a snapshot from open time, so
+                    // consult the live status: the task may have
+                    // finished while the picker was up.
+                    let live_status = world
+                        .task_registry
+                        .snapshot()
+                        .into_iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.status);
+                    let notice = match live_status {
+                        Some(aj_agent::tool::TaskStatus::Running) => {
+                            world.task_registry.kill(id);
+                            format!("Killing background task #{id}.")
+                        }
+                        Some(_) => format!("Background task #{id} already finished."),
+                        None => {
+                            format!("Background task #{id} is not in the registry (already gone?).")
+                        }
+                    };
+                    SelectorPollOutcome::Closed {
+                        notice: Some(notice),
+                        follow_up: None,
+                        start_login: None,
+                        session_request: None,
+                    }
+                }
                 Some(AgentPickerOutcome::Cancelled) => {
                     tui.hide_overlay(&handle);
                     if let Some(parent) = parent_palette {
@@ -5422,6 +5493,82 @@ mod tests {
         );
         let cfg = run_config.lock().expect("run config mutex poisoned");
         assert_eq!(cfg.model_info.id, "scripted", "run config untouched");
+    }
+
+    // ---- Agent picker: background tasks ------------------------------------
+
+    /// The picker's kill outcome routes through the task registry:
+    /// the task's cancel token fires and the close notice names the
+    /// task. (The driver, not the host, flips the status and emits
+    /// `TaskEnd` — with no driver attached the status stays
+    /// `Running` here, which is fine: we assert the cancellation.)
+    #[tokio::test]
+    async fn agent_picker_kill_outcome_cancels_the_registry_task() {
+        struct NoOutput;
+        impl aj_agent::tool::TaskOutputSource for NoOutput {
+            fn snapshot(&self) -> aj_agent::tool::TaskRead {
+                aj_agent::tool::TaskRead::default()
+            }
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("unused")]);
+        let mut world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+
+        let (task_id, cancel) = world.task_registry.register(
+            AgentId::Main,
+            aj_agent::tool::TaskKind::Bash {
+                command: "sleep 5".into(),
+            },
+            "sleep 5".into(),
+            Arc::new(NoOutput),
+        );
+        assert!(!cancel.is_cancelled());
+
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let inner = AgentPickerComponent::new(
+            select_list_theme(&theme),
+            Vec::new(),
+            Vec::new(),
+            AgentId::Main,
+        );
+        let outcome = inner.outcome_handle();
+        let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
+        *outcome.lock().expect("outcome poisoned") = Some(AgentPickerOutcome::KillTask(task_id));
+
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let result = handle_selector_outcome(
+            &mut tui,
+            OpenSelector::AgentPicker {
+                handle,
+                outcome,
+                parent_palette: None,
+            },
+            &auth,
+            Arc::clone(&run_config),
+            Arc::new(std::sync::Mutex::new(Config::default())),
+            &[],
+            &mut world,
+            &theme,
+            &RenderSettings::new(false, false, true),
+            &mut ThemeWatch {
+                _guard: None,
+                rx: None,
+            },
+        )
+        .await;
+
+        assert!(cancel.is_cancelled(), "kill cancels the task's token");
+        match result {
+            SelectorPollOutcome::Closed { notice, .. } => {
+                assert_eq!(notice, Some(format!("Killing background task #{task_id}.")))
+            }
+            _ => panic!("expected the selector to close"),
+        }
     }
 
     // ---- Wake triggers ----------------------------------------------------

@@ -34,13 +34,15 @@ pub struct ContextUsage {
     pub context_window: u64,
 }
 
-/// Count of currently-running sub-agents plus the resolved key
-/// label that opens the agent picker. Rendered as a compact
-/// `N agent (alt+a)` / `N agents (alt+a)` part. `running == 0`
+/// Counts of currently-running sub-agents and background (bash)
+/// tasks, plus the resolved key label that opens the agent picker.
+/// Rendered as a compact `2 agents, 1 task (alt+a)` part; each
+/// count is shown only when nonzero. `agents == 0 && tasks == 0`
 /// is never passed; callers set `None` to clear the indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentActivity {
-    pub running: usize,
+    pub agents: usize,
+    pub tasks: usize,
     /// Resolved keybinding label (e.g. "alt+a"); the caller
     /// resolves it from the keybindings manager so the footer
     /// stays free of keybinding dependencies.
@@ -154,11 +156,20 @@ impl AsRef<dyn Any> for Footer {
 }
 
 /// Format `AgentActivity` as `"1 agent (alt+a)"` /
-/// `"3 agents (alt+a)"`. Plain text so it inherits the dim wrap
-/// applied in [`Component::render`], like the model/cwd parts.
+/// `"2 agents, 1 task (alt+a)"`; each count appears only when
+/// nonzero. Plain text so it inherits the dim wrap applied in
+/// [`Component::render`], like the model/cwd parts.
 fn render_agent_activity(a: &AgentActivity) -> String {
-    let noun = if a.running == 1 { "agent" } else { "agents" };
-    format!("{} {} ({})", a.running, noun, a.open_hint)
+    let mut parts = Vec::new();
+    if a.agents > 0 {
+        let noun = if a.agents == 1 { "agent" } else { "agents" };
+        parts.push(format!("{} {}", a.agents, noun));
+    }
+    if a.tasks > 0 {
+        let noun = if a.tasks == 1 { "task" } else { "tasks" };
+        parts.push(format!("{} {}", a.tasks, noun));
+    }
+    format!("{} ({})", parts.join(", "), a.open_hint)
 }
 
 /// Format `usage` as e.g. `"12.3k/200k (6.1%)"`. The percentage
@@ -255,7 +266,8 @@ mod tests {
     fn agent_activity_singular_renders_with_hint() {
         let mut f = Footer::new();
         f.set_agent_activity(Some(AgentActivity {
-            running: 1,
+            agents: 1,
+            tasks: 0,
             open_hint: "alt+a".into(),
         }));
         let lines = f.render(80);
@@ -268,12 +280,48 @@ mod tests {
     fn agent_activity_plural_renders_with_hint() {
         let mut f = Footer::new();
         f.set_agent_activity(Some(AgentActivity {
-            running: 3,
+            agents: 3,
+            tasks: 0,
             open_hint: "alt+a".into(),
         }));
         let lines = f.render(80);
         let visible = lines[0].replace("\x1b[2m", "").replace("\x1b[22m", "");
         assert!(visible.contains("3 agents (alt+a)"), "got {visible:?}");
+    }
+
+    /// The task count renders alone when no sub-agents run, with
+    /// singular/plural handled like the agent part.
+    #[test]
+    fn task_activity_alone_renders_with_hint() {
+        let mut f = Footer::new();
+        f.set_agent_activity(Some(AgentActivity {
+            agents: 0,
+            tasks: 1,
+            open_hint: "alt+a".into(),
+        }));
+        let visible = f.render(80)[0]
+            .replace("\x1b[2m", "")
+            .replace("\x1b[22m", "");
+        assert!(visible.contains("1 task (alt+a)"), "got {visible:?}");
+        assert!(!visible.contains("agent"), "got {visible:?}");
+    }
+
+    /// Both counts render comma-separated, agents first.
+    #[test]
+    fn agent_and_task_activity_render_both_counts() {
+        let mut f = Footer::new();
+        f.set_agent_activity(Some(AgentActivity {
+            agents: 2,
+            tasks: 2,
+            open_hint: "alt+a".into(),
+        }));
+        let visible = f.render(80)[0]
+            .replace("\x1b[2m", "")
+            .replace("\x1b[22m", "");
+        assert!(
+            visible.contains("2 agents, 2 tasks (alt+a)"),
+            "got {visible:?}"
+        );
     }
 
     /// The indicator alone counts as a part, so a footer with only
@@ -282,7 +330,8 @@ mod tests {
     fn agent_activity_alone_renders_a_row() {
         let mut f = Footer::new();
         f.set_agent_activity(Some(AgentActivity {
-            running: 2,
+            agents: 2,
+            tasks: 0,
             open_hint: "alt+a".into(),
         }));
         let lines = f.render(80);
@@ -312,7 +361,8 @@ mod tests {
             context_window: 200_000,
         }));
         f.set_agent_activity(Some(AgentActivity {
-            running: 3,
+            agents: 3,
+            tasks: 1,
             open_hint: "alt+a".into(),
         }));
         for width in [0usize, 1, 2, 10, 40, 64, 80, 200] {

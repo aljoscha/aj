@@ -572,9 +572,11 @@ the supervisor) over `nohup`-style detachment.
   `"2 agents, 1 task (alt+a)"` (each part shown only when nonzero).
 - **Picker**: the alt+a picker grows task entries beneath the agent
   entries — status glyph, label (command tail), runtime. Selecting a
-  bash-task entry jumps the chat view to the owning agent's transcript
-  scrolled to the task's cell. A kill action on the selected task
-  (`ctrl+k`) fires `registry.kill(id)`.
+  bash-task entry jumps the chat view to the owning agent's
+  transcript (the chat renders into terminal scrollback, so there is
+  no viewport to position on the cell; the live-tailing cell sits at
+  or near the bottom of the switched-to view). A kill action on the
+  selected task (`ctrl+k`) fires `registry.kill(id)`.
 - **Live output**: `TaskOutput { call_id, partial }` updates the
   existing bash tool cell for the originating call in place — the cell
   keeps live-tailing after `ToolExecutionEnd`, then freezes on

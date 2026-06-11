@@ -47,7 +47,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use aj_agent::tool::ToolDetails;
+use aj_agent::tool::{TaskStatus, ToolDetails};
 use aj_models::types::{ImageContent, UserContent};
 use aj_tools::sanitize_terminal_output;
 use aj_tui::ansi::wrap_text_with_ansi;
@@ -269,6 +269,14 @@ pub struct ToolExecutionComponent {
     /// [`Self::reconcile_settings`]; sourced from the
     /// `image_show_in_terminal` config key.
     show_image_in_terminal: bool,
+    /// Terminal status of the background task this cell launched,
+    /// set by [`Self::finish_task`] when the task's `TaskEnd`
+    /// arrives. Renders into the header's task badge and freezes
+    /// the cell: once set, further partial updates are ignored.
+    /// Always `None` for foreground tool calls and for resumed
+    /// transcripts (task events are transient, so a replayed launch
+    /// cell keeps its started snapshot and plain `[task #N]` badge).
+    task_status: Option<TaskStatus>,
 }
 
 /// Snapshot of the inline image attachment to render alongside
@@ -338,6 +346,7 @@ impl ToolExecutionComponent {
             cell_pixel_size,
             image_payload: None,
             show_image_in_terminal,
+            task_status: None,
         };
         me.bubble.set_bg_fn(me.make_bg_box());
         me.rebuild_children();
@@ -346,9 +355,18 @@ impl ToolExecutionComponent {
 
     /// Replace the rendered body with the partial snapshot in
     /// `details`. Called from
-    /// [`aj_agent::events::AgentEvent::ToolExecutionUpdate`] (today
-    /// only `bash` emits these).
+    /// [`aj_agent::events::AgentEvent::ToolExecutionUpdate`] for
+    /// foreground progress and from
+    /// [`aj_agent::events::AgentEvent::TaskOutput`] for a background
+    /// task's live tail (which keeps flowing after the launch call's
+    /// `ToolExecutionEnd` — the cell deliberately accepts updates
+    /// past finalization for that reason).
     pub fn update_partial(&mut self, details: &ToolDetails, content: &[UserContent]) {
+        // Frozen: the background task reached its terminal status,
+        // so a straggling snapshot must not reopen the cell.
+        if self.task_status.is_some() {
+            return;
+        }
         self.reconcile_settings();
         self.body = render_details_body(details, self.expanded);
         self.image_payload = derive_image_payload(details, content);
@@ -426,8 +444,26 @@ impl ToolExecutionComponent {
         self.invalidate();
     }
 
-    /// Render the header line (`status tool(args)`). Kept private
-    /// so the header style is uniform across every variant.
+    /// Freeze a background-task cell with the task's terminal
+    /// status: the header badge gains the status text, the bubble
+    /// repaints per the outcome, and further partial updates are
+    /// ignored. Called from
+    /// [`aj_agent::events::AgentEvent::TaskEnd`].
+    pub fn finish_task(&mut self, status: TaskStatus) {
+        self.task_status = Some(status);
+        self.status = match status {
+            TaskStatus::Exited(Some(0)) => Status::Succeeded,
+            // `Running` can't legitimately reach a TaskEnd; keep the
+            // current paint rather than inventing an outcome.
+            TaskStatus::Running => self.status,
+            TaskStatus::Exited(_) | TaskStatus::Killed => Status::Failed,
+        };
+        self.bubble.set_bg_fn(self.make_bg_box());
+        self.rebuild_children();
+    }
+
+    /// Render the header line (`status tool(args) [task #N]`). Kept
+    /// private so the header style is uniform across every variant.
     fn header_line(&self) -> String {
         let glyph = match self.status {
             Status::Started => style::dim("…"),
@@ -435,7 +471,34 @@ impl ToolExecutionComponent {
             Status::Failed => style::red("✗"),
         };
         let name = style::bold(&self.tool_name);
-        format!("{glyph} {name}({})", style::dim(&self.args_pretty))
+        let mut line = format!("{glyph} {name}({})", style::dim(&self.args_pretty));
+        if let Some(badge) = self.task_badge() {
+            line.push(' ');
+            line.push_str(&style::dim(&badge));
+        }
+        line
+    }
+
+    /// The header's background-task badge: `[task #N]` while the
+    /// task runs (or for a resumed launch cell, where the terminal
+    /// status is unknown), `[task #N · exited 0]` etc. once
+    /// [`Self::finish_task`] recorded the outcome. `None` for
+    /// foreground tool calls — the task id rides on the
+    /// [`ToolDetails::Bash`] payload, so its presence is what marks
+    /// the cell as a background launch.
+    fn task_badge(&self) -> Option<String> {
+        let ToolDetails::Bash {
+            task_id: Some(id), ..
+        } = self.last_details.as_ref()?
+        else {
+            return None;
+        };
+        Some(match self.task_status {
+            None | Some(TaskStatus::Running) => format!("[task #{id}]"),
+            Some(TaskStatus::Exited(Some(code))) => format!("[task #{id} · exited {code}]"),
+            Some(TaskStatus::Exited(None)) => format!("[task #{id} · terminated by signal]"),
+            Some(TaskStatus::Killed) => format!("[task #{id} · killed]"),
+        })
     }
 
     /// Build the boxed bg closure that matches the current status.
@@ -1213,6 +1276,129 @@ mod tests {
             assert!(
                 w <= width,
                 "line {i} exceeds width: {w} > {width}: {line:?}",
+            );
+        }
+    }
+
+    /// `ToolDetails::Bash` payload with the given task id and
+    /// stdout; the other fields stay at their background-launch
+    /// defaults.
+    fn bash_task_details(stdout: &str, task_id: Option<usize>) -> ToolDetails {
+        ToolDetails::Bash {
+            command: "sleep 5".into(),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code: None,
+            truncated: false,
+            full_output_path: None,
+            stdout_truncation: None,
+            stderr_truncation: None,
+            task_id,
+        }
+    }
+
+    #[test]
+    fn bash_task_id_renders_a_header_badge() {
+        // The badge marks the cell as a background launch. It must
+        // render off the persisted `ToolDetails::Bash.task_id`
+        // alone (the resume path has no task events and no
+        // registry), so a bare `update_result` is the whole setup.
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
+        c.update_result(&bash_task_details("", Some(3)), &[], false);
+        let joined = c
+            .render(80)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("[task #3]"), "{joined:?}");
+
+        // Foreground calls (no task id) carry no badge.
+        c.update_result(&bash_task_details("", None), &[], false);
+        let joined = c
+            .render(80)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("[task #"), "{joined:?}");
+    }
+
+    #[test]
+    fn task_cell_live_tails_after_result_then_freezes_on_finish() {
+        let mut c = ToolExecutionComponent::new(
+            "bash".to_string(),
+            &serde_json::json!({}),
+            &theme(),
+            settings(true),
+        );
+        // Launch result (the "started" snapshot) finalizes the call,
+        // but a background cell keeps accepting partial updates.
+        c.update_result(&bash_task_details("", Some(3)), &[], false);
+        c.update_partial(&bash_task_details("LIVETAIL", Some(3)), &[]);
+        let joined = c
+            .render(80)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("LIVETAIL"), "{joined:?}");
+
+        // The terminal status freezes the cell: badge gains the
+        // outcome, the glyph follows it, and stragglers are ignored.
+        c.finish_task(TaskStatus::Exited(Some(0)));
+        let joined = c
+            .render(80)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("[task #3 · exited 0]"), "{joined:?}");
+        assert!(
+            joined.lines().any(|l| l.trim_start().starts_with('✓')),
+            "{joined:?}"
+        );
+        c.update_partial(&bash_task_details("AFTERFREEZE", Some(3)), &[]);
+        let joined = c
+            .render(80)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("AFTERFREEZE"), "{joined:?}");
+        assert!(joined.contains("LIVETAIL"), "{joined:?}");
+    }
+
+    #[test]
+    fn task_failure_statuses_paint_the_failed_glyph() {
+        for (status, badge) in [
+            (TaskStatus::Killed, "[task #4 · killed]"),
+            (TaskStatus::Exited(Some(2)), "[task #4 · exited 2]"),
+            (TaskStatus::Exited(None), "[task #4 · terminated by signal]"),
+        ] {
+            let mut c = ToolExecutionComponent::new(
+                "bash".to_string(),
+                &serde_json::json!({}),
+                &theme(),
+                settings(true),
+            );
+            c.update_result(&bash_task_details("", Some(4)), &[], false);
+            c.finish_task(status);
+            let joined = c
+                .render(80)
+                .iter()
+                .map(|l| strip_ansi(l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(joined.contains(badge), "{status:?}: {joined:?}");
+            assert!(
+                joined.lines().any(|l| l.trim_start().starts_with('✗')),
+                "{status:?}: {joined:?}"
             );
         }
     }

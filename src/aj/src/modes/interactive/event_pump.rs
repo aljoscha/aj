@@ -23,11 +23,13 @@
 //!
 //! [`SubAgentBox`]: crate::modes::interactive::components::subagent_box::SubAgentBox
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
+use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
 use aj_agent::types::TokenUsage;
 use aj_models::registry::ModelInfo;
 use aj_models::streaming::AssistantMessageEvent;
@@ -39,6 +41,7 @@ use aj_tui::container::Container;
 use aj_tui::tui::Tui;
 
 use crate::config::theme::ChatTheme;
+use crate::modes::interactive::components::agent_picker::TaskPickerEntry;
 use crate::modes::interactive::components::assistant_message::{
     AssistantMessageComponent, BlockKind,
 };
@@ -70,6 +73,36 @@ struct AgentRender {
     /// Map of `tool_use_id` → index inside this agent's container of
     /// the matching [`ToolExecutionComponent`].
     tool_index: HashMap<String, usize>,
+}
+
+/// One background task tracked from [`AgentEvent::TaskStart`] /
+/// [`AgentEvent::TaskEnd`]. Drives the footer's task count, the
+/// picker's task rows, and the routing of task events to the
+/// launching tool call's transcript cell.
+struct TaskInfo {
+    kind: TaskKind,
+    /// Display label — the command line for bash tasks, the task
+    /// description for agent-backed ones.
+    label: String,
+    /// The agent that launched the task; its transcript holds the
+    /// launch cell.
+    owner: AgentId,
+    /// `tool_use_id` of the originating tool call, correlating task
+    /// events with the cell.
+    call_id: String,
+    status: TaskStatus,
+    /// When the pump saw `TaskStart`, for the picker's runtime column.
+    started_at: Instant,
+    /// When the pump saw `TaskEnd`; freezes the displayed runtime.
+    finished_at: Option<Instant>,
+    /// Index of the launch cell inside the owner's container,
+    /// snapshotted at `TaskStart` (containers only append, so it
+    /// stays valid). The owner's `tool_index` is cleared on its
+    /// `AgentEnd`, but a background task outlives the turn — this
+    /// snapshot is what keeps `TaskOutput` / `TaskEnd` routable
+    /// afterwards. `None` when the launching call has no cell (the
+    /// `agent` tool renders as a sub-agent box, not a tool bubble).
+    cell: Option<usize>,
 }
 
 /// Translates [`AgentEvent`]s into TUI mutations.
@@ -112,6 +145,13 @@ pub struct EventPump {
     /// continuations versus nested initial spawns. The pump keeps
     /// this set as literal truth.
     running_agents: HashSet<AgentId>,
+    /// Background tasks observed via [`AgentEvent::TaskStart`],
+    /// keyed by task id. Entries are kept (with their terminal
+    /// status) after `TaskEnd` so the picker's "all" scope can list
+    /// finished tasks; the footer counts only running
+    /// [`TaskKind::Bash`] entries. Task events are transient, so a
+    /// resumed session starts with an empty map.
+    tasks: BTreeMap<TaskId, TaskInfo>,
     /// Shared session-wide render settings (tool expansion,
     /// thinking-block fold, inline-image rendering). Cloned into
     /// every assistant / tool component the pump creates so they
@@ -158,6 +198,7 @@ impl EventPump {
             theme,
             agents: HashMap::new(),
             running_agents: HashSet::new(),
+            tasks: BTreeMap::new(),
             render_settings,
             footer_data: AgentFooters::new(main_settings, main_context_window),
             catalog,
@@ -179,20 +220,28 @@ impl EventPump {
         tui.request_render();
     }
 
-    /// Push the running-sub-agent indicator into the [`Footer`].
-    /// Shows `N agent(s) (key)` while at least one sub-agent runs,
-    /// where `key` is the resolved `aj.agent.open` shortcut; clears
-    /// the indicator when none are running. The count is derived
-    /// from `running_agents` (every running `Sub(_)` id) so it
-    /// stays an aggregate regardless of the active view.
+    /// Push the running-activity indicator into the [`Footer`].
+    /// Shows `N agents, M tasks (key)` while at least one sub-agent
+    /// or background bash task runs, where `key` is the resolved
+    /// `aj.agent.open` shortcut; clears the indicator when neither.
+    /// The agent count is derived from `running_agents` (every
+    /// running `Sub(_)` id) and the task count from the running
+    /// [`TaskKind::Bash`] entries — agent-backed tasks are excluded
+    /// because their sub-agent is already in the agent count.
     fn sync_agent_indicator(&self, tui: &mut Tui) {
-        let running = self
+        let agents = self
             .running_agents
             .iter()
             .filter(|a| matches!(a, AgentId::Sub(_)))
             .count();
-        let activity = (running > 0).then(|| AgentActivity {
-            running,
+        let tasks = self
+            .tasks
+            .values()
+            .filter(|t| matches!(t.kind, TaskKind::Bash { .. }) && t.status == TaskStatus::Running)
+            .count();
+        let activity = (agents + tasks > 0).then(|| AgentActivity {
+            agents,
+            tasks,
             open_hint: agent_picker_hint(),
         });
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
@@ -327,6 +376,32 @@ impl EventPump {
         tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .map(|c| c.agents())
             .unwrap_or_default()
+    }
+
+    /// Snapshot of the tracked background bash tasks (in id order)
+    /// for the agent picker. Agent-backed tasks are skipped: their
+    /// sub-agent already appears as an agent entry, so a task row
+    /// would duplicate it.
+    pub fn tasks(&self) -> Vec<TaskPickerEntry> {
+        self.tasks
+            .iter()
+            .filter(|(_, t)| matches!(t.kind, TaskKind::Bash { .. }))
+            .map(|(&id, t)| TaskPickerEntry {
+                id,
+                label: t.label.clone(),
+                status: t.status,
+                runtime: t
+                    .finished_at
+                    .unwrap_or_else(Instant::now)
+                    .duration_since(t.started_at),
+            })
+            .collect()
+    }
+
+    /// The agent that launched task `id`, for the picker's
+    /// jump-to-task action. `None` for unknown ids.
+    pub fn task_owner(&self, id: TaskId) -> Option<AgentId> {
+        self.tasks.get(&id).map(|t| t.owner)
     }
 
     /// The agent whose transcript is currently the main view.
@@ -571,16 +646,69 @@ impl EventPump {
                 }
             }
 
+            // ---- Background tasks. ----
+            //
+            // Transient events: persistence ignores them and replay
+            // never synthesizes them, so everything here is
+            // live-session-only state. A resumed transcript shows the
+            // persisted launch cell (with its task-id badge from the
+            // `ToolDetails::Bash` payload) and notices, while this
+            // map starts empty — nothing below may assume an entry
+            // exists for a cell that carries a badge.
+            AgentEvent::TaskStart {
+                agent_id,
+                task_id,
+                call_id,
+                kind,
+                label,
+            } => {
+                // Snapshot the launch cell's index now: the owner's
+                // `tool_index` is wiped on its `AgentEnd`, and task
+                // events keep arriving after the turn.
+                let cell = self
+                    .agents
+                    .get(agent_id)
+                    .and_then(|a| a.tool_index.get(call_id))
+                    .copied();
+                self.tasks.insert(
+                    *task_id,
+                    TaskInfo {
+                        kind: kind.clone(),
+                        label: label.clone(),
+                        owner: *agent_id,
+                        call_id: call_id.clone(),
+                        status: TaskStatus::Running,
+                        started_at: Instant::now(),
+                        finished_at: None,
+                        cell,
+                    },
+                );
+                self.sync_agent_indicator(tui);
+            }
+            AgentEvent::TaskOutput {
+                task_id, partial, ..
+            } => {
+                if let Some((owner, cell)) = self.task_cell(*task_id) {
+                    self.update_task_cell(tui, owner, cell, |c| c.update_partial(partial, &[]));
+                }
+            }
+            AgentEvent::TaskEnd {
+                task_id, status, ..
+            } => {
+                if let Some(info) = self.tasks.get_mut(task_id) {
+                    info.status = *status;
+                    info.finished_at = Some(Instant::now());
+                }
+                if let Some((owner, cell)) = self.task_cell(*task_id) {
+                    self.update_task_cell(tui, owner, cell, |c| c.finish_task(*status));
+                }
+                self.sync_agent_indicator(tui);
+            }
+
             // ---- Placeholders: events whose UI work isn't yet wired. ----
-            AgentEvent::TurnEnd { .. }
-            | AgentEvent::QueueUpdate { .. }
-            | AgentEvent::TaskStart { .. }
-            | AgentEvent::TaskOutput { .. }
-            | AgentEvent::TaskEnd { .. } => {
-                // Queue indicators, the `TurnEnd` summary, and the
-                // background-task surfaces (footer count, picker
-                // entries, live cell updates) land in follow-up
-                // commits. Holding the arms here keeps the
+            AgentEvent::TurnEnd { .. } | AgentEvent::QueueUpdate { .. } => {
+                // Queue indicators and the `TurnEnd` summary land in
+                // follow-up commits. Holding the arms here keeps the
                 // exhaustiveness check active so a newly-emitted
                 // event variant shows up as a compile error.
             }
@@ -962,6 +1090,43 @@ impl EventPump {
             return;
         };
         c.update_result(result, content, is_error);
+    }
+
+    /// Resolve task `id`'s launch cell: the owner plus the cell's
+    /// index in the owner's container. Prefers the live `tool_index`
+    /// (by `call_id`) and falls back to the index snapshotted at
+    /// `TaskStart`, which is what survives the owner's `AgentEnd`
+    /// clearing its tool bookkeeping.
+    fn task_cell(&self, id: TaskId) -> Option<(AgentId, usize)> {
+        let info = self.tasks.get(&id)?;
+        let cell = self
+            .agents
+            .get(&info.owner)
+            .and_then(|a| a.tool_index.get(&info.call_id))
+            .copied()
+            .or(info.cell)?;
+        Some((info.owner, cell))
+    }
+
+    /// Apply `f` to the [`ToolExecutionComponent`] at `cell` inside
+    /// `owner`'s transcript container, if present.
+    fn update_task_cell<F: FnOnce(&mut ToolExecutionComponent)>(
+        &self,
+        tui: &mut Tui,
+        owner: AgentId,
+        cell: usize,
+        f: F,
+    ) {
+        let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) else {
+            return;
+        };
+        let Some(container) = chat.agent_container_mut(owner) else {
+            return;
+        };
+        let Some(c) = container.get_mut_as::<ToolExecutionComponent>(cell) else {
+            return;
+        };
+        f(c);
     }
 
     /// Append a plain dim-styled notice line into `agent_id`'s
@@ -2253,6 +2418,358 @@ mod tests {
             rendered_footer(&mut tui).contains("2 agents"),
             "footer count is view-independent; got {:?}",
             rendered_footer(&mut tui),
+        );
+    }
+
+    // ---- Background tasks --------------------------------------------------
+
+    /// Full ANSI-strip (SGR sequences), unlike `rendered_footer`'s
+    /// fixed-code replacement: tool bubbles paint with arbitrary
+    /// truecolor backgrounds.
+    fn strip_ansi(s: &str) -> String {
+        let mut out: Vec<u8> = Vec::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'm' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("strip_ansi: surviving bytes remain valid UTF-8")
+    }
+
+    /// `ToolDetails::Bash` payload with the given task id and
+    /// stdout; the other fields stay at their background-launch
+    /// defaults.
+    fn bash_task_details(stdout: &str, task_id: Option<usize>) -> aj_agent::tool::ToolDetails {
+        aj_agent::tool::ToolDetails::Bash {
+            command: "sleep 5".into(),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code: None,
+            truncated: false,
+            full_output_path: None,
+            stdout_truncation: None,
+            stderr_truncation: None,
+            task_id,
+        }
+    }
+
+    fn task_start(owner: AgentId, task_id: usize, call_id: &str, kind: TaskKind) -> AgentEvent {
+        AgentEvent::TaskStart {
+            agent_id: owner,
+            task_id,
+            call_id: call_id.into(),
+            kind,
+            label: "sleep 5".into(),
+        }
+    }
+
+    fn task_end(owner: AgentId, task_id: usize, call_id: &str, status: TaskStatus) -> AgentEvent {
+        AgentEvent::TaskEnd {
+            agent_id: owner,
+            task_id,
+            call_id: call_id.into(),
+            status,
+            label: "sleep 5".into(),
+        }
+    }
+
+    /// Drive a background-bash launch into the pump: the tool call's
+    /// cell, the task registration, and the immediately-returning
+    /// started result (carrying the task id).
+    fn launch_bash_task(tui: &mut Tui, pump: &mut EventPump, task_id: usize, call_id: &str) {
+        pump.handle(
+            tui,
+            &AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: call_id.into(),
+                tool: "bash".into(),
+                args: serde_json::json!({"command": "sleep 5"}),
+            },
+        );
+        pump.handle(
+            tui,
+            &task_start(
+                AgentId::Main,
+                task_id,
+                call_id,
+                TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+            ),
+        );
+        pump.handle(
+            tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: call_id.into(),
+                tool: "bash".into(),
+                result: bash_task_details("", Some(task_id)),
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
+                is_error: false,
+            },
+        );
+    }
+
+    /// Render the launch cell at `idx` in the main transcript,
+    /// ANSI-stripped and newline-joined.
+    fn rendered_cell(tui: &mut Tui, idx: usize) -> String {
+        tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut()
+            .get_mut_as::<ToolExecutionComponent>(idx)
+            .expect("tool cell at index")
+            .render(80)
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Index of the single tool cell in the main transcript.
+    fn main_tool_cell(tui: &mut Tui) -> usize {
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
+        (0..chat.len())
+            .find(|&i| chat.get_mut_as::<ToolExecutionComponent>(i).is_some())
+            .expect("a tool cell in the main transcript")
+    }
+
+    #[test]
+    fn footer_counts_agents_and_bash_tasks_separately() {
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+
+        // One running sub-agent: agents-only indicator.
+        pump.handle(&mut tui, &sub_agent_start(1, "scripted", "scripted-model"));
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        let line = rendered_footer(&mut tui);
+        assert!(line.contains("1 agent ("), "got {line:?}");
+        assert!(
+            !line.contains(" task (") && !line.contains(" tasks ("),
+            "got {line:?}"
+        );
+
+        // A background bash task joins the indicator.
+        pump.handle(
+            &mut tui,
+            &task_start(
+                AgentId::Main,
+                1,
+                "c-bash",
+                TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+            ),
+        );
+        let line = rendered_footer(&mut tui);
+        assert!(line.contains("1 agent, 1 task ("), "got {line:?}");
+
+        // An agent-backed task is NOT double-counted: its sub-agent
+        // is what drives the agent count.
+        pump.handle(
+            &mut tui,
+            &task_start(
+                AgentId::Main,
+                2,
+                "c-agent",
+                TaskKind::Agent {
+                    agent_id: 1,
+                    task: "explore".into(),
+                },
+            ),
+        );
+        let line = rendered_footer(&mut tui);
+        assert!(line.contains("1 agent, 1 task ("), "got {line:?}");
+
+        // The bash task ends: back to agents-only.
+        pump.handle(
+            &mut tui,
+            &task_end(AgentId::Main, 1, "c-bash", TaskStatus::Exited(Some(0))),
+        );
+        let line = rendered_footer(&mut tui);
+        assert!(line.contains("1 agent ("), "got {line:?}");
+        assert!(
+            !line.contains(" task (") && !line.contains(" tasks ("),
+            "got {line:?}"
+        );
+
+        // The sub ends too: the indicator clears (the agent-kind
+        // task entry never counts).
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        let line = rendered_footer(&mut tui);
+        assert!(!line.contains("agent ("), "got {line:?}");
+        assert!(
+            !line.contains(" task (") && !line.contains(" tasks ("),
+            "got {line:?}"
+        );
+    }
+
+    #[test]
+    fn task_output_live_tails_the_cell_and_task_end_freezes_it() {
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        launch_bash_task(&mut tui, &mut pump, 1, "c1");
+        let cell = main_tool_cell(&mut tui);
+        assert!(rendered_cell(&mut tui, cell).contains("[task #1]"));
+
+        // The owning turn ends — this wipes the agent's tool_index,
+        // so subsequent routing exercises the TaskStart snapshot.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+
+        // Live tail lands in the existing cell.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                partial: bash_task_details("LIVETAIL", Some(1)),
+            },
+        );
+        let body = rendered_cell(&mut tui, cell);
+        assert!(body.contains("LIVETAIL"), "got:\n{body}");
+
+        // TaskEnd freezes the cell with the terminal-status badge;
+        // a straggling snapshot no longer lands.
+        pump.handle(
+            &mut tui,
+            &task_end(AgentId::Main, 1, "c1", TaskStatus::Exited(Some(0))),
+        );
+        let body = rendered_cell(&mut tui, cell);
+        assert!(body.contains("[task #1 · exited 0]"), "got:\n{body}");
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                partial: bash_task_details("AFTERFREEZE", Some(1)),
+            },
+        );
+        let body = rendered_cell(&mut tui, cell);
+        assert!(!body.contains("AFTERFREEZE"), "got:\n{body}");
+        assert!(body.contains("LIVETAIL"), "got:\n{body}");
+    }
+
+    #[test]
+    fn tasks_snapshot_lists_bash_tasks_with_status_and_owner() {
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &task_start(
+                AgentId::Main,
+                1,
+                "c1",
+                TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+            ),
+        );
+        pump.handle(
+            &mut tui,
+            &task_start(
+                AgentId::Sub(2),
+                2,
+                "c2",
+                TaskKind::Agent {
+                    agent_id: 2,
+                    task: "explore".into(),
+                },
+            ),
+        );
+
+        // Only the bash task surfaces as a picker entry; the agent
+        // task is represented by its sub-agent entry instead.
+        let tasks = pump.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, 1);
+        assert_eq!(tasks[0].label, "sleep 5");
+        assert_eq!(tasks[0].status, TaskStatus::Running);
+        assert_eq!(pump.task_owner(1), Some(AgentId::Main));
+        assert_eq!(pump.task_owner(2), Some(AgentId::Sub(2)));
+        assert_eq!(pump.task_owner(99), None);
+
+        // TaskEnd flips the snapshot's status but keeps the entry
+        // so the picker's "all" scope can list it.
+        pump.handle(
+            &mut tui,
+            &task_end(AgentId::Main, 1, "c1", TaskStatus::Killed),
+        );
+        let tasks = pump.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, TaskStatus::Killed);
+    }
+
+    #[test]
+    fn resumed_launch_cell_renders_badge_without_task_tracking() {
+        // Resume fidelity: task events are transient, so replay only
+        // delivers the persisted launch result (a `ToolExecutionEnd`
+        // without a preceding Start). The cell must still carry its
+        // task-id badge, while the pump tracks no task — nothing may
+        // assume a registry or a `tasks` entry exists for a badged
+        // cell.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "c-resumed".into(),
+                tool: "bash".into(),
+                result: bash_task_details("", Some(7)),
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
+                is_error: false,
+            },
+        );
+        let cell = main_tool_cell(&mut tui);
+        assert!(rendered_cell(&mut tui, cell).contains("[task #7]"));
+        assert!(pump.tasks().is_empty(), "no tracked tasks on resume");
+        assert_eq!(pump.task_owner(7), None);
+        // Task events without a prior `TaskStart` (impossible live,
+        // conceivable on weird replays) must be inert: no panic, no
+        // tracking, no footer indicator.
+        pump.handle(
+            &mut tui,
+            &task_end(AgentId::Main, 7, "c-resumed", TaskStatus::Exited(Some(0))),
+        );
+        assert!(pump.tasks().is_empty(), "unknown TaskEnd tracks nothing");
+        let line = rendered_footer(&mut tui);
+        assert!(
+            !line.contains(" task (") && !line.contains(" tasks ("),
+            "no task indicator; got {line:?}"
         );
     }
 
