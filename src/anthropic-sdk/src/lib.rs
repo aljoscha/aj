@@ -6,3 +6,4 @@
 pub mod client;
 pub mod messages;
 mod stealth;
+pub mod usage;

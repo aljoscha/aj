@@ -101,6 +101,9 @@ use crate::modes::interactive::components::skills_window::{
 use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
 };
+use crate::modes::interactive::components::usage_status::{
+    UsageStatusComponent, UsageStatusOutcomeHandle,
+};
 use crate::modes::interactive::editor_ext::{DEFAULT_MAX_ENTRIES, PromptHistory};
 use crate::modes::interactive::event_pump::{
     EventPump, set_editor_submit_enabled, take_submitted_prompt,
@@ -2154,6 +2157,14 @@ enum OpenSelector {
         outcome: AuthStatusOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
+    /// Read-only `/usage` overlay. Both Esc and Enter close it. The
+    /// usage reports stream in from a background fetch after the
+    /// overlay opens; closing early just drops the fetch's receiver.
+    UsageStatus {
+        handle: OverlayHandle,
+        outcome: UsageStatusOutcomeHandle,
+        parent_palette: Option<ParentPalette>,
+    },
     /// Settings window (`/settings`). Stays open across changes: the
     /// host drains `changes` after every input event, applying and
     /// persisting each entry (and pushing a display fix through
@@ -2810,6 +2821,11 @@ fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
             parent_palette,
             ..
         }
+        | OpenSelector::UsageStatus {
+            handle,
+            parent_palette,
+            ..
+        }
         | OpenSelector::AgentPicker {
             handle,
             parent_palette,
@@ -3147,6 +3163,41 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
+        SlashAction::OpenUsageStatus => {
+            // The fetch hits the network, so it runs detached: the
+            // overlay opens immediately in its loading state and the
+            // task pokes the render loop when the reports land. If
+            // the user closes the overlay first, the send fails and
+            // the result is simply dropped.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let fetch_auth = auth.clone();
+            let render = tui.handle();
+            tokio::spawn(async move {
+                let statuses = crate::usage::collect_usage(&fetch_auth).await;
+                if tx.send(statuses).is_ok() {
+                    render.request_render();
+                }
+            });
+
+            let inner = UsageStatusComponent::new(select_list_theme(theme), rx);
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Usage",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            SlashHandled::Continue {
+                selector: Some(OpenSelector::UsageStatus {
+                    handle,
+                    outcome,
+                    parent_palette: parent_palette.clone(),
+                }),
+                notice: None,
+            }
+        }
         // Session-changing commands tear down the current world and
         // rebuild it, which must never abort in-flight work, so
         // refuse them mid-turn. The user can cancel the turn and
@@ -3464,6 +3515,7 @@ async fn handle_slash_command(
                         | OpenSelector::Help { .. }
                         | OpenSelector::AuthPicker { .. }
                         | OpenSelector::AuthStatus { .. }
+                        | OpenSelector::UsageStatus { .. }
                         | OpenSelector::Settings { .. }
                         | OpenSelector::Skills { .. },
                 ),
@@ -4478,6 +4530,36 @@ async fn handle_selector_outcome(
                     parent_palette,
                 }),
                 Some(AuthStatusOutcome::Closed) => {
+                    tui.hide_overlay(&handle);
+                    if let Some(parent) = parent_palette {
+                        tui.set_overlay_hidden(&parent.handle, false);
+                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
+                            handle: parent.handle,
+                            outcome: parent.outcome,
+                        });
+                    }
+                    SelectorPollOutcome::Closed {
+                        notice: None,
+                        follow_up: None,
+                        start_login: None,
+                        session_request: None,
+                    }
+                }
+            }
+        }
+        OpenSelector::UsageStatus {
+            handle,
+            outcome,
+            parent_palette,
+        } => {
+            use crate::modes::interactive::components::usage_status::UsageStatusOutcome;
+            match outcome.take() {
+                None => SelectorPollOutcome::StillOpen(OpenSelector::UsageStatus {
+                    handle,
+                    outcome,
+                    parent_palette,
+                }),
+                Some(UsageStatusOutcome::Closed) => {
                     tui.hide_overlay(&handle);
                     if let Some(parent) = parent_palette {
                         tui.set_overlay_hidden(&parent.handle, false);

@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
@@ -12,6 +13,7 @@ use crate::stealth::{
     CLAUDE_CODE_VERSION, apply_request_transformations, collect_caller_tool_names,
     reverse_map_event, reverse_map_message,
 };
+use crate::usage::OAuthUsage;
 
 const BASE_URL: &str = "https://api.anthropic.com";
 
@@ -138,11 +140,18 @@ impl Client {
         betas
     }
 
-    /// Build a request with common headers (auth, version, content-type,
-    /// and the configured + always-on beta headers).
+    /// Build a request for `POST /v1/messages` with the common headers.
     fn build_request(&self) -> reqwest::RequestBuilder {
-        let mut builder = self.client.post(format!("{}/v1/messages", self.base_url));
+        let builder = self.client.post(format!("{}/v1/messages", self.base_url));
+        self.apply_common_headers(builder)
+    }
 
+    /// Apply the headers shared by every endpoint: auth, version,
+    /// content-type, and the configured + always-on beta headers.
+    fn apply_common_headers(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
         match self.auth_mode {
             AuthMode::ApiKey => {
                 builder = builder.header("x-api-key", self.api_key.clone());
@@ -323,6 +332,54 @@ impl Client {
                 "unexpected status code ({status}): {error_text}"
             )))
         }
+    }
+
+    /// Fetch plan rate-limit utilization from `GET /api/oauth/usage`.
+    ///
+    /// Only meaningful in OAuth mode — the endpoint rejects plain API
+    /// keys, so we fail fast with a clear error instead of sending a
+    /// request that can only 401.
+    pub async fn oauth_usage(&self) -> Result<OAuthUsage, ClientError> {
+        if self.auth_mode != AuthMode::OAuth {
+            return Err(ClientError::InternalError(
+                "usage reporting requires OAuth authentication".to_string(),
+            ));
+        }
+
+        let builder = self
+            .client
+            .get(format!("{}/api/oauth/usage", self.base_url))
+            // The endpoint is a quick lookup; a tight timeout keeps a
+            // stalled request from hanging a UI that's waiting on it.
+            .timeout(Duration::from_secs(5));
+        let response = self.apply_common_headers(builder).send().await?;
+
+        let status = response.status();
+        if status.is_success() {
+            let text = response.text().await?;
+            return serde_json::from_str(&text).map_err(|err| {
+                ClientError::ParseError(format!("could not parse usage response: {err}"))
+            });
+        }
+
+        let http_status = status.as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let error_text = response.text().await?;
+        let error = match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+            Ok(error_response) => error_response.error,
+            Err(_) => ApiError::ApiError {
+                message: format!("request failed ({status}): {error_text}"),
+            },
+        };
+        Err(ClientError::ApiError {
+            error,
+            http_status,
+            retry_after,
+        })
     }
 }
 

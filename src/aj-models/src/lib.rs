@@ -25,6 +25,7 @@ pub mod streaming;
 pub mod tools;
 pub mod transform;
 pub mod types;
+pub mod usage;
 
 /// Thinking-policy enum used by the agent and the binary's UI to
 /// describe the user's preferred reasoning depth.

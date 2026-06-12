@@ -220,7 +220,10 @@ mod tests {
 
     #[test]
     fn renders_all_builtin_commands_when_query_empty() {
-        let mut p = CommandPaletteComponent::new(identity_theme(), 14);
+        // Sized to the catalog: this test needs every row visible,
+        // unlike the host, which gives the list a fixed height and
+        // lets it scroll.
+        let mut p = CommandPaletteComponent::new(identity_theme(), BUILTIN_COMMANDS.len());
         let body = p.render(80).join("\n");
         for cmd in BUILTIN_COMMANDS {
             assert!(
@@ -307,8 +310,10 @@ mod tests {
     #[test]
     fn label_column_stable_across_filter() {
         // Pick a query that matches exactly one command. `quit` is a
-        // single-row hit in the current catalog.
-        let mut p_unfiltered = CommandPaletteComponent::new(identity_theme(), 14);
+        // single-row hit in the current catalog. Sized to the catalog
+        // so the quit row is visible before filtering.
+        let mut p_unfiltered =
+            CommandPaletteComponent::new(identity_theme(), BUILTIN_COMMANDS.len());
         let unfiltered = p_unfiltered.render(80);
         let unfiltered_row =
             list_row_containing(&unfiltered, "quit").expect("unfiltered list contains quit row");

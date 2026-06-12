@@ -102,6 +102,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         action_id: None,
     },
     BuiltinCommand {
+        name: "usage",
+        title: "usage",
+        category: "auth",
+        description: "Show plan usage and rate-limit status for each provider.",
+        action_id: None,
+    },
+    BuiltinCommand {
         name: "resume",
         title: "resume",
         category: "session",
@@ -208,6 +215,10 @@ pub enum SlashAction {
     /// Open the read-only authentication-status overlay listing each
     /// provider's credential method and source.
     OpenAuthStatus,
+    /// Open the read-only usage overlay listing each provider's plan
+    /// usage and rate-limit windows. The reports load asynchronously
+    /// after the overlay opens.
+    OpenUsageStatus,
     /// Open the session selector overlay. The currently-active
     /// session is pre-selected; `Enter` swaps the agent over to the
     /// chosen session, `Esc` cancels.
@@ -271,6 +282,7 @@ pub fn dispatch(input: &str) -> SlashAction {
         "login" => SlashAction::OpenLoginSelector,
         "logout" => SlashAction::OpenLogoutSelector,
         "auth" => SlashAction::OpenAuthStatus,
+        "usage" => SlashAction::OpenUsageStatus,
         "resume" => SlashAction::OpenSessionSelector,
         "history" => SlashAction::OpenPromptHistory,
         "agents" => SlashAction::OpenAgentPicker,
@@ -450,6 +462,14 @@ mod tests {
         // equivalent.
         assert_eq!(dispatch("/auth"), SlashAction::OpenAuthStatus);
         assert_eq!(dispatch("/auth status"), SlashAction::OpenAuthStatus);
+    }
+
+    #[test]
+    fn dispatch_usage_opens_usage_status() {
+        assert_eq!(dispatch("/usage"), SlashAction::OpenUsageStatus);
+        assert_eq!(dispatch("  /usage  "), SlashAction::OpenUsageStatus);
+        // Trailing tokens are ignored — commands are zero-argument.
+        assert_eq!(dispatch("/usage anthropic"), SlashAction::OpenUsageStatus);
     }
 
     #[test]

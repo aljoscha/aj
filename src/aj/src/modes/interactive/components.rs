@@ -35,4 +35,5 @@ pub mod skills_window;
 pub mod subagent_box;
 pub mod thinking_selector;
 pub mod tool_execution;
+pub mod usage_status;
 pub mod user_message;
