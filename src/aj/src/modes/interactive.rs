@@ -2554,19 +2554,22 @@ fn persist_config(
 const PALETTE_OVERLAY_INNER_ROWS: usize = 17;
 
 /// Sizing/anchor used by the command palette and the compact pickers
-/// (model / thinking / help). Centered, fills ~70% of the terminal
-/// width with a 72-col floor and an 88-col ceiling so the box doesn't
-/// stretch uncomfortably wide on large monitors. Height is fixed at
-/// `PALETTE_OVERLAY_INNER_ROWS + 4` to match the stable height the
+/// (model / thinking / help). Centered, fills ~75% of the terminal
+/// width with a 72-col floor and a 100-col ceiling so the box doesn't
+/// stretch uncomfortably wide on large monitors. The ceiling is sized
+/// for the widest read-only page (`/usage`: provider prefix + window
+/// label + a "resets ... (Europe/Berlin)" description) to fit without
+/// truncation. Height is fixed at `PALETTE_OVERLAY_INNER_ROWS + 4` to
+/// match the stable height the
 /// [`aj_tui::components::overlay_window::OverlayWindow`] renders;
 /// pinning the compositor's height to the exact value keeps narrow
 /// terminals from reserving extra rows.
 fn palette_overlay_options() -> OverlayOptions {
     OverlayOptions {
         anchor: OverlayAnchor::Center,
-        width: Some(SizeValue::Percent(70.0)),
+        width: Some(SizeValue::Percent(75.0)),
         min_width: Some(72),
-        max_width: Some(88),
+        max_width: Some(100),
         max_height: Some(SizeValue::Absolute(PALETTE_OVERLAY_INNER_ROWS + 4)),
         ..OverlayOptions::default()
     }

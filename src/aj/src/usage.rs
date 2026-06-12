@@ -96,7 +96,8 @@ pub async fn collect_usage(auth: &AuthStorage) -> Vec<ProviderUsageStatus> {
     statuses
 }
 
-/// Render a window's status, e.g. `"12% used · resets 17:00 (UTC+2)"`.
+/// Render a window's status, e.g.
+/// `"12% used · resets 17:00 (Europe/Berlin)"`.
 pub fn format_window_status(used: f64, resets_at: Option<i64>, now_ms: i64) -> String {
     let percent = (used * 100.0).round().clamp(0.0, 100.0);
     match resets_at {
@@ -109,9 +110,9 @@ pub fn format_window_status(used: f64, resets_at: Option<i64>, now_ms: i64) -> S
 }
 
 /// Render a reset timestamp relative to `now`, in local time with
-/// the machine's UTC offset appended: `"17:00 (UTC+2)"` within the
-/// same day, `"Mon 09:00 (UTC+2)"` within a week, `"Jun 15 (UTC+2)"`
-/// beyond that, `"now"` when already past.
+/// the machine's timezone appended: `"17:00 (Europe/Berlin)"` within
+/// the same day, `"Mon 09:00 (Europe/Berlin)"` within a week,
+/// `"Jun 15 (Europe/Berlin)"` beyond that, `"now"` when already past.
 fn format_reset(reset_ms: i64, now_ms: i64) -> String {
     if reset_ms <= now_ms {
         return "now".to_string();
@@ -126,16 +127,30 @@ fn format_reset(reset_ms: i64, now_ms: i64) -> String {
         .map(|dt| dt.with_timezone(&Local))
         .unwrap_or_else(Local::now);
 
-    // The offset is taken from the reset instant, not from now, so a
-    // DST transition between the two renders the wall-clock time the
-    // reset will actually happen at.
-    let tz = utc_offset_label(reset.offset().local_minus_utc());
+    // The zone name covers DST by itself; the offset — used only by
+    // the fallback label — is taken from the reset instant rather
+    // than from now, so a DST transition between the two still
+    // renders correctly.
+    let tz = local_tz_label(reset.offset().local_minus_utc());
     if reset.date_naive() == now.date_naive() {
         format!("{} ({tz})", reset.format("%H:%M"))
     } else if reset_ms - now_ms < 7 * 24 * 3600 * 1000 {
         format!("{} ({tz})", reset.format("%a %H:%M"))
     } else {
         format!("{} {} ({tz})", month_abbrev(reset.month()), reset.day())
+    }
+}
+
+/// The machine's timezone as an IANA name (e.g. `"Europe/Berlin"`),
+/// falling back to a UTC-offset label built from `offset_secs` when
+/// the name can't be determined.
+fn local_tz_label(offset_secs: i32) -> String {
+    match iana_time_zone::get_timezone() {
+        // "Etc/UTC" is the zoneinfo spelling; plain "UTC" reads
+        // better.
+        Ok(name) if name == "Etc/UTC" => "UTC".to_string(),
+        Ok(name) => name,
+        Err(_) => utc_offset_label(offset_secs),
     }
 }
 
@@ -180,11 +195,11 @@ mod tests {
         dt.timestamp_millis()
     }
 
-    /// The machine-local offset label for `dt`, so the exact-string
+    /// The machine-local timezone label for `dt`, so the exact-string
     /// assertions below stay portable across test machines in any
     /// timezone.
     fn tz(dt: DateTime<Local>) -> String {
-        utc_offset_label(dt.offset().local_minus_utc())
+        local_tz_label(dt.offset().local_minus_utc())
     }
 
     #[test]

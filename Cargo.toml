@@ -29,6 +29,7 @@ eventsource-stream = "0.2"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 globset = "0.4"
 grep = "0.3"
+iana-time-zone = "0.1"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 itertools = "0.14.0"
