@@ -104,24 +104,23 @@ pub(crate) enum HintKind {
 
 /// Format the `… (N <kind> lines, <key> to expand)` hint line
 /// that signals a collapsed tool body has more content. The key is
-/// resolved at call time through the global keybindings registry;
-/// when no key is bound to [`crate::config::keybindings::ACTION_TOOLS_EXPAND`]
-/// the hint omits the parenthetical key reference rather than
-/// advertising an action the user can't trigger. The returned
-/// string is `style::dim`-wrapped so it reads as muted next to the
-/// surrounding body content.
+/// resolved and display-formatted at call time through the global
+/// keybindings registry; when no key is bound to
+/// [`crate::config::keybindings::ACTION_TOOLS_EXPAND`] the hint omits
+/// the parenthetical key reference rather than advertising an action
+/// the user can't trigger. The returned string is `style::dim`-wrapped
+/// so it reads as muted next to the surrounding body content.
 pub(crate) fn expand_hint(more: usize, kind: HintKind) -> String {
     let kb = aj_tui::keybindings::get();
     let keys = kb.get_keys(crate::config::keybindings::ACTION_TOOLS_EXPAND);
-    style::dim(&format_expand_hint(
-        more,
-        kind,
-        keys.first().map(String::as_str),
-    ))
+    let key = keys
+        .first()
+        .map(|k| aj_tui::keybindings::format_keybinding(k));
+    style::dim(&format_expand_hint(more, kind, key.as_deref()))
 }
 
-/// Pure formatting half of [`expand_hint`]; takes the resolved key
-/// (or `None` for the no-binding fallback) so it stays unit-testable
+/// Pure formatting half of [`expand_hint`]; takes the display-formatted
+/// key (or `None` for the no-binding fallback) so it stays unit-testable
 /// without touching the process-wide keybindings registry.
 fn format_expand_hint(more: usize, kind: HintKind, key: Option<&str>) -> String {
     let word = match kind {
@@ -1643,7 +1642,7 @@ mod tests {
             .iter()
             .find(|l| l.contains("more lines"))
             .expect("hint present");
-        assert!(hint.contains("alt+o"), "hint missing key: {hint:?}");
+        assert!(hint.contains("Alt+O"), "hint missing key: {hint:?}");
         assert!(hint.contains("20"), "hint missing count: {hint:?}");
 
         // Expand via the shared settings → the body cache is
@@ -1710,7 +1709,7 @@ mod tests {
             .iter()
             .find(|l| l.contains("earlier lines"))
             .expect("hint present");
-        assert!(hint.contains("alt+o"), "hint missing key: {hint:?}");
+        assert!(hint.contains("Alt+O"), "hint missing key: {hint:?}");
         assert!(hint.contains("15"), "hint missing count: {hint:?}");
     }
 
@@ -1728,8 +1727,8 @@ mod tests {
             "… (3 earlier lines)",
         );
         assert_eq!(
-            format_expand_hint(2, HintKind::More, Some("alt+o")),
-            "… (2 more lines, alt+o to expand)",
+            format_expand_hint(2, HintKind::More, Some("Alt+O")),
+            "… (2 more lines, Alt+O to expand)",
         );
     }
 }

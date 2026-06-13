@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(
             plain,
             vec![
-                "… (1 earlier lines, alt+o to expand)".to_string(),
+                "… (1 earlier lines, Alt+O to expand)".to_string(),
                 "b".to_string(),
                 "c".to_string(),
                 "d".to_string(),

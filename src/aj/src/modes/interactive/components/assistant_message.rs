@@ -383,7 +383,10 @@ impl AssistantMessageComponent {
             let kb = aj_tui::keybindings::get();
             let keys = kb.get_keys(crate::config::keybindings::ACTION_THINKING_TOGGLE);
             match keys.first() {
-                Some(key) => format!("{HIDDEN_THINKING_LABEL} ({key} to expand)"),
+                Some(key) => {
+                    let key = aj_tui::keybindings::format_keybinding(key);
+                    format!("{HIDDEN_THINKING_LABEL} ({key} to expand)")
+                }
                 None => HIDDEN_THINKING_LABEL.to_string(),
             }
         } else {
@@ -526,7 +529,7 @@ mod tests {
         let lines = c.render(80);
         assert_eq!(lines.len(), 1, "got {lines:?}");
         assert!(
-            lines[0].contains("alt+t") && lines[0].contains("to expand"),
+            lines[0].contains("Alt+T") && lines[0].contains("to expand"),
             "expected expand hint mentioning the key; got {:?}",
             lines[0]
         );
