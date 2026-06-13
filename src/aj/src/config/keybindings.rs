@@ -96,6 +96,25 @@ pub const ACTION_AGENT_TOGGLE_SCOPE: &str = "aj.agent.toggle_scope";
 /// the resulting outcome to the task registry's kill.
 pub const ACTION_TASK_KILL: &str = "aj.task.kill";
 
+/// Canonical display labels for keyboard chords that are deliberately
+/// fixed terminal conventions rather than rebindable actions.
+///
+/// The behavior behind these chords is hardcoded — `Ctrl+C` is matched
+/// as `is_ctrl('c')` in the interactive input loop (cancel the running
+/// turn, or quit when idle) and `Ctrl+Y` as `is_ctrl('y')` in the login
+/// dialog (copy the authorization URL). Because they are not registered
+/// with the keybindings manager, on-screen messages can't resolve them
+/// through `format_action_shortcut`. Keeping one spelling here gives
+/// those messages a single source of truth so they can't drift from the
+/// canonical `Ctrl+C` display form.
+pub mod fixed_keys {
+    /// Cancel the running turn, or quit when idle (SIGINT-style).
+    pub const CTRL_C: &str = "Ctrl+C";
+
+    /// Copy the authorization URL to the clipboard (login dialog).
+    pub const CTRL_Y: &str = "Ctrl+Y";
+}
+
 /// Built-in `aj`-level keybinding definitions.
 ///
 /// Returned as a fresh `Vec` so callers can extend or filter before

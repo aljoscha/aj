@@ -224,7 +224,8 @@ fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Option<Th
 /// never abort live work, so the commands are refused mid-turn.
 /// `what` names the action, e.g. `"switch sessions"`.
 fn session_busy_notice(what: &str) -> String {
-    format!("Can't {what} while a turn is running — press Ctrl+C to cancel it first.")
+    let cancel = crate::config::keybindings::fixed_keys::CTRL_C;
+    format!("Can't {what} while a turn is running — press {cancel} to cancel it first.")
 }
 
 /// Counts of running work a quit would tear down, for the Ctrl+C
@@ -267,8 +268,9 @@ fn quit_arm_notice(agents: usize, tasks: usize) -> String {
     if tasks > 0 {
         parts.push(format!("{tasks} task{}", if tasks == 1 { "" } else { "s" }));
     }
+    let quit = crate::config::keybindings::fixed_keys::CTRL_C;
     format!(
-        "{} still running — press Ctrl+C again to quit",
+        "{} still running — press {quit} again to quit",
         parts.join(" / ")
     )
 }
@@ -2860,8 +2862,9 @@ fn subtitle_login() -> String {
         .unwrap_or_else(|| "Enter".to_string());
     let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
         .unwrap_or_else(|| "Esc".to_string());
+    let copy = crate::config::keybindings::fixed_keys::CTRL_Y;
     format!(
-        "Ctrl+Y to copy URL  \u{2022}  {submit} to submit pasted code  \u{2022}  {cancel} to cancel"
+        "{copy} to copy URL  \u{2022}  {submit} to submit pasted code  \u{2022}  {cancel} to cancel"
     )
 }
 

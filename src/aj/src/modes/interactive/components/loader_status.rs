@@ -28,7 +28,12 @@ use aj_tui::tui::RenderHandle;
 /// The "(Ctrl+C to cancel)" suffix surfaces the cancellation
 /// affordance per `docs/aj-next-plan.md` §1.8 so users can discover
 /// it without consulting docs.
-pub const DEFAULT_MESSAGE: &str = "Working… (Ctrl+C to cancel)";
+pub fn default_message() -> String {
+    format!(
+        "Working… ({} to cancel)",
+        crate::config::keybindings::fixed_keys::CTRL_C
+    )
+}
 
 /// Component wrapping an [`aj_tui::components::loader::Loader`]
 /// with a small set of agent-aware affordances:
@@ -61,7 +66,7 @@ impl LoaderStatus {
             // Dim message text so the spinner draws the eye
             // rather than the word.
             Box::new(style::dim),
-            DEFAULT_MESSAGE,
+            &default_message(),
         );
         // `Loader::new` starts the animation pump immediately.
         // We want a quiet idle state, so stop it right away; the
@@ -91,9 +96,9 @@ impl LoaderStatus {
         self.loader.set_message(message);
     }
 
-    /// Reset the message to [`DEFAULT_MESSAGE`].
+    /// Reset the message to [`default_message`].
     pub fn reset_message(&mut self) {
-        self.set_message(DEFAULT_MESSAGE);
+        self.set_message(&default_message());
     }
 
     /// Whether the loader is currently animating.

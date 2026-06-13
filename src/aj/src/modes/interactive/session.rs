@@ -114,22 +114,25 @@ pub enum SessionEntry {
 /// The header notice announced when a world is installed. The
 /// wording depends on both how the log was obtained (create vs.
 /// resume) and whether this is the process's first session.
-fn header_notice(spec: &SessionSpec) -> &'static str {
+fn header_notice(spec: &SessionSpec) -> String {
     match spec {
         SessionSpec::Create {
             entry: SessionEntry::Startup,
-        } => "Chat with AJ — Ctrl+C to quit",
+        } => format!(
+            "Chat with AJ — {} to quit",
+            crate::config::keybindings::fixed_keys::CTRL_C
+        ),
         SessionSpec::Create {
             entry: SessionEntry::Switch,
-        } => "Fresh session",
+        } => "Fresh session".to_string(),
         SessionSpec::Resume {
             entry: SessionEntry::Startup,
             ..
-        } => "Resuming conversation",
+        } => "Resuming conversation".to_string(),
         SessionSpec::Resume {
             entry: SessionEntry::Switch,
             ..
-        } => "Resumed conversation",
+        } => "Resumed conversation".to_string(),
     }
 }
 
@@ -506,7 +509,7 @@ impl SessionWorld {
         }
         if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
             header.set_session_id(Some(self.session_id.clone()));
-            header.set_notice(Some(header_notice(spec).to_string()));
+            header.set_notice(Some(header_notice(spec)));
         }
         tui.request_render();
     }

@@ -186,10 +186,10 @@ impl Component for LoginDialogComponent {
         {
             crate::auth::copy_to_clipboard(url);
             self.auto_copied = true;
-            self.notice = Some(
-                "Copied the authorization URL to your clipboard (Ctrl+Y to copy again)."
-                    .to_string(),
-            );
+            let copy = crate::config::keybindings::fixed_keys::CTRL_Y;
+            self.notice = Some(format!(
+                "Copied the authorization URL to your clipboard ({copy} to copy again)."
+            ));
         }
 
         let mut out = Vec::new();
@@ -354,9 +354,10 @@ impl OAuthCallbacks for TuiOAuthCallbacks {
             if let Some(instructions) = info.instructions {
                 st.lines.push(LoginLine::Info(instructions.to_string()));
             }
-            st.lines.push(LoginLine::Info(
-                "If it doesn't open, click or copy (Ctrl+Y) this URL:".to_string(),
-            ));
+            st.lines.push(LoginLine::Info(format!(
+                "If it doesn't open, click or copy ({}) this URL:",
+                crate::config::keybindings::fixed_keys::CTRL_Y
+            )));
             st.lines.push(LoginLine::Url(info.url.to_string()));
             st.url = Some(info.url.to_string());
         }
@@ -373,9 +374,13 @@ impl OAuthCallbacks for TuiOAuthCallbacks {
     }
 
     async fn on_manual_code_input(&self) -> Result<String, OAuthError> {
-        self.await_input(
-            "On another machine? Paste the full redirect URL (or code) here, then press Enter:",
-        )
+        // The dialog submits via `tui.input.submit`, so the prompt
+        // resolves that action's key rather than hardcoding "Enter".
+        let submit = keybindings::format_action_shortcut("tui.input.submit")
+            .unwrap_or_else(|| "Enter".to_string());
+        self.await_input(&format!(
+            "On another machine? Paste the full redirect URL (or code) here, then press {submit}:"
+        ))
         .await
     }
 
