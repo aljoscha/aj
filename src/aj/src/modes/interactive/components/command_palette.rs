@@ -71,8 +71,11 @@ pub struct CommandPaletteComponent {
 impl CommandPaletteComponent {
     /// Build a palette seeded from [`BUILTIN_COMMANDS`].
     ///
-    /// `max_visible_rows` caps the [`SelectList`] window so the box
-    /// stays usable on shorter terminals.
+    /// `max_visible_rows` is the initial [`SelectList`] window cap. Once
+    /// mounted in an `OverlayWindow` the surrounding frame drives this
+    /// via [`Component::set_available_height`] each frame, so the list
+    /// grows to fill the overlay's inner-row budget; the constructor
+    /// value only governs the first render (and direct-render tests).
     pub fn new(list_theme: SelectListTheme, max_visible_rows: usize) -> Self {
         let mut search = TextInput::new("search: ");
         search.set_focused(true);
@@ -190,6 +193,13 @@ impl Component for CommandPaletteComponent {
         self.list.set_focused(focused);
     }
 
+    fn set_available_height(&mut self, rows: usize) {
+        // Grow the list to fill the overlay's inner-row budget. Chrome
+        // above the list (mirrored in `render`): search input + blank
+        // separator + the list's own scroll-info line.
+        self.list.set_max_visible(rows.saturating_sub(3).max(1));
+    }
+
     fn is_focused(&self) -> bool {
         self.search.is_focused()
     }
@@ -237,6 +247,26 @@ mod tests {
                 cmd.category
             );
         }
+    }
+
+    #[test]
+    fn set_available_height_grows_the_visible_list() {
+        // Seed with a small initial cap, then report a tall overlay: the
+        // list must fill it (minus the search box, blank separator, and
+        // scroll-info chrome) rather than stay pinned at the seed value.
+        // Guard against a catalog too small to exercise the growth.
+        assert!(
+            BUILTIN_COMMANDS.len() > 8,
+            "test needs a catalog larger than the tall budget"
+        );
+        let mut p = CommandPaletteComponent::new(identity_theme(), 3);
+        let seeded_rows = p.render(80).len();
+        p.set_available_height(20);
+        let tall_rows = p.render(80).len();
+        assert!(
+            tall_rows > seeded_rows,
+            "expected the list to grow with available height: {seeded_rows} -> {tall_rows}"
+        );
     }
 
     #[test]
