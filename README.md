@@ -8,86 +8,108 @@ Built on the premise that better models just need better tools. We therefore
 have a minimal agent loop and focus on providing the right set of builtin
 tools, with otherwise minimal scaffolding around it.
 
-## Installation & Setup
+## Install
 
-Install using `cargo`:
-
-```bash
-$ cargo install --path src/aj
-```
-
-You will need a `.env` file with an `ANTHROPIC_API_KEY` (or
-`OPENAI_API_KEY`) either in the working directory or a global one in
-`~/.aj/`.
-
-## Running
-
-The `aj` binary serves both an interactive TUI session and a non-interactive
-print mode through the same code path:
+Build and install from source with `cargo`:
 
 ```bash
-$ aj                            # interactive TUI (default)
-$ aj "draft a release note"     # prefill the first turn, then TUI
-$ aj --print "explain this"     # one-shot, stream to stdout, exit
-$ aj --print --format json …    # same, but JSONL events per line
+git clone git@github.com:aljoscha/aj.git
+cd aj
+cargo install --path src/aj
 ```
 
-Non-conversational subcommands short-circuit before mode dispatch:
+## Authentication
+
+AJ talks to Anthropic and OpenAI models, and you can authenticate either way.
+
+- **Subscription login (OAuth).** With a Claude Pro/Max or ChatGPT Plus/Pro
+  plan, open the command palette (`Ctrl+O`) and choose **login**. Credentials
+  are stored in `~/.aj/auth.json`. You can also provide a token directly via
+  `ANTHROPIC_OAUTH_TOKEN` or `OPENAI_CODEX_OAUTH_TOKEN`.
+- **API key.** Put an `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in a `.env` file,
+  either in the working directory or a global one at `~/.aj/.env`. You can also
+  export it in your environment.
+
+## Quickstart
 
 ```bash
-$ aj list-threads               # threads for the current project
-$ aj continue                   # resume the most recent thread
-$ aj continue <thread-id>       # resume a specific thread
-$ aj update-models              # refresh ~/.aj/models.json from models.dev
+aj                          # start an interactive session in the current project
+aj "explain this codebase"  # prefill the first message, then drop into the TUI
 ```
 
-Inside the TUI, press `/` (or `Ctrl+O`) to open the command palette: a
-fuzzy-searchable list of everything you can do — switch model, set the
-reasoning effort, resume a session, log in, and so on. Pick an entry to
-run it.
+## Using AJ
+
+Everything beyond chatting lives in the **command palette**, opened with
+`Ctrl+O`. From there you can switch model, set the reasoning effort, start or
+resume a session, log in or out, toggle skills, open settings, and more.
+
+A handful of keys worth knowing:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Send your message |
+| `Shift+Enter` | Insert a newline |
+| `Ctrl+O` | Open the command palette |
+| `Ctrl+C` | Interrupt the current turn (press again when idle to quit) |
+
+## Sessions
+
+Conversations are saved as resumable sessions, scoped to the project directory
+you run `aj` in:
+
+```bash
+aj list-sessions       # list this project's sessions
+aj continue            # resume the most recent session
+aj continue <id>       # resume a specific session
+```
+
+You can also resume a session or start a fresh one from the command palette.
+
+## Print mode
+
+For one-shot and scripted use, `--print` runs a single turn, streams to stdout,
+and exits:
+
+```bash
+aj --print "summarize the build setup"      # final answer as plain text
+aj --print --format json "..."              # one JSON event per line (JSONL)
+```
+
+`--format json` emits the event stream as JSONL for piping into other tools. It
+requires `--print`.
+
+## Feature highlights
+
+- **Minimal system prompt.** The built-in prompt is deliberately tiny, just a
+  short role statement and a few guidelines. Swap it out wholesale by creating
+  `~/.agents/SYSTEM_PROMPT.md` (or `~/.claude/SYSTEM_PROMPT.md`). Project and
+  user `AGENTS.md` or `CLAUDE.md` files are layered on top as extra context.
+- **Skills.** AJ supports skills, discovered from the usual `skills/`
+  directories under `.aj/`, `.agents/`, and `.claude/` in your project or home
+  directory. Enable or disable them in the config.
+- **Switch model mid-conversation.** Change provider or model at any point from
+  the command palette. The change takes effect on your next turn, and the rest
+  of the conversation carries over.
+- **Queue and steer.** While AJ is working, `Enter` queues a follow-up for when
+  the turn finishes, and `Alt+Enter` steers by injecting your message into the
+  running turn at the next step.
+- **Sub-agents.** AJ can spawn sub-agents and run shell commands or sub-agents
+  in the background. Open the agent view (`Alt+A`) to switch between them and
+  follow or stop background work.
+- **Images.** @-mention an image (or any file) in your message, or paste one
+  from the clipboard with `Ctrl+V`, and AJ can read it.
 
 ## Configuration
 
-Persistent state lives under `~/.aj/`:
+Configuration lives in `~/.aj/config.toml`. The settings window (open it from
+the command palette) covers every option and writes your changes there. You can
+also edit the file by hand.
 
-- `.env` — secrets (API keys), loaded before any project-local `.env`.
-- `config.toml` — defaults (model, thinking level, speed, theme, disabled
-  tools). CLI flags and env vars override.
-- `models.json` — model catalog consumed by the model selector.
-  Refreshed by `aj update-models`.
-- `themes/<name>.json` — optional user-supplied themes layered on top of
-  the bundled `dark` / `light` palettes. The active theme hot-reloads on
-  file changes.
-- `threads/<project>/` — JSONL conversation logs, one file per thread.
+## Contributing
 
-Model selection precedence (highest to lowest): CLI flags
-(`--model-api`, `--model-url`, `--model-name`) → env vars (`MODEL_API`,
-`MODEL_URL`, `MODEL_NAME`) → `config.toml` → built-in defaults.
+AJ is a Cargo workspace. See [`CLAUDE.md`](CLAUDE.md) for build/test commands,
+the crate layout, and code-style conventions.
 
-## Crate layout
+## License
 
-The workspace splits along the dependency graph from
-[`docs/aj-next-plan.md`](docs/aj-next-plan.md):
-
-```
-aj-models  ←  aj-agent  ←  aj-tools
-                ↑              ↑
-                └─  aj-session  ─┘
-                        ↑
-                        aj
-```
-
-- `aj-models` — wire layer: provider SDKs, unified `Message` /
-  `AssistantMessage` / streaming types, model registry.
-- `aj-agent` — the `Agent` runtime, the typed `AgentEvent` bus, the
-  tool trait, and `ToolDetails` for structured tool rendering.
-- `aj-session` — on-disk thread format, `ConversationLog`, replay.
-- `aj-tools` — the builtin tool implementations
-  (`read_file`, `bash`, `write_file`, `edit_file`,
-  `edit_file_multi`, `agent`, `todo_read`, `todo_write`).
-- `aj-tui` — in-process text-UI framework (layout, components, theming).
-- `aj-conf` — `~/.aj/config.toml` loader and path helpers.
-- `aj` — the binary: CLI parsing, print mode, interactive TUI, command
-  palette, selectors.
-- `anthropic-sdk` / `openai-sdk` — thin async clients used by
-  `aj-models`'s provider adapters.
+[MIT](LICENSE)
