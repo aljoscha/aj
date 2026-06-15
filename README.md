@@ -51,6 +51,7 @@ A handful of keys worth knowing:
 | `Enter` | Send your message |
 | `Shift+Enter` | Insert a newline |
 | `Ctrl+O` | Open the command palette |
+| `Ctrl+R` | Search your prompt history |
 | `Ctrl+C` | Interrupt the current turn (press again when idle to quit) |
 
 ## Sessions
