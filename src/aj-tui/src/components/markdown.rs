@@ -446,6 +446,17 @@ struct ListItem {
     number: Option<u32>,
 }
 
+/// A list item under construction in [`parse_list`]: its inline source
+/// text accumulated across the marker line and any soft-wrapped
+/// continuation lines, plus nested sub-blocks. The text is parsed into
+/// inlines once, after the item is complete, so markup that lands on (or
+/// straddles) a continuation line still renders as markup.
+struct PendingItem {
+    text: String,
+    sub_blocks: Vec<Block>,
+    number: Option<u32>,
+}
+
 #[derive(Debug)]
 enum Inline {
     Text(String),
@@ -775,7 +786,7 @@ fn parse_list(lines: &[&str], start: usize, ordered: bool, depth: usize) -> (Blo
     // A list marker at strictly greater indent opens a nested list.
     let base_indent = indent_of(lines[start]);
 
-    let mut items: Vec<ListItem> = Vec::new();
+    let mut pending: Vec<PendingItem> = Vec::new();
     let mut i = start;
 
     while i < lines.len() {
@@ -801,9 +812,8 @@ fn parse_list(lines: &[&str], start: usize, ordered: bool, depth: usize) -> (Blo
                 (false, Some(_), _) => {
                     // Open new unordered item at this level.
                     let (_ind, marker_len) = is_bullet.unwrap();
-                    let content_text = &line[base_indent + marker_len..];
-                    items.push(ListItem {
-                        content: parse_inline(content_text, 0),
+                    pending.push(PendingItem {
+                        text: line[base_indent + marker_len..].to_string(),
                         sub_blocks: Vec::new(),
                         number: None,
                     });
@@ -811,9 +821,8 @@ fn parse_list(lines: &[&str], start: usize, ordered: bool, depth: usize) -> (Blo
                 }
                 (true, _, Some(_)) => {
                     let (_ind, marker_len, n) = is_number.unwrap();
-                    let content_text = &line[base_indent + marker_len..];
-                    items.push(ListItem {
-                        content: parse_inline(content_text, 0),
+                    pending.push(PendingItem {
+                        text: line[base_indent + marker_len..].to_string(),
                         sub_blocks: Vec::new(),
                         number: Some(n),
                     });
@@ -834,21 +843,37 @@ fn parse_list(lines: &[&str], start: usize, ordered: bool, depth: usize) -> (Blo
                 // most recent item's sub_blocks.
                 let nested_ordered = is_number.is_some();
                 let (nested, new_i) = parse_list(lines, i, nested_ordered, depth + 1);
-                if let Some(last) = items.last_mut() {
+                if let Some(last) = pending.last_mut() {
                     last.sub_blocks.push(nested);
                 }
                 i = new_i;
-            } else if let Some(last) = items.last_mut() {
+            } else if let Some(last) = pending.last_mut() {
                 // Continuation text under the last item (also the
                 // landing spot for a nested marker we refused to
-                // descend into at the depth cap).
-                last.content.push(Inline::Text(format!(" {}", trimmed)));
+                // descend into at the depth cap). Join onto the item's
+                // text with a single space; the whole item is parsed as
+                // one inline run below, so a code span / emphasis / link
+                // on the continuation line — or one straddling the wrap —
+                // renders as markup rather than literal characters.
+                last.text.push(' ');
+                last.text.push_str(trimmed);
                 i += 1;
             } else {
                 break;
             }
         }
     }
+
+    // Parse each item's accumulated text once, now that any soft-wrapped
+    // continuation lines have been folded in.
+    let items: Vec<ListItem> = pending
+        .into_iter()
+        .map(|p| ListItem {
+            content: parse_inline(&p.text, 0),
+            sub_blocks: p.sub_blocks,
+            number: p.number,
+        })
+        .collect();
 
     if ordered {
         (Block::OrderedList(items), i)

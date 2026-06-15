@@ -301,6 +301,35 @@ fn tab_indented_list_continuation_is_recognized_as_nested() {
     );
 }
 
+#[test]
+fn parses_inline_markup_on_list_item_continuation_lines() {
+    // A soft-wrapped list item: the marker line ends mid-sentence and the
+    // continuation line (indented, no marker) carries its own inline-code
+    // spans. Inline markup on the continuation must render as styled code,
+    // not literal backticks — continuation text is joined onto the marker
+    // line's text and the whole item parsed as one inline run.
+    let mut m = md("- the `first` span and\n  the `second` and `third` spans");
+    let lines = m.render(80);
+
+    let plain = plain_lines_trim_end(&lines);
+    let all = plain.join(" ");
+    assert!(
+        !all.contains('`'),
+        "code-span backticks should be stripped, got: {:#?}",
+        plain,
+    );
+    assert!(all.contains("first") && all.contains("second") && all.contains("third"));
+
+    // Inline code renders yellow in the default test theme; every span
+    // (marker line and continuation) must be styled, not just the first.
+    let joined = lines.join("\n");
+    let styled = joined.matches("\x1b[33m").count();
+    assert!(
+        styled >= 3,
+        "expected all three code spans styled, got {styled} in: {joined:?}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tables
 // ---------------------------------------------------------------------------
