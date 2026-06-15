@@ -1421,7 +1421,7 @@ mod tests {
         // Spot check a couple of tokens to make sure the resolver
         // walked the var ref through to a concrete RGB.
         let accent = theme.fg(ThemeColor::Accent, "X");
-        assert!(accent.contains("\x1b[38;2;138;190;183m"));
+        assert!(accent.contains("\x1b[38;2;156;220;254m"));
         // `text` is `""` which means "terminal default" — that
         // encodes as the foreground-reset escape, not a color set.
         let text = theme.fg(ThemeColor::Text, "X");
@@ -1433,17 +1433,17 @@ mod tests {
         let theme = Theme::from_json_with_mode("light", LIGHT_THEME_JSON, ColorMode::Truecolor)
             .expect("light.json must parse");
         assert_eq!(theme.name(), "light");
-        // `accent` resolves to `teal` which is `#5a8080` —
+        // `accent` resolves to `lightBlue` which is `#5277a3` —
         // verifies var refs walk through to a concrete RGB.
         let accent = theme.fg(ThemeColor::Accent, "X");
-        assert!(accent.contains("\x1b[38;2;90;128;128m"));
+        assert!(accent.contains("\x1b[38;2;82;119;163m"));
     }
 
     #[test]
     fn ansi256_falls_back_to_palette_index_in_limited_terminal() {
         // 256-color mode downsamples hex values to palette
-        // indexes. `#8abeb7` is teal-ish — it should land somewhere
-        // in the 6x6x6 cube, not in the grayscale ramp.
+        // indexes. `#9cdcfe` is a light blue — it should land
+        // somewhere in the 6x6x6 cube, not in the grayscale ramp.
         let theme = Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Color256)
             .expect("dark.json must parse");
         let accent = theme.fg(ThemeColor::Accent, "X");
@@ -1793,9 +1793,9 @@ mod tests {
         let paint = handle.fg_closure(ThemeColor::Accent);
 
         let before = paint("X");
-        // Dark's accent is `#8abeb7` — truecolor encoding.
+        // Dark's accent resolves through `lightBlue` → `#9cdcfe`.
         assert!(
-            before.contains("\x1b[38;2;138;190;183m"),
+            before.contains("\x1b[38;2;156;220;254m"),
             "expected dark accent escape before swap, got {before:?}"
         );
 
@@ -1805,15 +1805,15 @@ mod tests {
                 .expect("light.json must parse"),
         );
         let after = paint("X");
-        // Light's accent resolves through `teal` → `#5a8080`.
+        // Light's accent resolves through `lightBlue` → `#5277a3`.
         assert!(
-            after.contains("\x1b[38;2;90;128;128m"),
+            after.contains("\x1b[38;2;82;119;163m"),
             "expected light accent escape after swap, got {after:?}"
         );
         // The dark prefix must be gone — otherwise we'd just be
         // concatenating both.
         assert!(
-            !after.contains("\x1b[38;2;138;190;183m"),
+            !after.contains("\x1b[38;2;156;220;254m"),
             "stale dark escape leaked into post-swap output: {after:?}"
         );
     }

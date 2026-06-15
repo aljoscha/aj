@@ -17,7 +17,7 @@
     "customMsgBg": "#2d2838"
   },
   "colors": {
-    "accent": "accent",
+    "accent": "lightBlue",
     "border": "blue",
     "borderAccent": "cyan",
     "borderMuted": "darkGray",
