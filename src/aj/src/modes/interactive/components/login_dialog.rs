@@ -357,22 +357,53 @@ impl TuiOAuthCallbacks {
 #[async_trait]
 impl OAuthCallbacks for TuiOAuthCallbacks {
     fn on_auth(&self, info: OAuthAuthInfo<'_>) {
+        // Detect up front whether we can reach a browser on this
+        // machine. When we can't (SSH/headless), opening the automatic
+        // URL is pointless — its redirect targets *this* machine's
+        // loopback, which the user's remote browser can't reach — so we
+        // steer them to the manual URL, whose redirect is a hosted page
+        // that shows a code to paste back.
+        let can_open = crate::auth::browser_available();
+        let copy = crate::config::keybindings::fixed_keys::CTRL_Y;
         {
             let mut st = self.state.lock().expect("login dialog state poisoned");
-            st.lines.push(LoginLine::Info(
-                "Opening your browser to authorize…".to_string(),
-            ));
-            if let Some(instructions) = info.instructions {
-                st.lines.push(LoginLine::Info(instructions.to_string()));
+            if can_open {
+                st.lines.push(LoginLine::Info(
+                    "Opening your browser to authorize…".to_string(),
+                ));
+                if let Some(instructions) = info.instructions {
+                    st.lines.push(LoginLine::Info(instructions.to_string()));
+                }
+                st.lines.push(LoginLine::Info(format!(
+                    "If it doesn't open, click or copy ({copy}) this URL:"
+                )));
+                st.lines.push(LoginLine::Url(info.url.to_string()));
+                st.url = Some(info.url.to_string());
+                if let Some(manual) = info.manual_url {
+                    st.lines.push(LoginLine::Info(
+                        "On a different machine? Open this URL instead, then paste the code it shows:"
+                            .to_string(),
+                    ));
+                    st.lines.push(LoginLine::Url(manual.to_string()));
+                }
+            } else {
+                // Headless: lead with the manual URL (falling back to
+                // the automatic one only if the provider offers no
+                // hosted manual page). That's the one we auto-copy.
+                let primary = info.manual_url.unwrap_or(info.url);
+                st.lines.push(LoginLine::Info(
+                    "No browser detected on this machine (headless/SSH).".to_string(),
+                ));
+                st.lines.push(LoginLine::Info(format!(
+                    "Open this URL on another device ({copy} to copy), then paste the code it shows:"
+                )));
+                st.lines.push(LoginLine::Url(primary.to_string()));
+                st.url = Some(primary.to_string());
             }
-            st.lines.push(LoginLine::Info(format!(
-                "If it doesn't open, click or copy ({}) this URL:",
-                crate::config::keybindings::fixed_keys::CTRL_Y
-            )));
-            st.lines.push(LoginLine::Url(info.url.to_string()));
-            st.url = Some(info.url.to_string());
         }
-        crate::auth::open_browser(info.url);
+        if can_open {
+            crate::auth::open_browser(info.url);
+        }
         self.render.request_render();
     }
 
@@ -390,7 +421,7 @@ impl OAuthCallbacks for TuiOAuthCallbacks {
         let submit = keybindings::format_action_shortcut("tui.input.submit")
             .unwrap_or_else(|| "Enter".to_string());
         self.await_input(&format!(
-            "On another machine? Paste the full redirect URL (or code) here, then press {submit}:"
+            "On another machine? Paste the code shown after login (or the full redirect URL), then press {submit}:"
         ))
         .await
     }

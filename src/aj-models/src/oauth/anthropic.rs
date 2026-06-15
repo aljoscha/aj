@@ -17,10 +17,16 @@
 //! 3. Hand the user the authorize URL via [`OAuthCallbacks::on_auth`]
 //!    and wait for either the browser callback to hit our server or
 //!    — for hosts that support it — a manually pasted code. The two
-//!    paths race; whichever arrives first wins. If neither produces
-//!    a code we fall back to a single [`OAuthCallbacks::on_prompt`]
-//!    call so the user can paste the redirect URL themselves.
-//! 4. POST the authorization code to the token endpoint.
+//!    paths race; whichever arrives first wins. We hand `on_auth` two
+//!    URLs: the automatic one (loopback redirect) and a manual one
+//!    whose redirect targets a provider-hosted page that shows a
+//!    `code#state` string to paste — the latter is what works when the
+//!    browser is on a different machine. If neither path produces a
+//!    code we fall back to a single [`OAuthCallbacks::on_prompt`] call.
+//! 4. POST the authorization code to the token endpoint. The
+//!    `redirect_uri` echoed there must match the one in the authorize
+//!    request that issued the code, so we track which URL produced it
+//!    (loopback vs. hosted) and send the matching redirect.
 //! 5. Compute an absolute expiration timestamp from the returned
 //!    `expires_in`, applying a small safety margin so we proactively
 //!    refresh just before the upstream token actually lapses.
@@ -52,12 +58,21 @@ use super::{OAuthAuthInfo, OAuthCallbacks, OAuthCredentials, OAuthError, OAuthPr
 /// security of the flow comes from PKCE, not from hiding the id.
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Hosted authorize endpoint the user visits in their browser.
-const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+/// Hosted authorize endpoint the user visits in their browser. This is
+/// the Claude.ai subscription (Pro/Max) authorize host, matching the
+/// official Claude Code client.
+const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 
 /// Token-exchange endpoint. Same URL handles both the
 /// `authorization_code` and `refresh_token` grants.
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+
+/// Redirect URI for the manual flow. The upstream renders a page here
+/// that displays a `code#state` string for the user to paste back,
+/// which is how login completes when the browser can't reach our
+/// loopback server (SSH/headless). Echoed verbatim in the token
+/// exchange when the code came from this path.
+const MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
 
 /// Local IP the callback HTTP server binds to. We bind the literal
 /// loopback address so we don't depend on `localhost` resolving to
@@ -188,17 +203,25 @@ async fn login_with(
         .local_addr()
         .map_err(|e| OAuthError::Other(format!("read local callback addr: {e}")))?
         .port();
-    let redirect_uri = redirect_uri_for(port);
+    let loopback_redirect = redirect_uri_for(port);
 
-    let auth_url = build_authorize_url(&pkce.challenge, &state, &redirect_uri);
+    // Build both authorize URLs up front (matching the official
+    // client): the automatic one redirects to our loopback server, the
+    // manual one to a provider-hosted page that shows a code to paste.
+    // The host decides which to surface based on whether it can reach a
+    // browser; we accept a code from either path.
+    let auto_url = build_authorize_url(&pkce.challenge, &state, &loopback_redirect);
+    let manual_url = build_authorize_url(&pkce.challenge, &state, MANUAL_REDIRECT_URL);
     callbacks.on_auth(OAuthAuthInfo {
-        url: &auth_url,
+        url: &auto_url,
+        manual_url: Some(&manual_url),
         instructions: Some(
-            "Complete login in your browser. If your browser is on a different machine, paste the final redirect URL here.",
+            "Complete login in your browser. If your browser is on a different machine, paste the code it shows here.",
         ),
     });
 
-    let (code, returned_state) = obtain_code_and_state(callbacks, listener, &state).await?;
+    let (code, returned_state, redirect_uri) =
+        obtain_code_and_state(callbacks, listener, &state, &loopback_redirect).await?;
 
     callbacks.on_progress("Exchanging authorization code for tokens...");
     exchange_authorization_code(
@@ -237,7 +260,16 @@ async fn refresh_with(
 
 /// Drive the race between the local callback server, the optional
 /// manual-code-input path, and (as a last resort) the prompt
-/// fallback. Returns the validated `(code, state)` pair.
+/// fallback. Returns the validated `(code, state, redirect_uri)`
+/// triple.
+///
+/// The `redirect_uri` is the one bound to the returned code: the
+/// `loopback_redirect` when the code arrived on our callback server,
+/// or the hosted [`MANUAL_REDIRECT_URL`] when it was pasted. We need it
+/// because the token exchange must echo the exact redirect from the
+/// authorize request that issued the code. A pasted *loopback* URL
+/// (the user copied the failed redirect from their address bar) is
+/// detected and mapped back to the loopback redirect.
 ///
 /// The select! is `biased` to prefer the callback server: if the
 /// browser redirect already produced a usable code, that's
@@ -247,9 +279,11 @@ async fn obtain_code_and_state(
     callbacks: &dyn OAuthCallbacks,
     listener: TcpListener,
     expected_state: &str,
-) -> Result<(String, String), OAuthError> {
+    loopback_redirect: &str,
+) -> Result<(String, String, String), OAuthError> {
     let mut code: Option<String> = None;
     let mut state: Option<String> = None;
+    let mut redirect: Option<String> = None;
 
     if callbacks.supports_manual_code_input() {
         let server_fut = await_callback(listener, expected_state);
@@ -260,6 +294,7 @@ async fn obtain_code_and_state(
                 let (c, s) = res?;
                 code = Some(c);
                 state = Some(s);
+                redirect = Some(loopback_redirect.to_string());
             }
             res = callbacks.on_manual_code_input() => {
                 let input = res?;
@@ -272,6 +307,7 @@ async fn obtain_code_and_state(
                 if let Some(c) = parsed.code {
                     code = Some(c);
                     state = Some(parsed.state.unwrap_or_else(|| expected_state.to_string()));
+                    redirect = Some(redirect_for_input(input.trim(), loopback_redirect));
                 }
                 // Empty / unparseable manual input: drop through to
                 // the prompt fallback below. Dropping `server_fut`
@@ -283,11 +319,12 @@ async fn obtain_code_and_state(
         let (c, s) = await_callback(listener, expected_state).await?;
         code = Some(c);
         state = Some(s);
+        redirect = Some(loopback_redirect.to_string());
     }
 
     if code.is_none() {
         let input = callbacks
-            .on_prompt("Paste the authorization code or full redirect URL:")
+            .on_prompt("Paste the code shown after login (or the full redirect URL):")
             .await?;
         let parsed = parse_authorization_input(input.trim());
         if let Some(s) = parsed.state.as_deref()
@@ -295,13 +332,31 @@ async fn obtain_code_and_state(
         {
             return Err(OAuthError::StateMismatch);
         }
+        if parsed.code.is_some() {
+            redirect = Some(redirect_for_input(input.trim(), loopback_redirect));
+        }
         code = parsed.code;
         state = parsed.state.or_else(|| Some(expected_state.to_string()));
     }
 
     let code = code.ok_or(OAuthError::MissingCode)?;
     let state = state.unwrap_or_else(|| expected_state.to_string());
-    Ok((code, state))
+    let redirect = redirect.unwrap_or_else(|| MANUAL_REDIRECT_URL.to_string());
+    Ok((code, state, redirect))
+}
+
+/// Pick the `redirect_uri` to echo at token-exchange time for a
+/// pasted input. If the user pasted the full loopback redirect URL
+/// (copied from the failed browser page), the code is bound to the
+/// loopback redirect; otherwise it came from the hosted manual page,
+/// so it's bound to [`MANUAL_REDIRECT_URL`].
+fn redirect_for_input(input: &str, loopback_redirect: &str) -> String {
+    if let Ok(url) = reqwest::Url::parse(input)
+        && matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+    {
+        return loopback_redirect.to_string();
+    }
+    MANUAL_REDIRECT_URL.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -752,8 +807,8 @@ mod tests {
         let url_str = build_authorize_url("CHALLENGE", "STATE", &redirect);
         let url = reqwest::Url::parse(&url_str).expect("authorize URL must parse");
         assert_eq!(url.scheme(), "https");
-        assert_eq!(url.host_str(), Some("claude.ai"));
-        assert_eq!(url.path(), "/oauth/authorize");
+        assert_eq!(url.host_str(), Some("claude.com"));
+        assert_eq!(url.path(), "/cai/oauth/authorize");
 
         let pairs: HashMap<String, String> = url
             .query_pairs()
@@ -778,6 +833,32 @@ mod tests {
         // `state` is an independent opaque value, passed through to
         // the authorize URL verbatim.
         assert_eq!(pairs.get("state").map(String::as_str), Some("STATE"));
+    }
+
+    /// The exchange `redirect_uri` for pasted input must match the
+    /// authorize request that issued the code: a loopback URL maps
+    /// back to the loopback redirect, anything else (bare code,
+    /// `code#state`, or a hosted URL) to the manual hosted redirect.
+    #[test]
+    fn redirect_for_input_distinguishes_loopback_from_manual() {
+        let loopback = redirect_uri_for(49152);
+
+        // Pasted loopback redirect URL → loopback redirect.
+        assert_eq!(
+            redirect_for_input("http://localhost:49152/callback?code=A&state=B", &loopback),
+            loopback
+        );
+        assert_eq!(
+            redirect_for_input("http://127.0.0.1:49152/callback?code=A", &loopback),
+            loopback
+        );
+
+        // Bare code / `code#state` from the hosted page → manual.
+        assert_eq!(redirect_for_input("ABC123", &loopback), MANUAL_REDIRECT_URL);
+        assert_eq!(
+            redirect_for_input("ABC#DEF", &loopback),
+            MANUAL_REDIRECT_URL
+        );
     }
 
     /// `parse_callback_request` should split the path from the query

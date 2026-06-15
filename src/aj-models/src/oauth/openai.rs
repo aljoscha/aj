@@ -231,6 +231,10 @@ async fn login_with(
     let auth_url = build_authorize_url(&pkce.challenge, &state, originator);
     callbacks.on_auth(OAuthAuthInfo {
         url: &auth_url,
+        // OpenAI's flow has no hosted manual redirect page: the
+        // registered redirect is the fixed loopback URI, so a remote
+        // user pastes the full redirect URL rather than a code.
+        manual_url: None,
         instructions: Some(
             "Complete login in your browser. If your browser is on a different machine, paste the final redirect URL here.",
         ),

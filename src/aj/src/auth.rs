@@ -188,6 +188,30 @@ fn format_remaining(expires_ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// Best-effort guess at whether a browser can be opened on *this*
+/// machine — i.e. whether the login flow should attempt the automatic
+/// loopback redirect or steer the user to the manual paste flow.
+///
+/// Heuristic, not authoritative:
+/// - macOS / Windows: assume yes; a desktop session is the norm and the
+///   launcher no-ops gracefully when there isn't one.
+/// - Linux / other Unix: yes only if a display server or an explicit
+///   `$BROWSER` is configured (`DISPLAY`, `WAYLAND_DISPLAY`, `BROWSER`).
+///   A bare SSH session without X forwarding has none of these, which
+///   is exactly the headless case the manual flow exists for.
+pub fn browser_available() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        ["DISPLAY", "WAYLAND_DISPLAY", "BROWSER"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()))
+    }
+}
+
 /// Best-effort open `url` in the user's default browser.
 ///
 /// Spawns the platform launcher detached and ignores the outcome —

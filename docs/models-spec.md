@@ -1986,15 +1986,26 @@ trait OAuthCallbacks: Send + Sync {
    ephemeral port (bind port 0). The upstream accepts any loopback
    redirect port (RFC 8252 §7.3), so we don't pin one; the chosen port
    is read back and used to build the redirect URI.
-3. Construct authorization URL:
-   - Endpoint: `https://claude.ai/oauth/authorize`
-   - Params: `code=true`, `client_id`, `response_type=code`, `redirect_uri=http://localhost:<port>/callback`,
+3. Construct two authorization URLs sharing the same `state` and PKCE
+   challenge — one per redirect target:
+   - Endpoint: `https://claude.com/cai/oauth/authorize`
+   - Common params: `code=true`, `client_id`, `response_type=code`,
      `scope=org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload`,
      `code_challenge`, `code_challenge_method=S256`, `state=<random>`
+   - Automatic URL: `redirect_uri=http://localhost:<port>/callback`
+     (the loopback server captures the code).
+   - Manual URL: `redirect_uri=https://platform.claude.com/oauth/code/callback`
+     (a hosted page renders a `code#state` string for the user to
+     paste). Used when the browser is on another machine.
    - Note: `state` is an opaque, independently-generated random token
-     echoed back on the callback and checked for equality. The same
-     `redirect_uri` must be echoed in the token exchange.
-4. Open URL in browser, wait for callback or manual paste
+     echoed back and checked for equality. The token exchange must echo
+     the exact `redirect_uri` from the authorize request that issued the
+     code, so we track which URL produced it (loopback vs. hosted).
+4. The host decides which URL to surface using a headless heuristic
+   (can it open a browser here?). On a desktop it opens the automatic
+   URL and shows the manual URL as a fallback; headless/SSH, it leads
+   with the manual URL and skips the browser open. Either way we wait
+   for the loopback callback or a pasted code, whichever arrives first.
 5. Exchange code at `https://platform.claude.com/v1/oauth/token`
 6. Store `{refresh, access, expires}` in auth.json
 

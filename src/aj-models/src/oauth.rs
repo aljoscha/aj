@@ -86,8 +86,21 @@ impl OAuthCredentials {
 /// is on a different machine, paste the redirect URL back here").
 #[derive(Debug, Clone)]
 pub struct OAuthAuthInfo<'a> {
-    /// Authorization URL the user must open.
+    /// Authorization URL for the automatic flow. Completing login in a
+    /// browser that can reach this machine redirects to our local
+    /// callback server, which captures the code without further user
+    /// action.
     pub url: &'a str,
+    /// Authorization URL for the manual flow, whose redirect targets a
+    /// provider-hosted page that displays a code for the user to paste
+    /// back. `None` for providers without a hosted manual redirect.
+    ///
+    /// Hosts should surface this when the browser runs on a different
+    /// machine (SSH/headless) and so can't reach the local callback
+    /// server: the automatic `url`'s redirect would land on the remote
+    /// machine's unreachable loopback address, whereas this one yields
+    /// a copyable code.
+    pub manual_url: Option<&'a str>,
     /// Optional human-readable instructions to display alongside the URL.
     pub instructions: Option<&'a str>,
 }
