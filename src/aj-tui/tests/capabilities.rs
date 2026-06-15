@@ -8,8 +8,8 @@
 mod support;
 
 use aj_tui::capabilities::{
-    ImageProtocol, TerminalCapabilities, detect_capabilities, get_capabilities,
-    reset_capabilities_cache, set_capabilities,
+    ImageProtocol, TerminalCapabilities, detect_capabilities, detect_capabilities_with,
+    get_capabilities, reset_capabilities_cache, set_capabilities,
 };
 use aj_tui::component::Component;
 use aj_tui::components::markdown::Markdown;
@@ -63,16 +63,41 @@ fn colorterm_truecolor_enables_true_color_but_nothing_else() {
 
 #[test]
 #[serial_test::serial]
-fn tmux_disables_hyperlinks_and_images_even_with_colorterm() {
+fn tmux_forwarding_hyperlinks_enables_osc8_but_not_images() {
     let _guard = isolated_env();
     let _guard2 = with_env(&[
         ("TMUX", Some("/tmp/tmux-1000/default,1234,0")),
         ("COLORTERM", Some("truecolor")),
-        // Even if someone tries to force Kitty detection, tmux wins.
+        // Even when the outer terminal would be detected as Kitty, tmux
+        // governs: images stay off, hyperlinks follow the probe.
         ("KITTY_WINDOW_ID", Some("1")),
     ]);
-    let caps = detect_capabilities();
-    assert!(!caps.hyperlinks, "tmux must suppress OSC 8");
+    let caps = detect_capabilities_with(|| true);
+    assert!(
+        caps.hyperlinks,
+        "tmux forwarding OSC 8 must enable hyperlinks"
+    );
+    assert!(caps.images.is_none(), "tmux must suppress image protocols");
+    assert!(
+        caps.true_color,
+        "colorterm still drives true_color under tmux"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn tmux_not_forwarding_hyperlinks_disables_osc8() {
+    let _guard = isolated_env();
+    let _guard2 = with_env(&[
+        ("TMUX", Some("/tmp/tmux-1000/default,1234,0")),
+        ("COLORTERM", Some("truecolor")),
+        ("KITTY_WINDOW_ID", Some("1")),
+    ]);
+    let caps = detect_capabilities_with(|| false);
+    assert!(
+        !caps.hyperlinks,
+        "tmux not forwarding OSC 8 must suppress it"
+    );
     assert!(caps.images.is_none(), "tmux must suppress image protocols");
     assert!(
         caps.true_color,
@@ -95,6 +120,9 @@ fn cmux_workspace_id_disables_hyperlinks_and_images() {
         // Outer terminal would otherwise be detected as Kitty.
         ("KITTY_WINDOW_ID", Some("1")),
     ]);
+    // The real detector is used here, not an injected probe: cmux makes
+    // `tmux::options` return `None` (it refuses to probe cmux), so
+    // hyperlinks resolve to off. Deterministic because `TMUX` is unset.
     let caps = detect_capabilities();
     assert!(!caps.hyperlinks, "cmux must suppress OSC 8");
     assert!(caps.images.is_none(), "cmux must suppress image protocols");

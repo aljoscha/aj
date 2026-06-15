@@ -146,13 +146,13 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
 
 /// Wrap `text` as an OSC 8 hyperlink pointing at `uri`.
 ///
-/// On terminals that support hyperlinks (and tmux >= 3.4, which
-/// forwards them) the user can click `text` to open `uri` directly —
-/// no clipboard round-trip. On terminals without hyperlink support the
-/// escapes are inert and only `text` shows, so this degrades cleanly.
-/// The escapes are OSC sequences, which [`crate::ansi`]-style width
-/// measurement (`visible_width`) treats as zero-width, so they don't
-/// disturb the overlay's width-based padding.
+/// Callers gate emission on detected hyperlink support
+/// ([`aj_tui::capabilities::get_capabilities`]) — including tmux, which
+/// only forwards OSC 8 when the client advertises the `hyperlinks`
+/// feature — so this helper just builds the sequence. The escapes are
+/// OSC sequences, which [`crate::ansi`]-style width measurement
+/// (`visible_width`) treats as zero-width, so they don't disturb the
+/// overlay's width-based padding.
 ///
 /// A long URL is rendered as several wrapped segments, each its own
 /// hyperlink. The shared `id=` parameter tells the terminal those
@@ -199,9 +199,20 @@ impl Component for LoginDialogComponent {
                 LoginLine::Progress(t) => out.push((self.style.progress)(t)),
                 LoginLine::Url(u) => {
                     // Each wrapped chunk is its own hyperlink to the
-                    // full URL, so clicking any visible part opens it.
+                    // full URL, so clicking any visible part opens it —
+                    // but only when the terminal forwards OSC 8 (tmux
+                    // without the `hyperlinks` feature strips it). When
+                    // it doesn't, the chunk text is itself part of the
+                    // URL, so the plain styled chunk still shows the
+                    // full link.
+                    let hyperlinks = aj_tui::capabilities::get_capabilities().hyperlinks;
                     for chunk in wrap_chars(u, width) {
-                        out.push(hyperlink(u, &(self.style.url)(&chunk)));
+                        let styled = (self.style.url)(&chunk);
+                        out.push(if hyperlinks {
+                            hyperlink(u, &styled)
+                        } else {
+                            styled
+                        });
                     }
                 }
             }
@@ -392,7 +403,28 @@ impl OAuthCallbacks for TuiOAuthCallbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aj_tui::capabilities::{TerminalCapabilities, reset_capabilities_cache, set_capabilities};
     use aj_tui::keys::Key;
+
+    /// Pin the process-wide hyperlink capability for a test, restoring
+    /// detection on drop. Only `hyperlinks` is meaningful here; the
+    /// other fields are left at their conservative defaults so this
+    /// doesn't perturb image/true-color-sensitive code elsewhere.
+    /// Paired with `#[serial_test::serial]` because the cache is shared.
+    struct CapsGuard;
+    impl Drop for CapsGuard {
+        fn drop(&mut self) {
+            reset_capabilities_cache();
+        }
+    }
+    fn with_hyperlinks(hyperlinks: bool) -> CapsGuard {
+        set_capabilities(TerminalCapabilities {
+            hyperlinks,
+            true_color: false,
+            images: None,
+        });
+        CapsGuard
+    }
 
     fn theme() -> ThemeHandle {
         ThemeHandle::new(crate::config::theme::Theme::bundled_dark())
@@ -486,7 +518,9 @@ mod tests {
     }
 
     #[test]
-    fn url_line_renders_as_hyperlink() {
+    #[serial_test::serial]
+    fn url_line_renders_as_hyperlink_when_supported() {
+        let _caps = with_hyperlinks(true);
         let (mut dialog, state, _pending, _cancel) = make();
         // Skip the copy-on-first-render side effect (clipboard/stdout).
         dialog.auto_copied = true;
@@ -501,6 +535,27 @@ mod tests {
             body.contains(&format!("\x1b]8;id=aj-oauth;{url}\x1b\\")),
             "expected OSC 8 open for {url} in {body:?}"
         );
+        assert!(body.contains(url), "{body:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn url_line_renders_plain_when_hyperlinks_unsupported() {
+        let _caps = with_hyperlinks(false);
+        let (mut dialog, state, _pending, _cancel) = make();
+        dialog.auto_copied = true;
+        let url = "https://example.com/oauth/authorize?x=1";
+        state
+            .lock()
+            .unwrap()
+            .lines
+            .push(LoginLine::Url(url.to_string()));
+        let body = dialog.render(80).join("\n");
+        assert!(
+            !body.contains("\x1b]8;"),
+            "must not emit OSC 8 when hyperlinks are unsupported; got {body:?}"
+        );
+        // The URL text still shows so the user can copy it manually.
         assert!(body.contains(url), "{body:?}");
     }
 }

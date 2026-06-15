@@ -63,14 +63,16 @@ impl Default for TerminalCapabilities {
     }
 }
 
-/// Detect the host terminal's capabilities from environment variables.
+/// Detect the host terminal's capabilities from environment variables
+/// (plus a tmux server probe inside tmux).
 ///
 /// Rules (applied in order; the first match wins):
 ///
-/// 1. Running inside tmux, screen, or cmux → all optional features
-///    off. Multiplexers filter or rewrap OSC 8 / image protocols in
-///    ways that frequently break rendering. Passthrough is opt-in and
-///    fragile; treat the safe fallback as the default.
+/// 1. Running inside tmux → images off (multiplexers rewrap image
+///    protocols in ways that break rendering); hyperlinks on only when
+///    the tmux server reports it forwards OSC 8 to the outer terminal.
+///    screen and cmux → all optional features off (they don't forward
+///    OSC 8, and we don't probe them).
 /// 2. Kitty / Ghostty / WezTerm env vars → Kitty graphics, hyperlinks,
 ///    true color.
 /// 3. iTerm2 env vars → iTerm2 inline images, hyperlinks, true color.
@@ -79,6 +81,19 @@ impl Default for TerminalCapabilities {
 /// 6. Fallback: true color if `COLORTERM` says so, everything else
 ///    off.
 pub fn detect_capabilities() -> TerminalCapabilities {
+    detect_capabilities_with(|| crate::tmux::options().is_some_and(|o| o.hyperlinks))
+}
+
+/// [`detect_capabilities`] with an injectable tmux probe.
+///
+/// `tmux_forwards_hyperlinks` is consulted only when we detect a tmux
+/// session, and answers whether tmux re-emits OSC 8 to the outer
+/// terminal. Tests pass a fixed closure to exercise both the forwarded
+/// and stripped paths without a live tmux server (the default probe
+/// shells out, which we don't want in unit tests).
+pub fn detect_capabilities_with(
+    tmux_forwards_hyperlinks: impl FnOnce() -> bool,
+) -> TerminalCapabilities {
     let term_program = std::env::var("TERM_PROGRAM")
         .unwrap_or_default()
         .to_lowercase();
@@ -87,14 +102,14 @@ pub fn detect_capabilities() -> TerminalCapabilities {
         .unwrap_or_default()
         .to_lowercase();
 
-    // tmux / screen short-circuit: force images off and hyperlinks off
-    // even on terminals that would otherwise support them. Both
-    // multiplexers filter or rewrap OSC 8 / image protocols in ways
-    // that frequently break rendering. cmux (a tmux-derived workspace
-    // multiplexer used in some agent harnesses) gets the same
-    // conservative fallback because it inherits the image-protocol
-    // corruption — detected via the `CMUX_WORKSPACE_ID` env var the
-    // host injects into every cmux session.
+    // tmux / screen short-circuit. tmux rewraps image protocols in
+    // ways that frequently break rendering, so images stay off; OSC 8,
+    // though, tmux *will* forward to the outer terminal when the
+    // attached client advertises the `hyperlinks` feature, so we defer
+    // to the injected probe (which asks the server). screen and cmux
+    // (a tmux-derived workspace multiplexer used in some agent
+    // harnesses, detected via `CMUX_WORKSPACE_ID`) don't forward OSC 8
+    // and aren't probed, so hyperlinks stay off there.
     let in_tmux_or_screen = std::env::var("TMUX").is_ok()
         || std::env::var("CMUX_WORKSPACE_ID").is_ok()
         || term.starts_with("tmux")
@@ -102,7 +117,7 @@ pub fn detect_capabilities() -> TerminalCapabilities {
     if in_tmux_or_screen {
         let true_color = color_term == "truecolor" || color_term == "24bit";
         return TerminalCapabilities {
-            hyperlinks: false,
+            hyperlinks: tmux_forwards_hyperlinks(),
             true_color,
             images: None,
         };

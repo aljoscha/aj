@@ -40,6 +40,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "serial_test",
  "similar",
  "tempfile",
  "thiserror",

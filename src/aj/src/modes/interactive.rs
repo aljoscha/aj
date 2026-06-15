@@ -443,6 +443,13 @@ impl InteractiveMode {
             }
         }
 
+        // Probe tmux for the options aj's rendering relies on
+        // (synchronized output, OSC 8 hyperlinks, escape passthrough).
+        // `None` when we're not in tmux or everything's already on; the
+        // warning is emitted via the pump further below, like the auth
+        // one above.
+        let tmux_warning = crate::tmux_notice::startup_warning();
+
         // Snapshot the model catalog up-front so the `/model`
         // selector overlay and the editor's argument completer
         // share a single load (registry::load reads JSON twice
@@ -662,6 +669,9 @@ impl InteractiveMode {
             world.pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
         }
         if let Some(warning) = &startup_auth_warning {
+            world.pump.handle(&mut tui, &warning_event(warning));
+        }
+        if let Some(warning) = &tmux_warning {
             world.pump.handle(&mut tui, &warning_event(warning));
         }
         // Settings restored from a resumed session's log (or the

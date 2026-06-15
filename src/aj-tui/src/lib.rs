@@ -4,16 +4,24 @@
 //! a component trait, and a set of built-in widgets suitable for building interactive
 //! terminal applications.
 //!
-//! # Design principle: in-process only
+//! # Design principle: prefer in-process
 //!
-//! The crate intentionally does not shell out to external binaries at
-//! runtime. Filesystem traversal for [`autocomplete`] goes through the
+//! The crate avoids shelling out to external binaries. Filesystem
+//! traversal for [`autocomplete`] goes through the
 //! [`ignore`](https://docs.rs/ignore) crate (the library backing both
 //! `ripgrep` and `fd`) rather than spawning `fd`, terminal input goes
 //! through `crossterm` rather than a shell, and so on. This keeps the
 //! crate portable, deterministic in tests, and free of optional-tool
-//! probes. If a future feature looks like it needs an external binary,
-//! reach for a Rust crate first.
+//! probes; reach for a Rust crate before an external binary.
+//!
+//! The one sanctioned exception is [`crate::tmux`]: the attached
+//! client's resolved feature set lives in the tmux *server* process,
+//! so there's no in-process way to learn whether tmux forwards our
+//! OSC 8 / synchronized-update escapes. We query the server over its
+//! socket via the `tmux` CLI. That talks to the server, not the
+//! terminal wire, so it doesn't race the input pipeline, and detection
+//! stays deterministic in tests because the probe is injectable (see
+//! [`crate::capabilities::detect_capabilities_with`]).
 //!
 //! ## Why no stdin buffering layer
 //!
@@ -62,6 +70,7 @@ pub mod keys;
 pub mod kill_ring;
 pub mod style;
 pub mod terminal;
+pub mod tmux;
 pub mod tui;
 pub mod undo_stack;
 pub mod word_boundary;
