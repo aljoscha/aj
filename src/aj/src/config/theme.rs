@@ -1563,17 +1563,24 @@ mod tests {
     fn builders_produce_themed_closures() {
         let handle = ThemeHandle::new(Theme::bundled_dark());
         let ml_theme = markdown_theme(&handle);
-        // The heading closure should wrap text in the heading
-        // foreground escape — `#f0c674` resolved via the dark
-        // palette. Either as a 24-bit triple or a 256-color
-        // index depending on the detected color mode of the
-        // bundled theme.
+        // Headings use the default text color (`mdHeading` is empty
+        // in the bundled palettes), so the closure emits the default
+        // foreground escape rather than a specific color — they're
+        // distinguished by bold/underline instead.
         let painted = (ml_theme.heading)("hi");
-        let has_truecolor = painted.contains("\x1b[38;2;240;198;116m");
+        assert!(
+            painted.contains("\x1b[39m"),
+            "expected default foreground escape, got {painted:?}"
+        );
+        // The inline-code closure carries the `mdCode` color
+        // (`#9cdcfe` light blue in dark), either as a 24-bit triple
+        // or a 256-color index depending on the detected color mode.
+        let painted = (ml_theme.code)("hi");
+        let has_truecolor = painted.contains("\x1b[38;2;156;220;254m");
         let has_256 = painted.contains("\x1b[38;5;");
         assert!(
             has_truecolor || has_256,
-            "expected heading color escape, got {painted:?}"
+            "expected inline-code color escape, got {painted:?}"
         );
         // Bold/italic/etc. don't go through the theme — they
         // emit pure SGR style codes via aj_tui::style.

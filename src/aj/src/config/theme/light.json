@@ -3,6 +3,7 @@
   "vars": {
     "teal": "#5a8080",
     "blue": "#547da7",
+    "lightBlue": "#5277a3",
     "green": "#588458",
     "red": "#aa5555",
     "yellow": "#9a7326",
@@ -39,10 +40,10 @@
     "toolTitle": "",
     "toolOutput": "mediumGray",
 
-    "mdHeading": "yellow",
+    "mdHeading": "",
     "mdLink": "blue",
     "mdLinkUrl": "dimGray",
-    "mdCode": "teal",
+    "mdCode": "lightBlue",
     "mdCodeBlock": "green",
     "mdCodeBlockBorder": "mediumGray",
     "mdQuote": "mediumGray",
