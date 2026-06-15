@@ -460,6 +460,15 @@ impl InteractiveMode {
         // resolution happens here, before the spec is built.
         let sessions_dir = Config::get_sessions_dir_path()?;
         let conversation_persistence = ConversationPersistence::new(sessions_dir);
+
+        // Resolve the launch prompt (`aj <prompt...>` / `aj continue ID
+        // <prompt...>`) before the match below moves `self.args.command`.
+        // Unlike print mode an absent prompt is fine — we just open with an
+        // empty editor — so this is an `Option`, seeded into the editor
+        // once the TUI is built. We don't auto-submit: the user reviews and
+        // presses Enter.
+        let initial_prompt = crate::cli::initial_prompt(&self.args)?;
+
         let spec = match self.args.command {
             Some(Command::Continue {
                 session_id: Some(id),
@@ -571,6 +580,16 @@ impl InteractiveMode {
             PromptHistory::bootstrap(&conversation_persistence, DEFAULT_MAX_ENTRIES);
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
             prompt_history.install(editor);
+        }
+
+        // Seed the editor with the launch prompt resolved above, leaving
+        // the cursor at the end (`set_text` moves it there). We pre-fill
+        // rather than auto-submit so the user can edit or discard before
+        // sending; an absent prompt leaves the editor empty.
+        if let Some(initial) = &initial_prompt {
+            if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+                editor.set_text(initial);
+            }
         }
 
         // Shared flag tripped by the editor's `/`-at-empty-prompt

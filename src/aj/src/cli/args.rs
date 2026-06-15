@@ -53,9 +53,11 @@ pub struct Args {
     pub format: PrintFormat,
 
     /// Free-form initial prompt. In print mode this is the entire
-    /// input; in interactive mode it pre-fills the editor's first
-    /// turn. Multiple positional args are joined with spaces; any
-    /// `@path` token is expanded by [`crate::cli::file_args`].
+    /// input; in interactive mode it pre-fills the editor (you still
+    /// press Enter to send — it is not auto-submitted). Multiple
+    /// positional args are joined with spaces; any `@path` token is
+    /// expanded by [`crate::cli::file_args`]. See
+    /// [`crate::cli::initial_prompt`] for the slot-selection rules.
     pub prompt: Vec<String>,
 
     /// Replace the live model with a scripted fake that replays a
@@ -114,11 +116,11 @@ pub enum Command {
         /// Conversation ID to continue. If absent, the latest
         /// session for this project is resumed.
         session_id: Option<String>,
-        /// Free-form prompt for the resumed run. Only consulted
-        /// in `--print` mode today; interactive mode prompts for
-        /// input from the editor regardless. Multiple positional
-        /// args are joined with spaces; any `@path` token is
-        /// expanded by [`crate::cli::file_args`].
+        /// Free-form prompt for the resumed run. In `--print` mode
+        /// it is the entire turn; in interactive mode it pre-fills
+        /// the editor (you still press Enter to send). Multiple
+        /// positional args are joined with spaces; any `@path` token
+        /// is expanded by [`crate::cli::file_args`].
         prompt: Vec<String>,
     },
     /// Refresh the user model catalog at `~/.aj/models.json` from

@@ -67,7 +67,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command, PrintFormat};
-use crate::cli::file_args;
 use crate::model::ResolvedModel;
 
 /// Drive a single print-mode run from `args`.
@@ -533,15 +532,10 @@ fn thinking_level_for(level: &aj_models::ThinkingConfig) -> aj_models::types::Th
 /// fall back on — so a missing prompt is a hard error rather than
 /// a quiet no-op.
 fn collect_prompt_text(args: &Args) -> Result<String> {
-    let prompt_parts: &[String] = match &args.command {
-        Some(Command::Continue { prompt, .. }) if !prompt.is_empty() => prompt,
-        _ => &args.prompt,
-    };
-    if prompt_parts.is_empty() {
-        bail!("aj --print requires a prompt argument");
+    match crate::cli::initial_prompt(args)? {
+        Some(prompt) => Ok(prompt),
+        None => bail!("aj --print requires a prompt argument"),
     }
-    let joined = prompt_parts.join(" ");
-    file_args::expand(joined).context("failed to expand @file references in prompt")
 }
 
 /// Build a [`Listener`] that writes each event as one JSONL line on
