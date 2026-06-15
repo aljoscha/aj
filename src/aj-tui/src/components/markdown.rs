@@ -7,6 +7,9 @@
 
 use std::sync::{Arc, OnceLock};
 
+use pulldown_cmark::{
+    Alignment as PdAlignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use syntect::easy::ScopeRegionIterator;
 use syntect::highlighting::ScopeSelectors;
 use syntect::parsing::{MatchPower, ParseState, Scope, ScopeStack, SyntaxSet};
@@ -25,9 +28,7 @@ use crate::component::Component;
 /// Visible on tab-indented input: a fenced code block whose body uses
 /// hard tabs would otherwise render with a literal `\t` byte (one cell
 /// wide on most terminals, but stylistically wrong) instead of the
-/// expected indent. List parsing is also affected — `indent_of` counts
-/// only space bytes, so a tab-indented continuation line wouldn't be
-/// recognized as nested without this normalization.
+/// expected indent.
 const TAB_AS_SPACES: &str = "   ";
 
 // ---------------------------------------------------------------------------
@@ -403,10 +404,9 @@ enum Block {
     /// to every emitted sub-block line, so a fenced code block, list,
     /// heading, table, or any other block-level element nested inside
     /// a `>` quote renders as its native block. Multi-line plain-text
-    /// quotes still render as multiple bordered rows because the
-    /// paragraph parser (see [`join_paragraph_lines`]) preserves `\n`
-    /// between source lines and downstream `wrap_text_with_ansi`
-    /// expands those newlines into visible rows.
+    /// quotes still render as multiple bordered rows because soft breaks
+    /// are preserved as `\n` (see [`parse_markdown`]) and downstream
+    /// `wrap_text_with_ansi` expands those newlines into visible rows.
     Blockquote(Vec<Block>),
     /// A GitHub-flavored-markdown style table: one header row, one
     /// alignment spec per column, zero or more data rows. Each cell is
@@ -443,17 +443,6 @@ struct ListItem {
     /// Preserved verbatim so that lists split by intervening blocks
     /// don't restart numbering from `1` in the rendered output.
     /// `None` for unordered items.
-    number: Option<u32>,
-}
-
-/// A list item under construction in [`parse_list`]: its inline source
-/// text accumulated across the marker line and any soft-wrapped
-/// continuation lines, plus nested sub-blocks. The text is parsed into
-/// inlines once, after the item is complete, so markup that lands on (or
-/// straddles) a continuation line still renders as markup.
-struct PendingItem {
-    text: String,
-    sub_blocks: Vec<Block>,
     number: Option<u32>,
 }
 
@@ -494,677 +483,573 @@ enum Inline {
 /// keeping the worst-case render stack to a few hundred frames.
 const MAX_NESTING_DEPTH: usize = 64;
 
-/// Length of the backtick run opening `trimmed`, if it qualifies as a
-/// code fence (three or more backticks).
-fn fence_len(trimmed: &str) -> Option<usize> {
-    let n = trimmed.chars().take_while(|&c| c == '`').count();
-    (n >= 3).then_some(n)
-}
-
-/// Parse markdown text into blocks.
+/// Parse markdown `text` into our render AST ([`Block`] / [`Inline`]).
 ///
-/// `depth` tracks block-nesting (incremented per blockquote level,
-/// shared with [`parse_list`]); top-level callers pass 0. At
-/// [`MAX_NESTING_DEPTH`] the text is emitted as one literal paragraph
-/// rather than recursing further.
-fn parse_markdown(text: &str, depth: usize) -> Vec<Block> {
-    if depth >= MAX_NESTING_DEPTH {
-        return vec![Block::Paragraph(parse_inline(text, 0))];
-    }
-    let mut blocks: Vec<Block> = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
+/// We delegate CommonMark + GFM parsing to `pulldown-cmark` and fold its
+/// event stream into the small block/inline tree the renderer walks. The
+/// renderer is the spec; this function exists only to feed it.
+///
+/// Three behaviors diverge from strict CommonMark on purpose, because the
+/// target surface is an agent's chat output rather than an HTML document:
+///
+/// - Soft and hard line breaks both map to a literal `\n`. A CLI user
+///   typing a multi-line message expects each line on its own row, so we
+///   never collapse a soft break to a space; downstream
+///   `wrap_text_with_ansi` splits on `\n`.
+/// - Raw HTML (`<thinking>`, `<div>`, ...) is emitted as literal visible
+///   text rather than interpreted or hidden. A model that wraps content in
+///   tags should have those exact bytes shown to the user.
+/// - Bare URLs and emails are autolinked by a post-pass over text runs
+///   (see [`linkify`]); pulldown only autolinks the angle-bracket form.
+///
+/// [`MAX_NESTING_DEPTH`] bounds the produced AST depth: structure deeper
+/// than the cap degrades to literal text. Because the renderer's recursion
+/// mirrors the AST shape, capping the tree here is what keeps adversarial
+/// model output (e.g. tens of thousands of nested blockquotes) from
+/// overflowing the render stack — a Rust stack overflow is an uncatchable
+/// process abort.
+fn parse_markdown(text: &str) -> Vec<Block> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
 
-    while i < lines.len() {
-        let line = lines[i];
+    let mut stack: Vec<Frame> = vec![Frame::new(FrameKind::Document)];
+    // Count of structural `Start`s swallowed past `MAX_NESTING_DEPTH`. While
+    // non-zero we push no frames; text content degrades into the deepest
+    // surviving frame so nothing is lost, and the `suppress` counter keeps
+    // `Start`/`End` balanced so we resume cleanly once nesting unwinds.
+    let mut suppress: usize = 0;
 
-        // Blank source lines are not emitted as blocks — every block's
-        // renderer already appends a single trailing blank line, so an
-        // explicit blank would double the spacing between blocks.
-        if line.trim().is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Heading.
-        if let Some(heading) = parse_heading(line) {
-            blocks.push(heading);
-            i += 1;
-            continue;
-        }
-
-        // Horizontal rule.
-        let trimmed = line.trim();
-        if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
-            && trimmed
-                .chars()
-                .all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
-            && trimmed.len() >= 3
-        {
-            blocks.push(Block::HorizontalRule);
-            i += 1;
-            continue;
-        }
-
-        // Fenced code block. CommonMark fence semantics: the opener
-        // is a run of three or more backticks, optionally followed by
-        // an info string; the closer is a run of at least as many
-        // backticks with nothing else on the line. Tracking the fence
-        // length is what makes nesting work: a ``` block quoted
-        // inside a ```` fence stays inside it, and an opener-looking
-        // line with an info string never closes a block.
-        if let Some(open_len) = fence_len(trimmed) {
-            let lang = trimmed[open_len..].trim().to_string();
-            let lang = if lang.is_empty() { None } else { Some(lang) };
-            let mut code_lines: Vec<&str> = Vec::new();
-            i += 1;
-            while i < lines.len() {
-                let t = lines[i].trim();
-                if fence_len(t).is_some_and(|n| n >= open_len) && t.chars().all(|c| c == '`') {
-                    i += 1;
-                    break;
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        match event {
+            Event::Start(tag) => match tag {
+                // Table head/row aren't frames: they only group cells. We
+                // track them as state on the enclosing table frame, and they
+                // must not touch `suppress` (neither does their matching End).
+                Tag::TableHead | Tag::TableRow => {
+                    if suppress == 0
+                        && let FrameKind::Table { current_row, .. } =
+                            &mut stack.last_mut().unwrap().kind
+                    {
+                        current_row.clear();
+                    }
                 }
-                code_lines.push(lines[i]);
-                i += 1;
+                _ => {
+                    if suppress > 0 {
+                        suppress += 1;
+                    } else if stack.len() - 1 >= MAX_NESTING_DEPTH {
+                        suppress = 1;
+                    } else {
+                        let kind = start_tag_to_kind(tag, text, range);
+                        stack.push(Frame::new(kind));
+                    }
+                }
+            },
+            Event::End(tag_end) => match tag_end {
+                TagEnd::TableHead => {
+                    if suppress == 0
+                        && let FrameKind::Table {
+                            headers,
+                            current_row,
+                            ..
+                        } = &mut stack.last_mut().unwrap().kind
+                    {
+                        *headers = std::mem::take(current_row);
+                    }
+                }
+                TagEnd::TableRow => {
+                    if suppress == 0
+                        && let FrameKind::Table {
+                            rows, current_row, ..
+                        } = &mut stack.last_mut().unwrap().kind
+                    {
+                        rows.push(std::mem::take(current_row));
+                    }
+                }
+                TagEnd::TableCell => {
+                    if suppress > 0 {
+                        suppress -= 1;
+                    } else {
+                        let mut cell = stack.pop().unwrap();
+                        cell.flush_text();
+                        if let FrameKind::Table { current_row, .. } =
+                            &mut stack.last_mut().unwrap().kind
+                        {
+                            current_row.push(std::mem::take(&mut cell.inlines));
+                        }
+                    }
+                }
+                _ => {
+                    if suppress > 0 {
+                        suppress -= 1;
+                    } else {
+                        let frame = stack.pop().unwrap();
+                        finish_frame(frame, &mut stack);
+                    }
+                }
+            },
+            // Raw HTML (block or inline) passes through as literal text.
+            Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => {
+                stack.last_mut().unwrap().push_text(&s);
             }
-            blocks.push(Block::CodeBlock(lang, code_lines.join("\n")));
-            continue;
-        }
-
-        // Blockquote.
-        if trimmed.starts_with("> ") || trimmed == ">" {
-            let mut quote_lines: Vec<String> = Vec::new();
-            while i < lines.len() {
-                let l = lines[i].trim();
-                if l.starts_with("> ") {
-                    quote_lines.push(l[2..].to_string());
-                } else if l == ">" {
-                    quote_lines.push(String::new());
-                } else if !l.is_empty() && !quote_lines.is_empty() {
-                    // Lazy continuation: a non-blank line immediately
-                    // following a `>` line is still part of the quote.
-                    quote_lines.push(l.to_string());
+            Event::Code(s) => {
+                let top = stack.last_mut().unwrap();
+                if suppress > 0 {
+                    top.push_text(&s);
                 } else {
-                    break;
+                    top.push_inline(Inline::Code(s.to_string()));
                 }
-                i += 1;
             }
-            // Recursively parse the stripped quote body so that block-
-            // level elements (fenced code blocks, lists, headings,
-            // tables, horizontal rules, nested blockquotes) inside a
-            // `>` quote render as their native block instead of as
-            // literal per-line inline text. Multi-line plain-text
-            // quotes (`> Foo\n> bar`) still render as two visible rows
-            // because the inner paragraph parser preserves `\n`
-            // between source lines (see `join_paragraph_lines`).
-            let inner = quote_lines.join("\n");
-            let sub_blocks = parse_markdown(&inner, depth + 1);
-            blocks.push(Block::Blockquote(sub_blocks));
-            continue;
-        }
-
-        // Table: GitHub-flavored-markdown tables need a row of cells
-        // followed by an alignment separator. We peek at the next line
-        // to disambiguate from paragraphs that coincidentally start
-        // with `|`.
-        if let Some((table, new_i)) = parse_table(&lines, i) {
-            blocks.push(table);
-            i = new_i;
-            continue;
-        }
-
-        // Unordered list.
-        if line_bullet(line).is_some() {
-            let (list, new_i) = parse_list(&lines, i, false, depth);
-            blocks.push(list);
-            i = new_i;
-            continue;
-        }
-
-        // Ordered list.
-        if line_number(line).is_some() {
-            let (list, new_i) = parse_list(&lines, i, true, depth);
-            blocks.push(list);
-            i = new_i;
-            continue;
-        }
-
-        // Paragraph: collect lines until a blank line or block start.
-        let mut para_lines: Vec<&str> = Vec::new();
-        while i < lines.len() {
-            let l = lines[i];
-            if l.trim().is_empty() {
-                break;
+            Event::SoftBreak | Event::HardBreak => {
+                stack.last_mut().unwrap().push_text("\n");
             }
-            if parse_heading(l).is_some() {
-                break;
-            }
-            if l.trim().starts_with("```") {
-                break;
-            }
-            if l.trim().starts_with("> ") || l.trim() == ">" {
-                break;
-            }
-            let lt = l.trim();
-            if line_bullet(l).is_some() || line_number(l).is_some() {
-                break;
-            }
-            // Keep the `lt` binding in scope for the check below; the
-            // paragraph collector doesn't use it further.
-            let _ = lt;
-            para_lines.push(l);
-            i += 1;
-        }
-        if !para_lines.is_empty() {
-            let text = join_paragraph_lines(&para_lines);
-            blocks.push(Block::Paragraph(parse_inline(&text, 0)));
-        }
-    }
-
-    blocks
-}
-
-/// Join paragraph source lines with a literal `\n` between them.
-///
-/// We deliberately diverge from strict CommonMark "soft break renders
-/// as space" semantics: every newline in the source is preserved as a
-/// newline in the rendered output. Downstream `wrap_text_with_ansi`
-/// splits on `\n` to produce visible rows. The motivation is UX: a
-/// CLI user typing a multi-line message expects each typed line to
-/// render on its own row — the "concatenate-with-space" CommonMark
-/// default isn't a good fit for an agent's chat surface.
-///
-/// CommonMark also recognizes two explicit hard-line-break markers at
-/// the end of a paragraph line:
-///
-/// 1. Two or more trailing spaces.
-/// 2. A single trailing backslash.
-///
-/// Even though every soft break already inserts a `\n`, we still
-/// strip these markers when present so they don't render literally as
-/// trailing whitespace or a stray `\\` at end-of-row. The user's
-/// intent ("force a line break here") is honored either way; we just
-/// keep the marker bytes from leaking into the visible output.
-fn join_paragraph_lines(lines: &[&str]) -> String {
-    let mut out = String::new();
-    let last = lines.len().saturating_sub(1);
-    for (idx, line) in lines.iter().enumerate() {
-        let (stripped, _hard_break) = split_hard_break(line);
-        out.push_str(stripped);
-        if idx < last {
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Detect a CommonMark hard-line-break marker at the end of `line` and
-/// strip it. The two recognized markers are two or more trailing
-/// spaces and a single trailing backslash.
-///
-/// Returns `(stripped, had_marker)`. `had_marker` is preserved on the
-/// return for callers who care about the distinction; current callers
-/// ignore it because every paragraph soft break already inserts `\n`
-/// (see [`join_paragraph_lines`]).
-fn split_hard_break(line: &str) -> (&str, bool) {
-    if let Some(stripped) = line.strip_suffix('\\') {
-        return (stripped, true);
-    }
-    let trimmed = line.trim_end_matches(' ');
-    let trailing_spaces = line.len() - trimmed.len();
-    if trailing_spaces >= 2 {
-        return (trimmed, true);
-    }
-    (line, false)
-}
-
-fn parse_heading(line: &str) -> Option<Block> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('#') {
-        return None;
-    }
-    let level_count = trimmed.chars().take_while(|&c| c == '#').count();
-    if level_count > 6 {
-        return None;
-    }
-    // `level_count` is bounded above by 6, so it always fits in `u8`.
-    let level = u8::try_from(level_count).unwrap_or(6);
-    let rest = trimmed[level_count..].trim();
-    // Trim trailing # marks.
-    let rest = rest.trim_end_matches('#').trim();
-    Some(Block::Heading(level, parse_inline(rest, 0)))
-}
-
-/// Return the `(indent, marker_len)` for a line that starts with an
-/// unordered-list marker (`- `, `* `, or `+ `), or `None` otherwise.
-fn line_bullet(line: &str) -> Option<(usize, usize)> {
-    let indent = indent_of(line);
-    let rest = &line[indent..];
-    if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
-        Some((indent, 2))
-    } else {
-        None
-    }
-}
-
-/// Return the `(indent, marker_len, number)` for a line that starts with
-/// an ordered-list marker (`N. `), or `None` otherwise.
-fn line_number(line: &str) -> Option<(usize, usize, u32)> {
-    let indent = indent_of(line);
-    let rest = &line[indent..];
-    let dot_pos = rest.find(". ")?;
-    let num_part = &rest[..dot_pos];
-    if num_part.is_empty() || !num_part.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let n = num_part.parse::<u32>().ok()?;
-    Some((indent, dot_pos + 2, n))
-}
-
-/// Count leading ASCII spaces. Tabs aren't supported in list indentation
-/// here — markdown authoring we care about uses spaces.
-fn indent_of(line: &str) -> usize {
-    line.bytes().take_while(|&b| b == b' ').count()
-}
-
-/// Parse a list starting at `lines[start]`, nesting sub-lists when
-/// subsequent lines use deeper indentation.
-///
-/// `ordered` picks between the unordered and ordered output variant; the
-/// first line's marker determines the list style and its column-0
-/// indentation sets the base level. More-indented list markers become
-/// nested sub-lists attached to the previous item's `sub_blocks`.
-///
-/// `depth` is the shared block-nesting counter (see [`parse_markdown`]);
-/// a nested sub-list opens only while `depth + 1 < MAX_NESTING_DEPTH`,
-/// otherwise the deeper line folds into the current item as
-/// continuation text.
-fn parse_list(lines: &[&str], start: usize, ordered: bool, depth: usize) -> (Block, usize) {
-    // Indentation of the first list marker defines the base level. A
-    // later line at or beyond this indent that is NOT itself a list
-    // marker is treated as a continuation of the last item's content.
-    // A list marker at strictly greater indent opens a nested list.
-    let base_indent = indent_of(lines[start]);
-
-    let mut pending: Vec<PendingItem> = Vec::new();
-    let mut i = start;
-
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-
-        // Blank line or outdent ends the list.
-        if trimmed.is_empty() {
-            break;
-        }
-        let this_indent = indent_of(line);
-        if this_indent < base_indent {
-            break;
-        }
-
-        let is_bullet = line_bullet(line);
-        let is_number = line_number(line);
-
-        if this_indent == base_indent {
-            // A marker of the wrong style at our own indent level ends
-            // this list (the caller will pick up the new one).
-            match (ordered, is_bullet, is_number) {
-                (false, Some(_), _) => {
-                    // Open new unordered item at this level.
-                    let (_ind, marker_len) = is_bullet.unwrap();
-                    pending.push(PendingItem {
-                        text: line[base_indent + marker_len..].to_string(),
-                        sub_blocks: Vec::new(),
-                        number: None,
-                    });
-                    i += 1;
+            Event::Rule => {
+                if suppress == 0 {
+                    stack.last_mut().unwrap().push_block(Block::HorizontalRule);
                 }
-                (true, _, Some(_)) => {
-                    let (_ind, marker_len, n) = is_number.unwrap();
-                    pending.push(PendingItem {
-                        text: line[base_indent + marker_len..].to_string(),
-                        sub_blocks: Vec::new(),
-                        number: Some(n),
-                    });
-                    i += 1;
-                }
-                _ => break,
             }
-        } else {
-            // Deeper indent than our base.
-            //
-            // A nested list opens only while we have block-nesting
-            // budget; at the [`MAX_NESTING_DEPTH`] cap the deeper line
-            // is folded into the current item as continuation text so
-            // pathologically indented input can't recurse without
-            // bound.
-            if (is_bullet.is_some() || is_number.is_some()) && depth + 1 < MAX_NESTING_DEPTH {
-                // Nested list. Parse it recursively and attach to the
-                // most recent item's sub_blocks.
-                let nested_ordered = is_number.is_some();
-                let (nested, new_i) = parse_list(lines, i, nested_ordered, depth + 1);
-                if let Some(last) = pending.last_mut() {
-                    last.sub_blocks.push(nested);
-                }
-                i = new_i;
-            } else if let Some(last) = pending.last_mut() {
-                // Continuation text under the last item (also the
-                // landing spot for a nested marker we refused to
-                // descend into at the depth cap). Join onto the item's
-                // text with a single space; the whole item is parsed as
-                // one inline run below, so a code span / emphasis / link
-                // on the continuation line — or one straddling the wrap —
-                // renders as markup rather than literal characters.
-                last.text.push(' ');
-                last.text.push_str(trimmed);
-                i += 1;
+            // Footnotes, task lists, and math require options we don't
+            // enable, so these never appear; degrade to text defensively
+            // rather than risk a panic on a future options change.
+            Event::FootnoteReference(s) | Event::InlineMath(s) | Event::DisplayMath(s) => {
+                stack.last_mut().unwrap().push_text(&s);
+            }
+            Event::TaskListMarker(_) => {}
+        }
+    }
+
+    // pulldown emits balanced events, so only the document frame remains.
+    // The loop is a defensive unwind for any frame left open (e.g. by a
+    // future change) so we never drop content.
+    while stack.len() > 1 {
+        let frame = stack.pop().unwrap();
+        finish_frame(frame, &mut stack);
+    }
+    let mut document = stack.pop().unwrap();
+    finish_block_container(&mut document)
+}
+
+/// A node under construction while folding the pulldown event stream.
+///
+/// Every frame buffers inline content two ways: `current_text` is the raw
+/// text not yet tokenized, and `inlines` holds the tokens produced so far.
+/// `flush_text` moves the former into the latter (linkifying as it goes).
+/// `blocks` collects child blocks for the block-level containers
+/// (document, blockquote, list item, HTML block).
+struct Frame {
+    kind: FrameKind,
+    current_text: String,
+    inlines: Vec<Inline>,
+    blocks: Vec<Block>,
+}
+
+/// What a [`Frame`] represents, plus the per-kind state needed to build its
+/// AST node on close.
+enum FrameKind {
+    Document,
+    Paragraph,
+    Heading(u8),
+    BlockQuote,
+    /// Fenced or indented code block; carries the info-string language tag.
+    CodeBlock(Option<String>),
+    /// A raw HTML block; rendered as a literal-text paragraph.
+    HtmlBlock,
+    /// `next_number` is the marker for the next item (seeded from the list's
+    /// start number); `items` accumulates finished items.
+    List {
+        ordered: bool,
+        next_number: u32,
+        items: Vec<ListItem>,
+    },
+    Item,
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Link(String),
+    Image(String),
+    /// `current_row` accumulates cells until the row/head closes; `headers`
+    /// and `rows` collect finished rows; `raw` is the source slice used for
+    /// the renderer's narrow-width fallback.
+    Table {
+        alignments: Vec<Alignment>,
+        headers: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+        current_row: Vec<Vec<Inline>>,
+        raw: String,
+    },
+    TableCell,
+}
+
+impl Frame {
+    fn new(kind: FrameKind) -> Self {
+        Self {
+            kind,
+            current_text: String::new(),
+            inlines: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+
+    fn push_text(&mut self, s: &str) {
+        self.current_text.push_str(s);
+    }
+
+    /// Flush buffered text into inline tokens, autolinking bare URLs and
+    /// emails along the way. Code-block bodies bypass this (they read
+    /// `current_text` directly on close) so their contents stay literal.
+    fn flush_text(&mut self) {
+        if !self.current_text.is_empty() {
+            let text = std::mem::take(&mut self.current_text);
+            self.inlines.extend(linkify(&text));
+        }
+    }
+
+    fn push_inline(&mut self, inline: Inline) {
+        self.flush_text();
+        self.inlines.push(inline);
+    }
+
+    /// Append a child block. Inline content buffered before this block is
+    /// first wrapped into a paragraph so source order is preserved — this
+    /// is how a tight list item's text or stray inline content ahead of a
+    /// nested block becomes its own paragraph.
+    fn push_block(&mut self, block: Block) {
+        self.flush_text();
+        if !self.inlines.is_empty() {
+            let inlines = std::mem::take(&mut self.inlines);
+            self.blocks.push(Block::Paragraph(inlines));
+        }
+        self.blocks.push(block);
+    }
+}
+
+/// Pop a finished frame and attach its product to the parent (now top of
+/// `stack`). Inline frames contribute an [`Inline`]; block frames a
+/// [`Block`]; list items push onto the enclosing list.
+fn finish_frame(mut frame: Frame, stack: &mut Vec<Frame>) {
+    match std::mem::replace(&mut frame.kind, FrameKind::Document) {
+        // The document frame is unwound by the caller, never here.
+        FrameKind::Document => {}
+        FrameKind::Paragraph => {
+            frame.flush_text();
+            let inlines = std::mem::take(&mut frame.inlines);
+            // pulldown can emit an empty paragraph (e.g. a blank quote
+            // line); drop it rather than render an empty row.
+            if !inlines.is_empty() {
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .push_block(Block::Paragraph(inlines));
+            }
+        }
+        FrameKind::Heading(level) => {
+            frame.flush_text();
+            let inlines = std::mem::take(&mut frame.inlines);
+            stack
+                .last_mut()
+                .unwrap()
+                .push_block(Block::Heading(level, inlines));
+        }
+        FrameKind::BlockQuote => {
+            let blocks = finish_block_container(&mut frame);
+            stack
+                .last_mut()
+                .unwrap()
+                .push_block(Block::Blockquote(blocks));
+        }
+        FrameKind::CodeBlock(lang) => {
+            // Strip the single trailing newline pulldown appends so
+            // `code.lines()` in the renderer matches the source lines.
+            let body = frame
+                .current_text
+                .strip_suffix('\n')
+                .unwrap_or(&frame.current_text)
+                .to_string();
+            stack
+                .last_mut()
+                .unwrap()
+                .push_block(Block::CodeBlock(lang, body));
+        }
+        FrameKind::HtmlBlock => {
+            frame.flush_text();
+            let inlines = std::mem::take(&mut frame.inlines);
+            if !inlines.is_empty() {
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .push_block(Block::Paragraph(inlines));
+            }
+        }
+        FrameKind::List { ordered, items, .. } => {
+            let block = if ordered {
+                Block::OrderedList(items)
             } else {
-                break;
+                Block::UnorderedList(items)
+            };
+            stack.last_mut().unwrap().push_block(block);
+        }
+        FrameKind::Item => {
+            let item = build_list_item(frame);
+            // Number the item from the enclosing list's running counter so
+            // a list whose start marker isn't 1 (or that pulldown split off
+            // a preceding list) renders with the right first number.
+            if let FrameKind::List {
+                ordered,
+                next_number,
+                items,
+            } = &mut stack.last_mut().unwrap().kind
+            {
+                let number = if *ordered {
+                    let n = *next_number;
+                    *next_number = next_number.saturating_add(1);
+                    Some(n)
+                } else {
+                    None
+                };
+                items.push(ListItem { number, ..item });
+            }
+        }
+        FrameKind::Emphasis => {
+            frame.flush_text();
+            let inner = std::mem::take(&mut frame.inlines);
+            stack.last_mut().unwrap().push_inline(Inline::Italic(inner));
+        }
+        FrameKind::Strong => {
+            frame.flush_text();
+            let inner = std::mem::take(&mut frame.inlines);
+            stack.last_mut().unwrap().push_inline(Inline::Bold(inner));
+        }
+        FrameKind::Strikethrough => {
+            frame.flush_text();
+            let inner = std::mem::take(&mut frame.inlines);
+            stack
+                .last_mut()
+                .unwrap()
+                .push_inline(Inline::Strikethrough(inner));
+        }
+        FrameKind::Link(url) => {
+            frame.flush_text();
+            let inner = std::mem::take(&mut frame.inlines);
+            stack
+                .last_mut()
+                .unwrap()
+                .push_inline(Inline::Link(inner, url));
+        }
+        FrameKind::Image(url) => {
+            // Terminals can't show images, so we render the alt text as a
+            // link to the source — the reference stays reachable, and an
+            // image with no alt text degrades to a bare link.
+            frame.flush_text();
+            let inner = std::mem::take(&mut frame.inlines);
+            stack
+                .last_mut()
+                .unwrap()
+                .push_inline(Inline::Link(inner, url));
+        }
+        FrameKind::Table {
+            alignments,
+            headers,
+            rows,
+            raw,
+            ..
+        } => {
+            stack.last_mut().unwrap().push_block(Block::Table {
+                headers,
+                alignments,
+                rows,
+                raw,
+            });
+        }
+        FrameKind::TableCell => {
+            // Reached only via the defensive unwind; the normal path is the
+            // End(TableCell) arm. Degrade leftover cell content to text.
+            frame.flush_text();
+            let inlines = std::mem::take(&mut frame.inlines);
+            if !inlines.is_empty() {
+                stack
+                    .last_mut()
+                    .unwrap()
+                    .push_block(Block::Paragraph(inlines));
             }
         }
     }
+}
 
-    // Parse each item's accumulated text once, now that any soft-wrapped
-    // continuation lines have been folded in.
-    let items: Vec<ListItem> = pending
-        .into_iter()
-        .map(|p| ListItem {
-            content: parse_inline(&p.text, 0),
-            sub_blocks: p.sub_blocks,
-            number: p.number,
-        })
-        .collect();
+/// Finish a block-level container: flush any trailing inline content into a
+/// final paragraph, then return its collected blocks.
+fn finish_block_container(frame: &mut Frame) -> Vec<Block> {
+    frame.flush_text();
+    if !frame.inlines.is_empty() {
+        let inlines = std::mem::take(&mut frame.inlines);
+        frame.blocks.push(Block::Paragraph(inlines));
+    }
+    std::mem::take(&mut frame.blocks)
+}
 
-    if ordered {
-        (Block::OrderedList(items), i)
-    } else {
-        (Block::UnorderedList(items), i)
+/// Split a finished item frame into its bullet content and nested blocks.
+///
+/// The item's first paragraph (or, for a tight list, its direct inline
+/// text) becomes the bullet `content`; everything else — nested lists,
+/// later paragraphs, code blocks — becomes `sub_blocks` rendered indented
+/// under the bullet. `number` is assigned by the caller.
+fn build_list_item(mut frame: Frame) -> ListItem {
+    frame.flush_text();
+    let mut content: Vec<Inline> = Vec::new();
+    let mut sub_blocks: Vec<Block> = Vec::new();
+    for block in std::mem::take(&mut frame.blocks) {
+        match block {
+            Block::Paragraph(inlines) if content.is_empty() => content = inlines,
+            other => sub_blocks.push(other),
+        }
+    }
+    // Direct inline text on a tight item never became a block; adopt it as
+    // the content, or as a trailing paragraph if a block already claimed it.
+    let leftover = std::mem::take(&mut frame.inlines);
+    if !leftover.is_empty() {
+        if content.is_empty() {
+            content = leftover;
+        } else {
+            sub_blocks.push(Block::Paragraph(leftover));
+        }
+    }
+    ListItem {
+        content,
+        sub_blocks,
+        number: None,
     }
 }
 
-/// Attempt to parse a GFM-style table starting at `lines[start]`. Returns
-/// `None` if the shape isn't right (missing separator, mismatched column
-/// counts, etc.) so the caller can fall through to paragraph parsing.
-fn parse_table(lines: &[&str], start: usize) -> Option<(Block, usize)> {
-    // Need at least two lines — header + separator.
-    if start + 1 >= lines.len() {
-        return None;
-    }
-
-    let header_cells = split_table_row(lines[start])?;
-    let align_cells = split_table_row(lines[start + 1])?;
-    let alignments = parse_table_alignments(&align_cells)?;
-    if header_cells.len() != alignments.len() {
-        return None;
-    }
-
-    let headers: Vec<Vec<Inline>> = header_cells.iter().map(|c| parse_inline(c, 0)).collect();
-    let mut rows: Vec<Vec<Vec<Inline>>> = Vec::new();
-    let mut i = start + 2;
-
-    while i < lines.len() {
-        let Some(cells) = split_table_row(lines[i]) else {
-            break;
-        };
-        let row: Vec<Vec<Inline>> = cells
-            .iter()
-            .map(|c| parse_inline(c, 0))
-            .chain(std::iter::repeat_with(Vec::new))
-            .take(alignments.len())
-            .collect();
-        rows.push(row);
-        i += 1;
-    }
-
-    Some((
-        Block::Table {
-            headers,
-            alignments,
-            rows,
-            // Capture the raw markdown source for this table block so
-            // the renderer can fall back to wrapping the source text
-            // when the available width can't accommodate even one
-            // cell per column.
-            raw: lines[start..i].join("\n"),
+/// Map a pulldown `Start(Tag)` onto the [`FrameKind`] we push for it.
+/// `source` and `range` are used only to capture a table's raw source.
+fn start_tag_to_kind(tag: Tag, source: &str, range: std::ops::Range<usize>) -> FrameKind {
+    match tag {
+        Tag::Paragraph => FrameKind::Paragraph,
+        Tag::Heading { level, .. } => FrameKind::Heading(heading_level(level)),
+        Tag::BlockQuote(_) => FrameKind::BlockQuote,
+        Tag::CodeBlock(kind) => FrameKind::CodeBlock(code_block_lang(kind)),
+        Tag::HtmlBlock => FrameKind::HtmlBlock,
+        Tag::List(start) => FrameKind::List {
+            ordered: start.is_some(),
+            next_number: u32::try_from(start.unwrap_or(1)).unwrap_or(u32::MAX),
+            items: Vec::new(),
         },
-        i,
-    ))
-}
-
-/// If `line` looks like a table row (`| ... | ... |`), split it into
-/// trimmed cell strings. Returns `None` if it doesn't have the minimum
-/// structure (leading and trailing `|` with at least one interior
-/// delimiter).
-fn split_table_row(line: &str) -> Option<Vec<String>> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('|') || !trimmed.ends_with('|') || trimmed.len() < 2 {
-        return None;
+        Tag::Item => FrameKind::Item,
+        Tag::Emphasis => FrameKind::Emphasis,
+        Tag::Strong => FrameKind::Strong,
+        Tag::Strikethrough => FrameKind::Strikethrough,
+        Tag::Link { dest_url, .. } => FrameKind::Link(dest_url.to_string()),
+        Tag::Image { dest_url, .. } => FrameKind::Image(dest_url.to_string()),
+        Tag::Table(aligns) => FrameKind::Table {
+            alignments: aligns.into_iter().map(convert_alignment).collect(),
+            headers: Vec::new(),
+            rows: Vec::new(),
+            current_row: Vec::new(),
+            raw: source
+                .get(range)
+                .unwrap_or("")
+                .trim_end_matches('\n')
+                .to_string(),
+        },
+        Tag::TableCell => FrameKind::TableCell,
+        // TableHead/TableRow are intercepted before this call. The remaining
+        // variants (footnotes, definition lists, metadata blocks,
+        // sub/superscript) require options we don't enable, so they never
+        // reach here; treat any straggler as a transparent paragraph so its
+        // text still surfaces.
+        _ => FrameKind::Paragraph,
     }
-    // Trim the outer pipes and split on interior `|`. Cells are
-    // trim()-ed so `| Alice  | 30 |` renders as `["Alice", "30"]`.
-    let inner = &trimmed[1..trimmed.len() - 1];
-    let cells: Vec<String> = inner.split('|').map(|c| c.trim().to_string()).collect();
-    if cells.is_empty() { None } else { Some(cells) }
 }
 
-/// Parse the alignment spec row (`| :--- | :---: | ---: |`). Returns
-/// `None` if any cell isn't a valid dash-plus-optional-colons pattern.
-fn parse_table_alignments(cells: &[String]) -> Option<Vec<Alignment>> {
-    cells
-        .iter()
-        .map(|c| {
-            let trimmed = c.trim();
-            let (left_colon, rest) = match trimmed.strip_prefix(':') {
-                Some(rest) => (true, rest),
-                None => (false, trimmed),
-            };
-            let (right_colon, dashes) = match rest.strip_suffix(':') {
-                Some(rest) => (true, rest),
-                None => (false, rest),
-            };
-            if dashes.is_empty() || !dashes.chars().all(|c| c == '-') {
-                return None;
-            }
-            Some(match (left_colon, right_colon) {
-                (true, true) => Alignment::Center,
-                (false, true) => Alignment::Right,
-                _ => Alignment::Left,
-            })
-        })
-        .collect()
-}
-
-/// Parse inline markdown elements (bold, italic, code, links, etc.).
-///
-/// Raw HTML tags are deliberately *not* recognized as a separate token
-/// type — `<thinking>`, `<div>`, etc. fall through the parser as plain
-/// text and render literally. This is the opposite of a strict
-/// CommonMark passthrough (which would emit a raw `html` token and have
-/// the renderer drop or copy it verbatim into HTML output) but the
-/// right call for a terminal renderer driving model output: a model
-/// that emits `<thinking>...</thinking>` should have those bytes
-/// visible to the user, not silently swallowed. The companion
-/// regression test is
-/// `renders_html_like_tags_in_text_as_content_rather_than_hiding_them`
-/// in `tests/markdown.rs`.
-///
-/// `depth` tracks inline-nesting (emphasis/link recursion), independent
-/// of block nesting; block-level callers pass 0. At [`MAX_NESTING_DEPTH`]
-/// the text is returned as a single literal run rather than recursing.
-fn parse_inline(text: &str, depth: usize) -> Vec<Inline> {
-    if depth >= MAX_NESTING_DEPTH {
-        return vec![Inline::Text(text.to_string())];
+fn heading_level(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
     }
-    let mut result: Vec<Inline> = Vec::new();
-    let mut current = String::new();
+}
+
+/// Language tag for a code block: the first whitespace-delimited token of a
+/// fenced block's info string, or `None` for an indented block or empty
+/// info string.
+fn code_block_lang(kind: CodeBlockKind) -> Option<String> {
+    match kind {
+        CodeBlockKind::Indented => None,
+        CodeBlockKind::Fenced(info) => info
+            .split_whitespace()
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    }
+}
+
+/// Map pulldown's column alignment onto ours. A column with no alignment
+/// colon renders left-aligned, matching the default.
+fn convert_alignment(alignment: PdAlignment) -> Alignment {
+    match alignment {
+        PdAlignment::Right => Alignment::Right,
+        PdAlignment::Center => Alignment::Center,
+        PdAlignment::None | PdAlignment::Left => Alignment::Left,
+    }
+}
+
+/// Split a plain-text run into text and autolink inlines.
+///
+/// pulldown only autolinks the angle-bracket form (`<http://...>`), so we
+/// recover GFM-style bare URL and email autolinks here. Each match becomes
+/// an `Inline::Link` whose visible text is the URL/email itself (so the
+/// renderer's `plain == url` check fires the no-parens fallback). A URL
+/// containing markdown-active characters (`*`, `_`) can be split by
+/// pulldown's inline parsing before it reaches this pass — the common case
+/// (no such characters) round-trips intact.
+fn linkify(text: &str) -> Vec<Inline> {
     let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<Inline> = Vec::new();
+    let mut buf = String::new();
     let mut i = 0;
 
     while i < chars.len() {
-        // Bold (**text** or __text__). Word-boundary rule: the opening
-        // `**`/`__` must not be preceded by a word character, and the
-        // closing `**`/`__` must not be followed by one. Prevents
-        // `5**4**3` from bolding the `4`, and (paired with the italic
-        // arm below) keeps `_` from opening intraword.
-        if i + 1 < chars.len()
-            && ((chars[i] == '*' && chars[i + 1] == '*')
-                || (chars[i] == '_' && chars[i + 1] == '_'))
-            && !preceded_by_word_char(&chars, i)
-        {
-            let marker = chars[i];
-            if let Some(end) = find_emphasis_closing(&chars, i + 2, &[marker, marker]) {
-                if !current.is_empty() {
-                    result.push(Inline::Text(std::mem::take(&mut current)));
-                }
-                let inner: String = chars[i + 2..end].iter().collect();
-                result.push(Inline::Bold(parse_inline(&inner, depth + 1)));
-                i = end + 2;
-                continue;
-            }
-        }
-
-        // Strikethrough (~~text~~). Strict double-tilde delimiters
-        // with non-whitespace boundaries: the character immediately
-        // after the opening `~~` and the character immediately before
-        // the closing `~~` must both be non-whitespace and non-tilde,
-        // and the character immediately after the closing `~~` (if
-        // any) must not be a tilde. Prevents loose tilde usage —
-        // `~~ foo ~~`, `~~foo~~~`, `~~~~~~~~` — from accidentally
-        // activating strikethrough.
-        if i + 1 < chars.len()
-            && chars[i] == '~'
-            && chars[i + 1] == '~'
-            && let Some(&after_open) = chars.get(i + 2)
-            && !after_open.is_whitespace()
-            && after_open != '~'
-            && let Some(end) = find_strict_strikethrough_close(&chars, i + 2)
-        {
-            if !current.is_empty() {
-                result.push(Inline::Text(std::mem::take(&mut current)));
-            }
-            let inner: String = chars[i + 2..end].iter().collect();
-            result.push(Inline::Strikethrough(parse_inline(&inner, depth + 1)));
-            i = end + 2;
-            continue;
-        }
-
-        // Italic (*text* or _text_). Word-boundary rule: the opening
-        // `*`/`_` must not be preceded by a word character, and the
-        // closing must not be followed by one. Prevents `5*4*3` from
-        // italicizing the `4`, and `foo_bar_baz` from being parsed as
-        // emphasis. The `chars[i - 1] != chars[i]` guard rejects the
-        // tail of a longer delimiter run (e.g. the second `*` in a
-        // rejected `**` opener) so `5**4**3` doesn't fall through to
-        // italic on `4`.
-        if (chars[i] == '*' || chars[i] == '_')
-            && (i + 1 < chars.len() && !chars[i + 1].is_whitespace())
-            && !preceded_by_word_char(&chars, i)
-            && (i == 0 || chars[i - 1] != chars[i])
-        {
-            let marker = chars[i];
-            if let Some(end) = find_emphasis_closing(&chars, i + 1, &[marker]) {
-                if end > i + 1 {
-                    if !current.is_empty() {
-                        result.push(Inline::Text(std::mem::take(&mut current)));
-                    }
-                    let inner: String = chars[i + 1..end].iter().collect();
-                    result.push(Inline::Italic(parse_inline(&inner, depth + 1)));
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-
-        // Inline code (`code`).
-        if chars[i] == '`' {
-            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`') {
-                let end = i + 1 + end;
-                if !current.is_empty() {
-                    result.push(Inline::Text(std::mem::take(&mut current)));
-                }
-                let code: String = chars[i + 1..end].iter().collect();
-                result.push(Inline::Code(code));
-                i = end + 1;
-                continue;
-            }
-        }
-
-        // Link [text](url).
-        if chars[i] == '[' {
-            if let Some(close_bracket) = chars[i + 1..].iter().position(|&c| c == ']') {
-                let close_bracket = i + 1 + close_bracket;
-                if close_bracket + 1 < chars.len() && chars[close_bracket + 1] == '(' {
-                    if let Some(close_paren) =
-                        chars[close_bracket + 2..].iter().position(|&c| c == ')')
-                    {
-                        let close_paren = close_bracket + 2 + close_paren;
-                        if !current.is_empty() {
-                            result.push(Inline::Text(std::mem::take(&mut current)));
-                        }
-                        let link_text: String = chars[i + 1..close_bracket].iter().collect();
-                        let link_url: String =
-                            chars[close_bracket + 2..close_paren].iter().collect();
-                        // Recursively parse the bracket content as
-                        // inlines so `[**bold**](url)` keeps its
-                        // emphasis.
-                        result.push(Inline::Link(parse_inline(&link_text, depth + 1), link_url));
-                        i = close_paren + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Autolink: bare `http://` or `https://` URL.
         if let Some(end) = bare_url_end(&chars, i) {
-            if !current.is_empty() {
-                result.push(Inline::Text(std::mem::take(&mut current)));
+            if !buf.is_empty() {
+                out.push(Inline::Text(std::mem::take(&mut buf)));
             }
             let url: String = chars[i..end].iter().collect();
-            // Autolinks have a single text inline whose content is
-            // the URL itself. Wrapping in `vec![Text(...)]` keeps the
-            // shape uniform with `[text](url)` parsing — the renderer
-            // treats both paths via [`Markdown::render_link`].
-            result.push(Inline::Link(vec![Inline::Text(url.clone())], url));
+            out.push(Inline::Link(vec![Inline::Text(url.clone())], url));
             i = end;
             continue;
         }
 
-        // Autolink: bare email `local@domain.tld`. Only fires when the
-        // previous character (or start of text) is a non-word boundary,
-        // so `foo@bar` inside an identifier still parses as plain text.
+        // The local part of a bare email has already been buffered into
+        // `buf`; `bare_email_span` checks it's recoverable and reports the
+        // span so we can back it out.
         if chars[i] == '@'
-            && i > 0
-            && !current.is_empty()
-            && let Some((start, end)) = bare_email_span(&chars, i, current.len())
+            && let Some((start, end)) = bare_email_span(&chars, i, buf.chars().count())
         {
-            // `start` and `end` are indexes into `chars`. We have to
-            // snip the local part back out of `current` since that
-            // buffer already captured it.
-            let local_len_chars = i - start;
-            let truncate_to = current.len().saturating_sub(local_len_chars);
-            current.truncate(truncate_to);
-            if !current.is_empty() {
-                result.push(Inline::Text(std::mem::take(&mut current)));
+            for _ in 0..(i - start) {
+                buf.pop();
+            }
+            if !buf.is_empty() {
+                out.push(Inline::Text(std::mem::take(&mut buf)));
             }
             let email: String = chars[start..end].iter().collect();
-            result.push(Inline::Link(
+            out.push(Inline::Link(
                 vec![Inline::Text(email.clone())],
-                format!("mailto:{}", email),
+                format!("mailto:{email}"),
             ));
             i = end;
             continue;
         }
 
-        current.push(chars[i]);
+        buf.push(chars[i]);
         i += 1;
     }
 
-    if !current.is_empty() {
-        result.push(Inline::Text(current));
+    if !buf.is_empty() {
+        out.push(Inline::Text(buf));
     }
-
-    result
+    out
 }
 
 /// If `chars[start..]` begins with `http://` or `https://`, return the
@@ -1285,79 +1170,6 @@ fn is_email_local_char(c: char) -> bool {
 
 fn is_email_domain_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
-}
-
-/// Find the strict closing `~~` for a strikethrough span starting at
-/// `start` (the index after the opening `~~`).
-///
-/// Enforces two boundary rules:
-///
-/// - The character immediately before the closing `~~` must be
-///   non-whitespace and non-tilde. Without this `~~foo ~~` would
-///   strikethrough `foo `, which doesn't match GFM-style strict
-///   strikethrough.
-/// - The character immediately after the closing `~~` (if any) must
-///   not be another tilde. Without this `~~foo~~~` would strikethrough
-///   `foo` and leave a stray `~`; the strict reading rejects the
-///   match outright when the run of closing tildes exceeds two.
-///
-/// Returns `None` for an empty content (the caller already enforces
-/// non-whitespace, non-tilde at `start`, but this is the structural
-/// reason the loop starts at `start + 1`).
-fn find_strict_strikethrough_close(chars: &[char], start: usize) -> Option<usize> {
-    if start + 2 > chars.len() {
-        return None;
-    }
-    for i in (start + 1)..=chars.len() - 2 {
-        if chars[i] == '~' && chars[i + 1] == '~' {
-            let prev = chars[i - 1];
-            if prev.is_whitespace() || prev == '~' {
-                continue;
-            }
-            if let Some(&next) = chars.get(i + 2)
-                && next == '~'
-            {
-                continue;
-            }
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Like a plain "find marker" scan, but skips marker occurrences that
-/// are followed by a word character. Used by the bold/italic
-/// word-boundary rule: a closing `*`/`_` (single or double) must sit
-/// at a non-word boundary on its right, otherwise it isn't a valid
-/// emphasis close.
-fn find_emphasis_closing(chars: &[char], start: usize, marker: &[char]) -> Option<usize> {
-    let mlen = marker.len();
-    if start + mlen > chars.len() {
-        return None;
-    }
-    for i in start..=chars.len() - mlen {
-        if &chars[i..i + mlen] == marker {
-            let after = i + mlen;
-            if after >= chars.len() || !is_emphasis_word_char(chars[after]) {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
-/// `true` if `chars[i]` is preceded by a word character — used by the
-/// bold/italic open-boundary rule. Treats start-of-input as a word
-/// boundary.
-fn preceded_by_word_char(chars: &[char], i: usize) -> bool {
-    i > 0 && is_emphasis_word_char(chars[i - 1])
-}
-
-/// Word-char predicate for emphasis boundaries: alphanumeric or `_`.
-/// Underscore counts as a word char so that `foo_bar_baz` is treated as
-/// a single intraword run rather than three emphasis candidates.
-fn is_emphasis_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 /// Recursively extract the plain-text content from a sequence of
@@ -2238,7 +2050,7 @@ impl Component for Markdown {
         // idempotent and deterministic, so a hit returns the same
         // result we'd produce by re-normalizing.
         let normalized = self.text.replace('\t', TAB_AS_SPACES);
-        let blocks = parse_markdown(&normalized, 0);
+        let blocks = parse_markdown(&normalized);
 
         // Phase 1: collect block-rendered lines (no horizontal
         // padding, no outer wrap yet). The per-block `render_block`
@@ -2838,7 +2650,7 @@ mod tests {
     fn parser_caps_block_nesting_on_adversarial_input() {
         // ~100k nested blockquotes collapse to a capped quote stack
         // wrapping a single literal paragraph.
-        let quotes = parse_markdown(&"> ".repeat(100_000), 0);
+        let quotes = parse_markdown(&"> ".repeat(100_000));
         assert!(
             block_depth(&quotes) <= MAX_NESTING_DEPTH + 1,
             "blockquote nesting not capped: depth {}",
@@ -2852,7 +2664,7 @@ mod tests {
             nested_list.push_str(&" ".repeat(level));
             nested_list.push_str("- x\n");
         }
-        let list = parse_markdown(&nested_list, 0);
+        let list = parse_markdown(&nested_list);
         assert!(
             block_depth(&list) <= MAX_NESTING_DEPTH + 1,
             "list nesting not capped: depth {}",

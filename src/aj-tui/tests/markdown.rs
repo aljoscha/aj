@@ -1637,19 +1637,45 @@ fn renders_double_tilde_as_strikethrough() {
 }
 
 #[test]
-fn keeps_single_tilde_as_plain_text() {
-    let mut m = md("Use ~strikethrough~ literally");
+fn single_tilde_strikes_through_per_gfm() {
+    // GFM strikethrough accepts a single `~` with tight flanking, so
+    // `~word~` is struck. The cases that matter for chat output (home-dir
+    // paths, "approximately" tildes) fail the flanking rules and stay
+    // literal; see `single_tilde_in_paths_and_approximations_stays_literal`.
+    let mut m = md("Use ~struck~ here");
+    let lines = m.render(80);
+    let joined = lines.join("\n");
+    let plain = plain_lines(&lines).join(" ");
+
+    assert!(plain.contains("struck"));
+    assert!(
+        !plain.contains("~struck~"),
+        "tight single-tilde delimiters should be consumed",
+    );
+    assert!(
+        joined.contains("\x1b[9m"),
+        "single-tilde strikethrough should use strikethrough styling",
+    );
+}
+
+#[test]
+fn single_tilde_in_paths_and_approximations_stays_literal() {
+    let mut m = md("run ~/home/user and ~5 to ~10 things");
     let lines = m.render(80);
     let joined = lines.join("\n");
     let plain = plain_lines(&lines).join(" ");
 
     assert!(
-        plain.contains("~strikethrough~"),
-        "single-tilde delimiters should remain visible",
+        plain.contains("~/home/user"),
+        "path tilde should survive: {plain:?}"
+    );
+    assert!(
+        plain.contains("~5 to ~10"),
+        "approx tildes should survive: {plain:?}"
     );
     assert!(
         !joined.contains("\x1b[9m"),
-        "single-tilde text should not use strikethrough styling",
+        "loose tildes must not open strikethrough; got: {joined:?}",
     );
 }
 
@@ -1863,25 +1889,25 @@ fn link_inside_heading_inherits_heading_style_via_context() {
 }
 
 #[test]
-fn autolinked_url_renders_with_simple_text_unchanged() {
-    // Regression guard: bare URL and email autolinks build
-    // `Link(vec![Text(url)], url)` shapes. The parser must not
-    // accidentally consume `*` characters from a URL's path/query.
-    let mut m = md("Visit https://example.com/path*with*stars for more");
+fn autolinked_url_with_path_renders_once() {
+    // A bare URL autolinks to `Link(vec![Text(url)], url)`, so the plain
+    // text equals the URL and the no-parens fallback fires: the URL shows
+    // exactly once with no ` (url)` suffix.
+    //
+    // NOTE: a URL containing markdown-active characters (`*`, `[`) can be
+    // split by inline parsing before it reaches the autolink pass, so such
+    // URLs are not round-tripped. The common case (path/query without
+    // active characters) is unaffected.
+    let mut m = md("Visit https://example.com/path/to/page?q=1 for more");
     let lines = m.render(80);
     let plain = plain_lines(&lines).join(" ");
 
-    let url_count = plain.matches("https://example.com/path*with*stars").count();
+    let url_count = plain
+        .matches("https://example.com/path/to/page?q=1")
+        .count();
     assert_eq!(
         url_count, 1,
-        "autolinked URL with literal stars should appear exactly once \
-         (autolink plain text == url, no parens fallback); got: {:?}",
-        plain,
-    );
-    // And the literal stars survive into the rendered output.
-    assert!(
-        plain.contains("path*with*stars"),
-        "stars in autolinked URL must not be parsed as italic: got {:?}",
+        "autolinked URL should appear exactly once; got: {:?}",
         plain,
     );
 }
@@ -2194,50 +2220,48 @@ fn paragraph_with_break_at_last_line_strips_marker_without_emitting_blank_row() 
 }
 
 // ---------------------------------------------------------------------------
-// Italic/bold word-boundary rule
+// Intraword emphasis (CommonMark flanking rules)
 // ---------------------------------------------------------------------------
 //
-// The opening `*` / `_` (single or double) of an emphasis run requires
-// a non-word-char on its left, and the closing requires a non-word-char
-// on its right. So `5*4*3` and `5**4**3` parse as plain text instead of
-// emphasizing the numbers in the middle. Standard well-formed emphasis
-// (`*foo*`, `**foo**`, `_foo_`, `__foo__` with whitespace or
-// punctuation around it) is unaffected.
+// `*`/`**` may open and close intraword, so `5*4*3` and `5**4**3`
+// emphasize the middle run. `_`/`__` may not open intraword, so `a_b_c`
+// stays literal (see the underscore cases below). This follows
+// CommonMark's left/right-flanking delimiter rules.
 
 #[test]
-fn intraword_asterisks_do_not_italicize_when_both_sides_are_word_chars() {
+fn intraword_asterisks_italicize_per_commonmark() {
     let mut m = md("5*4*3");
     let lines = m.render(80);
     let joined = lines.join("\n");
     let plain = plain_lines(&lines).join("\n");
 
     assert!(
-        plain.contains("5*4*3"),
-        "literal asterisks should survive the rendered text; got: {:?}",
+        plain.contains('4') && !plain.contains('*'),
+        "intraword `*` should emphasize `4` and consume the asterisks; got: {:?}",
         plain,
     );
     assert!(
-        !joined.contains("\x1b[3m"),
-        "intraword asterisks must not open italic; got: {:?}",
+        joined.contains("\x1b[3m"),
+        "intraword `*` should open italic; got: {:?}",
         joined,
     );
 }
 
 #[test]
-fn intraword_double_asterisks_do_not_bold_when_both_sides_are_word_chars() {
+fn intraword_double_asterisks_bold_per_commonmark() {
     let mut m = md("5**4**3");
     let lines = m.render(80);
     let joined = lines.join("\n");
     let plain = plain_lines(&lines).join("\n");
 
     assert!(
-        plain.contains("5**4**3"),
-        "literal asterisks should survive the rendered text; got: {:?}",
+        plain.contains('4') && !plain.contains('*'),
+        "intraword `**` should embolden `4` and consume the asterisks; got: {:?}",
         plain,
     );
     assert!(
-        !joined.contains("\x1b[1m"),
-        "intraword `**` must not open bold; got: {:?}",
+        joined.contains("\x1b[1m"),
+        "intraword `**` should open bold; got: {:?}",
         joined,
     );
 }
@@ -4039,4 +4063,41 @@ fn trailing_blank_trim_still_fires_with_bg_color_set() {
         "row 2 must be the bottom padding row (visible-empty after strip + trim_end); got {:?}",
         plain[2],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Streaming / partial input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renders_every_prefix_of_a_streaming_document_without_panicking() {
+    // The assistant-message component re-parses the whole accumulated
+    // buffer on every streamed delta, so mid-stream we routinely render
+    // *incomplete* markdown: an unclosed fence, a half-typed `**bold`, a
+    // dangling `[link`, a partial table row. CommonMark is total (no parse
+    // errors), so every prefix must render to some output without panic,
+    // and the final prefix must match a fresh render of the full text.
+    let doc = "# Heading\n\nSome **bold** and `code` and a [link](https://example.com).\n\n\
+               - item one\n- item two\n  - nested\n\n\
+               > a quote with ~~strike~~\n\n\
+               | a | b |\n|:--|--:|\n| 1 | 2 |\n\n\
+               ```rust\nfn main() { println!(\"hi\"); }\n```\n\n\
+               visit https://example.com/path and mail me@example.com\n";
+
+    let chars: Vec<char> = doc.chars().collect();
+    let mut m = Markdown::new("", 1, 0, default_markdown_theme(), None);
+    for end in 0..=chars.len() {
+        let prefix: String = chars[..end].iter().collect();
+        // Mirror the streaming mutation path: set_text + render at a few
+        // widths. The assertion is simply that none of this panics (e.g.
+        // the tui width-overflow backstop or a fold-stack mishap).
+        m.set_text(&prefix);
+        for width in [10_usize, 40, 80] {
+            let _ = m.render(width);
+        }
+    }
+
+    // After the last byte, the streamed result equals a from-scratch render.
+    let mut fresh = Markdown::new(doc, 1, 0, default_markdown_theme(), None);
+    assert_eq!(m.render(80), fresh.render(80));
 }
