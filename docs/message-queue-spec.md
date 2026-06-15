@@ -1,6 +1,6 @@
 # Queued messages — steering & follow-up — spec
 
-Status: proposed.
+Status: implemented.
 
 Let the user type a message while an agent is working. The message is
 **queued** and shown above the editor, signalling it will be sent when
