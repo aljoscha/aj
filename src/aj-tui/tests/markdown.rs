@@ -3334,18 +3334,21 @@ fn custom_non_italic_quote_theme_still_underwraps_with_italic() {
 #[test]
 fn code_block_without_syntax_highlight_renders_plain_body() {
     // `default_markdown_theme()` enables `syntax_highlight`, so the
-    // body is colored by syntect (24-bit `\x1b[38;2;…m` escapes).
-    // With the flag off, the body must instead route through the
-    // theme's `code_block` styler (green here) and carry no syntect
-    // truecolor escapes.
+    // body is tokenized and colored via the theme's `SyntaxStyles`.
+    // With the flag off, the body instead routes through the theme's
+    // `code_block` styler (green here) as a single span.
     let code = "```rust\nlet x = 1;\n```";
 
     let mut highlighted = Markdown::new(code, 0, 0, default_markdown_theme(), None);
-    let highlighted_join = highlighted.render(80).join("\n");
+    let hl_lines = highlighted.render(80);
+    let hl_body = hl_lines
+        .iter()
+        .find(|l| strip_ansi(l).contains("let x = 1;"))
+        .expect("expected a rendered row containing the code body");
     assert!(
-        highlighted_join.contains("\x1b[38;2;"),
-        "default theme should syntax-highlight with truecolor escapes; got: {:?}",
-        highlighted_join,
+        !hl_body.contains("\x1b[32m"),
+        "highlighted body should not use the green code_block styler; got: {:?}",
+        hl_body,
     );
 
     let theme = MarkdownTheme {
@@ -3354,13 +3357,6 @@ fn code_block_without_syntax_highlight_renders_plain_body() {
     };
     let mut plain = Markdown::new(code, 0, 0, theme, None);
     let lines = plain.render(80);
-    let joined = lines.join("\n");
-
-    assert!(
-        !joined.contains("\x1b[38;2;"),
-        "disabled highlighting should emit no syntect truecolor escapes; got: {:?}",
-        joined,
-    );
     let body = lines
         .iter()
         .find(|l| strip_ansi(l).contains("let x = 1;"))
@@ -3374,14 +3370,37 @@ fn code_block_without_syntax_highlight_renders_plain_body() {
 }
 
 #[test]
+fn code_block_colors_tokens_with_palette_syntax_styles() {
+    // The built-in highlighter tokenizes with syntect and colors each
+    // token via the theme's `SyntaxStyles`. `default_syntax_styles()`
+    // paints comments red and keywords magenta; a Rust block with a
+    // comment and a `let` keyword must show both, proving scope →
+    // palette-category classification is wired up.
+    let code = "```rust\n// note\nlet y = 2;\n```";
+    let mut m = Markdown::new(code, 0, 0, default_markdown_theme(), None);
+    let joined = m.render(80).join("\n");
+
+    assert!(
+        joined.contains("\x1b[31m"),
+        "comment should be painted with the red comment style; got: {:?}",
+        joined,
+    );
+    assert!(
+        joined.contains("\x1b[35m"),
+        "the `let` keyword should be painted with the magenta keyword style; got: {:?}",
+        joined,
+    );
+}
+
+#[test]
 fn code_block_in_blockquote_reopens_quote_styling_after_syntect_reset() {
     // `apply_quote_style` replaces every `\x1b[0m` (full SGR reset,
-    // emitted by syntect's `as_24_bit_terminal_escaped`) with
+    // appended to each highlighted code line) with
     // `\x1b[0m{quote_prefix}` before wrapping with `quote_apply`.
     // The visible effect: a fenced code block inside a `>` quote
     // keeps the quote/italic styling open through the trailing
     // cells of every highlighted code row, instead of falling back
-    // to plain after the syntect-emitted `\x1b[0m`.
+    // to plain after the line's `\x1b[0m`.
     //
     // For our default theme (`theme.quote = style::italic`) the
     // quote_prefix is `\x1b[3m\x1b[3m` (the quote's italic plus the

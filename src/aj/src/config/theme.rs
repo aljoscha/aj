@@ -59,7 +59,7 @@ use std::time::Duration;
 
 use aj_models::ThinkingConfig;
 use aj_tui::components::editor::EditorTheme;
-use aj_tui::components::markdown::MarkdownTheme;
+use aj_tui::components::markdown::{MarkdownTheme, SyntaxStyles};
 use aj_tui::components::select_list::SelectListTheme;
 use aj_tui::style;
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -1309,6 +1309,21 @@ pub fn markdown_theme(theme: &ThemeHandle, syntax_highlight: bool) -> MarkdownTh
         highlight_code: None,
         code_block_indent: None,
         syntax_highlight,
+        // Map syntect's token categories onto the palette's `Syntax*`
+        // tokens. Each closure re-reads the live palette, so code-block
+        // colors follow a theme reload and honor the active color mode
+        // just like the rest of the markdown styling.
+        syntax: SyntaxStyles {
+            comment: theme.fg_closure(ThemeColor::SyntaxComment),
+            keyword: theme.fg_closure(ThemeColor::SyntaxKeyword),
+            function: theme.fg_closure(ThemeColor::SyntaxFunction),
+            variable: theme.fg_closure(ThemeColor::SyntaxVariable),
+            string: theme.fg_closure(ThemeColor::SyntaxString),
+            number: theme.fg_closure(ThemeColor::SyntaxNumber),
+            type_name: theme.fg_closure(ThemeColor::SyntaxType),
+            operator: theme.fg_closure(ThemeColor::SyntaxOperator),
+            punctuation: theme.fg_closure(ThemeColor::SyntaxPunctuation),
+        },
     }
 }
 
@@ -1591,6 +1606,29 @@ mod tests {
         // emit pure SGR style codes via aj_tui::style.
         let painted = (ml_theme.bold)("hi");
         assert!(painted.contains("\x1b[1m"));
+    }
+
+    #[test]
+    fn markdown_theme_wires_palette_syntax_tokens() {
+        // The syntax closures must carry the palette's `Syntax*`
+        // colors so code blocks track the active theme. Pin the color
+        // mode so the assertion is deterministic regardless of the
+        // test environment's terminal.
+        let theme = Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
+            .expect("bundled dark must parse");
+        let handle = ThemeHandle::new(theme);
+        let ml = markdown_theme(&handle, true);
+
+        // dark.json: syntaxKeyword = #569CD6 → rgb(86,156,214),
+        // syntaxString = #CE9178 → rgb(206,145,120).
+        assert!(
+            (ml.syntax.keyword)("kw").contains("\x1b[38;2;86;156;214m"),
+            "keyword closure should carry the syntaxKeyword color"
+        );
+        assert!(
+            (ml.syntax.string)("s").contains("\x1b[38;2;206;145;120m"),
+            "string closure should carry the syntaxString color"
+        );
     }
 
     #[test]

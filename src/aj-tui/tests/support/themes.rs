@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use aj_tui::components::editor::EditorTheme;
-use aj_tui::components::markdown::MarkdownTheme;
+use aj_tui::components::markdown::{MarkdownTheme, SyntaxStyles};
 use aj_tui::components::select_list::SelectListTheme;
 use aj_tui::components::settings_list::SettingsListTheme;
 use aj_tui::style;
@@ -68,6 +68,38 @@ pub fn default_markdown_theme() -> MarkdownTheme {
         // Keep the built-in syntect highlighter active so the markdown
         // tests exercise the highlighting path.
         syntax_highlight: true,
+        syntax: default_syntax_styles(),
+    }
+}
+
+/// Distinct per-category colors so tests can tell syntax-highlighted
+/// tokens apart and from the green `code_block` styler.
+pub fn default_syntax_styles() -> SyntaxStyles {
+    SyntaxStyles {
+        comment: Arc::new(style::red),
+        keyword: Arc::new(style::magenta),
+        function: Arc::new(style::blue),
+        variable: Arc::new(style::cyan),
+        string: Arc::new(style::yellow),
+        number: Arc::new(style::white),
+        type_name: Arc::new(style::blue),
+        operator: Arc::new(style::dim),
+        punctuation: Arc::new(style::dim),
+    }
+}
+
+/// Syntax styles whose closures pass strings through verbatim.
+pub fn identity_syntax_styles() -> SyntaxStyles {
+    SyntaxStyles {
+        comment: Arc::new(|s| s.to_string()),
+        keyword: Arc::new(|s| s.to_string()),
+        function: Arc::new(|s| s.to_string()),
+        variable: Arc::new(|s| s.to_string()),
+        string: Arc::new(|s| s.to_string()),
+        number: Arc::new(|s| s.to_string()),
+        type_name: Arc::new(|s| s.to_string()),
+        operator: Arc::new(|s| s.to_string()),
+        punctuation: Arc::new(|s| s.to_string()),
     }
 }
 
@@ -117,6 +149,7 @@ pub fn identity_markdown_theme() -> MarkdownTheme {
         // Keep the built-in syntect highlighter active so the markdown
         // tests exercise the highlighting path.
         syntax_highlight: true,
+        syntax: identity_syntax_styles(),
     }
 }
 

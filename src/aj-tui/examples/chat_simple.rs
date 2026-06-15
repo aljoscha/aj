@@ -26,7 +26,7 @@ use aj_tui::autocomplete::CombinedAutocompleteProvider;
 use aj_tui::component::Component;
 use aj_tui::components::editor::{Editor, EditorTheme};
 use aj_tui::components::loader::Loader;
-use aj_tui::components::markdown::{Markdown, MarkdownTheme};
+use aj_tui::components::markdown::{Markdown, MarkdownTheme, SyntaxStyles};
 use aj_tui::components::select_list::SelectListTheme;
 use aj_tui::components::text::Text;
 use aj_tui::style;
@@ -92,6 +92,17 @@ fn markdown_theme() -> MarkdownTheme {
         highlight_code: None,
         code_block_indent: None,
         syntax_highlight: true,
+        syntax: SyntaxStyles {
+            comment: Arc::new(style::dim),
+            keyword: Arc::new(style::magenta),
+            function: Arc::new(style::blue),
+            variable: Arc::new(style::cyan),
+            string: Arc::new(style::green),
+            number: Arc::new(style::yellow),
+            type_name: Arc::new(style::blue),
+            operator: Arc::new(style::dim),
+            punctuation: Arc::new(style::dim),
+        },
     }
 }
 

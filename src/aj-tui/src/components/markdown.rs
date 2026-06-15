@@ -5,12 +5,11 @@
 //! lists (ordered and unordered, nested), links, blockquotes, horizontal rules,
 //! bold, italic, strikethrough, and inline code.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
-use syntect::util::as_24_bit_terminal_escaped;
+use syntect::easy::ScopeRegionIterator;
+use syntect::highlighting::ScopeSelectors;
+use syntect::parsing::{MatchPower, ParseState, Scope, ScopeStack, SyntaxSet};
 
 use crate::ansi::{
     apply_background_to_line, extract_ansi_code, visible_width, wrap_text_with_ansi,
@@ -69,11 +68,119 @@ pub struct MarkdownTheme {
     /// Prefix applied to each rendered code block line. Defaults to two
     /// spaces when `None`.
     pub code_block_indent: Option<String>,
-    /// Whether to syntax-highlight fenced code blocks with the
-    /// built-in highlighter. When `false`, code-block bodies render as
-    /// plain text via `code_block`. Ignored when `highlight_code` is
-    /// set: an explicit override always wins.
+    /// Whether to syntax-highlight fenced code blocks. When `false`,
+    /// code-block bodies render as plain text via `code_block`.
+    /// Ignored when `highlight_code` is set: an explicit override
+    /// always wins.
     pub syntax_highlight: bool,
+    /// Per-category styling for syntax-highlighted code. Used by the
+    /// built-in highlighter (when `highlight_code` is `None` and
+    /// `syntax_highlight` is `true`) to color each token according to
+    /// the scope syntect assigns it. See [`SyntaxStyles`].
+    pub syntax: SyntaxStyles,
+}
+
+/// Per-category styling closures for syntax-highlighted code.
+///
+/// The built-in highlighter tokenizes code with syntect, maps each
+/// token's scope onto one of these categories (see
+/// [`SyntaxCategory`]), and applies the matching closure. Tokens that
+/// match no category render in the terminal's default foreground. The
+/// closures use `Arc` so a theme stays cheaply cloneable.
+#[derive(Clone)]
+pub struct SyntaxStyles {
+    pub comment: Arc<dyn Fn(&str) -> String>,
+    pub keyword: Arc<dyn Fn(&str) -> String>,
+    pub function: Arc<dyn Fn(&str) -> String>,
+    pub variable: Arc<dyn Fn(&str) -> String>,
+    pub string: Arc<dyn Fn(&str) -> String>,
+    pub number: Arc<dyn Fn(&str) -> String>,
+    pub type_name: Arc<dyn Fn(&str) -> String>,
+    pub operator: Arc<dyn Fn(&str) -> String>,
+    pub punctuation: Arc<dyn Fn(&str) -> String>,
+}
+
+impl SyntaxStyles {
+    fn style(&self, category: SyntaxCategory) -> &dyn Fn(&str) -> String {
+        match category {
+            SyntaxCategory::Comment => &*self.comment,
+            SyntaxCategory::Keyword => &*self.keyword,
+            SyntaxCategory::Function => &*self.function,
+            SyntaxCategory::Variable => &*self.variable,
+            SyntaxCategory::String => &*self.string,
+            SyntaxCategory::Number => &*self.number,
+            SyntaxCategory::Type => &*self.type_name,
+            SyntaxCategory::Operator => &*self.operator,
+            SyntaxCategory::Punctuation => &*self.punctuation,
+        }
+    }
+}
+
+/// Syntax-highlighting categories the built-in highlighter recognizes.
+/// Each maps to one styling closure in [`SyntaxStyles`].
+#[derive(Clone, Copy)]
+enum SyntaxCategory {
+    Comment,
+    Keyword,
+    Function,
+    Variable,
+    String,
+    Number,
+    Type,
+    Operator,
+    Punctuation,
+}
+
+/// TextMate-style scope selectors per category, parsed once.
+///
+/// We classify a token by picking the category whose selector matches
+/// its scope stack with the highest [`MatchPower`] — the same
+/// most-specific-wins rule syntect themes use. `keyword` and
+/// `keyword.operator` overlap on purpose: an operator token matches
+/// both, and the more specific `keyword.operator` selector wins, so
+/// operators get their own color rather than the keyword color.
+fn category_selectors() -> &'static [(SyntaxCategory, ScopeSelectors)] {
+    static SELECTORS: OnceLock<Vec<(SyntaxCategory, ScopeSelectors)>> = OnceLock::new();
+    SELECTORS.get_or_init(|| {
+        let defs: &[(SyntaxCategory, &str)] = &[
+            (SyntaxCategory::Comment, "comment"),
+            (SyntaxCategory::Keyword, "keyword, storage"),
+            (
+                SyntaxCategory::Function,
+                "entity.name.function, support.function, variable.function",
+            ),
+            (SyntaxCategory::Variable, "variable"),
+            (SyntaxCategory::String, "string"),
+            (SyntaxCategory::Number, "constant.numeric"),
+            (
+                SyntaxCategory::Type,
+                "entity.name.type, entity.name.class, support.type, support.class",
+            ),
+            (SyntaxCategory::Operator, "keyword.operator"),
+            (SyntaxCategory::Punctuation, "punctuation"),
+        ];
+        defs.iter()
+            .filter_map(|(cat, sel)| sel.parse::<ScopeSelectors>().ok().map(|s| (*cat, s)))
+            .collect()
+    })
+}
+
+/// Pick the best-matching category for a scope stack, or `None` when
+/// no category's selector matches (the token then renders in the
+/// default foreground).
+fn classify_scope(
+    scopes: &[Scope],
+    selectors: &[(SyntaxCategory, ScopeSelectors)],
+) -> Option<SyntaxCategory> {
+    let mut best: Option<(MatchPower, SyntaxCategory)> = None;
+    for (cat, sel) in selectors {
+        if let Some(power) = sel.does_match(scopes)
+            && best.is_none_or(|(bp, _)| power > bp)
+        {
+            best = Some((power, *cat));
+        }
+    }
+    best.map(|(_, cat)| cat)
 }
 
 /// Outer styling applied to rendered paragraph lines, independently of
@@ -323,7 +430,6 @@ struct ListItem {
     number: Option<u32>,
 }
 
-/// Inline content within a paragraph or heading.
 #[derive(Debug)]
 enum Inline {
     Text(String),
@@ -1262,9 +1368,9 @@ pub struct Markdown {
     /// Outer styling applied to paragraph lines. See
     /// [`DefaultTextStyle`].
     default_text_style: Option<DefaultTextStyle>,
-    // Syntax highlighting resources (loaded lazily).
+    // Syntect syntax definitions for tokenizing code blocks. Coloring
+    // comes from the theme's `SyntaxStyles`, not a syntect theme.
     syntax_set: SyntaxSet,
-    theme_set: ThemeSet,
     // Cache.
     cached_text: Option<String>,
     cached_width: Option<usize>,
@@ -1293,7 +1399,6 @@ impl Markdown {
             theme,
             default_text_style,
             syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: ThemeSet::load_defaults(),
             cached_text: None,
             cached_width: None,
             cached_lines: None,
@@ -1981,25 +2086,60 @@ impl Markdown {
         result
     }
 
-    /// Highlight code using syntect.
+    /// Highlight `code`, tokenizing with syntect and coloring each
+    /// token through the theme's [`SyntaxStyles`].
+    ///
+    /// We use syntect only to assign scopes; the colors come from the
+    /// palette closures so code blocks track the active theme (and its
+    /// color mode) like the rest of the markdown. One `ParseState` /
+    /// `ScopeStack` spans the whole block so multi-line constructs
+    /// (block comments, multi-line strings) carry their scope across
+    /// lines. Each emitted line ends in a full SGR reset (`\x1b[0m`),
+    /// matching what downstream blockquote / background re-assertion
+    /// keys on.
     fn highlight_code(&self, code: &str, lang: Option<&str>) -> Vec<String> {
         let syntax = lang
             .and_then(|l| self.syntax_set.find_syntax_by_token(l))
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
-        let theme = &self.theme_set.themes["base16-ocean.dark"];
-        let mut highlighter = HighlightLines::new(syntax, theme);
+        let styles = &self.theme.syntax;
+        let selectors = category_selectors();
 
+        let mut parse_state = ParseState::new(syntax);
+        let mut stack = ScopeStack::new();
         let mut lines = Vec::new();
+
         for line in code.lines() {
-            match highlighter.highlight_line(line, &self.syntax_set) {
-                Ok(ranges) => {
-                    let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
-                    lines.push(format!("{}\x1b[0m", escaped));
+            let Ok(ops) = parse_state.parse_line(line, &self.syntax_set) else {
+                // Tokenizing failed: fall back to the plain code-block
+                // styler so the line still renders sensibly.
+                lines.push((self.theme.code_block)(line));
+                continue;
+            };
+
+            let mut out = String::new();
+            let mut errored = false;
+            for (text, op) in ScopeRegionIterator::new(&ops, line) {
+                // The op precedes its text region, so apply it before
+                // classifying (the leading region carries a no-op).
+                if stack.apply(op).is_err() {
+                    errored = true;
+                    break;
                 }
-                Err(_) => {
-                    lines.push((self.theme.code_block)(line));
+                if text.is_empty() {
+                    continue;
                 }
+                match classify_scope(stack.as_slice(), selectors) {
+                    Some(category) => out.push_str(&styles.style(category)(text)),
+                    None => out.push_str(text),
+                }
+            }
+
+            if errored {
+                lines.push((self.theme.code_block)(line));
+            } else {
+                out.push_str("\x1b[0m");
+                lines.push(out);
             }
         }
         lines
@@ -2472,6 +2612,17 @@ mod tests {
             highlight_code: None,
             code_block_indent: None,
             syntax_highlight: true,
+            syntax: SyntaxStyles {
+                comment: Arc::new(|s| s.to_string()),
+                keyword: Arc::new(|s| s.to_string()),
+                function: Arc::new(|s| s.to_string()),
+                variable: Arc::new(|s| s.to_string()),
+                string: Arc::new(|s| s.to_string()),
+                number: Arc::new(|s| s.to_string()),
+                type_name: Arc::new(|s| s.to_string()),
+                operator: Arc::new(|s| s.to_string()),
+                punctuation: Arc::new(|s| s.to_string()),
+            },
         }
     }
 
