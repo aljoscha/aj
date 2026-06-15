@@ -41,7 +41,8 @@ aj "explain this codebase"  # prefill the first message, then drop into the TUI
 
 Everything beyond chatting lives in the **command palette**, opened with
 `Ctrl+O`. From there you can switch model, set the reasoning effort, start or
-resume a session, log in or out, toggle skills, open settings, and more.
+resume a session, log in or out, check usage across providers, toggle skills,
+open settings, and more.
 
 A handful of keys worth knowing:
 
