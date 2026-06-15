@@ -26,7 +26,7 @@ pub mod shutdown;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,7 +41,7 @@ use aj_conf::{
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
-use aj_models::types::{Speed, StreamOptions};
+use aj_models::types::{Speed, StreamOptions, UserContent};
 use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_tools::{BuiltinToolOptions, get_builtin_tools};
@@ -461,13 +461,16 @@ impl InteractiveMode {
         let sessions_dir = Config::get_sessions_dir_path()?;
         let conversation_persistence = ConversationPersistence::new(sessions_dir);
 
-        // Resolve the launch prompt (`aj <prompt...>` / `aj continue ID
-        // <prompt...>`) before the match below moves `self.args.command`.
-        // Unlike print mode an absent prompt is fine — we just open with an
-        // empty editor — so this is an `Option`, seeded into the editor
-        // once the TUI is built. We don't auto-submit: the user reviews and
-        // presses Enter.
-        let initial_prompt = crate::cli::initial_prompt(&self.args)?;
+        // Resolve the launch positionals (free-form messages plus `@file`
+        // attachments) into the turns to auto-submit, before the match
+        // below moves `self.args.command`. Paths resolve relative to the
+        // process working directory — where the user typed the command.
+        // Consumed by the first `run_session` call via `mem::take`, so a
+        // later in-process session switch starts clean.
+        let mut launch_turns = {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            crate::cli::initial_input(&self.args, &cwd)?.into_turns()
+        };
 
         let spec = match self.args.command {
             Some(Command::Continue {
@@ -580,16 +583,6 @@ impl InteractiveMode {
             PromptHistory::bootstrap(&conversation_persistence, DEFAULT_MAX_ENTRIES);
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
             prompt_history.install(editor);
-        }
-
-        // Seed the editor with the launch prompt resolved above, leaving
-        // the cursor at the end (`set_text` moves it there). We pre-fill
-        // rather than auto-submit so the user can edit or discard before
-        // sending; an absent prompt leaves the editor empty.
-        if let Some(initial) = &initial_prompt {
-            if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
-                editor.set_text(initial);
-            }
         }
 
         // Shared flag tripped by the editor's `/`-at-empty-prompt
@@ -735,7 +728,14 @@ impl InteractiveMode {
         // carrying the final world (when one is still alive) for the
         // shutdown banner below.
         let (final_world, run_result): (Option<SessionWorld>, Result<()>) = loop {
-            let spec = match run_session(&mut shell, &mut world, &mut theme_watch).await {
+            let spec = match run_session(
+                &mut shell,
+                &mut world,
+                &mut theme_watch,
+                std::mem::take(&mut launch_turns),
+            )
+            .await
+            {
                 Ok(SessionExit::Quit) => break (Some(world), Ok(())),
                 Err(fatal) => break (Some(world), Err(fatal)),
                 Ok(SessionExit::New) => SessionSpec::Create {
@@ -1049,6 +1049,7 @@ async fn run_session(
     shell: &mut Shell,
     world: &mut SessionWorld,
     theme_watch: &mut ThemeWatch,
+    launch_turns: Vec<Vec<UserContent>>,
 ) -> Result<SessionExit> {
     // ---- Main event loop ------------------------------------------
     // In-flight turns keyed by the agent running them. `JoinSet`
@@ -1079,6 +1080,22 @@ async fn run_session(
     let mut login_session: Option<LoginSession> = None;
     let mut login_task: Option<tokio::task::JoinHandle<Result<(), aj_models::auth::AuthError>>> =
         None;
+
+    // Launch prompt auto-submit (`aj <msg>` / `aj @file ...`): the first
+    // turn runs immediately; the rest are dispatched on Main-turn
+    // completion below so multi-message launches (`aj a b`) run in order.
+    // Empty for any in-process session switch after the first.
+    let mut launch_turns: VecDeque<Vec<UserContent>> = launch_turns.into();
+    if let Some(content) = launch_turns.pop_front() {
+        spawn_auto_turn(
+            world,
+            &shell.run_config,
+            content,
+            &mut turns,
+            &mut turn_cancels,
+        );
+        sync_editor_enabled(&mut shell.tui);
+    }
 
     let exit: Result<SessionExit> = loop {
         tokio::select! {
@@ -1119,6 +1136,21 @@ async fn run_session(
                                 id,
                                 world,
                                 &shell.run_config,
+                                &mut turns,
+                                &mut turn_cancels,
+                            );
+                            sync_editor_enabled(&mut shell.tui);
+                        } else if id == AgentId::Main
+                            && let Some(content) = launch_turns.pop_front()
+                        {
+                            // Main is idle (a wake above would have re-marked
+                            // it busy, deferring this to the next completion):
+                            // run the next queued launch message as its own
+                            // turn.
+                            spawn_auto_turn(
+                                world,
+                                &shell.run_config,
+                                content,
                                 &mut turns,
                                 &mut turn_cancels,
                             );
@@ -2176,7 +2208,41 @@ fn spawn_prompt_turn(
     true
 }
 
-/// Pull the message queued for `target` (if any) back into the editor,
+/// Spawn an auto-submitted launch turn for the Main agent from CLI
+/// content (`aj <msg>` / `aj @file ...`).
+///
+/// Unlike [`spawn_prompt_turn`] this touches neither the editor nor the
+/// prompt history: the content is a launch argument rather than typed
+/// input, and may be a large `<file>` dump we don't want polluting the
+/// history ring. A missing live handle (no Main agent) is a silent
+/// no-op.
+fn spawn_auto_turn(
+    world: &SessionWorld,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    content: Vec<UserContent>,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) {
+    let target = AgentId::Main;
+    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+        return;
+    };
+    let run_config_for_turn = Arc::clone(run_config);
+    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
+    let turn_cancel = CancellationToken::new();
+    turn_cancels.insert(target, turn_cancel.clone());
+    turns.spawn(async move {
+        let mut a = handle.lock().await;
+        apply_turn_config(
+            target,
+            &mut a,
+            &run_config_for_turn,
+            &sub_overrides_for_turn,
+        );
+        let result = a.prompt_with_content(content, turn_cancel).await;
+        (target, result)
+    });
+}
 /// prepending it to whatever is currently typed (blank-line joined),
 /// and repaint the pending box. Returns whether anything was yanked.
 /// Used by the dequeue chord, the empty-editor Up/Ctrl+P yank, and the

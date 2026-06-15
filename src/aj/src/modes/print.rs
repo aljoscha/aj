@@ -105,7 +105,17 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
-    let prompt_text = collect_prompt_text(&args)?;
+    // Resolve the positionals (messages + `@file` attachments) into the
+    // turns to run. Print mode is one-shot with no editor to fall back
+    // on, so an empty result is a hard error rather than a quiet no-op.
+    let turns = {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let input = crate::cli::initial_input(&args, &cwd)?;
+        if input.is_empty() {
+            bail!("aj --print requires a prompt argument");
+        }
+        input.into_turns()
+    };
 
     // Load config.toml first (lowest priority). Missing or invalid
     // config falls back to defaults so a one-shot `aj --print`
@@ -461,7 +471,18 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         cancel_for_signal.cancel();
     });
-    let prompt_result = agent.prompt(prompt_text, turn_cancel).await;
+    // Run each turn in order under the one SIGINT handler, stopping at
+    // the first failure (the match below surfaces it). A multi-turn run
+    // happens when several bare messages were passed (`aj -p a b`).
+    let mut prompt_result = Ok(());
+    for content in turns {
+        prompt_result = agent
+            .prompt_with_content(content, turn_cancel.clone())
+            .await;
+        if prompt_result.is_err() {
+            break;
+        }
+    }
     // Stop listening for SIGINT before we return so a stray Ctrl+C
     // during shutdown doesn't trigger a phantom cancel.
     ctrl_c_handler.abort();
@@ -509,32 +530,6 @@ fn thinking_level_for(level: &aj_models::ThinkingConfig) -> aj_models::types::Th
         ThinkingConfig::High => ThinkingLevel::High,
         ThinkingConfig::XHigh => ThinkingLevel::XHigh,
         ThinkingConfig::Max => ThinkingLevel::Max,
-    }
-}
-
-/// Collect the free-form prompt arguments into a single string, then
-/// run them through `@file` expansion (today a passthrough — see
-/// [`crate::cli::file_args::expand`]).
-///
-/// Prompt text can come from two places depending on the dispatch
-/// shape: the top-level positional `args.prompt` (for the
-/// no-subcommand path: `aj --print "hello"`), or the
-/// `Continue.prompt` positional that lives after the session id
-/// (for the resume path: `aj --print continue ID "hello"`).
-/// Clap's greedy positional consumption keeps these disjoint —
-/// once the parser sees the `continue` subcommand it routes
-/// further positionals into `Continue`, so at most one of the
-/// two slots is ever populated for a single invocation. We pick
-/// whichever is non-empty and join with spaces; both empty is
-/// an error.
-///
-/// Print mode is fundamentally one-shot — there's no readline to
-/// fall back on — so a missing prompt is a hard error rather than
-/// a quiet no-op.
-fn collect_prompt_text(args: &Args) -> Result<String> {
-    match crate::cli::initial_prompt(args)? {
-        Some(prompt) => Ok(prompt),
-        None => bail!("aj --print requires a prompt argument"),
     }
 }
 
@@ -614,25 +609,42 @@ mod tests {
         Args::parse_from(argv)
     }
 
-    #[test]
-    fn collect_prompt_text_uses_top_level_prompt_when_no_subcommand() {
-        let args = parse(&["--print", "hello", "world"]);
-        let text = collect_prompt_text(&args).expect("prompt present");
-        assert_eq!(text, "hello world");
+    /// Flatten the text content of a turn for assertions.
+    fn turn_text(content: &[aj_models::types::UserContent]) -> String {
+        content
+            .iter()
+            .filter_map(|c| match c {
+                aj_models::types::UserContent::Text(t) => Some(t.text.clone()),
+                aj_models::types::UserContent::Image(_) => None,
+            })
+            .collect()
+    }
+
+    /// Resolve a CLI invocation into its launch turns (paths resolved
+    /// against `/`, which has no `@file` args in these tests).
+    fn turns(args: &[&str]) -> Vec<Vec<aj_models::types::UserContent>> {
+        crate::cli::initial_input(&parse(args), std::path::Path::new("/"))
+            .expect("resolve")
+            .into_turns()
     }
 
     #[test]
-    fn collect_prompt_text_errors_when_no_prompt_supplied() {
-        let args = parse(&["--print"]);
-        let err = collect_prompt_text(&args).expect_err("empty prompt should error");
-        assert!(
-            err.to_string().contains("requires a prompt argument"),
-            "unexpected error: {err}",
-        );
+    fn bare_messages_become_separate_turns() {
+        let turns = turns(&["--print", "hello", "world"]);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turn_text(&turns[0]), "hello");
+        assert_eq!(turn_text(&turns[1]), "world");
     }
 
     #[test]
-    fn collect_prompt_text_pulls_from_continue_subcommand_prompt() {
+    fn empty_input_when_no_prompt_supplied() {
+        let input =
+            crate::cli::initial_input(&parse(&["--print"]), std::path::Path::new("/")).unwrap();
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn pulls_from_continue_subcommand_prompt() {
         // Top-level `args.prompt` is empty here because clap routed
         // the positionals after `continue` into the subcommand's
         // own slots: the first into `session_id`, the rest into
@@ -647,33 +659,29 @@ mod tests {
         }
         assert!(args.prompt.is_empty(), "top-level prompt should be empty");
 
-        let text = collect_prompt_text(&args).expect("continue prompt present");
-        assert_eq!(text, "hello world");
+        let turns = turns(&["--print", "continue", "session-abc", "hello", "world"]);
+        assert_eq!(turn_text(&turns[0]), "hello");
     }
 
     #[test]
-    fn collect_prompt_text_errors_when_continue_has_no_prompt() {
+    fn empty_input_when_continue_has_no_prompt() {
         // `continue` with only a session id and no trailing prompt
-        // positionals: print mode still requires a prompt, so this
-        // is an error rather than a silent no-op.
+        // positionals: print mode still requires a prompt, so the
+        // bail in `run` fires off this empty result.
         let args = parse(&["--print", "continue", "session-abc"]);
-        let err = collect_prompt_text(&args).expect_err("empty continue prompt should error");
-        assert!(
-            err.to_string().contains("requires a prompt argument"),
-            "unexpected error: {err}",
-        );
+        let input = crate::cli::initial_input(&args, std::path::Path::new("/")).unwrap();
+        assert!(input.is_empty());
     }
 
     #[test]
-    fn collect_prompt_text_treats_lone_continue_positional_as_session_id() {
+    fn treats_lone_continue_positional_as_session_id() {
         // `aj --print continue hello` is ambiguous between
         // "resume session `hello`" and "resume latest, run prompt
         // `hello`". Clap's greedy positional consumption picks the
         // first interpretation (single `Option<String>` slot fills
-        // first), and `collect_prompt_text` falls back to the
-        // top-level `args.prompt` (empty) so the "requires a prompt"
-        // error fires. Users who want "latest + prompt" supply
-        // the session id explicitly.
+        // first), so there is no prompt and the "requires a prompt"
+        // bail in `run` fires. Users who want "latest + prompt"
+        // supply the session id explicitly.
         let args = parse(&["--print", "continue", "hello"]);
         match &args.command {
             Some(Command::Continue { session_id, prompt }) => {
@@ -682,10 +690,7 @@ mod tests {
             }
             other => panic!("expected Continue command, got {other:?}"),
         }
-        let err = collect_prompt_text(&args).expect_err("no prompt should error");
-        assert!(
-            err.to_string().contains("requires a prompt argument"),
-            "unexpected error: {err}",
-        );
+        let input = crate::cli::initial_input(&args, std::path::Path::new("/")).unwrap();
+        assert!(input.is_empty());
     }
 }

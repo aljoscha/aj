@@ -625,7 +625,23 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<(), TurnError> {
         self.cancellation = cancel;
-        self.run_top_level_turn(Some(message)).await
+        self.run_top_level_turn(Some(UserMessage::text(message)))
+            .await
+    }
+
+    /// Like [`Agent::prompt`], but the user message carries explicit
+    /// content blocks — used to attach images (and `<file>`-wrapped
+    /// text) alongside the prompt, e.g. from CLI `@file` arguments.
+    /// `content` must be non-empty; an empty vector produces a user
+    /// message the provider rejects.
+    pub async fn prompt_with_content(
+        &mut self,
+        content: Vec<UserContent>,
+        cancel: CancellationToken,
+    ) -> Result<(), TurnError> {
+        self.cancellation = cancel;
+        self.run_top_level_turn(Some(UserMessage::new(content)))
+            .await
     }
 
     /// Wake the agent on pending work it can react to without a fresh
@@ -687,12 +703,13 @@ impl Agent {
     /// Shared driver for [`Agent::prompt`] / [`Agent::continue_run`]
     /// / [`Agent::wake`].
     ///
-    /// `prompt` is `Some` for [`Agent::prompt`] (a fresh user
-    /// message is appended before inference) and `None` for
+    /// `prompt` is `Some` for [`Agent::prompt`] /
+    /// [`Agent::prompt_with_content`] (a fresh user message is
+    /// appended before inference) and `None` for
     /// [`Agent::continue_run`] and [`Agent::wake`] (the existing
     /// transcript — including any just-drained notices — is fed back
     /// to the model unchanged).
-    async fn run_top_level_turn(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
+    async fn run_top_level_turn(&mut self, prompt: Option<UserMessage>) -> Result<(), TurnError> {
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
         // bus. `AgentEnd.messages` will eventually carry a snapshot
         // of the agent's transcript per `docs/aj-next-plan.md` §1.4;
@@ -720,7 +737,10 @@ impl Agent {
         outcome
     }
 
-    async fn run_top_level_turn_inner(&mut self, prompt: Option<String>) -> Result<(), TurnError> {
+    async fn run_top_level_turn_inner(
+        &mut self,
+        prompt: Option<UserMessage>,
+    ) -> Result<(), TurnError> {
         // Notices that arrived while the agent was idle land before
         // the user's new message, in arrival order.
         self.drain_task_notices().await?;
@@ -733,14 +753,14 @@ impl Agent {
         self.drain_queued_messages(PendingKind::Steering).await?;
         self.drain_queued_messages(PendingKind::FollowUp).await?;
 
-        if let Some(text) = prompt {
+        if let Some(user) = prompt {
             // Append the user message to the in-memory transcript
             // and emit a `MessageStart` / `MessageEnd` pair so
             // listeners (renderers + the persistence listener) see
             // a complete lifecycle for the user input. The
             // transcript update happens before the bus emits so
             // the in-memory state can never trail the bus.
-            let user_message = AgentMessage::wire(Message::User(UserMessage::text(text)));
+            let user_message = AgentMessage::wire(Message::User(user));
             self.transcript.push(user_message.clone());
             self.bus
                 .emit(AgentEvent::MessageStart {
