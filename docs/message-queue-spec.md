@@ -51,17 +51,27 @@ task drivers and drained by the agent at fixed points while it holds
 message queues are built the same way; the steering/follow-up drain is a
 direct analog of `drain_task_notices` (`lib.rs:1345`).
 
-### 1.3 The drain points already exist
+### 1.3 The drain points
 
-In `execute_turn` (`lib.rs:848`), the loop already drains task notices at
-exactly the two boundaries we need:
+Steering must be injected mid-turn, so it drains inside `execute_turn`
+(`lib.rs:848`) at the point that already drains task notices: **after
+the tool batch, before the next inference** (`lib.rs:1318`) — "right
+after the next tool call".
 
-- **After the tool batch, before the next inference** (`lib.rs:1318`,
-  next to `drain_task_notices`) → the **steering** drain point ("right
-  after the next tool call").
-- **At loop exit** (the `else { break }`, `lib.rs:1326`) → the
-  **follow-up** drain point ("sent once the turn is done"), and a
-  steering fallback for a turn that ends without any tool call.
+Follow-up (and any end-of-turn steering left over) is delivered through
+the **wake mechanism** the background-tasks work already built
+(`docs/background-tasks-spec.md`): when a turn finishes, the binary
+re-enters an idle agent to drain pending work without waiting for the
+user. The turn-completion wake trigger (`interactive.rs:1095`) and
+`spawn_wake_turn` (`interactive.rs:1970`) drive `Agent::wake`
+(`lib.rs:621`), which drains at the run-top point beside
+`drain_task_notices` (`lib.rs:702`) and is a no-op when there is nothing
+to drain. Reusing wake — rather than a second in-loop drain at loop
+exit — means follow-up delivery is immune to the
+`should_stop_after_turn` break (`lib.rs:1314`, which exits before the
+in-loop drain) and to a message enqueued in the window between loop exit
+and `AgentEnd`: both land at the single idle-transition point the wake
+trigger already guards.
 
 ### 1.4 Submit, busy-gate, and the editor
 
@@ -82,7 +92,7 @@ exactly the two boundaries we need:
   (`editor.rs:3417`).
 - **Alt+Enter is currently a newline.** `is_newline_event`
   (`keys.rs:149`) treats `Enter+ALT` as a byte-form newline fallback for
-  terminals that deliver Shift+Enter as `\x1b\r`. See §5.5.
+  terminals that deliver Shift+Enter as `\x1b\r`. See §5.4.
 - Host chords (`alt+t`, `alt+o`, `ctrl+v`, `ctrl+o`, `ctrl+r`) are
   intercepted in the input arm *before* `shell.tui.handle_input`
   (`interactive.rs:1302`–`1458`); this spec adds two more.
@@ -131,13 +141,13 @@ editor, for the active view only.
 
 **When the message is sent:**
 
-- A `Follow-up` is injected as a user message when the turn would
-  otherwise end, and the run continues into a new turn (one `prompt`
-  call, one `AgentStart`/`AgentEnd` bracket — the busy-gate stays set
-  throughout).
+- A `Follow-up` is sent once the turn ends: the agent re-enters via the
+  wake path and runs it as a fresh turn (§3.3). The busy-gate stays set
+  across the wake, so the user can keep queueing.
 - A `Steering` message is injected right after the current tool batch
-  finishes, before the next inference; if the turn ends with no tool
-  call, it is injected at loop exit (so it is never lost).
+  finishes, before the next inference. If the turn ends before any tool
+  batch consumes it, it is delivered alongside follow-ups by the wake
+  (so it is never lost), just without the mid-turn urgency.
 - Injected messages are ordinary user messages: persisted via the
   normal `MessageEnd`, rendered in the transcript like any prompt.
 
@@ -200,7 +210,9 @@ consistent. The lock is never held across the `await` on `emit`.
   pending.
 - `clear(agent)` — drop the agent's pending message (§6.1).
 
-**Drain** (called from `execute_turn` while holding `&mut self`):
+**Drain** (called from the agent's turn driver while holding
+`&mut self` — the in-loop steering point and the run-top wake drain,
+§3.3):
 
 - `drain_steering(agent) -> Vec<UserMessage>`
 - `drain_follow_up(agent) -> Vec<UserMessage>`
@@ -227,23 +239,36 @@ print mode and tests are untouched (mirrors `set_task_registry`).
 task-registry share, so a sub-agent drains its own `AgentId`-keyed
 slot.
 
-### 3.3 Drain wiring in `execute_turn`
+### 3.3 Drain wiring
 
-- **Steering** at `lib.rs:1318` (alongside `drain_task_notices`): drain
-  `self.message_queues.drain_steering(self.agent_id)`, append each as a
-  user message via the existing `MessageStart`/`MessageEnd` bracket (no
-  `<task-notification>` wrapper — these are real user messages), then
-  fall through to the existing `continue`.
-- **Loop exit** at the `else { break }` (`lib.rs:1326`): before breaking,
-  drain steering first (the no-tool-call fallback), then follow-up; if
-  anything was drained, append the messages and `continue` instead of
-  breaking. Draining steering before follow-up keeps the "more urgent"
-  ordering when both somehow exist.
+**In-loop steering** at `lib.rs:1318` (alongside `drain_task_notices`):
+drain `self.message_queues.drain_steering(self.agent_id)` and append
+each as a user message via the existing `MessageStart`/`MessageEnd`
+bracket (no `<task-notification>` wrapper — these are real user
+messages), then fall through to the existing `continue` so the injected
+message is in context for the next inference. This is the only drain
+that must live in the loop; it is what makes steering urgent.
 
-Both drains stay inside the same `prompt` call, so the binary's
-`turn_cancels` entry — and thus the busy-gate and the editor's
-queue-routing mode — persist across the whole multi-message run with no
-extra bookkeeping.
+**Follow-up (and end-of-turn steering) via wake.** `Agent::wake`
+(`lib.rs:621`) and the run-top drain in `run_top_level_turn_inner`
+(`lib.rs:702`) gain a queued-message drain beside the notice drain:
+`drain_steering` then `drain_follow_up` for `self.agent_id`, each
+appended as a user message. `wake`'s "nothing to do" guard
+(`lib.rs:626`) becomes
+`has_notices(id) || message_queues.has_pending(id)`. The binary's
+turn-completion wake trigger (`interactive.rs:1095`) — and any other
+wake trigger — gains the same `|| has_pending(id)` condition, so a
+finished turn with a pending follow-up re-enters the agent exactly the
+way a finished turn with a task notice does today.
+
+A follow-up is therefore delivered as a fresh top-level run (new
+`AgentStart`/`AgentEnd`), not as a continuation inside the original
+`prompt` call as §1.9 first sketched. This is invisible to the user ("a
+message sent after the turn finished") and is strictly more robust than
+an in-loop loop-exit drain — see §1.3. The wake turn is spawned through
+the same `turn_cancels` machinery as a user submit, so the busy-gate and
+the editor's queue-routing mode stay correct while it runs and the user
+can keep queueing.
 
 ### 3.4 `QueueUpdate` is a trigger, not a payload
 
@@ -342,13 +367,21 @@ through to the editor's normal history-up. Restricting to an empty
 editor keeps the yank from hijacking cursor movement inside a draft and
 keeps "every up that would otherwise go to history" yanking instead.
 
+We also expose the yank as a named action `ACTION_DEQUEUE` (default
+`alt+up`) that yanks **regardless** of editor contents — prepending the
+queued text to whatever is currently typed (blank-line joined). This is
+the unambiguous alternative for users who would rather not rely on the
+empty-editor guard, and it is the chord referenced by the box's `↑ edit`
+hint when the editor is non-empty.
+
 ### 4.7 Keybindings summary
 
 | Action | Default | Where handled |
 |---|---|---|
 | Submit / append follow-up | `enter` | editor → submit handler routes |
 | Submit / append steering | `alt+enter` (`ACTION_SUBMIT_STEERING`) | host intercept |
-| Yank queued message | `up` / `ctrl+p` (`tui.editor.cursorUp`) | host intercept when editor empty + pending |
+| Yank queued message (editor empty) | `up` / `ctrl+p` (`tui.editor.cursorUp`) | host intercept when editor empty + pending |
+| Yank queued message (always) | `alt+up` (`ACTION_DEQUEUE`) | host intercept, prepends to current draft |
 | Newline | `shift+enter`, `\`+Enter | editor (unchanged) |
 
 All overridable via `config.toml` keybindings.
@@ -375,9 +408,15 @@ ignores it, like notices). A drained message persists as a normal user
 
 ### 5.3 Cancellation
 
-Per §1.9, cancelling a turn (Ctrl+C) does **not** clear the queues —
-the user may want the queued message to drive the next run. `clear`
-(§6.1) is a separate, explicit operation.
+Per §1.9, cancelling a turn does **not** silently drop the queues. In
+the branch where the per-view cancel actually cancels the viewed agent's
+turn (`interactive.rs:1255`), it also yanks any pending message for that
+agent back into the editor (the §4.6 yank composed onto the cancel
+path): interrupting the agent leaves the user holding exactly what they
+had lined up, ready to edit or resend, rather than discarding it. The
+quit-arm and exit branches (idle viewed agent, nothing running) are
+unchanged. `clear` (§6.1) remains a separate operation for dropping a
+pending message without restoring it.
 
 ### 5.4 The Alt+Enter / newline tradeoff
 
@@ -402,9 +441,14 @@ rejected to honor the requested UX.)
   immaterial while the TUI keeps one entry per kind. The agent drain
   loops over the Vec, so a future multi-entry producer works without
   changes.
-- Queue mutation by tools or the model (only the user enqueues).
+- Queue mutation by tools or the model (only the user enqueues), and
+  queuing anything but plain text — command-palette actions are not
+  queueable; the enqueue API takes a string.
 - Showing another agent's pending message while not viewing it (the box
   is view-scoped, like the footer).
+- Routing input typed during a blocking non-LLM operation (e.g. context
+  compaction) through these queues: no such state exists today, but the
+  handle is the natural place to buffer and flush it when one does.
 
 ### 6.1 `clear` gesture
 
@@ -429,9 +473,12 @@ the method's existence is intentional, not dead code.
   leaves `Main` untouched).
 - Scripted-provider turn: a steering message enqueued during a tool
   batch is injected as a user message after the batch and before the
-  next inference; a follow-up enqueued mid-turn is injected at loop exit
-  and the run continues in the same `AgentStart`/`AgentEnd` bracket; a
-  steering message on a no-tool-call turn is injected at loop exit.
+  next inference. A follow-up enqueued mid-turn is delivered by a wake
+  run after the turn ends (its own `AgentStart`/`AgentEnd`), as is a
+  steering message left pending when the turn ends without a tool call.
+  `wake` is a no-op when both queues and the notice queue are empty, and
+  a follow-up enqueued during a `should_stop_after_turn` stop is still
+  delivered by the wake.
 
 **`aj` / `aj-tui` (pump + interactive, scripted):**
 
@@ -455,12 +502,16 @@ the method's existence is intentional, not dead code.
 
 1. **`MessageQueues` + agent drain** — the handle (state, mutators,
    drain, `QueueUpdate` emission), the `Agent` field + injection +
-   sub-agent share, and the two drain points in `execute_turn`.
-   Agent-layer unit/scripted tests. No TUI yet.
+   sub-agent share, the in-loop steering drain in `execute_turn`, and
+   the wake-path drain (`Agent::wake` guard + the run-top
+   `drain_steering`/`drain_follow_up`). Agent-layer unit/scripted tests.
+   No TUI yet.
 2. **`PendingMessage` component + slot** — the component, the `Pending`
    slot in `layout.rs`, and `sync_pending` driven by the pump's
    `QueueUpdate` arm and `set_active_view`. Pump tests.
-3. **Submit routing + Alt+Enter + yank** — busy-routes-to-queue in the
-   submit handler, `spawn_turn` extraction, the two host intercepts and
-   the `ACTION_SUBMIT_STEERING` binding, drop the busy-disable.
+3. **Submit routing + Alt+Enter + yank + cancel-restore** —
+   busy-routes-to-queue in the submit handler, `spawn_turn` extraction,
+   the host intercepts and the `ACTION_SUBMIT_STEERING` / `ACTION_DEQUEUE`
+   bindings, dropping the busy-disable, the `|| has_pending(id)` clause
+   on the binary's wake trigger (§3.3), and the yank-on-cancel (§5.3).
    Interactive tests.
