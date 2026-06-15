@@ -32,8 +32,7 @@ use crate::config::theme::ChatTheme;
 use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
 
 /// Inner transcript rows shown in the compact (inline) box before
-/// the tail window kicks in. A bit taller than the command-palette
-/// overlay (`PALETTE_OVERLAY_INNER_ROWS = 17`); the single knob to tune.
+/// the tail window kicks in; the single knob to tune.
 const SUBAGENT_BOX_COMPACT_ROWS: usize = 18;
 
 /// Horizontal padding inside the compact box (one column on each

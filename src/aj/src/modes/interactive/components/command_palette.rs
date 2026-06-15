@@ -273,6 +273,26 @@ mod tests {
     }
 
     #[test]
+    fn default_overlay_height_shows_full_catalog_without_scrolling() {
+        // The user-facing invariant: at its default overlay height the
+        // palette shows every builtin command without scrolling. The
+        // list renders only its visible window, so if any title is
+        // missing the catalog has outgrown the budget and
+        // `PALETTE_OVERLAY_INNER_ROWS` needs a bump.
+        let mut p = CommandPaletteComponent::new(identity_theme(), 1);
+        p.set_available_height(crate::modes::interactive::PALETTE_OVERLAY_INNER_ROWS);
+        let body = p.render(80).join("\n");
+        for cmd in COMMANDS {
+            assert!(
+                body.contains(cmd.title),
+                "command {} is hidden at the default palette height; \
+                 bump PALETTE_OVERLAY_INNER_ROWS",
+                cmd.title
+            );
+        }
+    }
+
+    #[test]
     fn palette_shows_resolved_open_shortcut() {
         // The shortcut is now resolved at render time from the
         // process-wide keybindings manager, so installing the

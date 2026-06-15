@@ -2507,11 +2507,15 @@ fn persist_config(
 
 /// Inner-content row count for the compact overlays (palette, help,
 /// model / thinking pickers). Total rendered height including chrome
-/// is `PALETTE_OVERLAY_INNER_ROWS + 4`. Tuned to fit comfortably on a
-/// standard 24-row terminal. The content-heavy overlays (session
-/// switcher, prompt history) size their rows dynamically instead — see
-/// [`large_overlay_inner_rows`].
-const PALETTE_OVERLAY_INNER_ROWS: usize = 17;
+/// is `PALETTE_OVERLAY_INNER_ROWS + 4` (22 rows), which still fits
+/// comfortably on a standard 24-row terminal. Sized so the command
+/// palette shows its whole catalog without scrolling: the palette
+/// reserves three of these rows for its search box, separator, and
+/// scroll indicator (see `CommandPaletteComponent::set_available_height`),
+/// leaving enough list rows for every builtin command. The
+/// content-heavy overlays (session switcher, prompt history) size their
+/// rows dynamically instead — see [`large_overlay_inner_rows`].
+const PALETTE_OVERLAY_INNER_ROWS: usize = 18;
 
 /// Sizing/anchor used by the command palette and the compact pickers
 /// (model / thinking / help). Centered, fills ~75% of the terminal
