@@ -64,17 +64,37 @@ impl PendingMessage {
 
 /// Hint line describing the pending message's kind and the gestures
 /// that act on it.
+///
+/// Key labels resolve through the keybindings manager so user
+/// rebindings flow through to the hint, and render in the same
+/// title-cased form (`Alt+Enter`, `Up`) and `•`-separated layout the
+/// rest of the TUI uses for shortcut hints. The literal fallbacks
+/// match the default bindings: `Up` for the empty-editor yank
+/// (`tui.editor.cursorUp`, the action the input loop matches for it)
+/// and `Alt+Enter` for steer (`ACTION_SUBMIT_STEERING`).
 fn header(kind: PendingKind) -> String {
+    let edit = aj_tui::keybindings::format_action_shortcut("tui.editor.cursorUp")
+        .unwrap_or_else(|| "Up".to_string());
     match kind {
-        PendingKind::FollowUp => format!(
-            "{}{}",
-            style::cyan("queued"),
-            style::dim(" · sends when the turn ends · ↑ to edit · alt+enter to steer"),
-        ),
+        PendingKind::FollowUp => {
+            let steer = aj_tui::keybindings::format_action_shortcut(
+                crate::config::keybindings::ACTION_SUBMIT_STEERING,
+            )
+            .unwrap_or_else(|| "Alt+Enter".to_string());
+            format!(
+                "{}{}",
+                style::cyan("queued"),
+                style::dim(&format!(
+                    "  \u{2022}  sends when the turn ends  \u{2022}  {edit} to edit  \u{2022}  {steer} to steer"
+                )),
+            )
+        }
         PendingKind::Steering => format!(
             "{}{}",
             style::cyan("steering"),
-            style::dim(" · sends at the next tool call · ↑ to edit"),
+            style::dim(&format!(
+                "  \u{2022}  sends at the next tool call  \u{2022}  {edit} to edit"
+            )),
         ),
     }
 }
@@ -183,7 +203,8 @@ mod tests {
         let hint = line_with(&lines, "queued").expect("hint row present");
         let body = line_with(&lines, "do the thing").expect("body row present");
         assert!(hint < body, "the hint must sit right above the body");
-        assert!(lines[hint].contains("alt+enter"));
+        assert!(lines[hint].contains("Alt+Enter"));
+        assert!(lines[hint].contains("to edit"));
     }
 
     #[test]
@@ -207,7 +228,7 @@ mod tests {
         c.set_snapshot(snap(PendingKind::Steering, "now"));
         let lines = c.render(80);
         let hint = line_with(&lines, "steering").expect("hint row present");
-        assert!(!lines[hint].contains("alt+enter"));
+        assert!(!lines[hint].contains("Alt+Enter"));
     }
 
     #[test]
