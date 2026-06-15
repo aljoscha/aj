@@ -131,6 +131,22 @@ enum SyntaxCategory {
     Punctuation,
 }
 
+/// The syntect syntax definitions, loaded once and shared across all
+/// `Markdown` instances.
+///
+/// syntect compiles a grammar's regexes lazily on first use and caches
+/// them inside the `SyntaxSet` (via `OnceCell`). That first compile is
+/// expensive (~15ms for a heavy grammar like Rust), so loading a fresh
+/// set per component would pay it for every code block. Sharing one
+/// set means the compile happens once per process and every later
+/// block reuses the cached regexes. The set is read-only to callers
+/// (`parse_line` takes `&SyntaxSet`), and its caches are `Sync`, so a
+/// process-global is sound.
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
 /// TextMate-style scope selectors per category, parsed once.
 ///
 /// We classify a token by picking the category whose selector matches
@@ -1368,9 +1384,6 @@ pub struct Markdown {
     /// Outer styling applied to paragraph lines. See
     /// [`DefaultTextStyle`].
     default_text_style: Option<DefaultTextStyle>,
-    // Syntect syntax definitions for tokenizing code blocks. Coloring
-    // comes from the theme's `SyntaxStyles`, not a syntect theme.
-    syntax_set: SyntaxSet,
     // Cache.
     cached_text: Option<String>,
     cached_width: Option<usize>,
@@ -1398,7 +1411,6 @@ impl Markdown {
             padding_y,
             theme,
             default_text_style,
-            syntax_set: SyntaxSet::load_defaults_newlines(),
             cached_text: None,
             cached_width: None,
             cached_lines: None,
@@ -2098,9 +2110,10 @@ impl Markdown {
     /// matching what downstream blockquote / background re-assertion
     /// keys on.
     fn highlight_code(&self, code: &str, lang: Option<&str>) -> Vec<String> {
+        let syntax_set = syntax_set();
         let syntax = lang
-            .and_then(|l| self.syntax_set.find_syntax_by_token(l))
-            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+            .and_then(|l| syntax_set.find_syntax_by_token(l))
+            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
 
         let styles = &self.theme.syntax;
         let selectors = category_selectors();
@@ -2110,7 +2123,7 @@ impl Markdown {
         let mut lines = Vec::new();
 
         for line in code.lines() {
-            let Ok(ops) = parse_state.parse_line(line, &self.syntax_set) else {
+            let Ok(ops) = parse_state.parse_line(line, syntax_set) else {
                 // Tokenizing failed: fall back to the plain code-block
                 // styler so the line still renders sensibly.
                 lines.push((self.theme.code_block)(line));
