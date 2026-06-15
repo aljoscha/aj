@@ -349,9 +349,12 @@ pub enum CacheRetention {
     Long,
 }
 
-/// Inference speed mode. Maps onto Anthropic's `fast-mode-2026-02-01`
-/// beta header today; other providers ignore it. Set on the binary's
-/// `--speed` flag or `speed = "fast"` in `config.toml`.
+/// Inference speed mode. Set on the binary's `--speed` flag or
+/// `speed = "fast"` in `config.toml`. Anthropic-only today: the
+/// provider maps `Fast` onto both the request-body `speed` field and
+/// the `fast-mode-2026-02-01` beta header (a matched pair — the header
+/// opts into the beta, the body field selects the speed). Other
+/// providers ignore it.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Speed {
@@ -570,6 +573,12 @@ pub struct StreamOptions {
     /// [`Self::reasoning_summary`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_display: Option<ThinkingDisplay>,
+    /// Inference speed mode. Anthropic-only: the provider maps `Fast`
+    /// onto both the request-body `speed` field and the
+    /// `fast-mode-2026-02-01` beta header. Ignored by non-Anthropic
+    /// providers. See [`Speed`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<Speed>,
     /// Controls whether/how the model uses tools. When `None`, the
     /// provider default applies (typically [`ToolChoice::Auto`]).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -671,6 +680,17 @@ impl UserMessage {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![UserContent::text(text)],
+            timestamp: 0,
+        }
+    }
+
+    /// Create a user message from explicit content blocks (mixed text
+    /// and images). Callers are responsible for passing at least one
+    /// block; an empty `content` yields a user message the provider
+    /// will reject.
+    pub fn new(content: Vec<UserContent>) -> Self {
+        Self {
+            content,
             timestamp: 0,
         }
     }

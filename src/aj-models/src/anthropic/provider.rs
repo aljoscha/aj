@@ -11,10 +11,10 @@ use anthropic_sdk::client::{Client, ClientError};
 use anthropic_sdk::messages::{
     CacheControl, ContentBlock as AContentBlock, ContentBlockDelta as AContentBlockDelta,
     ContentBlockParam, ImageSource as AImageSource, MessageParam, Messages as AMessages, Metadata,
-    OutputConfig, OutputEffort, Role as ARole, ServerSentEvent, StopDetails as AStopDetails,
-    StopReason as AStopReason, Thinking as AThinking, ThinkingDisplay as AThinkingDisplay,
-    ToolChoice as ATC, ToolResultContent as ATRC, ToolUnion, Usage as AUsage,
-    UsageDelta as AUsageDelta,
+    OutputConfig, OutputEffort, Role as ARole, ServerSentEvent, Speed as ASpeed,
+    StopDetails as AStopDetails, StopReason as AStopReason, Thinking as AThinking,
+    ThinkingDisplay as AThinkingDisplay, ToolChoice as ATC, ToolResultContent as ATRC, ToolUnion,
+    Usage as AUsage, UsageDelta as AUsageDelta,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -34,13 +34,20 @@ use crate::streaming::{
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantContent, AssistantError, AssistantMessage, CacheRetention, Context, ErrorCategory,
-    Message, SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent,
+    Message, SimpleStreamOptions, Speed, StopReason, StreamOptions, TextContent, ThinkingContent,
     ThinkingDisplay, ThinkingLevel, ToolCall, ToolChoice, ToolDefinition, ToolResultMessage, Usage,
     UserContent, UserMessage,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
 const API_NAME: &str = "anthropic-messages";
+
+/// Beta header that opts a request into fast inference. Sent alongside
+/// the request-body `speed: "fast"` field when [`StreamOptions::speed`]
+/// is [`Speed::Fast`]; the two are a matched pair (the header enables
+/// the beta, the body field selects the speed). Models that don't
+/// support fast mode reject the request — we don't gate client-side.
+const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// Stateless provider for the Anthropic Messages API.
 pub struct AnthropicProvider;
@@ -250,6 +257,12 @@ fn build_client(
     for beta in extra_betas_from_headers(options.headers.as_ref()) {
         client = client.with_beta(beta);
     }
+    // Fast mode is the beta header half of the matched pair; the body
+    // `speed` field is set in `build_request`. Sent only for `Fast` —
+    // `Standard` is the API default and rides without a beta.
+    if options.speed == Some(Speed::Fast) {
+        client = client.with_beta(FAST_MODE_BETA);
+    }
     client
 }
 
@@ -352,7 +365,19 @@ fn build_request(
         output_config,
         temperature,
         metadata,
+        speed: to_anthropic_speed(options.speed),
         ..Default::default()
+    }
+}
+
+/// Map the unified [`Speed`] knob onto the Anthropic request-body
+/// `speed` field. Only `Fast` is sent explicitly; `Standard` (and an
+/// unset speed) leave the field absent so the request rides the API
+/// default, matching the beta-header half in [`build_client`].
+fn to_anthropic_speed(speed: Option<Speed>) -> Option<ASpeed> {
+    match speed {
+        Some(Speed::Fast) => Some(ASpeed::Fast),
+        Some(Speed::Standard) | None => None,
     }
 }
 
@@ -1548,6 +1573,31 @@ mod tests {
         let options = StreamOptions::default();
         let req = build_request(&model, &context, &options, None);
         assert_eq!(req.max_tokens, model.max_tokens / 3);
+    }
+
+    #[test]
+    fn build_request_sets_fast_speed_when_requested() {
+        let options = StreamOptions {
+            speed: Some(Speed::Fast),
+            ..Default::default()
+        };
+        let req = build_request(&fake_model(), &Context::new("sys"), &options, None);
+        assert_eq!(req.speed, Some(ASpeed::Fast));
+    }
+
+    #[test]
+    fn build_request_omits_speed_for_standard_and_unset() {
+        // `Standard` is the API default, so we omit the body field
+        // rather than send `speed: "standard"` (matching the beta
+        // header half, which is also only sent for `Fast`).
+        for speed in [None, Some(Speed::Standard)] {
+            let options = StreamOptions {
+                speed,
+                ..Default::default()
+            };
+            let req = build_request(&fake_model(), &Context::new("sys"), &options, None);
+            assert!(req.speed.is_none(), "speed {speed:?} should omit the field");
+        }
     }
 
     #[test]

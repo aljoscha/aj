@@ -20,7 +20,6 @@
 //! (e.g. so the user can log in later) and lets a mid-session login
 //! take effect on the next turn without a restart.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aj_conf::ConfigThinkingDisplay;
@@ -29,18 +28,6 @@ use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
 use aj_models::types::{ApiKeyResolver, ReasoningSummary, Speed, StreamOptions, ThinkingDisplay};
 use anyhow::{Result, anyhow};
-
-/// Beta header value that opts an Anthropic request into the
-/// fast-inference variant of the model. Stamped onto the outgoing
-/// request via the `anthropic-beta` header when the user set
-/// `--speed fast` (or the equivalent config key) and the resolved
-/// provider is `anthropic-messages`.
-///
-/// Kept inline here rather than re-exported from `aj-models` because
-/// the routing decision (Speed → beta header) is a binary-level
-/// policy: the provider crate stays generic over the headers list
-/// and the binary picks which extras to opt into per user request.
-pub const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// Fallback provider id used when neither CLI / env / config supplies
 /// one. Anthropic is the default so existing user setups keep
@@ -71,8 +58,10 @@ pub struct ResolvedModel {
     /// and pricing tables.
     pub model_info: Arc<ModelInfo>,
     /// Baseline [`StreamOptions`] applied to every inference call:
-    /// resolved API key plus any extra HTTP headers (e.g. the fast-
-    /// inference beta). The agent layers per-turn reasoning on top.
+    /// resolved API key plus the unified knobs the binary translates
+    /// from config (e.g. [`StreamOptions::speed`]). The provider turns
+    /// these into provider-specific wire fields; the agent layers
+    /// per-turn reasoning on top.
     pub stream_options: StreamOptions,
 }
 
@@ -92,12 +81,12 @@ pub struct ResolvedModel {
 /// caller can point at a staging proxy or a self-hosted endpoint
 /// without editing the catalog file.
 ///
-/// `speed` opts into provider-specific fast-inference variants by
-/// stamping extra HTTP headers on every request. Today only
-/// `anthropic-messages` participates (via the `anthropic-beta`
-/// header); other providers ignore the field. The Speed enum lives
-/// in `aj-models` because it's plumbed through the Anthropic SDK
-/// wire types as well.
+/// `speed` records the inference speed mode on the baseline
+/// [`StreamOptions`]; the provider decides what (if anything) it means
+/// on the wire. Anthropic maps `Fast` onto a request-body field plus a
+/// beta header; other providers ignore it. The Speed enum lives in
+/// `aj-models` because it's plumbed through the Anthropic SDK wire
+/// types as well.
 pub fn resolve(
     registry: &ModelRegistry,
     auth: &AuthStorage,
@@ -123,8 +112,8 @@ pub fn resolve(
 ///
 /// Same effect as [`resolve`] minus the lookup: dispatch the
 /// `model_info.api` to the matching [`Provider`] impl, install an
-/// [`AuthStorage`]-backed [`ApiKeyResolver`], and stamp speed-driven
-/// headers onto the baseline [`StreamOptions`].
+/// [`AuthStorage`]-backed [`ApiKeyResolver`], and record the [`Speed`]
+/// on the baseline [`StreamOptions`] for the provider to interpret.
 pub fn from_model_info(
     auth: &AuthStorage,
     model_info: ModelInfo,
@@ -141,7 +130,7 @@ pub fn from_model_info(
 
     let mut stream_options = StreamOptions::default();
     install_api_key_resolver(&mut stream_options, auth, &model_info.provider);
-    apply_speed_headers(&mut stream_options, &model_info, speed);
+    stream_options.speed = speed;
 
     Ok(ResolvedModel {
         provider: Arc::from(provider),
@@ -240,26 +229,6 @@ fn default_model_for<'a>(registry: &'a ModelRegistry, provider_id: &str) -> Opti
     preferred.or_else(|| registry.models(provider_id).into_iter().next())
 }
 
-/// Apply per-call HTTP headers derived from the [`Speed`] knob.
-///
-/// Today the only consumer is `anthropic-messages`, which accepts
-/// the `fast-mode-2026-02-01` beta header for opt-in low-latency
-/// inference. Other providers see the speed flag but ignore the
-/// headers (we still set them — the providers strip what they don't
-/// know how to handle).
-fn apply_speed_headers(options: &mut StreamOptions, model: &ModelInfo, speed: Option<Speed>) {
-    match speed {
-        Some(Speed::Fast) if model.api == "anthropic-messages" => {
-            let headers = options.headers.get_or_insert_with(HashMap::new);
-            add_beta_header(headers, "anthropic-beta", FAST_MODE_BETA);
-        }
-        // Standard / unset / non-Anthropic providers: nothing to
-        // stamp. Future fast-mode equivalents on other providers
-        // plug in here.
-        _ => {}
-    }
-}
-
 /// Fan the configured [`ConfigThinkingDisplay`] (if any) out onto
 /// both provider-specific wire fields on [`StreamOptions`]: Anthropic
 /// consumes `thinking_display`, OpenAI Responses consumes
@@ -300,28 +269,6 @@ pub fn apply_thinking_display(options: &mut StreamOptions, display: Option<Confi
     };
     options.thinking_display = anthropic;
     options.reasoning_summary = openai;
-}
-
-/// Append `value` to a comma-separated `name` header in `headers`
-/// without duplicating it. If the header isn't set yet, create it.
-///
-/// Anthropic accepts comma-separated values for `anthropic-beta`,
-/// and the SDK already coalesces caller-supplied betas with its own
-/// (e.g. `fine-grained-tool-streaming-2025-05-14`), so the binary's
-/// extension here only has to worry about the user-facing axis
-/// (Speed::Fast → fast-mode beta).
-fn add_beta_header(headers: &mut HashMap<String, String>, name: &str, value: &str) {
-    headers
-        .entry(name.to_string())
-        .and_modify(|existing| {
-            if !existing.split(',').any(|b| b.trim() == value) {
-                if !existing.is_empty() {
-                    existing.push(',');
-                }
-                existing.push_str(value);
-            }
-        })
-        .or_insert_with(|| value.to_string());
 }
 
 #[cfg(test)]
@@ -416,74 +363,6 @@ mod tests {
         )]);
         let err = pick_model(&reg, "anthropic", Some("claude-z")).expect_err("error");
         assert!(err.to_string().contains("not found in registry"), "{err}");
-    }
-
-    #[test]
-    fn apply_speed_headers_skips_when_speed_unset() {
-        let mut opts = StreamOptions::default();
-        let model = sample_model("anthropic", "claude-x", "anthropic-messages");
-        apply_speed_headers(&mut opts, &model, None);
-        assert!(opts.headers.is_none());
-    }
-
-    #[test]
-    fn apply_speed_headers_skips_standard_speed() {
-        let mut opts = StreamOptions::default();
-        let model = sample_model("anthropic", "claude-x", "anthropic-messages");
-        apply_speed_headers(&mut opts, &model, Some(Speed::Standard));
-        assert!(opts.headers.is_none());
-    }
-
-    #[test]
-    fn apply_speed_headers_stamps_fast_mode_beta_on_anthropic() {
-        let mut opts = StreamOptions::default();
-        let model = sample_model("anthropic", "claude-x", "anthropic-messages");
-        apply_speed_headers(&mut opts, &model, Some(Speed::Fast));
-        let headers = opts.headers.expect("headers populated");
-        assert_eq!(
-            headers.get("anthropic-beta").map(String::as_str),
-            Some(FAST_MODE_BETA)
-        );
-    }
-
-    #[test]
-    fn apply_speed_headers_is_noop_for_non_anthropic_providers() {
-        let mut opts = StreamOptions::default();
-        let model = sample_model("openai", "gpt-x", "openai-responses");
-        apply_speed_headers(&mut opts, &model, Some(Speed::Fast));
-        assert!(opts.headers.is_none());
-    }
-
-    #[test]
-    fn add_beta_header_creates_when_missing() {
-        let mut headers = HashMap::new();
-        add_beta_header(&mut headers, "anthropic-beta", "alpha-1");
-        assert_eq!(
-            headers.get("anthropic-beta").map(String::as_str),
-            Some("alpha-1")
-        );
-    }
-
-    #[test]
-    fn add_beta_header_appends_to_existing_value() {
-        let mut headers = HashMap::new();
-        headers.insert("anthropic-beta".into(), "existing-1".into());
-        add_beta_header(&mut headers, "anthropic-beta", "alpha-1");
-        assert_eq!(
-            headers.get("anthropic-beta").map(String::as_str),
-            Some("existing-1,alpha-1"),
-        );
-    }
-
-    #[test]
-    fn add_beta_header_skips_duplicate() {
-        let mut headers = HashMap::new();
-        headers.insert("anthropic-beta".into(), "alpha-1,beta-2".into());
-        add_beta_header(&mut headers, "anthropic-beta", "alpha-1");
-        assert_eq!(
-            headers.get("anthropic-beta").map(String::as_str),
-            Some("alpha-1,beta-2"),
-        );
     }
 
     #[test]

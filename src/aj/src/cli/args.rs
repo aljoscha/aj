@@ -34,9 +34,10 @@ pub struct Args {
     #[arg(long)]
     pub api_key: Option<String>,
 
-    /// Inference speed mode: `standard` (default) or `fast`
-    /// (Anthropic beta `speed` parameter; requires the
-    /// `fast-inference-2025-10-02` beta header).
+    /// Inference speed mode: `standard` (default) or `fast`. Fast mode
+    /// is Anthropic-only — it sends `speed: "fast"` in the request body
+    /// together with the `fast-mode-2026-02-01` beta header. Models
+    /// that don't support fast mode reject the request.
     #[arg(long, env = "AJ_SPEED")]
     pub speed: Option<String>,
 
@@ -52,12 +53,12 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = PrintFormat::Text)]
     pub format: PrintFormat,
 
-    /// Free-form initial prompt. In print mode this is the entire
-    /// input; in interactive mode it pre-fills the editor (you still
-    /// press Enter to send — it is not auto-submitted). Multiple
-    /// positional args are joined with spaces; any `@path` token is
-    /// expanded by [`crate::cli::file_args`]. See
-    /// [`crate::cli::initial_prompt`] for the slot-selection rules.
+    /// Free-form launch input. Each positional argument is either a
+    /// `@file` attachment (its contents are wrapped in a `<file>` block
+    /// and images are attached inline) or a message; the first message
+    /// carries the file content, and any further messages run as their
+    /// own turns. Both print and interactive mode auto-submit these in
+    /// order. See [`crate::cli::initial_input`] for the full rules.
     pub prompt: Vec<String>,
 
     /// Replace the live model with a scripted fake that replays a
@@ -104,23 +105,20 @@ pub enum Command {
     ListSessions,
     /// Continue a conversation session (latest if no id given).
     ///
-    /// Accepts an optional positional prompt after the session id:
-    /// `aj continue ID prompt words...` resumes the session
-    /// and (in `--print` mode) runs the supplied prompt as the
-    /// next turn. With no session id, the latest session for the
-    /// current project is resumed; supplying a prompt without a
-    /// session id is ambiguous, so callers wanting "latest +
-    /// prompt" should pass the session id explicitly (e.g. via
-    /// `aj list-sessions`).
+    /// Accepts optional positional launch input after the session id:
+    /// `aj continue ID <args...>` resumes the session and auto-submits
+    /// the args (messages and `@file` attachments) as the next turn(s).
+    /// With no session id, the latest session for the current project
+    /// is resumed; supplying input without a session id is ambiguous,
+    /// so callers wanting "latest + prompt" should pass the session id
+    /// explicitly (e.g. via `aj list-sessions`).
     Continue {
         /// Conversation ID to continue. If absent, the latest
         /// session for this project is resumed.
         session_id: Option<String>,
-        /// Free-form prompt for the resumed run. In `--print` mode
-        /// it is the entire turn; in interactive mode it pre-fills
-        /// the editor (you still press Enter to send). Multiple
-        /// positional args are joined with spaces; any `@path` token
-        /// is expanded by [`crate::cli::file_args`].
+        /// Launch input for the resumed run, interpreted exactly like
+        /// the top-level [`Args::prompt`]: a mix of `@file` attachments
+        /// and messages, auto-submitted in order.
         prompt: Vec<String>,
     },
     /// Refresh the user model catalog at `~/.aj/models.json` from
