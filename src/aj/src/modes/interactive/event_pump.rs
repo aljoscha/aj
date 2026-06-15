@@ -1388,8 +1388,8 @@ mod tests {
     ) -> (aj_tui::tui::Tui, EventPump, ChatTheme) {
         let mut tui = aj_tui::tui::Tui::new(Box::new(ProcessTerminal::new()));
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
-        build_layout(&mut tui, &theme);
-        let chat = chat_theme(&theme);
+        build_layout(&mut tui, &theme, true);
+        let chat = chat_theme(&theme, true);
         // Test-only: 200k matches the canonical Sonnet window so
         // any incidental "context_window" expectations in future
         // tests don't need to know about a synthetic value.

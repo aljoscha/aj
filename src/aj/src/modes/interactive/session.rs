@@ -459,7 +459,7 @@ impl SessionWorld {
         };
         let context_window = agent.model_info().context_window;
         let pump = EventPump::new(
-            chat_theme(theme),
+            chat_theme(theme, config.syntax_highlighting),
             render_settings.clone(),
             main_settings,
             context_window,
@@ -668,7 +668,7 @@ mod tests {
 
         // Install renders the prior conversation into the chat slot.
         let mut tui = Tui::new(Box::new(StubTerminal));
-        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
         world.install(&mut tui, &spec).await;
         let chat = tui
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
@@ -830,7 +830,7 @@ mod tests {
         let spec = resume_spec(&session_id);
         let mut world = build_test_world(&persistence, &run_config, &spec).expect("resume world");
         let mut tui = Tui::new(Box::new(StubTerminal));
-        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
         world.install(&mut tui, &spec).await;
 
         let changed = world
@@ -882,7 +882,7 @@ mod tests {
             let expected_id = world.session_id.clone();
 
             let mut tui = Tui::new(Box::new(StubTerminal));
-            build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+            build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
             world.install(&mut tui, &spec).await;
 
             let header = tui

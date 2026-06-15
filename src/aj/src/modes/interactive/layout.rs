@@ -74,7 +74,11 @@ impl SlotIndex {
 /// `tui.start()` is *not* called here — the caller drives the TUI
 /// lifecycle, and tests using a virtual terminal want full control
 /// over when the terminal is initialised.
-pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle) {
+///
+/// `syntax_highlight` toggles syntect highlighting of fenced code
+/// blocks in the chat scrollback (the `config.toml`
+/// `syntax_highlighting` option).
+pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle, syntax_highlight: bool) {
     // Header slot.
     tui.add_child(Box::new(Header::new()));
 
@@ -82,7 +86,7 @@ pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle) {
     // the per-sub-agent boxes; the event pump routes each event to
     // the owning agent's transcript and the view switches which
     // agent's transcript is shown (main, or a sub-agent in full).
-    tui.add_child(Box::new(ChatView::new(chat_theme(theme))));
+    tui.add_child(Box::new(ChatView::new(chat_theme(theme, syntax_highlight))));
 
     // Status slot. Always present; the loader inside it toggles
     // its own visibility based on whether the agent is mid-turn.
@@ -120,7 +124,7 @@ mod tests {
         // the test from touching real stdin/stdout.
         let mut tui = Tui::new(Box::new(ProcessTerminal::new()));
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
-        build_layout(&mut tui, &theme);
+        build_layout(&mut tui, &theme, true);
         assert_eq!(tui.len(), 5, "expected the five layout slots");
     }
 }

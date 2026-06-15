@@ -91,6 +91,7 @@ fn markdown_theme() -> MarkdownTheme {
         underline: Arc::new(style::underline),
         highlight_code: None,
         code_block_indent: None,
+        syntax_highlight: true,
     }
 }
 

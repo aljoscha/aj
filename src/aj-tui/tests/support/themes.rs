@@ -65,6 +65,9 @@ pub fn default_markdown_theme() -> MarkdownTheme {
         underline: Arc::new(style::underline),
         highlight_code: None,
         code_block_indent: None,
+        // Keep the built-in syntect highlighter active so the markdown
+        // tests exercise the highlighting path.
+        syntax_highlight: true,
     }
 }
 
@@ -111,6 +114,9 @@ pub fn identity_markdown_theme() -> MarkdownTheme {
         underline: Arc::new(|s| s.to_string()),
         highlight_code: None,
         code_block_indent: None,
+        // Keep the built-in syntect highlighter active so the markdown
+        // tests exercise the highlighting path.
+        syntax_highlight: true,
     }
 }
 

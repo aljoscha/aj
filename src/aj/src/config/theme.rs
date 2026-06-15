@@ -1267,9 +1267,9 @@ pub struct ChatTheme {
 /// downstream wiring (event pump → component constructor) only
 /// needs to consume `ChatTheme` rather than collecting individual
 /// closures.
-pub fn chat_theme(theme: &ThemeHandle) -> ChatTheme {
+pub fn chat_theme(theme: &ThemeHandle, syntax_highlight: bool) -> ChatTheme {
     ChatTheme {
-        markdown: markdown_theme(theme),
+        markdown: markdown_theme(theme, syntax_highlight),
         thinking_text: theme.fg_closure(ThemeColor::ThinkingText),
         user_message_bg: theme.bg_closure(ThemeBg::UserMessageBg),
         tool_pending_bg: theme.bg_closure(ThemeBg::ToolPendingBg),
@@ -1279,10 +1279,14 @@ pub fn chat_theme(theme: &ThemeHandle) -> ChatTheme {
 }
 
 /// Build the [`MarkdownTheme`] used by the assistant-message and
-/// user-message renderers. Code-block bodies stay identity because
-/// the bundled syntect highlighter colors per token inside the
-/// block — wrapping it would interfere with its SGR resets.
-pub fn markdown_theme(theme: &ThemeHandle) -> MarkdownTheme {
+/// user-message renderers. `syntax_highlight` carries the
+/// `config.toml` `syntax_highlighting` option.
+///
+/// `code_block` stays identity: when highlighting is on the bundled
+/// syntect highlighter colors per token inside the block (wrapping it
+/// would interfere with its SGR resets), and when it is off the
+/// identity closure is exactly the plain, uncolored rendering we want.
+pub fn markdown_theme(theme: &ThemeHandle, syntax_highlight: bool) -> MarkdownTheme {
     MarkdownTheme {
         heading: theme.fg_closure(ThemeColor::MdHeading),
         bold: Arc::new(style::bold),
@@ -1304,6 +1308,7 @@ pub fn markdown_theme(theme: &ThemeHandle) -> MarkdownTheme {
         underline: Arc::new(style::underline),
         highlight_code: None,
         code_block_indent: None,
+        syntax_highlight,
     }
 }
 
@@ -1562,7 +1567,7 @@ mod tests {
     #[test]
     fn builders_produce_themed_closures() {
         let handle = ThemeHandle::new(Theme::bundled_dark());
-        let ml_theme = markdown_theme(&handle);
+        let ml_theme = markdown_theme(&handle, true);
         // Headings use the default text color (`mdHeading` is empty
         // in the bundled palettes), so the closure emits the default
         // foreground escape rather than a specific color — they're

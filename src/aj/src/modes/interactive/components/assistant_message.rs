@@ -479,7 +479,7 @@ mod tests {
     use crate::config::theme::{Theme, ThemeHandle, chat_theme};
 
     fn theme() -> ChatTheme {
-        chat_theme(&ThemeHandle::new(Theme::bundled_dark()))
+        chat_theme(&ThemeHandle::new(Theme::bundled_dark()), true)
     }
 
     /// Build a shared settings handle with the given thinking-fold

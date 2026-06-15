@@ -202,9 +202,9 @@ fn one_tool_use_message(
 fn build_tui_and_pump() -> (Tui, EventPump) {
     let mut tui = Tui::new(Box::new(StubTerminal::new()));
     let theme = ThemeHandle::new(Theme::bundled_dark());
-    build_layout(&mut tui, &theme);
+    build_layout(&mut tui, &theme, true);
     let pump = EventPump::new(
-        chat_theme(&theme),
+        chat_theme(&theme, true),
         RenderSettings::new(false, false, true),
         AgentSettings {
             provider: SCRIPT_PROVIDER.to_string(),

@@ -530,7 +530,7 @@ impl InteractiveMode {
         let mut tui = Tui::new(Box::new(ProcessTerminal::new()));
         tui.start()
             .map_err(|e| anyhow::anyhow!("failed to start terminal: {e}"))?;
-        build_layout(&mut tui, &theme);
+        build_layout(&mut tui, &theme, config.syntax_highlighting);
 
         // Tint the editor border to match the initial thinking level
         // so the user sees the active reasoning mode at a glance the
@@ -3372,6 +3372,7 @@ async fn handle_slash_command(
                     image_auto_resize: cfg.image_auto_resize,
                     image_show_in_terminal: render_settings.show_image_in_terminal(),
                     image_block: cfg.image_block,
+                    syntax_highlighting: cfg.syntax_highlighting,
                 }
             };
             // Builtin tool names for the disabled-tools toggle list.
@@ -4025,6 +4026,14 @@ async fn apply_setting_change(
             let save_note = persist_config(config, |c| c.image_block = on);
             Some(join_notice(
                 format!("image_block set to {on}. Takes effect for new sessions."),
+                save_note,
+            ))
+        }
+        "syntax_highlighting" => {
+            let on = value == "true";
+            let save_note = persist_config(config, |c| c.syntax_highlighting = on);
+            Some(join_notice(
+                format!("syntax_highlighting set to {on}. Takes effect for new sessions."),
                 save_note,
             ))
         }
@@ -5491,7 +5500,7 @@ mod tests {
             build_test_world(persistence, &run_config, &create_spec()).expect("create world");
         drive_turn(&world, "delegate").await;
         let mut tui = Tui::new(Box::new(StubTerminal));
-        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
         while let Ok(event) = world.event_rx.try_recv() {
             world.pump.handle(&mut tui, &event);
         }
@@ -5747,7 +5756,7 @@ mod tests {
         let mut world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         let mut tui = Tui::new(Box::new(StubTerminal));
-        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
 
         let (task_id, cancel) = world.task_registry.register(
             AgentId::Main,

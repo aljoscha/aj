@@ -110,6 +110,7 @@ pub struct SettingsCurrentValues {
     pub image_auto_resize: bool,
     pub image_show_in_terminal: bool,
     pub image_block: bool,
+    pub syntax_highlighting: bool,
 }
 
 /// The overlay's top-level component. See the module docs for the
@@ -382,6 +383,13 @@ fn build_items(
                 items.push(bool_item(
                     option,
                     current.image_block,
+                    Some("Takes effect for new sessions."),
+                ));
+            }
+            "syntax_highlighting" => {
+                items.push(bool_item(
+                    option,
+                    current.syntax_highlighting,
                     Some("Takes effect for new sessions."),
                 ));
             }
@@ -763,6 +771,7 @@ mod tests {
             image_auto_resize: true,
             image_show_in_terminal: true,
             image_block: false,
+            syntax_highlighting: false,
         }
     }
 

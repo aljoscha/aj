@@ -3332,6 +3332,48 @@ fn custom_non_italic_quote_theme_still_underwraps_with_italic() {
 }
 
 #[test]
+fn code_block_without_syntax_highlight_renders_plain_body() {
+    // `default_markdown_theme()` enables `syntax_highlight`, so the
+    // body is colored by syntect (24-bit `\x1b[38;2;…m` escapes).
+    // With the flag off, the body must instead route through the
+    // theme's `code_block` styler (green here) and carry no syntect
+    // truecolor escapes.
+    let code = "```rust\nlet x = 1;\n```";
+
+    let mut highlighted = Markdown::new(code, 0, 0, default_markdown_theme(), None);
+    let highlighted_join = highlighted.render(80).join("\n");
+    assert!(
+        highlighted_join.contains("\x1b[38;2;"),
+        "default theme should syntax-highlight with truecolor escapes; got: {:?}",
+        highlighted_join,
+    );
+
+    let theme = MarkdownTheme {
+        syntax_highlight: false,
+        ..default_markdown_theme()
+    };
+    let mut plain = Markdown::new(code, 0, 0, theme, None);
+    let lines = plain.render(80);
+    let joined = lines.join("\n");
+
+    assert!(
+        !joined.contains("\x1b[38;2;"),
+        "disabled highlighting should emit no syntect truecolor escapes; got: {:?}",
+        joined,
+    );
+    let body = lines
+        .iter()
+        .find(|l| strip_ansi(l).contains("let x = 1;"))
+        .expect("expected a rendered row containing the code body");
+    assert!(
+        body.contains("\x1b[32m"),
+        "disabled highlighting should style the body via theme.code_block \
+         (green); got: {:?}",
+        body,
+    );
+}
+
+#[test]
 fn code_block_in_blockquote_reopens_quote_styling_after_syntect_reset() {
     // `apply_quote_style` replaces every `\x1b[0m` (full SGR reset,
     // emitted by syntect's `as_24_bit_terminal_escaped`) with

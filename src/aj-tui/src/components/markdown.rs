@@ -69,6 +69,11 @@ pub struct MarkdownTheme {
     /// Prefix applied to each rendered code block line. Defaults to two
     /// spaces when `None`.
     pub code_block_indent: Option<String>,
+    /// Whether to syntax-highlight fenced code blocks with the
+    /// built-in highlighter. When `false`, code-block bodies render as
+    /// plain text via `code_block`. Ignored when `highlight_code` is
+    /// set: an explicit override always wins.
+    pub syntax_highlight: bool,
 }
 
 /// Outer styling applied to rendered paragraph lines, independently of
@@ -1492,11 +1497,16 @@ impl Markdown {
                 };
                 lines.push((self.theme.code_block_border)(&border_open));
 
-                // Highlight via the theme override if present, otherwise
-                // fall back to the built-in syntect-based highlighter.
+                // Pick the highlighter: an explicit override hook
+                // wins, otherwise the built-in syntect highlighter
+                // when enabled, otherwise plain text styled by
+                // `code_block`.
                 let highlighted = match &self.theme.highlight_code {
                     Some(hook) => hook(code, lang.as_deref()),
-                    None => self.highlight_code(code, lang.as_deref()),
+                    None if self.theme.syntax_highlight => {
+                        self.highlight_code(code, lang.as_deref())
+                    }
+                    None => code.lines().map(|l| (self.theme.code_block)(l)).collect(),
                 };
 
                 let default_indent = "  ";
@@ -2461,6 +2471,7 @@ mod tests {
             underline: Arc::new(|s| s.to_string()),
             highlight_code: None,
             code_block_indent: None,
+            syntax_highlight: true,
         }
     }
 

@@ -784,6 +784,11 @@ pub struct Config {
     /// omission. The model never sees the bytes regardless of its
     /// declared vision capability. Defaults to `false`.
     pub image_block: bool,
+    /// Whether the interactive TUI syntax-highlights fenced code
+    /// blocks when rendering markdown. Defaults to `false`, which
+    /// renders code-block bodies as plain text. Only affects
+    /// interactive rendering; print mode never highlights.
+    pub syntax_highlighting: bool,
 }
 
 impl Default for Config {
@@ -804,6 +809,7 @@ impl Default for Config {
             image_auto_resize: true,
             image_show_in_terminal: true,
             image_block: false,
+            syntax_highlighting: false,
         }
     }
 }
@@ -990,6 +996,17 @@ impl Config {
             },
             display_fn: |c| c.image_block.to_string(),
             to_toml_fn: |c| bool_item(c.image_block, false),
+        },
+        ConfigOption {
+            name: "syntax_highlighting",
+            description: "Syntax-highlight fenced code blocks in rendered markdown (interactive TUI).",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.syntax_highlighting = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.syntax_highlighting.to_string(),
+            to_toml_fn: |c| bool_item(c.syntax_highlighting, false),
         },
     ];
 
