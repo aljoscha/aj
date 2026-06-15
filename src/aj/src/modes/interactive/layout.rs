@@ -14,6 +14,7 @@
 //! | `Header` | one-line dim banner with session id + transient notices |
 //! | `Chat` | [`super::components::chat_view::ChatView`] — main transcript + sub-agent boxes |
 //! | `Status` | `Container` holding the [`super::components::loader_status::LoaderStatus`] (idle = empty) |
+//! | `Pending` | [`super::components::pending_message::PendingMessage`] — the queued message (empty when none) |
 //! | `Editor` | the prompt editor (focused) |
 //! | `Footer` | one-line dim banner with model / cwd / usage |
 //!
@@ -28,6 +29,7 @@ use crate::modes::interactive::components::chat_view::ChatView;
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::components::loader_status::LoaderStatus;
+use crate::modes::interactive::components::pending_message::PendingMessage;
 
 /// Stable index of each layout slot in the TUI's root container.
 ///
@@ -41,6 +43,7 @@ pub enum SlotIndex {
     Header,
     Chat,
     Status,
+    Pending,
     Editor,
     Footer,
 }
@@ -58,8 +61,9 @@ impl SlotIndex {
             SlotIndex::Header => 0,
             SlotIndex::Chat => 1,
             SlotIndex::Status => 2,
-            SlotIndex::Editor => 3,
-            SlotIndex::Footer => 4,
+            SlotIndex::Pending => 3,
+            SlotIndex::Editor => 4,
+            SlotIndex::Footer => 5,
         }
     }
 }
@@ -97,6 +101,11 @@ pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle, syntax_highlight: bool) 
     };
     tui.add_child(Box::new(status));
 
+    // Pending-message box. Sits directly above the editor and renders
+    // the queued message (steering / follow-up) for the viewed agent;
+    // empty (zero height) when nothing is queued.
+    tui.add_child(Box::new(PendingMessage::new()));
+
     // Editor. Themed via the shared `editor_theme`; the event
     // pump installs an autocomplete provider once selectors land.
     let editor = Editor::new(tui.handle(), editor_theme(theme));
@@ -117,7 +126,7 @@ mod tests {
     use aj_tui::terminal::ProcessTerminal;
 
     #[test]
-    fn build_layout_attaches_five_slots() {
+    fn build_layout_attaches_six_slots() {
         // Construct against a `ProcessTerminal` without calling
         // `start()` — the layout function only ever needs the
         // container surface, not the running terminal. This keeps
@@ -125,6 +134,6 @@ mod tests {
         let mut tui = Tui::new(Box::new(ProcessTerminal::new()));
         let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
         build_layout(&mut tui, &theme, true);
-        assert_eq!(tui.len(), 5, "expected the five layout slots");
+        assert_eq!(tui.len(), 6, "expected the six layout slots");
     }
 }

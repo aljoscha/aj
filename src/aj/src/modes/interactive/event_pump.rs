@@ -29,6 +29,7 @@ use std::time::Instant;
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
+use aj_agent::queue::MessageQueues;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
 use aj_agent::types::TokenUsage;
 use aj_models::registry::ModelInfo;
@@ -48,6 +49,7 @@ use crate::modes::interactive::components::assistant_message::{
 use crate::modes::interactive::components::chat_view::{AgentEntry, ChatView};
 use crate::modes::interactive::components::footer::{AgentActivity, Footer};
 use crate::modes::interactive::components::loader_status::LoaderStatus;
+use crate::modes::interactive::components::pending_message::PendingMessage;
 use crate::modes::interactive::components::subagent_box::SubAgentStatus;
 use crate::modes::interactive::components::tool_execution::ToolExecutionComponent;
 use crate::modes::interactive::components::user_message::UserMessageComponent;
@@ -170,6 +172,11 @@ pub struct EventPump {
     /// settings identity to its context window (see
     /// [`Self::resolve_window`]).
     catalog: Arc<Vec<ModelInfo>>,
+    /// Shared steering / follow-up queues. The pump reads the active
+    /// view's snapshot to paint the pending-message box; it never
+    /// mutates them (the TUI input handlers and the agent do). See
+    /// [`Self::sync_pending`].
+    message_queues: MessageQueues,
 }
 
 impl EventPump {
@@ -193,6 +200,7 @@ impl EventPump {
         main_settings: AgentSettings,
         main_context_window: u64,
         catalog: Arc<Vec<ModelInfo>>,
+        message_queues: MessageQueues,
     ) -> Self {
         Self {
             theme,
@@ -202,6 +210,7 @@ impl EventPump {
             render_settings,
             footer_data: AgentFooters::new(main_settings, main_context_window),
             catalog,
+            message_queues,
         }
     }
 
@@ -220,7 +229,20 @@ impl EventPump {
         tui.request_render();
     }
 
-    /// Push the running-activity indicator into the [`Footer`].
+    /// Paint the pending-message box for the active view from the
+    /// shared queue handle. Called after every queue change (the
+    /// agent's `QueueUpdate`, a view switch, and the TUI input
+    /// handlers after they enqueue), so the box always reflects the
+    /// viewed agent's live snapshot rather than any event payload.
+    pub fn sync_pending(&self, tui: &mut Tui) {
+        let active = self.active_view(tui);
+        let snapshot = self.message_queues.snapshot(active);
+        if let Some(pending) = tui.get_mut_as::<PendingMessage>(SlotIndex::Pending.idx()) {
+            pending.set_snapshot(snapshot);
+        }
+        tui.request_render();
+    }
+
     /// Shows `N agents, M tasks (key)` while at least one sub-agent
     /// or background bash task runs, where `key` is the resolved
     /// `aj.agent.open` shortcut; clears the indicator when neither.
@@ -424,6 +446,7 @@ impl EventPump {
         // new view's model line and context usage.
         self.sync_loader(tui);
         self.sync_footer(tui);
+        self.sync_pending(tui);
         tui.invalidate();
         tui.request_render();
     }
@@ -706,11 +729,21 @@ impl EventPump {
             }
 
             // ---- Placeholders: events whose UI work isn't yet wired. ----
-            AgentEvent::TurnEnd { .. } | AgentEvent::QueueUpdate { .. } => {
-                // Queue indicators and the `TurnEnd` summary land in
-                // follow-up commits. Holding the arms here keeps the
-                // exhaustiveness check active so a newly-emitted
-                // event variant shows up as a compile error.
+            AgentEvent::QueueUpdate { agent_id, .. } => {
+                // The agent emits this after draining a queue. Repaint
+                // the box only when the change is for the viewed agent;
+                // we re-read the live snapshot rather than trust the
+                // payload (see `aj_agent::queue`), which keeps
+                // the box correct even if a TUI enqueue raced the drain.
+                if *agent_id == self.active_view(tui) {
+                    self.sync_pending(tui);
+                }
+            }
+            AgentEvent::TurnEnd { .. } => {
+                // The `TurnEnd` summary lands in a follow-up commit.
+                // Holding the arm here keeps the exhaustiveness check
+                // active so a newly-emitted event variant shows up as a
+                // compile error.
             }
         }
 
@@ -1399,6 +1432,7 @@ mod tests {
             main_settings(),
             200_000,
             Arc::new(catalog),
+            MessageQueues::default(),
         );
         (tui, pump, chat)
     }
@@ -1411,6 +1445,90 @@ mod tests {
             thinking: "off".into(),
             speed: "standard".into(),
         }
+    }
+
+    /// Build a `Tui` + `EventPump` sharing `queues`, for pending-box
+    /// tests that need to enqueue on the same handle the pump reads.
+    fn fresh_tui_with_queues(queues: MessageQueues) -> (aj_tui::tui::Tui, EventPump) {
+        let mut tui = aj_tui::tui::Tui::new(Box::new(ProcessTerminal::new()));
+        let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
+        build_layout(&mut tui, &theme, true);
+        let pump = EventPump::new(
+            chat_theme(&theme, true),
+            RenderSettings::new(false, false, true),
+            main_settings(),
+            200_000,
+            Arc::new(Vec::new()),
+            queues,
+        );
+        (tui, pump)
+    }
+
+    fn render_pending(tui: &mut aj_tui::tui::Tui) -> Vec<String> {
+        tui.get_mut_as::<PendingMessage>(SlotIndex::Pending.idx())
+            .map(|p| p.render(80))
+            .unwrap_or_default()
+    }
+
+    /// A `QueueUpdate` for the viewed agent repaints the box from the
+    /// live snapshot; an empty queue leaves it blank.
+    #[test]
+    fn queue_update_paints_pending_box_for_active_view() {
+        let queues = MessageQueues::default();
+        let (mut tui, mut pump) = fresh_tui_with_queues(queues.clone());
+
+        pump.sync_pending(&mut tui);
+        assert!(
+            render_pending(&mut tui).is_empty(),
+            "no message → empty box"
+        );
+
+        queues.append_follow_up(AgentId::Main, "clean up later");
+        pump.handle(
+            &mut tui,
+            &AgentEvent::QueueUpdate {
+                agent_id: AgentId::Main,
+                steering: Vec::new(),
+                follow_up: Vec::new(),
+            },
+        );
+        let lines = render_pending(&mut tui);
+        assert!(lines.iter().any(|l| l.contains("clean up later")));
+        assert!(lines.iter().any(|l| l.contains("queued")));
+    }
+
+    /// The box is view-scoped: a queue change for a non-viewed agent
+    /// doesn't paint it, but switching to that agent's view does.
+    #[test]
+    fn pending_box_is_view_scoped() {
+        let queues = MessageQueues::default();
+        let (mut tui, mut pump) = fresh_tui_with_queues(queues.clone());
+
+        // Queue for Sub(1) while viewing Main.
+        queues.append_steering(AgentId::Sub(1), "do this now");
+        pump.handle(
+            &mut tui,
+            &AgentEvent::QueueUpdate {
+                agent_id: AgentId::Sub(1),
+                steering: Vec::new(),
+                follow_up: Vec::new(),
+            },
+        );
+        assert!(
+            render_pending(&mut tui).is_empty(),
+            "Sub(1)'s pending message must not show while viewing Main"
+        );
+
+        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        let lines = render_pending(&mut tui);
+        assert!(lines.iter().any(|l| l.contains("do this now")));
+        assert!(lines.iter().any(|l| l.contains("steering")));
+
+        pump.set_active_view(&mut tui, AgentId::Main);
+        assert!(
+            render_pending(&mut tui).is_empty(),
+            "switching back to Main hides Sub(1)'s pending message"
+        );
     }
 
     /// Catalog row with only the identity + window fields the

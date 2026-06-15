@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, AgentSeed, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
@@ -284,6 +285,11 @@ pub struct SessionWorld {
     /// shuts it down on every exit (quit, fatal error, session
     /// switch), so tasks never outlive their world.
     pub task_registry: TaskRegistry,
+    /// Shared steering / follow-up queues injected into `agent` (and
+    /// its sub-agents). The main loop's input handlers enqueue onto
+    /// them and the wake triggers poll [`MessageQueues::has_pending`].
+    /// Per-world, like the agent itself.
+    pub message_queues: MessageQueues,
     /// Loop-side staged settings overrides, keyed by sub-agent id.
     /// The `/model` / `/thinking` selectors write entries when the
     /// user changes a sub-agent's settings; the submit handler's
@@ -442,6 +448,13 @@ impl SessionWorld {
         let task_registry = TaskRegistry::default();
         agent.set_task_registry(task_registry.clone());
 
+        // Fresh, shared steering / follow-up queues: the TUI input
+        // handlers enqueue onto them while a turn runs, the agent
+        // drains them, and the pump reads them to paint the
+        // pending-message box.
+        let message_queues = MessageQueues::default();
+        agent.set_message_queues(message_queues.clone());
+
         // Bus subscriptions: the channel forwarder feeds the pump in
         // the main loop; the persistence listener writes events into
         // the log. Seeding never emits bus events, so subscription
@@ -464,12 +477,14 @@ impl SessionWorld {
             main_settings,
             context_window,
             catalog,
+            message_queues.clone(),
         );
 
         Ok(SessionWorld {
             agent: Arc::new(TokioMutex::new(agent)),
             registry,
             task_registry,
+            message_queues,
             sub_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             log,
             session_id,

@@ -214,6 +214,7 @@ fn build_tui_and_pump() -> (Tui, EventPump) {
         },
         200_000,
         Arc::new(Vec::new()),
+        aj_agent::queue::MessageQueues::default(),
     );
     (tui, pump)
 }

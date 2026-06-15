@@ -28,6 +28,7 @@ pub mod help_overlay;
 pub mod loader_status;
 pub mod login_dialog;
 pub mod model_selector;
+pub mod pending_message;
 pub mod prompt_history;
 pub mod session_selector;
 pub mod settings_window;
