@@ -1,11 +1,10 @@
-//! User-facing configuration: keybindings, theming, slash commands.
+//! User-facing configuration: keybindings, theming, command catalog.
 //!
 //! Per `docs/aj-next-plan.md` §4 the interactive mode is driven by
 //! a [`KeybindingsRegistry`](keybindings::KeybindingsRegistry), a
-//! [`Theme`](theme::Theme), and a [`SlashCommandRegistry`](slash_commands::SlashCommandRegistry)
-//! built once at startup. The scaffold only declares the modules;
-//! the "Selectors and theming" step in Phase 1 fills them in.
+//! [`Theme`](theme::Theme), and the command catalog in
+//! [`commands`], built once at startup.
 
+pub mod commands;
 pub mod keybindings;
-pub mod slash_commands;
 pub mod theme;

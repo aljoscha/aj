@@ -8,9 +8,8 @@
 //!   component update;
 //! - a registry of [`components`] (assistant message, tool
 //!   execution, footer, header, selectors, etc.);
-//! - editor extensions ([`editor_ext`]) that bolt slash-command
-//!   completion and `@file` autocomplete onto the shared
-//!   [`aj_tui::EditorComponent`];
+//! - editor extensions ([`editor_ext`]) that bolt `@file`
+//!   autocomplete onto the shared [`aj_tui::EditorComponent`];
 //! - the keybinding map ([`keys`]).
 //!
 //! [`AgentEvent`]: aj_agent::events::AgentEvent
@@ -56,9 +55,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::args::{Args, Command};
-use crate::config::slash_commands::{
-    SlashAction, dispatch as slash_dispatch, load_model_catalog, thinking_level_name,
-};
+use crate::config::commands::{CommandAction, load_model_catalog, thinking_level_name};
 use crate::config::theme::{
     Theme, ThemeHandle, ThemeWatcherGuard, editor_border_color_for_thinking, select_list_theme,
     settings_list_theme, watch_user_theme,
@@ -123,7 +120,7 @@ use crate::modes::interactive::shutdown::{
 /// whole `select!` (including its Ctrl+C arm) until the turn ends.
 ///
 /// This snapshot is therefore the loop-side source of truth for "what
-/// the next turn runs against". The `/model` and `/thinking` selectors
+/// the next turn runs against". The model and thinking selectors
 /// mutate it without touching the agent; the footer renders the active
 /// model and effort from it; and the submit handler copies it into the
 /// agent just before each turn starts (while holding the turn's own
@@ -142,11 +139,11 @@ pub(crate) struct RunConfigSnapshot {
     /// Default thinking effort for the next turn.
     thinking: Option<ThinkingConfig>,
     /// Inference speed mode baked into `stream_options`' headers.
-    /// Tracked explicitly so bundle rebuilds (`/model` swap, resume
+    /// Tracked explicitly so bundle rebuilds (model swap, resume
     /// restore) preserve it and so it can be recorded in the
     /// session log. `None` means standard.
     speed: Option<Speed>,
-    /// `(provider_id, model_id)` the `/model` selector pre-selects.
+    /// `(provider_id, model_id)` the model selector pre-selects.
     /// Tracked explicitly rather than read off `model_info` because
     /// the scripted path's provider id (from `--model-api`) differs
     /// from `model_info.provider`, which is always `"scripted"`.
@@ -164,7 +161,7 @@ pub(crate) struct RunConfigSnapshot {
 /// an entry is the user's standing choice for that agent.
 #[derive(Default)]
 pub(crate) struct SubAgentOverrides {
-    /// Full bundle swap from a `/model` confirm: provider handle,
+    /// Full bundle swap from a model-selector confirm: provider handle,
     /// model info, stream options, and the `(provider, id)` key.
     pub(crate) bundle: Option<(
         Arc<dyn Provider>,
@@ -217,7 +214,7 @@ fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Option<Th
 }
 
 /// User-facing notice shown when a session-changing command
-/// (`/resume`, `/new`) is invoked while a turn is in flight.
+/// (resume, new) is invoked while a turn is in flight.
 ///
 /// A session change tears down the current world — agent, bus
 /// subscriptions, pump — and rebuilds it from scratch, which must
@@ -329,12 +326,12 @@ impl InteractiveMode {
         //
         // `run_config` is the loop-side snapshot of what the next
         // turn runs against (provider, model, stream options, thinking
-        // effort, and `(provider_id, model_id)` for the `/model`
+        // effort, and `(provider_id, model_id)` for the model
         // selector to pre-select). The selectors mutate it without
         // locking the agent; the submit handler copies it into the
         // agent just before each turn. See [`RunConfigSnapshot`].
-        // Credential store backing API-key resolution and the
-        // `/login` / `/logout` / `/auth` overlays. Cheap to clone
+        // Credential store backing API-key resolution and the login /
+        // logout / auth-status overlays. Cheap to clone
         // (`Arc`-backed); the resolver installed in
         // `crate::model::from_model_info` captures a clone and reads
         // it on every inference, so a mid-session login takes effect
@@ -370,7 +367,7 @@ impl InteractiveMode {
             // Load the registry once at startup; the same handle
             // also feeds resume-time settings restoration via the
             // `RestoreContext` below. (`load_model_catalog` further
-            // down does its own cheap JSON read for the `/model`
+            // down does its own cheap JSON read for the model
             // selector's snapshot.)
             let registry = ModelRegistry::load();
             let resolved = crate::model::resolve(
@@ -414,7 +411,7 @@ impl InteractiveMode {
 
         // Apply a `--api-key` runtime override (if supplied) to the
         // resolved provider, then check whether *any* credential is
-        // configured so we can nudge the user toward `/login` when
+        // configured so we can nudge the user toward logging in when
         // none is. Both are skipped for the scripted fake provider,
         // which needs no real credentials. The warning is emitted via
         // the pump further below (it doesn't exist yet here).
@@ -450,7 +447,7 @@ impl InteractiveMode {
         // one above.
         let tmux_warning = crate::tmux_notice::startup_warning();
 
-        // Snapshot the model catalog up-front so the `/model`
+        // Snapshot the model catalog up-front so the model
         // selector overlay and the editor's argument completer
         // share a single load (registry::load reads JSON twice
         // otherwise — once per consumer).
@@ -509,7 +506,7 @@ impl InteractiveMode {
         // ---- First session world --------------------------------------
         // One shared render-settings handle for the whole process:
         // each session's pump gets a clone, so `alt+t` / `alt+o`
-        // toggles survive `/new` and `/resume`.
+        // toggles survive a new-session or resume.
         let render_settings = RenderSettings::new(
             config.hide_thinking_block,
             false,
@@ -535,7 +532,7 @@ impl InteractiveMode {
         // Tint the editor border to match the initial thinking level
         // so the user sees the active reasoning mode at a glance the
         // moment the TUI comes up. Updates flow through the same
-        // helper on every `/thinking` change.
+        // helper on every thinking-effort change.
         let startup_thinking = {
             let cfg = run_config.lock().expect("run config mutex poisoned");
             cfg.thinking.clone()
@@ -544,9 +541,9 @@ impl InteractiveMode {
 
         // Install the path/symbol autocomplete provider on the
         // editor. The `@filename` fuzzy file picker and direct
-        // path completion live here; slash commands no longer have
-        // an inline popup (typing `/` at the empty prompt opens
-        // the command palette overlay instead).
+        // path completion live here. Typing `/` at the empty prompt
+        // opens the command palette overlay (see the editor's
+        // palette trigger), not an inline popup.
         let working_directory = {
             let a = world.agent.lock().await;
             a.env().working_directory.clone()
@@ -577,10 +574,10 @@ impl InteractiveMode {
 
         // Shared flag tripped by the editor's `/`-at-empty-prompt
         // callback and by the global `Ctrl+O` chord. The main loop
-        // polls it after `tui.handle_input` and routes a synthetic
-        // `/palette` through the slash dispatcher, so all three
-        // palette-open paths (typed `/palette`, leading `/`,
-        // `Ctrl+O`) converge on the same mounting code.
+        // polls it after `tui.handle_input` and runs
+        // [`CommandAction::OpenCommandPalette`], so all palette-open
+        // paths (leading `/`, `Ctrl+O`) converge on the same mounting
+        // code.
         let palette_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // Set when the user hits `aj.overlay.close_all` (default
         // `ctrl+c`) while any overlay is up. Drained after
@@ -588,14 +585,14 @@ impl InteractiveMode {
         // back-stack — distinct from Esc's one-level pop.
         let close_all_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // Set by the global `aj.history.open` chord (default
-        // `ctrl+r`). Drained after `tui.handle_input` to route a
-        // synthetic `/history` through the slash dispatcher, mirroring
-        // the `palette_open_request` path. Dispatched without a parent
+        // `ctrl+r`). Drained after `tui.handle_input` to run
+        // [`CommandAction::OpenPromptHistory`], mirroring the
+        // `palette_open_request` path. Dispatched without a parent
         // palette so `Esc` closes the overlay back to the editor.
         let history_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // Set by the global `aj.agent.open` chord (default `alt+a`).
-        // Drained after `tui.handle_input` to route a synthetic
-        // `/agents` through the dispatcher (mirroring the history
+        // Drained after `tui.handle_input` to run
+        // [`CommandAction::OpenAgentPicker`] (mirroring the history
         // chord), opening the agent picker.
         let agent_picker_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         {
@@ -691,8 +688,8 @@ impl InteractiveMode {
         let config = Arc::new(std::sync::Mutex::new(config));
 
         // Everything with process lifetime moves into the shell;
-        // session worlds are rebuilt around it on every `/new` /
-        // `/resume`.
+        // session worlds are rebuilt around it on every new-session /
+        // resume.
         let mut shell = Shell {
             tui,
             theme,
@@ -712,7 +709,7 @@ impl InteractiveMode {
 
         // ---- Outer session loop ---------------------------------------
         // Each iteration drives one session world to completion.
-        // `/new` and `/resume` exit the per-session loop; the world
+        // A new-session or resume exits the per-session loop; the world
         // is torn down wholesale and a fresh one is built and
         // installed in its place. Quit and fatal errors break out,
         // carrying the final world (when one is still alive) for the
@@ -800,8 +797,8 @@ impl InteractiveMode {
         // task that doesn't touch these mutexes, and the persistence
         // listener is no-op-and-quick when no events are firing.
         //
-        // When the process spanned several sessions (`/new` /
-        // `/resume`), each torn-down world's usage was snapshotted
+        // When the process spanned several sessions (new-session /
+        // resume), each torn-down world's usage was snapshotted
         // into `completed_sessions`; itemize them in order, each
         // under a dim `Session: <id>` header, then the live world's
         // block. A single-session process prints one bare block.
@@ -850,7 +847,7 @@ impl InteractiveMode {
 
 /// Process-lifetime state: everything that survives a session
 /// switch. Session worlds ([`SessionWorld`]) are rebuilt around the
-/// shell on every `/new` / `/resume`.
+/// shell on every new-session or resume.
 struct Shell {
     /// Terminal, layout, and editor. Never torn down on a session
     /// switch, so the editor draft, prompt-history ring, and raw
@@ -861,13 +858,13 @@ struct Shell {
     /// Shared, mutable view of the on-disk config; selector
     /// outcomes mutate and persist it.
     config: Arc<std::sync::Mutex<Config>>,
-    /// Credential store backing API-key resolution and `/login`.
+    /// Credential store backing API-key resolution and login.
     auth: AuthStorage,
-    /// Model catalog shared by the `/model` selector and the
+    /// Model catalog shared by the model selector and the
     /// editor's argument completer; loaded once at startup.
     model_catalog: Arc<Vec<ModelInfo>>,
     /// Loop-side snapshot of the next turn's run configuration;
-    /// `/model` / `/thinking` choices made mid-process survive
+    /// model / thinking choices made mid-process survive
     /// session switches through it.
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     /// Sessions-directory handle used to build session worlds and
@@ -908,7 +905,7 @@ struct NextWorld {
     notices: Vec<String>,
 }
 
-/// Build the session world a `/new` or `/resume` request asks for.
+/// Build the session world a new-session or resume request asks for.
 ///
 /// If the requested build fails, falls back to resuming
 /// `previous_session_id` — the session that just ended, whose log is
@@ -992,16 +989,16 @@ fn build_next_world(
 
 /// Why [`run_session`]'s per-session loop returned.
 enum SessionExit {
-    /// The user quit (Ctrl+C / Ctrl+D / `/quit`, or the terminal
+    /// The user quit (Ctrl+C / Ctrl+D / the quit command, or the terminal
     /// stream ended); the process shuts down.
     Quit,
-    /// A `/resume` pick: rebuild onto the identified session.
+    /// A resume pick: rebuild onto the identified session.
     Switch(String),
-    /// `/new`: rebuild onto a freshly minted session.
+    /// New session: rebuild onto a freshly minted session.
     New,
 }
 
-/// A session change requested by a slash command or selector. The
+/// A session change requested by a command or selector. The
 /// per-session loop maps it onto a [`SessionExit`] so the outer
 /// loop in [`InteractiveMode::run`] can tear down the current world
 /// and build the next one. Only emitted with no turn in flight.
@@ -1046,7 +1043,7 @@ async fn run_session(
     // still running.
     let mut quit_armed = false;
 
-    // Slash commands like `/thinking` open an overlay selector.
+    // A command like the thinking selector opens an overlay selector.
     // While an overlay is up the editor is not focused, but
     // `shell.tui.show_overlay` already routes input to the overlay,
     // so the main loop's job is just to poll the outcome slot
@@ -1500,14 +1497,14 @@ async fn run_session(
                         // or by the `Ctrl+O` chord intercepted
                         // below. Dispatched here, after routing,
                         // so the editor's `/` swallow has already
-                        // landed and so we can `await` the slash
-                        // dispatcher. Gated on `open_selector` to
+                        // landed and so we can `await` the command
+                        // handler. Gated on `open_selector` to
                         // be inert while another selector is up.
                         if shell.palette_open_request.swap(false, Ordering::Relaxed)
                             && open_selector.is_none()
                             && login_session.is_none()
                         {
-                            match handle_slash_command(
+                            match handle_command(
                                 &mut shell.tui,
                                 &shell.auth,
                                 Arc::clone(&shell.model_catalog),
@@ -1517,11 +1514,11 @@ async fn run_session(
                                 world,
                                 &shell.conversation_persistence,
                                 &shell.theme,
-                                "/palette",
+                                CommandAction::OpenCommandPalette,
                                 None,
                                 !turns.is_empty(),
                             ).await {
-                                SlashHandled::Continue { selector, notice } => {
+                                CommandOutcome::Continue { selector, notice } => {
                                     if let Some(text) = notice {
                                         world.pump.handle(&mut shell.tui, &notice_event(&text));
                                     }
@@ -1529,27 +1526,27 @@ async fn run_session(
                                         open_selector = Some(sel);
                                     }
                                 }
-                                SlashHandled::SessionChange(request) => {
+                                CommandOutcome::SessionChange(request) => {
                                     debug_assert!(turns.is_empty(), "session change requested mid-turn");
                                     break Ok(request.into_exit());
                                 }
-                                SlashHandled::Quit => break Ok(SessionExit::Quit),
+                                CommandOutcome::Quit => break Ok(SessionExit::Quit),
                             }
                             continue;
                         }
 
                         // Global prompt-history open: fired by the
-                        // `Ctrl+R` chord intercepted above. Routes a
-                        // synthetic `/history` through the same
-                        // dispatcher with no parent palette, so the
-                        // overlay's `Esc` closes straight back to
-                        // the editor. Gated on `open_selector` to be
-                        // inert while another selector is up.
+                        // `Ctrl+R` chord intercepted above. Runs
+                        // [`CommandAction::OpenPromptHistory`] with no
+                        // parent palette, so the overlay's `Esc` closes
+                        // straight back to the editor. Gated on
+                        // `open_selector` to be inert while another
+                        // selector is up.
                         if shell.history_open_request.swap(false, Ordering::Relaxed)
                             && open_selector.is_none()
                             && login_session.is_none()
                         {
-                            match handle_slash_command(
+                            match handle_command(
                                 &mut shell.tui,
                                 &shell.auth,
                                 Arc::clone(&shell.model_catalog),
@@ -1559,11 +1556,11 @@ async fn run_session(
                                 world,
                                 &shell.conversation_persistence,
                                 &shell.theme,
-                                "/history",
+                                CommandAction::OpenPromptHistory,
                                 None,
                                 !turns.is_empty(),
                             ).await {
-                                SlashHandled::Continue { selector, notice } => {
+                                CommandOutcome::Continue { selector, notice } => {
                                     if let Some(text) = notice {
                                         world.pump.handle(&mut shell.tui, &notice_event(&text));
                                     }
@@ -1571,27 +1568,27 @@ async fn run_session(
                                         open_selector = Some(sel);
                                     }
                                 }
-                                SlashHandled::SessionChange(request) => {
+                                CommandOutcome::SessionChange(request) => {
                                     debug_assert!(turns.is_empty(), "session change requested mid-turn");
                                     break Ok(request.into_exit());
                                 }
-                                SlashHandled::Quit => break Ok(SessionExit::Quit),
+                                CommandOutcome::Quit => break Ok(SessionExit::Quit),
                             }
                             continue;
                         }
 
                         // Global agent-picker open: fired by the
-                        // `Alt+A` chord intercepted above. Routes a
-                        // synthetic `/agents` through the same
-                        // dispatcher with no parent palette, so the
-                        // overlay's `Esc` closes straight back to
-                        // the editor. Gated on `open_selector` to be
-                        // inert while another selector is up.
+                        // `Alt+A` chord intercepted above. Runs
+                        // [`CommandAction::OpenAgentPicker`] with no
+                        // parent palette, so the overlay's `Esc` closes
+                        // straight back to the editor. Gated on
+                        // `open_selector` to be inert while another
+                        // selector is up.
                         if shell.agent_picker_open_request.swap(false, Ordering::Relaxed)
                             && open_selector.is_none()
                             && login_session.is_none()
                         {
-                            match handle_slash_command(
+                            match handle_command(
                                 &mut shell.tui,
                                 &shell.auth,
                                 Arc::clone(&shell.model_catalog),
@@ -1601,11 +1598,11 @@ async fn run_session(
                                 world,
                                 &shell.conversation_persistence,
                                 &shell.theme,
-                                "/agents",
+                                CommandAction::OpenAgentPicker,
                                 None,
                                 !turns.is_empty(),
                             ).await {
-                                SlashHandled::Continue { selector, notice } => {
+                                CommandOutcome::Continue { selector, notice } => {
                                     if let Some(text) = notice {
                                         world.pump.handle(&mut shell.tui, &notice_event(&text));
                                     }
@@ -1613,11 +1610,11 @@ async fn run_session(
                                         open_selector = Some(sel);
                                     }
                                 }
-                                SlashHandled::SessionChange(request) => {
+                                CommandOutcome::SessionChange(request) => {
                                     debug_assert!(turns.is_empty(), "session change requested mid-turn");
                                     break Ok(request.into_exit());
                                 }
-                                SlashHandled::Quit => break Ok(SessionExit::Quit),
+                                CommandOutcome::Quit => break Ok(SessionExit::Quit),
                             }
                             continue;
                         }
@@ -1661,7 +1658,7 @@ async fn run_session(
                                         );
                                         break Ok(request.into_exit());
                                     }
-                                    // A confirmed `/login` provider
+                                    // A confirmed login provider
                                     // pick asks the host to launch
                                     // the async browser flow: mount
                                     // the dialog overlay and spawn
@@ -1688,14 +1685,14 @@ async fn run_session(
                                             ),
                                         }
                                     }
-                                    // The command palette chains into a
-                                    // real slash command by emitting a
+                                    // The command palette chains into
+                                    // the selected command by emitting a
                                     // `follow_up`. Re-feed it through
-                                    // `handle_slash_command` so the
-                                    // dispatch path is identical to a
-                                    // user-typed `/...` line.
+                                    // `handle_command` so the dispatch
+                                    // path is identical to triggering the
+                                    // command by its keyboard shortcut.
                                     if let Some(follow_up) = follow_up {
-                                        match handle_slash_command(
+                                        match handle_command(
                                             &mut shell.tui,
                                             &shell.auth,
                                             Arc::clone(&shell.model_catalog),
@@ -1705,13 +1702,13 @@ async fn run_session(
                                             world,
                                             &shell.conversation_persistence,
                                             &shell.theme,
-                                            &follow_up.input,
+                                            follow_up.action,
                                             Some(follow_up.parent_palette),
                                             !turns.is_empty(),
                                         )
                                         .await
                                         {
-                                            SlashHandled::Continue { selector, notice } => {
+                                            CommandOutcome::Continue { selector, notice } => {
                                                 if let Some(text) = notice {
                                                     world.pump.handle(&mut shell.tui, &notice_event(&text));
                                                 }
@@ -1719,11 +1716,11 @@ async fn run_session(
                                                     open_selector = Some(sel);
                                                 }
                                             }
-                                            SlashHandled::SessionChange(request) => {
+                                            CommandOutcome::SessionChange(request) => {
                                                 debug_assert!(turns.is_empty(), "session change requested mid-turn");
                                                 break Ok(request.into_exit());
                                             }
-                                            SlashHandled::Quit => break Ok(SessionExit::Quit),
+                                            CommandOutcome::Quit => break Ok(SessionExit::Quit),
                                         }
                                     }
                                 }
@@ -1739,54 +1736,6 @@ async fn run_session(
                         if let Some(text) = take_submitted_prompt(&mut shell.tui) {
                             let trimmed = text.trim().to_string();
                             if trimmed.is_empty() {
-                                continue;
-                            }
-
-                            // Slash-command branch: a submitted
-                            // `/...` line is dispatched as a command
-                            // (not queued as a prompt). `disable_submit`
-                            // gates editor submits while a turn runs,
-                            // so this path only fires between turns;
-                            // mid-turn settings changes go through the
-                            // palette/selectors, which never block on
-                            // the agent. `handle_slash_command` still
-                            // gets the live in-flight-turn state so it
-                            // can refuse session-changing commands if
-                            // one ever reaches here mid-turn.
-                            if trimmed.starts_with('/') {
-                                if let Some(editor) = shell.tui.get_mut_as::<Editor>(
-                                    SlotIndex::Editor.idx()
-                                ) {
-                                    editor.set_text("");
-                                }
-                                match handle_slash_command(
-                                    &mut shell.tui,
-                                    &shell.auth,
-                                    Arc::clone(&shell.model_catalog),
-                                    Arc::clone(&shell.run_config),
-                                    &shell.config,
-                                    &shell.render_settings,
-                                    world,
-                                    &shell.conversation_persistence,
-                                    &shell.theme,
-                                    &trimmed,
-                                    None,
-                                    !turns.is_empty(),
-                                ).await {
-                                    SlashHandled::Continue { selector, notice } => {
-                                        if let Some(text) = notice {
-                                            world.pump.handle(&mut shell.tui, &notice_event(&text));
-                                        }
-                                        if let Some(sel) = selector {
-                                            open_selector = Some(sel);
-                                        }
-                                    }
-                                    SlashHandled::SessionChange(request) => {
-                                        debug_assert!(turns.is_empty(), "session change requested mid-turn");
-                                        break Ok(request.into_exit());
-                                    }
-                                    SlashHandled::Quit => break Ok(SessionExit::Quit),
-                                }
                                 continue;
                             }
 
@@ -2111,7 +2060,7 @@ enum OpenSelector {
         /// palette's handle + outcome slot. On cancel we un-hide
         /// it and restore host-side polling so the palette stays
         /// usable; on confirm we tear it down. `None` when the
-        /// selector was reached directly via `/thinking`.
+        /// selector was reached directly (not via the palette).
         parent_palette: Option<ParentPalette>,
     },
     Model {
@@ -2146,7 +2095,7 @@ enum OpenSelector {
         handle: OverlayHandle,
         outcome: CommandPaletteOutcomeHandle,
     },
-    /// Read-only `/help` overlay. Both Esc and Enter close it; if
+    /// Read-only help overlay. Both Esc and Enter close it; if
     /// opened via the palette, the parent palette is restored on
     /// close so the back-stack stays coherent.
     Help {
@@ -2154,7 +2103,7 @@ enum OpenSelector {
         outcome: crate::modes::interactive::components::help_overlay::HelpOverlayOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
-    /// Provider picker for `/login` / `/logout`. `mode` decides what
+    /// Provider picker for login / logout. `mode` decides what
     /// confirming a provider does: start the OAuth browser flow, or
     /// remove the stored credential.
     AuthPicker {
@@ -2163,13 +2112,13 @@ enum OpenSelector {
         parent_palette: Option<ParentPalette>,
         mode: AuthPickerMode,
     },
-    /// Read-only `/auth` status overlay. Both Esc and Enter close it.
+    /// Read-only auth-status overlay. Both Esc and Enter close it.
     AuthStatus {
         handle: OverlayHandle,
         outcome: AuthStatusOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
-    /// Read-only `/usage` overlay. Both Esc and Enter close it. The
+    /// Read-only usage overlay. Both Esc and Enter close it. The
     /// usage reports stream in from a background fetch after the
     /// overlay opens; closing early just drops the fetch's receiver.
     UsageStatus {
@@ -2177,7 +2126,7 @@ enum OpenSelector {
         outcome: UsageStatusOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
-    /// Settings window (`/settings`). Stays open across changes: the
+    /// Settings window. Stays open across changes: the
     /// host drains `changes` after every input event, applying and
     /// persisting each entry (and pushing a display fix through
     /// `corrections` when an apply fails); `outcome` only ever
@@ -2189,7 +2138,7 @@ enum OpenSelector {
         corrections: SettingsCorrectionsHandle,
         parent_palette: Option<ParentPalette>,
     },
-    /// Skills window (`/skills`). Stays open across changes: the host
+    /// Skills window. Stays open across changes: the host
     /// drains `changes` after every input event, persisting each
     /// enable/disable toggle into the `disabled_skills` config option;
     /// `outcome` only ever reports the close.
@@ -2236,14 +2185,14 @@ struct ParentPalette {
 }
 
 /// Result of dispatching a `/...`-prefixed editor submission.
-enum SlashHandled {
+enum CommandOutcome {
     /// Stay in the session loop. Optionally present a transient
     /// notice to the chat scrollback and/or open a selector overlay.
     Continue {
         selector: Option<OpenSelector>,
         notice: Option<String>,
     },
-    /// A session change (`/new`) for the outer session loop to
+    /// A new-session change for the outer session loop to
     /// perform; the per-session loop exits with the matching
     /// [`SessionExit`]. Only emitted when no turn is in flight.
     SessionChange(SessionRequest),
@@ -2258,20 +2207,19 @@ enum SelectorPollOutcome {
     /// The selector closed (confirmed or cancelled). The optional
     /// notice describes what happened so the host can render a
     /// status line in the chat scrollback. `follow_up`, when set,
-    /// is a slash-prefixed string the main loop should re-feed
-    /// through [`handle_slash_command`] — the command palette
-    /// uses this to chain into a sub-selector (e.g. the user
-    /// picked `/model` from the palette, so the main loop now
-    /// dispatches `/model` for real). The follow-up path keeps
-    /// the recursion at the main-loop level rather than calling
-    /// `handle_slash_command` from inside
+    /// is the command the main loop should run via [`handle_command`]
+    /// — the command palette uses this to chain into a sub-selector
+    /// (e.g. the user picked the model command from the palette, so
+    /// the main loop now opens the model selector for real). The
+    /// follow-up path keeps the recursion at the main-loop level
+    /// rather than calling `handle_command` from inside
     /// [`handle_selector_outcome`] — which would require threading
-    /// the model catalog and other slash-only dependencies
+    /// the model catalog and other command-only dependencies
     /// through the outcome handler.
     Closed {
         notice: Option<String>,
         follow_up: Option<PaletteFollowUp>,
-        /// When set, a `/login` provider pick the host should turn
+        /// When set, a login provider pick the host should turn
         /// into a launched OAuth flow (the picker can't spawn the
         /// task itself — that's the main loop's job, where the login
         /// session state and the task `select!` arm live).
@@ -2283,21 +2231,21 @@ enum SelectorPollOutcome {
     },
 }
 
-/// Deferred chain from the command palette to a real slash
-/// command. Carries the palette's (hidden) overlay handle + outcome
+/// Deferred chain from the command palette to the command it
+/// selected. Carries the palette's (hidden) overlay handle + outcome
 /// slot so the main loop can stash both on the sub-selector for the
 /// back-stack (and so the palette stays pollable after a cancel
 /// returns to it), or tear it down if the follow-up doesn't open a
 /// sub-selector.
 struct PaletteFollowUp {
-    input: String,
+    action: CommandAction,
     parent_palette: ParentPalette,
 }
 
 /// Wrap a notice string in the [`AgentEvent::Notice`] shape so we
 /// can route it through the existing event pump for rendering. The
 /// pump's `Notice` arm appends a dim text row to the chat slot,
-/// which is exactly the look we want for slash-command status
+/// which is exactly the look we want for command status
 /// feedback.
 fn notice_event(text: &str) -> AgentEvent {
     AgentEvent::Notice {
@@ -2569,7 +2517,7 @@ const PALETTE_OVERLAY_INNER_ROWS: usize = 17;
 /// (model / thinking / help). Centered, fills ~75% of the terminal
 /// width with a 72-col floor and a 100-col ceiling so the box doesn't
 /// stretch uncomfortably wide on large monitors. The ceiling is sized
-/// for the widest read-only page (`/usage`: provider prefix + window
+/// for the widest read-only page (usage: provider prefix + window
 /// label + a "resets ... (Europe/Berlin)" description) to fit without
 /// truncation. Height is fixed at `PALETTE_OVERLAY_INNER_ROWS + 4` to
 /// match the stable height the
@@ -2951,9 +2899,10 @@ async fn start_login_session(
     ))
 }
 
-/// Dispatch a freshly-submitted slash-prefixed line.
+/// Apply a [`CommandAction`] chosen from the palette, a keyboard
+/// shortcut, or a palette follow-up.
 #[allow(clippy::too_many_arguments)]
-async fn handle_slash_command(
+async fn handle_command(
     tui: &mut Tui,
     auth: &AuthStorage,
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
@@ -2963,12 +2912,12 @@ async fn handle_slash_command(
     world: &SessionWorld,
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
-    text: &str,
+    action: CommandAction,
     parent_palette: Option<ParentPalette>,
     turn_running: bool,
-) -> SlashHandled {
-    let result = match slash_dispatch(text) {
-        SlashAction::OpenCommandPalette => {
+) -> CommandOutcome {
+    let result = match action {
+        CommandAction::OpenCommandPalette => {
             debug_assert!(
                 parent_palette.is_none(),
                 "command palette has no parent palette"
@@ -2984,12 +2933,12 @@ async fn handle_slash_command(
             )
             .with_subtitle(&subtitle_confirm_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::Palette { handle, outcome }),
                 notice: None,
             }
         }
-        SlashAction::OpenThinkingSelector => {
+        CommandAction::OpenThinkingSelector => {
             // The selector targets the agent the user is viewing;
             // pre-select its tracked thinking level, falling back to
             // the run config for ids with no footer entry (which
@@ -3016,7 +2965,7 @@ async fn handle_slash_command(
             )
             .with_subtitle(&subtitle_confirm_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::Thinking {
                     handle,
                     outcome,
@@ -3026,7 +2975,7 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::OpenModelSelector => {
+        CommandAction::OpenModelSelector => {
             // The selector targets the agent the user is viewing;
             // pre-select its tracked (provider, id) pair, falling
             // back to the run config for ids with no footer entry.
@@ -3062,7 +3011,7 @@ async fn handle_slash_command(
             )
             .with_subtitle(&subtitle_confirm_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::Model {
                     handle,
                     outcome,
@@ -3072,10 +3021,10 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::OpenLoginSelector => {
+        CommandAction::OpenLoginSelector => {
             let providers = auth.oauth_provider_ids().await;
             if providers.is_empty() {
-                SlashHandled::Continue {
+                CommandOutcome::Continue {
                     selector: None,
                     notice: Some("No OAuth providers are available to log in to.".to_string()),
                 }
@@ -3099,7 +3048,7 @@ async fn handle_slash_command(
                 )
                 .with_subtitle(&subtitle_confirm_close());
                 let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-                SlashHandled::Continue {
+                CommandOutcome::Continue {
                     selector: Some(OpenSelector::AuthPicker {
                         handle,
                         outcome,
@@ -3110,10 +3059,10 @@ async fn handle_slash_command(
                 }
             }
         }
-        SlashAction::OpenLogoutSelector => {
+        CommandAction::OpenLogoutSelector => {
             let mut stored = auth.list().await.unwrap_or_default();
             if stored.is_empty() {
-                SlashHandled::Continue {
+                CommandOutcome::Continue {
                     selector: None,
                     notice: Some(
                         "No stored credentials to remove. (Env vars and --api-key aren't \
@@ -3147,7 +3096,7 @@ async fn handle_slash_command(
                 )
                 .with_subtitle(&subtitle_confirm_close());
                 let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-                SlashHandled::Continue {
+                CommandOutcome::Continue {
                     selector: Some(OpenSelector::AuthPicker {
                         handle,
                         outcome,
@@ -3158,7 +3107,7 @@ async fn handle_slash_command(
                 }
             }
         }
-        SlashAction::OpenAuthStatus => {
+        CommandAction::OpenAuthStatus => {
             let statuses = crate::auth::collect_statuses(auth).await;
             let inner = AuthStatusComponent::new(select_list_theme(theme), statuses);
             let outcome = inner.outcome_handle();
@@ -3170,7 +3119,7 @@ async fn handle_slash_command(
             )
             .with_subtitle(&subtitle_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::AuthStatus {
                     handle,
                     outcome,
@@ -3179,7 +3128,7 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::OpenUsageStatus => {
+        CommandAction::OpenUsageStatus => {
             // The fetch hits the network, so it runs detached: the
             // overlay opens immediately in its loading state and the
             // task pokes the render loop when the reports land. If
@@ -3205,7 +3154,7 @@ async fn handle_slash_command(
             )
             .with_subtitle(&subtitle_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::UsageStatus {
                     handle,
                     outcome,
@@ -3218,11 +3167,11 @@ async fn handle_slash_command(
         // rebuild it, which must never abort in-flight work, so
         // refuse them mid-turn. The user can cancel the turn and
         // retry.
-        SlashAction::OpenSessionSelector if turn_running => SlashHandled::Continue {
+        CommandAction::OpenSessionSelector if turn_running => CommandOutcome::Continue {
             selector: None,
             notice: Some(session_busy_notice("switch sessions")),
         },
-        SlashAction::OpenSessionSelector => {
+        CommandAction::OpenSessionSelector => {
             // The current session id lets the overlay pre-select the
             // active row once it streams in.
             let current_session_id = world.session_id.clone();
@@ -3258,7 +3207,7 @@ async fn handle_slash_command(
             .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
             .with_subtitle(&subtitle_confirm_close());
             let handle = tui.show_overlay(Box::new(window), large_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::Session {
                     handle,
                     outcome,
@@ -3267,7 +3216,7 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::OpenPromptHistory => {
+        CommandAction::OpenPromptHistory => {
             // Both scans run on a blocking thread so the overlay opens
             // immediately and fills in incrementally. The
             // current-workspace scan starts on construction; the
@@ -3310,7 +3259,7 @@ async fn handle_slash_command(
             .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
             .with_dynamic_subtitle(subtitle_prompt_history);
             let handle = tui.show_overlay(Box::new(window), large_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::PromptHistory {
                     handle,
                     outcome,
@@ -3319,7 +3268,7 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::OpenAgentPicker => {
+        CommandAction::OpenAgentPicker => {
             // Snapshot the known agents and the active view from the
             // pump (reads through the `ChatView`); never touches the
             // agent, so it's safe mid-turn. Tasks come from the
@@ -3337,7 +3286,7 @@ async fn handle_slash_command(
             )
             .with_dynamic_subtitle(subtitle_agent_picker);
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::AgentPicker {
                     handle,
                     outcome,
@@ -3346,12 +3295,12 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::NewSession if turn_running => SlashHandled::Continue {
+        CommandAction::NewSession if turn_running => CommandOutcome::Continue {
             selector: None,
             notice: Some(session_busy_notice("start a new session")),
         },
-        SlashAction::NewSession => SlashHandled::SessionChange(SessionRequest::New),
-        SlashAction::OpenSettings => {
+        CommandAction::NewSession => CommandOutcome::SessionChange(SessionRequest::New),
+        CommandAction::OpenSettings => {
             // Snapshot the live values the window opens with. Model /
             // thinking / speed come from the run config (the loop-side
             // truth for the next turn); the render toggles from the
@@ -3413,7 +3362,7 @@ async fn handle_slash_command(
             .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
             .with_dynamic_subtitle(subtitle_settings_window);
             let handle = tui.show_overlay(Box::new(window), large_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::Settings {
                     handle,
                     outcome,
@@ -3424,7 +3373,7 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::OpenSkills => {
+        CommandAction::OpenSkills => {
             // Rediscover skills at open time so the window reflects the
             // on-disk state (and the current `disabled_skills` value)
             // rather than the session-frozen env snapshot. Discovery is
@@ -3434,7 +3383,7 @@ async fn handle_slash_command(
                 aj_conf::skills::discover_skills(&cfg.disabled_skills)
             };
             if skills.is_empty() {
-                SlashHandled::Continue {
+                CommandOutcome::Continue {
                     selector: None,
                     notice: Some(
                         "No skills found. Put skills in ~/.agents/skills/ or \
@@ -3467,7 +3416,7 @@ async fn handle_slash_command(
                 .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
                 .with_subtitle(subtitle_change_close("toggle"));
                 let handle = tui.show_overlay(Box::new(window), large_overlay_options());
-                SlashHandled::Continue {
+                CommandOutcome::Continue {
                     selector: Some(OpenSelector::Skills {
                         handle,
                         outcome,
@@ -3478,7 +3427,7 @@ async fn handle_slash_command(
                 }
             }
         }
-        SlashAction::Help => {
+        CommandAction::Help => {
             use crate::modes::interactive::components::help_overlay::HelpOverlayComponent;
             let inner = HelpOverlayComponent::new(select_list_theme(theme));
             let outcome = inner.outcome_handle();
@@ -3490,7 +3439,7 @@ async fn handle_slash_command(
             )
             .with_subtitle(&subtitle_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(OpenSelector::Help {
                     handle,
                     outcome,
@@ -3499,30 +3448,24 @@ async fn handle_slash_command(
                 notice: None,
             }
         }
-        SlashAction::NotYetImplemented { message, .. } => SlashHandled::Continue {
+        CommandAction::NotYetImplemented { message, .. } => CommandOutcome::Continue {
             selector: None,
             notice: Some(message.to_string()),
         },
-        SlashAction::Quit => SlashHandled::Quit,
-        SlashAction::Unknown { input } => SlashHandled::Continue {
-            selector: None,
-            notice: Some(format!(
-                "Unknown command: {input}. Try /help for available commands."
-            )),
-        },
+        CommandAction::Quit => CommandOutcome::Quit,
     };
 
     // If we were dispatched as a palette follow-up, the palette
     // is hidden on the overlay stack. The arms that mount a
     // sub-selector consume `parent_palette` (passing it onto the
     // new `OpenSelector`), in which case the resulting
-    // `SlashHandled::Continue` carries one of those variants.
+    // `CommandOutcome::Continue` carries one of those variants.
     // For every other arm — `NewSession`, `Quit`, errors, etc. —
     // the palette would otherwise leak, so tear it down here.
     if let Some(palette) = parent_palette {
         let consumed = matches!(
             &result,
-            SlashHandled::Continue {
+            CommandOutcome::Continue {
                 selector: Some(
                     OpenSelector::Thinking { .. }
                         | OpenSelector::Model { .. }
@@ -3546,7 +3489,7 @@ async fn handle_slash_command(
     result
 }
 
-/// Apply a confirmed `/thinking` pick to the main agent: stage into
+/// Apply a confirmed thinking pick to the main agent: stage into
 /// the run config, persist to `config.toml`, record on the session
 /// log's user thread, and refresh footer + border. Returns the
 /// user-facing notice.
@@ -3608,7 +3551,7 @@ async fn confirm_thinking_for_main(
     notice
 }
 
-/// Apply a confirmed `/thinking` pick to sub-agent `n`: validate
+/// Apply a confirmed thinking pick to sub-agent `n`: validate
 /// against the target's model, stage into the world's override map
 /// (applied at the sub's next turn start), record on the sub's log
 /// thread, and refresh its footer entry. Deliberately does not touch
@@ -3696,7 +3639,7 @@ async fn confirm_thinking_for_sub(
     notice
 }
 
-/// Apply a confirmed `/model` pick to the main agent: rebuild the
+/// Apply a confirmed model pick to the main agent: rebuild the
 /// bundle, stage into the run config, persist to `config.toml`,
 /// record on the session log's user thread, and refresh the footer.
 /// Returns the user-facing notice.
@@ -3710,7 +3653,7 @@ async fn confirm_model_for_main(
 ) -> String {
     // Construct a fresh provider handle from the picked catalog
     // entry, carrying the active speed over so e.g. `--speed fast`
-    // survives a `/model` pick (degrading silently on providers
+    // survives a model pick (degrading silently on providers
     // that ignore it).
     let speed = {
         let cfg = run_config.lock().expect("run config mutex poisoned");
@@ -3787,7 +3730,7 @@ async fn confirm_model_for_main(
     }
 }
 
-/// Apply a confirmed `/model` pick to sub-agent `n`: rebuild the
+/// Apply a confirmed model pick to sub-agent `n`: rebuild the
 /// bundle at the target's effective speed, stage it into the world's
 /// override map (applied at the sub's next turn start), record on
 /// the sub's log thread, and refresh its footer entry. Deliberately
@@ -3883,7 +3826,7 @@ async fn confirm_model_for_sub(
 /// persist it. Returns the user-facing notice.
 ///
 /// Live-appliable settings reuse the same confirm paths as their
-/// dedicated selectors (`/model`, `/thinking`) or stage into the run
+/// dedicated selectors (model, thinking) or stage into the run
 /// config / render settings; the agent- and tool-construction
 /// settings are persisted with a "takes effect for new sessions /
 /// on restart" note. When an apply fails the row's displayed value
@@ -4836,12 +4779,12 @@ async fn handle_selector_outcome(
                         session_request: None,
                     }
                 }
-                Some(CommandPaletteOutcome::Confirmed { input }) => {
+                Some(CommandPaletteOutcome::Confirmed { action }) => {
                     // Hide (don't remove) the palette so we can
                     // restore it if the follow-up command opens a
                     // sub-selector and the user cancels back. If
                     // the follow-up doesn't open a sub-selector,
-                    // `handle_slash_command` tears the palette
+                    // `handle_command` tears the palette
                     // down once it finishes dispatching. The
                     // outcome handle is cloned into the follow-up
                     // so the host can re-install
@@ -4851,7 +4794,7 @@ async fn handle_selector_outcome(
                     SelectorPollOutcome::Closed {
                         notice: None,
                         follow_up: Some(PaletteFollowUp {
-                            input,
+                            action,
                             parent_palette: ParentPalette {
                                 handle,
                                 outcome: outcome.clone(),
@@ -5558,7 +5501,7 @@ mod tests {
         log.linearize(&head, filter).settings()
     }
 
-    /// Confirming `/thinking` while targeting a live sub-agent
+    /// Confirming a thinking pick while targeting a live sub-agent
     /// stages an override, records the change on the sub's log
     /// thread, refreshes the sub's footer entry, and leaves the run
     /// config alone.
@@ -5644,7 +5587,7 @@ mod tests {
         assert_eq!(cfg.thinking, None, "run config untouched");
     }
 
-    /// Confirming `/model` while targeting a live sub-agent stages a
+    /// Confirming a model pick while targeting a live sub-agent stages a
     /// bundle override keyed to the picked model, records the change
     /// on the sub's log thread, and refreshes the sub's footer entry
     /// (preserving its thinking string) without touching the run

@@ -143,7 +143,7 @@ const SCRIPT_MODEL: &str = "scripted";
 
 /// Build a [`ModelInfo`] mirroring what [`ScriptedProvider`] stamps
 /// onto every emitted [`AssistantMessage`] partial. The agent reads
-/// identity off this struct for the TUI footer and the `/model`
+/// identity off this struct for the TUI footer and the model
 /// selector; values are only checked for "matches what the provider
 /// claims", so any consistent triple works.
 fn scripted_model_info() -> ModelInfo {

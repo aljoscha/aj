@@ -19,7 +19,7 @@ use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, 
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 
-use crate::config::slash_commands::BUILTIN_COMMANDS;
+use crate::config::commands::COMMANDS;
 
 /// Outcome of a single help-overlay session.
 ///
@@ -53,7 +53,7 @@ impl HelpOverlayOutcomeHandle {
 }
 
 /// Help overlay component: a read-only [`SelectList`] of
-/// [`BUILTIN_COMMANDS`].
+/// [`COMMANDS`].
 pub struct HelpOverlayComponent {
     list: SelectList,
     outcome: HelpOverlayOutcomeHandle,
@@ -61,19 +61,14 @@ pub struct HelpOverlayComponent {
 }
 
 impl HelpOverlayComponent {
-    /// Build the help view seeded from [`BUILTIN_COMMANDS`].
+    /// Build the help view seeded from [`COMMANDS`].
     pub fn new(list_theme: SelectListTheme) -> Self {
         let layout = SelectListLayout {
             // Read-only: no selection to highlight.
             show_selection_indicator: false,
             ..Default::default()
         };
-        let list = SelectList::new(
-            build_items(),
-            BUILTIN_COMMANDS.len().max(1),
-            list_theme,
-            layout,
-        );
+        let list = SelectList::new(build_items(), COMMANDS.len().max(1), list_theme, layout);
         Self {
             list,
             outcome: HelpOverlayOutcomeHandle::new(),
@@ -91,7 +86,7 @@ impl HelpOverlayComponent {
 /// label, and `description` (with the bound shortcut folded in) in
 /// the right column.
 fn build_items() -> Vec<SelectItem> {
-    BUILTIN_COMMANDS
+    COMMANDS
         .iter()
         .map(|cmd| {
             let description = match cmd
@@ -165,7 +160,7 @@ mod tests {
         let mut h = HelpOverlayComponent::new(identity_theme());
         // Render wide so descriptions aren't column-truncated.
         let body = h.render(200).join("\n");
-        for cmd in BUILTIN_COMMANDS {
+        for cmd in COMMANDS {
             assert!(
                 body.contains(cmd.title),
                 "missing title {}: {body}",

@@ -136,8 +136,8 @@ impl Default for SuggestOpts {
 ///   runs whatever work it needs (synchronously in the `async` sense
 ///   — a single future to completion), returns a finalized
 ///   [`AutocompleteSuggestions`], and is done. This is right for
-///   closed, in-memory candidate sets: slash commands, direct path
-///   completion on a single `readdir`, etc.
+///   closed, in-memory candidate sets: direct path completion on a
+///   single `readdir`, a fixed keyword list, etc.
 ///
 /// - [`Self::try_start_session`] is the **streaming** path. The
 ///   provider returns an [`AutocompleteSession`] object whose
@@ -226,7 +226,7 @@ pub trait AutocompleteProvider: Send + Sync {
     /// (Tab). Defaults to `true`; providers that wrap or extend the
     /// default behavior can override it to suppress the popup in
     /// contexts where they own the keystroke (a stacked
-    /// `#`-symbol provider, a slash-command-only screen, etc.).
+    /// `#`-symbol provider, a screen with its own completion, etc.).
     fn should_trigger_file_completion(
         &self,
         lines: &[String],
@@ -323,9 +323,8 @@ pub struct CombinedAutocompleteProvider {
 }
 
 /// Cheap-to-clone filesystem config used by the async worker threads.
-/// Split out of [`CombinedAutocompleteProvider`] because the provider
-/// itself holds `Box<dyn Fn>` slash-command argument completers that
-/// aren't `Clone`.
+/// Split out of [`CombinedAutocompleteProvider`] so a worker can hold
+/// just the filesystem settings it needs, cloned cheaply per request.
 #[derive(Clone)]
 struct FsConfig {
     base_path: PathBuf,
@@ -746,10 +745,10 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
         cursor_col: usize,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> Option<Box<dyn AutocompleteSession>> {
-        // Streaming only covers the `@`-fuzzy-file context. Slash
-        // commands and direct path completion stay on the one-shot
-        // `get_suggestions` path — their candidate sets are small
-        // and already fast, so the streaming machinery would just
+        // Streaming only covers the `@`-fuzzy-file context. A leading
+        // `/` (absolute path) and direct path completion stay on the
+        // one-shot `get_suggestions` path — their candidate sets are
+        // small and already fast, so the streaming machinery would just
         // add bookkeeping for no win.
         let current = lines.get(cursor_line).map(String::as_str).unwrap_or("");
         let before = safe_slice(current, 0, cursor_col);
@@ -1409,8 +1408,8 @@ impl AutocompleteSession for FuzzyFileSession {
         // Re-extract the at-prefix from the current cursor position.
         // If we're no longer in an `@`-context or the quoted/raw
         // shape flipped, the session can't serve the new state — hand
-        // control back to the editor so it can restart us. Slash
-        // characters inside the prefix no longer invalidate: the
+        // control back to the editor so it can restart us. Path
+        // separators (`/`) inside the prefix no longer invalidate: the
         // walker is rooted at the project base once for the session's
         // lifetime, and nucleo absorbs the updated pattern in place.
         let current = lines.get(cursor_line).map(String::as_str).unwrap_or("");

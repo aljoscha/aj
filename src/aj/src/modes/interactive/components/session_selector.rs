@@ -136,7 +136,7 @@ impl SessionSelectorComponent {
     /// `current_session_id` is the agent's active session — used to
     /// pre-select the matching row and mark it `(current)`.
     /// `initial_query`, when set, pre-fills the search box so the
-    /// overlay opens already filtered; the slash layer passes `None`,
+    /// overlay opens already filtered; the host passes `None`,
     /// but the parameter is kept as a general capability. `theme` styles
     /// the underlying [`SelectList`]. `max_visible_rows` caps how many
     /// result rows the list shows at once. `scan` drives the streaming

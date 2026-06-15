@@ -41,16 +41,10 @@ $ aj continue <thread-id>       # resume a specific thread
 $ aj update-models              # refresh ~/.aj/models.json from models.dev
 ```
 
-Inside the TUI, slash commands open inline selectors:
-
-| Command | Effect |
-|---|---|
-| `/model` | Pick the active model (fuzzy filter; persists as default). |
-| `/thinking [level]` | Set the reasoning budget (off / low / medium / high / xhigh / max). |
-| `/session` | Resume a different thread for this project. |
-| `/clear` | Start a fresh thread (the current one stays on disk). |
-| `/help` | Show the slash-command reference. |
-| `/quit` | Exit. |
+Inside the TUI, press `/` (or `Ctrl+O`) to open the command palette: a
+fuzzy-searchable list of everything you can do — switch model, set the
+reasoning effort, resume a session, log in, and so on. Pick an entry to
+run it.
 
 ## Configuration
 
@@ -59,7 +53,7 @@ Persistent state lives under `~/.aj/`:
 - `.env` — secrets (API keys), loaded before any project-local `.env`.
 - `config.toml` — defaults (model, thinking level, speed, theme, disabled
   tools). CLI flags and env vars override.
-- `models.json` — model catalog consumed by the `/model` selector.
+- `models.json` — model catalog consumed by the model selector.
   Refreshed by `aj update-models`.
 - `themes/<name>.json` — optional user-supplied themes layered on top of
   the bundled `dark` / `light` palettes. The active theme hot-reloads on
@@ -93,7 +87,7 @@ aj-models  ←  aj-agent  ←  aj-tools
   `edit_file_multi`, `agent`, `todo_read`, `todo_write`).
 - `aj-tui` — in-process text-UI framework (layout, components, theming).
 - `aj-conf` — `~/.aj/config.toml` loader and path helpers.
-- `aj` — the binary: CLI parsing, print mode, interactive TUI, slash
-  commands, selectors.
+- `aj` — the binary: CLI parsing, print mode, interactive TUI, command
+  palette, selectors.
 - `anthropic-sdk` / `openai-sdk` — thin async clients used by
   `aj-models`'s provider adapters.

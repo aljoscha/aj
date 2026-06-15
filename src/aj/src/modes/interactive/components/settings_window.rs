@@ -37,7 +37,7 @@ use aj_tui::components::text_input::TextInput;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 
-use crate::config::slash_commands::THINKING_LEVELS;
+use crate::config::commands::THINKING_LEVELS;
 use crate::modes::interactive::components::model_selector::{
     ModelIdentity, ModelIdentityRef, ModelSelectorComponent, ModelSelectorOutcome,
 };

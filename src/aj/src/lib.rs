@@ -9,7 +9,7 @@
 //! Structure mirrors the plan's §4 layout:
 //!
 //! - [`cli`] — argument parsing and `@file` expansion.
-//! - [`config`] — keybindings, theme, slash-command registry.
+//! - [`config`] — keybindings, theme, command catalog.
 //! - [`modes`] — `print` (text/JSONL) and `interactive` (TUI).
 //! - [`persistence`] — thin wrapper that builds the
 //!   `aj-session` persistence listener for either mode.

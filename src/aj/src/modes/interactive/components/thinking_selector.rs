@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use aj_models::ThinkingConfig;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
 
-use crate::config::slash_commands::{THINKING_LEVELS, parse_thinking_level, thinking_level_name};
+use crate::config::commands::{THINKING_LEVELS, parse_thinking_level, thinking_level_name};
 
 /// Outcome of a single overlay session.
 ///

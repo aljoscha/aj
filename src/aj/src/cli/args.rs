@@ -70,7 +70,7 @@ pub struct Args {
     /// registry-driven provider construction entirely and registers a
     /// [`ScriptedProvider`](aj_models::scripted::ScriptedProvider)
     /// in its place; every other code path (TUI, persistence, tools,
-    /// slash commands) runs unchanged so the eyeball test exercises
+    /// commands) runs unchanged so the eyeball test exercises
     /// the real surface.
     #[arg(long)]
     pub scripted: Option<String>,

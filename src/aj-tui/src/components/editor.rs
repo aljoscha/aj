@@ -205,8 +205,8 @@ fn marker_ending_at(
 // Character-class helpers used by word segmentation
 // ---------------------------------------------------------------------------
 
-/// Set of characters that, when typed *inside* an existing slash or
-/// `@` context, keep the autocomplete popup open. Matches the regex
+/// Set of characters that, when typed *inside* an existing `@` / `#`
+/// symbol context, keep the autocomplete popup open. Matches the regex
 /// `[A-Za-z0-9.\-_]` used by the trigger-gating logic.
 fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
@@ -396,8 +396,8 @@ struct VisualLine {
 pub struct EditorTheme {
     /// Style for the top/bottom border lines.
     pub border_color: Arc<dyn Fn(&str) -> String>,
-    /// Theme for embedded select lists (e.g. slash-command and attachment
-    /// autocomplete popups).
+    /// Theme for the embedded autocomplete popup's select list (the
+    /// `@`/`#` file/symbol picker).
     pub select_list: SelectListTheme,
 }
 
@@ -484,7 +484,7 @@ pub struct Editor {
     // Mutually exclusive with the one-shot pipeline below: the
     // editor prefers the session when one exists, and falls back to
     // `dispatch_autocomplete_request` only when `try_start_session`
-    // returned `None` for the current context (e.g. slash commands,
+    // returned `None` for the current context (e.g. an empty prompt,
     // direct path completion).
     autocomplete_session: Option<Box<dyn AutocompleteSession>>,
 
@@ -562,8 +562,7 @@ pub struct Editor {
     /// Fired when the user types `/` at an empty start-of-message
     /// position. When set, the `/` keystroke is swallowed (not
     /// inserted) and the callback runs. The host wires this to open
-    /// the command palette overlay. When unset, `/` inserts normally
-    /// and the legacy inline slash-command popup may trigger.
+    /// the command palette overlay. When unset, `/` inserts normally.
     on_palette_trigger: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -2307,8 +2306,8 @@ impl Editor {
     /// Return the debounce interval appropriate for the given request
     /// context. `@`- and `#`-symbol triggers get a small coalescing
     /// window so rapid keystrokes don't fan out into one provider call
-    /// per character; everything else (Tab/force, slash commands,
-    /// programmatic refreshes) is immediate.
+    /// per character; everything else (Tab/force, programmatic
+    /// refreshes) is immediate.
     ///
     /// Delegates to [`ends_in_symbol_context`] for the symbol
     /// detection so the trigger / re-trigger / debounce predicates all
@@ -2491,9 +2490,8 @@ impl Editor {
     /// providers handle `@`-fuzzy-file completion in-process via
     /// [`nucleo::Nucleo`]: keystrokes only update the matcher
     /// pattern, not re-walk the filesystem. The one-shot path stays
-    /// available for everything else (slash commands, direct path
-    /// completion) and for providers that don't implement the
-    /// streaming API.
+    /// available for everything else (direct path completion) and for
+    /// providers that don't implement the streaming API.
     ///
     /// Asynchronous on the one-shot path: returns immediately after
     /// dispatching the request. The popup will appear (or
@@ -2688,7 +2686,7 @@ impl Editor {
     /// Honors the provider's
     /// [`AutocompleteProvider::should_trigger_file_completion`] hook so
     /// stacked / extension wrapper providers can suppress the popup in
-    /// contexts they own (e.g. mid slash-command name).
+    /// contexts they own (e.g. a `#`-symbol context).
     ///
     /// Asynchronous: control returns before the worker has produced a
     /// result, so the effect is visible on the next frame.
@@ -2723,10 +2721,10 @@ impl Editor {
     /// Opens the autocomplete popup only when the just-typed character
     /// plausibly starts or continues a completable context:
     ///
-    /// - `/` at the start of the first line → slash-command popup
-    /// - `@` immediately after whitespace or start-of-line → `@`-file popup
-    /// - `[A-Za-z0-9._-]` while the cursor is already inside a slash or
-    ///   `@` context → refines the open popup
+    /// - `@` or `#` immediately after whitespace or start-of-line
+    ///   → symbol popup
+    /// - `[A-Za-z0-9._-]` while the cursor is already inside an `@` /
+    ///   `#` symbol context → refines the open popup
     ///
     /// For any other character (including plain alphabetical letters
     /// outside of a completion context, and crucially whitespace), no
@@ -2755,7 +2753,7 @@ impl Editor {
     /// Entry point called after a deletion (backspace, forward-delete,
     /// kill). If a popup is already open, refresh it against the new
     /// buffer; otherwise, re-trigger only if the deletion has left the
-    /// cursor inside a slash or `@` context.
+    /// cursor inside an `@` / `#` symbol context.
     fn maybe_retrigger_autocomplete_after_delete(&mut self) {
         if self.autocomplete_provider.is_none() {
             return;
@@ -3752,13 +3750,14 @@ mod tests {
         assert_eq!(editor.get_text(), "pasted\ntext");
     }
 
-    /// Pin down the slash-command auto-trigger alphabet. We gate the
+    /// Pin down the symbol auto-trigger alphabet. We gate the
     /// "keep refining the popup as the user types" branch on the
     /// regex `[a-zA-Z0-9.\-_]` applied to the just-inserted character;
     /// [`is_identifier_char`] is the byte-level equivalent.  A future
     /// tweak that, say, adds `/` or drops `_` would silently change
-    /// which keystrokes auto-trigger completion inside a slash or `@`
-    /// context — this test fails loudly when that alphabet drifts.
+    /// which keystrokes auto-trigger completion inside an `@` / `#`
+    /// symbol context — this test fails loudly when that alphabet
+    /// drifts.
     #[test]
     fn is_identifier_char_matches_expected_alphabet() {
         // ASCII alphanumeric: every letter (both cases) and digit must
@@ -3845,7 +3844,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_at_empty_prompt_fires_palette_callback() {
+    fn palette_trigger_fires_on_slash_at_empty_prompt() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
         editor.set_focused(true);
@@ -3861,7 +3860,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_at_empty_prompt_without_callback_still_inserts() {
+    fn slash_inserts_at_empty_prompt_without_palette_trigger() {
         let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
         editor.set_focused(true);
         // No callback installed.
@@ -3870,7 +3869,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_mid_line_does_not_fire_callback() {
+    fn palette_trigger_ignores_mid_line_slash() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
         editor.set_focused(true);

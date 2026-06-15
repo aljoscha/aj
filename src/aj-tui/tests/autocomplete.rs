@@ -2,8 +2,8 @@
 //!
 //! These cover the three completion modes of the provider:
 //!
-//! - **Prefix extraction** (no filesystem): slash-command handling, forced
-//!   extraction, and absolute-path detection within command arguments.
+//! - **Prefix extraction** (no filesystem): leading-`/` token handling,
+//!   forced extraction, and absolute-path detection within later tokens.
 //! - **`@`-prefixed fuzzy file search**: walks a temp directory and
 //!   verifies ranking, hidden-file handling, `.git` exclusion, quoted
 //!   paths, and scoped sub-tree search. Uses `ignore::WalkBuilder`
@@ -129,7 +129,7 @@ fn should_trigger_file_completion_returns_true_in_normal_contexts() {
     let lines = vec!["@src".to_string()];
     assert!(provider.should_trigger_file_completion(&lines, 0, 4));
 
-    // Past the slash-command name (now in argument position).
+    // Past the leading `/` token, now in a later (argument) position.
     let lines = vec!["/cmd ".to_string()];
     assert!(provider.should_trigger_file_completion(&lines, 0, 5));
 }
@@ -163,13 +163,13 @@ fn extracts_slash_a_from_plain_slash_a_when_forced() {
 }
 
 #[test]
-fn does_not_trigger_on_slash_command_when_forced() {
+fn does_not_trigger_on_bare_root_slash_token_when_forced() {
     let tmp = TempDir::new().unwrap();
     let provider = CombinedAutocompleteProvider::new(tmp.path());
     let result = suggest(&provider, "/model", true);
     assert!(
         result.is_none(),
-        "forced extraction on a bare slash-command token should still suppress path suggestions",
+        "forced extraction on a bare root-slash token should still suppress path suggestions",
     );
 }
 

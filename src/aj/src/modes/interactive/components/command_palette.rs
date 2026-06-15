@@ -1,12 +1,11 @@
 //! Command palette overlay.
 //!
-//! A grouped, fuzzy-searchable list of every entry in
-//! [`BUILTIN_COMMANDS`]. The user types to filter, navigates with
-//! arrows, presses `Enter` to confirm or `Esc` to cancel. The
-//! palette's outcome is a fully-formed slash-dispatchable string
-//! (e.g. `"/model"`); the host re-feeds that string through
-//! [`crate::config::slash_commands::dispatch`] so the palette is a
-//! thin discoverability layer on top of the regular slash flow.
+//! A grouped, fuzzy-searchable list of every entry in [`COMMANDS`].
+//! The user types to filter, navigates with arrows, presses `Enter`
+//! to confirm or `Esc` to cancel. The palette's outcome is the chosen
+//! command's [`CommandAction`], which the host applies — the palette
+//! is a thin discoverability layer over the same actions the keyboard
+//! shortcuts trigger.
 //!
 //! Visual layout per row: `<category>  <name>  …  <shortcut-or-hint>`,
 //! supplied to [`SelectList`] via the `prefix` / primary label /
@@ -20,16 +19,15 @@ use aj_tui::components::text_input::TextInput;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 
-use crate::config::slash_commands::BUILTIN_COMMANDS;
+use crate::config::commands::{COMMANDS, CommandAction};
 
 /// Outcome of a single palette session.
 ///
-/// `Confirmed.input` is the full slash-prefixed command string
-/// the host should feed back through the slash dispatcher (e.g.
-/// `"/model"`). Cancelled is `Esc`.
+/// `Confirmed.action` is the chosen command's [`CommandAction`] for
+/// the host to apply. `Cancelled` is `Esc`.
 #[derive(Clone, Debug)]
 pub enum CommandPaletteOutcome {
-    Confirmed { input: String },
+    Confirmed { action: CommandAction },
     Cancelled,
 }
 
@@ -58,7 +56,7 @@ impl CommandPaletteOutcomeHandle {
 /// Palette component: search input over a fuzzy-filtered
 /// [`SelectList`] of builtin commands.
 ///
-/// The list is built **once** from [`BUILTIN_COMMANDS`]; each
+/// The list is built **once** from [`COMMANDS`]; each
 /// keystroke calls [`SelectList::set_filter`] rather than rebuilding
 /// the list, so the prefix/label columns stay anchored and no
 /// per-keystroke allocation churn occurs.
@@ -69,7 +67,7 @@ pub struct CommandPaletteComponent {
 }
 
 impl CommandPaletteComponent {
-    /// Build a palette seeded from [`BUILTIN_COMMANDS`].
+    /// Build a palette seeded from [`COMMANDS`].
     ///
     /// `max_visible_rows` is the initial [`SelectList`] window cap. Once
     /// mounted in an `OverlayWindow` the surrounding frame drives this
@@ -104,9 +102,13 @@ impl CommandPaletteComponent {
         let Some(item) = self.list.selected_item().cloned() else {
             return;
         };
-        self.outcome.set(CommandPaletteOutcome::Confirmed {
-            input: format!("/{}", item.value),
-        });
+        // The list item's `value` is the command `name`; map it back
+        // to the catalog entry to recover the action to dispatch.
+        let Some(cmd) = COMMANDS.iter().find(|c| c.name == item.value) else {
+            return;
+        };
+        self.outcome
+            .set(CommandPaletteOutcome::Confirmed { action: cmd.action });
     }
 
     fn commit_cancel(&self) {
@@ -114,9 +116,10 @@ impl CommandPaletteComponent {
     }
 }
 
-/// Build one [`SelectItem`] per builtin command.
+/// Build one [`SelectItem`] per command.
 ///
-/// - `value` is the command token, so confirming yields `/{value}`.
+/// - `value` is the command `name`; `commit_selection` maps it back
+///   to the catalog entry to recover the [`CommandAction`].
 /// - `label` is the friendly `title` shown in the primary column.
 /// - `prefix` is the dim `category` column.
 /// - `filter_key` is `"{category} {title}"` so typing a category
@@ -125,7 +128,7 @@ impl CommandPaletteComponent {
 ///   accent right column, resolved at render time from the
 ///   keybindings manager so user rebindings flow through.
 fn build_items() -> Vec<SelectItem> {
-    BUILTIN_COMMANDS
+    COMMANDS
         .iter()
         .map(|cmd| {
             let mut item = SelectItem::new(cmd.name, cmd.title)
@@ -233,9 +236,9 @@ mod tests {
         // Sized to the catalog: this test needs every row visible,
         // unlike the host, which gives the list a fixed height and
         // lets it scroll.
-        let mut p = CommandPaletteComponent::new(identity_theme(), BUILTIN_COMMANDS.len());
+        let mut p = CommandPaletteComponent::new(identity_theme(), COMMANDS.len());
         let body = p.render(80).join("\n");
-        for cmd in BUILTIN_COMMANDS {
+        for cmd in COMMANDS {
             assert!(
                 body.contains(cmd.title),
                 "missing title {}: {body}",
@@ -256,7 +259,7 @@ mod tests {
         // scroll-info chrome) rather than stay pinned at the seed value.
         // Guard against a catalog too small to exercise the growth.
         assert!(
-            BUILTIN_COMMANDS.len() > 8,
+            COMMANDS.len() > 8,
             "test needs a catalog larger than the tall budget"
         );
         let mut p = CommandPaletteComponent::new(identity_theme(), 3);
@@ -312,11 +315,11 @@ mod tests {
     fn confirm_writes_outcome() {
         let mut p = CommandPaletteComponent::new(identity_theme(), 14);
         let handle = p.outcome_handle();
-        let expected_name = BUILTIN_COMMANDS[0].name;
+        let expected_action = COMMANDS[0].action;
         p.handle_input(&Key::enter());
         match handle.take().expect("outcome set") {
-            CommandPaletteOutcome::Confirmed { input } => {
-                assert_eq!(input, format!("/{expected_name}"));
+            CommandPaletteOutcome::Confirmed { action } => {
+                assert_eq!(action, expected_action);
             }
             other => panic!("expected Confirmed, got {other:?}"),
         }
@@ -342,8 +345,7 @@ mod tests {
         // Pick a query that matches exactly one command. `quit` is a
         // single-row hit in the current catalog. Sized to the catalog
         // so the quit row is visible before filtering.
-        let mut p_unfiltered =
-            CommandPaletteComponent::new(identity_theme(), BUILTIN_COMMANDS.len());
+        let mut p_unfiltered = CommandPaletteComponent::new(identity_theme(), COMMANDS.len());
         let unfiltered = p_unfiltered.render(80);
         let unfiltered_row =
             list_row_containing(&unfiltered, "quit").expect("unfiltered list contains quit row");

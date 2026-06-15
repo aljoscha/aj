@@ -100,7 +100,7 @@ impl ModelSelectorComponent {
     /// the agent's active model — used to pre-select the matching
     /// row and mark it `(current)`. `initial_query`, when set,
     /// pre-fills the search box so the overlay opens already
-    /// filtered; the slash layer passes `None`, but the parameter
+    /// filtered; the host passes `None`, but the parameter
     /// is kept as a general capability. `theme` styles the
     /// underlying [`SelectList`].
     pub fn new(

@@ -233,8 +233,7 @@ async fn keeps_suggestions_open_when_typing_in_force_mode() {
 
 /// The `@`-attachment context has a 20ms debounce: typing several
 /// characters faster than that should result in strictly fewer
-/// provider calls than characters typed. Slash-command triggers
-/// have no debounce, so they serve as a control group.
+/// provider calls than characters typed.
 #[tokio::test]
 async fn debounces_at_autocomplete_while_typing() {
     use std::sync::Arc;
@@ -593,9 +592,9 @@ fn counting_editor() -> (Editor, Arc<AtomicUsize>) {
 
 #[tokio::test]
 async fn typing_prose_does_not_call_provider() {
-    // Typing ordinary prose in the first line with no slash or @ should
-    // never ask the provider for suggestions. In particular a trailing
-    // space must not fire a "list every file" query.
+    // Typing ordinary prose in the first line with no `@`/`#` trigger
+    // should never ask the provider for suggestions. In particular a
+    // trailing space must not fire a "list every file" query.
     let (mut e, count) = counting_editor();
 
     for ch in "hello world ".chars() {
@@ -664,9 +663,9 @@ async fn at_sign_inside_a_word_does_not_call_provider() {
 
 #[tokio::test]
 async fn enter_on_at_file_popup_applies_completion_but_does_not_submit() {
-    // Complement to the slash-command case: @-file and other non-slash
-    // prefixes apply the completion and *stop*, because the user is
-    // mid-message and hasn't indicated they're ready to send.
+    // `@`-file and similar prefixes apply the completion and *stop*,
+    // because the user is mid-message and hasn't indicated they're
+    // ready to send.
     use aj_tui::autocomplete::{AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions};
 
     struct AtProvider;
@@ -741,9 +740,8 @@ async fn enter_on_at_file_popup_applies_completion_but_does_not_submit() {
 #[tokio::test]
 async fn at_prefix_autocomplete_keeps_default_layout() {
     // A MockProvider that returns suggestions whenever the line contains
-    // an `@`. The returned prefix starts with `@`, so the editor's
-    // `select_list_layout_for_prefix` should fall through to the default
-    // (32-cell primary column) rather than the slash-command branch.
+    // an `@`. The returned prefix starts with `@`, so the popup uses the
+    // default (32-cell primary column) layout.
     let mut e = editor();
     e.set_theme(support::themes::identity_editor_theme());
     e.set_autocomplete_provider(Arc::new(MockProvider {
@@ -788,7 +786,7 @@ async fn at_prefix_autocomplete_keeps_default_layout() {
         support::visible_index_of(row_with_first, "first file"),
         34,
         "@-file popup should use the layout default (32-cell primary); \
-         description column should be 34, not the slash layout's 14. row: {:?}",
+         description column should be 34. row: {:?}",
         row_with_first,
     );
 }

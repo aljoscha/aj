@@ -10,7 +10,7 @@
 //! machinery that doesn't exist on the one-shot path:
 //!
 //! - Starting a session returns `Some` for `@`-contexts and `None`
-//!   for slash / plain-text / direct-path contexts.
+//!   for leading-`/` / plain-text / direct-path contexts.
 //! - Incremental `update` re-scores without re-walking.
 //! - Scope changes (typing a `/` that redirects the walker root)
 //!   return [`SessionInvalid`] so the editor knows to restart.
@@ -114,7 +114,8 @@ async fn try_start_session_returns_none_for_slash_context() {
     let session = provider.try_start_session(&lines, 0, 1, noop_notify());
     assert!(
         session.is_none(),
-        "slash commands stay on the one-shot path — streaming would add complexity with no win"
+        "only `@`-contexts get a streaming session; a leading `/` is an \
+         absolute path and stays on the one-shot path"
     );
 }
 

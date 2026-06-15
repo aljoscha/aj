@@ -17,7 +17,7 @@
 //! before each inference and walks the [`AuthStorage`] chain (runtime
 //! `--api-key` override → env var → stored API key → stored OAuth,
 //! auto-refreshing). This lets a session start without credentials
-//! (e.g. so the user can run `/login`) and lets a mid-session login
+//! (e.g. so the user can log in later) and lets a mid-session login
 //! take effect on the next turn without a restart.
 
 use std::collections::HashMap;
@@ -148,7 +148,7 @@ pub fn from_model_info(
 /// cross-process file lock. A missing credential is surfaced as a
 /// human-readable error (the provider maps it to an `Auth`-category
 /// failure) rather than a hard startup bail, so a session can come up
-/// uncredentialed and the user can `/login`.
+/// uncredentialed and the user can log in later.
 fn install_api_key_resolver(options: &mut StreamOptions, auth: &AuthStorage, provider_id: &str) {
     let auth = auth.clone();
     let provider_id = provider_id.to_string();
@@ -175,13 +175,13 @@ pub fn missing_key_message(provider_id: &str) -> String {
     let vars = find_env_keys(provider_id);
     if vars.is_empty() {
         format!(
-            "no credentials for provider {provider_id:?}; run /login, \
-             or set a `headers` override in models.json"
+            "no credentials for provider {provider_id:?}; log in from the \
+             command palette (press /), or set a `headers` override in models.json"
         )
     } else {
         format!(
-            "no credentials for provider {provider_id:?}; run /login \
-             or set one of: {}",
+            "no credentials for provider {provider_id:?}; log in from the \
+             command palette (press /) or set one of: {}",
             vars.join(", "),
         )
     }
