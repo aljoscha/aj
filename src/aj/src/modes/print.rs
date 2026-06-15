@@ -106,15 +106,16 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     // Resolve the positionals (messages + `@file` attachments) into the
-    // turns to run. Print mode is one-shot with no editor to fall back
-    // on, so an empty result is a hard error rather than a quiet no-op.
-    let turns = {
+    // launch turn content. Print mode is one-shot with no editor to fall
+    // back on, so an empty result is a hard error rather than a quiet
+    // no-op.
+    let content = {
         let cwd = std::env::current_dir().unwrap_or_default();
         let input = crate::cli::initial_input(&args, &cwd)?;
         if input.is_empty() {
             bail!("aj --print requires a prompt argument");
         }
-        input.into_turns()
+        input.into_content()
     };
 
     // Load config.toml first (lowest priority). Missing or invalid
@@ -471,18 +472,7 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         cancel_for_signal.cancel();
     });
-    // Run each turn in order under the one SIGINT handler, stopping at
-    // the first failure (the match below surfaces it). A multi-turn run
-    // happens when several bare messages were passed (`aj -p a b`).
-    let mut prompt_result = Ok(());
-    for content in turns {
-        prompt_result = agent
-            .prompt_with_content(content, turn_cancel.clone())
-            .await;
-        if prompt_result.is_err() {
-            break;
-        }
-    }
+    let prompt_result = agent.prompt_with_content(content, turn_cancel).await;
     // Stop listening for SIGINT before we return so a stray Ctrl+C
     // during shutdown doesn't trigger a phantom cancel.
     ctrl_c_handler.abort();
@@ -609,7 +599,7 @@ mod tests {
         Args::parse_from(argv)
     }
 
-    /// Flatten the text content of a turn for assertions.
+    /// Flatten the text content of the launch turn for assertions.
     fn turn_text(content: &[aj_models::types::UserContent]) -> String {
         content
             .iter()
@@ -620,20 +610,20 @@ mod tests {
             .collect()
     }
 
-    /// Resolve a CLI invocation into its launch turns (paths resolved
+    /// Resolve a CLI invocation into its launch content (paths resolved
     /// against `/`, which has no `@file` args in these tests).
-    fn turns(args: &[&str]) -> Vec<Vec<aj_models::types::UserContent>> {
+    fn content(args: &[&str]) -> Vec<aj_models::types::UserContent> {
         crate::cli::initial_input(&parse(args), std::path::Path::new("/"))
             .expect("resolve")
-            .into_turns()
+            .into_content()
     }
 
     #[test]
-    fn bare_messages_become_separate_turns() {
-        let turns = turns(&["--print", "hello", "world"]);
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turn_text(&turns[0]), "hello");
-        assert_eq!(turn_text(&turns[1]), "world");
+    fn bare_messages_are_joined() {
+        assert_eq!(
+            turn_text(&content(&["--print", "hello", "world"])),
+            "hello world"
+        );
     }
 
     #[test]
@@ -659,8 +649,8 @@ mod tests {
         }
         assert!(args.prompt.is_empty(), "top-level prompt should be empty");
 
-        let turns = turns(&["--print", "continue", "session-abc", "hello", "world"]);
-        assert_eq!(turn_text(&turns[0]), "hello");
+        let content = content(&["--print", "continue", "session-abc", "hello", "world"]);
+        assert_eq!(turn_text(&content), "hello world");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! arguments into `<file>`-wrapped text and image attachments).
 //! [`initial_input`] ties them together: it interprets the positional
 //! arguments as a mix of `@file` attachments and free-form messages and
-//! produces the turns to run at launch.
+//! produces the content to auto-submit as the launch turn.
 
 pub mod args;
 pub mod file_args;
@@ -19,58 +19,43 @@ use aj_models::types::UserContent;
 
 use crate::cli::args::{Args, Command};
 
-/// The prompt content supplied on the command line, ready to run.
+/// The prompt content supplied on the command line, ready to submit.
 ///
 /// Positional arguments are interpreted argument-by-argument: any
 /// argument starting with `@` is a file attachment, the rest are
-/// free-form messages. The first message is concatenated onto the
-/// resolved file text to form the initial turn (carrying the image
-/// attachments); each remaining message becomes its own follow-up
-/// turn, run in order.
+/// free-form messages joined with spaces. The resolved file text and
+/// the joined messages form a single launch turn (carrying any image
+/// attachments) that both modes auto-submit.
 pub struct InitialInput {
-    /// Combined text for the first turn: resolved `<file>` blocks
-    /// followed by the first free-form message. `None` when there is
-    /// neither file text nor a message.
+    /// Combined launch text: resolved `<file>` blocks followed by the
+    /// joined messages. `None` when there is neither file text nor a
+    /// message.
     message: Option<String>,
-    /// Image attachments for the first turn.
+    /// Image attachments for the launch turn.
     images: Vec<UserContent>,
-    /// Additional free-form messages, each run as its own turn after
-    /// the first, in order.
-    followups: Vec<String>,
 }
 
 impl InitialInput {
     /// Whether nothing was supplied on the command line (no files, no
     /// messages). Print mode treats this as a hard error.
     pub fn is_empty(&self) -> bool {
-        self.message.is_none() && self.images.is_empty() && self.followups.is_empty()
+        self.message.is_none() && self.images.is_empty()
     }
 
-    /// Flatten into an ordered list of turns, each a non-empty content
-    /// block vector. The first turn carries the combined message text
-    /// and image attachments; subsequent turns are the single-text
-    /// follow-up messages. Both modes auto-submit these in order.
-    pub fn into_turns(self) -> Vec<Vec<UserContent>> {
-        let mut turns = Vec::new();
-
-        let mut first = Vec::new();
+    /// Content blocks for the auto-submitted launch turn: the combined
+    /// message text (if any) followed by the image attachments.
+    pub fn into_content(self) -> Vec<UserContent> {
+        let mut content = Vec::new();
         if let Some(text) = self.message {
-            first.push(UserContent::text(text));
+            content.push(UserContent::text(text));
         }
-        first.extend(self.images);
-        if !first.is_empty() {
-            turns.push(first);
-        }
-
-        for followup in self.followups {
-            turns.push(vec![UserContent::text(followup)]);
-        }
-        turns
+        content.extend(self.images);
+        content
     }
 }
 
-/// Resolve the command-line positionals into the turns to run at
-/// launch, relative to `cwd` (for `@file` path resolution).
+/// Resolve the command-line positionals into the launch turn content,
+/// relative to `cwd` (for `@file` path resolution).
 ///
 /// The positionals come from whichever slot clap populated: the
 /// top-level `aj <args...>` or `aj continue ID <args...>` (its greedy
@@ -88,33 +73,27 @@ pub fn initial_input(args: &Args, cwd: &Path) -> Result<InitialInput> {
     for token in positionals {
         match token.strip_prefix('@') {
             Some(path) => file_args.push(path.to_string()),
-            None => messages.push(token.clone()),
+            None => messages.push(token.as_str()),
         }
     }
 
     let resolved = file_args::process_file_args(&file_args, cwd)?;
 
-    // The first message rides along with the file text into the initial
-    // turn (matching how a user would paste files then ask about them);
-    // the rest are sequential follow-up turns.
-    let mut messages = messages.into_iter();
-    let mut parts = Vec::new();
-    if !resolved.text.is_empty() {
-        parts.push(resolved.text);
+    // File text is prepended to the joined messages so the model sees
+    // the attachments before the question, all as one launch turn.
+    let mut message = resolved.text;
+    if !messages.is_empty() {
+        message.push_str(&messages.join(" "));
     }
-    if let Some(first) = messages.next() {
-        parts.push(first);
-    }
-    let message = if parts.is_empty() {
+    let message = if message.is_empty() {
         None
     } else {
-        Some(parts.concat())
+        Some(message)
     };
 
     Ok(InitialInput {
         message,
         images: resolved.images,
-        followups: messages.collect(),
     })
 }
 
@@ -127,35 +106,37 @@ mod tests {
     use crate::cli::args::Args;
     use crate::cli::initial_input;
 
-    /// Flatten the first turn's text content for assertions.
-    fn first_turn_text(args: &[&str]) -> Option<String> {
+    /// Flatten the launch turn's text content for assertions.
+    fn content_text(args: &[&str]) -> Option<String> {
         let parsed = Args::parse_from(args);
-        let turns = initial_input(&parsed, Path::new("/"))
+        let content = initial_input(&parsed, Path::new("/"))
             .expect("resolve")
-            .into_turns();
-        turns.into_iter().next().map(|content| {
+            .into_content();
+        if content.is_empty() {
+            return None;
+        }
+        Some(
             content
                 .iter()
                 .filter_map(|c| match c {
                     aj_models::types::UserContent::Text(t) => Some(t.text.clone()),
                     aj_models::types::UserContent::Image(_) => None,
                 })
-                .collect()
-        })
+                .collect(),
+        )
     }
 
     #[test]
-    fn first_positional_becomes_first_turn() {
-        assert_eq!(first_turn_text(&["aj", "hello"]).as_deref(), Some("hello"));
+    fn single_message_is_used() {
+        assert_eq!(content_text(&["aj", "hello"]).as_deref(), Some("hello"));
     }
 
     #[test]
-    fn bare_positionals_are_separate_turns() {
-        let parsed = Args::parse_from(["aj", "first", "second"]);
-        let turns = initial_input(&parsed, Path::new("/"))
-            .expect("resolve")
-            .into_turns();
-        assert_eq!(turns.len(), 2);
+    fn bare_messages_are_joined() {
+        assert_eq!(
+            content_text(&["aj", "first", "second"]).as_deref(),
+            Some("first second")
+        );
     }
 
     #[test]
@@ -171,8 +152,8 @@ mod tests {
     #[test]
     fn prefers_continue_slot() {
         assert_eq!(
-            first_turn_text(&["aj", "continue", "ID", "do", "thing"]).as_deref(),
-            Some("do")
+            content_text(&["aj", "continue", "ID", "do", "thing"]).as_deref(),
+            Some("do thing")
         );
     }
 }

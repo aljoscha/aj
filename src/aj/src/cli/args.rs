@@ -55,10 +55,10 @@ pub struct Args {
 
     /// Free-form launch input. Each positional argument is either a
     /// `@file` attachment (its contents are wrapped in a `<file>` block
-    /// and images are attached inline) or a message; the first message
-    /// carries the file content, and any further messages run as their
-    /// own turns. Both print and interactive mode auto-submit these in
-    /// order. See [`crate::cli::initial_input`] for the full rules.
+    /// and images are attached inline) or a message; the messages are
+    /// joined and combined with the file content into a single launch
+    /// turn, which both print and interactive mode auto-submit. See
+    /// [`crate::cli::initial_input`] for the full rules.
     pub prompt: Vec<String>,
 
     /// Replace the live model with a scripted fake that replays a
@@ -107,7 +107,7 @@ pub enum Command {
     ///
     /// Accepts optional positional launch input after the session id:
     /// `aj continue ID <args...>` resumes the session and auto-submits
-    /// the args (messages and `@file` attachments) as the next turn(s).
+    /// the args (messages and `@file` attachments) as the next turn.
     /// With no session id, the latest session for the current project
     /// is resumed; supplying input without a session id is ambiguous,
     /// so callers wanting "latest + prompt" should pass the session id
@@ -118,7 +118,7 @@ pub enum Command {
         session_id: Option<String>,
         /// Launch input for the resumed run, interpreted exactly like
         /// the top-level [`Args::prompt`]: a mix of `@file` attachments
-        /// and messages, auto-submitted in order.
+        /// and messages, auto-submitted as the next turn.
         prompt: Vec<String>,
     },
     /// Refresh the user model catalog at `~/.aj/models.json` from

@@ -26,7 +26,7 @@ pub mod shutdown;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -462,14 +462,14 @@ impl InteractiveMode {
         let conversation_persistence = ConversationPersistence::new(sessions_dir);
 
         // Resolve the launch positionals (free-form messages plus `@file`
-        // attachments) into the turns to auto-submit, before the match
+        // attachments) into the content to auto-submit, before the match
         // below moves `self.args.command`. Paths resolve relative to the
         // process working directory — where the user typed the command.
         // Consumed by the first `run_session` call via `mem::take`, so a
         // later in-process session switch starts clean.
-        let mut launch_turns = {
+        let mut launch_content = {
             let cwd = std::env::current_dir().unwrap_or_default();
-            crate::cli::initial_input(&self.args, &cwd)?.into_turns()
+            crate::cli::initial_input(&self.args, &cwd)?.into_content()
         };
 
         let spec = match self.args.command {
@@ -732,7 +732,7 @@ impl InteractiveMode {
                 &mut shell,
                 &mut world,
                 &mut theme_watch,
-                std::mem::take(&mut launch_turns),
+                std::mem::take(&mut launch_content),
             )
             .await
             {
@@ -1049,7 +1049,7 @@ async fn run_session(
     shell: &mut Shell,
     world: &mut SessionWorld,
     theme_watch: &mut ThemeWatch,
-    launch_turns: Vec<Vec<UserContent>>,
+    launch_content: Vec<UserContent>,
 ) -> Result<SessionExit> {
     // ---- Main event loop ------------------------------------------
     // In-flight turns keyed by the agent running them. `JoinSet`
@@ -1081,16 +1081,13 @@ async fn run_session(
     let mut login_task: Option<tokio::task::JoinHandle<Result<(), aj_models::auth::AuthError>>> =
         None;
 
-    // Launch prompt auto-submit (`aj <msg>` / `aj @file ...`): the first
-    // turn runs immediately; the rest are dispatched on Main-turn
-    // completion below so multi-message launches (`aj a b`) run in order.
-    // Empty for any in-process session switch after the first.
-    let mut launch_turns: VecDeque<Vec<UserContent>> = launch_turns.into();
-    if let Some(content) = launch_turns.pop_front() {
+    // Auto-submit the launch prompt (`aj <msg>` / `aj @file ...`) as the
+    // first turn. Empty for any in-process session switch after the first.
+    if !launch_content.is_empty() {
         spawn_auto_turn(
             world,
             &shell.run_config,
-            content,
+            launch_content,
             &mut turns,
             &mut turn_cancels,
         );
@@ -1136,21 +1133,6 @@ async fn run_session(
                                 id,
                                 world,
                                 &shell.run_config,
-                                &mut turns,
-                                &mut turn_cancels,
-                            );
-                            sync_editor_enabled(&mut shell.tui);
-                        } else if id == AgentId::Main
-                            && let Some(content) = launch_turns.pop_front()
-                        {
-                            // Main is idle (a wake above would have re-marked
-                            // it busy, deferring this to the next completion):
-                            // run the next queued launch message as its own
-                            // turn.
-                            spawn_auto_turn(
-                                world,
-                                &shell.run_config,
-                                content,
                                 &mut turns,
                                 &mut turn_cancels,
                             );
