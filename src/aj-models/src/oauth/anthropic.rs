@@ -2,14 +2,18 @@
 //!
 //! Authorization Code + PKCE. The high-level flow:
 //!
-//! 1. Generate a PKCE verifier / challenge pair (S256). The verifier
-//!    is reused as the OAuth `state` parameter — Anthropic's
-//!    authorization server is configured to expect this exact
-//!    arrangement and rejects randomly generated states.
-//! 2. Bind a local HTTP callback server on `127.0.0.1:53692`. The
-//!    redirect URI registered with the upstream server is
-//!    `http://localhost:53692/callback`, so the port is fixed; we
-//!    have no choice in the matter.
+//! 1. Generate a PKCE verifier / challenge pair (S256) and an
+//!    independent random `state` value. The authorization server
+//!    treats `state` as opaque CSRF-protection material and echoes it
+//!    back on the callback; we only check that what comes back matches
+//!    what we sent.
+//! 2. Bind a local HTTP callback server on `127.0.0.1` on an
+//!    OS-assigned ephemeral port, and advertise
+//!    `http://localhost:<port>/callback` as the redirect URI. The
+//!    upstream accepts any loopback port (RFC 8252 §7.3), so we don't
+//!    pin one — that avoids failing when a fixed port happens to be
+//!    taken. The same redirect URI is echoed in the token exchange,
+//!    where it must match byte-for-byte.
 //! 3. Hand the user the authorize URL via [`OAuthCallbacks::on_auth`]
 //!    and wait for either the browser callback to hit our server or
 //!    — for hosts that support it — a manually pasted code. The two
@@ -36,7 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::page::{error_page, success_page};
-use super::pkce::generate_pkce;
+use super::pkce::{generate_pkce, random_token};
 use super::{OAuthAuthInfo, OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
 
 // ---------------------------------------------------------------------------
@@ -57,21 +61,13 @@ const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 
 /// Local IP the callback HTTP server binds to. We bind the literal
 /// loopback address so we don't depend on `localhost` resolving to
-/// `127.0.0.1` on the user's machine; the redirect URI advertised to
-/// the upstream server still uses `localhost` because that's what
-/// the registered redirect requires.
+/// `127.0.0.1` on the user's machine; the redirect URI we advertise
+/// upstream still spells the host `localhost`, which the
+/// authorization server accepts for loopback redirects.
 const CALLBACK_HOST: &str = "127.0.0.1";
-
-/// Fixed by the upstream authorization server's allowed redirect
-/// URIs; not an implementation choice.
-const CALLBACK_PORT: u16 = 53692;
 
 /// Path the upstream redirects the browser to.
 const CALLBACK_PATH: &str = "/callback";
-
-/// Full redirect URI sent in the authorization and token-exchange
-/// requests. Must be exactly the value registered upstream.
-const REDIRECT_URI: &str = "http://localhost:53692/callback";
 
 /// Scope string requested at authorize time. The wide set is what
 /// Claude Code asks for; trimming it would cause the upstream server
@@ -177,16 +173,24 @@ async fn login_with(
     callbacks: &dyn OAuthCallbacks,
 ) -> Result<OAuthCredentials, OAuthError> {
     let pkce = generate_pkce()?;
+    let state = random_token()?;
 
     // Bind the callback listener *before* we hand the user the
     // authorize URL: if the user is fast enough to click through and
     // the redirect arrives at our port before we're listening, we'd
-    // miss the callback.
-    let listener = TcpListener::bind((CALLBACK_HOST, CALLBACK_PORT))
+    // miss the callback. Port 0 lets the OS pick a free ephemeral
+    // port; the upstream accepts any loopback port so we read the
+    // assigned one back and build the redirect URI from it.
+    let listener = TcpListener::bind((CALLBACK_HOST, 0))
         .await
-        .map_err(|e| OAuthError::Other(format!("bind {CALLBACK_HOST}:{CALLBACK_PORT}: {e}")))?;
+        .map_err(|e| OAuthError::Other(format!("bind {CALLBACK_HOST}: {e}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| OAuthError::Other(format!("read local callback addr: {e}")))?
+        .port();
+    let redirect_uri = redirect_uri_for(port);
 
-    let auth_url = build_authorize_url(&pkce.challenge, &pkce.verifier);
+    let auth_url = build_authorize_url(&pkce.challenge, &state, &redirect_uri);
     callbacks.on_auth(OAuthAuthInfo {
         url: &auth_url,
         instructions: Some(
@@ -194,10 +198,26 @@ async fn login_with(
         ),
     });
 
-    let (code, state) = obtain_code_and_state(callbacks, listener, &pkce.verifier).await?;
+    let (code, returned_state) = obtain_code_and_state(callbacks, listener, &state).await?;
 
     callbacks.on_progress("Exchanging authorization code for tokens...");
-    exchange_authorization_code(client, token_url, &code, &state, &pkce.verifier).await
+    exchange_authorization_code(
+        client,
+        token_url,
+        &code,
+        &returned_state,
+        &pkce.verifier,
+        &redirect_uri,
+    )
+    .await
+}
+
+/// Redirect URI advertised to the upstream and echoed in the token
+/// exchange, built from the ephemeral callback port. Spelled with the
+/// host `localhost` (not the bound `127.0.0.1`) because that's the
+/// conventional loopback redirect form.
+fn redirect_uri_for(port: u16) -> String {
+    format!("http://localhost:{port}{CALLBACK_PATH}")
 }
 
 /// Refresh an existing Anthropic OAuth token. Exposed as a free
@@ -226,13 +246,13 @@ async fn refresh_with(
 async fn obtain_code_and_state(
     callbacks: &dyn OAuthCallbacks,
     listener: TcpListener,
-    verifier: &str,
+    expected_state: &str,
 ) -> Result<(String, String), OAuthError> {
     let mut code: Option<String> = None;
     let mut state: Option<String> = None;
 
     if callbacks.supports_manual_code_input() {
-        let server_fut = await_callback(listener, verifier);
+        let server_fut = await_callback(listener, expected_state);
         tokio::pin!(server_fut);
         tokio::select! {
             biased;
@@ -245,13 +265,13 @@ async fn obtain_code_and_state(
                 let input = res?;
                 let parsed = parse_authorization_input(input.trim());
                 if let Some(s) = parsed.state.as_deref()
-                    && s != verifier
+                    && s != expected_state
                 {
                     return Err(OAuthError::StateMismatch);
                 }
                 if let Some(c) = parsed.code {
                     code = Some(c);
-                    state = Some(parsed.state.unwrap_or_else(|| verifier.to_string()));
+                    state = Some(parsed.state.unwrap_or_else(|| expected_state.to_string()));
                 }
                 // Empty / unparseable manual input: drop through to
                 // the prompt fallback below. Dropping `server_fut`
@@ -260,7 +280,7 @@ async fn obtain_code_and_state(
             }
         }
     } else {
-        let (c, s) = await_callback(listener, verifier).await?;
+        let (c, s) = await_callback(listener, expected_state).await?;
         code = Some(c);
         state = Some(s);
     }
@@ -271,16 +291,16 @@ async fn obtain_code_and_state(
             .await?;
         let parsed = parse_authorization_input(input.trim());
         if let Some(s) = parsed.state.as_deref()
-            && s != verifier
+            && s != expected_state
         {
             return Err(OAuthError::StateMismatch);
         }
         code = parsed.code;
-        state = parsed.state.or_else(|| Some(verifier.to_string()));
+        state = parsed.state.or_else(|| Some(expected_state.to_string()));
     }
 
     let code = code.ok_or(OAuthError::MissingCode)?;
-    let state = state.unwrap_or_else(|| verifier.to_string());
+    let state = state.unwrap_or_else(|| expected_state.to_string());
     Ok((code, state))
 }
 
@@ -483,21 +503,20 @@ fn parse_callback_request(path_and_query: &str) -> Option<CallbackParams> {
 /// parameters are required by Anthropic's OAuth server; trimming any
 /// of them produces a 400 from the upstream.
 ///
-/// Note that `state` is intentionally set to the verifier rather
-/// than a fresh random value. The Anthropic server validates state
-/// against the verifier-derived material at token-exchange time;
-/// passing anything else causes the exchange to fail.
-fn build_authorize_url(challenge: &str, verifier: &str) -> String {
+/// `state` is an opaque CSRF token (see the module docs) and
+/// `redirect_uri` must be the exact value later echoed in the token
+/// exchange.
+fn build_authorize_url(challenge: &str, state: &str, redirect_uri: &str) -> String {
     let mut url = reqwest::Url::parse(AUTHORIZE_URL).expect("AUTHORIZE_URL is a valid URL");
     url.query_pairs_mut()
         .append_pair("code", "true")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("response_type", "code")
-        .append_pair("redirect_uri", REDIRECT_URI)
+        .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", SCOPES)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")
-        .append_pair("state", verifier);
+        .append_pair("state", state);
     url.into()
 }
 
@@ -607,13 +626,14 @@ async fn exchange_authorization_code(
     code: &str,
     state: &str,
     verifier: &str,
+    redirect_uri: &str,
 ) -> Result<OAuthCredentials, OAuthError> {
     let body = serde_json::json!({
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
         "code": code,
         "state": state,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "code_verifier": verifier,
     });
     post_token_request(client, token_url, body).await
@@ -728,7 +748,8 @@ mod tests {
     /// flow silently (the upstream returns 400 with no useful body).
     #[test]
     fn authorize_url_contains_required_params() {
-        let url_str = build_authorize_url("CHALLENGE", "VERIFIER");
+        let redirect = redirect_uri_for(49152);
+        let url_str = build_authorize_url("CHALLENGE", "STATE", &redirect);
         let url = reqwest::Url::parse(&url_str).expect("authorize URL must parse");
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("claude.ai"));
@@ -743,7 +764,7 @@ mod tests {
         assert_eq!(pairs.get("response_type").map(String::as_str), Some("code"));
         assert_eq!(
             pairs.get("redirect_uri").map(String::as_str),
-            Some(REDIRECT_URI)
+            Some(redirect.as_str())
         );
         assert_eq!(pairs.get("scope").map(String::as_str), Some(SCOPES));
         assert_eq!(
@@ -754,9 +775,9 @@ mod tests {
             pairs.get("code_challenge_method").map(String::as_str),
             Some("S256")
         );
-        // The state-equals-verifier rule in §9.3 is the most
-        // surprising part of the flow; explicitly assert it.
-        assert_eq!(pairs.get("state").map(String::as_str), Some("VERIFIER"));
+        // `state` is an independent opaque value, passed through to
+        // the authorize URL verbatim.
+        assert_eq!(pairs.get("state").map(String::as_str), Some("STATE"));
     }
 
     /// `parse_callback_request` should split the path from the query
@@ -826,6 +847,7 @@ mod tests {
             "the-code",
             "the-state",
             "the-verifier",
+            "http://localhost:49152/callback",
         )
         .await
         .expect("exchange should succeed");
@@ -842,7 +864,7 @@ mod tests {
         assert_eq!(body["client_id"], CLIENT_ID);
         assert_eq!(body["code"], "the-code");
         assert_eq!(body["state"], "the-state");
-        assert_eq!(body["redirect_uri"], REDIRECT_URI);
+        assert_eq!(body["redirect_uri"], "http://localhost:49152/callback");
         assert_eq!(body["code_verifier"], "the-verifier");
     }
 

@@ -3,10 +3,11 @@
 //!
 //! Authorization Code + PKCE, with a few OpenAI-specific quirks:
 //!
-//! - **Random state.** Unlike the Anthropic flow, which reuses the
-//!   PKCE verifier as `state`, OpenAI's authorization server expects
-//!   a fresh random `state` value. We mint 16 random bytes and
-//!   hex-encode them.
+//! - **Random state.** OpenAI's authorization server expects a fresh
+//!   random `state` value, which we mint as 16 random bytes,
+//!   hex-encoded. (We use hex here rather than the base64url
+//!   `state` the Anthropic flow uses only because the upstreams differ
+//!   in what they round-trip cleanly; both are opaque CSRF tokens.)
 //! - **Form-encoded token requests.** The token endpoint takes
 //!   `application/x-www-form-urlencoded` bodies, not JSON.
 //! - **JWT access tokens.** The returned `access_token` is itself a

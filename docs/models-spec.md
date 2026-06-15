@@ -1980,18 +1980,20 @@ trait OAuthCallbacks: Send + Sync {
 
 **Protocol:** OAuth 2.0 Authorization Code + PKCE
 
-1. Generate PKCE verifier + challenge (SHA-256, base64url)
-2. Start local HTTP callback server on `127.0.0.1:53692` (this port is
-   fixed by the upstream OAuth server's allowed redirect URIs; it is
-   not an implementation choice)
+1. Generate PKCE verifier + challenge (SHA-256, base64url) and an
+   independent random `state` token
+2. Start local HTTP callback server on `127.0.0.1` on an OS-assigned
+   ephemeral port (bind port 0). The upstream accepts any loopback
+   redirect port (RFC 8252 §7.3), so we don't pin one; the chosen port
+   is read back and used to build the redirect URI.
 3. Construct authorization URL:
    - Endpoint: `https://claude.ai/oauth/authorize`
-   - Params: `code=true`, `client_id`, `response_type=code`, `redirect_uri=http://localhost:53692/callback`,
+   - Params: `code=true`, `client_id`, `response_type=code`, `redirect_uri=http://localhost:<port>/callback`,
      `scope=org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload`,
-     `code_challenge`, `code_challenge_method=S256`, `state=<verifier>`
-   - Note: passing the PKCE verifier as the `state` parameter is intentional
-     for Claude Code server compatibility — do not "fix" this to a random
-     value or the server will reject the callback.
+     `code_challenge`, `code_challenge_method=S256`, `state=<random>`
+   - Note: `state` is an opaque, independently-generated random token
+     echoed back on the callback and checked for equality. The same
+     `redirect_uri` must be echoed in the token exchange.
 4. Open URL in browser, wait for callback or manual paste
 5. Exchange code at `https://platform.claude.com/v1/oauth/token`
 6. Store `{refresh, access, expires}` in auth.json

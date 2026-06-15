@@ -42,18 +42,29 @@ pub struct PkcePair {
 /// that rather than panic so the caller can present a meaningful login
 /// failure (e.g. on locked-down systems with no entropy).
 pub fn generate_pkce() -> Result<PkcePair, PkceError> {
-    let mut verifier_bytes = [0u8; 32];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut verifier_bytes)
-        .map_err(|err| PkceError::Random(err.to_string()))?;
-    let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
-
+    let verifier = random_token()?;
     let challenge = challenge_for(&verifier);
 
     Ok(PkcePair {
         verifier,
         challenge,
     })
+}
+
+/// Generate a cryptographically random URL-safe token: 32 bytes from
+/// the OS CSPRNG, base64url-encoded without padding (43 ASCII chars).
+///
+/// Backs the PKCE `code_verifier` and is also used by the Anthropic
+/// flow as the OAuth `state` value — both want an unguessable,
+/// URL-safe opaque string, and the authorization server treats each as
+/// such. Propagates a CSPRNG failure rather than panicking for the
+/// same reason as [`generate_pkce`].
+pub fn random_token() -> Result<String, PkceError> {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|err| PkceError::Random(err.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Compute the S256 challenge for a given verifier string.
