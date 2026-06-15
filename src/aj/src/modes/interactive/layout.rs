@@ -83,6 +83,8 @@ impl SlotIndex {
 /// blocks in the chat scrollback (the `config.toml`
 /// `syntax_highlighting` option).
 pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle, syntax_highlight: bool) {
+    let chat = chat_theme(theme, syntax_highlight);
+
     // Header slot.
     tui.add_child(Box::new(Header::new()));
 
@@ -90,7 +92,7 @@ pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle, syntax_highlight: bool) 
     // the per-sub-agent boxes; the event pump routes each event to
     // the owning agent's transcript and the view switches which
     // agent's transcript is shown (main, or a sub-agent in full).
-    tui.add_child(Box::new(ChatView::new(chat_theme(theme, syntax_highlight))));
+    tui.add_child(Box::new(ChatView::new(chat.clone())));
 
     // Status slot. Always present; the loader inside it toggles
     // its own visibility based on whether the agent is mid-turn.
@@ -101,10 +103,10 @@ pub fn build_layout(tui: &mut Tui, theme: &ThemeHandle, syntax_highlight: bool) 
     };
     tui.add_child(Box::new(status));
 
-    // Pending-message box. Sits directly above the editor and renders
-    // the queued message (steering / follow-up) for the viewed agent;
-    // empty (zero height) when nothing is queued.
-    tui.add_child(Box::new(PendingMessage::new()));
+    // Pending-message box. Sits directly above the editor and previews
+    // the queued message (steering / follow-up) for the viewed agent as
+    // a user-message bubble; empty (zero height) when nothing is queued.
+    tui.add_child(Box::new(PendingMessage::new(&chat)));
 
     // Editor. Themed via the shared `editor_theme`; the event
     // pump installs an autocomplete provider once selectors land.
