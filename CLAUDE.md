@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Build: `cargo check` or `cargo build`
 - Run all tests: `cargo test`
 - Run specific test: `cargo test --package package_name -- test_name`
-- Run CLI: `cargo run -p aj -- [args]` (e.g. `list-threads`, `continue <id>`, `continue`)
+- Run CLI: `cargo run -p aj -- [args]` (e.g. `list-sessions`, `continue <id>`, `continue`)
 - Format code: `cargo fmt`
 - Lint: `cargo clippy --workspace --all-targets`
 
@@ -38,8 +38,8 @@ aj-models  ←  aj-agent  ←  aj-tools
 - `aj-tools` — the builtin tool implementations.
 - `aj-tui` — in-process text-UI framework (layout, components, theming).
 - `aj-conf` — `~/.aj/config.toml` loader and path helpers.
-- `aj` — the binary: CLI parsing, print mode, interactive TUI, slash
-  commands, selectors.
+- `aj` — the binary: CLI parsing, print mode, interactive TUI, command
+  palette, selectors.
 - `anthropic-sdk` / `openai-sdk` — thin async clients used by
   `aj-models`'s provider adapters.
 
@@ -55,7 +55,7 @@ Persistent state lives under `~/.aj/`:
 - `.env` — secrets (API keys); loaded before the project-local `.env`.
 - `config.toml` — defaults (model, thinking level, speed, theme,
   disabled tools/skills).
-- `models.json` — model catalog; refresh with `aj models update`.
+- `models.json` — model catalog; refresh with `aj update-models`.
 - `skills/` — user-level skills (SKILL.md directories); also discovered
   from `~/.agents/skills/`, `~/.claude/skills/`, and project-level
   `.aj/`/`.agents/`/`.claude/` `skills/` dirs up to the git root.
