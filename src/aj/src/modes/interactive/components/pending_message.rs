@@ -92,10 +92,10 @@ impl Component for PendingMessage {
             return Vec::new();
         }
 
-        // Hint first, then the message body — the user sees how the
-        // queued text will read once sent, with the hint right above it
-        // inside the same bubble.
-        let mut content = vec![header(kind)];
+        // Hint first, then a blank separator row, then the message body
+        // — the user sees how the queued text will read once sent, with
+        // the hint above it inside the same bubble.
+        let mut content = vec![header(kind), String::new()];
         let lines: Vec<&str> = self.snapshot.text.split('\n').collect();
         // Show every line up to the cap; past it, keep `MAX_BODY_LINES
         // - 1` rows and spend the last on the overflow indicator so the
@@ -219,10 +219,10 @@ mod tests {
             .join("\n");
         c.set_snapshot(snap(PendingKind::FollowUp, &text));
         let lines = c.render(80);
-        // padding + hint + (MAX_BODY_LINES - 1) body rows + overflow + padding.
+        // padding + hint + separator + (MAX_BODY_LINES - 1) body rows + overflow + padding.
         assert_eq!(
             lines.len(),
-            PADDING_Y + 1 + (MAX_BODY_LINES - 1) + 1 + PADDING_Y
+            PADDING_Y + 1 + 1 + (MAX_BODY_LINES - 1) + 1 + PADDING_Y
         );
         // 10 lines, 5 shown, 5 collapsed.
         assert!(
