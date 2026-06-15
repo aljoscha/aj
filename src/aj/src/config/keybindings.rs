@@ -96,6 +96,28 @@ pub const ACTION_AGENT_TOGGLE_SCOPE: &str = "aj.agent.toggle_scope";
 /// the resulting outcome to the task registry's kill.
 pub const ACTION_TASK_KILL: &str = "aj.task.kill";
 
+/// Action ID for the "submit as a steering message" chord.
+///
+/// Bound by default to `alt+enter`. The interactive loop intercepts
+/// the keystroke before the editor sees it (so it never inserts a
+/// newline). While the viewed agent is busy it queues the editor text
+/// as a steering message (injected right after the next tool call),
+/// escalating any pending follow-up; while idle it starts a normal
+/// turn. Repurposing `alt+enter` drops its editor newline-fallback
+/// role — `shift+enter` and `\`+Enter remain for newline.
+pub const ACTION_SUBMIT_STEERING: &str = "aj.message.steer";
+
+/// Action ID for the "pull a queued message back into the editor"
+/// chord.
+///
+/// Bound by default to `alt+up`. The interactive loop intercepts it
+/// before the editor and, when a message is queued for the viewed
+/// agent, removes it from the queue and prepends it to the editor.
+/// `up` / `ctrl+p` also yank, but only when the editor is empty (so
+/// they keep their normal history-navigation role otherwise); this
+/// chord yanks regardless of editor contents.
+pub const ACTION_DEQUEUE: &str = "aj.message.dequeue";
+
 /// Canonical display labels for keyboard chords that are deliberately
 /// fixed terminal conventions rather than rebindable actions.
 ///
@@ -161,6 +183,14 @@ pub fn aj_keybindings() -> KeybindingDefinitions {
         (
             ACTION_TASK_KILL.to_string(),
             K::new("ctrl+k", "Kill the selected background task"),
+        ),
+        (
+            ACTION_SUBMIT_STEERING.to_string(),
+            K::new("alt+enter", "Queue / send the message as steering"),
+        ),
+        (
+            ACTION_DEQUEUE.to_string(),
+            K::new("alt+up", "Pull the queued message back into the editor"),
         ),
     ]
 }
@@ -263,6 +293,21 @@ mod tests {
     fn aj_task_kill_defaults_to_ctrl_k() {
         let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
         assert_eq!(kbm.get_keys(ACTION_TASK_KILL), &["ctrl+k".to_string()]);
+    }
+
+    #[test]
+    fn aj_submit_steering_defaults_to_alt_enter() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(
+            kbm.get_keys(ACTION_SUBMIT_STEERING),
+            &["alt+enter".to_string()]
+        );
+    }
+
+    #[test]
+    fn aj_dequeue_defaults_to_alt_up() {
+        let kbm = KeybindingsManager::new(all_keybindings(), Vec::<(String, Vec<KeyId>)>::new());
+        assert_eq!(kbm.get_keys(ACTION_DEQUEUE), &["alt+up".to_string()]);
     }
 
     #[test]

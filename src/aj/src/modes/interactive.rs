@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
 use aj_conf::{
@@ -1086,13 +1087,15 @@ async fn run_session(
                                 }
                             }
                         }
-                        sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                        sync_editor_enabled(&mut shell.tui);
                         // Wake trigger 2: notices that arrived after
                         // the last mid-run drain point (or during an
                         // aborted turn) are still queued — wake the
                         // same agent so they reach the model without
                         // waiting for the user.
-                        if world.task_registry.has_notices(id) {
+                        if world.task_registry.has_notices(id)
+                            || world.message_queues.has_pending(id)
+                        {
                             spawn_wake_turn(
                                 id,
                                 world,
@@ -1100,7 +1103,7 @@ async fn run_session(
                                 &mut turns,
                                 &mut turn_cancels,
                             );
-                            sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                            sync_editor_enabled(&mut shell.tui);
                         }
                         match result {
                             Ok(()) => {}
@@ -1257,6 +1260,15 @@ async fn run_session(
                                 if let Some(token) = turn_cancels.get(&active) {
                                     // Viewed agent has a binary-driven turn: cancel just it.
                                     token.cancel();
+                                    // Don't discard what the user lined
+                                    // up: pull any queued message back
+                                    // into the editor.
+                                    yank_pending_into_editor(
+                                        &mut shell.tui,
+                                        &world.pump,
+                                        &world.message_queues,
+                                        active,
+                                    );
                                     quit_armed = false;
                                     continue;
                                 } else if world.pump.is_running(active) {
@@ -1266,6 +1278,12 @@ async fn run_session(
                                     if let Some(token) = turn_cancels.get(&AgentId::Main) {
                                         token.cancel();
                                     }
+                                    yank_pending_into_editor(
+                                        &mut shell.tui,
+                                        &world.pump,
+                                        &world.message_queues,
+                                        active,
+                                    );
                                     quit_armed = false;
                                     continue;
                                 }
@@ -1371,6 +1389,116 @@ async fn run_session(
                                 }
                                 shell.tui.request_render();
                                 continue;
+                            }
+                        }
+                        // Submit as a steering message. Bound via
+                        // `aj.message.steer` (default `alt+enter`);
+                        // intercepted before `shell.tui.handle_input` so
+                        // the editor never treats it as a newline. While
+                        // the viewed agent is busy this queues the
+                        // editor text as steering (escalating a pending
+                        // follow-up, or promoting it when the editor is
+                        // empty); while idle it starts a normal turn —
+                        // there is nothing to steer yet.
+                        {
+                            let kb = aj_tui::keybindings::get();
+                            let matched = kb.matches(
+                                &input,
+                                crate::config::keybindings::ACTION_SUBMIT_STEERING,
+                            );
+                            drop(kb);
+                            if matched && open_selector.is_none() && login_session.is_none() {
+                                let target = world.pump.active_view(&mut shell.tui);
+                                let text = shell
+                                    .tui
+                                    .get_mut_as::<Editor>(SlotIndex::Editor.idx())
+                                    .map(|e| e.get_expanded_text().trim().to_string())
+                                    .unwrap_or_default();
+                                let busy = turn_cancels.contains_key(&target)
+                                    || world.pump.is_running(target);
+                                if busy {
+                                    if text.is_empty() {
+                                        world.message_queues.promote(target);
+                                    } else {
+                                        world.message_queues.append_steering(target, &text);
+                                        if let Some(editor) = shell
+                                            .tui
+                                            .get_mut_as::<Editor>(SlotIndex::Editor.idx())
+                                        {
+                                            editor.add_to_history(&text);
+                                            editor.set_text("");
+                                        }
+                                    }
+                                    world.pump.sync_pending(&mut shell.tui);
+                                } else if !text.is_empty() {
+                                    if spawn_prompt_turn(
+                                        &mut shell.tui,
+                                        world,
+                                        &shell.run_config,
+                                        target,
+                                        text,
+                                        &mut turns,
+                                        &mut turn_cancels,
+                                    ) {
+                                        sync_editor_enabled(&mut shell.tui);
+                                    } else {
+                                        world.pump.handle(
+                                            &mut shell.tui,
+                                            &notice_event("This agent can't be prompted."),
+                                        );
+                                    }
+                                }
+                                shell.tui.request_render();
+                                continue;
+                            }
+                        }
+                        // Pull the queued message back into the editor.
+                        // Bound via `aj.message.dequeue` (default
+                        // `alt+up`); yanks regardless of editor contents,
+                        // prepending to the current draft.
+                        {
+                            let kb = aj_tui::keybindings::get();
+                            let matched =
+                                kb.matches(&input, crate::config::keybindings::ACTION_DEQUEUE);
+                            drop(kb);
+                            if matched && open_selector.is_none() && login_session.is_none() {
+                                let target = world.pump.active_view(&mut shell.tui);
+                                yank_pending_into_editor(
+                                    &mut shell.tui,
+                                    &world.pump,
+                                    &world.message_queues,
+                                    target,
+                                );
+                                shell.tui.request_render();
+                                continue;
+                            }
+                        }
+                        // Up / Ctrl+P with an empty editor and a pending
+                        // message yanks it (same restore as `alt+up`)
+                        // rather than navigating history. With a
+                        // non-empty editor it falls through to the
+                        // editor's normal history-up.
+                        {
+                            let kb = aj_tui::keybindings::get();
+                            let is_up = kb.matches(&input, "tui.editor.cursorUp");
+                            drop(kb);
+                            if is_up && open_selector.is_none() && login_session.is_none() {
+                                let target = world.pump.active_view(&mut shell.tui);
+                                let editor_empty = shell
+                                    .tui
+                                    .get_mut_as::<Editor>(SlotIndex::Editor.idx())
+                                    .map(|e| e.get_text().is_empty())
+                                    .unwrap_or(false);
+                                if editor_empty && world.message_queues.has_pending(target) {
+                                    yank_pending_into_editor(
+                                        &mut shell.tui,
+                                        &world.pump,
+                                        &world.message_queues,
+                                        target,
+                                    );
+                                    shell.tui.request_render();
+                                    continue;
+                                }
                             }
                         }
                         // Global command-palette chord. Bound via
@@ -1725,7 +1853,7 @@ async fn run_session(
                                     }
                                 }
                             }
-                            sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                            sync_editor_enabled(&mut shell.tui);
                             continue;
                         }
 
@@ -1741,59 +1869,49 @@ async fn run_session(
 
                             let target = world.pump.active_view(&mut shell.tui);
 
-                            // Per-agent single-turn gate: ignore the submit if the viewed
-                            // agent is already busy (a binary-driven turn or a nested
-                            // initial spawn). Mirrors `sync_editor_enabled`.
+                            // Per-agent routing: while the viewed agent
+                            // is busy (a binary-driven turn or a nested
+                            // initial spawn), a plain-Enter submit is
+                            // queued as a follow-up instead of starting
+                            // a turn; the agent's wake path delivers it
+                            // when the turn ends. The editor already
+                            // cleared itself on submit, so we only
+                            // record the history entry.
                             if turn_cancels.contains_key(&target) || world.pump.is_running(target) {
+                                if let Some(editor) =
+                                    shell.tui.get_mut_as::<Editor>(SlotIndex::Editor.idx())
+                                {
+                                    editor.add_to_history(&trimmed);
+                                }
+                                world.message_queues.append_follow_up(target, &trimmed);
+                                world.pump.sync_pending(&mut shell.tui);
                                 continue;
                             }
 
-                            // Resolve before touching editor state, so a non-promptable
-                            // target (a resumed sub-agent with no live handle) leaves the
-                            // editor as-is and just surfaces a notice.
-                            let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
-                                world.pump.handle(&mut shell.tui, &notice_event("This agent can't be prompted."));
-                                continue;
-                            };
-
-                            if let Some(editor) = shell.tui.get_mut_as::<Editor>(
-                                SlotIndex::Editor.idx()
+                            // Idle: start a turn. `spawn_prompt_turn`
+                            // clears the editor, records history, mints
+                            // the per-turn cancel token (kept in
+                            // `turn_cancels` so the Ctrl+C arm can fire
+                            // it without locking the agent), and spawns
+                            // onto `turns`. A non-promptable target
+                            // (resumed sub with no handle) returns false
+                            // with the editor left intact.
+                            if spawn_prompt_turn(
+                                &mut shell.tui,
+                                world,
+                                &shell.run_config,
+                                target,
+                                trimmed,
+                                &mut turns,
+                                &mut turn_cancels,
                             ) {
-                                editor.set_text("");
-                                editor.add_to_history(&trimmed);
-                            }
-
-                            let run_config_for_turn = Arc::clone(&shell.run_config);
-                            let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
-                            // Mint a fresh per-turn cancellation
-                            // token. The binary keeps one clone in
-                            // `turn_cancels` so the Ctrl+C arm can
-                            // fire `.cancel()` without locking the
-                            // agent mutex; the spawned task hands its
-                            // own clone to `agent.prompt`. Both clones
-                            // share cancellation state because the
-                            // inner is `Arc`-backed.
-                            let turn_cancel = CancellationToken::new();
-                            turn_cancels.insert(target, turn_cancel.clone());
-                            turns.spawn(async move {
-                                let mut a = handle.lock().await;
-                                // Stamp the run config before the turn
-                                // (main only; see `apply_turn_config`).
-                                // Done under the turn's own lock —
-                                // uncontended, since no turn is in
-                                // flight yet — so the loop never
-                                // blocks on it.
-                                apply_turn_config(
-                                    target,
-                                    &mut a,
-                                    &run_config_for_turn,
-                                    &sub_overrides_for_turn,
+                                sync_editor_enabled(&mut shell.tui);
+                            } else {
+                                world.pump.handle(
+                                    &mut shell.tui,
+                                    &notice_event("This agent can't be prompted."),
                                 );
-                                let result = a.prompt(trimmed, turn_cancel).await;
-                                (target, result)
-                            });
-                            // The viewed agent is now busy; reflect it in the editor.
-                            sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                            }
                         }
                     }
                 }
@@ -1825,7 +1943,8 @@ async fn run_session(
                 // processed the event, so the owner reads as idle and
                 // the gate inside spawn_wake_turn is open.
                 if let AgentEvent::AgentEnd { agent_id, .. } = &event
-                    && world.task_registry.has_notices(*agent_id)
+                    && (world.task_registry.has_notices(*agent_id)
+                        || world.message_queues.has_pending(*agent_id))
                 {
                     spawn_wake_turn(
                         *agent_id,
@@ -1835,7 +1954,7 @@ async fn run_session(
                         &mut turn_cancels,
                     );
                 }
-                sync_editor_enabled(&mut shell.tui, &world.pump, &turn_cancels);
+                sync_editor_enabled(&mut shell.tui);
             }
 
             // --- Theme reload (fs-watcher) ---
@@ -1997,20 +2116,82 @@ fn spawn_wake_turn(
     });
 }
 
-/// Match the editor's submit-enabled state to the *viewed* agent:
-/// the editor accepts a submit iff that agent is idle. "Busy" means
-/// the binary is driving a turn for it (`turn_cancels`) or it is
-/// running a turn the binary isn't driving — e.g. a sub-agent's
-/// initial spawn nested in the main turn (`pump.is_running`). This
-/// mirrors the submit gate and the per-view spinner.
-fn sync_editor_enabled(
+/// Spawn a user-prompt turn for `target` with `text`, sharing the
+/// per-agent machinery `spawn_wake_turn` uses (resolve handle → clear
+/// editor + record history → insert cancel token → spawn onto
+/// `turns`). Returns `false` without spawning when the target can't be
+/// prompted (e.g. a resumed sub-agent with no live handle), leaving
+/// the editor untouched so the caller can surface a notice and the
+/// user keeps their text.
+fn spawn_prompt_turn(
+    tui: &mut Tui,
+    world: &SessionWorld,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    target: AgentId,
+    text: String,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) -> bool {
+    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+        return false;
+    };
+    if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+        editor.set_text("");
+        editor.add_to_history(&text);
+    }
+    let run_config_for_turn = Arc::clone(run_config);
+    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
+    let turn_cancel = CancellationToken::new();
+    turn_cancels.insert(target, turn_cancel.clone());
+    turns.spawn(async move {
+        let mut a = handle.lock().await;
+        apply_turn_config(
+            target,
+            &mut a,
+            &run_config_for_turn,
+            &sub_overrides_for_turn,
+        );
+        let result = a.prompt(text, turn_cancel).await;
+        (target, result)
+    });
+    true
+}
+
+/// Pull the message queued for `target` (if any) back into the editor,
+/// prepending it to whatever is currently typed (blank-line joined),
+/// and repaint the pending box. Returns whether anything was yanked.
+/// Used by the dequeue chord, the empty-editor Up/Ctrl+P yank, and the
+/// per-view cancel restore.
+fn yank_pending_into_editor(
     tui: &mut Tui,
     pump: &EventPump,
-    turn_cancels: &HashMap<AgentId, CancellationToken>,
-) {
-    let active = pump.active_view(tui);
-    let busy = turn_cancels.contains_key(&active) || pump.is_running(active);
-    set_editor_submit_enabled(tui, !busy);
+    queues: &MessageQueues,
+    target: AgentId,
+) -> bool {
+    let Some(text) = queues.take_pending(target) else {
+        return false;
+    };
+    if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+        let current = editor.get_text();
+        let combined = if current.trim().is_empty() {
+            text
+        } else {
+            format!("{text}\n\n{current}")
+        };
+        editor.set_text(&combined);
+    }
+    pump.sync_pending(tui);
+    true
+}
+
+/// Keep the editor's submit enabled.
+///
+/// A submit while the viewed agent is busy is routed to the message
+/// queue by the submit handler rather than refused, so the editor is
+/// never gated on busy state. Retained as the single choke point in
+/// case a future state needs to hard-disable submit.
+fn sync_editor_enabled(tui: &mut Tui) {
+    set_editor_submit_enabled(tui, true);
 }
 
 /// Await the next completed turn, or pend forever when no turn is
@@ -5885,5 +6066,168 @@ mod tests {
         result.expect("empty wake succeeds");
         let agent = world.agent.lock().await;
         assert!(agent.messages().is_empty(), "no-op wake leaves no trace");
+    }
+
+    // ---- message queues: submit routing, yank, wake delivery -------------
+
+    /// `spawn_prompt_turn` for an idle, promptable target clears the
+    /// editor, registers the turn in `turn_cancels`, and runs the
+    /// prompt against the agent.
+    #[tokio::test]
+    async fn spawn_prompt_turn_starts_a_turn_and_clears_editor() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("hi back")]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
+        if let Some(e) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+            e.set_text("draft text");
+        }
+
+        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        let spawned = spawn_prompt_turn(
+            &mut tui,
+            &world,
+            &run_config,
+            AgentId::Main,
+            "do the thing".to_string(),
+            &mut turns,
+            &mut turn_cancels,
+        );
+        assert!(spawned);
+        assert!(turn_cancels.contains_key(&AgentId::Main));
+        let editor_text = tui
+            .get_mut_as::<Editor>(SlotIndex::Editor.idx())
+            .map(|e| e.get_text())
+            .unwrap();
+        assert!(editor_text.is_empty(), "editor cleared on spawn");
+
+        let (id, result) = turns
+            .join_next()
+            .await
+            .expect("one turn spawned")
+            .expect("turn did not panic");
+        assert_eq!(id, AgentId::Main);
+        result.expect("turn succeeds");
+        let agent = world.agent.lock().await;
+        assert!(format!("{:?}", agent.messages()).contains("do the thing"));
+    }
+
+    /// `spawn_prompt_turn` for a non-promptable target (a sub-agent
+    /// with no live handle) spawns nothing and leaves the editor
+    /// intact so the caller can surface a notice without losing the
+    /// user's text.
+    #[tokio::test]
+    async fn spawn_prompt_turn_declines_unpromptable_target() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
+        if let Some(e) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
+            e.set_text("keep me");
+        }
+
+        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        let spawned = spawn_prompt_turn(
+            &mut tui,
+            &world,
+            &run_config,
+            AgentId::Sub(99),
+            "x".to_string(),
+            &mut turns,
+            &mut turn_cancels,
+        );
+        assert!(!spawned);
+        assert!(turns.is_empty());
+        assert!(turn_cancels.is_empty());
+        let editor_text = tui
+            .get_mut_as::<Editor>(SlotIndex::Editor.idx())
+            .map(|e| e.get_text())
+            .unwrap();
+        assert_eq!(editor_text, "keep me", "editor untouched on decline");
+    }
+
+    /// `yank_pending_into_editor` moves the queued message into the
+    /// editor and empties the queue; with nothing pending it is a
+    /// no-op returning `false`.
+    #[tokio::test]
+    async fn yank_pending_into_editor_restores_and_empties() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
+
+        world
+            .message_queues
+            .append_follow_up(AgentId::Main, "queued line");
+        let yanked =
+            yank_pending_into_editor(&mut tui, &world.pump, &world.message_queues, AgentId::Main);
+        assert!(yanked);
+        let editor_text = tui
+            .get_mut_as::<Editor>(SlotIndex::Editor.idx())
+            .map(|e| e.get_text())
+            .unwrap();
+        assert_eq!(editor_text, "queued line");
+        assert!(!world.message_queues.has_pending(AgentId::Main));
+
+        assert!(
+            !yank_pending_into_editor(&mut tui, &world.pump, &world.message_queues, AgentId::Main),
+            "nothing pending → false"
+        );
+    }
+
+    /// A finished turn with a pending follow-up is delivered by the
+    /// wake path: `spawn_wake_turn` runs it as a fresh turn whose user
+    /// message is the queued text, and the queue ends empty. (No task
+    /// notice is queued — the follow-up alone opens the wake gate.)
+    #[tokio::test]
+    async fn spawn_wake_turn_delivers_queued_follow_up() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("on it")]);
+        let world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        world
+            .message_queues
+            .append_follow_up(AgentId::Main, "then tidy up");
+
+        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
+        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        spawn_wake_turn(
+            AgentId::Main,
+            &world,
+            &run_config,
+            &mut turns,
+            &mut turn_cancels,
+        );
+        assert!(
+            turn_cancels.contains_key(&AgentId::Main),
+            "follow-up alone opens the wake gate"
+        );
+        let (id, result) = turns
+            .join_next()
+            .await
+            .expect("one wake turn spawned")
+            .expect("wake turn did not panic");
+        assert_eq!(id, AgentId::Main);
+        result.expect("wake turn succeeds");
+
+        let agent = world.agent.lock().await;
+        let transcript = format!("{:?}", agent.messages());
+        assert!(
+            transcript.contains("then tidy up"),
+            "follow-up delivered: {transcript}"
+        );
+        assert!(!world.message_queues.has_pending(AgentId::Main));
     }
 }
