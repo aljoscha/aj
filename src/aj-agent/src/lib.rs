@@ -11,6 +11,7 @@ pub mod events;
 pub mod hooks;
 pub mod message;
 pub mod projection;
+pub mod queue;
 pub mod tool;
 pub mod types;
 
@@ -35,6 +36,7 @@ use crate::bus::{EventBus, Listener, SubscriptionHandle};
 use crate::events::{AgentEvent, AgentId, AgentSettings};
 use crate::message::AgentMessage;
 use crate::projection::transcript_to_messages;
+use crate::queue::{MessageQueues, PendingKind};
 use crate::tool::{
     ErasedToolDefinition, SpawnMode, SpawnResult, SpawnedAgent, StartedTask, TaskEventSink, TaskId,
     TaskKind, TaskNotice, TaskOutputSource, TaskRead, TaskStatus, TodoItem, ToolContext,
@@ -174,6 +176,14 @@ pub struct Agent {
     /// and kill tasks. Tasks in a default registry die with the
     /// process — same caveats as [`SubAgentRegistry`].
     task_registry: TaskRegistry,
+    /// Shared steering / follow-up message queues, keyed by
+    /// [`AgentId`]. The binary injects a shared instance and threads a
+    /// clone into each spawned sub-agent (see
+    /// [`SessionContextWrapper::spawn_agent`]) so the TUI can enqueue
+    /// while a turn runs; the turn driver drains them at the in-loop
+    /// steering point and the run-top (wake) point. A default handle
+    /// is used by print mode and tests, where nothing enqueues.
+    message_queues: MessageQueues,
 }
 
 impl Agent {
@@ -249,6 +259,7 @@ impl Agent {
             block_images: false,
             sub_agent_registry: SubAgentRegistry::default(),
             task_registry: TaskRegistry::default(),
+            message_queues: MessageQueues::default(),
         }
     }
 
@@ -328,6 +339,17 @@ impl Agent {
     /// one get the default registry, whose tasks die with the process.
     pub fn set_task_registry(&mut self, registry: TaskRegistry) {
         self.task_registry = registry;
+    }
+
+    /// Inject the shared steering / follow-up message queues.
+    ///
+    /// The binary calls this on the main agent so the agent and the
+    /// binary share one handle; the agent threads a clone into every
+    /// spawned sub-agent so the TUI can steer or queue for any agent
+    /// it views. Callers that never inject one get a default handle
+    /// that nothing ever enqueues onto.
+    pub fn set_message_queues(&mut self, queues: MessageQueues) {
+        self.message_queues = queues;
     }
 
     /// Subscribe an async listener to the agent's internal event
@@ -606,24 +628,26 @@ impl Agent {
         self.run_top_level_turn(Some(message)).await
     }
 
-    /// Wake the agent on queued task notices: drain them into the
-    /// transcript and run a turn so the model reacts to finished
-    /// background work without waiting for the user.
+    /// Wake the agent on pending work it can react to without a fresh
+    /// user prompt: queued task-completion notices and messages the
+    /// user queued while the agent was busy (steering / follow-up).
+    /// Drains them into the transcript and runs a turn.
     ///
     /// Returns [`WakeOutcome::Empty`] — emitting no events at all —
-    /// when the queue is empty, which makes the binary's wake
-    /// triggers idempotent: both may fire for the same notice and the
-    /// loser is a cheap no-op. Otherwise this is
+    /// when there is nothing pending, which makes the binary's wake
+    /// triggers idempotent: several may fire for the same work and the
+    /// losers are cheap no-ops. Otherwise this is
     /// [`Agent::continue_run`] minus the ends-in-user-message
-    /// precondition — the drained notices are themselves the
-    /// user-role messages that make the transcript valid for
-    /// inference.
+    /// precondition — the drained notices and queued messages are
+    /// themselves the user-role messages that make the transcript
+    /// valid for inference.
     pub async fn wake(&mut self, cancel: CancellationToken) -> Result<WakeOutcome, TurnError> {
-        // Only the owner drains its own notice queue, and every drain
-        // point holds `&mut self`, so nothing can consume the queue
-        // between this check and the drain inside
-        // `run_top_level_turn_inner`.
-        if !self.task_registry.has_notices(self.agent_id) {
+        // Only the owner drains its own queues, and every drain point
+        // holds `&mut self`, so nothing can consume them between this
+        // check and the drain inside `run_top_level_turn_inner`.
+        if !self.task_registry.has_notices(self.agent_id)
+            && !self.message_queues.has_pending(self.agent_id)
+        {
             return Ok(WakeOutcome::Empty);
         }
         self.cancellation = cancel;
@@ -700,6 +724,14 @@ impl Agent {
         // Notices that arrived while the agent was idle land before
         // the user's new message, in arrival order.
         self.drain_task_notices().await?;
+
+        // Messages the user queued while the agent was busy are
+        // delivered here on the wake / continuation path: steering
+        // first (more urgent), then follow-up. On a fresh user prompt
+        // both queues are empty (the queue box only appears while the
+        // agent is busy), so these are no-ops.
+        self.drain_queued_messages(PendingKind::Steering).await?;
+        self.drain_queued_messages(PendingKind::FollowUp).await?;
 
         if let Some(text) = prompt {
             // Append the user message to the in-memory transcript
@@ -1320,6 +1352,13 @@ impl Agent {
                 // step.
                 self.drain_task_notices().await?;
 
+                // Steering messages the user queued during the tool
+                // batch are injected here, right after the tool
+                // results and before the next inference — the urgent
+                // path. Follow-up messages are left for the wake drain
+                // when the turn ends.
+                self.drain_queued_messages(PendingKind::Steering).await?;
+
                 // Continue the conversation loop to get the model's
                 // response to tool results.
                 continue;
@@ -1379,6 +1418,57 @@ impl Agent {
                 .map_err(TurnError::Fatal)?;
         }
         Ok(())
+    }
+
+    /// Drain `kind`'s queued messages for this agent into the
+    /// transcript as user messages, emitting a `MessageStart` /
+    /// `MessageEnd` pair for each plus a trailing `QueueUpdate`.
+    /// Returns whether anything was drained.
+    ///
+    /// Unlike [`Self::drain_task_notices`] these are genuine user
+    /// messages with no `<task-notification>` wrapper: the user typed
+    /// them while the agent was busy, so they read like any prompt.
+    async fn drain_queued_messages(&mut self, kind: PendingKind) -> Result<bool, TurnError> {
+        let texts = match kind {
+            PendingKind::Steering => self.message_queues.drain_steering(self.agent_id),
+            PendingKind::FollowUp => self.message_queues.drain_follow_up(self.agent_id),
+        };
+        if texts.is_empty() {
+            return Ok(false);
+        }
+        for text in texts {
+            let message = AgentMessage::wire(Message::User(UserMessage::text(text)));
+            self.transcript.push(message.clone());
+            self.bus
+                .emit(AgentEvent::MessageStart {
+                    agent_id: self.agent_id,
+                    message: message.clone(),
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
+            self.bus
+                .emit(AgentEvent::MessageEnd {
+                    agent_id: self.agent_id,
+                    message,
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
+        }
+        // Announce the post-drain queue state so view listeners can
+        // clear the pending-message box. Renderers re-read the handle
+        // rather than trusting this payload (see `crate::queue`), but
+        // the snapshot keeps the wire event honest for out-of-process
+        // consumers.
+        let (steering, follow_up) = self.message_queues.event_messages(self.agent_id);
+        self.bus
+            .emit(AgentEvent::QueueUpdate {
+                agent_id: self.agent_id,
+                steering,
+                follow_up,
+            })
+            .await
+            .map_err(TurnError::Fatal)?;
+        Ok(true)
     }
 
     /// Project a finalized [`ToolOutcome`] onto a unified
@@ -1598,6 +1688,7 @@ impl Agent {
             speed: self.speed,
             sub_agent_registry: self.sub_agent_registry.clone(),
             task_registry: self.task_registry.clone(),
+            message_queues: self.message_queues.clone(),
             call_id: call_id.to_string(),
         };
 
@@ -2307,6 +2398,10 @@ struct SessionContextWrapper<'a> {
     /// tasks started by this tool call (and by spawned sub-agents)
     /// land in the same map the binary observes.
     task_registry: TaskRegistry,
+    /// Shared steering / follow-up message queues, cloned from the
+    /// parent so a spawned sub-agent drains the same per-agent slots
+    /// the binary's TUI enqueues onto.
+    message_queues: MessageQueues,
     /// Id of the tool call this wrapper was built for. Captured on the
     /// [`TaskEventSink`] so task lifecycle events correlate with the
     /// originating transcript cell.
@@ -2424,6 +2519,10 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // observes, with notices scoped to the sub-agent's own
             // id.
             sub_agent.set_task_registry(self.task_registry.clone());
+            // Share the steering / follow-up queues so the user can
+            // steer or queue for this sub-agent from its view; the
+            // sub-agent drains its own `Sub(n)`-keyed slots.
+            sub_agent.set_message_queues(self.message_queues.clone());
             // Share the parent's bus per `docs/aj-next-plan.md`
             // §1.6: every event the sub-agent emits during its
             // run reaches the listeners the binary registered on
@@ -2871,6 +2970,7 @@ mod event_protocol_tests {
     use crate::bus::listener_from_sync;
     use crate::events::{AgentEvent, AgentId};
     use crate::message::AgentMessage;
+    use crate::queue::MessageQueues;
     use crate::tool::{
         ErasedToolDefinition, TaskKind, TaskNotice, TaskStatus, ToolContext, ToolDefinition,
         ToolDetails, ToolOutcome,
@@ -5117,5 +5217,165 @@ mod event_protocol_tests {
             recorded.lock().unwrap()
         );
         assert!(agent.messages().is_empty());
+    }
+
+    // ---- steering / follow-up queues --------------------------------------
+
+    /// Tool that enqueues a steering message for `Main` through the
+    /// shared [`MessageQueues`] while it runs, standing in for the user
+    /// pressing Alt+Enter during a tool batch.
+    #[derive(Clone)]
+    struct SteerTool {
+        queues: MessageQueues,
+    }
+
+    impl ToolDefinition for SteerTool {
+        type Input = PingInput;
+
+        fn name(&self) -> &'static str {
+            "steer_tool"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that enqueues a steering message"
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &mut dyn ToolContext,
+            _input: PingInput,
+        ) -> anyhow::Result<ToolOutcome> {
+            self.queues.append_steering(AgentId::Main, "steer now");
+            Ok(ToolOutcome {
+                content: vec![aj_models::types::UserContent::text("ok".to_string())],
+                details: ToolDetails::Text {
+                    summary: "steer_tool".to_string(),
+                    body: "ok".to_string(),
+                },
+                is_error: false,
+            })
+        }
+    }
+
+    /// In-loop steering drain: a message queued while a tool batch runs
+    /// is injected as a user message after the batch's tool results and
+    /// before the next inference, and a `QueueUpdate` announces the
+    /// now-empty queue.
+    #[tokio::test]
+    async fn steering_queued_mid_batch_drains_after_tool_batch() {
+        let queues = MessageQueues::default();
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "steer_tool")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(
+            scripts,
+            vec![SteerTool {
+                queues: queues.clone(),
+            }
+            .into()],
+        );
+        agent.set_message_queues(queues.clone());
+
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            captured_clone.lock().unwrap().push(event.clone());
+        }));
+
+        agent
+            .prompt("go".to_string(), CancellationToken::new())
+            .await
+            .expect("prompt");
+
+        let events = captured.lock().unwrap().clone();
+        let tool_end_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .expect("tool batch finished");
+        let steer_end_idx = events
+            .iter()
+            .position(|e| match e {
+                AgentEvent::MessageEnd { message, .. } => {
+                    user_text(message).is_some_and(|t| t == "steer now")
+                }
+                _ => false,
+            })
+            .expect("steering user message emitted");
+        let second_inference_idx = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    AgentEvent::MessageStart { message, .. }
+                        if matches!(message.as_wire(), Some(Message::Assistant(_)))
+                )
+            })
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("second inference started");
+        assert!(
+            tool_end_idx < steer_end_idx && steer_end_idx < second_inference_idx,
+            "steering must land after the tool batch and before the next inference \
+             (tool_end={tool_end_idx}, steer={steer_end_idx}, \
+             inference={second_inference_idx})"
+        );
+
+        // A QueueUpdate announcing the drained (now-empty) queue follows
+        // the injected message.
+        let queue_update_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::QueueUpdate { .. }))
+            .expect("QueueUpdate emitted on drain");
+        assert!(steer_end_idx < queue_update_idx);
+        let AgentEvent::QueueUpdate {
+            steering,
+            follow_up,
+            ..
+        } = &events[queue_update_idx]
+        else {
+            unreachable!()
+        };
+        assert!(steering.is_empty() && follow_up.is_empty());
+        assert!(!queues.has_pending(AgentId::Main));
+    }
+
+    /// Wake delivers a queued follow-up: with no task notices but a
+    /// pending follow-up, `wake` runs a bracketed turn whose user
+    /// message is the queued text, then the queue is empty. This is the
+    /// path the binary's turn-completion trigger drives when a turn
+    /// finishes with a follow-up pending.
+    #[tokio::test]
+    async fn wake_delivers_queued_follow_up() {
+        let queues = MessageQueues::default();
+        let scripts = vec![finalize_script(finalize_text("on it"))];
+        let mut agent = build_agent(scripts, Vec::new());
+        agent.set_message_queues(queues.clone());
+        queues.append_follow_up(AgentId::Main, "then clean up the temp files");
+
+        let ends: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ends_clone = Arc::clone(&ends);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::MessageEnd { message, .. } = event {
+                if let Some(text) = user_text(message) {
+                    ends_clone.lock().unwrap().push(text);
+                }
+            }
+        }));
+
+        let outcome = agent
+            .wake(CancellationToken::new())
+            .await
+            .expect("wake runs the queued follow-up");
+        assert_eq!(outcome, crate::WakeOutcome::Ran);
+
+        assert_eq!(
+            *ends.lock().unwrap(),
+            vec!["then clean up the temp files".to_string()]
+        );
+        let first = user_text(&agent.messages()[0]).expect("first message is the follow-up");
+        assert_eq!(first, "then clean up the temp files");
+        assert!(!queues.has_pending(AgentId::Main));
     }
 }

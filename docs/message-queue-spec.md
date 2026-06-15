@@ -177,26 +177,26 @@ A shared, `Arc`-backed, `Clone` handle modeled on `TaskRegistry`:
 /// One agent's pending messages. At most one of the two is non-empty
 /// under the TUI's coalescing invariant (§4.2); the Vec shape matches
 /// the QueueUpdate wire contract and leaves room for other producers.
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct AgentQueues {
-    steering: Vec<UserMessage>,
-    follow_up: Vec<UserMessage>,
+    steering: Vec<String>,
+    follow_up: Vec<String>,
 }
 
 pub struct MessageQueues {
     inner: Arc<Mutex<HashMap<AgentId, AgentQueues>>>,
-    bus: EventBus, // emits QueueUpdate after every change
 }
 ```
 
-`bus` is a clone of the session bus, obtained at construction the way
-`TaskRegistry`'s drivers receive one. Every mutator mutates under the
-lock, drops the lock, then emits
-`QueueUpdate { agent_id, steering, follow_up }` for that agent — the
-snapshot is taken under the lock so the emitted payload is internally
-consistent. The lock is never held across the `await` on `emit`.
+The handle carries **no event bus** — mirroring `TaskRegistry`, which
+is also pure state (only its per-task driver holds a bus). All methods
+are `&self`, synchronous, and never held across an `.await`. Emission
+of `QueueUpdate` is split by who changed the queue: the **agent** emits
+it after it drains (it is mid-turn, holding its own bus), and the
+**TUI** re-syncs its own box directly after it enqueues (it holds
+`&mut Tui` in the input arm). See §3.4.
 
-**Mutators** (called from the TUI input arm, which is async):
+**Mutators** (called synchronously from the TUI input arm):
 
 - `append_follow_up(agent, text)` — newline-join `text` onto the agent's
   pending message; create a Follow-up if none exists; never change an
@@ -214,13 +214,17 @@ consistent. The lock is never held across the `await` on `emit`.
 `&mut self` — the in-loop steering point and the run-top wake drain,
 §3.3):
 
-- `drain_steering(agent) -> Vec<UserMessage>`
-- `drain_follow_up(agent) -> Vec<UserMessage>`
+- `drain_steering(agent) -> Vec<String>`
+- `drain_follow_up(agent) -> Vec<String>`
 
-Each removes and returns the relevant slot and emits `QueueUpdate`.
+Each removes and returns the relevant slot. The agent appends the
+drained text as user messages and then emits one `QueueUpdate`
+announcing the post-drain state.
 
 **Reads** (no emit): `snapshot(agent) -> QueueSnapshot { kind, text }`
-and `has_pending(agent) -> bool`, used by the TUI to render the box.
+and `has_pending(agent) -> bool` for the TUI box and the wake guard;
+`event_messages(agent) -> (Vec<AgentMessage>, Vec<AgentMessage>)` for
+the agent's `QueueUpdate` payload.
 
 > NOTE: the kind is derived — Steering if the steering slot is
 > non-empty, else Follow-up if the follow-up slot is non-empty, else
@@ -270,17 +274,20 @@ the same `turn_cancels` machinery as a user submit, so the busy-gate and
 the editor's queue-routing mode stay correct while it runs and the user
 can keep queueing.
 
-### 3.4 `QueueUpdate` is a trigger, not a payload
+### 3.4 `QueueUpdate` ownership and race-freedom
 
-`QueueUpdate` is emitted on every mutation and every drain. The TUI
-treats it purely as a "something changed for this agent, re-sync"
-trigger and **always re-reads `queues.snapshot(active_view)`** rather
-than trusting the event payload. This makes the design race-free without
-ordering guarantees between the TUI task (mutations) and the turn task
-(drains): the handle's `Mutex` is the single source of truth, and a
-stale event can never clobber newer state because the handler re-reads
-the live snapshot. The payload remains correct for out-of-process
-consumers (`aj --format json`); persistence ignores `QueueUpdate` (it is
+The agent emits `QueueUpdate` after it drains (§3.3). The TUI treats it
+purely as a "something changed for this agent, re-sync" trigger and
+**always re-reads `queues.snapshot(active_view)`** rather than trusting
+the event payload. For its own enqueues the TUI re-syncs the box
+directly (it holds `&mut Tui`), so no event round-trip is needed there.
+
+This is race-free without ordering guarantees between the TUI task
+(enqueues) and the turn task (drains): the handle's `Mutex` is the
+single source of truth, and a stale event can never clobber newer state
+because the handler re-reads the live snapshot. The event payload
+remains a correct snapshot for out-of-process consumers
+(`aj --format json`); persistence ignores `QueueUpdate` (it is
 transient, like notices).
 
 ---
