@@ -5,7 +5,7 @@
 //! The binary loads the
 //! [`ModelRegistry`](aj_models::registry::ModelRegistry), picks a
 //! concrete model (either an explicit `(provider, id)` pair or the
-//! provider's first listed entry), looks up the matching
+//! provider's preferred default), looks up the matching
 //! [`Provider`] impl by the model's `api` string, and installs an
 //! [`ApiKeyResolver`] backed by [`AuthStorage`]. The resulting bundle
 //! is what
@@ -47,6 +47,18 @@ pub const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 /// working without an explicit `MODEL_API=anthropic` env var.
 pub const DEFAULT_PROVIDER_ID: &str = "anthropic";
 
+/// Preferred default model per provider, used when the user hasn't
+/// pinned a `model_name`. This is selection *policy* and deliberately
+/// lives here rather than in the catalog: `models.json` is provider
+/// data refreshed by `aj models update`, whereas "which model we reach
+/// for by default" is ours to decide.
+///
+/// A provider absent from this table — or one whose preferred id isn't
+/// in the current catalog — falls back to its first listed entry, so a
+/// catalog refresh that drops or renames the preferred model degrades
+/// gracefully instead of erroring.
+const PREFERRED_DEFAULT_MODELS: &[(&str, &str)] = &[("anthropic", "claude-opus-4-8")];
+
 /// A model handle assembled by [`resolve`] (or [`from_model_info`])
 /// ready to plug into [`aj_agent::Agent::with_provider`] or
 /// [`aj_agent::Agent::set_provider`].
@@ -71,8 +83,9 @@ pub struct ResolvedModel {
 /// to [`DEFAULT_PROVIDER_ID`] so an unconfigured run still works.
 ///
 /// `model_id` selects an entry from the provider's catalog. When
-/// [`None`] the helper picks the first listed model for that
-/// provider; the registry preserves insertion order so the choice is
+/// [`None`] the helper picks the provider's preferred default (see
+/// [`PREFERRED_DEFAULT_MODELS`]), falling back to the first listed
+/// entry; the registry preserves insertion order so the fallback is
 /// deterministic given a fixed catalog.
 ///
 /// `url_override` replaces `model_info.base_url` after lookup so a
@@ -209,16 +222,22 @@ fn pick_model(
     }
 }
 
-/// Pick the first model the registry knows about for `provider_id`.
+/// Pick the default model for `provider_id` when the user hasn't named
+/// one.
 ///
-/// The registry preserves insertion order from the catalog, so the
-/// "first" entry is whatever ships at the top of the bundled
-/// `models.json` (or the user's refreshed cache). A richer
-/// "preferred default per provider" hook is reserved for the §4.3
-/// SettingsManager work; for now the catalog order is the source of
-/// truth.
+/// Prefers the provider's entry in [`PREFERRED_DEFAULT_MODELS`] when
+/// that id is present in the catalog, otherwise falls back to the first
+/// listed model. The registry preserves catalog insertion order, so the
+/// fallback is deterministic given a fixed catalog.
 fn default_model_for<'a>(registry: &'a ModelRegistry, provider_id: &str) -> Option<&'a ModelInfo> {
-    registry.models(provider_id).into_iter().next()
+    // Honor the preferred-default policy only when the model still
+    // exists in the catalog; a refresh that drops it must not break
+    // startup.
+    let preferred = PREFERRED_DEFAULT_MODELS
+        .iter()
+        .find(|(provider, _)| *provider == provider_id)
+        .and_then(|(_, id)| registry.get(provider_id, id));
+    preferred.or_else(|| registry.models(provider_id).into_iter().next())
 }
 
 /// Apply per-call HTTP headers derived from the [`Speed`] knob.
@@ -357,11 +376,24 @@ mod tests {
             sample_model("anthropic", "claude-y", "anthropic-messages"),
         ]);
         let m = pick_model(&reg, "anthropic", None).expect("found");
-        // Insertion order: catalog order is preserved by
-        // `from_catalog_with_overrides`, so the first listed entry
-        // wins. The Codex seed is spliced in after but only injects
-        // openai-codex models, so the anthropic-first stays stable.
+        // The preferred default for anthropic isn't in this catalog, so
+        // selection falls back to the first listed entry. Catalog order
+        // is preserved by `from_catalog_with_overrides`, so that's
+        // deterministic.
         assert_eq!(m.id, "claude-x");
+    }
+
+    #[test]
+    fn pick_model_prefers_provider_default_when_present() {
+        // The preferred default is honored even when it isn't first in
+        // the catalog. "claude-opus-4-8" is anthropic's entry in
+        // `PREFERRED_DEFAULT_MODELS`.
+        let reg = registry(vec![
+            sample_model("anthropic", "claude-x", "anthropic-messages"),
+            sample_model("anthropic", "claude-opus-4-8", "anthropic-messages"),
+        ]);
+        let m = pick_model(&reg, "anthropic", None).expect("found");
+        assert_eq!(m.id, "claude-opus-4-8");
     }
 
     #[test]

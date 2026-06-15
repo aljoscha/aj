@@ -735,14 +735,15 @@ pub struct Config {
     pub model_url: Option<String>,
     /// Model name override.
     pub model_name: Option<String>,
-    /// Default thinking level.
+    /// Default thinking level applied to every request. Defaults to
+    /// `xhigh` when unset.
     pub thinking: Option<ConfigThinkingLevel>,
     /// How much of the assistant's reasoning channel to surface to
-    /// the user. Defaults to `None`, which leaves both providers'
-    /// upstream defaults in place — that's typically a `Thinking…`
-    /// placeholder with no streamed body on adaptive Anthropic
-    /// models, and no reasoning summary on OpenAI Responses.
-    /// See [`ConfigThinkingDisplay`] for the per-variant mapping.
+    /// the user. Defaults to `summarized`, which streams a terse
+    /// model-generated summary of the reasoning (Anthropic
+    /// `Summarized`, OpenAI `Concise`). Set to `omitted` to suppress
+    /// the channel. See [`ConfigThinkingDisplay`] for the per-variant
+    /// mapping.
     pub thinking_display: Option<ConfigThinkingDisplay>,
     /// Inference speed mode (Anthropic only). `fast` enables higher
     /// output-tokens-per-second at some quality cost.
@@ -760,7 +761,7 @@ pub struct Config {
     pub disabled_skills: Vec<String>,
     /// Replace expanded thinking blocks with a single italic
     /// "Thinking…" placeholder line in the interactive TUI.
-    /// Defaults to `false` (expanded). Toggled at runtime with
+    /// Defaults to `true` (collapsed). Toggled at runtime with
     /// `Ctrl+T`; see `docs/aj-next-plan.md` §4.4.
     pub hide_thinking_block: bool,
     /// Whether `read_file` resizes images to fit within the inline
@@ -797,13 +798,13 @@ impl Default for Config {
             model_api: None,
             model_url: None,
             model_name: None,
-            thinking: None,
-            thinking_display: None,
+            thinking: Some(ConfigThinkingLevel::XHigh),
+            thinking_display: Some(ConfigThinkingDisplay::Summarized),
             speed: None,
             theme: None,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
-            hide_thinking_block: false,
+            hide_thinking_block: true,
             // Image features: resize and inline-render by default;
             // blocking is opt-in.
             image_auto_resize: true,
@@ -962,7 +963,7 @@ impl Config {
                 Ok(())
             },
             display_fn: |c| c.hide_thinking_block.to_string(),
-            to_toml_fn: |c| bool_item(c.hide_thinking_block, false),
+            to_toml_fn: |c| bool_item(c.hide_thinking_block, true),
         },
         ConfigOption {
             name: "image_auto_resize",
@@ -1442,16 +1443,23 @@ mod tests {
         assert!(config.model_api.is_none());
         assert!(config.model_url.is_none());
         assert!(config.model_name.is_none());
-        assert!(config.thinking.is_none());
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::XHigh));
+        assert_eq!(
+            config.thinking_display,
+            Some(ConfigThinkingDisplay::Summarized)
+        );
+        assert!(config.hide_thinking_block);
     }
 
     #[test]
     fn test_config_deserialize_thinking_display() {
-        // Unset → None so the binary leaves both providers' upstream
-        // defaults in place.
+        // Unset → the `summarized` default.
         let (config, diag) = parse_config("", Path::new("/tmp/config.toml"));
         assert!(diag.is_empty());
-        assert!(config.thinking_display.is_none());
+        assert_eq!(
+            config.thinking_display,
+            Some(ConfigThinkingDisplay::Summarized)
+        );
 
         let cases = [
             ("summarized", ConfigThinkingDisplay::Summarized),
@@ -1646,7 +1654,7 @@ theme = "dark"
         );
         assert_eq!(config.theme.as_deref(), Some("dark"));
         // The bad key was dropped to its default.
-        assert!(config.thinking.is_none());
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::XHigh));
 
         assert_eq!(diagnostics.len(), 1);
         match &diagnostics[0] {
@@ -1839,11 +1847,13 @@ image_block = true
 
     #[test]
     fn test_config_option_display_bool() {
-        let mut config = Config::default();
-        let opt = Config::option("hide_thinking_block").unwrap();
-        assert_eq!(opt.display(&config), "false");
-        config.hide_thinking_block = true;
-        assert_eq!(opt.display(&config), "true");
+        let config = Config::default();
+        // Defaults exercise both literals: `hide_thinking_block` is
+        // on, `image_block` is off.
+        let hide = Config::option("hide_thinking_block").unwrap();
+        assert_eq!(hide.display(&config), "true");
+        let block = Config::option("image_block").unwrap();
+        assert_eq!(block.display(&config), "false");
     }
 
     #[test]
@@ -1858,10 +1868,14 @@ image_block = true
     #[test]
     fn test_config_option_display_enum() {
         let mut config = Config::default();
-        let opt = Config::option("thinking").unwrap();
-        assert_eq!(opt.display(&config), "<unset>");
+        // `speed` is unset by default and renders the placeholder.
+        let speed = Config::option("speed").unwrap();
+        assert_eq!(speed.display(&config), "<unset>");
+        // `thinking` carries the `xhigh` default.
+        let thinking = Config::option("thinking").unwrap();
+        assert_eq!(thinking.display(&config), "xhigh");
         config.thinking = Some(ConfigThinkingLevel::Medium);
-        assert_eq!(opt.display(&config), "medium");
+        assert_eq!(thinking.display(&config), "medium");
     }
 
     #[test]
@@ -2161,18 +2175,18 @@ thinking = \"low\"
         // baseline carries the prior non-default values; `config` is
         // back at defaults, so the merge drops each key it owns.
         let existing = "\
-thinking = \"low\"
+theme = \"dark\"
 disabled_tools = [\"bash\"]
 image_block = true
 ";
         let mut baseline = Config::default();
-        baseline.thinking = Some(ConfigThinkingLevel::Low);
+        baseline.theme = Some("dark".to_string());
         baseline.disabled_tools = vec!["bash".to_string()];
         baseline.image_block = true;
         let config = Config::default();
         let rewritten = rewrite_changed(existing, &baseline, &config);
 
-        assert!(!rewritten.contains("thinking"), "got: {rewritten:?}");
+        assert!(!rewritten.contains("theme"), "got: {rewritten:?}");
         assert!(!rewritten.contains("disabled_tools"), "got: {rewritten:?}");
         assert!(!rewritten.contains("image_block"), "got: {rewritten:?}");
     }
@@ -2209,7 +2223,7 @@ image_block = true
         config.speed = Some(ConfigSpeed::Fast);
         config.theme = Some("light".to_string());
         config.disabled_tools = vec!["bash".to_string(), "todo_read".to_string()];
-        config.hide_thinking_block = true;
+        config.hide_thinking_block = false;
         config.image_auto_resize = false;
         config.image_show_in_terminal = false;
         config.image_block = true;
@@ -2229,7 +2243,7 @@ image_block = true
         assert_eq!(parsed.speed, Some(ConfigSpeed::Fast));
         assert_eq!(parsed.theme.as_deref(), Some("light"));
         assert_eq!(parsed.disabled_tools, vec!["bash", "todo_read"]);
-        assert!(parsed.hide_thinking_block);
+        assert!(!parsed.hide_thinking_block);
         assert!(!parsed.image_auto_resize);
         assert!(!parsed.image_show_in_terminal);
         assert!(parsed.image_block);
