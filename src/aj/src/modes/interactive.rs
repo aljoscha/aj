@@ -2508,7 +2508,9 @@ impl ThemeWatch {
 /// guidance is actually active. Skill rows carry the skill name and a
 /// marker when the skill is excluded from the model's listing — either
 /// `disabled` (the user's `disabled_skills` config) or
-/// `model-invocation disabled` (the skill's own frontmatter).
+/// `model-invocation disabled` (the skill's own frontmatter). Disabled
+/// rows are additionally struck through so they read as inactive at a
+/// glance.
 fn build_context_notice(env: &AgentEnv) -> String {
     let mut lines = String::from("Context:");
     let source = &env.system_prompt.source;
@@ -2542,11 +2544,22 @@ fn build_context_notice(env: &AgentEnv) -> String {
         } else {
             ""
         };
-        lines.push_str(&format!(
-            "\n  - {} (skill: {}{marker})",
+        let row = format!(
+            "{} (skill: {}{marker})",
             display_path(&skill.path),
             skill.name,
-        ));
+        );
+        // A disabled skill is excluded from the model's listing
+        // entirely, so we strike its row through to set it apart at a
+        // glance. The notice renderer's dim wrap and this strikethrough
+        // are independent SGR attributes, so they nest cleanly; the
+        // `, disabled` marker stays legible through the line.
+        let row = if skill.enabled {
+            row
+        } else {
+            aj_tui::style::strikethrough(&row)
+        };
+        lines.push_str(&format!("\n  - {row}"));
     }
     lines
 }
@@ -5229,11 +5242,15 @@ mod tests {
         ];
 
         let notice = build_context_notice(&env);
-        let expected = "Context:\n  \
+        let beta =
+            aj_tui::style::strikethrough("/var/skills/beta/SKILL.md (skill: beta, disabled)");
+        let expected = format!(
+            "Context:\n  \
              - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
              - /var/skills/alpha/SKILL.md (skill: alpha)\n  \
-             - /var/skills/beta/SKILL.md (skill: beta, disabled)\n  \
-             - /var/skills/gamma/SKILL.md (skill: gamma, model-invocation disabled)";
+             - {beta}\n  \
+             - /var/skills/gamma/SKILL.md (skill: gamma, model-invocation disabled)"
+        );
         assert_eq!(notice, expected);
     }
 
