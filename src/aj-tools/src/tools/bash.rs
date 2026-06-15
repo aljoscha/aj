@@ -42,11 +42,12 @@
 //!   the structured per-stream summary (that's only meaningful once
 //!   the stream has closed).
 //! - **Cancellation / timeout.** The child is launched in a fresh
-//!   process group (`process_group(0)`) so we can SIGKILL the entire
+//!   process group (`process_group(0)`) so we can signal the entire
 //!   tree on cancel or timeout. Plain `Child::kill()` only terminates
 //!   the immediate child and leaks any grandchildren the shell forked.
-//!   On Unix we `kill(2)` the negative pgid directly; non-Unix builds
-//!   fall back to dropping the child handle.
+//!   On Unix we `SIGTERM` the process group, give it a short grace
+//!   period, then escalate to `SIGKILL`; non-Unix builds fall back to
+//!   killing just the immediate child.
 //! - **`Sequential` execution.** `bash` runs arbitrary commands; the
 //!   spec marks it `Sequential` so a batch containing it serializes
 //!   around any other in-flight tool calls.
@@ -65,7 +66,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -118,6 +119,14 @@ const TRIM_TRIGGER_BYTES: usize = ROLLING_CAP_BYTES * 2;
 /// second, with a leading-edge fire so the very first chunk of output
 /// reaches a renderer without waiting for the next tick.
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Grace period a terminated command's process group gets to exit on
+/// `SIGTERM` before we escalate to `SIGKILL`.
+///
+/// Kept comfortably below `task_stop`'s own `STOP_GRACE` (5s) so that a
+/// `task_stop` blocking on the status flip still observes the kill
+/// within its budget, even for a command that ignores `SIGTERM`.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct BashTool;
@@ -172,9 +181,9 @@ impl ToolDefinition for BashTool {
         let command = input.command.clone();
 
         // Build the child. `process_group(0)` makes the child the
-        // leader of a new process group so a SIGKILL to the negative
-        // pgid reaches every descendant the shell may have spawned (a
-        // `Child::kill` alone only signals the immediate child).
+        // leader of a new process group so signaling the group reaches
+        // every descendant the shell may have spawned (a `Child::kill`
+        // alone only signals the immediate child).
         //
         // `stdin: null` keeps any command that reads from stdin from
         // hanging on the agent's terminal — the child gets EOF
@@ -248,8 +257,7 @@ impl ToolDefinition for BashTool {
                     // entry yet — bailing without killing it would
                     // leak a process that task_stop and shutdown can
                     // never reach.
-                    kill_process_group(child_pid);
-                    let _ = child.wait().await;
+                    terminate_process_group(&mut child, child_pid).await;
                     return Err(err.into());
                 }
             };
@@ -338,9 +346,7 @@ impl ToolDefinition for BashTool {
         // Cancel/timeout paths: signal the whole process group so any
         // shell-spawned grandchildren die with the parent.
         if matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut) {
-            kill_process_group(child_pid);
-            // Reap the zombie so `child` doesn't outlive the function.
-            let _ = child.wait().await;
+            terminate_process_group(&mut child, child_pid).await;
         }
 
         // The reader tasks exit when their pipe closes (which happens
@@ -741,8 +747,7 @@ async fn drive_background_bash(task: BackgroundBash) {
             // deliberately not wired in — outliving the turn is the
             // point.
             _ = cancel.cancelled() => {
-                kill_process_group(child_pid);
-                let _ = child.wait().await;
+                terminate_process_group(&mut child, child_pid).await;
                 break TaskStatus::Killed;
             }
             res = child.wait() => {
@@ -1088,34 +1093,48 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
     crate::sanitize::sanitize_terminal_output(&lossy)
 }
 
-/// SIGKILL the entire process group rooted at `pid`.
+/// Terminate the child's whole process group and reap the child.
+///
+/// Sends `SIGTERM` to the group first so the command (and any
+/// descendants the shell forked) can run their cleanup handlers, then
+/// waits up to [`KILL_GRACE`] for the leader to exit before escalating
+/// to an unconditional `SIGKILL`. Returns once the child has been
+/// reaped, so the handle never outlives the call.
 #[cfg(unix)]
-fn kill_process_group(pid: i32) {
-    // `pid` is the child's PID, which equals its process-group id because
-    // it was spawned with `process_group(0)`. A negative argument to
-    // `kill(2)` targets the whole process group, so this SIGKILLs the
-    // immediate child plus every descendant the shell forked.
-    //
-    // We invoke the syscall directly rather than shelling out to the
-    // `kill(1)` binary: that binary's parsing of a negative pgid argument
-    // varies across environments and on some runners silently fails to
-    // deliver the signal, leaving the process tree alive until it exits
-    // on its own.
-    //
-    // NOTE: `process_group(0)` guarantees the group id is the child PID
-    // (> 1), so `-pid` can never collapse to `kill(-1, ...)` (every
-    // process) or `kill(0, ...)` (our own group).
-    debug_assert!(pid > 1, "child pid/pgid must be > 1");
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
+async fn terminate_process_group(child: &mut Child, pgid: i32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    // `pgid` is the child's PID, which equals its process-group id
+    // because it was spawned with `process_group(0)`. `killpg` signals
+    // the whole group, reaching the immediate child plus every
+    // descendant. That `process_group(0)` also guarantees the group id
+    // is the child PID (> 1), so we never target group 0 (our own
+    // group) or -1 (every process).
+    debug_assert!(pgid > 1, "child pid/pgid must be > 1");
+    let group = Pid::from_raw(pgid);
+
+    // Errors here mean the group is already gone (ESRCH) or we lack
+    // permission; either way `child.wait()` below resolves the handle,
+    // so there is nothing actionable to do with them.
+    let _ = killpg(group, Signal::SIGTERM);
+    if tokio::time::timeout(KILL_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        // Still alive after the grace window: escalate and reap.
+        let _ = killpg(group, Signal::SIGKILL);
+        let _ = child.wait().await;
     }
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: i32) {
-    // Process-group semantics are Unix-only; on other platforms we
-    // rely on the `Child` drop / explicit `kill` to terminate the
-    // immediate child. Grandchild leakage is a known limitation.
+async fn terminate_process_group(child: &mut Child, _pgid: i32) {
+    // Process-group semantics are Unix-only; elsewhere we kill just the
+    // immediate child and accept that shell-forked grandchildren may
+    // leak.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 #[cfg(test)]
@@ -1502,9 +1521,58 @@ mod tests {
         assert!(wire.contains("Command cancelled"), "wire: {wire:?}");
     }
 
-    /// Timeout kills the process and surfaces an `is_error: true`
-    /// outcome with no exit code and a timeout marker in the wire
-    /// content.
+    /// A command that ignores `SIGTERM` is still killed: once the grace
+    /// window elapses we escalate to `SIGKILL`, so cancellation finishes
+    /// long before the command's natural runtime. Without escalation the
+    /// whole group would shrug off the `SIGTERM` and run for the full
+    /// timeout.
+    #[tokio::test]
+    async fn cancellation_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let (mut ctx, _updates) = RecordingCtx::new();
+        let token = ctx.cancellation();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            token.cancel();
+        });
+
+        let start = Instant::now();
+        let outcome = BashTool
+            .execute(
+                &mut ctx,
+                BashInput {
+                    // `trap '' TERM` makes the shell ignore SIGTERM; the
+                    // loop keeps it (and thus the group) alive until the
+                    // escalation SIGKILL lands.
+                    command: "trap '' TERM; while true; do sleep 0.2; done".to_string(),
+                    timeout: 60,
+                    description: "test sigkill escalation".to_string(),
+                    run_in_background: false,
+                },
+            )
+            .await
+            .expect("execute");
+        let elapsed = start.elapsed();
+
+        // We waited out the grace window (proving SIGTERM alone did not
+        // end it) but still finished far short of the 60s timeout.
+        assert!(
+            elapsed >= KILL_GRACE,
+            "should have waited the grace window before SIGKILL, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "escalation should kill shortly after the grace window, took {elapsed:?}"
+        );
+        assert!(outcome.is_error, "cancellation should mark is_error");
+        match &outcome.details {
+            ToolDetails::Bash { exit_code, .. } => {
+                assert!(exit_code.is_none(), "killed process has no exit code");
+            }
+            other => panic!("expected Bash details, got {other:?}"),
+        }
+        let wire = extract_text(&outcome.content);
+        assert!(wire.contains("Command cancelled"), "wire: {wire:?}");
+    }
     #[tokio::test]
     async fn timeout_kills_command_and_marks_error() {
         let mut ctx = DummyToolContext::default();
