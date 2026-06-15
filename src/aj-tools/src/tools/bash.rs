@@ -45,8 +45,8 @@
 //!   process group (`process_group(0)`) so we can SIGKILL the entire
 //!   tree on cancel or timeout. Plain `Child::kill()` only terminates
 //!   the immediate child and leaks any grandchildren the shell forked.
-//!   On Unix we shell out to `kill -9 -- -<pgid>`; non-Unix builds fall
-//!   back to dropping the child handle.
+//!   On Unix we `kill(2)` the negative pgid directly; non-Unix builds
+//!   fall back to dropping the child handle.
 //! - **`Sequential` execution.** `bash` runs arbitrary commands; the
 //!   spec marks it `Sequential` so a batch containing it serializes
 //!   around any other in-flight tool calls.
@@ -172,9 +172,9 @@ impl ToolDefinition for BashTool {
         let command = input.command.clone();
 
         // Build the child. `process_group(0)` makes the child the
-        // leader of a new process group so `kill -9 -- -<pgid>` reaches
-        // every descendant the shell may have spawned (a `Child::kill`
-        // alone only signals the immediate child).
+        // leader of a new process group so a SIGKILL to the negative
+        // pgid reaches every descendant the shell may have spawned (a
+        // `Child::kill` alone only signals the immediate child).
         //
         // `stdin: null` keeps any command that reads from stdin from
         // hanging on the agent's terminal — the child gets EOF
@@ -1088,17 +1088,27 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
     crate::sanitize::sanitize_terminal_output(&lossy)
 }
 
-/// SIGKILL the entire process group rooted at `pid`. Negative argument
-/// to `kill(2)` (and the `kill` shell command) targets a process group
-/// rather than a single process — combined with `process_group(0)` at
-/// spawn time this terminates the immediate child plus every
-/// descendant the shell forked.
+/// SIGKILL the entire process group rooted at `pid`.
 #[cfg(unix)]
 fn kill_process_group(pid: i32) {
-    let _ = std::process::Command::new("kill")
-        .arg("-9")
-        .arg(format!("-{}", pid))
-        .status();
+    // `pid` is the child's PID, which equals its process-group id because
+    // it was spawned with `process_group(0)`. A negative argument to
+    // `kill(2)` targets the whole process group, so this SIGKILLs the
+    // immediate child plus every descendant the shell forked.
+    //
+    // We invoke the syscall directly rather than shelling out to the
+    // `kill(1)` binary: that binary's parsing of a negative pgid argument
+    // varies across environments and on some runners silently fails to
+    // deliver the signal, leaving the process tree alive until it exits
+    // on its own.
+    //
+    // NOTE: `process_group(0)` guarantees the group id is the child PID
+    // (> 1), so `-pid` can never collapse to `kill(-1, ...)` (every
+    // process) or `kill(0, ...)` (our own group).
+    debug_assert!(pid > 1, "child pid/pgid must be > 1");
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
 }
 
 #[cfg(not(unix))]
