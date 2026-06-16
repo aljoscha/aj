@@ -124,6 +124,17 @@ impl AgentFooters {
         }
     }
 
+    /// Overwrite `id`'s context-occupancy numerator. Used after a
+    /// compaction reseeds the transcript: no `TurnUsage` follows a
+    /// compaction, so without this the footer would keep showing the
+    /// pre-compaction occupancy until the next real turn. A missing
+    /// entry is left untouched (nothing to display against yet).
+    pub fn set_context_tokens(&mut self, id: AgentId, tokens: u64) {
+        if let Some(entry) = self.agents.get_mut(&id) {
+            entry.last_turn_context_tokens = Some(tokens);
+        }
+    }
+
     /// Format the footer's model line, `"<model_id> <thinking>"`,
     /// for `id`, falling back to the Main entry when `id` has none.
     /// Returns `None` when the resolved entry's `model_id` is empty

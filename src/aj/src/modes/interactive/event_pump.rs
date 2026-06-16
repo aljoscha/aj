@@ -317,6 +317,14 @@ impl EventPump {
         self.footer_data.context_usage(id).context_window
     }
 
+    /// Current context-occupancy numerator for `id` (the size of the
+    /// prompt that produced the most recent response), or `None` when
+    /// no turn has landed yet. The auto-compaction trigger compares it
+    /// against [`Self::agent_context_window`].
+    pub fn agent_context_tokens(&self, id: AgentId) -> Option<u64> {
+        self.footer_data.context_usage(id).tokens
+    }
+
     /// Resolve the context window for a settings identity known
     /// only as `(provider, model_id)` strings:
     ///
@@ -662,6 +670,14 @@ impl EventPump {
                         *agent_id,
                         &format!("Context compacted: ~{tokens_before} → ~{tokens_after} tokens."),
                     );
+                    // No `TurnUsage` follows a compaction, so refresh the
+                    // footer occupancy directly to the post-compaction
+                    // estimate.
+                    self.footer_data
+                        .set_context_tokens(*agent_id, *tokens_after);
+                    if *agent_id == self.active_view(tui) {
+                        self.sync_footer(tui);
+                    }
                 }
                 tui.request_render();
             }

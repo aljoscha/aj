@@ -26,7 +26,7 @@ pub mod shutdown;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1059,6 +1059,11 @@ async fn run_session(
     // exactly "agents the binary is currently driving".
     let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
     let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+    // Agents whose currently-tracked task is a compaction rather than a
+    // real turn. Lets the completion arm skip re-evaluating the
+    // auto-compaction threshold against a compaction it just ran (which
+    // would otherwise loop, since occupancy is read from the footer).
+    let mut compaction_agents: HashSet<AgentId> = HashSet::new();
     // Implements the "press Ctrl+C again to quit" guard when the
     // viewed agent is idle but other agents or background tasks are
     // still running.
@@ -1103,6 +1108,7 @@ async fn run_session(
                 match joined {
                     Ok((id, result)) => {
                         turn_cancels.remove(&id);
+                        let was_compaction = compaction_agents.remove(&id);
                         world.pump.mark_idle(&mut shell.tui, id);
                         // Main-turn completion bounds every nested
                         // initial spawn it started. Drain any sub
@@ -1139,7 +1145,43 @@ async fn run_session(
                             sync_editor_enabled(&mut shell.tui);
                         }
                         match result {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                // Auto-compaction: after a successful real
+                                // Main turn (not a compaction, and only when
+                                // no wake turn was just spawned), compact if
+                                // occupancy crossed the configured threshold.
+                                if id == AgentId::Main
+                                    && !was_compaction
+                                    && !turn_cancels.contains_key(&AgentId::Main)
+                                {
+                                    let (auto, threshold, keep_recent) = {
+                                        let c =
+                                            shell.config.lock().expect("config mutex poisoned");
+                                        (c.auto_compact, c.compact_threshold, c.compact_keep_recent)
+                                    };
+                                    if auto
+                                        && let Some(tokens) =
+                                            world.pump.agent_context_tokens(AgentId::Main)
+                                        && aj_session::compaction::should_compact(
+                                            tokens,
+                                            world.pump.agent_context_window(AgentId::Main),
+                                            threshold,
+                                        )
+                                    {
+                                        spawn_compaction_turn(
+                                            world,
+                                            &shell.run_config,
+                                            aj_agent::events::CompactionReason::Threshold,
+                                            None,
+                                            keep_recent,
+                                            &mut turns,
+                                            &mut turn_cancels,
+                                            &mut compaction_agents,
+                                        );
+                                        sync_editor_enabled(&mut shell.tui);
+                                    }
+                                }
+                            }
                             Err(TurnError::Aborted) => {
                                 // The agent has already emitted the
                                 // synthetic aborted `MessageEnd` and
@@ -1875,10 +1917,12 @@ async fn run_session(
                                                 spawn_compaction_turn(
                                                     world,
                                                     &shell.run_config,
+                                                    aj_agent::events::CompactionReason::Manual,
                                                     None,
                                                     keep_recent,
                                                     &mut turns,
                                                     &mut turn_cancels,
+                                                    &mut compaction_agents,
                                                 );
                                                 sync_editor_enabled(&mut shell.tui);
                                             }
@@ -2235,10 +2279,12 @@ fn spawn_prompt_turn(
 fn spawn_compaction_turn(
     world: &SessionWorld,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    reason: aj_agent::events::CompactionReason,
     instructions: Option<String>,
     keep_recent_tokens: u64,
     turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
     turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+    compaction_agents: &mut HashSet<AgentId>,
 ) -> bool {
     let target = AgentId::Main;
     let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
@@ -2249,6 +2295,9 @@ fn spawn_compaction_turn(
     let log = Arc::clone(&world.log);
     let turn_cancel = CancellationToken::new();
     turn_cancels.insert(target, turn_cancel.clone());
+    // Tagged so the completion arm tells a compaction apart from a real
+    // turn and doesn't re-check the auto-compaction threshold against it.
+    compaction_agents.insert(target);
     turns.spawn(async move {
         let mut a = handle.lock().await;
         // Stamp the latest staged config so the summarizer uses the
@@ -2262,7 +2311,7 @@ fn spawn_compaction_turn(
         let _ = crate::compaction::run_compaction(
             &mut a,
             &log,
-            aj_agent::events::CompactionReason::Manual,
+            reason,
             instructions.as_deref(),
             keep_recent_tokens,
             turn_cancel,
