@@ -636,6 +636,52 @@ impl ConfigOption {
         (self.apply_toml_fn)(value, config)
     }
 
+    /// Apply a value supplied as a user-entered string — the shape the
+    /// interactive settings window (and any string-based entry path)
+    /// delivers — by converting it to the [`toml::Value`] this option's
+    /// [`Self::apply_toml`] expects, then applying it.
+    ///
+    /// This is the single place that turns a UI string into the typed
+    /// value an option wants, keyed off [`Self::kind`], so adding an
+    /// option to [`Config::OPTIONS`] makes it editable from those paths
+    /// without a bespoke parser. Validation (range checks, enum
+    /// membership) still runs inside `apply_toml`.
+    pub fn apply_str(&self, value: &str, config: &mut Config) -> Result<(), toml::de::Error> {
+        let parsed = match self.kind {
+            ValueKind::Bool => toml::Value::Boolean(value.parse::<bool>().map_err(|_| {
+                <toml::de::Error as serde::de::Error>::custom(format!(
+                    "{}: expected `true` or `false`, got `{value}`",
+                    self.name
+                ))
+            })?),
+            // Prefer an integer so integer-backed options keep an exact
+            // value; fall back to a float for fractional input.
+            ValueKind::Number => {
+                if let Ok(i) = value.parse::<i64>() {
+                    toml::Value::Integer(i)
+                } else if let Ok(f) = value.parse::<f64>() {
+                    toml::Value::Float(f)
+                } else {
+                    return Err(<toml::de::Error as serde::de::Error>::custom(format!(
+                        "{}: expected a number, got `{value}`",
+                        self.name
+                    )));
+                }
+            }
+            // Comma-separated, trimmed, empty entries dropped.
+            ValueKind::StringList => toml::Value::Array(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| toml::Value::String(s.to_string()))
+                    .collect(),
+            ),
+            ValueKind::String | ValueKind::Enum(_) => toml::Value::String(value.to_string()),
+        };
+        self.apply_toml(parsed, config)
+    }
+
     /// Render the field's current value for display.
     pub fn display(&self, config: &Config) -> String {
         (self.display_fn)(config)
@@ -1971,6 +2017,34 @@ hide_thinking_block = true
     fn int_item_emits_only_when_changed() {
         assert!(int_item(20_000, 20_000).is_none());
         assert!(int_item(8_000, 20_000).is_some());
+    }
+
+    /// Guard for the settings-apply path: every schema option must
+    /// accept a representative string value through [`apply_str`]. The
+    /// interactive settings window feeds edits to `apply_str` as
+    /// strings, so an option whose `kind`/validation can't round-trip a
+    /// sane value would silently fail to apply from the window. Driven
+    /// with a per-kind literal rather than each field's default
+    /// `display()` because the latter is the `<unset>`/`<empty>`
+    /// sentinel for unset `Option`/empty-list fields.
+    #[test]
+    fn every_option_applies_its_string_value() {
+        for option in Config::OPTIONS {
+            let mut config = Config::default();
+            let value = match option.kind {
+                ValueKind::Bool => "true".to_string(),
+                ValueKind::Number => "1".to_string(),
+                ValueKind::StringList => "a, b".to_string(),
+                ValueKind::Enum(variants) => variants[0].to_string(),
+                ValueKind::String => "x".to_string(),
+            };
+            option.apply_str(&value, &mut config).unwrap_or_else(|e| {
+                panic!(
+                    "option {} rejected its apply_str value {value:?}: {e}",
+                    option.name
+                )
+            });
+        }
     }
 
     #[test]

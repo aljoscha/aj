@@ -4556,7 +4556,36 @@ async fn apply_setting_change(
                 save_note,
             ))
         }
-        other => Some(format!("Unknown setting {other:?}.")),
+        other => {
+            // Any other key that's a real schema option is a plain
+            // config-backed value with no extra side effects: the
+            // options that need a provider rebuild, theme reload, or a
+            // live render update are intercepted by the arms above.
+            // Route the rest through the schema so a freshly-added
+            // option is editable from the settings window without a
+            // bespoke arm here. `apply_str` validates the value; the
+            // `every_option_applies_its_string_value` guard in `aj-conf`
+            // keeps every option round-trippable through this path.
+            let Some(option) = Config::option(other) else {
+                return Some(format!("Unknown setting {other:?}."));
+            };
+            let (baseline, updated) = {
+                let mut cfg = config.lock().expect("config mutex poisoned");
+                let baseline = cfg.clone();
+                if let Err(err) = option.apply_str(value, &mut cfg) {
+                    // Reject without half-applying: restore the pre-edit
+                    // config and report why.
+                    *cfg = baseline;
+                    return Some(format!("Can't set {other}: {err}"));
+                }
+                (baseline, cfg.clone())
+            };
+            let save_note = match updated.persist_changed(&baseline) {
+                Ok(()) => None,
+                Err(err) => Some(format!("(couldn't save to config.toml: {err})")),
+            };
+            Some(join_notice(format!("{other} set to {value}."), save_note))
+        }
     }
 }
 
