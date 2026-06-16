@@ -573,6 +573,8 @@ pub enum ValueKind {
     Enum(&'static [&'static str]),
     /// A list of strings.
     StringList,
+    /// A floating-point number (stored as `f64` on `Config`).
+    Number,
 }
 
 impl fmt::Display for ValueKind {
@@ -582,6 +584,7 @@ impl fmt::Display for ValueKind {
             ValueKind::Bool => write!(f, "bool"),
             ValueKind::Enum(variants) => write!(f, "{}", variants.join(" | ")),
             ValueKind::StringList => write!(f, "list of strings"),
+            ValueKind::Number => write!(f, "number"),
         }
     }
 }
@@ -697,6 +700,20 @@ fn bool_item(value: bool, default: bool) -> Option<toml_edit::Item> {
     (value != default).then(|| toml_edit::value(value))
 }
 
+/// `to_toml` helper for `f64` fields: emit the value only when it
+/// differs from `default`, so a config left at its default doesn't
+/// accumulate a redundant line.
+fn number_item(value: f64, default: f64) -> Option<toml_edit::Item> {
+    (value != default).then(|| toml_edit::value(value))
+}
+
+/// Emit an integer config value only when it differs from `default`, so
+/// a pristine config never accumulates redundant lines.
+#[allow(clippy::as_conversions)]
+fn int_item(value: u64, default: u64) -> Option<toml_edit::Item> {
+    (value != default).then(|| toml_edit::value(value as i64))
+}
+
 /// Canonical string form of an option's serialized value, or `None`
 /// when the option is at its default/unset (its `to_toml` returns
 /// `None`). Used to detect whether an option changed between two
@@ -790,6 +807,20 @@ pub struct Config {
     /// renders code-block bodies as plain text. Only affects
     /// interactive rendering; print mode never highlights.
     pub syntax_highlighting: bool,
+    /// Whether the agent automatically compacts context when occupancy
+    /// crosses `compact_threshold`. Defaults to `true`. Also gates the
+    /// reactive context-overflow recovery path.
+    pub auto_compact: bool,
+    /// Fraction of the model's context window at which auto-compaction
+    /// fires. Defaults to `0.85`. Must be in the half-open range
+    /// `(0.0, 1.0]`.
+    pub compact_threshold: f64,
+    /// Approximate tokens of recent conversation kept verbatim after a
+    /// compaction; everything older is summarized into the checkpoint.
+    /// A fixed budget rather than a fraction of the window, so the
+    /// summarized range depends only on how much recent context we want
+    /// to retain, not on the model. Defaults to `20_000`.
+    pub compact_keep_recent: u64,
 }
 
 impl Default for Config {
@@ -811,6 +842,9 @@ impl Default for Config {
             image_show_in_terminal: true,
             image_block: false,
             syntax_highlighting: false,
+            auto_compact: true,
+            compact_threshold: 0.85,
+            compact_keep_recent: 20_000,
         }
     }
 }
@@ -1008,6 +1042,78 @@ impl Config {
             },
             display_fn: |c| c.syntax_highlighting.to_string(),
             to_toml_fn: |c| bool_item(c.syntax_highlighting, false),
+        },
+        ConfigOption {
+            name: "auto_compact",
+            description: "Automatically summarize earlier context when the window fills up.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.auto_compact = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.auto_compact.to_string(),
+            to_toml_fn: |c| bool_item(c.auto_compact, true),
+        },
+        ConfigOption {
+            name: "compact_threshold",
+            description: "Fraction of the context window (0.0–1.0) at which auto-compaction fires.",
+            kind: ValueKind::Number,
+            apply_toml_fn: |v, c| {
+                // Accept a TOML float or integer (so both `0.85` and `1`
+                // parse), reject any other type, then validate the
+                // (0.0, 1.0] range.
+                #[allow(clippy::as_conversions)]
+                let n: f64 = match v {
+                    toml::Value::Float(f) => f,
+                    toml::Value::Integer(i) => i as f64,
+                    _ => {
+                        return Err(<toml::de::Error as serde::de::Error>::custom(
+                            "compact_threshold must be a number",
+                        ));
+                    }
+                };
+                if !(n > 0.0 && n <= 1.0) {
+                    return Err(<toml::de::Error as serde::de::Error>::custom(
+                        "compact_threshold must be in the range (0.0, 1.0]",
+                    ));
+                }
+                c.compact_threshold = n;
+                Ok(())
+            },
+            display_fn: |c| c.compact_threshold.to_string(),
+            to_toml_fn: |c| number_item(c.compact_threshold, 0.85),
+        },
+        ConfigOption {
+            name: "compact_keep_recent",
+            description: "Approximate tokens of recent context kept verbatim after a compaction.",
+            kind: ValueKind::Number,
+            apply_toml_fn: |v, c| {
+                // Accept a TOML integer or float (so `20000` and
+                // `20000.0` both parse), reject any other type, then
+                // require a positive token count.
+                #[allow(clippy::as_conversions)]
+                let n: i64 = match v {
+                    toml::Value::Integer(i) => i,
+                    toml::Value::Float(f) => f as i64,
+                    _ => {
+                        return Err(<toml::de::Error as serde::de::Error>::custom(
+                            "compact_keep_recent must be a number",
+                        ));
+                    }
+                };
+                if n <= 0 {
+                    return Err(<toml::de::Error as serde::de::Error>::custom(
+                        "compact_keep_recent must be a positive number of tokens",
+                    ));
+                }
+                #[allow(clippy::as_conversions)]
+                {
+                    c.compact_keep_recent = n as u64;
+                }
+                Ok(())
+            },
+            display_fn: |c| c.compact_keep_recent.to_string(),
+            to_toml_fn: |c| int_item(c.compact_keep_recent, 20_000),
         },
     ];
 
@@ -1794,6 +1900,80 @@ hide_thinking_block = true
     }
 
     #[test]
+    fn compact_threshold_parses_and_validates_range() {
+        let opt = Config::option("compact_threshold").unwrap();
+
+        // TOML float in range is accepted and stored verbatim.
+        let mut config = Config::default();
+        assert!(opt.apply_toml(toml::Value::Float(0.5), &mut config).is_ok());
+        assert_eq!(config.compact_threshold, 0.5);
+
+        // TOML integer is accepted and widened to f64.
+        let mut config = Config::default();
+        assert!(opt.apply_toml(toml::Value::Integer(1), &mut config).is_ok());
+        assert_eq!(config.compact_threshold, 1.0);
+
+        // 0.0 is excluded by the open lower bound.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Float(0.0), &mut config)
+                .is_err()
+        );
+
+        // Anything above 1.0 is rejected.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Float(1.5), &mut config)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compact_keep_recent_parses_and_validates() {
+        let opt = Config::option("compact_keep_recent").unwrap();
+
+        // A positive integer is accepted and stored.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Integer(8000), &mut config)
+                .is_ok()
+        );
+        assert_eq!(config.compact_keep_recent, 8000);
+
+        // A float is floored to an integer token count.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Float(12000.0), &mut config)
+                .is_ok()
+        );
+        assert_eq!(config.compact_keep_recent, 12000);
+
+        // Zero and negatives are rejected.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Integer(0), &mut config)
+                .is_err()
+        );
+        assert!(
+            opt.apply_toml(toml::Value::Integer(-1), &mut config)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn number_item_emits_only_when_changed() {
+        // At default the key is dropped; off-default it round-trips.
+        assert!(number_item(0.85, 0.85).is_none());
+        assert!(number_item(0.5, 0.85).is_some());
+    }
+
+    #[test]
+    fn int_item_emits_only_when_changed() {
+        assert!(int_item(20_000, 20_000).is_none());
+        assert!(int_item(8_000, 20_000).is_some());
+    }
+
+    #[test]
     fn test_config_image_keys_default_and_parse() {
         // Defaults: auto_resize=true, show_in_terminal=true, block=false.
         let cfg = Config::default();
@@ -1888,6 +2068,7 @@ image_block = true
         assert_eq!(ValueKind::String.to_string(), "string");
         assert_eq!(ValueKind::Bool.to_string(), "bool");
         assert_eq!(ValueKind::StringList.to_string(), "list of strings");
+        assert_eq!(ValueKind::Number.to_string(), "number");
         assert_eq!(ValueKind::Enum(&["a", "b", "c"]).to_string(), "a | b | c");
     }
 

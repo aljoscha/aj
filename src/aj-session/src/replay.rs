@@ -56,6 +56,11 @@
 //!   either.
 //! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
 //!   feeds the sub-agent bracketing below.
+//! - [`ConversationEntryKind::Compaction`]: a single
+//!   [`AgentEvent::Notice`] marking the compaction boundary in the
+//!   scrollback. The summarized prefix entries still replay in order,
+//!   so the scrollback shows the full history even though the model
+//!   context (rebuilt via `agent_messages`) is the reduced projection.
 //!
 //! Sub-agent runs are bracketed with synthesized
 //! [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
@@ -217,11 +222,13 @@ impl ReplayState {
                 self.open_sub_started = true;
             }
             // Settings entries ahead of any message don't open the
-            // bracket; the first `Message` entry does.
+            // bracket; the first `Message` entry does. A compaction
+            // marker likewise opens no bracket.
             ConversationEntryKind::ModelChange { .. }
             | ConversationEntryKind::ThinkingChange { .. }
             | ConversationEntryKind::SpeedChange { .. }
-            | ConversationEntryKind::SystemPrompt { .. } => {}
+            | ConversationEntryKind::SystemPrompt { .. }
+            | ConversationEntryKind::Compaction { .. } => {}
         }
     }
 
@@ -276,6 +283,17 @@ impl ReplayState {
                 // Seed entry: projected as the synthesized
                 // SubAgentStart by `bracket_subagent`, never as a
                 // notice.
+            }
+            ConversationEntryKind::Compaction { tokens_before, .. } => {
+                // Placeholder marker in the scrollback. A richer
+                // compaction-summary event is a later task; for now a
+                // Notice marks the boundary the same way live runs do.
+                out.push(AgentEvent::Notice {
+                    agent_id,
+                    text: format!(
+                        "Context compacted: earlier history summarized (~{tokens_before} tokens)."
+                    ),
+                });
             }
             ConversationEntryKind::Message { message: agent_msg } => {
                 self.seen_message.insert(agent_id);

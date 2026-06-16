@@ -81,6 +81,17 @@ pub enum AgentId {
     Sub(usize),
 }
 
+/// Why a compaction ran. Carried on the compaction lifecycle events so
+/// renderers can distinguish a user-invoked `/compact` from an
+/// automatic threshold trigger or context-overflow recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
 /// Bus event emitted by the agent runtime.
 ///
 /// Every variant carries an `agent_id` so a single listener (e.g. the
@@ -284,6 +295,31 @@ pub enum AgentEvent {
         usage: TokenUsage,
     },
 
+    // --- Compaction --------------------------------------------------------
+    /// Compaction has started for this agent. Renderers show a
+    /// "compacting…" indicator. Transient — not persisted.
+    CompactionStart {
+        agent_id: AgentId,
+        reason: CompactionReason,
+    },
+    /// Compaction finished. `tokens_before` / `tokens_after` are the
+    /// estimated context occupancy on either side (for a "freed ~N
+    /// tokens" notice). `summary` is the generated text so a live
+    /// renderer can show a compaction-summary row; `error` is set when
+    /// compaction failed and nothing was written. Transient — not
+    /// persisted; the conversation log's compaction entry is the
+    /// durable record.
+    CompactionEnd {
+        agent_id: AgentId,
+        reason: CompactionReason,
+        tokens_before: u64,
+        tokens_after: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     // --- Queue snapshots ---------------------------------------------------
     /// Full snapshot of both pending-message queues. Fired whenever
     /// either queue changes so listeners can render a single state
@@ -318,6 +354,8 @@ impl AgentEvent {
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
             | Self::TurnUsage { agent_id, .. }
+            | Self::CompactionStart { agent_id, .. }
+            | Self::CompactionEnd { agent_id, .. }
             | Self::TaskStart { agent_id, .. }
             | Self::TaskOutput { agent_id, .. }
             | Self::TaskEnd { agent_id, .. }
@@ -445,5 +483,37 @@ mod tests {
         assert_eq!(json["thinking"], "medium");
         assert_eq!(json["speed"], "fast");
         assert!(json.get("settings").is_none());
+    }
+
+    /// Lock the JSON-on-the-wire shape for the compaction lifecycle
+    /// events so `--format json` consumers see a stable discriminator,
+    /// the `snake_case` reason, and the numeric occupancy fields.
+    #[test]
+    fn compaction_events_serialize_with_snake_case_reason() {
+        let start = AgentEvent::CompactionStart {
+            agent_id: AgentId::Main,
+            reason: CompactionReason::Manual,
+        };
+        let json = serde_json::to_value(&start).expect("CompactionStart serializes");
+        assert_eq!(json["type"], "compaction_start");
+        assert_eq!(json["agent_id"], "main");
+        assert_eq!(json["reason"], "manual");
+
+        let end = AgentEvent::CompactionEnd {
+            agent_id: AgentId::Main,
+            reason: CompactionReason::Overflow,
+            tokens_before: 1200,
+            tokens_after: 300,
+            summary: Some("did stuff".into()),
+            error: None,
+        };
+        let json = serde_json::to_value(&end).expect("CompactionEnd serializes");
+        assert_eq!(json["type"], "compaction_end");
+        assert_eq!(json["reason"], "overflow");
+        assert_eq!(json["tokens_before"], 1200);
+        assert_eq!(json["tokens_after"], 300);
+        assert_eq!(json["summary"], "did stuff");
+        // `error` is `None`, so it is skipped on the wire.
+        assert!(json.get("error").is_none());
     }
 }

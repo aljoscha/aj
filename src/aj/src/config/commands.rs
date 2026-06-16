@@ -119,6 +119,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::NewSession,
     },
     Command {
+        name: "compact",
+        title: "compact",
+        category: "session",
+        description: "Summarize earlier context to free up the window.",
+        action_id: None,
+        action: CommandAction::Compact,
+    },
+    Command {
         name: "history",
         title: "history",
         category: "prompt",
@@ -245,6 +253,12 @@ pub enum CommandAction {
     /// in, seeds the agent's transcript empty, and clears the
     /// scrollback.
     NewSession,
+    /// Compact the current session: summarize earlier context and
+    /// reseed the agent with the reduced transcript. The interactive
+    /// loop intercepts this action and runs it as a tracked task (it
+    /// owns the turn machinery `handle_command` lacks), so the
+    /// `handle_command` arm for it is a no-op.
+    Compact,
     /// Show the command reference. The host opens the help overlay
     /// listing every entry in [`COMMANDS`].
     Help,

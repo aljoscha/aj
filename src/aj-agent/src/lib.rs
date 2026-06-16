@@ -364,6 +364,19 @@ impl Agent {
         self.bus.subscribe(listener)
     }
 
+    /// Emit one event on the agent's bus.
+    ///
+    /// Lets the host drive out-of-band lifecycle events that the agent
+    /// loop itself doesn't produce — today, the
+    /// [`AgentEvent::CompactionStart`] / [`AgentEvent::CompactionEnd`]
+    /// markers around a host-driven compaction. Listeners are awaited
+    /// inline (a failing listener maps to [`TurnError::Fatal`]), exactly
+    /// like the agent's own emits, so the event reaches the renderer and
+    /// any out-of-process sinks in order.
+    pub async fn emit_event(&self, event: AgentEvent) -> Result<(), TurnError> {
+        self.bus.emit(event).await.map_err(TurnError::Fatal)
+    }
+
     /// Subscribe a channel-style sink for the agent's event bus.
     ///
     /// Registers a non-blocking forwarding listener that pushes
@@ -446,6 +459,18 @@ impl Agent {
             .seed_sub_agent_counter(seed.sub_agent_counter);
     }
 
+    /// Replace the in-memory transcript wholesale. Contract: call only
+    /// while no turn is in flight (the caller holds the agent lock and
+    /// is not inside `prompt` / `wake` / `continue_run`). Used by
+    /// host-driven compaction to install the reduced post-compaction
+    /// projection; the durable record is the conversation log's
+    /// compaction entry, from which an identical transcript is
+    /// reconstructed on resume. The assembled system prompt and
+    /// sub-agent counter are untouched.
+    pub fn reseed_transcript(&mut self, transcript: Vec<AgentMessage>) {
+        self.transcript = transcript;
+    }
+
     /// Install a hook fired before every tool call, replacing any
     /// previous hook. Passing the closure inside `Some(...)` enables
     /// the hook; passing `None` clears it. See
@@ -519,6 +544,66 @@ impl Agent {
         ));
 
         text
+    }
+
+    /// Run a single, bus-silent completion against the agent's provider
+    /// and return the concatenated assistant text. Does not touch the
+    /// transcript, emits no events, and does not accumulate usage.
+    /// Honors `cancel`.
+    ///
+    /// Used for out-of-band model calls — today, generating a
+    /// compaction summary. `max_tokens` caps the response;
+    /// `system_prompt` and the single user `text` define the request.
+    pub async fn complete_oneshot(
+        &self,
+        system_prompt: &str,
+        text: String,
+        max_tokens: u64,
+        cancel: CancellationToken,
+    ) -> Result<String, TurnError> {
+        let context = Context {
+            system_prompt: Some(system_prompt.to_string()),
+            messages: vec![Message::User(UserMessage::text(text))],
+            tools: Vec::new(),
+        };
+
+        // Mirror run_inference_streaming's option assembly, but cap
+        // output at `max_tokens` and use the supplied cancel token.
+        let mut base = self.stream_options.clone();
+        base.cancel = Some(cancel);
+        base.max_tokens = Some(max_tokens);
+        let options = SimpleStreamOptions {
+            base,
+            reasoning: self.default_thinking.as_ref().map(thinking_config_to_level),
+        };
+
+        let mut stream = self
+            .provider
+            .stream_simple(&self.model_info, &context, &options);
+        // Poll to drive the producer, then take the canonical final
+        // message.
+        while stream.next().await.is_some() {}
+        let message = stream.result().await;
+
+        match message.stop_reason {
+            StopReason::Aborted => Err(TurnError::Aborted),
+            StopReason::Error => {
+                let detail = message
+                    .error
+                    .map(|e| e.message)
+                    .unwrap_or_else(|| "summary generation failed".to_string());
+                Err(TurnError::Recoverable(anyhow!(detail)))
+            }
+            _ => {
+                let mut out = String::new();
+                for block in &message.content {
+                    if let AssistantContent::Text(t) = block {
+                        out.push_str(&t.text);
+                    }
+                }
+                Ok(out)
+            }
+        }
     }
 
     /// Borrow the registry-resolved [`ModelInfo`] this agent is
@@ -3320,6 +3405,8 @@ mod event_protocol_tests {
             AgentEvent::TaskStart { .. } => EventLabel::Other("TaskStart"),
             AgentEvent::TaskOutput { .. } => EventLabel::Other("TaskOutput"),
             AgentEvent::TaskEnd { .. } => EventLabel::Other("TaskEnd"),
+            AgentEvent::CompactionStart { .. } => EventLabel::Other("CompactionStart"),
+            AgentEvent::CompactionEnd { .. } => EventLabel::Other("CompactionEnd"),
         }
     }
 
@@ -3432,6 +3519,40 @@ mod event_protocol_tests {
             ..AgentSeed::default()
         });
         agent
+    }
+
+    #[test]
+    fn reseed_transcript_replaces_in_memory_messages() {
+        // Seed an agent with one user message, then reseed with a
+        // different transcript and confirm `messages()` reflects the
+        // replacement wholesale (no merge with the prior transcript).
+        let mut agent = build_agent_with_transcript(
+            vec![],
+            vec![],
+            vec![AgentMessage::wire(Message::User(UserMessage::text(
+                "original",
+            )))],
+        );
+        assert_eq!(agent.messages().len(), 1);
+
+        let reduced = vec![
+            AgentMessage::wire(Message::User(UserMessage::text("summary"))),
+            AgentMessage::wire(Message::User(UserMessage::text("recent tail"))),
+        ];
+        agent.reseed_transcript(reduced);
+
+        let messages = agent.messages();
+        assert_eq!(messages.len(), 2);
+        match messages[0].as_wire().expect("wire message") {
+            Message::User(u) => {
+                assert_eq!(u.content.len(), 1);
+                match &u.content[0] {
+                    aj_models::types::UserContent::Text(t) => assert_eq!(t.text, "summary"),
+                    other => panic!("expected text content, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
     }
 
     /// Stub with the builtin `read_file` tool's name, so prompt-assembly

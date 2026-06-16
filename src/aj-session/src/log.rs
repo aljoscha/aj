@@ -143,6 +143,31 @@ pub enum ConversationEntryKind {
         task: String,
         settings: AgentSettings,
     },
+    /// A compaction checkpoint: the thread's history before
+    /// `first_kept_entry_id` was summarized into `summary`. Projection
+    /// ([`Conversation::agent_messages`] / [`Conversation::messages`])
+    /// replaces that prefix with a single synthetic summary message and
+    /// keeps everything from `first_kept_entry_id` onward verbatim. The
+    /// summarized entries stay on disk — compaction changes only the
+    /// projection, never deletes lines.
+    Compaction {
+        /// LLM-generated structured summary that stands in for the
+        /// summarized prefix.
+        summary: String,
+        /// First retained entry. Everything strictly before it on this
+        /// thread (back to the previous compaction boundary, or the
+        /// thread root) is represented by `summary`.
+        first_kept_entry_id: EntryId,
+        /// Estimated context tokens before this compaction ran. Carried
+        /// for the UI ("freed ~N tokens") and telemetry; not used by
+        /// projection.
+        tokens_before: u64,
+        /// Files read / modified in the summarized range, surfaced so
+        /// the model knows what was touched without parsing the prose.
+        /// `None` when extraction found nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<crate::compaction::CompactionDetails>,
+    },
 }
 
 impl ConversationEntryKind {
@@ -160,9 +185,13 @@ impl ConversationEntryKind {
     /// Net effect: a session the user opens but abandons before
     /// submitting anything leaves no file on disk; the system prompt
     /// alone is not enough to materialize one.
+    ///
+    /// A `Compaction` checkpoint is likewise punctuation: it must be
+    /// durable on its own so that resuming a compacted-then-abandoned
+    /// session still sees the reduced context.
     pub fn is_punctuation(&self) -> bool {
         match self {
-            Self::Message { .. } => true,
+            Self::Message { .. } | Self::Compaction { .. } => true,
             Self::SystemPrompt { .. }
             | Self::ModelChange { .. }
             | Self::ThinkingChange { .. }
@@ -282,30 +311,84 @@ impl Conversation {
     }
 
     /// Borrow every wire-level message in this view, in chronological
-    /// order. Non-message entries (system prompt) are skipped — the
-    /// wire layer only cares about turn-by-turn conversation, and
-    /// out-of-band metadata travels through other channels.
+    /// order. Honors the latest compaction (see
+    /// [`Self::projected_agent_messages`]): the summarized prefix is
+    /// replaced by one synthetic summary message. Non-message entries
+    /// (system prompt, settings) are skipped — the wire layer only
+    /// cares about turn-by-turn conversation.
     pub fn messages(&self) -> Vec<Message> {
-        self.entries
+        self.projected_agent_messages()
             .iter()
-            .filter_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message { message: m } => m.as_wire().cloned(),
-                _ => None,
-            })
+            .filter_map(|m| m.as_wire().cloned())
             .collect()
     }
 
     /// Borrow every [`AgentMessage`] in this view, in chronological
-    /// order. The transcript-shaped projection used to seed the
-    /// agent on resume.
+    /// order. The transcript-shaped projection used to seed the agent
+    /// on resume. Honors the latest compaction (see
+    /// [`Self::projected_agent_messages`]).
     pub fn agent_messages(&self) -> Vec<AgentMessage> {
-        self.entries
+        self.projected_agent_messages()
+    }
+
+    /// Project entries to the agent transcript, honoring the latest
+    /// compaction: everything before its `first_kept_entry_id` is
+    /// replaced by a single synthetic summary message.
+    ///
+    /// The last compaction wins — its summary already folds in any
+    /// earlier compaction and its `first_kept_entry_id` points past the
+    /// earlier boundary, so the latest summary plus its retained tail
+    /// reconstruct the full reduced context (see
+    /// `docs/compaction-spec.md` §3.3).
+    fn projected_agent_messages(&self) -> Vec<AgentMessage> {
+        let last_compaction = self
+            .entries
             .iter()
-            .filter_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message { message: m } => Some(m.clone()),
+            .enumerate()
+            .rev()
+            .find_map(|(c, entry)| match &entry.entry {
+                ConversationEntryKind::Compaction {
+                    summary,
+                    first_kept_entry_id,
+                    ..
+                } => Some((c, summary.clone(), first_kept_entry_id.clone())),
                 _ => None,
-            })
-            .collect()
+            });
+
+        let Some((c, summary, first_kept)) = last_compaction else {
+            return self
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.entry {
+                    ConversationEntryKind::Message { message } => Some(message.clone()),
+                    _ => None,
+                })
+                .collect();
+        };
+
+        // `first_kept` should be on this linearized chain; if it is
+        // missing (a corrupt or hand-edited log) fall back to the
+        // compaction marker's own index so we drop nothing extra.
+        let k = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == first_kept)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "compaction first_kept_entry_id {first_kept} missing from linearized view; \
+                     projecting from the compaction marker so nothing extra is dropped"
+                );
+                c
+            });
+
+        let mut out: Vec<AgentMessage> = Vec::new();
+        out.push(crate::compaction::summary_message(&summary));
+        for entry in &self.entries[k..] {
+            if let ConversationEntryKind::Message { message } = &entry.entry {
+                out.push(message.clone());
+            }
+        }
+        out
     }
 
     /// Extract the session settings recorded on this path. One
@@ -342,6 +425,11 @@ impl Conversation {
                     }
                 }
                 ConversationEntryKind::SystemPrompt { .. } => {}
+                // Compaction does not change settings; the retained tail
+                // still carries the last assistant model, and any
+                // settings entries before the boundary remain on the
+                // path.
+                ConversationEntryKind::Compaction { .. } => {}
             }
         }
         settings
@@ -816,6 +904,39 @@ impl ConversationLog {
         )
     }
 
+    /// Record a compaction checkpoint on `filter`'s thread, anchored at
+    /// the thread's current leaf. Punctuation: flushes immediately (see
+    /// [`ConversationEntryKind::is_punctuation`]). `first_kept_entry_id`
+    /// must be an existing entry in the log.
+    pub fn append_compaction(
+        &mut self,
+        filter: ThreadFilter,
+        summary: String,
+        first_kept_entry_id: EntryId,
+        tokens_before: u64,
+        details: Option<crate::compaction::CompactionDetails>,
+    ) -> Result<EntryId, ConversationError> {
+        if !self.entries.contains_key(&first_kept_entry_id) {
+            return Err(ConversationError::InvalidAppend(format!(
+                "compaction first_kept_entry_id {first_kept_entry_id} not found in log"
+            )));
+        }
+        let parent = self
+            .latest_leaf(filter)
+            .or_else(|| self.system_prompt_id().cloned());
+        self.append(
+            parent,
+            filter.thread,
+            filter.agent_id,
+            ConversationEntryKind::Compaction {
+                summary,
+                first_kept_entry_id,
+                tokens_before,
+                details,
+            },
+        )
+    }
+
     /// Seed sub-agent `agent_id`'s thread with its
     /// [`ConversationEntryKind::SubAgentSpawn`] root, anchored at
     /// `parent_head` (the parent thread's head at spawn time — the
@@ -959,7 +1080,8 @@ mod tests {
     use super::*;
     use crate::persistence::ConversationPersistence;
     use aj_models::types::{
-        AssistantContent, AssistantMessage, TextContent, ToolCall, ToolResultMessage, UserMessage,
+        AssistantContent, AssistantMessage, TextContent, ToolCall, ToolResultMessage, UserContent,
+        UserMessage,
     };
 
     /// Allocate a unique scratch directory for one test's persistence
@@ -1672,5 +1794,141 @@ mod tests {
         let head = log.latest_leaf(ThreadFilter::USER).expect("head exists");
         let convo = log.linearize(&head, ThreadFilter::USER);
         assert_eq!(convo.message_count(), 3);
+    }
+
+    #[test]
+    fn append_compaction_flushes_and_round_trips() {
+        // A `Compaction` entry is punctuation: appending it must
+        // materialize the file immediately and survive a resume with
+        // all its fields intact.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+
+        let (session_id, first_kept) = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".into()).expect("set sp");
+
+            let first_kept = {
+                let mut view = ConversationView::user(&mut log, None);
+                view.add_message(user_text("one")).expect("u1");
+                view.add_message(assistant_text("a1")).expect("a1");
+                view.add_message(user_text("two")).expect("u2")
+            };
+
+            let details = crate::compaction::CompactionDetails {
+                read_files: vec!["/tmp/a".into()],
+                modified_files: vec!["/tmp/b".into()],
+            };
+            log.append_compaction(
+                ThreadFilter::USER,
+                "the summary".into(),
+                first_kept.clone(),
+                1234,
+                Some(details),
+            )
+            .expect("append compaction");
+
+            let path = persistence.session_path(log.session_id());
+            assert!(
+                path.exists(),
+                "compaction is punctuation; file must exist right after append"
+            );
+
+            (log.session_id().to_string(), first_kept)
+        };
+
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let head = resumed.latest_leaf(ThreadFilter::USER).expect("head");
+        let convo = resumed.linearize(&head, ThreadFilter::USER);
+        let last = convo.entries().last().expect("entries present");
+        match &last.entry {
+            ConversationEntryKind::Compaction {
+                summary,
+                first_kept_entry_id,
+                tokens_before,
+                details,
+            } => {
+                assert_eq!(summary, "the summary");
+                assert_eq!(first_kept_entry_id, &first_kept);
+                assert_eq!(*tokens_before, 1234);
+                let details = details.as_ref().expect("details present");
+                assert_eq!(details.read_files, vec!["/tmp/a".to_string()]);
+                assert_eq!(details.modified_files, vec!["/tmp/b".to_string()]);
+            }
+            other => panic!("expected Compaction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_compaction_rejects_unknown_first_kept_id() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("hi")).expect("u");
+        }
+        let err = log
+            .append_compaction(ThreadFilter::USER, "s".into(), "no-such-id".into(), 0, None)
+            .expect_err("must reject unknown first_kept id");
+        assert!(matches!(err, ConversationError::InvalidAppend(_)));
+    }
+
+    #[test]
+    fn agent_messages_drops_prefix_and_prepends_summary_after_compaction() {
+        // Projection after a compaction: the summarized prefix is gone,
+        // replaced by one synthetic wrapped-summary message, and the
+        // retained tail (from `first_kept_entry_id` on) is verbatim.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+
+        let kept_user = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("old one")).expect("u1");
+            view.add_message(assistant_text("old reply")).expect("a1");
+            let kept = view.add_message(user_text("kept question")).expect("u2");
+            view.add_message(assistant_text("kept reply")).expect("a2");
+            kept
+        };
+
+        log.append_compaction(ThreadFilter::USER, "SUMMARY".into(), kept_user, 999, None)
+            .expect("compaction");
+
+        let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+        let convo = log.linearize(&head, ThreadFilter::USER);
+        let messages = convo.messages();
+
+        // Synthetic summary + the two retained messages.
+        assert_eq!(messages.len(), 3, "got: {messages:#?}");
+        match &messages[0] {
+            Message::User(u) => match &u.content[0] {
+                UserContent::Text(t) => {
+                    assert!(
+                        t.text
+                            .starts_with(crate::compaction::COMPACTION_SUMMARY_PREFIX)
+                    );
+                    assert!(t.text.contains("SUMMARY"));
+                }
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected synthetic summary user message, got {other:?}"),
+        }
+        match &messages[1] {
+            Message::User(u) => match &u.content[0] {
+                UserContent::Text(t) => assert_eq!(t.text, "kept question"),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected kept user message, got {other:?}"),
+        }
+        match &messages[2] {
+            Message::Assistant(a) => match &a.content[0] {
+                AssistantContent::Text(t) => assert_eq!(t.text, "kept reply"),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected kept assistant message, got {other:?}"),
+        }
     }
 }

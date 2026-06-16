@@ -1853,6 +1853,36 @@ async fn run_session(
                                     // path is identical to triggering the
                                     // command by its keyboard shortcut.
                                     if let Some(follow_up) = follow_up {
+                                        // `/compact` runs as a tracked task
+                                        // (like a turn), so the loop — which
+                                        // owns `turns` / `turn_cancels` —
+                                        // drives it rather than
+                                        // `handle_command`, which can't spawn.
+                                        if matches!(follow_up.action, CommandAction::Compact) {
+                                            if turn_cancels.contains_key(&AgentId::Main)
+                                                || world.pump.is_running(AgentId::Main)
+                                            {
+                                                world.pump.handle(
+                                                    &mut shell.tui,
+                                                    &notice_event(&session_busy_notice("compact")),
+                                                );
+                                            } else {
+                                                let keep_recent = shell
+                                                    .config
+                                                    .lock()
+                                                    .expect("config mutex poisoned")
+                                                    .compact_keep_recent;
+                                                spawn_compaction_turn(
+                                                    world,
+                                                    &shell.run_config,
+                                                    None,
+                                                    keep_recent,
+                                                    &mut turns,
+                                                    &mut turn_cancels,
+                                                );
+                                                sync_editor_enabled(&mut shell.tui);
+                                            }
+                                        } else {
                                         match handle_command(
                                             &mut shell.tui,
                                             &shell.auth,
@@ -1882,6 +1912,7 @@ async fn run_session(
                                                 break Ok(request.into_exit());
                                             }
                                             CommandOutcome::Quit => break Ok(SessionExit::Quit),
+                                        }
                                         }
                                     }
                                 }
@@ -2186,6 +2217,58 @@ fn spawn_prompt_turn(
         );
         let result = a.prompt(text, turn_cancel).await;
         (target, result)
+    });
+    true
+}
+
+/// Spawn a manual compaction for the Main agent as a tracked task.
+///
+/// Modeled on [`spawn_prompt_turn`]: it inserts a cancel token into
+/// `turn_cancels` (so the loop refuses overlapping turns and disables
+/// the editor while it runs) and returns the standard
+/// `(AgentId, Result)` shape so the completion arm cleans up uniformly.
+/// The summarizer runs bus-silently inside
+/// [`crate::compaction::run_compaction`]; progress and the result are
+/// surfaced through the `CompactionStart` / `CompactionEnd` events the
+/// run emits on the agent's bus. Returns `false` without spawning when
+/// the Main agent has no live handle.
+fn spawn_compaction_turn(
+    world: &SessionWorld,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    instructions: Option<String>,
+    keep_recent_tokens: u64,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) -> bool {
+    let target = AgentId::Main;
+    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+        return false;
+    };
+    let run_config_for_turn = Arc::clone(run_config);
+    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
+    let log = Arc::clone(&world.log);
+    let turn_cancel = CancellationToken::new();
+    turn_cancels.insert(target, turn_cancel.clone());
+    turns.spawn(async move {
+        let mut a = handle.lock().await;
+        // Stamp the latest staged config so the summarizer uses the
+        // current model.
+        apply_turn_config(
+            target,
+            &mut a,
+            &run_config_for_turn,
+            &sub_overrides_for_turn,
+        );
+        let _ = crate::compaction::run_compaction(
+            &mut a,
+            &log,
+            aj_agent::events::CompactionReason::Manual,
+            instructions.as_deref(),
+            keep_recent_tokens,
+            turn_cancel,
+        )
+        .await;
+        (target, Ok(()))
     });
     true
 }
@@ -2768,7 +2851,7 @@ fn persist_config(
 
 /// Inner-content row count for the compact overlays (palette, help,
 /// model / thinking pickers). Total rendered height including chrome
-/// is `PALETTE_OVERLAY_INNER_ROWS + 4` (22 rows), which still fits
+/// is `PALETTE_OVERLAY_INNER_ROWS + 4` (23 rows), which still fits
 /// comfortably on a standard 24-row terminal. Sized so the command
 /// palette shows its whole catalog without scrolling: the palette
 /// reserves three of these rows for its search box, separator, and
@@ -2776,7 +2859,7 @@ fn persist_config(
 /// leaving enough list rows for every builtin command. The
 /// content-heavy overlays (session switcher, prompt history) size their
 /// rows dynamically instead — see [`large_overlay_inner_rows`].
-const PALETTE_OVERLAY_INNER_ROWS: usize = 18;
+const PALETTE_OVERLAY_INNER_ROWS: usize = 19;
 
 /// Sizing/anchor used by the command palette and the compact pickers
 /// (model / thinking / help). Centered, fills ~75% of the terminal
@@ -3565,6 +3648,13 @@ async fn handle_command(
             notice: Some(session_busy_notice("start a new session")),
         },
         CommandAction::NewSession => CommandOutcome::SessionChange(SessionRequest::New),
+        // The interactive loop intercepts `Compact` before reaching
+        // `handle_command` (it needs the turn machinery this function
+        // doesn't have), so this arm only exists for exhaustiveness.
+        CommandAction::Compact => CommandOutcome::Continue {
+            selector: None,
+            notice: None,
+        },
         CommandAction::OpenSettings => {
             // Snapshot the live values the window opens with. Model /
             // thinking / speed come from the run config (the loop-side
@@ -3587,6 +3677,9 @@ async fn handle_command(
                     image_show_in_terminal: render_settings.show_image_in_terminal(),
                     image_block: cfg.image_block,
                     syntax_highlighting: cfg.syntax_highlighting,
+                    auto_compact: cfg.auto_compact,
+                    compact_threshold: cfg.compact_threshold.to_string(),
+                    compact_keep_recent: cfg.compact_keep_recent.to_string(),
                 }
             };
             // Builtin tool names for the disabled-tools toggle list.

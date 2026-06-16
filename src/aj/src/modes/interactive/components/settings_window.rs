@@ -111,6 +111,13 @@ pub struct SettingsCurrentValues {
     pub image_show_in_terminal: bool,
     pub image_block: bool,
     pub syntax_highlighting: bool,
+    pub auto_compact: bool,
+    /// Compaction threshold fraction, formatted for display/editing
+    /// (e.g. `"0.85"`).
+    pub compact_threshold: String,
+    /// Recent-tail token budget kept after compaction, formatted for
+    /// display/editing (e.g. `"20000"`).
+    pub compact_keep_recent: String,
 }
 
 /// The overlay's top-level component. See the module docs for the
@@ -392,6 +399,29 @@ fn build_items(
                     current.syntax_highlighting,
                     Some("Takes effect for new sessions."),
                 ));
+            }
+            "auto_compact" => {
+                items.push(bool_item(option, current.auto_compact, None));
+            }
+            "compact_threshold" => {
+                let mut item = SettingItem::with_submenu(
+                    option.name,
+                    option.name,
+                    current.compact_threshold.clone(),
+                    text_submenu_factory(),
+                );
+                item.description = Some(describe(option, "A fraction between 0.0 and 1.0."));
+                items.push(item);
+            }
+            "compact_keep_recent" => {
+                let mut item = SettingItem::with_submenu(
+                    option.name,
+                    option.name,
+                    current.compact_keep_recent.clone(),
+                    text_submenu_factory(),
+                );
+                item.description = Some(describe(option, "A positive number of tokens."));
+                items.push(item);
             }
             other => {
                 tracing::warn!(option = other, "config option has no settings-window row");
@@ -772,6 +802,9 @@ mod tests {
             image_show_in_terminal: true,
             image_block: false,
             syntax_highlighting: false,
+            auto_compact: true,
+            compact_threshold: "0.85".to_string(),
+            compact_keep_recent: "20000".to_string(),
         }
     }
 

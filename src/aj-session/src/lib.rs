@@ -15,15 +15,23 @@
 //! - [`replay`] projects a persisted log onto the typed
 //!   [`aj_agent::events::AgentEvent`] stream so frontends can drive
 //!   the same renderer pipeline for both live and resumed sessions.
+//! - [`compaction`] is the pure planning library for context
+//!   compaction: token estimation, cut-point selection, summary
+//!   prompt templates, and file-op extraction over log entries.
 //!
 //! See `docs/aj-next-plan.md` §1, §2.0(a), and §2.5.
 
+pub mod compaction;
 pub mod listener;
 pub mod log;
 pub mod persistence;
 pub mod repair;
 pub mod replay;
 
+pub use compaction::{
+    CompactionDetails, CompactionPlan, ContextEstimate, estimate_context_tokens,
+    prepare_compaction, should_compact,
+};
 pub use listener::persistence_listener;
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,

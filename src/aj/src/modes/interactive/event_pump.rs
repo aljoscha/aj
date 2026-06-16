@@ -637,6 +637,35 @@ impl EventPump {
                 }
             }
 
+            // ---- Compaction lifecycle. ----
+            AgentEvent::CompactionStart { agent_id, .. } => {
+                self.append_notice(tui, *agent_id, "Compacting context…");
+                tui.request_render();
+            }
+            AgentEvent::CompactionEnd {
+                agent_id,
+                tokens_before,
+                tokens_after,
+                error,
+                ..
+            } => {
+                if let Some(err) = error {
+                    self.append_styled_notice(
+                        tui,
+                        *agent_id,
+                        &format!("Compaction failed: {err}"),
+                        aj_tui::style::yellow,
+                    );
+                } else {
+                    self.append_notice(
+                        tui,
+                        *agent_id,
+                        &format!("Context compacted: ~{tokens_before} → ~{tokens_after} tokens."),
+                    );
+                }
+                tui.request_render();
+            }
+
             // ---- Sub-agent boxes. ----
             AgentEvent::SubAgentStart {
                 child,

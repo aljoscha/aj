@@ -299,6 +299,7 @@ mod tests {
         // `aj.*` defaults is required for the action to be known.
         crate::config::keybindings::install_global_manager_defaults();
         let mut p = CommandPaletteComponent::new(identity_theme(), 14);
+        p.set_available_height(crate::modes::interactive::PALETTE_OVERLAY_INNER_ROWS);
         let body = p.render(80).join("\n");
         assert!(body.contains("Ctrl+O"), "expected Ctrl+O in: {body}");
     }
