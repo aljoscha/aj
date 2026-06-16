@@ -321,8 +321,6 @@ fn build_request(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> AMessages {
-    let thinking_enabled = reasoning.is_some() && model.reasoning;
-
     // §8: rewrite the history for cross-provider replay (signature
     // strip, tool-call ID normalization, orphan/errored handling, image
     // downgrade) before serializing into Anthropic message params.
@@ -335,22 +333,26 @@ fn build_request(
     let tools: Vec<ToolUnion> = context.tools.iter().map(to_anthropic_tool).collect();
     let tool_choice = to_anthropic_tool_choice(options.tool_choice.as_ref(), !tools.is_empty());
 
-    // Spec §6.2: default `max_tokens` to model.max_tokens / 3 when the
-    // caller doesn't override it. We clamp to at least 1 to keep the API
-    // happy on degenerate (zero) catalog values.
-    let max_tokens = options
-        .max_tokens
-        .unwrap_or_else(|| (model.max_tokens / 3).max(1));
+    // The wire `max_tokens` must hold both the answer and any thinking
+    // budget, since Anthropic spends the budget out of the same response
+    // allotment. Size the cap around the budget and default an unset cap
+    // to the full model output window.
+    let (thinking, output_config) =
+        build_thinking(model, reasoning, options.thinking_display.as_ref());
+    let (max_tokens, thinking) =
+        fit_max_tokens_and_thinking(thinking, options.max_tokens, model.max_tokens);
 
-    // Anthropic rejects `temperature` when extended thinking is on.
-    let temperature = if thinking_enabled {
+    // Anthropic rejects `temperature` when extended thinking is on. Read
+    // it off the final thinking config so a disabled config (no reasoning
+    // requested) still lets the caller's temperature through.
+    let temperature = if matches!(
+        thinking,
+        Some(AThinking::Enabled { .. }) | Some(AThinking::Adaptive { .. })
+    ) {
         None
     } else {
         options.temperature
     };
-
-    let (thinking, output_config) =
-        build_thinking(model, reasoning, options.thinking_display.as_ref());
 
     let metadata = build_metadata(options);
 
@@ -831,6 +833,82 @@ fn budget_for(level: &ThinkingLevel) -> u64 {
         // above `high`; the higher rungs share the top budget.
         ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => 16_384,
     }
+}
+
+/// Tokens reserved for the answer when a model ceiling below the
+/// thinking budget forces us to shrink the budget, so the answer is
+/// never starved entirely. A tuning constant.
+const MIN_OUTPUT_HEADROOM: u64 = 1024;
+
+/// Anthropic's floor for an extended-thinking budget (the `minimal`
+/// rung in [`budget_for`]). A budget below this is rejected, so a budget
+/// that a tiny ceiling squeezed to zero is floored back to this minimum
+/// rather than sent as an illegal value. Must stay `>=` Anthropic's
+/// documented floor.
+const MIN_THINKING_BUDGET: u64 = 1024;
+
+/// Reconcile the caller's answer budget with a thinking config into the
+/// wire `max_tokens` and the thinking config we actually send.
+///
+/// `requested_max_tokens` is the answer allotment the caller wants
+/// ([`StreamOptions::max_tokens`]), *excluding* extended-thinking
+/// tokens; `None` means "no cap" and defaults to the full model output
+/// window `model_max`.
+///
+/// Anthropic spends the thinking `budget_tokens` out of the same
+/// response allotment as the answer and rejects a request unless
+/// `max_tokens` is strictly greater than the budget. So for a
+/// budget-based `Enabled` config we size `max_tokens` up to
+/// `answer + budget_tokens` (bounded by `model_max`) — growing the cap
+/// to fit thinking on top of the answer rather than carving the budget
+/// out of it. When the resulting cap can't sit above the budget (a model
+/// ceiling at or below the budget), we shrink the budget to leave
+/// [`MIN_OUTPUT_HEADROOM`] for the answer. Adaptive and disabled configs
+/// carry no fixed budget, so `max_tokens` is just the answer budget (or
+/// the model window).
+fn fit_max_tokens_and_thinking(
+    thinking: Option<AThinking>,
+    requested_max_tokens: Option<u64>,
+    model_max: u64,
+) -> (u64, Option<AThinking>) {
+    let Some(AThinking::Enabled {
+        budget_tokens,
+        display,
+    }) = thinking
+    else {
+        // No fixed budget to fit: the cap is the caller's answer budget,
+        // or the full model window when they set none.
+        return (requested_max_tokens.unwrap_or(model_max).max(1), thinking);
+    };
+
+    // With no caller cap, give the request the whole model window;
+    // otherwise grow the answer budget to also hold the thinking budget,
+    // bounded by the model ceiling. The `.max(1)` guards a degenerate
+    // zero catalog ceiling from yielding an empty cap.
+    let max_tokens = match requested_max_tokens {
+        None => model_max,
+        Some(answer) => answer.saturating_add(budget_tokens).min(model_max),
+    }
+    .max(1);
+
+    // When the cap can't sit strictly above the budget, shrink the budget
+    // to leave the answer its headroom; floor a budget the ceiling
+    // squeezed to nothing back up to Anthropic's documented minimum.
+    let mut budget = budget_tokens;
+    if max_tokens <= budget {
+        budget = max_tokens.saturating_sub(MIN_OUTPUT_HEADROOM);
+    }
+    if budget == 0 {
+        budget = MIN_THINKING_BUDGET;
+    }
+
+    (
+        max_tokens,
+        Some(AThinking::Enabled {
+            budget_tokens: budget,
+            display,
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,6 +1580,206 @@ mod tests {
     }
 
     #[test]
+    fn fit_grows_max_tokens_to_fit_budget() {
+        // Answer budget 8192 + High budget 16384 fits under the model
+        // window: the cap grows to hold both and the budget is untouched,
+        // strictly under `max_tokens`.
+        let (max_tokens, thinking) = fit_max_tokens_and_thinking(
+            Some(AThinking::Enabled {
+                budget_tokens: 16_384,
+                display: None,
+            }),
+            Some(8192),
+            64_000,
+        );
+        assert_eq!(max_tokens, 8192 + 16_384);
+        match thinking {
+            Some(AThinking::Enabled { budget_tokens, .. }) => {
+                assert_eq!(budget_tokens, 16_384);
+                assert!(budget_tokens < max_tokens);
+            }
+            other => panic!("expected an untouched Enabled budget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fit_unset_cap_uses_the_model_window() {
+        // No caller cap: the request gets the full model output window
+        // and the budget rides underneath it untouched.
+        let (max_tokens, thinking) = fit_max_tokens_and_thinking(
+            Some(AThinking::Enabled {
+                budget_tokens: 16_384,
+                display: None,
+            }),
+            None,
+            64_000,
+        );
+        assert_eq!(max_tokens, 64_000);
+        assert!(matches!(
+            thinking,
+            Some(AThinking::Enabled {
+                budget_tokens: 16_384,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fit_shrinks_budget_when_window_below_budget() {
+        // Answer 8192 + budget 16384 (24576) overruns a 16000 window: the
+        // cap is spent in full and the budget shrinks to leave
+        // MIN_OUTPUT_HEADROOM, staying strictly under `max_tokens` — we
+        // shrink rather than disable thinking.
+        let (max_tokens, thinking) = fit_max_tokens_and_thinking(
+            Some(AThinking::Enabled {
+                budget_tokens: 16_384,
+                display: None,
+            }),
+            Some(8192),
+            16_000,
+        );
+        assert_eq!(max_tokens, 16_000);
+        match thinking {
+            Some(AThinking::Enabled { budget_tokens, .. }) => {
+                assert_eq!(budget_tokens, 16_000 - MIN_OUTPUT_HEADROOM);
+                assert!(budget_tokens < max_tokens);
+            }
+            other => panic!("expected a shrunk Enabled budget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fit_keeps_budget_strictly_under_max_tokens_at_the_boundary() {
+        // A window equal to the budget is the case the API rejects
+        // (`budget_tokens == max_tokens`): the budget must come out
+        // strictly below the cap. Guards a `<`/`<=` slip in the shrink.
+        let (max_tokens, thinking) = fit_max_tokens_and_thinking(
+            Some(AThinking::Enabled {
+                budget_tokens: 16_384,
+                display: None,
+            }),
+            None,
+            16_384,
+        );
+        assert_eq!(max_tokens, 16_384);
+        match thinking {
+            Some(AThinking::Enabled { budget_tokens, .. }) => assert!(budget_tokens < max_tokens),
+            other => panic!("expected a shrunk Enabled budget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fit_floors_budget_to_minimum_for_a_tiny_window() {
+        // A window below `MIN_OUTPUT_HEADROOM` shrinks the budget to zero;
+        // we floor it back to the documented minimum rather than send a
+        // zero budget. NOTE: such a window is below any real model, so
+        // this only documents the degenerate floor.
+        let (max_tokens, thinking) = fit_max_tokens_and_thinking(
+            Some(AThinking::Enabled {
+                budget_tokens: 16_384,
+                display: None,
+            }),
+            None,
+            MIN_THINKING_BUDGET,
+        );
+        assert_eq!(max_tokens, MIN_THINKING_BUDGET);
+        assert!(matches!(
+            thinking,
+            Some(AThinking::Enabled {
+                budget_tokens: MIN_THINKING_BUDGET,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fit_passes_through_adaptive_and_disabled() {
+        // Adaptive carries no fixed budget and Disabled nothing to fit;
+        // `max_tokens` is the caller's answer budget, or the model window
+        // when they set none.
+        let (max_tokens, thinking) = fit_max_tokens_and_thinking(
+            Some(AThinking::Adaptive { display: None }),
+            Some(8192),
+            64_000,
+        );
+        assert_eq!(max_tokens, 8192);
+        assert!(matches!(thinking, Some(AThinking::Adaptive { .. })));
+
+        let (max_tokens, thinking) =
+            fit_max_tokens_and_thinking(Some(AThinking::Adaptive { display: None }), None, 64_000);
+        assert_eq!(max_tokens, 64_000);
+        assert!(matches!(thinking, Some(AThinking::Adaptive { .. })));
+
+        let (max_tokens, thinking) =
+            fit_max_tokens_and_thinking(Some(AThinking::Disabled), Some(8192), 64_000);
+        assert_eq!(max_tokens, 8192);
+        assert!(matches!(thinking, Some(AThinking::Disabled)));
+    }
+
+    #[test]
+    fn build_request_grows_max_tokens_for_budget_model() {
+        // A budget-based reasoning model with a caller answer budget: the
+        // wire cap grows to hold the answer plus the full High budget,
+        // the request stays valid (budget strictly under `max_tokens`),
+        // and temperature is nulled since thinking is on.
+        let options = StreamOptions {
+            max_tokens: Some(8192),
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let req = build_request(
+            &budget_model(),
+            &Context::new("sys"),
+            &options,
+            Some(&ThinkingLevel::High),
+        );
+        assert_eq!(req.max_tokens, 8192 + 16_384);
+        match req.thinking {
+            Some(AThinking::Enabled { budget_tokens, .. }) => {
+                assert_eq!(budget_tokens, 16_384);
+                assert!(budget_tokens < req.max_tokens);
+            }
+            other => panic!("expected an untouched Enabled budget, got {other:?}"),
+        }
+        assert!(
+            req.temperature.is_none(),
+            "thinking on still nulls temperature"
+        );
+    }
+
+    #[test]
+    fn build_request_shrinks_budget_for_tiny_window() {
+        // A budget model whose window is below the budget: the adapter
+        // shrinks the budget to fit (keeping thinking on, which still
+        // nulls temperature) rather than disabling it.
+        let tiny_model = ModelInfo {
+            max_tokens: 2047,
+            ..budget_model()
+        };
+        let options = StreamOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let req = build_request(
+            &tiny_model,
+            &Context::new("sys"),
+            &options,
+            Some(&ThinkingLevel::High),
+        );
+        assert_eq!(req.max_tokens, 2047);
+        match req.thinking {
+            Some(AThinking::Enabled { budget_tokens, .. }) => {
+                assert!(budget_tokens < req.max_tokens)
+            }
+            other => panic!("expected a shrunk Enabled budget, got {other:?}"),
+        }
+        assert!(
+            req.temperature.is_none(),
+            "thinking on still nulls temperature"
+        );
+    }
+
+    #[test]
     fn build_thinking_threads_display_flag_through_both_shapes() {
         // Adaptive thinking: the `display` field rides on the
         // `Adaptive` variant directly.
@@ -1567,12 +1845,14 @@ mod tests {
     }
 
     #[test]
-    fn build_request_default_max_tokens_is_third() {
+    fn build_request_default_max_tokens_is_model_window() {
+        // No caller cap and no reasoning: the request defaults to the
+        // model's full output window.
         let model = fake_model();
         let context = Context::new("sys");
         let options = StreamOptions::default();
         let req = build_request(&model, &context, &options, None);
-        assert_eq!(req.max_tokens, model.max_tokens / 3);
+        assert_eq!(req.max_tokens, model.max_tokens);
     }
 
     #[test]

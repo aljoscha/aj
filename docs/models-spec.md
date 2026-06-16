@@ -971,8 +971,8 @@ idiom — `tokio::select!` can race a stream against a shutdown signal.
 **Default `max_tokens` resolution:**
 - `stream_simple` / `complete_simple`: when `max_tokens` is `None`, defaults
   to `min(model.max_tokens, 32000)`.
-- Raw `stream` / `complete`: provider-specific (e.g. Anthropic uses
-  `model.max_tokens / 3`, see §6.2).
+- Raw `stream` / `complete`: provider-specific (e.g. Anthropic defaults
+  to the model's full `max_tokens` output window, see §6.2).
 
 **Retry:** there is intentionally no retry knob on `StreamOptions`.
 Providers never auto-retry failed requests; they classify the error
@@ -1104,7 +1104,11 @@ list and replace it with the caller's casing. If no match, pass through.
 - Images as base64 with media type
 
 **Default `max_tokens`:** If `StreamOptions.max_tokens` is `None`, the
-provider sends `model.max_tokens / 3` as a reasonable default.
+provider defaults to the model's full `max_tokens` output window. The
+caller's `max_tokens` is the *answer* budget (excluding extended-thinking
+tokens); when thinking is on, the wire `max_tokens` is sized up to hold
+the answer plus the thinking budget rather than carving the budget out of
+the answer.
 
 **Prompt caching:** driven by `StreamOptions.cache_retention`.
 - `None`: send no `cache_control` markers. The request is processed

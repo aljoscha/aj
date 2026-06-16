@@ -567,8 +567,11 @@ impl Agent {
             tools: Vec::new(),
         };
 
-        // Mirror run_inference_streaming's option assembly, but cap
-        // output at `max_tokens` and use the supplied cancel token.
+        // Cap output at `max_tokens` and use the supplied cancel token.
+        // `max_tokens` is the *answer* budget; the Anthropic adapter
+        // sizes the wire request to fit the thinking budget on top, so a
+        // summarizer that inherits the session's thinking level keeps its
+        // whole cap for the summary text.
         let mut base = self.stream_options.clone();
         base.cancel = Some(cancel);
         base.max_tokens = Some(max_tokens);

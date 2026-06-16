@@ -522,6 +522,17 @@ impl std::fmt::Debug for ApiKeyResolver {
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// Desired answer budget: the upper bound on the visible response
+    /// the caller wants, *excluding* any extended-thinking/reasoning
+    /// tokens. When unset, adapters fall back to a model-derived
+    /// default.
+    ///
+    /// NOTE: this is the answer budget, not the provider's raw
+    /// `max_tokens`. On Anthropic the thinking budget is spent from the
+    /// same response allotment, so the adapter sizes the wire
+    /// `max_tokens` up to fit the thinking budget on top of this value —
+    /// a caller-set cap keeps its full answer budget rather than having
+    /// thinking carved out of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     /// Static API key. Used when [`StreamOptions::api_key_resolver`]
