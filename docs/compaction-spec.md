@@ -30,8 +30,8 @@ Goals:
   context, and the full pre-compaction history remains on disk.
 - Iterative summaries: a second compaction folds new history into the
   previous summary rather than summarizing a summary.
-- Available in both the interactive TUI and headless `--print` /
-  `aj compact` paths.
+- Available in both the interactive TUI and the headless `--print`
+  path (the reactive overflow trigger fires under `--print`).
 
 Non-goals:
 
@@ -69,10 +69,10 @@ aj-conf                  `auto_compact` + `compact_threshold` config
                          options; `ValueKind::Number`.
 
 aj (binary)              orchestration (the `compaction` host module),
-                         the `/compact` command, the `compact` CLI
-                         subcommand, the threshold and overflow triggers,
-                         interactive wiring (spawned task, footer
-                         accessor, notices), print-mode recovery.
+                         the `/compact` command, the threshold and
+                         overflow triggers, interactive wiring (spawned
+                         task, footer accessor, notices), print-mode
+                         recovery.
 ```
 
 Rationale: the cut-point and summary-prompt logic operates over log
@@ -680,15 +680,14 @@ recovery so consumers see it.
 
 ### 7.7 `aj compact` CLI subcommand
 
-Add a `Compact { session_id: Option<String> }` variant to `Command`
-(`aj/src/cli/args.rs:103`) and a dispatch arm in `main.rs` (alongside
-`list-sessions` / `update-models`, which short-circuit before mode
-dispatch). It resolves a session the way print mode does
-(`print.rs:173`: explicit id, or latest for the project), builds the
-agent (restoring the session's recorded model/thinking/speed), runs one
-`run_compaction(Manual, custom_instructions = None)`, prints a one-line
-summary of what it freed, and exits. This is the headless way to compact
-a session without sending a new turn.
+Not implemented. A headless one-shot `aj compact [session_id]` would
+build an agent for a resolved session and run a single
+`run_compaction(Manual)` without sending a turn, but it duplicates print
+mode's agent-construction path for marginal value. Compaction is reached
+through the interactive `/compact` command, the automatic threshold
+trigger, and the reactive overflow path (including under `--print`),
+which together cover the intended use. Revisit if a scripted "compact
+this session" entry point is needed.
 
 ## 8. Replay
 
@@ -795,7 +794,7 @@ for `CompactionStart`/`End`.
 Host (`aj`): a scripted end-to-end `run_compaction` over a seeded log
 (summary from the scripted provider) producing a `Compaction` entry and
 a reduced reseed; overflow detection + trailing-error trim +
-`continue_run` recovery; the `compact` subcommand on a resumed session.
+`continue_run` recovery.
 
 Config: parse/round-trip `compact_threshold`; range rejection; drift
 test.
@@ -812,8 +811,8 @@ test.
    `CompactionStart`/`End` events.
 4. **Host orchestration + manual path.** `aj::compaction::run_compaction`,
    `/compact` command (+ tail-argument dispatch), interactive
-   `spawn_compaction` + notice + footer accessor, `aj compact`
-   subcommand. End-to-end manual compaction.
+   `spawn_compaction` + notice + footer accessor. End-to-end manual
+   compaction.
 5. **Auto + reactive triggers.** Threshold check in the turn-completion
    arm; overflow detection + retry-once in interactive and print mode;
    config (`auto_compact`, `compact_threshold`, `ValueKind::Number`).

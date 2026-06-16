@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use aj_agent::Agent;
 use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
+use aj_agent::message::AgentMessage;
+use aj_models::types::{AssistantContent, Message, StopReason};
 use aj_session::compaction as planning;
 use aj_session::{ConversationLog, ThreadFilter};
 use tokio::sync::Mutex as TokioMutex;
@@ -153,7 +155,14 @@ pub async fn run_compaction(
             .latest_leaf(ThreadFilter::USER)
             .expect("head exists after append");
         let conversation = log_guard.linearize(&head, ThreadFilter::USER);
-        let messages = conversation.agent_messages();
+        let mut messages = conversation.agent_messages();
+        // Drop a trailing failed-assistant message. The log records the
+        // failed turn (it was emitted to the bus), but the wire layer
+        // never shows Error/Aborted assistants to the model, and the
+        // reactive overflow path needs the reseeded transcript to end in
+        // a user/tool-result message so `continue_run` can re-drive
+        // inference against the reduced context.
+        trim_trailing_failed_assistant(&mut messages);
         // The just-appended compaction sits at the head, so the
         // retained tail's assistant `usage` is stale; the
         // compaction-aware estimate uses the projection's heuristic
@@ -180,6 +189,32 @@ pub async fn run_compaction(
     CompactionOutcome::Compacted {
         tokens_before: plan.tokens_before,
         tokens_after,
+    }
+}
+
+/// Drop trailing failed-assistant messages (an overflow's error turn
+/// or an aborted turn) so the reseeded transcript ends in a
+/// user/tool-result message — the precondition `continue_run` enforces
+/// for reactive recovery. We only trim a failed assistant that carries
+/// no tool calls, so we never orphan a tool result that references it;
+/// a partially-executed tool turn ends in its tool-result messages
+/// rather than the assistant and so is left untouched.
+fn trim_trailing_failed_assistant(messages: &mut Vec<AgentMessage>) {
+    while let Some(last) = messages.last() {
+        let trim = matches!(
+            last.as_wire(),
+            Some(Message::Assistant(a))
+                if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted)
+                    && !a
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::ToolCall(_)))
+        );
+        if trim {
+            messages.pop();
+        } else {
+            break;
+        }
     }
 }
 
@@ -264,4 +299,67 @@ async fn finish_failed(
         tracing::warn!("failed to emit CompactionEnd: {err}");
     }
     CompactionOutcome::Failed(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aj_models::types::{AssistantMessage, ToolCall, UserMessage};
+
+    fn user(text: &str) -> AgentMessage {
+        AgentMessage::wire(Message::User(UserMessage::text(text)))
+    }
+
+    fn assistant(stop: StopReason, content: Vec<AssistantContent>) -> AgentMessage {
+        let mut a = AssistantMessage::empty();
+        a.stop_reason = stop;
+        a.content = content;
+        AgentMessage::wire(Message::Assistant(a))
+    }
+
+    fn tool_call() -> AssistantContent {
+        AssistantContent::ToolCall(ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: serde_json::Value::Null,
+        })
+    }
+
+    #[test]
+    fn trims_trailing_error_assistant() {
+        let mut msgs = vec![user("hi"), assistant(StopReason::Error, vec![])];
+        trim_trailing_failed_assistant(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].as_wire(), Some(Message::User(_))));
+    }
+
+    #[test]
+    fn trims_consecutive_failed_assistants() {
+        let mut msgs = vec![
+            user("hi"),
+            assistant(StopReason::Aborted, vec![]),
+            assistant(StopReason::Error, vec![]),
+        ];
+        trim_trailing_failed_assistant(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn keeps_failed_assistant_with_tool_calls() {
+        // A partially-executed turn ends in its tool-result messages, not
+        // the assistant; trimming the assistant would orphan results.
+        let mut msgs = vec![
+            user("hi"),
+            assistant(StopReason::Aborted, vec![tool_call()]),
+        ];
+        trim_trailing_failed_assistant(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn keeps_successful_trailing_assistant() {
+        let mut msgs = vec![user("hi"), assistant(StopReason::Stop, vec![])];
+        trim_trailing_failed_assistant(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+    }
 }

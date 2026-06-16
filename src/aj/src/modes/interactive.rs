@@ -1064,6 +1064,11 @@ async fn run_session(
     // auto-compaction threshold against a compaction it just ran (which
     // would otherwise loop, since occupancy is read from the footer).
     let mut compaction_agents: HashSet<AgentId> = HashSet::new();
+    // Agents for which a reactive overflow recovery (compact + retry) is
+    // already in flight or just attempted. Gates the once-per-sequence
+    // retry so a second overflow surfaces the error instead of looping;
+    // cleared on any successful or aborted turn.
+    let mut overflow_recovered: HashSet<AgentId> = HashSet::new();
     // Implements the "press Ctrl+C again to quit" guard when the
     // viewed agent is idle but other agents or background tasks are
     // still running.
@@ -1146,6 +1151,10 @@ async fn run_session(
                         }
                         match result {
                             Ok(()) => {
+                                // A successful turn ends any reactive
+                                // recovery sequence, so a later overflow
+                                // can recover afresh.
+                                overflow_recovered.remove(&id);
                                 // Auto-compaction: after a successful real
                                 // Main turn (not a compaction, and only when
                                 // no wake turn was just spawned), compact if
@@ -1183,6 +1192,7 @@ async fn run_session(
                                 }
                             }
                             Err(TurnError::Aborted) => {
+                                overflow_recovered.remove(&id);
                                 // The agent has already emitted the
                                 // synthetic aborted `MessageEnd` and
                                 // any cancelled tool-result
@@ -1194,18 +1204,79 @@ async fn run_session(
                                 world.pump.handle(&mut shell.tui, &notice_event("Turn cancelled."));
                             }
                             Err(TurnError::Recoverable(err)) => {
-                                // Surface to the user; the chat
-                                // container's notice line keeps the
-                                // session going. The agent's own bus
-                                // already wrote whatever partial
-                                // assistant message it produced.
-                                world.pump.handle(
-                                    &mut shell.tui,
-                                    &AgentEvent::Error {
-                                        agent_id: id,
-                                        text: format!("agent error: {err:#}"),
-                                    },
-                                );
+                                // Reactive overflow recovery: the failed
+                                // assistant message is persisted to the
+                                // log (it was emitted to the bus) but not
+                                // pushed onto the in-memory transcript, so
+                                // detect on the log's most recent
+                                // assistant turn.
+                                let is_overflow = id == AgentId::Main && {
+                                    let window =
+                                        world.pump.agent_context_window(AgentId::Main);
+                                    let log = world.log.lock().await;
+                                    log.latest_leaf(ThreadFilter::USER)
+                                        .map(|head| {
+                                            let conv =
+                                                log.linearize(&head, ThreadFilter::USER);
+                                            aj_models::errors::last_turn_is_context_overflow(
+                                                &conv.messages(),
+                                                Some(window),
+                                            )
+                                        })
+                                        .unwrap_or(false)
+                                };
+                                let (auto, keep_recent) = {
+                                    let c =
+                                        shell.config.lock().expect("config mutex poisoned");
+                                    (c.auto_compact, c.compact_keep_recent)
+                                };
+                                if is_overflow && auto && !overflow_recovered.contains(&id) {
+                                    // First overflow of this sequence:
+                                    // compact and retry once.
+                                    overflow_recovered.insert(id);
+                                    world.pump.handle(
+                                        &mut shell.tui,
+                                        &notice_event(
+                                            "Context overflow — compacting and retrying…",
+                                        ),
+                                    );
+                                    spawn_overflow_recovery_turn(
+                                        world,
+                                        &shell.run_config,
+                                        keep_recent,
+                                        &mut turns,
+                                        &mut turn_cancels,
+                                    );
+                                    sync_editor_enabled(&mut shell.tui);
+                                } else if is_overflow && overflow_recovered.contains(&id) {
+                                    // The retry overflowed again; stop and
+                                    // surface a clear, actionable error.
+                                    overflow_recovered.remove(&id);
+                                    world.pump.handle(
+                                        &mut shell.tui,
+                                        &AgentEvent::Error {
+                                            agent_id: id,
+                                            text: "Context overflow recovery failed; \
+                                                   reduce context or switch to a \
+                                                   larger-context model."
+                                                .to_string(),
+                                        },
+                                    );
+                                } else {
+                                    // Non-overflow recoverable error (or
+                                    // auto-compaction disabled): surface it
+                                    // and keep the session going. The
+                                    // agent's bus already wrote whatever
+                                    // partial assistant message it produced.
+                                    overflow_recovered.remove(&id);
+                                    world.pump.handle(
+                                        &mut shell.tui,
+                                        &AgentEvent::Error {
+                                            agent_id: id,
+                                            text: format!("agent error: {err:#}"),
+                                        },
+                                    );
+                                }
                             }
                             Err(TurnError::Fatal(err)) => {
                                 break Err(err);
@@ -2318,6 +2389,56 @@ fn spawn_compaction_turn(
         )
         .await;
         (target, Ok(()))
+    });
+    true
+}
+
+/// Spawn a reactive overflow-recovery turn for the Main agent: compact
+/// (reason [`CompactionReason::Overflow`]) and then re-drive inference
+/// once with [`Agent::continue_run`] against the reduced transcript.
+///
+/// The failed assistant message of the overflow turn is persisted to the
+/// log but never pushed onto the in-memory transcript, and
+/// `run_compaction` trims a trailing failed assistant from the reseed,
+/// so the transcript ends in a user/tool-result message — satisfying
+/// `continue_run`'s precondition. If compaction is a no-op or fails we
+/// still retry: a repeat overflow surfaces through the completion arm,
+/// which won't recurse because the per-agent recovery flag is set.
+fn spawn_overflow_recovery_turn(
+    world: &SessionWorld,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    keep_recent_tokens: u64,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) -> bool {
+    let target = AgentId::Main;
+    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+        return false;
+    };
+    let run_config_for_turn = Arc::clone(run_config);
+    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
+    let log = Arc::clone(&world.log);
+    let turn_cancel = CancellationToken::new();
+    turn_cancels.insert(target, turn_cancel.clone());
+    turns.spawn(async move {
+        let mut a = handle.lock().await;
+        apply_turn_config(
+            target,
+            &mut a,
+            &run_config_for_turn,
+            &sub_overrides_for_turn,
+        );
+        let _ = crate::compaction::run_compaction(
+            &mut a,
+            &log,
+            aj_agent::events::CompactionReason::Overflow,
+            None,
+            keep_recent_tokens,
+            turn_cancel.clone(),
+        )
+        .await;
+        let result = a.continue_run(turn_cancel).await;
+        (target, result)
     });
     true
 }
