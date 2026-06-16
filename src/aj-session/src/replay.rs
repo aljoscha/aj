@@ -57,9 +57,11 @@
 //! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
 //!   feeds the sub-agent bracketing below.
 //! - [`ConversationEntryKind::Compaction`]: a single
-//!   [`AgentEvent::Notice`] marking the compaction boundary in the
-//!   scrollback. The summarized prefix entries still replay in order,
-//!   so the scrollback shows the full history even though the model
+//!   [`AgentEvent::CompactionEnd`] marking the boundary, mirroring the
+//!   live path so the footer occupancy drops to the reduced size (no
+//!   `TurnUsage` follows a compaction, and the retained tail's usage is
+//!   stale). The summarized prefix entries still replay in order, so
+//!   the scrollback shows the full history even though the model
 //!   context (rebuilt via `agent_messages`) is the reduced projection.
 //!
 //! Sub-agent runs are bracketed with synthesized
@@ -74,14 +76,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionReason};
 use aj_agent::message::AgentMessage;
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::TokenUsage;
 use aj_models::types::{AssistantContent, Message, Usage, UserContent};
 use serde_json::Value;
 
-use crate::log::{ConversationEntry, ConversationEntryKind, ConversationLog, ThreadKind};
+use crate::compaction::estimate_conversation_context;
+use crate::log::{
+    ConversationEntry, ConversationEntryKind, ConversationLog, ThreadFilter, ThreadKind,
+};
 
 /// Walk `log` in append order and yield one or more [`AgentEvent`]s
 /// per persisted entry.
@@ -94,7 +99,7 @@ pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> {
     let mut events: Vec<AgentEvent> = Vec::new();
     for entry in log.entries_in_order() {
         state.bracket_subagent(entry, &mut events);
-        state.project_entry(entry, &mut events);
+        state.project_entry(entry, log, &mut events);
     }
     // Close a sub-agent run still open at end-of-log.
     state.close_open_sub(&mut events);
@@ -252,8 +257,15 @@ impl ReplayState {
     }
 
     /// Translate one entry into zero or more events, appending them
-    /// to `out`.
-    fn project_entry(&mut self, entry: &ConversationEntry, out: &mut Vec<AgentEvent>) {
+    /// to `out`. `log` is consulted only for a `Compaction` entry, to
+    /// estimate the post-compaction occupancy of the reduced
+    /// projection.
+    fn project_entry(
+        &mut self,
+        entry: &ConversationEntry,
+        log: &ConversationLog,
+        out: &mut Vec<AgentEvent>,
+    ) {
         let agent_id = match agent_id_for(entry) {
             Some(id) => id,
             // [`ThreadKind::Meta`] is structural framing (system
@@ -285,14 +297,24 @@ impl ReplayState {
                 // notice.
             }
             ConversationEntryKind::Compaction { tokens_before, .. } => {
-                // Placeholder marker in the scrollback. A richer
-                // compaction-summary event is a later task; for now a
-                // Notice marks the boundary the same way live runs do.
-                out.push(AgentEvent::Notice {
+                // Mirror the live path: a compaction reduces context
+                // but emits no `TurnUsage`, and the retained tail's
+                // assistant `usage` is stale, so the footer would keep
+                // showing the pre-compaction occupancy without this.
+                // `tokens_after` is the occupancy of the reduced
+                // projection as of this boundary. We omit `summary`
+                // (the durable record is the log entry) to keep replay
+                // events lean.
+                let tokens_after =
+                    estimate_conversation_context(&log.linearize(&entry.id, ThreadFilter::USER))
+                        .tokens;
+                out.push(AgentEvent::CompactionEnd {
                     agent_id,
-                    text: format!(
-                        "Context compacted: earlier history summarized (~{tokens_before} tokens)."
-                    ),
+                    reason: CompactionReason::Manual,
+                    tokens_before: *tokens_before,
+                    tokens_after,
+                    summary: None,
+                    error: None,
                 });
             }
             ConversationEntryKind::Message { message: agent_msg } => {
@@ -1123,6 +1145,84 @@ mod tests {
         assert_eq!(second.accumulated_output, 50);
         assert_eq!(second.accumulated_cache_read, 20);
         assert_eq!(second.accumulated_cache_write, 5);
+    }
+
+    /// A `Compaction` entry replays as a `CompactionEnd` whose
+    /// `tokens_after` reflects the reduced projection — not the
+    /// retained tail's stale pre-compaction usage. This is what keeps a
+    /// resumed compacted session from showing the old occupancy in the
+    /// footer.
+    #[test]
+    fn replay_compaction_emits_compaction_end_with_reduced_after() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        let first_kept = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("old request")).expect("u0");
+            // The retained assistant reports a large (pre-compaction)
+            // prompt; after compaction this usage is stale.
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "old reply".into(),
+                    text_signature: None,
+                })],
+                100_000,
+                10,
+                0,
+                0,
+            ))
+            .expect("a0");
+            let kept = view.add_message(user_msg("recent request")).expect("u1");
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "recent reply".into(),
+                    text_signature: None,
+                })],
+                100_000,
+                10,
+                0,
+                0,
+            ))
+            .expect("a1");
+            kept
+        };
+        log.append_compaction(
+            ThreadFilter::USER,
+            "SUMMARY".into(),
+            first_kept,
+            100_000,
+            None,
+        )
+        .expect("append compaction");
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+
+        // No Notice marks the boundary anymore; a CompactionEnd does.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { text, .. } if text.contains("compact"))),
+            "compaction should no longer replay as a Notice"
+        );
+        let (before, after) = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                AgentEvent::CompactionEnd {
+                    tokens_before,
+                    tokens_after,
+                    ..
+                } => Some((*tokens_before, *tokens_after)),
+                _ => None,
+            })
+            .expect("a CompactionEnd event");
+        assert_eq!(before, 100_000);
+        assert!(
+            after < 10_000,
+            "tokens_after should drop below the stale 100k anchor, got {after}"
+        );
     }
 
     /// Main and sub-agent assistants keep independent

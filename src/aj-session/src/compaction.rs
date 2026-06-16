@@ -250,6 +250,58 @@ pub fn estimate_context_tokens(messages: &[Message]) -> ContextEstimate {
     }
 }
 
+/// Whether the most-recent-assistant-`usage` anchor would over-report
+/// occupancy for this entry path.
+///
+/// The anchor is stale exactly when a `Compaction` is the most recent
+/// entry among {compaction, assistant message}: every retained
+/// assistant message then predates the summary, so its `usage` still
+/// reflects the old, pre-compaction prompt — the full summarized prefix
+/// included — rather than the reduced projection that will actually be
+/// sent next. Once a real assistant turn runs after the compaction,
+/// that turn's `usage` measures the reduced context and the anchor is
+/// trustworthy again.
+fn usage_anchor_is_stale(entries: &[ConversationEntry]) -> bool {
+    for entry in entries.iter().rev() {
+        match &entry.entry {
+            ConversationEntryKind::Compaction { .. } => return true,
+            ConversationEntryKind::Message { message }
+                if matches!(message.as_wire(), Some(Message::Assistant(_))) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Estimate context occupancy for a linearized conversation, honoring
+/// compaction.
+///
+/// Like [`estimate_context_tokens`] but compaction-aware. When a
+/// compaction sits at the head (no assistant turn has run since it),
+/// the retained tail's most recent assistant `usage` predates the
+/// summary and would over-report by the entire summarized prefix; we
+/// then estimate the projected messages (summary plus retained tail)
+/// purely heuristically. Otherwise we defer to the usage-anchored
+/// estimate over the projection, which is authoritative.
+///
+/// Both compaction `tokens_before` / `tokens_after` and the resumed
+/// footer occupancy go through here, so the reported numbers match what
+/// the next turn will actually send.
+pub fn estimate_conversation_context(conversation: &Conversation) -> ContextEstimate {
+    let messages = conversation.messages();
+    if usage_anchor_is_stale(conversation.entries()) {
+        ContextEstimate {
+            tokens: messages.iter().map(estimate_message_tokens).sum(),
+            last_usage_index: None,
+        }
+    } else {
+        estimate_context_tokens(&messages)
+    }
+}
+
 /// Whether occupancy has crossed the configured fraction of the window.
 /// `threshold` is a fraction in (0, 1]; `context_tokens` and
 /// `context_window` are absolute token counts.
@@ -577,7 +629,7 @@ pub fn prepare_compaction(
     };
 
     // `tokens_before` is the current (compaction-aware) occupancy.
-    let tokens_before = estimate_context_tokens(&conversation.messages()).tokens;
+    let tokens_before = estimate_conversation_context(conversation).tokens;
 
     let cut = find_cut_point(entries, boundary_start, keep_recent_tokens)?;
     let history_end = cut.turn_start_index.unwrap_or(cut.first_kept_index);
@@ -658,6 +710,38 @@ mod tests {
         })
     }
 
+    /// Assistant message whose `usage` reports a prompt of `base`
+    /// tokens (all as plain `input`).
+    fn assistant_with_usage(text: &str, base: u64) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            })],
+            usage: Usage {
+                input: base,
+                ..Usage::default()
+            },
+            ..AssistantMessage::empty()
+        })
+    }
+
+    fn compaction_entry(id: &str, first_kept: &str, summary: &str) -> ConversationEntry {
+        ConversationEntry {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Compaction {
+                summary: summary.to_string(),
+                first_kept_entry_id: first_kept.to_string(),
+                tokens_before: 0,
+                details: None,
+            },
+        }
+    }
+
     fn tool_call(id: &str, name: &str, args: serde_json::Value) -> Message {
         Message::Assistant(AssistantMessage {
             content: vec![AssistantContent::ToolCall(ToolCall {
@@ -711,6 +795,51 @@ mod tests {
         let est = estimate_context_tokens(&[user("aaaa"), assistant_text("bbbb")]);
         assert_eq!(est.last_usage_index, None);
         assert_eq!(est.tokens, 2);
+    }
+
+    #[test]
+    fn estimate_conversation_context_ignores_stale_usage_after_compaction() {
+        // A compaction at the head: the retained tail's assistant still
+        // carries the pre-compaction 100k usage. That anchor is stale
+        // (it counts the now-summarized prefix), so the estimate must
+        // fall back to the heuristic over the projection (summary +
+        // short retained tail), not report ~100k.
+        let entries = vec![
+            msg_entry("0", user("old request")),
+            msg_entry("1", assistant_with_usage("old reply", 100_000)),
+            msg_entry("2", user("recent request")),
+            msg_entry("3", assistant_with_usage("recent reply", 100_000)),
+            compaction_entry("4", "2", "SUMMARY"),
+        ];
+        let conv = Conversation::from_entries("t".to_string(), entries);
+        let est = estimate_conversation_context(&conv);
+        assert_eq!(est.last_usage_index, None);
+        assert!(
+            est.tokens < 1_000,
+            "expected a small heuristic, got {}",
+            est.tokens
+        );
+    }
+
+    #[test]
+    fn estimate_conversation_context_uses_usage_after_post_compaction_turn() {
+        // A real turn ran after the compaction; its 5k usage measures
+        // the reduced context and is authoritative again.
+        let entries = vec![
+            msg_entry("0", user("old request")),
+            msg_entry("1", assistant_with_usage("old reply", 100_000)),
+            compaction_entry("2", "3", "SUMMARY"),
+            msg_entry("3", user("new request")),
+            msg_entry("4", assistant_with_usage("new reply", 5_000)),
+        ];
+        let conv = Conversation::from_entries("t".to_string(), entries);
+        let est = estimate_conversation_context(&conv);
+        assert!(est.last_usage_index.is_some());
+        assert!(
+            (5_000..6_000).contains(&est.tokens),
+            "expected ~5k usage anchor, got {}",
+            est.tokens
+        );
     }
 
     #[test]

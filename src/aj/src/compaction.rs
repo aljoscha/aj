@@ -154,7 +154,11 @@ pub async fn run_compaction(
             .expect("head exists after append");
         let conversation = log_guard.linearize(&head, ThreadFilter::USER);
         let messages = conversation.agent_messages();
-        let after = planning::estimate_context_tokens(&conversation.messages()).tokens;
+        // The just-appended compaction sits at the head, so the
+        // retained tail's assistant `usage` is stale; the
+        // compaction-aware estimate uses the projection's heuristic
+        // size instead, which is what the next turn will actually send.
+        let after = planning::estimate_conversation_context(&conversation).tokens;
         agent.reseed_transcript(messages);
         after
     };

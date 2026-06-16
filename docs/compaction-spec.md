@@ -247,7 +247,24 @@ pub fn estimate_message_tokens(message: &Message) -> u64;
 /// preferring the last assistant `usage` and estimating only the
 /// trailing messages after it.
 pub fn estimate_context_tokens(messages: &[Message]) -> ContextEstimate;
+
+/// Compaction-aware occupancy for a whole `Conversation`.
+pub fn estimate_conversation_context(conversation: &Conversation) -> ContextEstimate;
 ```
+
+The usage anchor needs one correction once compaction enters the
+picture: a retained assistant message's `usage` measures the prompt as
+it was *when that turn ran*, including history that a later compaction
+has since summarized away. So immediately after a compaction (no real
+turn has run since), the most recent assistant `usage` over-reports by
+the entire summarized prefix. `estimate_conversation_context` guards
+against this: when a `Compaction` is the most recent entry among
+{compaction, assistant message}, it estimates the projected messages
+(summary + retained tail) purely heuristically instead of anchoring on
+the stale usage; otherwise it defers to `estimate_context_tokens` over
+the projection. Both compaction `tokens_before` / `tokens_after` and the
+resumed footer occupancy go through it, so the reported numbers match
+what the next turn actually sends.
 
 ### 4.2 The trigger predicate
 
@@ -676,13 +693,17 @@ a session without sending a new turn.
 ## 8. Replay
 
 `replay` (`aj-session/src/replay.rs`) maps each persisted entry onto
-renderer events so a resumed session looks like a live one. Add a
-`Compaction` arm to `ReplayState::project_entry` (`replay.rs:249`):
+renderer events so a resumed session looks like a live one. The
+`Compaction` arm of `ReplayState::project_entry` emits:
 
-- Emit `CompactionEnd { reason: Manual, tokens_before, tokens_after: <occupancy of what follows>, summary: Some(entry.summary), error: None }`
-  (or a dedicated lighter event) so the renderer paints the same
-  compaction-summary row it shows live. No `CompactionStart` is needed
-  on replay (there is no progress to show).
+- `CompactionEnd { reason: Manual, tokens_before, tokens_after, summary:
+  None, error: None }`, where `tokens_after` is
+  `estimate_conversation_context` of the user thread linearized up to the
+  compaction (the reduced projection's occupancy). This mirrors the live
+  path: a compaction emits no `TurnUsage` and the retained tail's usage
+  is stale, so without it a resumed footer would keep showing the
+  pre-compaction occupancy. `summary` is omitted to keep replay events
+  lean — the durable record is the log's compaction entry.
 
 Crucially, replay's other arms are unaffected: the summarized prefix
 entries are still in the log and `replay` still walks them in order, so
