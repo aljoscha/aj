@@ -557,6 +557,14 @@ fn thinking_level_for(level: &aj_models::ThinkingConfig) -> aj_models::types::Th
 /// keeps the run alive while making the gap visible.
 fn json_event_listener() -> Listener {
     listener_from_sync(move |event: &AgentEvent| {
+        // `ToolExecutionUpdate` is a high-frequency (~10/s) transient
+        // progress snapshot for live rendering; it is never persisted
+        // and adds only noise to a structured event stream meant for
+        // programmatic consumption. The terminal `ToolExecutionEnd`
+        // carries the authoritative result.
+        if matches!(event, AgentEvent::ToolExecutionUpdate { .. }) {
+            return;
+        }
         match serde_json::to_string(event) {
             Ok(line) => {
                 if let Err(e) = writeln!(io::stdout(), "{line}") {
