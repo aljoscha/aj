@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionPhase};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::queue::MessageQueues;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
@@ -47,6 +47,7 @@ use crate::modes::interactive::components::assistant_message::{
     AssistantMessageComponent, BlockKind,
 };
 use crate::modes::interactive::components::chat_view::{AgentEntry, ChatView};
+use crate::modes::interactive::components::compaction_summary::CompactionSummaryComponent;
 use crate::modes::interactive::components::footer::{AgentActivity, Footer};
 use crate::modes::interactive::components::loader_status::LoaderStatus;
 use crate::modes::interactive::components::pending_message::PendingMessage;
@@ -147,6 +148,15 @@ pub struct EventPump {
     /// continuations versus nested initial spawns. The pump keeps
     /// this set as literal truth.
     running_agents: HashSet<AgentId>,
+    /// Agents with an in-flight host-driven compaction — inserted on
+    /// [`AgentEvent::CompactionStart`], removed on
+    /// [`AgentEvent::CompactionEnd`]. Compaction runs outside the
+    /// `AgentStart`/`AgentEnd` bracket (it is host-orchestrated, not a
+    /// model turn), so it never touches `running_agents`; the
+    /// per-view spinner ([`Self::sync_loader`]) treats an agent as busy
+    /// when it is in *either* set, which is how the spinner animates
+    /// during the multi-second summarizer call.
+    compacting: HashSet<AgentId>,
     /// Background tasks observed via [`AgentEvent::TaskStart`],
     /// keyed by task id. Entries are kept (with their terminal
     /// status) after `TaskEnd` so the picker's "all" scope can list
@@ -206,6 +216,7 @@ impl EventPump {
             theme,
             agents: HashMap::new(),
             running_agents: HashSet::new(),
+            compacting: HashSet::new(),
             tasks: BTreeMap::new(),
             render_settings,
             footer_data: AgentFooters::new(main_settings, main_context_window),
@@ -646,17 +657,45 @@ impl EventPump {
             }
 
             // ---- Compaction lifecycle. ----
+            //
+            // Compaction is host-orchestrated and does not bracket
+            // itself with `AgentStart`/`AgentEnd`, so the spinner is
+            // driven through the separate `compacting` set: `Start`
+            // marks the agent busy and labels the spinner, `Progress`
+            // relabels it per phase, and `End` clears the set and
+            // stops the spinner on the edge. The summarizer is a
+            // multi-second network call, so this animated label is the
+            // primary "still working" affordance.
             AgentEvent::CompactionStart { agent_id, .. } => {
-                self.append_notice(tui, *agent_id, "Compacting context…");
+                self.compacting.insert(*agent_id);
+                self.set_loader_message_for(tui, *agent_id, "Compacting context…");
+                self.sync_loader(tui);
+                tui.request_render();
+            }
+            AgentEvent::CompactionProgress {
+                agent_id, phase, ..
+            } => {
+                let message = match phase {
+                    CompactionPhase::Summarizing => "Compacting: summarizing earlier context…",
+                    CompactionPhase::SummarizingTurnPrefix => "Compacting: summarizing split turn…",
+                    CompactionPhase::Saving => "Compacting: saving…",
+                };
+                self.set_loader_message_for(tui, *agent_id, message);
                 tui.request_render();
             }
             AgentEvent::CompactionEnd {
                 agent_id,
                 tokens_before,
                 tokens_after,
+                summary,
                 error,
                 ..
             } => {
+                self.compacting.remove(agent_id);
+                // The `summary`/`error` pair encodes the terminal
+                // outcome (see `AgentEvent::CompactionEnd`): an error
+                // is a failure, a summary is a success, neither is a
+                // cancellation that wrote nothing.
                 if let Some(err) = error {
                     self.append_styled_notice(
                         tui,
@@ -664,12 +703,15 @@ impl EventPump {
                         &format!("Compaction failed: {err}"),
                         aj_tui::style::yellow,
                     );
-                } else {
-                    self.append_notice(
-                        tui,
-                        *agent_id,
-                        &format!("Context compacted: ~{tokens_before} → ~{tokens_after} tokens."),
+                } else if let Some(summary) = summary {
+                    let component = CompactionSummaryComponent::new(
+                        *tokens_before,
+                        *tokens_after,
+                        summary,
+                        &self.theme,
+                        self.render_settings.clone(),
                     );
+                    self.push_chat_child(tui, *agent_id, Box::new(component));
                     // No `TurnUsage` follows a compaction, so refresh the
                     // footer occupancy directly to the post-compaction
                     // estimate.
@@ -678,7 +720,11 @@ impl EventPump {
                     if *agent_id == self.active_view(tui) {
                         self.sync_footer(tui);
                     }
+                } else {
+                    self.append_notice(tui, *agent_id, "Compaction canceled.");
                 }
+                self.reset_loader_message(tui, *agent_id);
+                self.sync_loader(tui);
                 tui.request_render();
             }
 
@@ -804,12 +850,33 @@ impl EventPump {
     /// every event would jitter the animation.
     fn sync_loader(&self, tui: &mut Tui) {
         let active = self.active_view(tui);
-        let should_run = self.running_agents.contains(&active);
+        let should_run = self.running_agents.contains(&active) || self.compacting.contains(&active);
         self.with_loader(tui, |l| match (should_run, l.is_active()) {
             (true, false) => l.start(),
             (false, true) => l.stop(),
             _ => {}
         });
+    }
+
+    /// Set the loader message, but only when `agent_id` is the viewed
+    /// agent — the single status-slot loader is scoped to the active
+    /// view, so a background agent's compaction must not relabel the
+    /// spinner the user is watching.
+    fn set_loader_message_for(&self, tui: &mut Tui, agent_id: AgentId, message: &str) {
+        if agent_id != self.active_view(tui) {
+            return;
+        }
+        self.with_loader(tui, |l| l.set_message(message));
+    }
+
+    /// Restore the loader's default message for the viewed agent, used
+    /// when a compaction ends so a subsequent turn shows "Working…"
+    /// rather than the stale compaction label.
+    fn reset_loader_message(&self, tui: &mut Tui, agent_id: AgentId) {
+        if agent_id != self.active_view(tui) {
+            return;
+        }
+        self.with_loader(tui, |l| l.reset_message());
     }
 
     /// Mutate the [`LoaderStatus`] component in the status slot.

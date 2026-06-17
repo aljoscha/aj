@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
-use aj_agent::Agent;
-use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
+use aj_agent::events::{AgentEvent, AgentId, CompactionPhase, CompactionReason};
 use aj_agent::message::AgentMessage;
+use aj_agent::{Agent, TurnError};
 use aj_models::types::{AssistantContent, Message, StopReason};
 use aj_session::compaction as planning;
 use aj_session::{ConversationLog, ThreadFilter};
@@ -34,8 +34,9 @@ pub enum CompactionOutcome {
     },
     /// Nothing to compact (session too small or already compacted).
     NothingToDo,
-    /// Compaction failed (summarizer error or cancellation); nothing
-    /// was written.
+    /// Compaction was cancelled before anything was persisted.
+    Canceled,
+    /// Compaction failed (summarizer error); nothing was written.
     Failed(String),
 }
 
@@ -96,6 +97,7 @@ pub async fn run_compaction(
         None => planning::initial_summary_prompt(&conversation_text, custom_instructions),
     };
 
+    emit_progress(agent, reason, CompactionPhase::Summarizing).await;
     let mut summary = match agent
         .complete_oneshot(
             planning::SUMMARIZATION_SYSTEM_PROMPT,
@@ -106,6 +108,7 @@ pub async fn run_compaction(
         .await
     {
         Ok(text) => text,
+        Err(TurnError::Aborted) => return finish_canceled(agent, reason, plan.tokens_before).await,
         Err(err) => return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await,
     };
 
@@ -115,6 +118,7 @@ pub async fn run_compaction(
         let prefix_text = planning::serialize_conversation(&plan.turn_prefix_messages);
         let prefix_prompt = planning::turn_prefix_summary_prompt(&prefix_text);
         let prefix_max_tokens = clamp_output_budget(SUMMARY_OUTPUT_CAP / 2, model_max_tokens);
+        emit_progress(agent, reason, CompactionPhase::SummarizingTurnPrefix).await;
         let prefix = match agent
             .complete_oneshot(
                 planning::SUMMARIZATION_SYSTEM_PROMPT,
@@ -125,6 +129,9 @@ pub async fn run_compaction(
             .await
         {
             Ok(text) => text,
+            Err(TurnError::Aborted) => {
+                return finish_canceled(agent, reason, plan.tokens_before).await;
+            }
             Err(err) => {
                 return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await;
             }
@@ -139,6 +146,7 @@ pub async fn run_compaction(
     // Persist the checkpoint and reseed the live transcript from the
     // post-compaction projection. `log` and `agent` are distinct locks,
     // so holding the log guard while reseeding the agent is safe.
+    emit_progress(agent, reason, CompactionPhase::Saving).await;
     let tokens_after = {
         let mut log_guard = log.lock().await;
         if let Err(err) = log_guard.append_compaction(
@@ -215,6 +223,21 @@ fn trim_trailing_failed_assistant(messages: &mut Vec<AgentMessage>) {
         } else {
             break;
         }
+    }
+}
+
+/// Emit a best-effort [`AgentEvent::CompactionProgress`]; a failed emit
+/// only loses a UI label, so it must not abort the run.
+async fn emit_progress(agent: &Agent, reason: CompactionReason, phase: CompactionPhase) {
+    if let Err(err) = agent
+        .emit_event(AgentEvent::CompactionProgress {
+            agent_id: AgentId::Main,
+            reason,
+            phase,
+        })
+        .await
+    {
+        tracing::warn!("failed to emit CompactionProgress: {err}");
     }
 }
 
@@ -299,6 +322,31 @@ async fn finish_failed(
         tracing::warn!("failed to emit CompactionEnd: {err}");
     }
     CompactionOutcome::Failed(error)
+}
+
+/// Emit a terminal `CompactionEnd` for a cancelled run. `summary` and
+/// `error` are both `None` — the event's documented "ended without
+/// writing" shape — so a renderer stops the in-progress indicator and
+/// shows a neutral notice rather than reading it as success or failure.
+async fn finish_canceled(
+    agent: &Agent,
+    reason: CompactionReason,
+    tokens_before: u64,
+) -> CompactionOutcome {
+    if let Err(err) = agent
+        .emit_event(AgentEvent::CompactionEnd {
+            agent_id: AgentId::Main,
+            reason,
+            tokens_before,
+            tokens_after: 0,
+            summary: None,
+            error: None,
+        })
+        .await
+    {
+        tracing::warn!("failed to emit CompactionEnd (canceled): {err}");
+    }
+    CompactionOutcome::Canceled
 }
 
 #[cfg(test)]

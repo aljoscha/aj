@@ -296,15 +296,20 @@ impl ReplayState {
                 // SubAgentStart by `bracket_subagent`, never as a
                 // notice.
             }
-            ConversationEntryKind::Compaction { tokens_before, .. } => {
+            ConversationEntryKind::Compaction {
+                tokens_before,
+                summary,
+                ..
+            } => {
                 // Mirror the live path: a compaction reduces context
                 // but emits no `TurnUsage`, and the retained tail's
                 // assistant `usage` is stale, so the footer would keep
                 // showing the pre-compaction occupancy without this.
                 // `tokens_after` is the occupancy of the reduced
-                // projection as of this boundary. We omit `summary`
-                // (the durable record is the log entry) to keep replay
-                // events lean.
+                // projection as of this boundary. The summary is the
+                // durable on-disk record, so we carry it through here
+                // to paint the same collapsible compaction-summary row
+                // a live run shows.
                 let tokens_after =
                     estimate_conversation_context(&log.linearize(&entry.id, ThreadFilter::USER))
                         .tokens;
@@ -313,7 +318,7 @@ impl ReplayState {
                     reason: CompactionReason::Manual,
                     tokens_before: *tokens_before,
                     tokens_after,
-                    summary: None,
+                    summary: Some(summary.clone()),
                     error: None,
                 });
             }
@@ -1213,8 +1218,14 @@ mod tests {
                 AgentEvent::CompactionEnd {
                     tokens_before,
                     tokens_after,
+                    summary,
                     ..
-                } => Some((*tokens_before, *tokens_after)),
+                } => {
+                    // The durable on-disk summary is carried through so a
+                    // resumed session paints the same collapsible row.
+                    assert_eq!(summary.as_deref(), Some("SUMMARY"));
+                    Some((*tokens_before, *tokens_after))
+                }
                 _ => None,
             })
             .expect("a CompactionEnd event");

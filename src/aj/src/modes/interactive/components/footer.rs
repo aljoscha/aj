@@ -222,7 +222,7 @@ fn render_context_usage(usage: ContextUsage) -> Option<String> {
 /// cast (>2^53) are well past anything a context window or a
 /// realistic session would reach.
 #[allow(clippy::as_conversions)]
-fn format_tokens(n: u64) -> String {
+pub(crate) fn format_tokens(n: u64) -> String {
     if n < 1_000 {
         format!("{n}")
     } else if n < 10_000 {

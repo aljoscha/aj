@@ -92,6 +92,22 @@ pub enum CompactionReason {
     Overflow,
 }
 
+/// Stage of an in-flight compaction, carried on
+/// [`AgentEvent::CompactionProgress`] so a renderer can label the
+/// in-progress indicator with the step currently running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    /// Summarizing the history before the cut point — the main
+    /// summarizer inference and the longest part of a run.
+    Summarizing,
+    /// Summarizing the prefix of a turn the cut split, so the retained
+    /// suffix keeps its setup. Only emitted for a split-turn cut.
+    SummarizingTurnPrefix,
+    /// Persisting the compaction entry and reseeding the transcript.
+    Saving,
+}
+
 /// Bus event emitted by the agent runtime.
 ///
 /// Every variant carries an `agent_id` so a single listener (e.g. the
@@ -302,13 +318,31 @@ pub enum AgentEvent {
         agent_id: AgentId,
         reason: CompactionReason,
     },
+    /// Compaction advanced to a new [`CompactionPhase`]. Renderers
+    /// update the in-progress indicator's label; carries no occupancy
+    /// figures. Transient — not persisted.
+    CompactionProgress {
+        agent_id: AgentId,
+        reason: CompactionReason,
+        phase: CompactionPhase,
+    },
     /// Compaction finished. `tokens_before` / `tokens_after` are the
     /// estimated context occupancy on either side (for a "freed ~N
-    /// tokens" notice). `summary` is the generated text so a live
-    /// renderer can show a compaction-summary row; `error` is set when
-    /// compaction failed and nothing was written. Transient — not
-    /// persisted; the conversation log's compaction entry is the
-    /// durable record.
+    /// tokens" notice).
+    ///
+    /// The `summary` / `error` pair encodes the terminal outcome, so a
+    /// renderer can always treat this event as the signal to stop the
+    /// in-progress indicator:
+    ///
+    /// - `error: Some` — compaction failed and nothing was written.
+    /// - `summary: Some` (and `error: None`) — success; the text is the
+    ///   generated summary so a live renderer can show a
+    ///   compaction-summary row.
+    /// - both `None` — the run ended without writing (cancelled before
+    ///   the persist step).
+    ///
+    /// Transient — not persisted; the conversation log's compaction
+    /// entry is the durable record.
     CompactionEnd {
         agent_id: AgentId,
         reason: CompactionReason,
@@ -355,6 +389,7 @@ impl AgentEvent {
             | Self::StreamRetry { agent_id, .. }
             | Self::TurnUsage { agent_id, .. }
             | Self::CompactionStart { agent_id, .. }
+            | Self::CompactionProgress { agent_id, .. }
             | Self::CompactionEnd { agent_id, .. }
             | Self::TaskStart { agent_id, .. }
             | Self::TaskOutput { agent_id, .. }
@@ -498,6 +533,16 @@ mod tests {
         assert_eq!(json["type"], "compaction_start");
         assert_eq!(json["agent_id"], "main");
         assert_eq!(json["reason"], "manual");
+
+        let progress = AgentEvent::CompactionProgress {
+            agent_id: AgentId::Main,
+            reason: CompactionReason::Threshold,
+            phase: CompactionPhase::SummarizingTurnPrefix,
+        };
+        let json = serde_json::to_value(&progress).expect("CompactionProgress serializes");
+        assert_eq!(json["type"], "compaction_progress");
+        assert_eq!(json["reason"], "threshold");
+        assert_eq!(json["phase"], "summarizing_turn_prefix");
 
         let end = AgentEvent::CompactionEnd {
             agent_id: AgentId::Main,

@@ -8,9 +8,11 @@
 //! loader can be added to / removed from the rendered tree without
 //! the pump having to track raw pointers.
 //!
-//! Today the message is fixed at "Working…"; future commits can
-//! plug richer status (current tool, retry-attempt count, queue
-//! depth) into [`LoaderStatus::set_message`].
+//! The message defaults to "Working…" but the pump relabels it via
+//! [`LoaderStatus::set_message`] for non-turn activity — today, the
+//! per-phase status of an in-flight compaction — and restores the
+//! default with [`LoaderStatus::reset_message`] when that activity
+//! ends.
 //!
 //! See `docs/aj-next-plan.md` §4 — `components/loader_status.rs`.
 

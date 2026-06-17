@@ -3468,6 +3468,7 @@ mod event_protocol_tests {
             AgentEvent::TaskOutput { .. } => EventLabel::Other("TaskOutput"),
             AgentEvent::TaskEnd { .. } => EventLabel::Other("TaskEnd"),
             AgentEvent::CompactionStart { .. } => EventLabel::Other("CompactionStart"),
+            AgentEvent::CompactionProgress { .. } => EventLabel::Other("CompactionProgress"),
             AgentEvent::CompactionEnd { .. } => EventLabel::Other("CompactionEnd"),
         }
     }

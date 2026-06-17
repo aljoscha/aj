@@ -21,6 +21,7 @@ pub mod auth_status;
 pub mod bash_execution;
 pub mod chat_view;
 pub mod command_palette;
+pub mod compaction_summary;
 pub mod diff;
 pub mod footer;
 pub mod header;
