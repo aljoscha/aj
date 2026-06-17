@@ -28,7 +28,7 @@ use aj_tui::style;
 /// summaries from primitive [`Usage`] values without needing to
 /// construct a live [`Agent`].
 pub fn build_usage_summary(agent: &Agent) -> UsageSummary {
-    build_usage_summary_from_parts(agent.accumulated_usage(), agent.sub_agent_usage())
+    build_usage_summary_from_parts(&agent.accumulated_usage(), &agent.sub_agent_usage())
 }
 
 /// Project a main-agent [`Usage`] plus a `HashMap` of sub-agent

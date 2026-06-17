@@ -429,16 +429,16 @@ impl Agent {
         self.session_state.turn_counter()
     }
 
-    pub fn accumulated_usage(&self) -> &Usage {
+    pub fn accumulated_usage(&self) -> Usage {
         self.session_state.accumulated_usage()
     }
 
-    /// Borrow the per-sub-agent accumulated [`Usage`] map. The
+    /// Snapshot of the per-sub-agent accumulated [`Usage`] map. The
     /// binary uses this to compute the end-of-session usage summary
     /// (the agent no longer renders one — the binary owns
     /// presentation).
-    pub fn sub_agent_usage(&self) -> &HashMap<usize, Usage> {
-        &self.session_state.sub_agent_usage
+    pub fn sub_agent_usage(&self) -> HashMap<usize, Usage> {
+        self.session_state.sub_agent_usage()
     }
 
     /// Borrow the agent's in-memory transcript. The binary uses
@@ -1012,7 +1012,7 @@ impl Agent {
     ///    the transcript never carries a `tool_use` without a
     ///    matching `tool_result`.
     async fn execute_turn(&mut self) -> Result<(), TurnError> {
-        self.session_state.turn_counter += 1;
+        self.session_state.bump_turn_counter();
 
         // `TurnStart` mirrors entry to the assistant-message cycle.
         // The matching `TurnEnd` event (which carries the finalized
@@ -1315,14 +1315,15 @@ impl Agent {
             self.transcript
                 .push(AgentMessage::wire(Message::Assistant(response.clone())));
 
+            let accumulated = self.session_state.accumulated_usage();
             let usage = TokenUsage {
-                accumulated_input: self.session_state.accumulated_usage.input,
+                accumulated_input: accumulated.input,
                 turn_input: turn_usage.input,
-                accumulated_output: self.session_state.accumulated_usage.output,
+                accumulated_output: accumulated.output,
                 turn_output: turn_usage.output,
-                accumulated_cache_write: self.session_state.accumulated_usage.cache_write,
+                accumulated_cache_write: accumulated.cache_write,
                 turn_cache_write: turn_usage.cache_write,
-                accumulated_cache_read: self.session_state.accumulated_usage.cache_read,
+                accumulated_cache_read: accumulated.cache_read,
                 turn_cache_read: turn_usage.cache_read,
             };
             self.bus
@@ -1333,7 +1334,7 @@ impl Agent {
                 .await
                 .map_err(TurnError::Fatal)?;
 
-            accumulate_usage(&mut self.session_state.accumulated_usage, &turn_usage);
+            self.session_state.accumulate_usage(&turn_usage);
 
             // Execute tool calls if any
             if has_tool_use {
@@ -1783,7 +1784,7 @@ impl Agent {
     }
 
     async fn execute_tool(
-        &mut self,
+        &self,
         call_id: &str,
         tool_name: &str,
         tool_input: serde_json::Value,
@@ -1796,20 +1797,18 @@ impl Agent {
 
         // Build the sub-agent tool template now (cheap clone: every
         // `ErasedToolDefinition` field is `Clone`, with the closure
-        // sitting behind an `Arc`). Doing this before borrowing
-        // `self` mutably for the wrapper avoids field-aliasing
-        // borrows.
+        // sitting behind an `Arc`).
         let sub_agent_tools: Vec<ErasedToolDefinition> =
             self.tool_definitions.values().cloned().collect();
 
         // Build the [`ToolContext`] the tool sees: working
         // directory, todos, sub-agent spawn, cancellation token,
-        // progress updates via `emit_update`. After §2.4b the wrapper
-        // no longer touches the conversation log; sub-agent persistence
-        // is anchored via the `SubAgentStart` event the wrapper emits
-        // before the child runs.
+        // progress updates via `emit_update`. The wrapper holds a
+        // clone of the session-state handle (not a `&mut` borrow), so
+        // `execute_tool` takes `&self` and several tool calls can run
+        // concurrently within one turn.
         let mut session_ctx_wrapper = SessionContextWrapper {
-            session_ctx: &mut self.session_state,
+            session_state: self.session_state.clone(),
             env: &self.env,
             assembled_system_prompt: self
                 .assembled_system_prompt
@@ -2181,9 +2180,23 @@ impl TaskRegistry {
     }
 }
 
-/// Mutable state of an [`Agent`] session.
-#[derive(Debug)]
+/// Session-scoped state read and mutated by tool calls through
+/// [`ToolContext`], plus the run loop's own turn / usage bookkeeping.
+///
+/// A cheaply-cloneable handle over one shared inner, mirroring
+/// [`TaskRegistry`] / [`SubAgentRegistry`] / [`MessageQueues`]: clones
+/// share the same state. The inner [`std::sync::Mutex`] guards short
+/// field/map operations only and is never held across `.await`, so
+/// concurrent foreground tool calls can each hold a clone and mutate
+/// session state without contending on a `&mut` borrow of the agent —
+/// that borrow is what otherwise forces tool calls to run serially.
+#[derive(Clone)]
 pub struct SessionState {
+    inner: Arc<StdMutex<SessionStateInner>>,
+}
+
+#[derive(Debug)]
+struct SessionStateInner {
     working_directory: PathBuf,
     todo_list: Vec<TodoItem>,
     turn_counter: usize,
@@ -2195,50 +2208,69 @@ pub struct SessionState {
 impl SessionState {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
-            working_directory,
-            todo_list: Vec::new(),
-            turn_counter: 0,
-            accumulated_usage: Usage::default(),
-            sub_agent_counter: 0,
-            sub_agent_usage: HashMap::new(),
+            inner: Arc::new(StdMutex::new(SessionStateInner {
+                working_directory,
+                todo_list: Vec::new(),
+                turn_counter: 0,
+                accumulated_usage: Usage::default(),
+                sub_agent_counter: 0,
+                sub_agent_usage: HashMap::new(),
+            })),
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionStateInner> {
+        self.inner.lock().expect("session state mutex poisoned")
+    }
+
     fn working_directory(&self) -> PathBuf {
-        self.working_directory.to_owned()
+        self.lock().working_directory.clone()
     }
 
     fn get_todo_list(&self) -> Vec<TodoItem> {
-        self.todo_list.clone()
+        self.lock().todo_list.clone()
     }
 
-    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
-        self.todo_list = todos;
+    fn set_todo_list(&self, todos: Vec<TodoItem>) {
+        self.lock().todo_list = todos;
     }
 
     pub fn turn_counter(&self) -> usize {
-        self.turn_counter
+        self.lock().turn_counter
     }
 
-    pub fn accumulated_usage(&self) -> &Usage {
-        &self.accumulated_usage
+    fn bump_turn_counter(&self) {
+        self.lock().turn_counter += 1;
     }
 
-    fn next_sub_agent_id(&mut self) -> usize {
-        self.sub_agent_counter += 1;
-        self.sub_agent_counter
+    pub fn accumulated_usage(&self) -> Usage {
+        self.lock().accumulated_usage.clone()
+    }
+
+    fn accumulate_usage(&self, delta: &Usage) {
+        accumulate_usage(&mut self.lock().accumulated_usage, delta);
+    }
+
+    fn next_sub_agent_id(&self) -> usize {
+        let mut inner = self.lock();
+        inner.sub_agent_counter += 1;
+        inner.sub_agent_counter
     }
 
     /// Seed the subagent counter to `value` so subsequent
     /// [`SessionState::next_sub_agent_id`] calls mint ids strictly
     /// greater than `value`. Used on resume to avoid colliding
     /// with subagent subtrees already persisted in the log.
-    fn seed_sub_agent_counter(&mut self, value: usize) {
-        self.sub_agent_counter = value;
+    fn seed_sub_agent_counter(&self, value: usize) {
+        self.lock().sub_agent_counter = value;
     }
 
-    fn record_sub_agent_usage(&mut self, agent_id: usize, usage: Usage) {
-        self.sub_agent_usage.insert(agent_id, usage);
+    fn record_sub_agent_usage(&self, agent_id: usize, usage: Usage) {
+        self.lock().sub_agent_usage.insert(agent_id, usage);
+    }
+
+    fn sub_agent_usage(&self) -> HashMap<usize, Usage> {
+        self.lock().sub_agent_usage.clone()
     }
 }
 
@@ -2253,7 +2285,7 @@ mod session_state_tests {
     /// so a resumed session never reuses persisted sub-agent ids.
     #[test]
     fn seeded_counter_mints_strictly_greater_ids() {
-        let mut state = SessionState::new(PathBuf::from("/test"));
+        let state = SessionState::new(PathBuf::from("/test"));
         state.seed_sub_agent_counter(3);
         assert_eq!(state.next_sub_agent_id(), 4);
         assert_eq!(state.next_sub_agent_id(), 5);
@@ -2482,7 +2514,7 @@ mod task_registry_tests {
 /// while we have partial immutable access to other parts. Used in
 /// [`Agent::execute_tool`].
 struct SessionContextWrapper<'a> {
-    session_ctx: &'a mut SessionState,
+    session_state: SessionState,
     env: &'a AgentEnv,
     /// The fully-assembled system prompt for the current run,
     /// captured at the moment the tool is invoked. Sub-agents
@@ -2560,15 +2592,15 @@ struct SessionContextWrapper<'a> {
 
 impl<'a> ToolContext for SessionContextWrapper<'a> {
     fn working_directory(&self) -> PathBuf {
-        self.session_ctx.working_directory()
+        self.session_state.working_directory()
     }
 
     fn get_todo_list(&self) -> Vec<TodoItem> {
-        self.session_ctx.get_todo_list()
+        self.session_state.get_todo_list()
     }
 
     fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
-        self.session_ctx.set_todo_list(todos);
+        self.session_state.set_todo_list(todos);
     }
 
     fn spawn_agent<'b>(
@@ -2579,7 +2611,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
     {
         Box::pin(async move {
             // Get the next agent ID
-            let agent_id = self.session_ctx.next_sub_agent_id();
+            let agent_id = self.session_state.next_sub_agent_id();
             let child_id = AgentId::Sub(agent_id);
 
             // Mirror sub-agent lifecycle on the parent's bus so a
@@ -2749,12 +2781,12 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             let (result, sub_agent_usage) = {
                 let mut guard = shared.lock().await;
                 let result = guard.run_single_turn(task).await;
-                let usage = guard.session_state.accumulated_usage.clone();
+                let usage = guard.session_state.accumulated_usage();
                 (result, usage)
             };
 
             // Record the usage in the main session state
-            self.session_ctx
+            self.session_state
                 .record_sub_agent_usage(agent_id, sub_agent_usage);
 
             // Emit `SubAgentEnd` regardless of success — listeners
@@ -2908,7 +2940,7 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
     let (result, usage) = {
         let mut guard = shared.lock().await;
         let result = guard.run_single_turn(task).await;
-        let usage = guard.session_state.accumulated_usage.clone();
+        let usage = guard.session_state.accumulated_usage();
         (result, usage)
     };
     // The owner folds this into `SessionState.sub_agent_usage` when
@@ -5173,10 +5205,8 @@ mod event_protocol_tests {
             .await
             .expect("wake runs");
         assert_eq!(outcome, crate::WakeOutcome::Ran);
-        let usage = agent
-            .sub_agent_usage()
-            .get(&1)
-            .expect("usage folded at drain");
+        let sub_usage = agent.sub_agent_usage();
+        let usage = sub_usage.get(&1).expect("usage folded at drain");
         assert_eq!((usage.input, usage.output, usage.total_tokens), (7, 3, 10));
 
         let notice_text = agent
