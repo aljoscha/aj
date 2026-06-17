@@ -38,9 +38,9 @@ use crate::message::AgentMessage;
 use crate::projection::transcript_to_messages;
 use crate::queue::{MessageQueues, PendingKind};
 use crate::tool::{
-    ErasedToolDefinition, SpawnMode, SpawnResult, SpawnedAgent, StartedTask, TaskEventSink, TaskId,
-    TaskKind, TaskNotice, TaskOutputSource, TaskRead, TaskStatus, TodoItem, ToolContext,
-    ToolDetails, ToolOutcome,
+    ErasedToolDefinition, ExecutionMode, SpawnMode, SpawnResult, SpawnedAgent, StartedTask,
+    TaskEventSink, TaskId, TaskKind, TaskNotice, TaskOutputSource, TaskRead, TaskStatus, TodoItem,
+    ToolContext, ToolDetails, ToolOutcome,
 };
 use crate::types::TokenUsage;
 use anyhow::anyhow;
@@ -184,6 +184,10 @@ pub struct Agent {
     /// steering point and the run-top (wake) point. A default handle
     /// is used by print mode and tests, where nothing enqueues.
     message_queues: MessageQueues,
+    /// Maximum number of tool calls this agent runs concurrently within
+    /// one turn (see [`max_tool_concurrency`]). Read once at
+    /// construction so a turn never re-reads the environment.
+    max_tool_concurrency: usize,
     /// Terminal assistant message of the most recent inference
     /// (success, error, or abort). Retained so the host can classify
     /// the just-finished turn — context overflow, occupancy — without
@@ -268,6 +272,7 @@ impl Agent {
             sub_agent_registry: SubAgentRegistry::default(),
             task_registry: TaskRegistry::default(),
             message_queues: MessageQueues::default(),
+            max_tool_concurrency: max_tool_concurrency(),
             last_assistant: None,
         }
     }
@@ -1338,143 +1343,83 @@ impl Agent {
 
             // Execute tool calls if any
             if has_tool_use {
-                let mut pending = tool_calls.into_iter();
-                while let Some((tool_id, tool_name, tool_input)) = pending.next() {
-                    // Mirror the start of every tool invocation on the
-                    // bus before we do any work — listeners that render
-                    // a "running…" placeholder rely on seeing this
-                    // event before any update or end.
-                    self.bus
-                        .emit(AgentEvent::ToolExecutionStart {
-                            agent_id: self.agent_id,
-                            call_id: tool_id.clone(),
-                            tool: tool_name.clone(),
-                            args: tool_input.clone(),
-                        })
-                        .await
-                        .map_err(TurnError::Fatal)?;
+                // Partition the batch into contiguous concurrency
+                // groups and run each group through a bounded pool.
+                // `Sequential` tools (bash, file edits) are singleton
+                // barrier groups; a contiguous run of `Parallel` tools
+                // becomes one group that runs concurrently. Groups run
+                // one at a time and each is fully finalized before the
+                // next starts, so a `Sequential` tool never overlaps
+                // its neighbours and the transcript lands in original
+                // call order regardless of which futures finish first.
+                let cap = self.max_tool_concurrency;
+                let groups = group_tool_calls(tool_calls, |name| {
+                    self.tool_definitions
+                        .get(name)
+                        .is_some_and(|def| def.execution_mode == ExecutionMode::Parallel)
+                });
 
-                    // Consult the before-tool-call hook (if installed).
-                    // The hook can rewrite `tool_input` or short-circuit
-                    // the call with a pre-baked outcome (permission
-                    // denial, policy block). We clone the `Arc` here so
-                    // the borrow doesn't conflict with the `&mut self`
-                    // `execute_tool` call below; closures are cheap to
-                    // clone since they ride behind `Arc`.
-                    let before_hook = self.before_tool_call.clone();
-                    let (tool_input, short_circuit_outcome) = match before_hook {
-                        Some(hook) => {
-                            let ctx = hooks::ToolCallContext {
-                                call_id: &tool_id,
-                                tool_name: &tool_name,
-                            };
-                            match hook(ctx, tool_input.clone()).await {
-                                hooks::BeforeToolCallOutcome::Proceed { args } => (args, None),
-                                hooks::BeforeToolCallOutcome::ShortCircuit { outcome } => {
-                                    (tool_input, Some(outcome))
-                                }
-                            }
-                        }
-                        None => (tool_input, None),
-                    };
-
-                    // Run the tool unless the before-hook short-
-                    // circuited it, racing against cancel. On cancel
-                    // we drop the tool future (bash tears down its
-                    // process tree; other tools just exit) and
-                    // synthesize a cancelled outcome so the
-                    // transcript still pairs `tool_use` with
-                    // `tool_result`.
-                    //
-                    // Tool-input parse failures surface as a
-                    // [`AssistantContent::ToolCall`] with
-                    // `arguments == Value::Null`; the tool's own
-                    // deserializer rejects the payload and the call
-                    // bubbles up here as an `Err`. We fold that
-                    // into a synthesized `ToolOutcome` with
-                    // `is_error: true` so the failure rides on the
-                    // same `Message::ToolResult` shape every other
-                    // tool error does.
-                    let outcome_or_cancel: Option<ToolOutcome> = if let Some(outcome) =
-                        short_circuit_outcome
-                    {
-                        Some(outcome)
-                    } else {
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => None,
-                            res = self.execute_tool(&tool_id, &tool_name, tool_input.clone()) => {
-                                Some(match res {
-                                    Ok(outcome) => outcome,
-                                    Err(err) => {
-                                        let body = err.to_string();
-                                        ToolOutcome {
-                                            content: vec![UserContent::text(format!("{err}"))],
-                                            details: ToolDetails::Text {
-                                                summary: format!("{tool_name}: error"),
-                                                body,
-                                            },
-                                            is_error: true,
-                                        }
-                                    }
-                                })
-                            }
-                        }
-                    };
-
-                    let aborted_this_tool = outcome_or_cancel.is_none();
-                    let mut outcome =
-                        outcome_or_cancel.unwrap_or_else(|| cancelled_tool_outcome(&tool_name));
-
-                    // Consult the after-tool-call hook (if installed).
-                    // The hook can rewrite `outcome.content`,
-                    // `outcome.details`, or `outcome.is_error` before
-                    // the bus event and the wire projection fire.
-                    // Same `Arc` clone dance as the before-hook so the
-                    // `&mut outcome` borrow stays clean.
-                    //
-                    // We skip the hook on cancellation so a misbehaving
-                    // hook can't swallow the abort: the cancelled
-                    // outcome lands verbatim, the matching `TurnError::Aborted`
-                    // is returned below.
-                    if !aborted_this_tool {
-                        if let Some(hook) = self.after_tool_call.clone() {
-                            let ctx = hooks::ToolCallContext {
-                                call_id: &tool_id,
-                                tool_name: &tool_name,
-                            };
-                            hook(ctx, &mut outcome).await;
-                        }
-                    }
-
-                    self.finalize_tool_result(&tool_id, &tool_name, outcome)
-                        .await?;
-
-                    if aborted_this_tool {
-                        // Synthesize matching `tool_result` entries
-                        // for every still-pending tool call so the
-                        // transcript stays internally consistent —
-                        // no dangling `tool_use` without a matching
-                        // `tool_result`. Each emits its own
-                        // ToolExecutionStart / MessageStart /
+                let mut aborted = false;
+                for group in groups {
+                    if aborted {
+                        // An earlier group was cancelled. Synthesize
+                        // cancelled `tool_result`s for the remaining
+                        // calls, in order, so no `tool_use` is left
+                        // without a matching `tool_result`. Each emits
+                        // its own ToolExecutionStart / MessageStart /
                         // MessageEnd / ToolExecutionEnd bracket so
                         // listeners get a uniform shape.
-                        for (pending_id, pending_name, pending_input) in pending {
+                        for (call_id, tool_name, args) in group {
                             self.bus
                                 .emit(AgentEvent::ToolExecutionStart {
                                     agent_id: self.agent_id,
-                                    call_id: pending_id.clone(),
-                                    tool: pending_name.clone(),
-                                    args: pending_input,
+                                    call_id: call_id.clone(),
+                                    tool: tool_name.clone(),
+                                    args,
                                 })
                                 .await
                                 .map_err(TurnError::Fatal)?;
-                            let cancelled = cancelled_tool_outcome(&pending_name);
-                            self.finalize_tool_result(&pending_id, &pending_name, cancelled)
+                            let cancelled = cancelled_tool_outcome(&tool_name);
+                            self.finalize_tool_result(&call_id, &tool_name, cancelled)
                                 .await?;
                         }
-                        return Err(TurnError::Aborted);
+                        continue;
                     }
+
+                    // Drive the group's calls concurrently, capped at
+                    // `cap`. `buffered` (not `buffer_unordered`) keeps
+                    // the collected results in original call order, so
+                    // finalization below stays deterministic. Each
+                    // future only borrows `&self`, so the whole group
+                    // can be in flight at once.
+                    let results: Vec<Result<RunToolResult, TurnError>> = futures::stream::iter(
+                        group.into_iter().map(|(call_id, tool_name, args)| {
+                            self.run_tool_call(call_id, tool_name, args, cancel.clone())
+                        }),
+                    )
+                    .buffered(cap)
+                    .collect()
+                    .await;
+
+                    // Finalize in original call order under `&mut
+                    // self`. A cancelled call flips `aborted`, which
+                    // drains every remaining group as cancelled above
+                    // before we return `Aborted`.
+                    for result in results {
+                        let RunToolResult {
+                            call_id,
+                            tool_name,
+                            outcome,
+                            aborted: call_aborted,
+                        } = result?;
+                        self.finalize_tool_result(&call_id, &tool_name, outcome)
+                            .await?;
+                        aborted = aborted || call_aborted;
+                    }
+                }
+
+                if aborted {
+                    return Err(TurnError::Aborted);
                 }
 
                 // Consult the should-stop-after-turn hook (if
@@ -1781,6 +1726,116 @@ impl Agent {
 
         self.provider
             .stream_simple(&self.model_info, &context, &options)
+    }
+
+    /// Run one tool call up to (but not including) result
+    /// finalization: emit `ToolExecutionStart`, consult the
+    /// before/after hooks, and race the tool against cancellation.
+    ///
+    /// Takes `&self` so a batch of these can run concurrently within a
+    /// turn. Appending the result to the transcript and emitting the
+    /// terminal events is left to [`Agent::finalize_tool_result`],
+    /// which the caller invokes under `&mut self` in original call
+    /// order — that ordering, not the order these futures resolve in,
+    /// is what the transcript records.
+    async fn run_tool_call(
+        &self,
+        call_id: String,
+        tool_name: String,
+        tool_input: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<RunToolResult, TurnError> {
+        // Mirror the start of every tool invocation on the bus before
+        // any work — listeners that render a "running…" placeholder
+        // rely on seeing this before any update or end.
+        self.bus
+            .emit(AgentEvent::ToolExecutionStart {
+                agent_id: self.agent_id,
+                call_id: call_id.clone(),
+                tool: tool_name.clone(),
+                args: tool_input.clone(),
+            })
+            .await
+            .map_err(TurnError::Fatal)?;
+
+        // The before-tool-call hook can rewrite the input or
+        // short-circuit the call with a pre-baked outcome (permission
+        // denial, policy block). We clone the `Arc` so the borrow
+        // doesn't conflict with the `execute_tool` call below.
+        let before_hook = self.before_tool_call.clone();
+        let (tool_input, short_circuit_outcome) = match before_hook {
+            Some(hook) => {
+                let ctx = hooks::ToolCallContext {
+                    call_id: &call_id,
+                    tool_name: &tool_name,
+                };
+                match hook(ctx, tool_input.clone()).await {
+                    hooks::BeforeToolCallOutcome::Proceed { args } => (args, None),
+                    hooks::BeforeToolCallOutcome::ShortCircuit { outcome } => {
+                        (tool_input, Some(outcome))
+                    }
+                }
+            }
+            None => (tool_input, None),
+        };
+
+        // Run the tool unless the before-hook short-circuited it,
+        // racing against cancel. On cancel we drop the tool future
+        // (bash tears down its process tree; other tools just exit)
+        // and synthesize a cancelled outcome so the transcript still
+        // pairs `tool_use` with `tool_result`.
+        //
+        // Tool-input parse failures surface as a `ToolCall` with
+        // `arguments == Value::Null`; the tool's own deserializer
+        // rejects the payload and the call bubbles up here as an
+        // `Err`. We fold that into an `is_error: true` outcome so the
+        // failure rides the same `Message::ToolResult` shape every
+        // other tool error does.
+        let outcome_or_cancel: Option<ToolOutcome> = if let Some(outcome) = short_circuit_outcome {
+            Some(outcome)
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                res = self.execute_tool(&call_id, &tool_name, tool_input.clone()) => {
+                    Some(match res {
+                        Ok(outcome) => outcome,
+                        Err(err) => ToolOutcome {
+                            content: vec![UserContent::text(format!("{err}"))],
+                            details: ToolDetails::Text {
+                                summary: format!("{tool_name}: error"),
+                                body: err.to_string(),
+                            },
+                            is_error: true,
+                        },
+                    })
+                }
+            }
+        };
+
+        let aborted = outcome_or_cancel.is_none();
+        let mut outcome = outcome_or_cancel.unwrap_or_else(|| cancelled_tool_outcome(&tool_name));
+
+        // The after-tool-call hook can rewrite the outcome before it
+        // is finalized. We skip it on cancellation so a misbehaving
+        // hook can't swallow the abort: the cancelled outcome lands
+        // verbatim and the caller returns `TurnError::Aborted`.
+        if !aborted {
+            if let Some(hook) = self.after_tool_call.clone() {
+                let ctx = hooks::ToolCallContext {
+                    call_id: &call_id,
+                    tool_name: &tool_name,
+                };
+                hook(ctx, &mut outcome).await;
+            }
+        }
+
+        Ok(RunToolResult {
+            call_id,
+            tool_name,
+            outcome,
+            aborted,
+        })
     }
 
     async fn execute_tool(
@@ -3133,6 +3188,69 @@ fn cancelled_tool_outcome(tool_name: &str) -> ToolOutcome {
         },
         is_error: true,
     }
+}
+
+/// One pending tool call from an assistant turn:
+/// `(call_id, tool_name, arguments)`.
+type PendingToolCall = (String, String, serde_json::Value);
+
+/// Outcome of [`Agent::run_tool_call`]: the produced result plus
+/// whether the call was cancelled before it could finish. The result
+/// is finalized (transcript append + terminal events) by the caller,
+/// in original call order.
+struct RunToolResult {
+    call_id: String,
+    tool_name: String,
+    outcome: ToolOutcome,
+    aborted: bool,
+}
+
+/// Partition a turn's tool calls into contiguous concurrency groups.
+///
+/// A maximal contiguous run of tools for which `is_parallel` returns
+/// `true` forms one group that runs concurrently; every other tool —
+/// serial, or unknown to `is_parallel` — is its own singleton group
+/// and acts as a barrier. Order is preserved, so a serial tool never
+/// overlaps the parallel runs on either side of it, and finalizing
+/// groups in order reproduces the model's original call order.
+fn group_tool_calls(
+    calls: Vec<PendingToolCall>,
+    is_parallel: impl Fn(&str) -> bool,
+) -> Vec<Vec<PendingToolCall>> {
+    let mut groups: Vec<Vec<PendingToolCall>> = Vec::new();
+    // Whether the previous call extended a parallel group we can keep
+    // appending to. A serial call leaves this false, so it both stands
+    // alone and breaks the run after it.
+    let mut extend_previous = false;
+    for call in calls {
+        let parallel = is_parallel(&call.1);
+        if parallel && extend_previous {
+            groups
+                .last_mut()
+                .expect("extend_previous implies a previous group")
+                .push(call);
+        } else {
+            groups.push(vec![call]);
+        }
+        extend_previous = parallel;
+    }
+    groups
+}
+
+/// Maximum number of tool calls one turn runs concurrently.
+///
+/// `AJ_MAX_TOOL_CONCURRENCY` overrides the default when set to a
+/// positive integer. The cap guards against a model emitting a large
+/// fan-out that would exhaust file descriptors or provider rate
+/// limits. Groups run one at a time, so this also bounds an agent's
+/// total in-flight tool work per turn.
+fn max_tool_concurrency() -> usize {
+    const DEFAULT: usize = 8;
+    std::env::var("AJ_MAX_TOOL_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT)
 }
 
 #[cfg(test)]
@@ -5799,5 +5917,390 @@ mod event_protocol_tests {
         let first = user_text(&agent.messages()[0]).expect("first message is the follow-up");
         assert_eq!(first, "then clean up the temp files");
         assert!(!queues.has_pending(AgentId::Main));
+    }
+
+    // ===== Parallel tool execution =====
+
+    use crate::tool::ExecutionMode;
+
+    /// Build a finalized assistant message carrying several `tool_call`
+    /// blocks, `stop_reason = ToolUse`. Each `(id, name, args)` becomes
+    /// one block, so the parallel-execution tests can put a whole batch
+    /// in one assistant turn.
+    fn finalize_tool_uses(calls: &[(&str, &str, serde_json::Value)]) -> AssistantMessage {
+        AssistantMessage {
+            content: calls
+                .iter()
+                .map(|(id, name, args)| {
+                    AssistantContent::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments: args.clone(),
+                    })
+                })
+                .collect(),
+            api: SCRIPT_API.to_string(),
+            provider: SCRIPT_PROVIDER.to_string(),
+            model: SCRIPT_MODEL.to_string(),
+            response_id: Some("test-multi-tool".to_string()),
+            usage: Default::default(),
+            stop_reason: StopReason::ToolUse,
+            error: None,
+            timestamp: 0,
+        }
+    }
+
+    /// `tool_call_id`s of the transcript's `ToolResult` messages, in
+    /// transcript order — which is the order the agent finalized them.
+    fn tool_result_ids(agent: &Agent) -> Vec<String> {
+        agent
+            .messages()
+            .iter()
+            .filter_map(|m| match m.as_wire() {
+                Some(Message::ToolResult(r)) => Some(r.tool_call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Shared observation state for [`ProbeTool`] instances.
+    #[derive(Default)]
+    struct ProbeState {
+        /// Probe `execute` bodies currently in flight.
+        active: Mutex<usize>,
+        /// High-water mark of `active` — the real concurrency observed.
+        max_active: Mutex<usize>,
+        /// Call ids in the order their bodies ran to completion.
+        finish_order: Mutex<Vec<String>>,
+    }
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct ProbeInput {
+        id: String,
+        #[serde(default)]
+        delay_ms: u64,
+    }
+
+    /// Test tool that records concurrency and completion order against a
+    /// shared [`ProbeState`], optionally sleeping so overlap is
+    /// observable. Name and execution mode are per-instance so one test
+    /// can register both a parallel and a serial variant over the same
+    /// state.
+    #[derive(Clone)]
+    struct ProbeTool {
+        name: &'static str,
+        mode: ExecutionMode,
+        state: Arc<ProbeState>,
+    }
+
+    impl ToolDefinition for ProbeTool {
+        type Input = ProbeInput;
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "concurrency probe"
+        }
+
+        fn execution_mode(&self) -> ExecutionMode {
+            self.mode
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &mut dyn ToolContext,
+            input: ProbeInput,
+        ) -> anyhow::Result<ToolOutcome> {
+            let now = {
+                let mut active = self.state.active.lock().unwrap();
+                *active += 1;
+                *active
+            };
+            {
+                let mut max = self.state.max_active.lock().unwrap();
+                *max = (*max).max(now);
+            }
+            if input.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(input.delay_ms)).await;
+            }
+            self.state
+                .finish_order
+                .lock()
+                .unwrap()
+                .push(input.id.clone());
+            *self.state.active.lock().unwrap() -= 1;
+            Ok(ToolOutcome {
+                content: vec![aj_models::types::UserContent::text(input.id.clone())],
+                details: ToolDetails::Text {
+                    summary: input.id,
+                    body: String::new(),
+                },
+                is_error: false,
+            })
+        }
+    }
+
+    /// `buffered` keeps a parallel group's results in original call
+    /// order, so a slow first call still lands ahead of a fast second
+    /// one in the transcript. The completion order proves they actually
+    /// overlapped and finished out of order.
+    #[tokio::test]
+    async fn parallel_results_keep_call_order_despite_skew() {
+        let state = Arc::new(ProbeState::default());
+        let probe = ProbeTool {
+            name: "probe",
+            mode: ExecutionMode::Parallel,
+            state: Arc::clone(&state),
+        };
+        let scripts = vec![
+            finalize_script(finalize_tool_uses(&[
+                (
+                    "c0",
+                    "probe",
+                    serde_json::json!({"id": "c0", "delay_ms": 60}),
+                ),
+                (
+                    "c1",
+                    "probe",
+                    serde_json::json!({"id": "c1", "delay_ms": 0}),
+                ),
+            ])),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![probe.into()]);
+        agent.run_single_turn("go".to_string()).await.expect("turn");
+
+        assert_eq!(tool_result_ids(&agent), vec!["c0", "c1"]);
+        assert_eq!(
+            *state.finish_order.lock().unwrap(),
+            vec!["c1".to_string(), "c0".to_string()],
+            "the no-delay call should finish first, proving overlap"
+        );
+        assert_eq!(*state.max_active.lock().unwrap(), 2);
+    }
+
+    /// Serial tools are singleton barrier groups: two calls to a
+    /// `Sequential` tool never overlap.
+    #[tokio::test]
+    async fn sequential_tools_never_overlap() {
+        let state = Arc::new(ProbeState::default());
+        let probe = ProbeTool {
+            name: "seq",
+            mode: ExecutionMode::Sequential,
+            state: Arc::clone(&state),
+        };
+        let scripts = vec![
+            finalize_script(finalize_tool_uses(&[
+                ("c0", "seq", serde_json::json!({"id": "c0", "delay_ms": 20})),
+                ("c1", "seq", serde_json::json!({"id": "c1", "delay_ms": 20})),
+            ])),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![probe.into()]);
+        agent.run_single_turn("go".to_string()).await.expect("turn");
+
+        assert_eq!(tool_result_ids(&agent), vec!["c0", "c1"]);
+        assert_eq!(
+            *state.max_active.lock().unwrap(),
+            1,
+            "serial tools must not overlap"
+        );
+        assert_eq!(
+            *state.finish_order.lock().unwrap(),
+            vec!["c0".to_string(), "c1".to_string()]
+        );
+    }
+
+    /// The concurrency cap bounds in-flight calls within a parallel
+    /// group while still finalizing results in order.
+    #[tokio::test]
+    async fn concurrency_cap_bounds_in_flight_calls() {
+        let state = Arc::new(ProbeState::default());
+        let probe = ProbeTool {
+            name: "probe",
+            mode: ExecutionMode::Parallel,
+            state: Arc::clone(&state),
+        };
+        let scripts = vec![
+            finalize_script(finalize_tool_uses(&[
+                (
+                    "c0",
+                    "probe",
+                    serde_json::json!({"id": "c0", "delay_ms": 40}),
+                ),
+                (
+                    "c1",
+                    "probe",
+                    serde_json::json!({"id": "c1", "delay_ms": 40}),
+                ),
+                (
+                    "c2",
+                    "probe",
+                    serde_json::json!({"id": "c2", "delay_ms": 40}),
+                ),
+                (
+                    "c3",
+                    "probe",
+                    serde_json::json!({"id": "c3", "delay_ms": 40}),
+                ),
+            ])),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![probe.into()]);
+        agent.max_tool_concurrency = 2;
+        agent.run_single_turn("go".to_string()).await.expect("turn");
+
+        assert_eq!(
+            *state.max_active.lock().unwrap(),
+            2,
+            "a cap of 2 must bound concurrent probes to 2"
+        );
+        assert_eq!(tool_result_ids(&agent), vec!["c0", "c1", "c2", "c3"]);
+    }
+
+    /// Cancelling mid-batch synthesizes a `tool_result` for every
+    /// call — the in-flight parallel group and the not-yet-started
+    /// serial barrier after it — in original order, and the turn ends
+    /// in `Aborted`. No `tool_use` is left dangling.
+    #[tokio::test]
+    async fn cancellation_synthesizes_results_for_whole_batch() {
+        let state = Arc::new(ProbeState::default());
+        let par = ProbeTool {
+            name: "probe",
+            mode: ExecutionMode::Parallel,
+            state: Arc::clone(&state),
+        };
+        let seq = ProbeTool {
+            name: "seq",
+            mode: ExecutionMode::Sequential,
+            state: Arc::clone(&state),
+        };
+        let scripts = vec![finalize_script(finalize_tool_uses(&[
+            (
+                "c0",
+                "probe",
+                serde_json::json!({"id": "c0", "delay_ms": 1000}),
+            ),
+            (
+                "c1",
+                "probe",
+                serde_json::json!({"id": "c1", "delay_ms": 1000}),
+            ),
+            ("c2", "seq", serde_json::json!({"id": "c2", "delay_ms": 0})),
+        ]))];
+        let mut agent = build_agent(scripts, vec![par.into(), seq.into()]);
+
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            canceller.cancel();
+        });
+
+        let result = agent.prompt("go".to_string(), cancel).await;
+        assert!(matches!(result, Err(crate::TurnError::Aborted)));
+        assert_eq!(tool_result_ids(&agent), vec!["c0", "c1", "c2"]);
+        assert!(
+            state.finish_order.lock().unwrap().is_empty(),
+            "no probe body should complete: the parallel calls are dropped \
+             and the serial barrier is drained as cancelled"
+        );
+    }
+
+    /// Two foreground (`Blocking`) `agent` calls in one batch each spawn
+    /// and drive a child concurrently. Both children are retained and
+    /// both tool results land, in original call order.
+    #[tokio::test]
+    async fn parallel_blocking_agent_calls_both_run() {
+        use crate::SubAgentRegistry;
+
+        // Parent emits two `agent` calls; each child runs one text turn.
+        // The two child scripts are identical, so it doesn't matter
+        // which child pops which (the provider serves them under its
+        // mutex in nondeterministic order under concurrency).
+        let scripts = vec![
+            finalize_script(finalize_tool_uses(&[
+                ("tu-1", "agent", serde_json::json!({"task": "a"})),
+                ("tu-2", "agent", serde_json::json!({"task": "b"})),
+            ])),
+            finalize_script(finalize_text("sub report")),
+            finalize_script(finalize_text("sub report")),
+            finalize_script(finalize_text("parent done")),
+        ];
+        let mut agent = build_agent(scripts, vec![SpawnTool::blocking().into()]);
+        let registry = SubAgentRegistry::default();
+        agent.set_sub_agent_registry(registry.clone());
+
+        agent
+            .run_single_turn("delegate".to_string())
+            .await
+            .expect("turn");
+
+        assert_eq!(registry.ids(), vec![1, 2], "both spawns retained");
+        assert_eq!(tool_result_ids(&agent), vec!["tu-1", "tu-2"]);
+    }
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::{group_tool_calls, PendingToolCall};
+
+    fn call(id: &str, name: &str) -> PendingToolCall {
+        (id.to_string(), name.to_string(), serde_json::Value::Null)
+    }
+
+    /// Tool names per group, for compact assertions.
+    fn names(groups: &[Vec<PendingToolCall>]) -> Vec<Vec<&str>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|c| c.1.as_str()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn contiguous_parallel_runs_coalesce_and_serial_tools_are_barriers() {
+        let calls = vec![
+            call("0", "par"),
+            call("1", "par"),
+            call("2", "seq"),
+            call("3", "par"),
+        ];
+        let groups = group_tool_calls(calls, |name| name == "par");
+        assert_eq!(
+            names(&groups),
+            vec![vec!["par", "par"], vec!["seq"], vec!["par"]]
+        );
+    }
+
+    #[test]
+    fn all_parallel_is_one_group() {
+        let calls = vec![call("0", "par"), call("1", "par"), call("2", "par")];
+        let groups = group_tool_calls(calls, |_| true);
+        assert_eq!(names(&groups), vec![vec!["par", "par", "par"]]);
+    }
+
+    #[test]
+    fn all_serial_is_singletons() {
+        let calls = vec![call("0", "a"), call("1", "b")];
+        let groups = group_tool_calls(calls, |_| false);
+        assert_eq!(names(&groups), vec![vec!["a"], vec!["b"]]);
+    }
+
+    #[test]
+    fn unknown_tool_is_a_barrier() {
+        let calls = vec![call("0", "par"), call("1", "unknown"), call("2", "par")];
+        let groups = group_tool_calls(calls, |name| name == "par");
+        assert_eq!(
+            names(&groups),
+            vec![vec!["par"], vec!["unknown"], vec!["par"]]
+        );
+    }
+
+    #[test]
+    fn empty_batch_is_no_groups() {
+        let groups = group_tool_calls(Vec::new(), |_| true);
+        assert!(groups.is_empty());
     }
 }
