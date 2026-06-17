@@ -580,14 +580,14 @@ impl InteractiveMode {
         let palette_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // Set when the user hits `aj.overlay.close_all` (default
         // `ctrl+c`) while any overlay is up. Drained after
-        // `tui.handle_input` to tear down the entire overlay
-        // back-stack — distinct from Esc's one-level pop.
+        // `tui.handle_input` to tear down the whole selector stack,
+        // distinct from Esc's one-level pop.
         let close_all_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // Set by the global `aj.history.open` chord (default
         // `ctrl+r`). Drained after `tui.handle_input` to run
         // [`CommandAction::OpenPromptHistory`], mirroring the
-        // `palette_open_request` path. Dispatched without a parent
-        // palette so `Esc` closes the overlay back to the editor.
+        // `palette_open_request` path. Opens as a top-level overlay
+        // so `Esc` closes it back to the editor.
         let history_open_request: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // Set by the global `aj.agent.open` chord (default `alt+a`).
         // Drained after `tui.handle_input` to run
@@ -1044,17 +1044,19 @@ async fn run_session(
     // still running.
     let mut quit_armed = false;
 
-    // A command like the thinking selector opens an overlay selector.
-    // While an overlay is up the editor is not focused, but
+    // A command like the thinking selector opens an overlay
+    // selector. While an overlay is up the editor is not focused, but
     // `shell.tui.show_overlay` already routes input to the overlay,
-    // so the main loop's job is just to poll the outcome slot
-    // after every input event and close the overlay on result.
-    let mut open_selector: Option<OpenSelector> = None;
+    // so the main loop's job is just to poll the top of the stack
+    // after every input event and move the stack on the result.
+    // Nesting (a child opened over the palette, the task viewer over
+    // the picker) is the depth of this stack. It usually holds one.
+    let mut selectors = SelectorStack::default();
 
     // An in-flight OAuth login: the dialog overlay + a cancel flag
     // the dialog (Esc) and Ctrl+C set, plus the spawned login task
     // whose `JoinHandle` we poll alongside the agent turn. Kept
-    // separate from `open_selector` because the flow is async and
+    // separate from `selectors` because the flow is async and
     // long-running rather than a synchronous confirm/cancel
     // selector.
     let mut login_session: Option<LoginSession> = None;
@@ -1220,8 +1222,8 @@ async fn run_session(
                         // aimed at a modal dismisses the modal and
                         // leaves any turn running behind it intact.
                         //
-                        // 1. Overlay up (`open_selector` is
-                        //    `Some`): dismiss the overlay. Don't
+                        // 1. Overlay up (`selectors` is
+                        //    non-empty): dismiss the overlay. Don't
                         //    break or cancel the turn; fall
                         //    through to the
                         //    `ACTION_OVERLAY_CLOSE_ALL`
@@ -1270,7 +1272,7 @@ async fn run_session(
                             quit_armed = false;
                         }
                         if input.is_ctrl('c') {
-                            if open_selector.is_some() {
+                            if !selectors.is_empty() {
                                 // Overlay up: fall through to the
                                 // close-all interception below.
                             } else if let Some(session) = login_session.as_ref() {
@@ -1429,7 +1431,7 @@ async fn run_session(
                                 crate::config::keybindings::ACTION_SUBMIT_STEERING,
                             );
                             drop(kb);
-                            if matched && open_selector.is_none() && login_session.is_none() {
+                            if matched && selectors.is_empty() && login_session.is_none() {
                                 let target = world.pump.active_view(&mut shell.tui);
                                 let text = shell
                                     .tui
@@ -1484,7 +1486,7 @@ async fn run_session(
                             let matched =
                                 kb.matches(&input, crate::config::keybindings::ACTION_DEQUEUE);
                             drop(kb);
-                            if matched && open_selector.is_none() && login_session.is_none() {
+                            if matched && selectors.is_empty() && login_session.is_none() {
                                 let target = world.pump.active_view(&mut shell.tui);
                                 yank_pending_into_editor(
                                     &mut shell.tui,
@@ -1505,7 +1507,7 @@ async fn run_session(
                             let kb = aj_tui::keybindings::get();
                             let is_up = kb.matches(&input, "tui.editor.cursorUp");
                             drop(kb);
-                            if is_up && open_selector.is_none() && login_session.is_none() {
+                            if is_up && selectors.is_empty() && login_session.is_none() {
                                 let target = world.pump.active_view(&mut shell.tui);
                                 let editor_empty = shell
                                     .tui
@@ -1544,7 +1546,7 @@ async fn run_session(
                         let mut consume_event = false;
                         {
                             let kb = aj_tui::keybindings::get();
-                            if open_selector.is_some()
+                            if !selectors.is_empty()
                                 && kb.matches(
                                     &input,
                                     crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
@@ -1556,11 +1558,10 @@ async fn run_session(
                                 // entirely so the selector doesn't
                                 // also see Ctrl+C as a cancel and
                                 // write a cancel-outcome that would
-                                // then drive a stale one-level
-                                // back-stack restore underneath
-                                // our explicit teardown.
+                                // then drive a stale one-level Back
+                                // underneath our explicit teardown.
                                 consume_event = true;
-                            } else if open_selector.is_none()
+                            } else if selectors.is_empty()
                                 && login_session.is_none()
                                 && kb.matches(
                                     &input,
@@ -1573,7 +1574,7 @@ async fn run_session(
                                 // arm below by letting handle_input
                                 // run (it's a no-op for this chord
                                 // since no component binds ctrl+o).
-                            } else if open_selector.is_none()
+                            } else if selectors.is_empty()
                                 && login_session.is_none()
                                 && kb.matches(
                                     &input,
@@ -1588,7 +1589,7 @@ async fn run_session(
                                 // future binding and matches the
                                 // close-all interception style.
                                 consume_event = true;
-                            } else if open_selector.is_none()
+                            } else if selectors.is_empty()
                                 && login_session.is_none()
                                 && kb.matches(
                                     &input,
@@ -1608,16 +1609,13 @@ async fn run_session(
                             shell.tui.handle_input(&input);
                         }
 
-                        // Close-all: tear down current selector
-                        // and any parent palette in one shot.
-                        // Done before the palette-open dispatch
-                        // and the per-tick outcome poll so we
-                        // never re-enter the back-stack logic
-                        // on a unwound state.
+                        // Close-all: tear the whole selector stack
+                        // down in one shot, back to the chat editor.
+                        // Done before the open dispatch and the
+                        // per-tick poll so we never act on a
+                        // half-unwound stack.
                         if shell.close_all_request.swap(false, Ordering::Relaxed) {
-                            if let Some(sel) = open_selector.take() {
-                                close_all_overlays(&mut shell.tui, sel);
-                            }
+                            selectors.close_all(&mut shell.tui);
                             continue;
                         }
 
@@ -1649,10 +1647,10 @@ async fn run_session(
                         // below. Dispatched here, after routing,
                         // so the editor's `/` swallow has already
                         // landed and so we can `await` the command
-                        // handler. Gated on `open_selector` to
-                        // be inert while another selector is up.
+                        // handler. Gated on an empty selector stack so
+                        // it's inert while another selector is up.
                         if shell.palette_open_request.swap(false, Ordering::Relaxed)
-                            && open_selector.is_none()
+                            && selectors.is_empty()
                             && login_session.is_none()
                         {
                             match handle_command(
@@ -1666,7 +1664,6 @@ async fn run_session(
                                 &shell.conversation_persistence,
                                 &shell.theme,
                                 CommandAction::OpenCommandPalette,
-                                None,
                                 !turns.is_empty(),
                             ).await {
                                 CommandOutcome::Continue { selector, notice } => {
@@ -1674,7 +1671,7 @@ async fn run_session(
                                         world.pump.handle(&mut shell.tui, &notice_event(&text));
                                     }
                                     if let Some(sel) = selector {
-                                        open_selector = Some(sel);
+                                        selectors.push(&mut shell.tui, sel);
                                     }
                                 }
                                 CommandOutcome::SessionChange(request) => {
@@ -1688,13 +1685,13 @@ async fn run_session(
 
                         // Global prompt-history open: fired by the
                         // `Ctrl+R` chord intercepted above. Runs
-                        // [`CommandAction::OpenPromptHistory`] with no
-                        // parent palette, so the overlay's `Esc` closes
-                        // straight back to the editor. Gated on
-                        // `open_selector` to be inert while another
-                        // selector is up.
+                        // [`CommandAction::OpenPromptHistory`] as a
+                        // top-level overlay, so the overlay's `Esc`
+                        // closes straight back to the editor. Gated on
+                        // an empty selector stack so it's inert while
+                        // another selector is up.
                         if shell.history_open_request.swap(false, Ordering::Relaxed)
-                            && open_selector.is_none()
+                            && selectors.is_empty()
                             && login_session.is_none()
                         {
                             match handle_command(
@@ -1708,7 +1705,6 @@ async fn run_session(
                                 &shell.conversation_persistence,
                                 &shell.theme,
                                 CommandAction::OpenPromptHistory,
-                                None,
                                 !turns.is_empty(),
                             ).await {
                                 CommandOutcome::Continue { selector, notice } => {
@@ -1716,7 +1712,7 @@ async fn run_session(
                                         world.pump.handle(&mut shell.tui, &notice_event(&text));
                                     }
                                     if let Some(sel) = selector {
-                                        open_selector = Some(sel);
+                                        selectors.push(&mut shell.tui, sel);
                                     }
                                 }
                                 CommandOutcome::SessionChange(request) => {
@@ -1730,13 +1726,13 @@ async fn run_session(
 
                         // Global agent-picker open: fired by the
                         // `Alt+A` chord intercepted above. Runs
-                        // [`CommandAction::OpenAgentPicker`] with no
-                        // parent palette, so the overlay's `Esc` closes
-                        // straight back to the editor. Gated on
-                        // `open_selector` to be inert while another
-                        // selector is up.
+                        // [`CommandAction::OpenAgentPicker`] as a
+                        // top-level overlay, so the overlay's `Esc`
+                        // closes straight back to the editor. Gated on
+                        // an empty selector stack so it's inert while
+                        // another selector is up.
                         if shell.agent_picker_open_request.swap(false, Ordering::Relaxed)
-                            && open_selector.is_none()
+                            && selectors.is_empty()
                             && login_session.is_none()
                         {
                             match handle_command(
@@ -1750,7 +1746,6 @@ async fn run_session(
                                 &shell.conversation_persistence,
                                 &shell.theme,
                                 CommandAction::OpenAgentPicker,
-                                None,
                                 !turns.is_empty(),
                             ).await {
                                 CommandOutcome::Continue { selector, notice } => {
@@ -1758,7 +1753,7 @@ async fn run_session(
                                         world.pump.handle(&mut shell.tui, &notice_event(&text));
                                     }
                                     if let Some(sel) = selector {
-                                        open_selector = Some(sel);
+                                        selectors.push(&mut shell.tui, sel);
                                     }
                                 }
                                 CommandOutcome::SessionChange(request) => {
@@ -1769,14 +1764,15 @@ async fn run_session(
                             }
                             continue;
                         }
-                        // input was just routed to it. Poll
-                        // the overlay's outcome slot; on a
-                        // confirm/cancel, close it and apply
-                        // the result.
-                        if let Some(sel) = open_selector.take() {
-                            match handle_selector_outcome(
+
+                        // A selector overlay is up and just got the
+                        // input event. Poll the top of the stack and
+                        // apply the transition it returns to the stack
+                        // and the compositor.
+                        if !selectors.is_empty() {
+                            let transition = handle_selector_outcome(
                                 &mut shell.tui,
-                                sel,
+                                selectors.top().expect("selector stack non-empty"),
                                 &shell.auth,
                                 Arc::clone(&shell.run_config),
                                 Arc::clone(&shell.config),
@@ -1785,37 +1781,33 @@ async fn run_session(
                                 &shell.theme,
                                 &shell.render_settings,
                                 theme_watch,
-                            ).await {
-                                SelectorPollOutcome::StillOpen(reopened) => {
-                                    open_selector = Some(reopened);
-                                }
-                                SelectorPollOutcome::Closed {
-                                    notice,
-                                    follow_up,
-                                    start_login,
-                                    session_request,
-                                } => {
-                                    if let Some(text) = notice {
+                            )
+                            .await;
+                            match transition {
+                                SelectorTransition::Stay => {}
+                                SelectorTransition::Back => selectors.back(&mut shell.tui),
+                                SelectorTransition::Close(effects) => {
+                                    selectors.close_all(&mut shell.tui);
+                                    if let Some(text) = effects.notice {
                                         world.pump.handle(&mut shell.tui, &notice_event(&text));
                                     }
                                     // A confirmed session pick exits the
-                                    // per-session loop; the outer loop
-                                    // in `InteractiveMode::run` rebuilds
-                                    // onto the chosen session.
-                                    if let Some(request) = session_request {
+                                    // per-session loop. The outer loop in
+                                    // `InteractiveMode::run` rebuilds onto
+                                    // the chosen session.
+                                    if let Some(request) = effects.session_request {
                                         debug_assert!(
                                             turns.is_empty(),
                                             "session change requested mid-turn"
                                         );
                                         break Ok(request.into_exit());
                                     }
-                                    // A confirmed login provider
-                                    // pick asks the host to launch
-                                    // the async browser flow: mount
-                                    // the dialog overlay and spawn
-                                    // the login task (polled by the
+                                    // A confirmed login provider pick asks
+                                    // the host to launch the async browser
+                                    // flow: mount the dialog overlay and
+                                    // spawn the login task (polled by the
                                     // login `select!` arm).
-                                    if let Some(provider_id) = start_login {
+                                    if let Some(provider_id) = effects.start_login {
                                         match start_login_session(
                                             &mut shell.tui,
                                             &shell.auth,
@@ -1836,43 +1828,52 @@ async fn run_session(
                                             ),
                                         }
                                     }
-                                    // The command palette chains into
-                                    // the selected command by emitting a
-                                    // `follow_up`. Re-feed it through
-                                    // `handle_command` so the dispatch
-                                    // path is identical to triggering the
-                                    // command by its keyboard shortcut.
-                                    if let Some(follow_up) = follow_up {
-                                        // `/compact` runs as a tracked task
-                                        // (like a turn), so the loop — which
-                                        // owns `turns` / `turn_cancels` —
-                                        // drives it rather than
-                                        // `handle_command`, which can't spawn.
-                                        if matches!(follow_up.action, CommandAction::Compact) {
-                                            if turn_cancels.contains_key(&AgentId::Main)
-                                                || world.pump.is_running(AgentId::Main)
-                                            {
-                                                world.pump.handle(
-                                                    &mut shell.tui,
-                                                    &notice_event(&session_busy_notice("compact")),
-                                                );
-                                            } else {
-                                                spawn_turn(
-                                                    world,
-                                                    &shell.run_config,
-                                                    AgentId::Main,
-                                                    TurnStart::Compact {
-                                                        reason:
-                                                            aj_agent::events::CompactionReason::Manual,
-                                                        instructions: None,
-                                                    },
-                                                    turn_policy(AgentId::Main, &shell.config),
-                                                    &mut turns,
-                                                    &mut turn_cancels,
-                                                );
-                                                sync_editor_enabled(&mut shell.tui);
-                                            }
+                                }
+                                SelectorTransition::Open {
+                                    action,
+                                    keep_parents,
+                                } => {
+                                    // A drill-down (keep_parents false)
+                                    // tears the stack down first so the
+                                    // child has no parent to return to.
+                                    // Chaining from the palette leaves it
+                                    // on the stack, and `push` hides it
+                                    // under the child so a cancel returns
+                                    // to it.
+                                    if !keep_parents {
+                                        selectors.close_all(&mut shell.tui);
+                                    }
+                                    // `/compact` runs as a tracked task
+                                    // (like a turn), so the loop (which
+                                    // owns `turns` and `turn_cancels`)
+                                    // drives it rather than `handle_command`,
+                                    // which can't spawn. It opens no child,
+                                    // so any kept palette closes back to chat.
+                                    if matches!(action, CommandAction::Compact) {
+                                        if turn_cancels.contains_key(&AgentId::Main)
+                                            || world.pump.is_running(AgentId::Main)
+                                        {
+                                            world.pump.handle(
+                                                &mut shell.tui,
+                                                &notice_event(&session_busy_notice("compact")),
+                                            );
                                         } else {
+                                            spawn_turn(
+                                                world,
+                                                &shell.run_config,
+                                                AgentId::Main,
+                                                TurnStart::Compact {
+                                                    reason:
+                                                        aj_agent::events::CompactionReason::Manual,
+                                                    instructions: None,
+                                                },
+                                                turn_policy(AgentId::Main, &shell.config),
+                                                &mut turns,
+                                                &mut turn_cancels,
+                                            );
+                                        }
+                                        selectors.close_all(&mut shell.tui);
+                                    } else {
                                         match handle_command(
                                             &mut shell.tui,
                                             &shell.auth,
@@ -1883,8 +1884,7 @@ async fn run_session(
                                             world,
                                             &shell.conversation_persistence,
                                             &shell.theme,
-                                            follow_up.action,
-                                            Some(follow_up.parent_palette),
+                                            action,
                                             !turns.is_empty(),
                                         )
                                         .await
@@ -1893,16 +1893,30 @@ async fn run_session(
                                                 if let Some(text) = notice {
                                                     world.pump.handle(&mut shell.tui, &notice_event(&text));
                                                 }
-                                                if let Some(sel) = selector {
-                                                    open_selector = Some(sel);
+                                                match selector {
+                                                    // `push` hides any kept
+                                                    // palette under the child.
+                                                    Some(sel) => {
+                                                        selectors.push(&mut shell.tui, sel)
+                                                    }
+                                                    // No child opened, so a
+                                                    // kept palette is done.
+                                                    None => selectors.close_all(&mut shell.tui),
                                                 }
                                             }
+                                            // Tear the stack down before
+                                            // leaving the loop so a kept
+                                            // palette can't leak into the
+                                            // next session.
                                             CommandOutcome::SessionChange(request) => {
                                                 debug_assert!(turns.is_empty(), "session change requested mid-turn");
+                                                selectors.close_all(&mut shell.tui);
                                                 break Ok(request.into_exit());
                                             }
-                                            CommandOutcome::Quit => break Ok(SessionExit::Quit),
-                                        }
+                                            CommandOutcome::Quit => {
+                                                selectors.close_all(&mut shell.tui);
+                                                break Ok(SessionExit::Quit);
+                                            }
                                         }
                                     }
                                 }
@@ -2319,11 +2333,14 @@ async fn recv_theme(rx: Option<&mut UnboundedReceiver<Theme>>) -> Option<Theme> 
     }
 }
 
-/// State for an active selector overlay.
+/// An overlay the host is tracking on the [`SelectorStack`].
 ///
 /// Each variant pairs the overlay's [`OverlayHandle`] (so the host
-/// can hide it on completion) with a typed outcome handle that the
-/// component populates when the user confirms or cancels.
+/// can hide or reveal it) with a typed outcome handle the component
+/// populates on confirm or cancel. There is no per-variant parent
+/// pointer: nesting (a child opened over the palette, the task
+/// viewer drilled into from the picker) is positional, the entry
+/// beneath a selector on the stack is its parent.
 enum OpenSelector {
     Thinking {
         handle: OverlayHandle,
@@ -2332,12 +2349,6 @@ enum OpenSelector {
         /// view at open time so a view switch while the overlay is
         /// up doesn't redirect the change.
         target: AgentId,
-        /// When opened via the command palette, the (hidden)
-        /// palette's handle + outcome slot. On cancel we un-hide
-        /// it and restore host-side polling so the palette stays
-        /// usable; on confirm we tear it down. `None` when the
-        /// selector was reached directly (not via the palette).
-        parent_palette: Option<ParentPalette>,
     },
     Model {
         handle: OverlayHandle,
@@ -2345,31 +2356,26 @@ enum OpenSelector {
         /// Agent the confirm applies to, captured at open time
         /// like [`OpenSelector::Thinking::target`].
         target: AgentId,
-        parent_palette: Option<ParentPalette>,
     },
     Session {
         handle: OverlayHandle,
         outcome: SessionOutcomeHandle,
-        parent_palette: Option<ParentPalette>,
     },
     /// Prompt-history search overlay. `Enter` recalls the chosen
-    /// prompt into the editor; `Esc` (or back-stack pop) closes it.
+    /// prompt into the editor. `Esc` closes it.
     PromptHistory {
         handle: OverlayHandle,
         outcome: PromptHistoryOutcomeHandle,
-        parent_palette: Option<ParentPalette>,
     },
     /// Agent picker overlay. `Enter` switches the chat view to the
     /// chosen agent's transcript (and sets the editor's observing
-    /// marker); `Esc` (or back-stack pop) closes it.
+    /// marker). `Esc` closes it.
     AgentPicker {
         handle: OverlayHandle,
         outcome: AgentPickerOutcomeHandle,
-        parent_palette: Option<ParentPalette>,
     },
-    /// Read-only viewer for a background bash task's output, opened by
-    /// confirming a task row in the agent picker. Both Esc and Enter
-    /// close straight to chat; it carries no parent back-stack.
+    /// Read-only viewer for a background bash task's output, drilled
+    /// into from the agent picker. Both Esc and Enter close it.
     TaskOutput {
         handle: OverlayHandle,
         outcome: TaskOutputOutcomeHandle,
@@ -2378,13 +2384,10 @@ enum OpenSelector {
         handle: OverlayHandle,
         outcome: CommandPaletteOutcomeHandle,
     },
-    /// Read-only help overlay. Both Esc and Enter close it; if
-    /// opened via the palette, the parent palette is restored on
-    /// close so the back-stack stays coherent.
+    /// Read-only help overlay. Both Esc and Enter close it.
     Help {
         handle: OverlayHandle,
         outcome: crate::modes::interactive::components::help_overlay::HelpOverlayOutcomeHandle,
-        parent_palette: Option<ParentPalette>,
     },
     /// Provider picker for login / logout. `mode` decides what
     /// confirming a provider does: start the OAuth browser flow, or
@@ -2392,14 +2395,12 @@ enum OpenSelector {
     AuthPicker {
         handle: OverlayHandle,
         outcome: AuthPickerOutcomeHandle,
-        parent_palette: Option<ParentPalette>,
         mode: AuthPickerMode,
     },
     /// Read-only auth-status overlay. Both Esc and Enter close it.
     AuthStatus {
         handle: OverlayHandle,
         outcome: AuthStatusOutcomeHandle,
-        parent_palette: Option<ParentPalette>,
     },
     /// Read-only usage overlay. Both Esc and Enter close it. The
     /// usage reports stream in from a background fetch after the
@@ -2407,7 +2408,6 @@ enum OpenSelector {
     UsageStatus {
         handle: OverlayHandle,
         outcome: UsageStatusOutcomeHandle,
-        parent_palette: Option<ParentPalette>,
     },
     /// Settings window. Stays open across changes: the
     /// host drains `changes` after every input event, applying and
@@ -2419,7 +2419,6 @@ enum OpenSelector {
         outcome: SettingsOutcomeHandle,
         changes: SettingsChangesHandle,
         corrections: SettingsCorrectionsHandle,
-        parent_palette: Option<ParentPalette>,
     },
     /// Skills window. Stays open across changes: the host
     /// drains `changes` after every input event, persisting each
@@ -2429,8 +2428,29 @@ enum OpenSelector {
         handle: OverlayHandle,
         outcome: SkillsOutcomeHandle,
         changes: SkillsChangesHandle,
-        parent_palette: Option<ParentPalette>,
     },
+}
+
+impl OpenSelector {
+    /// The overlay handle this selector tracks, used to hide or
+    /// reveal it on the compositor's overlay stack.
+    fn handle(&self) -> OverlayHandle {
+        match self {
+            OpenSelector::Thinking { handle, .. }
+            | OpenSelector::Model { handle, .. }
+            | OpenSelector::Session { handle, .. }
+            | OpenSelector::PromptHistory { handle, .. }
+            | OpenSelector::AgentPicker { handle, .. }
+            | OpenSelector::TaskOutput { handle, .. }
+            | OpenSelector::Palette { handle, .. }
+            | OpenSelector::Help { handle, .. }
+            | OpenSelector::AuthPicker { handle, .. }
+            | OpenSelector::AuthStatus { handle, .. }
+            | OpenSelector::UsageStatus { handle, .. }
+            | OpenSelector::Settings { handle, .. }
+            | OpenSelector::Skills { handle, .. } => *handle,
+        }
+    }
 }
 
 /// What confirming a provider in the [`OpenSelector::AuthPicker`]
@@ -2456,17 +2476,6 @@ struct LoginSession {
     cancel: Arc<AtomicBool>,
 }
 
-/// Snapshot of a palette pushed underneath a sub-selector. Held by
-/// each child selector so that on cancel we can both un-hide the
-/// palette and restore the host's `OpenSelector::Palette` tracking
-/// (without re-installing this, the palette becomes input-wedged
-/// because nothing polls its outcome slot).
-#[derive(Clone)]
-struct ParentPalette {
-    handle: OverlayHandle,
-    outcome: CommandPaletteOutcomeHandle,
-}
-
 /// Result of dispatching a `/...`-prefixed editor submission.
 enum CommandOutcome {
     /// Stay in the session loop. Optionally present a transient
@@ -2483,46 +2492,117 @@ enum CommandOutcome {
     Quit,
 }
 
-/// Result of polling an open selector after a TUI input event.
-enum SelectorPollOutcome {
-    /// The selector is still waiting for input.
-    StillOpen(OpenSelector),
-    /// The selector closed (confirmed or cancelled). The optional
-    /// notice describes what happened so the host can render a
-    /// status line in the chat scrollback. `follow_up`, when set,
-    /// is the command the main loop should run via [`handle_command`]
-    /// — the command palette uses this to chain into a sub-selector
-    /// (e.g. the user picked the model command from the palette, so
-    /// the main loop now opens the model selector for real). The
-    /// follow-up path keeps the recursion at the main-loop level
-    /// rather than calling `handle_command` from inside
-    /// [`handle_selector_outcome`] — which would require threading
-    /// the model catalog and other command-only dependencies
-    /// through the outcome handler.
-    Closed {
-        notice: Option<String>,
-        follow_up: Option<PaletteFollowUp>,
-        /// When set, a login provider pick the host should turn
-        /// into a launched OAuth flow (the picker can't spawn the
-        /// task itself — that's the main loop's job, where the login
-        /// session state and the task `select!` arm live).
-        start_login: Option<String>,
-        /// When set, a confirmed session pick the outer session loop
-        /// should perform by rebuilding the world. Only emitted when
-        /// no turn is in flight.
-        session_request: Option<SessionRequest>,
+/// The host's stack of open selector overlays, mirroring the
+/// compositor's overlay z-order. The top is the active selector,
+/// polled after each input event. Entries beneath it are parents,
+/// hidden via [`Tui::set_overlay_hidden`] and revealed when the
+/// selector above them is dismissed.
+///
+/// The stack owns stack-to-compositor sync: [`push`] shows the child
+/// on top and hides the parent beneath it, [`back`] reveals that
+/// parent again, and [`close_all`] tears everything down. Callers
+/// show the overlay (which auto-focuses it) and hand it here.
+///
+/// [`push`]: SelectorStack::push
+/// [`back`]: SelectorStack::back
+/// [`close_all`]: SelectorStack::close_all
+#[derive(Default)]
+struct SelectorStack {
+    stack: Vec<OpenSelector>,
+}
+
+impl SelectorStack {
+    fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+
+    /// The active selector, or `None` when nothing is open.
+    fn top(&self) -> Option<&OpenSelector> {
+        self.stack.last()
+    }
+
+    /// Push a freshly shown overlay as the new top, hiding the parent
+    /// beneath it so only the top stays visible. The caller has
+    /// already shown the overlay, which auto-focused it.
+    fn push(&mut self, tui: &mut Tui, selector: OpenSelector) {
+        if let Some(parent) = self.stack.last() {
+            tui.set_overlay_hidden(&parent.handle(), true);
+        }
+        self.stack.push(selector);
+    }
+
+    /// Pop and hide the top overlay, then reveal the parent beneath
+    /// it. With no parent this returns to the chat. Used for Esc /
+    /// cancel and for stay-open windows closing.
+    fn back(&mut self, tui: &mut Tui) {
+        if let Some(top) = self.stack.pop() {
+            tui.hide_overlay(&top.handle());
+        }
+        if let Some(parent) = self.stack.last() {
+            tui.set_overlay_hidden(&parent.handle(), false);
+        }
+    }
+
+    /// Tear the whole stack down, hiding every overlay, back to the
+    /// chat. Used on a terminal confirm and on the close-all chord.
+    fn close_all(&mut self, tui: &mut Tui) {
+        while let Some(top) = self.stack.pop() {
+            tui.hide_overlay(&top.handle());
+        }
+    }
+}
+
+/// What polling the top selector decided. The main loop applies this
+/// to the [`SelectorStack`] and the compositor; the poll handler
+/// itself never touches overlay state.
+enum SelectorTransition {
+    /// The outcome slot is still empty; leave the stack untouched.
+    Stay,
+    /// Esc / cancel (or a stay-open window closing): pop the top and
+    /// reveal the parent beneath it, or return to chat if it was the
+    /// only level.
+    Back,
+    /// A terminal confirm: tear the whole stack down to chat and
+    /// apply these host-side effects.
+    Close(CloseEffects),
+    /// Open `action` as a child overlay. The palette chains into the
+    /// command it picked (`keep_parents: true`, so a cancel returns
+    /// to the palette); the agent picker drills into the task viewer
+    /// (`keep_parents: false`, so the picker is torn down first). The
+    /// open runs through [`handle_command`] in the main loop, which
+    /// has the command-only dependencies the poll handler lacks.
+    Open {
+        action: CommandAction,
+        keep_parents: bool,
     },
 }
 
-/// Deferred chain from the command palette to the command it
-/// selected. Carries the palette's (hidden) overlay handle + outcome
-/// slot so the main loop can stash both on the sub-selector for the
-/// back-stack (and so the palette stays pollable after a cancel
-/// returns to it), or tear it down if the follow-up doesn't open a
-/// sub-selector.
-struct PaletteFollowUp {
-    action: CommandAction,
-    parent_palette: ParentPalette,
+/// Host-side effects a terminal confirm asks the main loop to apply
+/// after it drains the selector stack. The fields are independent
+/// and usually only one is set.
+#[derive(Default)]
+struct CloseEffects {
+    /// A status line to render in the chat scrollback.
+    notice: Option<String>,
+    /// A login provider pick the host should turn into a launched
+    /// OAuth flow. The picker can't spawn the task itself, that's the
+    /// main loop's job, where the login session state and the task
+    /// `select!` arm live.
+    start_login: Option<String>,
+    /// A confirmed session pick the outer session loop should perform
+    /// by rebuilding the world. Only emitted when no turn is in
+    /// flight.
+    session_request: Option<SessionRequest>,
+}
+
+impl CloseEffects {
+    /// A confirm that closes with just a status notice.
+    fn notice(text: String) -> Self {
+        CloseEffects {
+            notice: Some(text),
+            ..CloseEffects::default()
+        }
+    }
 }
 
 /// Wrap a notice string in the [`AgentEvent::Notice`] shape so we
@@ -3051,85 +3131,6 @@ fn subtitle_settings_window(child: &dyn aj_tui::component::Component) -> String 
     }
 }
 
-/// Tear down every visible overlay: the current selector plus its
-/// parent palette (if any). Returns control to the chat editor.
-///
-/// Distinct from the per-variant Esc/cancel path in
-/// [`handle_selector_outcome`], which pops one level (sub-selector
-/// back to palette). This helper is invoked by the
-/// `aj.overlay.close_all` chord and unconditionally removes both
-/// the current overlay and its parent from the overlay stack.
-fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
-    match sel {
-        OpenSelector::Palette { handle, .. } => {
-            tui.hide_overlay(&handle);
-        }
-        OpenSelector::TaskOutput { handle, .. } => {
-            tui.hide_overlay(&handle);
-        }
-        OpenSelector::Thinking {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::Model {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::Session {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::PromptHistory {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::Help {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::AuthPicker {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::AuthStatus {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::UsageStatus {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::AgentPicker {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::Settings {
-            handle,
-            parent_palette,
-            ..
-        }
-        | OpenSelector::Skills {
-            handle,
-            parent_palette,
-            ..
-        } => {
-            tui.hide_overlay(&handle);
-            if let Some(parent) = parent_palette {
-                tui.hide_overlay(&parent.handle);
-            }
-        }
-    }
-}
-
 /// Subtitle for the OAuth login dialog overlay: how to submit a
 /// pasted code and how to cancel, with key labels resolved from the
 /// keybindings manager.
@@ -3231,15 +3232,10 @@ async fn handle_command(
     conversation_persistence: &ConversationPersistence,
     theme: &ThemeHandle,
     action: CommandAction,
-    parent_palette: Option<ParentPalette>,
     turn_running: bool,
 ) -> CommandOutcome {
-    let result = match action {
+    match action {
         CommandAction::OpenCommandPalette => {
-            debug_assert!(
-                parent_palette.is_none(),
-                "command palette has no parent palette"
-            );
             use crate::modes::interactive::components::command_palette::CommandPaletteComponent;
             let inner = CommandPaletteComponent::new(select_list_theme(theme), 13);
             let outcome = inner.outcome_handle();
@@ -3288,7 +3284,6 @@ async fn handle_command(
                     handle,
                     outcome,
                     target,
-                    parent_palette: parent_palette.clone(),
                 }),
                 notice: None,
             }
@@ -3334,7 +3329,6 @@ async fn handle_command(
                     handle,
                     outcome,
                     target,
-                    parent_palette: parent_palette.clone(),
                 }),
                 notice: None,
             }
@@ -3370,7 +3364,6 @@ async fn handle_command(
                     selector: Some(OpenSelector::AuthPicker {
                         handle,
                         outcome,
-                        parent_palette: parent_palette.clone(),
                         mode: AuthPickerMode::Login,
                     }),
                     notice: None,
@@ -3418,7 +3411,6 @@ async fn handle_command(
                     selector: Some(OpenSelector::AuthPicker {
                         handle,
                         outcome,
-                        parent_palette: parent_palette.clone(),
                         mode: AuthPickerMode::Logout,
                     }),
                     notice: None,
@@ -3438,11 +3430,7 @@ async fn handle_command(
             .with_subtitle(&subtitle_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             CommandOutcome::Continue {
-                selector: Some(OpenSelector::AuthStatus {
-                    handle,
-                    outcome,
-                    parent_palette: parent_palette.clone(),
-                }),
+                selector: Some(OpenSelector::AuthStatus { handle, outcome }),
                 notice: None,
             }
         }
@@ -3473,11 +3461,7 @@ async fn handle_command(
             .with_subtitle(&subtitle_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             CommandOutcome::Continue {
-                selector: Some(OpenSelector::UsageStatus {
-                    handle,
-                    outcome,
-                    parent_palette: parent_palette.clone(),
-                }),
+                selector: Some(OpenSelector::UsageStatus { handle, outcome }),
                 notice: None,
             }
         }
@@ -3526,11 +3510,7 @@ async fn handle_command(
             .with_subtitle(&subtitle_confirm_close());
             let handle = tui.show_overlay(Box::new(window), large_overlay_options());
             CommandOutcome::Continue {
-                selector: Some(OpenSelector::Session {
-                    handle,
-                    outcome,
-                    parent_palette: parent_palette.clone(),
-                }),
+                selector: Some(OpenSelector::Session { handle, outcome }),
                 notice: None,
             }
         }
@@ -3578,12 +3558,43 @@ async fn handle_command(
             .with_dynamic_subtitle(subtitle_prompt_history);
             let handle = tui.show_overlay(Box::new(window), large_overlay_options());
             CommandOutcome::Continue {
-                selector: Some(OpenSelector::PromptHistory {
-                    handle,
-                    outcome,
-                    parent_palette: parent_palette.clone(),
-                }),
+                selector: Some(OpenSelector::PromptHistory { handle, outcome }),
                 notice: None,
+            }
+        }
+        CommandAction::OpenTaskOutput { id } => {
+            // Drilled into from the agent picker, never the palette.
+            // The picker only lists bash tasks, so resolve the command
+            // line for the viewer header; if the task has left the
+            // registry there is nothing to show.
+            let command = world.task_registry.summary(id).and_then(|s| match s.kind {
+                aj_agent::tool::TaskKind::Bash { command } => Some(command),
+                aj_agent::tool::TaskKind::Agent { .. } => None,
+            });
+            match command {
+                Some(command) => {
+                    let initial_inner_rows =
+                        large_overlay_inner_rows(usize::from(tui.terminal().rows()));
+                    let inner = TaskOutputComponent::new(world.task_registry.clone(), id, command);
+                    let outcome = inner.outcome_handle();
+                    let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                        format!("Task #{id}"),
+                        Box::new(inner),
+                        crate::config::theme::overlay_window_theme(theme),
+                        initial_inner_rows,
+                    )
+                    .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
+                    .with_subtitle(&subtitle_task_output());
+                    let handle = tui.show_overlay(Box::new(window), large_overlay_options());
+                    CommandOutcome::Continue {
+                        selector: Some(OpenSelector::TaskOutput { handle, outcome }),
+                        notice: None,
+                    }
+                }
+                None => CommandOutcome::Continue {
+                    selector: None,
+                    notice: Some(format!("Background task #{id} is no longer available.")),
+                },
             }
         }
         CommandAction::OpenAgentPicker => {
@@ -3605,11 +3616,7 @@ async fn handle_command(
             .with_dynamic_subtitle(subtitle_agent_picker);
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             CommandOutcome::Continue {
-                selector: Some(OpenSelector::AgentPicker {
-                    handle,
-                    outcome,
-                    parent_palette: parent_palette.clone(),
-                }),
+                selector: Some(OpenSelector::AgentPicker { handle, outcome }),
                 notice: None,
             }
         }
@@ -3696,7 +3703,6 @@ async fn handle_command(
                     outcome,
                     changes,
                     corrections,
-                    parent_palette: parent_palette.clone(),
                 }),
                 notice: None,
             }
@@ -3749,7 +3755,6 @@ async fn handle_command(
                         handle,
                         outcome,
                         changes,
-                        parent_palette: parent_palette.clone(),
                     }),
                     notice: None,
                 }
@@ -3768,11 +3773,7 @@ async fn handle_command(
             .with_subtitle(&subtitle_close());
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             CommandOutcome::Continue {
-                selector: Some(OpenSelector::Help {
-                    handle,
-                    outcome,
-                    parent_palette: parent_palette.clone(),
-                }),
+                selector: Some(OpenSelector::Help { handle, outcome }),
                 notice: None,
             }
         }
@@ -3781,40 +3782,7 @@ async fn handle_command(
             notice: Some(message.to_string()),
         },
         CommandAction::Quit => CommandOutcome::Quit,
-    };
-
-    // If we were dispatched as a palette follow-up, the palette
-    // is hidden on the overlay stack. The arms that mount a
-    // sub-selector consume `parent_palette` (passing it onto the
-    // new `OpenSelector`), in which case the resulting
-    // `CommandOutcome::Continue` carries one of those variants.
-    // For every other arm — `NewSession`, `Quit`, errors, etc. —
-    // the palette would otherwise leak, so tear it down here.
-    if let Some(palette) = parent_palette {
-        let consumed = matches!(
-            &result,
-            CommandOutcome::Continue {
-                selector: Some(
-                    OpenSelector::Thinking { .. }
-                        | OpenSelector::Model { .. }
-                        | OpenSelector::Session { .. }
-                        | OpenSelector::PromptHistory { .. }
-                        | OpenSelector::AgentPicker { .. }
-                        | OpenSelector::Help { .. }
-                        | OpenSelector::AuthPicker { .. }
-                        | OpenSelector::AuthStatus { .. }
-                        | OpenSelector::UsageStatus { .. }
-                        | OpenSelector::Settings { .. }
-                        | OpenSelector::Skills { .. },
-                ),
-                ..
-            },
-        );
-        if !consumed {
-            tui.hide_overlay(&palette.handle);
-        }
     }
-    result
 }
 
 /// Apply a confirmed thinking pick to the main agent: stage into
@@ -4506,16 +4474,21 @@ fn join_notice(mut notice: String, note: Option<String>) -> String {
     notice
 }
 
-/// Poll an open selector for its outcome and apply the result.
+/// Poll the active selector's outcome slot after an input event and
+/// decide how the host should move the selector stack.
 ///
-/// Returns [`SelectorPollOutcome::StillOpen`] if the user hasn't
-/// pressed Enter or Esc yet; [`SelectorPollOutcome::Closed`] if the
-/// overlay completed, with an optional notice describing what
-/// happened.
+/// This computes a [`SelectorTransition`] and performs the
+/// variant-specific confirm work (staging a model/thinking change,
+/// switching the chat view, killing a task, draining a stay-open
+/// window's edits). It deliberately does not touch the compositor's
+/// overlay stack: hiding and revealing overlays is the main loop's
+/// job, applied through [`SelectorStack`] once this returns. The
+/// confirm work runs before that hide, but rendering is deferred to
+/// the top of the loop, so the overlay is gone before the next paint.
 #[allow(clippy::too_many_arguments)]
 async fn handle_selector_outcome(
     tui: &mut Tui,
-    selector: OpenSelector,
+    selector: &OpenSelector,
     auth: &AuthStorage,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: Arc<std::sync::Mutex<Config>>,
@@ -4524,28 +4497,16 @@ async fn handle_selector_outcome(
     theme: &ThemeHandle,
     render_settings: &RenderSettings,
     theme_watch: &mut ThemeWatch,
-) -> SelectorPollOutcome {
+) -> SelectorTransition {
     match selector {
         OpenSelector::Thinking {
-            handle,
-            outcome,
-            target,
-            parent_palette,
+            outcome, target, ..
         } => {
             let outcome_value = outcome.lock().expect("thinking outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Thinking {
-                    handle,
-                    outcome,
-                    target,
-                    parent_palette,
-                }),
+                None => SelectorTransition::Stay,
                 Some(ThinkingSelectorOutcome::Confirmed(level)) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.hide_overlay(&parent.handle);
-                    }
-                    let notice = match target {
+                    let notice = match *target {
                         AgentId::Main => {
                             confirm_thinking_for_main(
                                 tui,
@@ -4562,438 +4523,149 @@ async fn handle_selector_outcome(
                                 .await
                         }
                     };
-                    SelectorPollOutcome::Closed {
-                        notice: Some(notice),
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
+                    SelectorTransition::Close(CloseEffects::notice(notice))
                 }
-                Some(ThinkingSelectorOutcome::Cancelled) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        // Pop back to the palette. Un-hide it on the
-                        // overlay stack and restore the host-side
-                        // `OpenSelector::Palette` tracking so its
-                        // outcome slot is polled again — without
-                        // restoring tracking the palette becomes
-                        // input-wedged.
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                Some(ThinkingSelectorOutcome::Cancelled) => SelectorTransition::Back,
             }
         }
         OpenSelector::Model {
-            handle,
-            outcome,
-            target,
-            parent_palette,
+            outcome, target, ..
         } => {
             let outcome_value = outcome.lock().expect("model outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Model {
-                    handle,
-                    outcome,
-                    target,
-                    parent_palette,
-                }),
+                None => SelectorTransition::Stay,
                 Some(ModelSelectorOutcome::Confirmed(info)) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.hide_overlay(&parent.handle);
-                    }
-                    let notice = match target {
+                    let notice = match *target {
                         AgentId::Main => {
                             confirm_model_for_main(tui, info, auth, &run_config, &config, world)
                                 .await
                         }
                         AgentId::Sub(n) => confirm_model_for_sub(tui, info, n, auth, world).await,
                     };
-                    SelectorPollOutcome::Closed {
-                        notice: Some(notice),
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
+                    SelectorTransition::Close(CloseEffects::notice(notice))
                 }
-                Some(ModelSelectorOutcome::Cancelled) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                Some(ModelSelectorOutcome::Cancelled) => SelectorTransition::Back,
             }
         }
-        OpenSelector::Session {
-            handle,
-            outcome,
-            parent_palette,
-        } => {
+        OpenSelector::Session { outcome, .. } => {
             let outcome_value = outcome.lock().expect("session outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Session {
-                    handle,
-                    outcome,
-                    parent_palette,
-                }),
+                None => SelectorTransition::Stay,
                 Some(SessionSelectorOutcome::Confirmed(preview)) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.hide_overlay(&parent.handle);
-                    }
-                    // No-op when the user picks the row that's
-                    // already active. Saves the rebuild (and the
-                    // chat-container clear that would briefly hide
-                    // the user's scrollback).
+                    // No-op when the user picks the row that's already
+                    // active. Saves the rebuild (and the chat-container
+                    // clear that would briefly hide the scrollback).
                     if world.session_id == preview.session_id {
-                        return SelectorPollOutcome::Closed {
-                            notice: Some(format!("Already on session {}.", preview.session_id)),
-                            follow_up: None,
-                            start_login: None,
-                            session_request: None,
-                        };
+                        return SelectorTransition::Close(CloseEffects::notice(format!(
+                            "Already on session {}.",
+                            preview.session_id
+                        )));
                     }
                     // Hand the pick to the outer session loop, which
-                    // tears down the current world and rebuilds onto
-                    // the chosen session (and emits the switch notice
-                    // after the new world is installed).
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
+                    // tears down the current world and rebuilds onto the
+                    // chosen session (and emits the switch notice after
+                    // the new world is installed).
+                    SelectorTransition::Close(CloseEffects {
                         session_request: Some(SessionRequest::Resume(preview.session_id)),
-                    }
+                        ..CloseEffects::default()
+                    })
                 }
-                Some(SessionSelectorOutcome::Cancelled) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                Some(SessionSelectorOutcome::Cancelled) => SelectorTransition::Back,
             }
         }
-        OpenSelector::PromptHistory {
-            handle,
-            outcome,
-            parent_palette,
-        } => match outcome.take() {
-            None => SelectorPollOutcome::StillOpen(OpenSelector::PromptHistory {
-                handle,
-                outcome,
-                parent_palette,
-            }),
+        OpenSelector::PromptHistory { outcome, .. } => match outcome.take() {
+            None => SelectorTransition::Stay,
             Some(PromptHistoryOutcome::Recalled { text }) => {
-                tui.hide_overlay(&handle);
-                if let Some(parent) = parent_palette {
-                    tui.hide_overlay(&parent.handle);
-                }
-                // Recall replaces the editor buffer (it does not
-                // submit) so the user can edit before sending.
+                // Recall replaces the editor buffer (it does not submit)
+                // so the user can edit before sending.
                 if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
                     editor.set_text(&text);
                 }
                 tui.request_render();
-                SelectorPollOutcome::Closed {
-                    notice: None,
-                    follow_up: None,
-                    start_login: None,
-                    session_request: None,
-                }
+                SelectorTransition::Close(CloseEffects::default())
             }
-            Some(PromptHistoryOutcome::Cancelled) => {
-                tui.hide_overlay(&handle);
-                if let Some(parent) = parent_palette {
-                    tui.set_overlay_hidden(&parent.handle, false);
-                    return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                        handle: parent.handle,
-                        outcome: parent.outcome,
-                    });
-                }
-                SelectorPollOutcome::Closed {
-                    notice: None,
-                    follow_up: None,
-                    start_login: None,
-                    session_request: None,
-                }
-            }
+            Some(PromptHistoryOutcome::Cancelled) => SelectorTransition::Back,
         },
-        OpenSelector::Help {
-            handle,
-            outcome,
-            parent_palette,
-        } => {
+        OpenSelector::Help { outcome, .. } => {
             use crate::modes::interactive::components::help_overlay::HelpOverlayOutcome;
             match outcome.take() {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Help {
-                    handle,
-                    outcome,
-                    parent_palette,
-                }),
-                Some(HelpOverlayOutcome::Closed) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                None => SelectorTransition::Stay,
+                Some(HelpOverlayOutcome::Closed) => SelectorTransition::Back,
             }
         }
-        OpenSelector::AuthPicker {
-            handle,
-            outcome,
-            parent_palette,
-            mode,
-        } => {
+        OpenSelector::AuthPicker { outcome, mode, .. } => {
             use crate::modes::interactive::components::auth_picker::AuthPickerOutcome;
             let value = outcome.lock().expect("auth picker outcome poisoned").take();
             match value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::AuthPicker {
-                    handle,
-                    outcome,
-                    parent_palette,
-                    mode,
-                }),
-                Some(AuthPickerOutcome::Cancelled) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
+                None => SelectorTransition::Stay,
+                Some(AuthPickerOutcome::Cancelled) => SelectorTransition::Back,
+                Some(AuthPickerOutcome::Confirmed(provider_id)) => match *mode {
+                    // Login is async + long-running: hand the provider id
+                    // back so the main loop mounts the dialog and spawns
+                    // the flow.
+                    AuthPickerMode::Login => SelectorTransition::Close(CloseEffects {
+                        start_login: Some(provider_id),
+                        ..CloseEffects::default()
+                    }),
+                    // Logout is a quick disk write we can do inline.
+                    AuthPickerMode::Logout => {
+                        let notice = match auth.logout(&provider_id).await {
+                            Ok(()) => format!("Logged out of {provider_id}."),
+                            Err(err) => format!("Failed to log out of {provider_id}: {err}"),
+                        };
+                        SelectorTransition::Close(CloseEffects::notice(notice))
                     }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
-                Some(AuthPickerOutcome::Confirmed(provider_id)) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.hide_overlay(&parent.handle);
-                    }
-                    match mode {
-                        // Login is async + long-running: hand the
-                        // provider id back so the main loop mounts the
-                        // dialog and spawns the flow.
-                        AuthPickerMode::Login => SelectorPollOutcome::Closed {
-                            notice: None,
-                            follow_up: None,
-                            start_login: Some(provider_id),
-                            session_request: None,
-                        },
-                        // Logout is a quick disk write we can do inline.
-                        AuthPickerMode::Logout => {
-                            let notice = match auth.logout(&provider_id).await {
-                                Ok(()) => format!("Logged out of {provider_id}."),
-                                Err(err) => {
-                                    format!("Failed to log out of {provider_id}: {err}")
-                                }
-                            };
-                            SelectorPollOutcome::Closed {
-                                notice: Some(notice),
-                                follow_up: None,
-                                start_login: None,
-                                session_request: None,
-                            }
-                        }
-                    }
-                }
+                },
             }
         }
-        OpenSelector::AuthStatus {
-            handle,
-            outcome,
-            parent_palette,
-        } => {
+        OpenSelector::AuthStatus { outcome, .. } => {
             use crate::modes::interactive::components::auth_status::AuthStatusOutcome;
             match outcome.take() {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::AuthStatus {
-                    handle,
-                    outcome,
-                    parent_palette,
-                }),
-                Some(AuthStatusOutcome::Closed) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                None => SelectorTransition::Stay,
+                Some(AuthStatusOutcome::Closed) => SelectorTransition::Back,
             }
         }
-        OpenSelector::UsageStatus {
-            handle,
-            outcome,
-            parent_palette,
-        } => {
+        OpenSelector::UsageStatus { outcome, .. } => {
             use crate::modes::interactive::components::usage_status::UsageStatusOutcome;
             match outcome.take() {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::UsageStatus {
-                    handle,
-                    outcome,
-                    parent_palette,
-                }),
-                Some(UsageStatusOutcome::Closed) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                None => SelectorTransition::Stay,
+                Some(UsageStatusOutcome::Closed) => SelectorTransition::Back,
             }
         }
-        OpenSelector::AgentPicker {
-            handle,
-            outcome,
-            parent_palette,
-        } => {
+        OpenSelector::AgentPicker { outcome, .. } => {
             let outcome_value = outcome
                 .lock()
                 .expect("agent picker outcome poisoned")
                 .take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::AgentPicker {
-                    handle,
-                    outcome,
-                    parent_palette,
-                }),
+                None => SelectorTransition::Stay,
                 Some(AgentPickerOutcome::Confirmed(id)) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.hide_overlay(&parent.handle);
-                    }
                     // Switch the chat view to the chosen agent and mark
                     // the editor so the user sees which agent they're
                     // observing (cleared when switching back to main).
                     world.pump.set_active_view(tui, id);
                     apply_editor_agent_marker(tui, id);
                     apply_editor_border_for_view(tui, theme, &world.pump, &run_config, id);
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
+                    SelectorTransition::Close(CloseEffects::default())
                 }
                 Some(AgentPickerOutcome::ConfirmedTask(id)) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.hide_overlay(&parent.handle);
-                    }
-                    // The picker only lists bash tasks, so resolve the
-                    // command line for the viewer header. If the task is
-                    // gone from the registry, there is nothing to show;
-                    // close to chat with a notice.
-                    let command = world.task_registry.summary(id).and_then(|s| match s.kind {
-                        aj_agent::tool::TaskKind::Bash { command } => Some(command),
-                        aj_agent::tool::TaskKind::Agent { .. } => None,
-                    });
-                    match command {
-                        Some(command) => {
-                            let initial_inner_rows =
-                                large_overlay_inner_rows(usize::from(tui.terminal().rows()));
-                            let inner =
-                                TaskOutputComponent::new(world.task_registry.clone(), id, command);
-                            let outcome = inner.outcome_handle();
-                            let window = aj_tui::components::overlay_window::OverlayWindow::new(
-                                format!("Task #{id}"),
-                                Box::new(inner),
-                                crate::config::theme::overlay_window_theme(theme),
-                                initial_inner_rows,
-                            )
-                            .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
-                            .with_subtitle(&subtitle_task_output());
-                            let handle =
-                                tui.show_overlay(Box::new(window), large_overlay_options());
-                            // Open the viewer in place of the picker and
-                            // keep polling it. This is the one overlay
-                            // opened from inside the poll handler rather
-                            // than `handle_command`.
-                            SelectorPollOutcome::StillOpen(OpenSelector::TaskOutput {
-                                handle,
-                                outcome,
-                            })
-                        }
-                        None => SelectorPollOutcome::Closed {
-                            notice: Some(format!("Background task #{id} is no longer available.")),
-                            follow_up: None,
-                            start_login: None,
-                            session_request: None,
-                        },
+                    // Drill into the task's output viewer, tearing the
+                    // picker down first: Esc from the viewer returns to
+                    // chat, not the picker. `handle_command` resolves the
+                    // task and builds the overlay, or surfaces a notice
+                    // if it's already gone.
+                    SelectorTransition::Open {
+                        action: CommandAction::OpenTaskOutput { id },
+                        keep_parents: false,
                     }
                 }
                 Some(AgentPickerOutcome::KillTask(id)) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.hide_overlay(&parent.handle);
-                    }
-                    // The registry cancels the task's token; the
-                    // driver kills the process group, flips the
-                    // status, and the resulting `TaskEnd` freezes the
-                    // cell — no pump bookkeeping to update here. The
-                    // picker rows are a snapshot from open time, so
-                    // consult the live status: the task may have
-                    // finished while the picker was up.
+                    // The registry cancels the task's token; the driver
+                    // kills the process group, flips the status, and the
+                    // resulting `TaskEnd` freezes the cell. The picker
+                    // rows are a snapshot from open time, so consult the
+                    // live status: the task may have finished while the
+                    // picker was up.
                     let live_status = world
                         .task_registry
                         .snapshot()
@@ -5010,53 +4682,24 @@ async fn handle_selector_outcome(
                             format!("Background task #{id} is not in the registry (already gone?).")
                         }
                     };
-                    SelectorPollOutcome::Closed {
-                        notice: Some(notice),
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
+                    SelectorTransition::Close(CloseEffects::notice(notice))
                 }
-                Some(AgentPickerOutcome::Cancelled) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                Some(AgentPickerOutcome::Cancelled) => SelectorTransition::Back,
             }
         }
-        OpenSelector::TaskOutput { handle, outcome } => match outcome.take() {
-            None => SelectorPollOutcome::StillOpen(OpenSelector::TaskOutput { handle, outcome }),
-            Some(TaskOutputOutcome::Closed) => {
-                tui.hide_overlay(&handle);
-                SelectorPollOutcome::Closed {
-                    notice: None,
-                    follow_up: None,
-                    start_login: None,
-                    session_request: None,
-                }
-            }
+        OpenSelector::TaskOutput { outcome, .. } => match outcome.take() {
+            None => SelectorTransition::Stay,
+            Some(TaskOutputOutcome::Closed) => SelectorTransition::Back,
         },
         OpenSelector::Settings {
-            handle,
             outcome,
             changes,
             corrections,
-            parent_palette,
+            ..
         } => {
-            // Apply queued changes first — the window stays open
-            // while the user keeps editing, so changes and the
-            // eventual close arrive through separate channels.
+            // Apply queued changes first. The window stays open while
+            // the user keeps editing, so changes and the eventual close
+            // arrive through separate channels.
             let drained: Vec<(String, String)> =
                 std::mem::take(&mut *changes.lock().expect("settings changes poisoned"));
             for (id, value) in drained {
@@ -5072,7 +4715,7 @@ async fn handle_selector_outcome(
                     theme,
                     theme_watch,
                     render_settings,
-                    &corrections,
+                    corrections,
                 )
                 .await;
                 if let Some(text) = notice {
@@ -5081,40 +4724,16 @@ async fn handle_selector_outcome(
             }
             let outcome_value = outcome.lock().expect("settings outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Settings {
-                    handle,
-                    outcome,
-                    changes,
-                    corrections,
-                    parent_palette,
-                }),
-                Some(SettingsWindowOutcome::Closed) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                None => SelectorTransition::Stay,
+                Some(SettingsWindowOutcome::Closed) => SelectorTransition::Back,
             }
         }
         OpenSelector::Skills {
-            handle,
-            outcome,
-            changes,
-            parent_palette,
+            outcome, changes, ..
         } => {
-            // Persist queued toggles first — the window stays open
-            // while the user keeps toggling, so changes and the
-            // eventual close arrive through separate channels.
+            // Persist queued toggles first. The window stays open while
+            // the user keeps toggling, so changes and the eventual close
+            // arrive through separate channels.
             let drained: Vec<(String, String)> =
                 std::mem::take(&mut *changes.lock().expect("skills changes poisoned"));
             for (name, value) in drained {
@@ -5136,68 +4755,22 @@ async fn handle_selector_outcome(
             }
             let outcome_value = outcome.lock().expect("skills outcome poisoned").take();
             match outcome_value {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Skills {
-                    handle,
-                    outcome,
-                    changes,
-                    parent_palette,
-                }),
-                Some(SkillsWindowOutcome::Closed) => {
-                    tui.hide_overlay(&handle);
-                    if let Some(parent) = parent_palette {
-                        tui.set_overlay_hidden(&parent.handle, false);
-                        return SelectorPollOutcome::StillOpen(OpenSelector::Palette {
-                            handle: parent.handle,
-                            outcome: parent.outcome,
-                        });
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                None => SelectorTransition::Stay,
+                Some(SkillsWindowOutcome::Closed) => SelectorTransition::Back,
             }
         }
-        OpenSelector::Palette { handle, outcome } => {
+        OpenSelector::Palette { outcome, .. } => {
             use crate::modes::interactive::components::command_palette::CommandPaletteOutcome;
             match outcome.take() {
-                None => SelectorPollOutcome::StillOpen(OpenSelector::Palette { handle, outcome }),
-                Some(CommandPaletteOutcome::Cancelled) => {
-                    tui.hide_overlay(&handle);
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
-                Some(CommandPaletteOutcome::Confirmed { action }) => {
-                    // Hide (don't remove) the palette so we can
-                    // restore it if the follow-up command opens a
-                    // sub-selector and the user cancels back. If
-                    // the follow-up doesn't open a sub-selector,
-                    // `handle_command` tears the palette
-                    // down once it finishes dispatching. The
-                    // outcome handle is cloned into the follow-up
-                    // so the host can re-install
-                    // `OpenSelector::Palette` after a child cancel,
-                    // keeping the palette pollable.
-                    tui.set_overlay_hidden(&handle, true);
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: Some(PaletteFollowUp {
-                            action,
-                            parent_palette: ParentPalette {
-                                handle,
-                                outcome: outcome.clone(),
-                            },
-                        }),
-                        start_login: None,
-                        session_request: None,
-                    }
-                }
+                None => SelectorTransition::Stay,
+                Some(CommandPaletteOutcome::Cancelled) => SelectorTransition::Back,
+                // Chain into the chosen command. The palette stays on the
+                // stack (hidden) as the parent, so a cancel from the
+                // child returns to it.
+                Some(CommandPaletteOutcome::Confirmed { action }) => SelectorTransition::Open {
+                    action,
+                    keep_parents: true,
+                },
             }
         }
     }
@@ -5856,7 +5429,7 @@ mod tests {
         run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
         target: AgentId,
         level: Option<ThinkingConfig>,
-    ) -> SelectorPollOutcome {
+    ) -> SelectorTransition {
         let theme = ThemeHandle::new(Theme::bundled_dark());
         let inner = ThinkingSelectorComponent::new(select_list_theme(&theme), None);
         let outcome = inner.outcome_handle();
@@ -5867,11 +5440,10 @@ mod tests {
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         handle_selector_outcome(
             tui,
-            OpenSelector::Thinking {
+            &OpenSelector::Thinking {
                 handle,
                 outcome,
                 target,
-                parent_palette: None,
             },
             &auth,
             Arc::clone(run_config),
@@ -5919,8 +5491,8 @@ mod tests {
         .await;
 
         match outcome {
-            SelectorPollOutcome::Closed { notice, .. } => assert_eq!(
-                notice.as_deref(),
+            SelectorTransition::Close(effects) => assert_eq!(
+                effects.notice.as_deref(),
                 Some("Thinking effort set to high for agent 1.")
             ),
             _ => panic!("expected the selector to close"),
@@ -5968,8 +5540,11 @@ mod tests {
         .await;
 
         match outcome {
-            SelectorPollOutcome::Closed { notice, .. } => {
-                assert_eq!(notice.as_deref(), Some("This agent can't be prompted."));
+            SelectorTransition::Close(effects) => {
+                assert_eq!(
+                    effects.notice.as_deref(),
+                    Some("This agent can't be prompted.")
+                );
             }
             _ => panic!("expected the selector to close"),
         }
@@ -6020,11 +5595,10 @@ mod tests {
 
         let result = handle_selector_outcome(
             &mut tui,
-            OpenSelector::Model {
+            &OpenSelector::Model {
                 handle,
                 outcome,
                 target: AgentId::Sub(1),
-                parent_palette: None,
             },
             &auth,
             Arc::clone(&run_config),
@@ -6041,8 +5615,8 @@ mod tests {
         .await;
 
         match result {
-            SelectorPollOutcome::Closed { notice, .. } => assert_eq!(
-                notice.as_deref(),
+            SelectorTransition::Close(effects) => assert_eq!(
+                effects.notice.as_deref(),
                 Some("Model set to claude-x (anthropic/claude-x) for agent 1.")
             ),
             _ => panic!("expected the selector to close"),
@@ -6123,11 +5697,7 @@ mod tests {
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let result = handle_selector_outcome(
             &mut tui,
-            OpenSelector::AgentPicker {
-                handle,
-                outcome,
-                parent_palette: None,
-            },
+            &OpenSelector::AgentPicker { handle, outcome },
             &auth,
             Arc::clone(&run_config),
             Arc::new(std::sync::Mutex::new(Config::default())),
@@ -6144,11 +5714,210 @@ mod tests {
 
         assert!(cancel.is_cancelled(), "kill cancels the task's token");
         match result {
-            SelectorPollOutcome::Closed { notice, .. } => {
-                assert_eq!(notice, Some(format!("Killing background task #{task_id}.")))
+            SelectorTransition::Close(effects) => {
+                assert_eq!(
+                    effects.notice,
+                    Some(format!("Killing background task #{task_id}."))
+                )
             }
             _ => panic!("expected the selector to close"),
         }
+    }
+
+    // ---- Selector stack & transitions -------------------------------------
+
+    /// Mount a simple read-only overlay (the help window) and return a
+    /// tracking [`OpenSelector`] for it. Handy for exercising the
+    /// stack's reveal/teardown mechanics without a full command flow.
+    fn show_help_selector(tui: &mut Tui, theme: &ThemeHandle) -> OpenSelector {
+        use crate::modes::interactive::components::help_overlay::HelpOverlayComponent;
+        let inner = HelpOverlayComponent::new(select_list_theme(theme));
+        let outcome = inner.outcome_handle();
+        let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
+        OpenSelector::Help { handle, outcome }
+    }
+
+    /// `back` pops the top overlay, reveals the parent beneath it, and
+    /// returns to the chat once the last level is popped, mirroring a
+    /// child opened over the palette and Esc'd twice.
+    #[test]
+    fn selector_stack_back_reveals_parent_then_returns_to_chat() {
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &theme, true);
+
+        let mut stack = SelectorStack::default();
+        let parent = show_help_selector(&mut tui, &theme);
+        let parent_handle = parent.handle();
+        stack.push(&mut tui, parent);
+        assert!(tui.is_overlay_focused(&parent_handle));
+
+        // Opening a child over the parent hides the parent (push owns
+        // that) and focuses the child.
+        let child = show_help_selector(&mut tui, &theme);
+        let child_handle = child.handle();
+        stack.push(&mut tui, child);
+        assert!(tui.is_overlay_focused(&child_handle));
+        assert!(!tui.is_overlay_focused(&parent_handle));
+
+        stack.back(&mut tui);
+        assert!(
+            tui.is_overlay_focused(&parent_handle),
+            "popping the child reveals the parent"
+        );
+        assert!(!tui.is_overlay_focused(&child_handle));
+
+        stack.back(&mut tui);
+        assert!(stack.is_empty());
+        assert!(
+            !tui.is_overlay_focused(&parent_handle),
+            "popping the last level returns to the chat"
+        );
+    }
+
+    /// `close_all` tears every level down in one shot.
+    #[test]
+    fn selector_stack_close_all_drains_every_level() {
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &theme, true);
+
+        let mut stack = SelectorStack::default();
+        let parent = show_help_selector(&mut tui, &theme);
+        let parent_handle = parent.handle();
+        stack.push(&mut tui, parent);
+        let child = show_help_selector(&mut tui, &theme);
+        let child_handle = child.handle();
+        stack.push(&mut tui, child);
+
+        stack.close_all(&mut tui);
+        assert!(stack.is_empty());
+        assert!(!tui.is_overlay_focused(&parent_handle));
+        assert!(!tui.is_overlay_focused(&child_handle));
+    }
+
+    /// Poll an agent picker carrying `outcome_value` and return the
+    /// transition the host would apply.
+    async fn poll_agent_picker(outcome_value: AgentPickerOutcome) -> SelectorTransition {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("unused")]);
+        let mut world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        build_layout(&mut tui, &theme, true);
+
+        let inner = AgentPickerComponent::new(
+            select_list_theme(&theme),
+            Vec::new(),
+            Vec::new(),
+            AgentId::Main,
+        );
+        let outcome = inner.outcome_handle();
+        let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
+        *outcome.lock().expect("outcome poisoned") = Some(outcome_value);
+
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        handle_selector_outcome(
+            &mut tui,
+            &OpenSelector::AgentPicker { handle, outcome },
+            &auth,
+            Arc::clone(&run_config),
+            Arc::new(std::sync::Mutex::new(Config::default())),
+            &[],
+            &mut world,
+            &theme,
+            &RenderSettings::new(false, false, true),
+            &mut ThemeWatch {
+                _guard: None,
+                rx: None,
+            },
+        )
+        .await
+    }
+
+    /// Confirming a task row drills into the viewer: a drain-the-stack
+    /// open of [`CommandAction::OpenTaskOutput`], so the picker is torn
+    /// down rather than kept as a parent.
+    #[tokio::test]
+    async fn agent_picker_confirm_task_drills_into_the_viewer() {
+        let transition = poll_agent_picker(AgentPickerOutcome::ConfirmedTask(7)).await;
+        assert!(matches!(
+            transition,
+            SelectorTransition::Open {
+                action: CommandAction::OpenTaskOutput { id: 7 },
+                keep_parents: false,
+            }
+        ));
+    }
+
+    /// Cancelling the picker steps one level back.
+    #[tokio::test]
+    async fn agent_picker_cancel_steps_back() {
+        let transition = poll_agent_picker(AgentPickerOutcome::Cancelled).await;
+        assert!(matches!(transition, SelectorTransition::Back));
+    }
+
+    /// Drive a freshly-opened command palette with `key` (Enter to
+    /// confirm the selected command, Esc to cancel) and return the
+    /// transition the host would apply.
+    async fn poll_command_palette(key: aj_tui::keys::InputEvent) -> SelectorTransition {
+        use crate::modes::interactive::components::command_palette::CommandPaletteComponent;
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("unused")]);
+        let mut world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &theme, true);
+
+        let inner = CommandPaletteComponent::new(select_list_theme(&theme), 13);
+        let outcome = inner.outcome_handle();
+        let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
+        // Route the key to the focused palette so it writes an outcome.
+        tui.handle_input(&key);
+
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        handle_selector_outcome(
+            &mut tui,
+            &OpenSelector::Palette { handle, outcome },
+            &auth,
+            Arc::clone(&run_config),
+            Arc::new(std::sync::Mutex::new(Config::default())),
+            &[],
+            &mut world,
+            &theme,
+            &RenderSettings::new(false, false, true),
+            &mut ThemeWatch {
+                _guard: None,
+                rx: None,
+            },
+        )
+        .await
+    }
+
+    /// Confirming a command in the palette chains into it as a
+    /// keep-parents Open, so a cancel from the child returns to the
+    /// palette rather than the chat.
+    #[tokio::test]
+    async fn command_palette_confirm_chains_keeping_the_palette() {
+        let transition = poll_command_palette(aj_tui::keys::Key::enter()).await;
+        assert!(matches!(
+            transition,
+            SelectorTransition::Open {
+                keep_parents: true,
+                ..
+            }
+        ));
+    }
+
+    /// Cancelling the palette steps back to the chat.
+    #[tokio::test]
+    async fn command_palette_cancel_steps_back() {
+        let transition = poll_command_palette(aj_tui::keys::Key::escape()).await;
+        assert!(matches!(transition, SelectorTransition::Back));
     }
 
     // ---- Wake triggers ----------------------------------------------------

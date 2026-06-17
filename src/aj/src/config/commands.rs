@@ -207,6 +207,11 @@ pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
 /// mutating agent state inline, or surfacing a notice. Variants not
 /// yet wired return [`CommandAction::NotYetImplemented`] so the user
 /// sees a clear "soon, not silently dropped" message.
+///
+/// A few variants are internal dispatch targets rather than catalog
+/// commands: they carry data, are emitted by the host (not chosen by
+/// the user), and are absent from [`COMMANDS`]. `OpenTaskOutput` is
+/// one, dispatched by the agent picker drilling into a task's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandAction {
     /// Open the global command palette overlay.
@@ -241,6 +246,11 @@ pub enum CommandAction {
     /// Open the agent picker overlay. `Enter` switches the chat view
     /// to the chosen agent's transcript; `Esc` cancels.
     OpenAgentPicker,
+    /// Open the read-only output viewer for a background bash task,
+    /// drilled into from the agent picker. Not a catalog command: it
+    /// carries the task id and is dispatched only by the picker's
+    /// confirm, never surfaced in the palette or help.
+    OpenTaskOutput { id: usize },
     /// Open the settings window overlay. Changes apply (and persist
     /// to `config.toml`) as the user makes them; `Esc` closes.
     OpenSettings,
