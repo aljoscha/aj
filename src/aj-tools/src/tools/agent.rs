@@ -60,7 +60,7 @@ The sub-agent will return a comprehensive report that you can use to inform your
 Set run_in_background: true to keep working while the sub-agent runs: the call
 returns immediately with a task id, and the sub-agent's report is delivered to
 you as a completion notice when it finishes. Don't babysit a background
-sub-agent with task_output calls — the notice arrives on its own; use
+sub-agent with task_output calls, since the notice arrives on its own. Use
 task_stop(id) if you need to stop it early.
 
 Parallel agents share your filesystem. When you launch several agents at once
