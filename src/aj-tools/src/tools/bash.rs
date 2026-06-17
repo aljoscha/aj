@@ -320,7 +320,7 @@ impl ToolDefinition for BashTool {
             let now = Instant::now();
             if now.duration_since(last_update) >= UPDATE_DEBOUNCE {
                 let snapshot = snapshot_partial(&command, &stdout_state, &stderr_state);
-                ctx.emit_update(snapshot);
+                ctx.emit_update(snapshot).await;
                 last_update = now;
             }
 
@@ -1191,8 +1191,12 @@ mod tests {
             self.inner.spawn_agent(task, mode)
         }
 
-        fn emit_update(&mut self, partial: ToolDetails) {
+        fn emit_update<'a>(
+            &'a mut self,
+            partial: ToolDetails,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
             self.updates.lock().unwrap().push(partial);
+            Box::pin(async {})
         }
 
         fn cancellation(&self) -> CancellationToken {

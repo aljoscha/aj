@@ -196,7 +196,12 @@ mod tests {
             Box::pin(async move { Ok(response) })
         }
 
-        fn emit_update(&mut self, _partial: ToolDetails) {}
+        fn emit_update<'a>(
+            &'a mut self,
+            _partial: ToolDetails,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
 
         fn cancellation(&self) -> CancellationToken {
             CancellationToken::new()
@@ -243,7 +248,12 @@ mod tests {
             Box::pin(async move { Err(anyhow::anyhow!("model exploded")) })
         }
 
-        fn emit_update(&mut self, _partial: ToolDetails) {}
+        fn emit_update<'a>(
+            &'a mut self,
+            _partial: ToolDetails,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
 
         fn cancellation(&self) -> CancellationToken {
             CancellationToken::new()

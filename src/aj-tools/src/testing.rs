@@ -79,8 +79,13 @@ impl ToolContext for DummyToolContext {
         })
     }
 
-    fn emit_update(&mut self, _partial: ToolDetails) {
-        // No-op: no production listener consumes ToolExecutionUpdate yet.
+    fn emit_update<'a>(
+        &'a mut self,
+        _partial: ToolDetails,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        // No-op: discards snapshots so tools can be exercised without a
+        // bus subscriber.
+        Box::pin(async {})
     }
 
     fn cancellation(&self) -> CancellationToken {

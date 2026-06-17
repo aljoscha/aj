@@ -714,7 +714,17 @@ pub trait ToolContext: Send {
     /// [`crate::events::AgentEvent::ToolExecutionUpdate`]. Tools that
     /// produce many updates self-throttle (~10/s); the agent does not
     /// debounce.
-    fn emit_update(&mut self, partial: ToolDetails);
+    ///
+    /// Awaited inline by the calling tool, which itself runs inline in
+    /// the agent's turn. That ordering is the whole point: a foreground
+    /// tool finishes (and the agent emits the terminal
+    /// [`crate::events::AgentEvent::ToolExecutionEnd`]) only after this
+    /// future resolves, so a straggling update can never overtake the
+    /// end event on the bus.
+    fn emit_update<'a>(
+        &'a mut self,
+        partial: ToolDetails,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// Cancellation token tools must observe for long-running work.
     /// Cancellation propagates from `Agent::cancel` and from a parent

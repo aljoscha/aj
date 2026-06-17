@@ -1804,9 +1804,9 @@ impl Agent {
 
         // Build the [`ToolContext`] the tool sees: working
         // directory, todos, sub-agent spawn, cancellation token,
-        // no-op `emit_update`. After §2.4b the wrapper no longer
-        // touches the conversation log; sub-agent persistence is
-        // anchored via the `SubAgentStart` event the wrapper emits
+        // progress updates via `emit_update`. After §2.4b the wrapper
+        // no longer touches the conversation log; sub-agent persistence
+        // is anchored via the `SubAgentStart` event the wrapper emits
         // before the child runs.
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_ctx: &mut self.session_state,
@@ -1830,6 +1830,8 @@ impl Agent {
             task_registry: self.task_registry.clone(),
             message_queues: self.message_queues.clone(),
             call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            tool_args: tool_input.clone(),
         };
 
         let outcome = (tool_def.func)(&mut session_ctx_wrapper, tool_input).await?;
@@ -2546,6 +2548,14 @@ struct SessionContextWrapper<'a> {
     /// [`TaskEventSink`] so task lifecycle events correlate with the
     /// originating transcript cell.
     call_id: String,
+    /// Name of the tool call this wrapper was built for. Stamped onto
+    /// [`AgentEvent::ToolExecutionUpdate`] events so they carry the
+    /// same `tool` / `args` correlation fields as the bracketing
+    /// `ToolExecutionStart` / `ToolExecutionEnd`.
+    tool_name: String,
+    /// Validated input passed to the tool call, stamped onto
+    /// [`AgentEvent::ToolExecutionUpdate`] events alongside `tool_name`.
+    tool_args: serde_json::Value,
 }
 
 impl<'a> ToolContext for SessionContextWrapper<'a> {
@@ -2773,18 +2783,29 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         })
     }
 
-    fn emit_update(&mut self, _partial: ToolDetails) {
-        // No-op for now. The trait's `emit_update` is synchronous
-        // but the bus's `emit` is async, so we cannot drive
-        // [`AgentEvent::ToolExecutionUpdate`] inline from a sync
-        // context without breaking the bus's "listeners are
-        // awaited inline" guarantee (firing the listener from a
-        // spawned task would let `Update` events arrive after
-        // `End`). Today only `bash` calls `emit_update`, the
-        // legacy CLI doesn't render it, and dropping the snapshot
-        // is functionally equivalent to the pre-§2.4a behavior. A
-        // bus-side `try_emit_sync` (or an async `emit_update` on
-        // the trait) lands when the TUI needs progress streaming.
+    fn emit_update<'b>(
+        &'b mut self,
+        partial: ToolDetails,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> {
+        let event = AgentEvent::ToolExecutionUpdate {
+            agent_id: self.parent_agent_id,
+            call_id: self.call_id.clone(),
+            tool: self.tool_name.clone(),
+            args: self.tool_args.clone(),
+            partial,
+            // Bash (the only tool that emits updates today) streams
+            // ToolDetails snapshots without partial wire content; an
+            // empty slice keeps the event cheap to clone across the bus.
+            content: Arc::from(Vec::<UserContent>::new()),
+        };
+        let bus = self.parent_bus.clone();
+        Box::pin(async move {
+            // Progress is best-effort: a listener error here is dropped
+            // rather than aborting the turn. The durable record is the
+            // persisted `MessageEnd` for the tool result, whose own emit
+            // would resurface the same failure as `TurnError::Fatal`.
+            let _ = bus.emit(event).await;
+        })
     }
 
     fn cancellation(&self) -> CancellationToken {
@@ -3147,6 +3168,48 @@ mod event_protocol_tests {
                 details: ToolDetails::Text {
                     summary: "ping".to_string(),
                     body: "pong".to_string(),
+                },
+                is_error: false,
+            })
+        }
+    }
+
+    /// Tool that emits a single progress snapshot through
+    /// [`ToolContext::emit_update`] before returning. Lets the protocol
+    /// tests pin that a foreground tool's progress reaches the bus as a
+    /// `ToolExecutionUpdate` ahead of the terminal `ToolExecutionEnd`.
+    #[derive(Clone)]
+    struct ProgressTool;
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct ProgressInput {}
+
+    impl ToolDefinition for ProgressTool {
+        type Input = ProgressInput;
+
+        fn name(&self) -> &'static str {
+            "progress"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that emits a progress update"
+        }
+
+        async fn execute(
+            &self,
+            ctx: &mut dyn ToolContext,
+            _input: ProgressInput,
+        ) -> anyhow::Result<ToolOutcome> {
+            ctx.emit_update(ToolDetails::Text {
+                summary: "working".to_string(),
+                body: "halfway".to_string(),
+            })
+            .await;
+            Ok(ToolOutcome {
+                content: vec![aj_models::types::UserContent::text("done".to_string())],
+                details: ToolDetails::Text {
+                    summary: "progress".to_string(),
+                    body: "done".to_string(),
                 },
                 is_error: false,
             })
@@ -3818,6 +3881,87 @@ mod event_protocol_tests {
             EventLabel::AgentEnd(AgentId::Sub(1)),
         ];
         assert_eq!(events, expected, "unexpected event sequence: {events:#?}");
+    }
+
+    #[tokio::test]
+    async fn foreground_tool_progress_emits_update_before_end() {
+        // A tool that calls `emit_update` during execution must surface
+        // a `ToolExecutionUpdate` on the bus, ordered strictly between
+        // the call's `ToolExecutionStart` and `ToolExecutionEnd`. The
+        // inline-await contract is what guarantees the update cannot
+        // overtake the end event.
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "progress")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![ProgressTool.into()]);
+        agent.set_agent_id(AgentId::Main);
+
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if matches!(
+                event,
+                AgentEvent::ToolExecutionStart { .. }
+                    | AgentEvent::ToolExecutionUpdate { .. }
+                    | AgentEvent::ToolExecutionEnd { .. }
+            ) {
+                captured_clone.lock().unwrap().push(event.clone());
+            }
+        }));
+
+        agent
+            .run_single_turn("run progress".to_string())
+            .await
+            .expect("run_single_turn");
+
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            3,
+            "expected Start, Update, End for the one tool call: {events:#?}"
+        );
+
+        assert!(
+            matches!(
+                &events[0],
+                AgentEvent::ToolExecutionStart { call_id, tool, .. }
+                    if call_id == "tu-1" && tool == "progress"
+            ),
+            "first event must be ToolExecutionStart: {:#?}",
+            events[0]
+        );
+
+        match &events[1] {
+            AgentEvent::ToolExecutionUpdate {
+                agent_id,
+                call_id,
+                tool,
+                partial,
+                ..
+            } => {
+                assert_eq!(*agent_id, AgentId::Main);
+                assert_eq!(call_id, "tu-1");
+                // The update inherits the originating call's tool name so
+                // it carries the same correlation fields as the bracket.
+                assert_eq!(tool, "progress");
+                assert!(
+                    matches!(partial, ToolDetails::Text { body, .. } if body == "halfway"),
+                    "partial must be the snapshot the tool emitted: {partial:#?}"
+                );
+            }
+            other => panic!("second event must be ToolExecutionUpdate, got {other:#?}"),
+        }
+
+        assert!(
+            matches!(
+                &events[2],
+                AgentEvent::ToolExecutionEnd { call_id, tool, .. }
+                    if call_id == "tu-1" && tool == "progress"
+            ),
+            "third event must be ToolExecutionEnd: {:#?}",
+            events[2]
+        );
     }
 
     #[tokio::test]
