@@ -1,17 +1,23 @@
-//! The turn driver: drive one user-initiated turn and its automatic
-//! continuations (overflow recovery, queued-work delivery, threshold
-//! compaction) to quiescence.
+//! The turn driver: drive one turn and its automatic compaction
+//! continuations (overflow recovery, threshold compaction) to
+//! quiescence.
 //!
 //! `aj::compaction` owns the compaction *mechanics* (`run_compaction`);
 //! this module owns the turn *lifecycle*. Both the interactive TUI and
-//! `--print` drive turns through [`drive_turn`], so the post-turn policy
-//! lives in exactly one place rather than being duplicated across the
-//! two frontends' loops. See `docs/compaction-spec.md` §7.2.
+//! `--print` drive turns through [`drive_turn`], so the post-turn
+//! compaction policy lives in exactly one place rather than being
+//! duplicated across the two frontends' loops.
+//!
+//! Delivering queued work (task notices, follow-up messages) is *not*
+//! the driver's job: the host starts a [`TurnStart::Wake`] turn when an
+//! agent goes idle with work pending, and that wake turn is itself
+//! driven here. Mid-turn steering is drained inside the agent's own
+//! turn loop, a layer below this. See `docs/compaction-spec.md` §7.2.
 
 use std::sync::Arc;
 
 use aj_agent::events::CompactionReason;
-use aj_agent::{Agent, TurnError, WakeOutcome};
+use aj_agent::{Agent, TurnError};
 use aj_models::errors::is_context_overflow;
 use aj_models::types::UserContent;
 use aj_session::ConversationLog;
@@ -29,7 +35,8 @@ pub enum TurnStart {
     /// [`Agent::prompt_with_content`].
     Content(Vec<UserContent>),
     /// Drain queued notices/messages and run. Drives [`Agent::wake`]; a
-    /// no-op (no events) when nothing is pending.
+    /// no-op (no events) when nothing is pending. Started by the host
+    /// when an idle agent has queued work.
     Wake,
     /// Compact only — no turn. Drives `run_compaction` and returns.
     Compact {
@@ -38,11 +45,13 @@ pub enum TurnStart {
     },
 }
 
-/// The automatic continuations [`drive_turn`] applies after each turn.
+/// The automatic compaction continuations [`drive_turn`] applies after
+/// a turn.
 ///
-/// Constructed per caller: interactive Main enables all of them, a
-/// sub-agent continuation only `wake`, print mode only
-/// `recover_overflow`.
+/// Constructed per caller: interactive Main enables overflow recovery
+/// and threshold compaction; a sub-agent continuation enables neither
+/// (compaction operates on the log's Main thread); print mode enables
+/// only overflow recovery.
 pub struct TurnPolicy {
     /// Compact and retry once when a turn fails with a context overflow.
     pub recover_overflow: bool,
@@ -50,9 +59,6 @@ pub struct TurnPolicy {
     /// the model's context window, compact (no re-drive). `None`
     /// disables the threshold trigger (print mode, sub-agents).
     pub auto_threshold: Option<f64>,
-    /// After a turn, deliver queued notices/messages via [`Agent::wake`]
-    /// and continue. Off in print mode (one-shot).
-    pub wake: bool,
     /// Recent-tail budget kept verbatim across a compaction.
     pub keep_recent: u64,
 }
@@ -144,28 +150,12 @@ pub async fn drive_turn(
             return result;
         }
 
-        // 3. Deliver work that queued while the turn ran. `wake`
-        //    self-gates: `Empty` means nothing pending (no events
-        //    emitted), so we fall through to the threshold check.
-        if policy.wake {
-            reconfigure(agent);
-            match agent.wake(cancel.clone()).await {
-                Ok(WakeOutcome::Ran) => {
-                    result = Ok(());
-                    continue;
-                }
-                Ok(WakeOutcome::Empty) => {}
-                // A wake turn can itself error/overflow; loop so step 1/2
-                // handle its result.
-                Err(e) => {
-                    result = Err(e);
-                    continue;
-                }
-            }
-        }
-
-        // 4. Threshold compaction. Terminal for the sequence: the next
-        //    turn happens on the next prompt or wake.
+        // 3. Threshold compaction. Terminal for the sequence: the next
+        //    turn happens on the next prompt or wake. If queued work is
+        //    waiting, the loop wakes the agent after this returns and
+        //    that turn runs against the freshly reduced context — so we
+        //    compact first rather than letting an over-threshold context
+        //    grow further.
         if let Some(threshold) = policy.auto_threshold
             && over_threshold(agent, threshold)
         {
@@ -254,7 +244,6 @@ mod tests {
         TurnPolicy {
             recover_overflow: true,
             auto_threshold: None,
-            wake: false,
             keep_recent: 20_000,
         }
     }
@@ -357,7 +346,6 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
-            wake: false,
             keep_recent: 20_000,
         };
         let result = drive_turn(
@@ -394,7 +382,6 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
-            wake: false,
             keep_recent: 20_000,
         };
         let result = drive_turn(
@@ -437,7 +424,6 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: Some(0.85),
-            wake: false,
             keep_recent: 10,
         };
         let result = drive_turn(
@@ -476,7 +462,6 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: Some(0.85),
-            wake: false,
             keep_recent: 10,
         };
         let result = drive_turn(

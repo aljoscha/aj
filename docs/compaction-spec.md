@@ -620,37 +620,38 @@ orphan a result.
 
 ### 7.2 The turn driver (`aj::turn`)
 
-A user-initiated turn is rarely a single inference: it may need to
-recover from a context overflow, deliver work that queued while it ran,
-or compact once it crosses the threshold. The driver expresses these as
-one post-turn policy ladder applied in a loop:
+The driver owns the *compaction* continuations of a turn — recovering
+from a context overflow, and compacting once occupancy crosses the
+threshold — as one post-turn ladder. Delivering queued work (task
+notices, follow-up messages) is deliberately *not* the driver's job; it
+is the host loop's, which starts a `Wake` turn when an agent goes idle
+with work pending (§7.4). That keeps wake delivery to a single site.
 
 ```rust
 /// How a turn sequence begins.
 pub enum TurnStart {
     Prompt(String),                // typed user text → Agent::prompt
     Content(Vec<UserContent>),     // CLI launch content → prompt_with_content
-    Wake,                          // drain queues/notices → Agent::wake
+    Wake,                          // drain queues/notices → Agent::wake (started by the host)
     Compact {                      // compact only, no turn
         reason: CompactionReason,
         instructions: Option<String>,
     },
 }
 
-/// The automatic continuations applied after a turn settles.
+/// The automatic compaction continuations applied after a turn settles.
 pub struct TurnPolicy {
     pub recover_overflow: bool,      // compact + retry once on a context-overflow failure
     pub auto_threshold: Option<f64>, // Some(t): compact after a turn that crossed t of the window
-    pub wake: bool,                  // deliver queued notices/messages and continue
     pub keep_recent: u64,            // recent-tail budget kept verbatim across a compaction
 }
 
-/// Drive one turn and its automatic continuations to quiescence.
-/// `reconfigure` re-stamps the latest staged run-config onto the agent
-/// before each inference (interactive's `apply_turn_config`; a no-op in
-/// print). Returns the final result: `Ok` when the sequence settled,
-/// `Recoverable`/`Aborted` for the caller to surface, `Fatal` to bubble
-/// out.
+/// Drive one turn and its automatic compaction continuations to
+/// quiescence. `reconfigure` re-stamps the latest staged run-config
+/// onto the agent before each inference (interactive's
+/// `apply_turn_config`; a no-op in print). Returns the final result:
+/// `Ok` when the sequence settled, `Recoverable`/`Aborted` for the
+/// caller to surface, `Fatal` to bubble out.
 pub async fn drive_turn(
     agent: &mut Agent,
     log: &Arc<TokioMutex<ConversationLog>>,
@@ -663,7 +664,8 @@ pub async fn drive_turn(
 
 A `Compact` start runs `run_compaction` and returns immediately — there
 is no turn and no ladder. Otherwise the driver runs the initial action
-and then loops:
+(a `Wake` start delivers queued work, when the host asked for one) and
+then loops:
 
 1. **Reactive overflow (once).** If the result is `Recoverable`,
    `policy.recover_overflow` holds, and `agent.last_assistant()` is a
@@ -675,25 +677,19 @@ and then loops:
 2. **Other error / abort.** Any other `Err` — a non-overflow
    `Recoverable`, or `Aborted` — returns unchanged for the caller to
    surface.
-3. **Deliver queued work.** If `policy.wake`, call `Agent::wake`, which
-   self-gates: a `Ran` outcome means queued notices/messages produced a
-   turn, so loop and re-apply the ladder to its result; `Empty` (nothing
-   pending, no events emitted) falls through; an `Err` loops back so
-   step 1/2 handle it.
-4. **Threshold compaction.** If `policy.auto_threshold` is `Some(t)` and
-   occupancy crossed `t` of the window, `run_compaction(Threshold)` and
-   return. Occupancy is `agent.last_assistant().usage`
+3. **Threshold compaction.** If `policy.auto_threshold` is `Some(t)`
+   and occupancy crossed `t` of the window, `run_compaction(Threshold)`
+   and return. Occupancy is `agent.last_assistant().usage`
    (`input + cache_read + cache_write`, the footer's numerator) over
    `agent.model_info().context_window`, via
    `aj_session::compaction::should_compact`. Threshold compaction does
    not re-drive: the next turn happens on the next prompt or wake.
 
-The priorities match the previous completion-arm behavior: overflow
-recovery beats everything; delivering queued work beats threshold
-compaction (a turn was just queued, so compact next round); threshold
-compaction is terminal for the sequence. The cancel token covers the
-whole sequence, so one Ctrl+C stops the current inference and every
-continuation.
+We compact first and let the host wake the agent for any queued work
+afterward, so that work runs against the freshly reduced context rather
+than growing an already-over-threshold prompt further. The cancel token
+covers the whole sequence, so one Ctrl+C stops the current inference and
+every continuation.
 
 ### 7.3 Manual `/compact`
 
@@ -727,26 +723,31 @@ spawns a task that locks the agent and calls `drive_turn` with
 Policy per target:
 
 - **Main**: `recover_overflow = auto_compact`,
-  `auto_threshold = auto_compact.then_some(threshold)`, `wake = true`.
+  `auto_threshold = auto_compact.then_some(threshold)`.
 - **Sub-agent continuation**: `recover_overflow = false`,
-  `auto_threshold = None`, `wake = true`. Compaction operates on the
-  log's USER (Main) thread, so it is Main-only.
+  `auto_threshold = None`. Compaction operates on the log's USER (Main)
+  thread, so it is Main-only.
 
-Because the driver owns the post-turn ladder, the completion arm
-collapses to cleanup and outcome rendering: drop the cancel token,
-reconcile pump idle state (and the Main→sub idle drain), then `match`
-the result — `Ok` does nothing, `Aborted` shows "Turn cancelled.",
-`Recoverable` shows the error (the driver already exhausted recovery and
-wrapped the give-up message), `Fatal` breaks the loop. The
+Because the driver owns the post-turn compaction ladder, the completion
+arm collapses to cleanup, the post-turn wake, and outcome rendering:
+drop the cancel token, reconcile pump idle state (and the Main→sub idle
+drain), spawn a `Wake` turn if the just-idled agent has queued work,
+then `match` the result — `Ok` does nothing, `Aborted` shows "Turn
+cancelled.", `Recoverable` shows the error (the driver already exhausted
+recovery and wrapped the give-up message), `Fatal` breaks the loop. The
 `compaction_agents` and `overflow_recovered` sets and the threshold
 re-check are gone — they were the externalized state the driver now
-holds internally. The driver delivers queued work during the sequence,
-but the completion arm keeps a small wake safety-net for work that
-arrives in the gap between the driver's final drain and its completion;
-the two *idle* wake triggers in the bus-event arm (a background
-`TaskEnd`, and a sub's nested `AgentEnd`) likewise start a
-`TurnStart::Wake` sequence when work arrives for an idle agent. A busy
-agent's driver picks the work up in ladder step 3.
+holds internally.
+
+Delivering queued work is the loop's single responsibility, not the
+driver's: the completion-arm wake handles work left when a turn ends,
+and the two *idle* wake triggers in the bus-event arm (a background
+`TaskEnd`, and a sub's nested `AgentEnd`) handle work that arrives while
+an agent is already idle. All three funnel through one `spawn_wake_turn`
+with its idle gate; `Agent::wake` is a no-op once the queue is drained,
+so overlapping triggers are cheap. (Steering, by contrast, is urgent and
+is drained *inside* the running turn by the agent itself, a layer below
+the driver — see §6/the agent's in-loop drain.)
 
 Mid-sequence progress renders from the bus exactly as before
 (`AgentStart`/`AgentEnd`, `MessageEnd`, `CompactionStart`/
@@ -762,7 +763,6 @@ inline (no task) and uses the returned result for its exit status:
 let policy = TurnPolicy {
     recover_overflow: config.auto_compact,
     auto_threshold: None, // one-shot: never compact-then-exit
-    wake: false,          // no post-turn queued-work delivery
     keep_recent: config.compact_keep_recent,
 };
 let result =

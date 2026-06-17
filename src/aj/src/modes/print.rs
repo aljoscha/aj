@@ -481,7 +481,6 @@ pub async fn run(args: Args) -> Result<()> {
     let policy = crate::turn::TurnPolicy {
         recover_overflow: config.auto_compact,
         auto_threshold: None,
-        wake: false,
         keep_recent: config.compact_keep_recent,
     };
     let prompt_result = crate::turn::drive_turn(

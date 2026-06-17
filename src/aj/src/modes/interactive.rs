@@ -1124,13 +1124,15 @@ async fn run_session(
                             }
                         }
                         sync_editor_enabled(&mut shell.tui);
-                        // Wake safety-net: the driver delivers queued
-                        // notices/messages during the sequence, but work
-                        // can arrive in the gap between its final drain
-                        // and completion (or during an aborted turn).
-                        // Catch it here so it reaches the model without
-                        // waiting for the user; `Agent::wake` is a no-op
-                        // when the driver already drained the queue.
+                        // Post-turn wake: deliver queued task notices
+                        // and follow-up messages the moment the agent
+                        // goes idle. This is the single wake path \u2014 the
+                        // driver doesn't deliver queued work itself.
+                        // (Steering was already drained mid-turn by the
+                        // agent; this is the deferred work plus any
+                        // notice that landed during an aborted turn.)
+                        // `Agent::wake` is a no-op when nothing is
+                        // pending, so a racing trigger is cheap.
                         if world.task_registry.has_notices(id)
                             || world.message_queues.has_pending(id)
                         {
@@ -2154,16 +2156,15 @@ fn resolve_agent(
 
 /// Build the per-agent [`TurnPolicy`]. The Main agent gets reactive
 /// overflow recovery and threshold compaction (both gated on
-/// `auto_compact`) plus queued-work delivery; a sub-agent continuation
-/// gets only queued-work delivery, since compaction operates on the
-/// log's USER (Main) thread and is therefore Main-only.
+/// `auto_compact`); a sub-agent continuation gets neither, since
+/// compaction operates on the log's USER (Main) thread. Queued-work
+/// delivery is not a policy knob — the loop wakes idle agents directly.
 fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnPolicy {
     let c = config.lock().expect("config mutex poisoned");
     let main = target == AgentId::Main;
     TurnPolicy {
         recover_overflow: main && c.auto_compact,
         auto_threshold: (main && c.auto_compact).then_some(c.compact_threshold),
-        wake: true,
         keep_recent: c.compact_keep_recent,
     }
 }
@@ -2211,11 +2212,13 @@ fn spawn_turn(
 }
 
 /// Spawn a wake turn on `owner` if it is idle, delivering queued
-/// notices / messages through the same driver user submits use. A busy
-/// owner is left alone — its in-flight driver drains the queue, or the
-/// mid-run drain point does. Both wake triggers may fire for the same
-/// notice; `Agent::wake` returns `Empty` (emitting nothing) once the
-/// queue is drained, so the loser is a cheap no-op.
+/// notices / messages. This is the single post-turn wake path: the
+/// driver itself does not deliver queued work, so the loop starts a
+/// wake here whenever an agent has work pending and no turn in flight.
+/// A busy owner is left alone (its running turn drains steering
+/// mid-flight). Both wake triggers may fire for the same notice;
+/// `Agent::wake` returns `Empty` (emitting nothing) once the queue is
+/// drained, so the loser is a cheap no-op.
 fn spawn_wake_turn(
     owner: AgentId,
     world: &SessionWorld,
@@ -6129,7 +6132,6 @@ mod tests {
         TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
-            wake: true,
             keep_recent: 20_000,
         }
     }
