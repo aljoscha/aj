@@ -138,7 +138,7 @@ When presenting a proposal, cover:
   at every locus. Decide where that helper lives so it's shared, not
   copied.
 
-### R6 — Guard the session log against concurrent writers  [bug · TODO]
+### R6 — Guard the session log against concurrent writers  [bug · DONE]
 - **Sources:** SE1 (Major); `_SUMMARY` P1.
 - **Problem:** two `aj continue <id>` processes interleave JSONL lines and
   mint colliding entry ids, corrupting the parent chain. No file lock.
@@ -378,3 +378,30 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   over-engineered relative to the reference and the small files
   involved. Tests: clobber regression, invalid-TOML refusal, missing
   file, comment preservation, lock acquire/release + stale-steal.
+- 2026-06-17 · R6 · DONE · 15a7018 · Reframed (with the user, after
+  reading the reference) from the proposed single-writer lock to
+  **collision-free random entry ids**, matching what the reference does:
+  it takes no session-file lock at all (it locks auth/settings/trust but
+  deliberately not sessions) and stays corruption-free under two
+  concurrent writers purely by minting random ids. AJ's actual bug was
+  its id *scheme*, a per-process `{:08}` counter seeded from the max id
+  on disk, so two `aj continue <id>` processes mint identical ids and
+  `entries.insert` overwrites, breaking the parent chain. Replaced
+  `next_id`/`parse_id_counter`/`next_counter` with `mint_id` (a random
+  `u32` as 8 hex digits, re-drawn on the astronomically rare
+  within-process collision via the `entries` map) and switched the two
+  per-line `writeln!`s to a single `write_all` of `format!("{json}\n")`
+  each, so under `O_APPEND` concurrent appends interleave whole lines
+  instead of tearing one. Backward compatible: ids are opaque strings,
+  old decimal-id logs still load, and a new hex id that happens to equal
+  an existing decimal id is caught by the mint check. Honestly documented
+  the residual: a cross-process id collision is possible at ~1/2^32 (not
+  "never"), and two concurrent resumers grow sibling branches off the
+  shared head so on re-resume one writer's tail is left off the
+  linearized path (accepted over a lock). Rejected an OS advisory lock
+  (`flock`)/sidecar-lock: heaviest option, needs a Windows path, must be
+  held for the whole multi-hour session (for which the auth/config
+  mkdir+stale-mtime pattern doesn't fit), and diverges from the
+  reference. Tests: two-resumer distinct-ids + clean-re-resume
+  regression (would fail under the old counter) and within-log id
+  uniqueness across many appends. Verified by a fresh-agent review.
