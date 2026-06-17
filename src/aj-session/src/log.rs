@@ -49,8 +49,12 @@ pub enum ConversationError {
 /// A unique identifier for a [ConversationEntry] within a single
 /// [ConversationLog]. Parent-child links between entries use this id.
 ///
-/// Ids are only unique within one log file; they are a counter assigned at
-/// append time and are not meaningful outside of that file.
+/// Ids are only unique within one log file and are not meaningful outside
+/// of it. They are random, collision-resistant tokens (minted by
+/// `ConversationLog::mint_id`), not a counter. Within one process the mint
+/// check rules out duplicates; across two processes appending to the same
+/// file a collision is possible but vanishingly unlikely (a 32-bit draw),
+/// rather than the certainty a shared counter would produce.
 pub type EntryId = String;
 
 /// Which thread within a conversation log an entry belongs to.
@@ -76,8 +80,9 @@ pub enum ThreadKind {
 /// `#[serde(flatten)]` on `entry`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationEntry {
-    /// Unique within the file. Monotonic so lexicographic sort matches
-    /// append order.
+    /// Unique within the file. A random, collision-resistant token, not
+    /// an ordered counter: append order is tracked separately (by
+    /// `ConversationLog`'s `order`), so ids need not sort.
     pub id: EntryId,
 
     /// The immediate predecessor in this entry's thread. `None` only for
@@ -455,6 +460,16 @@ impl Conversation {
 /// maps, so a failed write never leaves the two diverging. A process crash
 /// truncates at most the last line, which [ConversationLog::resume] tolerates
 /// with a warning.
+///
+/// Concurrent writers are tolerated rather than locked out: the same session
+/// can be resumed in two processes at once (`aj continue <id>` twice). Entry
+/// ids are random (see `mint_id`), so the two writers practically never mint
+/// the same id, and each entry line is appended with its own `O_APPEND`
+/// write, so concurrent appends interleave whole lines instead of tearing
+/// one. Neither writer corrupts the file. They do both anchor to the same
+/// head, though, so they grow two sibling branches: on the next resume one
+/// becomes the head and the other writer's tail is left off the linearized
+/// path (still on disk, just not replayed). We accept that over a lock.
 pub struct ConversationLog {
     path: PathBuf,
     session_id: String,
@@ -462,8 +477,6 @@ pub struct ConversationLog {
     /// Insertion order: ids in the order they were appended. Used to find
     /// the most recently written entry matching a filter.
     order: Vec<EntryId>,
-    /// Per-log counter, used to mint new entry ids. Survives resumes.
-    next_counter: u64,
     /// Lazily opened: `None` for a freshly-[ConversationLog::create]'d log
     /// that has never had a real ("punctuation") entry appended, `Some`
     /// once we've committed one (or for a [ConversationLog::resume]'d log
@@ -508,7 +521,6 @@ impl ConversationLog {
             session_id,
             entries: HashMap::new(),
             order: Vec::new(),
-            next_counter: 0,
             file: None,
             pending_writes: Vec::new(),
         })
@@ -557,7 +569,6 @@ impl ConversationLog {
 
         let mut entries: HashMap<EntryId, ConversationEntry> = HashMap::new();
         let mut order: Vec<EntryId> = Vec::new();
-        let mut next_counter: u64 = 0;
 
         for (i, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
@@ -582,14 +593,6 @@ impl ConversationLog {
                 }
             };
 
-            // Bump counter so new ids continue monotonically after
-            // resume. Uses the same scheme as [Self::next_id]; see
-            // [Self::parse_id_counter].
-            if let Some(n) = Self::parse_id_counter(&entry.id) {
-                if n >= next_counter {
-                    next_counter = n + 1;
-                }
-            }
             order.push(entry.id.clone());
             entries.insert(entry.id.clone(), entry);
         }
@@ -601,7 +604,6 @@ impl ConversationLog {
             session_id: session_id.to_string(),
             entries,
             order,
-            next_counter,
             file: Some(file),
             // Anything on disk is by definition already committed.
             pending_writes: Vec::new(),
@@ -635,10 +637,10 @@ impl ConversationLog {
     ///   sessions (where the user opens the TUI but never submits
     ///   a message).
     ///
-    /// The in-memory state (`entries`, `order`, `next_counter`) is
-    /// updated identically for both paths, so all read-side queries
-    /// (`latest_leaf`, `system_prompt_id`, `linearize`, …) behave the
-    /// same way regardless of whether the entry has been flushed yet.
+    /// The in-memory state (`entries`, `order`) is updated identically
+    /// for both paths, so all read-side queries (`latest_leaf`,
+    /// `system_prompt_id`, `linearize`, …) behave the same way
+    /// regardless of whether the entry has been flushed yet.
     pub fn append(
         &mut self,
         parent_id: Option<EntryId>,
@@ -678,7 +680,7 @@ impl ConversationLog {
             ));
         }
 
-        let id = self.next_id();
+        let id = self.mint_id();
         let record = ConversationEntry {
             id: id.clone(),
             parent_id: parent_id.clone(),
@@ -699,10 +701,19 @@ impl ConversationLog {
             // initialise it empty.
             let queued: Vec<String> = self.pending_writes.drain(..).collect();
             let file = self.ensure_open()?;
+            // Write each entry as one buffer (line + trailing newline)
+            // rather than as separate line and newline writes. Under
+            // `O_APPEND` the kernel makes a single append write atomic
+            // against other appenders, so a second process writing the
+            // same file (the same session resumed twice) interleaves
+            // whole lines instead of tearing one mid-line. A very large
+            // line can still split across writes, but that's the same
+            // exposure as any append-only log, and far less likely than
+            // the id collisions that random ids remove.
             for line in &queued {
-                writeln!(file, "{line}")?;
+                file.write_all(format!("{line}\n").as_bytes())?;
             }
-            writeln!(file, "{json}")?;
+            file.write_all(format!("{json}\n").as_bytes())?;
         } else {
             self.pending_writes.push(json);
         }
@@ -729,22 +740,24 @@ impl ConversationLog {
         Ok(self.file.as_mut().expect("file just opened above"))
     }
 
-    /// Mint a fresh entry id from [Self::next_counter]. The on-disk id
-    /// format is tied to [Self::parse_id_counter] -- if you change this
-    /// scheme (e.g. to ULIDs), update the parser too so resume can
-    /// continue the sequence without collisions.
-    fn next_id(&mut self) -> EntryId {
-        let id = format!("{:08}", self.next_counter);
-        self.next_counter += 1;
-        id
-    }
-
-    /// Parse an id produced by [Self::next_id] back into its counter
-    /// value, or `None` if the id doesn't match the current scheme.
-    /// Used on resume to continue minting ids monotonically past
-    /// whatever's already in the log.
-    fn parse_id_counter(id: &str) -> Option<u64> {
-        id.parse::<u64>().ok()
+    /// Mint a fresh entry id: a random 32-bit value as 8 hex digits,
+    /// re-drawn until it doesn't collide with an id already in this log.
+    ///
+    /// Ids are random rather than a per-process counter so two processes
+    /// appending to the same file (the same session resumed in two
+    /// terminals) practically can't mint the same id and corrupt the
+    /// parent chain. The `contains_key` check rules out a collision with
+    /// ids this process already holds, so it fully guards the
+    /// within-process draw. Two concurrent processes don't see each
+    /// other's fresh ids, so a cross-process collision is possible at
+    /// ~1/2^32 per overlapping mint, which we accept over taking a lock.
+    fn mint_id(&self) -> EntryId {
+        loop {
+            let id = format!("{:08x}", rand::random::<u32>());
+            if !self.entries.contains_key(&id) {
+                return id;
+            }
+        }
     }
 
     /// Walk back from `head` along parent_id pointers, keeping only
@@ -1930,5 +1943,88 @@ mod tests {
             },
             other => panic!("expected kept assistant message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn appended_ids_are_unique_within_a_log() {
+        // The mint-and-retry path must never hand out a duplicate id
+        // within one log, even across many appends.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+
+        let mut ids = std::collections::HashSet::new();
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            for i in 0..200 {
+                let id = view
+                    .add_message(user_text(&format!("m{i}")))
+                    .expect("append message");
+                assert!(ids.insert(id), "minted a duplicate id");
+            }
+        }
+    }
+
+    #[test]
+    fn two_resumers_mint_distinct_ids_and_reresume_cleanly() {
+        // Guards against id-collision corruption when one session is
+        // resumed twice (`aj continue <id>` in two terminals). Two
+        // resumers that both seed from the same on-disk state must mint
+        // distinct ids and leave a file that re-resumes without a parse
+        // error. A shared counter would mint identical ids here (both
+        // seed the same value), overwriting one append and breaking the
+        // parent chain.
+        //
+        // The two resumers append sequentially, so this exercises the
+        // id-uniqueness guarantee, not the line-tearing one (which
+        // depends on real concurrent `O_APPEND` writes).
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+
+        let session_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".into()).expect("set sp");
+            {
+                let mut view = ConversationView::user(&mut log, None);
+                view.add_message(user_text("hi")).expect("first user msg");
+            }
+            log.session_id().to_string()
+        };
+
+        let (id_a, id_b) = {
+            let mut log_a = ConversationLog::resume(&persistence, &session_id).expect("resume a");
+            let mut log_b = ConversationLog::resume(&persistence, &session_id).expect("resume b");
+
+            let head_a = log_a.latest_leaf(ThreadFilter::USER);
+            let id_a = {
+                let mut view = ConversationView::user(&mut log_a, head_a);
+                view.add_message(user_text("from a")).expect("a msg")
+            };
+            let head_b = log_b.latest_leaf(ThreadFilter::USER);
+            let id_b = {
+                let mut view = ConversationView::user(&mut log_b, head_b);
+                view.add_message(user_text("from b")).expect("b msg")
+            };
+            (id_a, id_b)
+        };
+
+        // Independent 32-bit draws, so this can in principle collide at
+        // ~1/2^32. Negligible, and exactly the cross-process risk the
+        // contract documents.
+        assert_ne!(id_a, id_b, "two resumers must not mint the same id");
+
+        // The merged file (system prompt, "hi", and both resumers'
+        // appends) parses cleanly and contains both new entries.
+        let resumed =
+            ConversationLog::resume(&persistence, &session_id).expect("re-resume merged file");
+        assert_eq!(resumed.len(), 4);
+        let ids: std::collections::HashSet<&str> = resumed
+            .entries_in_order()
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert!(ids.contains(id_a.as_str()));
+        assert!(ids.contains(id_b.as_str()));
     }
 }
