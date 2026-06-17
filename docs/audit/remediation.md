@@ -148,7 +148,7 @@ When presenting a proposal, cover:
 
 ## ARCH — architecture deviations (resolve early; other work builds on these)
 
-### R7 — Resolve the `aj-agent → aj-conf` edge and the edition pin  [decision + change · TODO]
+### R7 — Resolve the `aj-agent → aj-conf` edge and the edition pin  [decision + change · DONE]
 - **Sources:** AG1 (Critical); `_SUMMARY` dependency-graph section.
 - **Problem:** `aj-agent` depends on `aj-conf` (`AgentEnv`,
   `ConfigThinkingLevel`), contradicting "the runtime depends only on
@@ -405,3 +405,30 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   reference. Tests: two-resumer distinct-ids + clean-re-resume
   regression (would fail under the old counter) and within-log id
   uniqueness across many appends. Verified by a fresh-agent review.
+- 2026-06-17 · R7 · DONE · f6ca82f · Decoupled the runtime from
+  `aj-conf` (Option B, confirmed against the reference, whose
+  `pi-agent-core` likewise depends only on its models layer and takes a
+  finished system-prompt string). The runtime no longer assembles the
+  prompt or holds an `AgentEnv`: `Agent::with_provider` now takes a
+  plain `working_directory: PathBuf` (the only host environment the
+  loop needs, for `SessionState`/tool cwd) and a wire-level
+  `Option<ThinkingConfig>` instead of `Option<ConfigThinkingLevel>`;
+  `assemble_system_prompt` and the `env()` getter are gone, and
+  sub-agent spawn roots off `session_state.working_directory()`. The
+  host now owns assembly: a new `aj::system_prompt::assemble_system_prompt`
+  (in the binary, next to `SYSTEM_PROMPT`) builds the string from the
+  `AgentEnv` plus a `read_file`-presence gate, and the
+  `ConfigThinkingLevel → ThinkingConfig` map moved to `aj::model`
+  (shared by both modes). The interactive `SessionWorld` keeps the
+  `AgentEnv` it built so the context notice, footer cwd, and editor
+  autocomplete read it directly instead of through `agent.env()`. Net:
+  `aj-agent` depends only on `aj-models`, matching the documented
+  graph; `aj-conf` stays a leaf. Also fixed the manifest drift the
+  finding bundled in: `aj-agent` now inherits `edition`/`version` from
+  the workspace (was pinned to edition 2021 / 0.1.0), which entails the
+  expected style-edition-2024 reformat of `queue.rs`/`tool.rs` and some
+  import reordering. The skills-listing gate test moved with the
+  assembly into the binary; provider roundtrips and the agent event
+  protocol are unaffected. Verified the whole workspace compiles +
+  tests pass in an isolated worktree (the change landed alongside
+  concurrent work, so it was built and tested in isolation).
