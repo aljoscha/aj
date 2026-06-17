@@ -5919,6 +5919,79 @@ mod event_protocol_tests {
         assert!(!queues.has_pending(AgentId::Main));
     }
 
+    /// A wake turn (driven by `Agent::wake` to deliver a queued
+    /// follow-up) drains steering mid-turn just like a prompt turn, even
+    /// when it makes only a single tool call. Steering queued while that
+    /// one tool runs lands after the tool result and before the next
+    /// inference. The wake and prompt paths share `execute_turn`, so the
+    /// mid-turn drain applies regardless of how the turn started.
+    #[tokio::test]
+    async fn steering_drains_mid_wake_turn_with_single_tool_call() {
+        let queues = MessageQueues::default();
+        // A pending follow-up is what makes `wake` run a turn at all.
+        queues.append_follow_up(AgentId::Main, "the follow-up");
+
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "steer_tool")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(
+            scripts,
+            vec![SteerTool {
+                queues: queues.clone(),
+            }
+            .into()],
+        );
+        agent.set_message_queues(queues.clone());
+
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            captured_clone.lock().unwrap().push(event.clone());
+        }));
+
+        let outcome = agent
+            .wake(CancellationToken::new())
+            .await
+            .expect("wake runs the queued follow-up turn");
+        assert_eq!(outcome, crate::WakeOutcome::Ran);
+
+        let events = captured.lock().unwrap().clone();
+        let tool_end_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .expect("the wake turn's tool batch finished");
+        let steer_end_idx = events
+            .iter()
+            .position(|e| match e {
+                AgentEvent::MessageEnd { message, .. } => {
+                    user_text(message).is_some_and(|t| t == "steer now")
+                }
+                _ => false,
+            })
+            .expect("steering injected during the wake turn");
+        let second_inference_idx = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    AgentEvent::MessageStart { message, .. }
+                        if matches!(message.as_wire(), Some(Message::Assistant(_)))
+                )
+            })
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("the wake turn's second inference started");
+        assert!(
+            tool_end_idx < steer_end_idx && steer_end_idx < second_inference_idx,
+            "steering must land after the wake turn's tool batch and before its \
+             next inference (tool_end={tool_end_idx}, steer={steer_end_idx}, \
+             inference={second_inference_idx})"
+        );
+        assert!(!queues.has_pending(AgentId::Main));
+    }
+
     // ===== Parallel tool execution =====
 
     use crate::tool::ExecutionMode;
