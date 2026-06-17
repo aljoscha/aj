@@ -123,6 +123,11 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>
             "two sequential tool calls (bash echo, bash date) and a wrap-up text",
             multi_tool,
         ),
+        (
+            "parallel-agents",
+            "two sub-agents spawned in one turn, each running a bash call, executing concurrently",
+            parallel_agents,
+        ),
     ]
 }
 
@@ -410,6 +415,92 @@ two distinct tool panels with their respective outputs.";
     let script_3 = builder().start().text_block(wrap).done(DoneReason::Stop);
 
     vec![script_1, script_2, script_3]
+}
+
+/// `parallel-agents`: the parent emits two `agent` tool calls in one
+/// assistant message, so they form a single `Parallel` group and run
+/// concurrently. Each sub-agent then makes its own (sequential) `bash`
+/// call before reporting back, so the nested transcripts look lifelike.
+///
+/// The scripted provider is a shared FIFO queue with no per-agent
+/// routing, and the two children consume from it concurrently in
+/// nondeterministic order. The demo stays deterministic by making the
+/// children's same-phase inferences interchangeable: both "make a bash
+/// call" scripts are identical, and both "report back" scripts are
+/// identical. `buffered` kicks off both children before either
+/// completes, so the two tool-call scripts are consumed first, then the
+/// two report scripts, then the parent's wrap-up.
+fn parallel_agents() -> Vec<ProviderScript> {
+    let intro = "I'll delegate two independent checks to sub-agents and run them \
+at the same time. Watch both sub-agent panels open and make their own tool \
+calls concurrently.";
+    let wrap = "Both sub-agents finished. They ran concurrently: each spun up in \
+the same turn, made its own bash call, and reported back independently.";
+
+    // Parent: one assistant message carrying two `agent` calls. They are
+    // contiguous `Parallel` tools, so the runtime runs them as one group.
+    // `run_in_background` is omitted (defaults to false), so each spawn is
+    // a blocking foreground sub-agent.
+    let parent_calls = builder()
+        .start()
+        .text_block(intro)
+        .delay(section_delay())
+        .tool_call_block_chunked(
+            "agent-call-a",
+            "agent",
+            serde_json::json!({ "task": "Check the build setup and report what you find." }),
+            0,
+            Duration::ZERO,
+        )
+        .tool_call_block_chunked(
+            "agent-call-b",
+            "agent",
+            serde_json::json!({ "task": "Check the test setup and report what you find." }),
+            0,
+            Duration::ZERO,
+        )
+        .done(DoneReason::ToolUse);
+
+    // A child's first inference: a short line, then a single bash call.
+    // Both children may pop either copy, so the two are identical.
+    let child_tool_call = || {
+        builder()
+            .start()
+            .text_block("On it. I'll run a quick command to gather the facts.")
+            .delay(section_delay())
+            .tool_call_block_chunked(
+                "child-bash",
+                "bash",
+                serde_json::json!({
+                    "command": "echo 'sub-agent reporting in'",
+                    "timeout": 5,
+                    "description": "Sub-agent demo bash call."
+                }),
+                0,
+                Duration::ZERO,
+            )
+            .done(DoneReason::ToolUse)
+    };
+
+    // A child's second inference: wrap up after its bash result. Also
+    // identical across the two children.
+    let child_report = || {
+        builder()
+            .start()
+            .text_block("The command finished. Reporting my findings back to the parent.")
+            .done(DoneReason::Stop)
+    };
+
+    let parent_wrap = builder().start().text_block(wrap).done(DoneReason::Stop);
+
+    vec![
+        parent_calls,
+        child_tool_call(),
+        child_tool_call(),
+        child_report(),
+        child_report(),
+        parent_wrap,
+    ]
 }
 
 // ===========================================================================
