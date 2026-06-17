@@ -26,7 +26,7 @@ pub mod shutdown;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -112,6 +112,7 @@ use crate::modes::interactive::session::{RestoreContext, SessionEntry, SessionSp
 use crate::modes::interactive::shutdown::{
     print_resume_hint, print_session_usage, print_usage_summary,
 };
+use crate::turn::{TurnPolicy, TurnStart};
 
 /// Loop-side snapshot of the agent's run configuration.
 ///
@@ -1059,16 +1060,6 @@ async fn run_session(
     // exactly "agents the binary is currently driving".
     let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
     let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
-    // Agents whose currently-tracked task is a compaction rather than a
-    // real turn. Lets the completion arm skip re-evaluating the
-    // auto-compaction threshold against a compaction it just ran (which
-    // would otherwise loop, since occupancy is read from the footer).
-    let mut compaction_agents: HashSet<AgentId> = HashSet::new();
-    // Agents for which a reactive overflow recovery (compact + retry) is
-    // already in flight or just attempted. Gates the once-per-sequence
-    // retry so a second overflow surfaces the error instead of looping;
-    // cleared on any successful or aborted turn.
-    let mut overflow_recovered: HashSet<AgentId> = HashSet::new();
     // Implements the "press Ctrl+C again to quit" guard when the
     // viewed agent is idle but other agents or background tasks are
     // still running.
@@ -1094,10 +1085,12 @@ async fn run_session(
     // Auto-submit the launch prompt (`aj <msg>` / `aj @file ...`) as the
     // first turn. Empty for any in-process session switch after the first.
     if !launch_content.is_empty() {
-        spawn_auto_turn(
+        spawn_turn(
             world,
             &shell.run_config,
-            launch_content,
+            AgentId::Main,
+            TurnStart::Content(launch_content),
+            turn_policy(AgentId::Main, &shell.config),
             &mut turns,
             &mut turn_cancels,
         );
@@ -1113,7 +1106,6 @@ async fn run_session(
                 match joined {
                     Ok((id, result)) => {
                         turn_cancels.remove(&id);
-                        let was_compaction = compaction_agents.remove(&id);
                         world.pump.mark_idle(&mut shell.tui, id);
                         // Main-turn completion bounds every nested
                         // initial spawn it started. Drain any sub
@@ -1132,11 +1124,13 @@ async fn run_session(
                             }
                         }
                         sync_editor_enabled(&mut shell.tui);
-                        // Wake trigger 2: notices that arrived after
-                        // the last mid-run drain point (or during an
-                        // aborted turn) are still queued — wake the
-                        // same agent so they reach the model without
-                        // waiting for the user.
+                        // Wake safety-net: the driver delivers queued
+                        // notices/messages during the sequence, but work
+                        // can arrive in the gap between its final drain
+                        // and completion (or during an aborted turn).
+                        // Catch it here so it reaches the model without
+                        // waiting for the user; `Agent::wake` is a no-op
+                        // when the driver already drained the queue.
                         if world.task_registry.has_notices(id)
                             || world.message_queues.has_pending(id)
                         {
@@ -1144,139 +1138,40 @@ async fn run_session(
                                 id,
                                 world,
                                 &shell.run_config,
+                                turn_policy(id, &shell.config),
                                 &mut turns,
                                 &mut turn_cancels,
                             );
                             sync_editor_enabled(&mut shell.tui);
                         }
                         match result {
-                            Ok(()) => {
-                                // A successful turn ends any reactive
-                                // recovery sequence, so a later overflow
-                                // can recover afresh.
-                                overflow_recovered.remove(&id);
-                                // Auto-compaction: after a successful real
-                                // Main turn (not a compaction, and only when
-                                // no wake turn was just spawned), compact if
-                                // occupancy crossed the configured threshold.
-                                if id == AgentId::Main
-                                    && !was_compaction
-                                    && !turn_cancels.contains_key(&AgentId::Main)
-                                {
-                                    let (auto, threshold, keep_recent) = {
-                                        let c =
-                                            shell.config.lock().expect("config mutex poisoned");
-                                        (c.auto_compact, c.compact_threshold, c.compact_keep_recent)
-                                    };
-                                    if auto
-                                        && let Some(tokens) =
-                                            world.pump.agent_context_tokens(AgentId::Main)
-                                        && aj_session::compaction::should_compact(
-                                            tokens,
-                                            world.pump.agent_context_window(AgentId::Main),
-                                            threshold,
-                                        )
-                                    {
-                                        spawn_compaction_turn(
-                                            world,
-                                            &shell.run_config,
-                                            aj_agent::events::CompactionReason::Threshold,
-                                            None,
-                                            keep_recent,
-                                            &mut turns,
-                                            &mut turn_cancels,
-                                            &mut compaction_agents,
-                                        );
-                                        sync_editor_enabled(&mut shell.tui);
-                                    }
-                                }
-                            }
+                            // The driver settled every automatic
+                            // continuation (overflow recovery,
+                            // queued-work delivery, threshold compaction)
+                            // before returning, so the completion arm
+                            // only renders the terminal outcome.
+                            Ok(()) => {}
                             Err(TurnError::Aborted) => {
-                                overflow_recovered.remove(&id);
-                                // The agent has already emitted the
-                                // synthetic aborted `MessageEnd` and
-                                // any cancelled tool-result
-                                // `MessageEnd`s, so the chat scrollback
-                                // is consistent. Surface a brief notice
-                                // so the user has visible confirmation
-                                // that Ctrl+C took effect; the session
-                                // stays alive.
+                                // The agent already emitted the synthetic
+                                // aborted `MessageEnd`s, so the scrollback
+                                // is consistent; a brief notice confirms
+                                // Ctrl+C took effect and the session stays
+                                // alive.
                                 world.pump.handle(&mut shell.tui, &notice_event("Turn cancelled."));
                             }
                             Err(TurnError::Recoverable(err)) => {
-                                // Reactive overflow recovery: the failed
-                                // assistant message is persisted to the
-                                // log (it was emitted to the bus) but not
-                                // pushed onto the in-memory transcript, so
-                                // detect on the log's most recent
-                                // assistant turn.
-                                let is_overflow = id == AgentId::Main && {
-                                    let window =
-                                        world.pump.agent_context_window(AgentId::Main);
-                                    let log = world.log.lock().await;
-                                    log.latest_leaf(ThreadFilter::USER)
-                                        .map(|head| {
-                                            let conv =
-                                                log.linearize(&head, ThreadFilter::USER);
-                                            aj_models::errors::last_turn_is_context_overflow(
-                                                &conv.messages(),
-                                                Some(window),
-                                            )
-                                        })
-                                        .unwrap_or(false)
-                                };
-                                let (auto, keep_recent) = {
-                                    let c =
-                                        shell.config.lock().expect("config mutex poisoned");
-                                    (c.auto_compact, c.compact_keep_recent)
-                                };
-                                if is_overflow && auto && !overflow_recovered.contains(&id) {
-                                    // First overflow of this sequence:
-                                    // compact and retry once.
-                                    overflow_recovered.insert(id);
-                                    world.pump.handle(
-                                        &mut shell.tui,
-                                        &notice_event(
-                                            "Context overflow — compacting and retrying…",
-                                        ),
-                                    );
-                                    spawn_overflow_recovery_turn(
-                                        world,
-                                        &shell.run_config,
-                                        keep_recent,
-                                        &mut turns,
-                                        &mut turn_cancels,
-                                    );
-                                    sync_editor_enabled(&mut shell.tui);
-                                } else if is_overflow && overflow_recovered.contains(&id) {
-                                    // The retry overflowed again; stop and
-                                    // surface a clear, actionable error.
-                                    overflow_recovered.remove(&id);
-                                    world.pump.handle(
-                                        &mut shell.tui,
-                                        &AgentEvent::Error {
-                                            agent_id: id,
-                                            text: "Context overflow recovery failed; \
-                                                   reduce context or switch to a \
-                                                   larger-context model."
-                                                .to_string(),
-                                        },
-                                    );
-                                } else {
-                                    // Non-overflow recoverable error (or
-                                    // auto-compaction disabled): surface it
-                                    // and keep the session going. The
-                                    // agent's bus already wrote whatever
-                                    // partial assistant message it produced.
-                                    overflow_recovered.remove(&id);
-                                    world.pump.handle(
-                                        &mut shell.tui,
-                                        &AgentEvent::Error {
-                                            agent_id: id,
-                                            text: format!("agent error: {err:#}"),
-                                        },
-                                    );
-                                }
+                                // The driver already exhausted overflow
+                                // recovery (folding the give-up message
+                                // into the error chain) before handing
+                                // this back, so surface it and keep the
+                                // session going.
+                                world.pump.handle(
+                                    &mut shell.tui,
+                                    &AgentEvent::Error {
+                                        agent_id: id,
+                                        text: format!("agent error: {err:#}"),
+                                    },
+                                );
                             }
                             Err(TurnError::Fatal(err)) => {
                                 break Err(err);
@@ -1583,6 +1478,7 @@ async fn run_session(
                                         &shell.run_config,
                                         target,
                                         text,
+                                        turn_policy(target, &shell.config),
                                         &mut turns,
                                         &mut turn_cancels,
                                     ) {
@@ -1980,20 +1876,18 @@ async fn run_session(
                                                     &notice_event(&session_busy_notice("compact")),
                                                 );
                                             } else {
-                                                let keep_recent = shell
-                                                    .config
-                                                    .lock()
-                                                    .expect("config mutex poisoned")
-                                                    .compact_keep_recent;
-                                                spawn_compaction_turn(
+                                                spawn_turn(
                                                     world,
                                                     &shell.run_config,
-                                                    aj_agent::events::CompactionReason::Manual,
-                                                    None,
-                                                    keep_recent,
+                                                    AgentId::Main,
+                                                    TurnStart::Compact {
+                                                        reason:
+                                                            aj_agent::events::CompactionReason::Manual,
+                                                        instructions: None,
+                                                    },
+                                                    turn_policy(AgentId::Main, &shell.config),
                                                     &mut turns,
                                                     &mut turn_cancels,
-                                                    &mut compaction_agents,
                                                 );
                                                 sync_editor_enabled(&mut shell.tui);
                                             }
@@ -2081,6 +1975,7 @@ async fn run_session(
                                 &shell.run_config,
                                 target,
                                 trimmed,
+                                turn_policy(target, &shell.config),
                                 &mut turns,
                                 &mut turn_cancels,
                             ) {
@@ -2109,6 +2004,7 @@ async fn run_session(
                         *agent_id,
                         world,
                         &shell.run_config,
+                        turn_policy(*agent_id, &shell.config),
                         &mut turns,
                         &mut turn_cancels,
                     );
@@ -2129,6 +2025,7 @@ async fn run_session(
                         *agent_id,
                         world,
                         &shell.run_config,
+                        turn_policy(*agent_id, &shell.config),
                         &mut turns,
                         &mut turn_cancels,
                     );
@@ -2255,229 +2152,125 @@ fn resolve_agent(
     }
 }
 
-/// Spawn a wake turn on `owner` if it is idle, driving
-/// [`Agent::wake`] through the same per-agent turn machinery user
-/// submits use (resolve handle → gate → insert cancel token → spawn
-/// onto `turns`).
-///
-/// A busy owner is left alone — the mid-run drain point or the
-/// turn-completion trigger delivers its notices instead. Both wake
-/// triggers may fire for the same notice; `Agent::wake` returns
-/// `Empty` (emitting nothing) when the queue was already drained, so
-/// the loser is a cheap no-op.
+/// Build the per-agent [`TurnPolicy`]. The Main agent gets reactive
+/// overflow recovery and threshold compaction (both gated on
+/// `auto_compact`) plus queued-work delivery; a sub-agent continuation
+/// gets only queued-work delivery, since compaction operates on the
+/// log's USER (Main) thread and is therefore Main-only.
+fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnPolicy {
+    let c = config.lock().expect("config mutex poisoned");
+    let main = target == AgentId::Main;
+    TurnPolicy {
+        recover_overflow: main && c.auto_compact,
+        auto_threshold: (main && c.auto_compact).then_some(c.compact_threshold),
+        wake: true,
+        keep_recent: c.compact_keep_recent,
+    }
+}
+
+/// Spawn a turn sequence for `target` onto `turns`: resolve the agent
+/// handle, mint the per-sequence cancel token (into `turn_cancels`,
+/// which Ctrl+C fires), and drive `start` plus its automatic
+/// continuations via [`crate::turn::drive_turn`]. The spawned task
+/// re-stamps the staged run config before each inference. Returns
+/// `false` without spawning when `target` has no live handle (e.g. a
+/// resumed sub-agent).
+fn spawn_turn(
+    world: &SessionWorld,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    target: AgentId,
+    start: TurnStart,
+    policy: TurnPolicy,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) -> bool {
+    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+        return false;
+    };
+    let run_config_for_turn = Arc::clone(run_config);
+    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
+    let log = Arc::clone(&world.log);
+    let turn_cancel = CancellationToken::new();
+    turn_cancels.insert(target, turn_cancel.clone());
+    turns.spawn(async move {
+        let mut a = handle.lock().await;
+        let result = crate::turn::drive_turn(
+            &mut a,
+            &log,
+            &policy,
+            start,
+            |agent: &mut Agent| {
+                apply_turn_config(target, agent, &run_config_for_turn, &sub_overrides_for_turn);
+            },
+            turn_cancel,
+        )
+        .await;
+        (target, result)
+    });
+    true
+}
+
+/// Spawn a wake turn on `owner` if it is idle, delivering queued
+/// notices / messages through the same driver user submits use. A busy
+/// owner is left alone — its in-flight driver drains the queue, or the
+/// mid-run drain point does. Both wake triggers may fire for the same
+/// notice; `Agent::wake` returns `Empty` (emitting nothing) once the
+/// queue is drained, so the loser is a cheap no-op.
 fn spawn_wake_turn(
     owner: AgentId,
     world: &SessionWorld,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    policy: TurnPolicy,
     turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
     turn_cancels: &mut HashMap<AgentId, CancellationToken>,
 ) {
     if turn_cancels.contains_key(&owner) || world.pump.is_running(owner) {
         return;
     }
-    // Owners normally hold a live handle — task ownership is only
-    // acquired by a live run in this process — so a miss just means
-    // there is nothing left to wake.
-    let Some(handle) = resolve_agent(owner, &world.agent, &world.registry) else {
-        return;
-    };
-    let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
-    let turn_cancel = CancellationToken::new();
-    turn_cancels.insert(owner, turn_cancel.clone());
-    turns.spawn(async move {
-        let mut a = handle.lock().await;
-        // Wake turns apply the current run config and count usage
-        // like any other turn.
-        apply_turn_config(owner, &mut a, &run_config_for_turn, &sub_overrides_for_turn);
-        let result = a.wake(turn_cancel).await.map(|_| ());
-        (owner, result)
-    });
+    spawn_turn(
+        world,
+        run_config,
+        owner,
+        TurnStart::Wake,
+        policy,
+        turns,
+        turn_cancels,
+    );
 }
 
-/// Spawn a user-prompt turn for `target` with `text`, sharing the
-/// per-agent machinery `spawn_wake_turn` uses (resolve handle → clear
-/// editor + record history → insert cancel token → spawn onto
-/// `turns`). Returns `false` without spawning when the target can't be
-/// prompted (e.g. a resumed sub-agent with no live handle), leaving
-/// the editor untouched so the caller can surface a notice and the
-/// user keeps their text.
+/// Spawn a user-prompt turn for `target`. Resolves the handle first and
+/// leaves the editor intact on a miss (returning `false`) so the caller
+/// can surface a notice and the user keeps their text; otherwise clears
+/// the editor, records history, and dispatches a [`TurnStart::Prompt`]
+/// sequence.
 fn spawn_prompt_turn(
     tui: &mut Tui,
     world: &SessionWorld,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     target: AgentId,
     text: String,
+    policy: TurnPolicy,
     turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
     turn_cancels: &mut HashMap<AgentId, CancellationToken>,
 ) -> bool {
-    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+    if resolve_agent(target, &world.agent, &world.registry).is_none() {
         return false;
-    };
+    }
     if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
         editor.set_text("");
         editor.add_to_history(&text);
     }
-    let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
-    let turn_cancel = CancellationToken::new();
-    turn_cancels.insert(target, turn_cancel.clone());
-    turns.spawn(async move {
-        let mut a = handle.lock().await;
-        apply_turn_config(
-            target,
-            &mut a,
-            &run_config_for_turn,
-            &sub_overrides_for_turn,
-        );
-        let result = a.prompt(text, turn_cancel).await;
-        (target, result)
-    });
-    true
+    spawn_turn(
+        world,
+        run_config,
+        target,
+        TurnStart::Prompt(text),
+        policy,
+        turns,
+        turn_cancels,
+    )
 }
 
-/// Spawn a manual compaction for the Main agent as a tracked task.
-///
-/// Modeled on [`spawn_prompt_turn`]: it inserts a cancel token into
-/// `turn_cancels` (so the loop refuses overlapping turns and disables
-/// the editor while it runs) and returns the standard
-/// `(AgentId, Result)` shape so the completion arm cleans up uniformly.
-/// The summarizer runs bus-silently inside
-/// [`crate::compaction::run_compaction`]; progress and the result are
-/// surfaced through the `CompactionStart` / `CompactionEnd` events the
-/// run emits on the agent's bus. Returns `false` without spawning when
-/// the Main agent has no live handle.
-fn spawn_compaction_turn(
-    world: &SessionWorld,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    reason: aj_agent::events::CompactionReason,
-    instructions: Option<String>,
-    keep_recent_tokens: u64,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
-    compaction_agents: &mut HashSet<AgentId>,
-) -> bool {
-    let target = AgentId::Main;
-    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
-        return false;
-    };
-    let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
-    let log = Arc::clone(&world.log);
-    let turn_cancel = CancellationToken::new();
-    turn_cancels.insert(target, turn_cancel.clone());
-    // Tagged so the completion arm tells a compaction apart from a real
-    // turn and doesn't re-check the auto-compaction threshold against it.
-    compaction_agents.insert(target);
-    turns.spawn(async move {
-        let mut a = handle.lock().await;
-        // Stamp the latest staged config so the summarizer uses the
-        // current model.
-        apply_turn_config(
-            target,
-            &mut a,
-            &run_config_for_turn,
-            &sub_overrides_for_turn,
-        );
-        let _ = crate::compaction::run_compaction(
-            &mut a,
-            &log,
-            reason,
-            instructions.as_deref(),
-            keep_recent_tokens,
-            turn_cancel,
-        )
-        .await;
-        (target, Ok(()))
-    });
-    true
-}
-
-/// Spawn a reactive overflow-recovery turn for the Main agent: compact
-/// (reason [`CompactionReason::Overflow`]) and then re-drive inference
-/// once with [`Agent::continue_run`] against the reduced transcript.
-///
-/// The failed assistant message of the overflow turn is persisted to the
-/// log but never pushed onto the in-memory transcript, and
-/// `run_compaction` trims a trailing failed assistant from the reseed,
-/// so the transcript ends in a user/tool-result message — satisfying
-/// `continue_run`'s precondition. If compaction is a no-op or fails we
-/// still retry: a repeat overflow surfaces through the completion arm,
-/// which won't recurse because the per-agent recovery flag is set.
-fn spawn_overflow_recovery_turn(
-    world: &SessionWorld,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    keep_recent_tokens: u64,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
-) -> bool {
-    let target = AgentId::Main;
-    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
-        return false;
-    };
-    let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
-    let log = Arc::clone(&world.log);
-    let turn_cancel = CancellationToken::new();
-    turn_cancels.insert(target, turn_cancel.clone());
-    turns.spawn(async move {
-        let mut a = handle.lock().await;
-        apply_turn_config(
-            target,
-            &mut a,
-            &run_config_for_turn,
-            &sub_overrides_for_turn,
-        );
-        let _ = crate::compaction::run_compaction(
-            &mut a,
-            &log,
-            aj_agent::events::CompactionReason::Overflow,
-            None,
-            keep_recent_tokens,
-            turn_cancel.clone(),
-        )
-        .await;
-        let result = a.continue_run(turn_cancel).await;
-        (target, result)
-    });
-    true
-}
-
-/// Spawn an auto-submitted launch turn for the Main agent from CLI
-/// content (`aj <msg>` / `aj @file ...`).
-///
-/// Unlike [`spawn_prompt_turn`] this touches neither the editor nor the
-/// prompt history: the content is a launch argument rather than typed
-/// input, and may be a large `<file>` dump we don't want polluting the
-/// history ring. A missing live handle (no Main agent) is a silent
-/// no-op.
-fn spawn_auto_turn(
-    world: &SessionWorld,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    content: Vec<UserContent>,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
-) {
-    let target = AgentId::Main;
-    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
-        return;
-    };
-    let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
-    let turn_cancel = CancellationToken::new();
-    turn_cancels.insert(target, turn_cancel.clone());
-    turns.spawn(async move {
-        let mut a = handle.lock().await;
-        apply_turn_config(
-            target,
-            &mut a,
-            &run_config_for_turn,
-            &sub_overrides_for_turn,
-        );
-        let result = a.prompt_with_content(content, turn_cancel).await;
-        (target, result)
-    });
-}
 /// prepending it to whatever is currently typed (blank-line joined),
 /// and repaint the pending box. Returns whether anything was yanked.
 /// Used by the dequeue chord, the empty-editor Up/Ctrl+P yank, and the
@@ -6329,6 +6122,18 @@ mod tests {
         }
     }
 
+    /// A default [`TurnPolicy`] for the spawn-helper tests: queued-work
+    /// delivery on, compaction off (these tests don't drive the overflow
+    /// or threshold paths).
+    fn test_policy() -> TurnPolicy {
+        TurnPolicy {
+            recover_overflow: false,
+            auto_threshold: None,
+            wake: true,
+            keep_recent: 20_000,
+        }
+    }
+
     /// An idle owner with a queued notice gets a wake turn through
     /// the normal per-agent machinery: gated via `turn_cancels`,
     /// spawned on the `turns` JoinSet, and the wake drains the notice
@@ -6350,6 +6155,7 @@ mod tests {
             AgentId::Main,
             &world,
             &run_config,
+            test_policy(),
             &mut turns,
             &mut turn_cancels,
         );
@@ -6401,6 +6207,7 @@ mod tests {
             AgentId::Main,
             &world,
             &run_config,
+            test_policy(),
             &mut turns,
             &mut turn_cancels,
         );
@@ -6429,6 +6236,7 @@ mod tests {
             AgentId::Main,
             &world,
             &run_config,
+            test_policy(),
             &mut turns,
             &mut turn_cancels,
         );
@@ -6470,6 +6278,7 @@ mod tests {
             &run_config,
             AgentId::Main,
             "do the thing".to_string(),
+            test_policy(),
             &mut turns,
             &mut turn_cancels,
         );
@@ -6517,6 +6326,7 @@ mod tests {
             &run_config,
             AgentId::Sub(99),
             "x".to_string(),
+            test_policy(),
             &mut turns,
             &mut turn_cancels,
         );
@@ -6583,6 +6393,7 @@ mod tests {
             AgentId::Main,
             &world,
             &run_config,
+            test_policy(),
             &mut turns,
             &mut turn_cancels,
         );

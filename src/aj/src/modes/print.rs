@@ -472,48 +472,30 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         cancel_for_signal.cancel();
     });
-    let mut prompt_result = agent.prompt_with_content(content, turn_cancel).await;
+    // Drive the turn inline (print mode is one-shot — no spawn, no
+    // responsiveness constraint) and use the result for the exit status.
+    // The policy enables only reactive overflow recovery: the threshold
+    // and queued-work paths don't apply to a single headless turn.
+    // Recovery runs before the background-task teardown below so the
+    // retried turn can still use tools.
+    let policy = crate::turn::TurnPolicy {
+        recover_overflow: config.auto_compact,
+        auto_threshold: None,
+        wake: false,
+        keep_recent: config.compact_keep_recent,
+    };
+    let prompt_result = crate::turn::drive_turn(
+        &mut agent,
+        &log,
+        &policy,
+        crate::turn::TurnStart::Content(content),
+        |_| {},
+        turn_cancel,
+    )
+    .await;
     // Stop listening for SIGINT before we return so a stray Ctrl+C
     // during shutdown doesn't trigger a phantom cancel.
     ctrl_c_handler.abort();
-
-    // Reactive overflow recovery (single attempt), before tearing down
-    // background tasks so the retried turn can still use tools. The
-    // failed assistant message is persisted to the log but never pushed
-    // onto the in-memory transcript, so detect on the log's most recent
-    // assistant turn. `run_compaction` reseeds the transcript and trims
-    // the trailing failed assistant, leaving it valid for `continue_run`.
-    if matches!(prompt_result, Err(TurnError::Recoverable(_))) && config.auto_compact {
-        let window = agent.model_info().context_window;
-        let is_overflow = {
-            let l = log.lock().await;
-            l.latest_leaf(ThreadFilter::USER)
-                .map(|head| {
-                    let conv = l.linearize(&head, ThreadFilter::USER);
-                    aj_models::errors::last_turn_is_context_overflow(&conv.messages(), Some(window))
-                })
-                .unwrap_or(false)
-        };
-        if is_overflow {
-            let cancel = CancellationToken::new();
-            let _ = crate::compaction::run_compaction(
-                &mut agent,
-                &log,
-                aj_agent::events::CompactionReason::Overflow,
-                None,
-                config.compact_keep_recent,
-                cancel.clone(),
-            )
-            .await;
-            prompt_result = match agent.continue_run(cancel).await {
-                Err(TurnError::Recoverable(e)) => Err(TurnError::Recoverable(e.context(
-                    "context overflow recovery failed; reduce context or \
-                     switch to a larger-context model",
-                ))),
-                other => other,
-            };
-        }
-    }
 
     // Kill the background-task tree and reap the process groups
     // before observing the prompt result, so the early error returns

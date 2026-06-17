@@ -68,11 +68,13 @@ aj-agent                 generic mechanisms only: `Agent::complete_oneshot`
 aj-conf                  `auto_compact` + `compact_threshold` config
                          options; `ValueKind::Number`.
 
-aj (binary)              orchestration (the `compaction` host module),
-                         the `/compact` command, the threshold and
-                         overflow triggers, interactive wiring (spawned
-                         task, footer accessor, notices), print-mode
-                         recovery.
+aj (binary)              orchestration: the `compaction` host module
+                         (`run_compaction` mechanics) and the `turn`
+                         host module (`drive_turn`, the turn-and-
+                         continuation driver that owns the post-turn
+                         policy ladder); the `/compact` command;
+                         interactive wiring (driver tasks, terminal-
+                         outcome notices); print-mode wiring.
 ```
 
 Rationale: the cut-point and summary-prompt logic operates over log
@@ -513,21 +515,61 @@ contract (the locked
 `agent_event_serializes_with_internally_tagged_snake_case_shape` test in
 `aj-agent::events` gets new cases).
 
+### 6.4 `Agent::last_assistant`
+
+The host's post-turn policy (overflow recovery, threshold compaction)
+needs two facts about the turn that just ran: whether it was a context
+overflow, and how much context it occupied. Both are properties of the
+turn's terminal assistant message, which the agent produces but, for an
+error/overflow turn, deliberately does *not* push onto the transcript
+(only aborts are pushed; `lib.rs:1159-1187`). Rather than have the
+binary re-read and re-linearize the log to recover that message, the
+agent retains it:
+
+```rust
+/// The terminal assistant message of the most recent inference
+/// (success, error, or abort), or `None` before the first turn.
+/// Retained so the host can classify the turn — context overflow via
+/// `aj_models::errors::is_context_overflow`, occupancy via `usage` —
+/// without re-reading the log.
+///
+/// Reflects the most recent inference only; its value is meaningless
+/// after `reseed_transcript` until the next turn, and the host reads it
+/// solely right after driving a turn.
+pub fn last_assistant(&self) -> Option<&AssistantMessage>;
+```
+
+Set wherever the terminal assistant `MessageEnd` is emitted
+(`lib.rs:1151`), so it covers the success, error, and abort paths alike.
+This subsumes the earlier log-reading overflow detection and, by also
+exposing `usage`, lets the threshold trigger read occupancy from the
+agent rather than the UI footer (`footer_data.rs:113` derives the same
+`input + cache_read + cache_write` sum from the same `TurnUsage`).
+
 ## 7. Host orchestration (`aj`)
 
-A new `aj::compaction` module ties the pieces together. It is the only
-place that calls both the planning library and the model.
+Two host modules tie the pieces together. `aj::compaction` owns the
+compaction *mechanics* (`run_compaction`); `aj::turn` owns the turn
+*lifecycle* — driving one user-initiated turn and its automatic
+continuations (overflow recovery, queued-work delivery, threshold
+compaction) to quiescence. Both the interactive TUI and `--print` drive
+turns through `aj::turn::drive_turn`, so the post-turn policy lives in
+exactly one place instead of being duplicated across the two frontends'
+loops.
 
-### 7.1 The end-to-end flow
+### 7.1 `run_compaction` (mechanics)
 
-`run_compaction` is the shared core for all three triggers:
+`run_compaction` is the shared core for all three compaction triggers.
+It assumes no turn is in flight and that the caller holds the agent
+exclusively:
 
 ```rust
 /// Plan, summarize, persist, and reseed. Returns the outcome for the
-/// caller to render. Locks `log` and `agent` as needed; assumes no
-/// turn is in flight.
+/// caller to render. Takes the agent by exclusive borrow and locks
+/// `log` around planning and persist+reseed; assumes no turn is in
+/// flight.
 pub async fn run_compaction(
-    agent: &Arc<TokioMutex<Agent>>,
+    agent: &mut Agent,
     log: &Arc<TokioMutex<ConversationLog>>,
     reason: CompactionReason,
     custom_instructions: Option<&str>,
@@ -554,7 +596,8 @@ Steps:
 4. **Persist**: lock `log`, `append_compaction(USER, summary,
    plan.first_kept_entry_id, plan.tokens_before, Some(plan.file_ops))`.
 5. **Reseed**: re-linearize from the new head → `agent_messages()`
-   (now compaction-aware) → lock `agent`, `reseed_transcript(...)`.
+   (now compaction-aware) → `reseed_transcript(...)` on the borrowed
+   agent, trimming a trailing failed assistant (below).
 6. Compute `tokens_after` (occupancy of the reseeded projection) and
    return `Compacted { tokens_before, tokens_after, summary }`.
 
@@ -563,7 +606,96 @@ calls; an abort before step 4 leaves the log untouched (no partial
 compaction is ever persisted). A summarizer error returns
 `Failed { error }` and likewise writes nothing.
 
-### 7.2 Manual `/compact`
+**Trailing-failed-assistant trim.** During the reseed, `run_compaction`
+drops a trailing `Error`/`Aborted` assistant message that carries no
+tool calls, so the reseeded transcript ends in a user/tool-result
+message. This is not overflow-specific: it makes the reseed faithful to
+what the wire sends, since `transform_messages` rule 5
+(`aj-models/src/transform.rs:328`) already drops such messages and their
+orphaned tool results before inference. It also leaves the transcript
+valid for `Agent::continue_run`, which the overflow path (§7.2) relies
+on. A failed assistant *with* tool calls is left untouched — its
+tool-result messages, not the assistant, are the tail — so we never
+orphan a result.
+
+### 7.2 The turn driver (`aj::turn`)
+
+A user-initiated turn is rarely a single inference: it may need to
+recover from a context overflow, deliver work that queued while it ran,
+or compact once it crosses the threshold. The driver expresses these as
+one post-turn policy ladder applied in a loop:
+
+```rust
+/// How a turn sequence begins.
+pub enum TurnStart {
+    Prompt(String),                // typed user text → Agent::prompt
+    Content(Vec<UserContent>),     // CLI launch content → prompt_with_content
+    Wake,                          // drain queues/notices → Agent::wake
+    Compact {                      // compact only, no turn
+        reason: CompactionReason,
+        instructions: Option<String>,
+    },
+}
+
+/// The automatic continuations applied after a turn settles.
+pub struct TurnPolicy {
+    pub recover_overflow: bool,      // compact + retry once on a context-overflow failure
+    pub auto_threshold: Option<f64>, // Some(t): compact after a turn that crossed t of the window
+    pub wake: bool,                  // deliver queued notices/messages and continue
+    pub keep_recent: u64,            // recent-tail budget kept verbatim across a compaction
+}
+
+/// Drive one turn and its automatic continuations to quiescence.
+/// `reconfigure` re-stamps the latest staged run-config onto the agent
+/// before each inference (interactive's `apply_turn_config`; a no-op in
+/// print). Returns the final result: `Ok` when the sequence settled,
+/// `Recoverable`/`Aborted` for the caller to surface, `Fatal` to bubble
+/// out.
+pub async fn drive_turn(
+    agent: &mut Agent,
+    log: &Arc<TokioMutex<ConversationLog>>,
+    policy: &TurnPolicy,
+    start: TurnStart,
+    reconfigure: impl FnMut(&mut Agent),
+    cancel: CancellationToken,
+) -> Result<(), TurnError>;
+```
+
+A `Compact` start runs `run_compaction` and returns immediately — there
+is no turn and no ladder. Otherwise the driver runs the initial action
+and then loops:
+
+1. **Reactive overflow (once).** If the result is `Recoverable`,
+   `policy.recover_overflow` holds, and `agent.last_assistant()` is a
+   context overflow (§6.4, `is_context_overflow`): on the first
+   occurrence, `run_compaction(Overflow)` then `continue_run`, and loop.
+   On a repeat, return the error wrapped with "context overflow recovery
+   failed; reduce context or switch to a larger-context model." The
+   once-only guard is a local `bool`.
+2. **Other error / abort.** Any other `Err` — a non-overflow
+   `Recoverable`, or `Aborted` — returns unchanged for the caller to
+   surface.
+3. **Deliver queued work.** If `policy.wake`, call `Agent::wake`, which
+   self-gates: a `Ran` outcome means queued notices/messages produced a
+   turn, so loop and re-apply the ladder to its result; `Empty` (nothing
+   pending, no events emitted) falls through; an `Err` loops back so
+   step 1/2 handle it.
+4. **Threshold compaction.** If `policy.auto_threshold` is `Some(t)` and
+   occupancy crossed `t` of the window, `run_compaction(Threshold)` and
+   return. Occupancy is `agent.last_assistant().usage`
+   (`input + cache_read + cache_write`, the footer's numerator) over
+   `agent.model_info().context_window`, via
+   `aj_session::compaction::should_compact`. Threshold compaction does
+   not re-drive: the next turn happens on the next prompt or wake.
+
+The priorities match the previous completion-arm behavior: overflow
+recovery beats everything; delivering queued work beats threshold
+compaction (a turn was just queued, so compact next round); threshold
+compaction is terminal for the sequence. The cancel token covers the
+whole sequence, so one Ctrl+C stops the current inference and every
+continuation.
+
+### 7.3 Manual `/compact`
 
 Command surface (`aj/src/config/commands.rs`):
 
@@ -573,112 +705,77 @@ Command surface (`aj/src/config/commands.rs`):
   the window."
 
 `/compact` accepts optional free-form focus instructions
-(`/compact focus on the auth refactor`). Commands today are
-zero-argument (`commands.rs:52`); compaction is the first that takes a
-tail argument, so the interactive command parser passes the remainder of
-the input line to the handler as `custom_instructions`. (This is a small
-extension to the command dispatch, not a new parser — the palette still
-lists `compact` with no args; typed `/compact <text>` carries the tail.)
+(`/compact focus on the auth refactor`); the typed tail is passed as
+`custom_instructions`. It dispatches a `drive_turn` with
+`TurnStart::Compact { reason: Manual, instructions }` (a compact-only
+sequence). Like the session-changing commands it is **refused mid-turn**
+via the busy guard with `session_busy_notice("compact")`.
 
-Handling in `handle_command` (`interactive.rs:3170`): like the
-session-changing commands, `/compact` is **refused mid-turn** via the
-`turn_running` guard with `session_busy_notice("compact")`
-(`interactive.rs:224`). Otherwise it triggers a compaction run (§7.5).
+### 7.4 Interactive integration
 
-### 7.3 Automatic (threshold) trigger
+Turns run as tasks on the `turns` JoinSet so the `select!` loop stays
+responsive to input/render while a multi-second inference or summarizer
+call runs, and so Main and sub-agent continuations run concurrently. A
+single `spawn_turn(target, start, policy)` helper replaces the former
+per-step helpers (`spawn_prompt_turn`, `spawn_wake_turn`,
+`spawn_compaction_turn`, `spawn_overflow_recovery_turn`,
+`spawn_auto_turn`): it resolves the agent handle, mints the
+per-sequence cancel token into `turn_cancels` (which Ctrl+C fires), and
+spawns a task that locks the agent and calls `drive_turn` with
+`reconfigure = |a| apply_turn_config(target, a, ...)`.
 
-After each top-level turn completes, the binary already learns occupancy
-from the `TurnUsage` event folded into the footer
-(`footer_data.rs:102`). In the interactive turn-completion arm
-(`interactive.rs:1102`), after the turn is removed from `turns` and the
-agent is marked idle:
+Policy per target:
 
-- If `config.auto_compact` is enabled, no compaction is already in
-  flight, the just-finished turn was not aborted/errored, and
-  `should_compact(occupancy, window, threshold)` holds, spawn a
-  compaction run with `reason = Threshold` *before* draining the wake
-  triggers / accepting the next prompt.
+- **Main**: `recover_overflow = auto_compact`,
+  `auto_threshold = auto_compact.then_some(threshold)`, `wake = true`.
+- **Sub-agent continuation**: `recover_overflow = false`,
+  `auto_threshold = None`, `wake = true`. Compaction operates on the
+  log's USER (Main) thread, so it is Main-only.
 
-The occupancy numerator needs a read accessor: add
-`AgentFooters::last_turn_context_tokens(id) -> Option<u64>` (or expose it
-via `EventPump`), since today only the composite `context_usage` view is
-public (`footer_data.rs:119`). The denominator is
-`agent.model_info().context_window`, already seeded into the footer at
-`session.rs:473`.
+Because the driver owns the post-turn ladder, the completion arm
+collapses to cleanup and outcome rendering: drop the cancel token,
+reconcile pump idle state (and the Main→sub idle drain), then `match`
+the result — `Ok` does nothing, `Aborted` shows "Turn cancelled.",
+`Recoverable` shows the error (the driver already exhausted recovery and
+wrapped the give-up message), `Fatal` breaks the loop. The
+`compaction_agents` and `overflow_recovered` sets and the threshold
+re-check are gone — they were the externalized state the driver now
+holds internally. The driver delivers queued work during the sequence,
+but the completion arm keeps a small wake safety-net for work that
+arrives in the gap between the driver's final drain and its completion;
+the two *idle* wake triggers in the bus-event arm (a background
+`TaskEnd`, and a sub's nested `AgentEnd`) likewise start a
+`TurnStart::Wake` sequence when work arrives for an idle agent. A busy
+agent's driver picks the work up in ladder step 3.
 
-Auto-compaction never fires *inside* a turn (aj's `execute_turn` loops
-over tool batches without returning to the binary). A single very long
-tool-using turn that overruns the window is handled by the reactive path
-(§7.4), not the threshold path.
+Mid-sequence progress renders from the bus exactly as before
+(`AgentStart`/`AgentEnd`, `MessageEnd`, `CompactionStart`/
+`CompactionEnd`, `Notice`), so moving the lifecycle into one task
+changes nothing the user sees while it runs.
 
-### 7.4 Reactive (overflow) trigger
+### 7.5 Print mode
 
-When a turn returns `TurnError::Recoverable` and the last assistant
-message is a context overflow, compact and retry once.
+Print owns the agent by value and is one-shot, so it drives the sequence
+inline (no task) and uses the returned result for its exit status:
 
-Mechanics, leaning on existing behavior:
+```rust
+let policy = TurnPolicy {
+    recover_overflow: config.auto_compact,
+    auto_threshold: None, // one-shot: never compact-then-exit
+    wake: false,          // no post-turn queued-work delivery
+    keep_recent: config.compact_keep_recent,
+};
+let result =
+    drive_turn(&mut agent, &log, &policy, TurnStart::Content(content), |_| {}, cancel).await;
+```
 
-- The agent emits `MessageEnd` for the overflow error assistant message
-  (`lib.rs:1063`) — so it is persisted to the log — but does **not**
-  push it onto the in-memory transcript (`lib.rs:1085-1163` only pushes
-  on abort). Detection therefore reads the log: after a `Recoverable`
-  turn, lock `log`, linearize, and call
-  `aj_models::errors::last_turn_is_context_overflow(&conversation.messages(), Some(window))`.
-- Gate on a once-per-turn flag (`overflow_recovery_attempted`) so a
-  second overflow surfaces the error instead of looping.
-- Run `run_compaction(reason = Overflow)`. The reseeded transcript's
-  tail ends with the persisted error assistant message; trim a trailing
-  `Error`/`Aborted` assistant message during this reseed so the
-  transcript ends in a user/tool-result message. This is consistent with
-  the wire, because `transform_messages` rule 5
-  (`aj-models/src/transform.rs:328`) already drops `Error`/`Aborted`
-  assistant messages and their tool results before inference — the model
-  never sees the failed turn regardless.
-- Re-drive inference with `Agent::continue_run` (`lib.rs:689`), which
-  requires the transcript to end in user/tool-result — satisfied by the
-  trim above.
+This replaces print's bespoke overflow-detect-and-retry block. Overflow
+recovery runs before background-task teardown so the retried turn can
+still use tools. In `--format json` the `CompactionStart`/`End` pair
+still reaches the stream, because `run_compaction` emits them on the bus
+and the JSON listener is subscribed.
 
-If the retry overflows again, surface the original recoverable error
-("context overflow recovery failed; reduce context or switch to a
-larger-context model"). Recovery is capped at one attempt.
-
-### 7.5 Interactive integration
-
-The summarizer is a multi-second network call, so compaction runs as a
-spawned task (like a turn), never inline in `handle_command` (which is
-awaited on the UI event loop). Add `spawn_compaction`, mirroring
-`spawn_prompt_turn` (`interactive.rs:2159`):
-
-- It is tracked alongside `turns` so the loop treats a compaction as an
-  in-flight operation: new prompts/turns and overlapping compactions are
-  refused while it runs (reusing the `turn_running` notion —
-  `!turns.is_empty()` plus a compaction-in-flight flag).
-- The task: emit `CompactionStart`, call `run_compaction(...)` (which
-  locks `log`/`agent` internally and does the reseed), emit
-  `CompactionEnd`, and return the outcome.
-- A cancel token (Esc) is wired the same way as a turn's, so a long
-  summary can be aborted; an aborted compaction writes nothing.
-- On completion the loop renders a notice via the existing
-  `notice_event` path (`interactive.rs:2498`): "Compacted: summarized N
-  messages, context ~X% → ~Y%." A failure renders a warning. The
-  `CompactionStart`/`End` events also drive a live "compacting…"
-  indicator in the pump and a compaction-summary row.
-
-Why not reuse `seed_session`: its contract is once-only on a fresh agent
-(`lib.rs:438`); `reseed_transcript` (§6.2) is the live-agent path.
-
-### 7.6 Print mode
-
-Print mode (`aj/src/modes/print.rs`) is one-shot, so the threshold path
-(between top-level turns) does not apply. It supports the **reactive**
-path only: after `agent.prompt_with_content` returns `Recoverable`
-(`print.rs:485`), if `config.auto_compact` and the last turn overflowed,
-run `run_compaction(Overflow)` and retry once with `continue_run`,
-then print the final assistant text. In `--format json` a
-`CompactionStart`/`End` pair is emitted to the JSONL stream around the
-recovery so consumers see it.
-
-### 7.7 `aj compact` CLI subcommand
+### 7.6 `aj compact` CLI subcommand
 
 Not implemented. A headless one-shot `aj compact [session_id]` would
 build an agent for a resolved session and run a single
@@ -793,8 +890,13 @@ for `CompactionStart`/`End`.
 
 Host (`aj`): a scripted end-to-end `run_compaction` over a seeded log
 (summary from the scripted provider) producing a `Compaction` entry and
-a reduced reseed; overflow detection + trailing-error trim +
-`continue_run` recovery.
+a reduced reseed; the trailing-failed-assistant trim. The
+`aj::turn::drive_turn` ladder with a scripted provider: a context
+overflow triggers one compact-and-retry that then succeeds; a second
+overflow returns the wrapped give-up error; a successful over-threshold
+turn compacts once and stops; queued work wakes before a threshold
+compaction; a sub-agent policy never compacts. `Agent::last_assistant`
+reflects the terminal message for both an overflow error and a success.
 
 Config: parse/round-trip `compact_threshold`; range rejection; drift
 test.
@@ -819,6 +921,12 @@ test.
 6. **Polish.** Live "compacting…" indicator + compaction-summary row
    rendering; footer wording near the threshold ("context until
    auto-compact").
+7. **Turn driver.** `Agent::last_assistant`; the `aj::turn` module
+   (`TurnStart`, `TurnPolicy`, `drive_turn`); fold the per-step spawn
+   helpers and the completion-arm policy into `spawn_turn` + `drive_turn`
+   (interactive) and one `drive_turn` call (print). A behavior-preserving
+   refactor of the phase-4/5 wiring that moves the post-turn policy to a
+   single site.
 
 ## 12. Open questions / flagged tradeoffs
 

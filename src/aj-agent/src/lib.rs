@@ -184,6 +184,14 @@ pub struct Agent {
     /// steering point and the run-top (wake) point. A default handle
     /// is used by print mode and tests, where nothing enqueues.
     message_queues: MessageQueues,
+    /// Terminal assistant message of the most recent inference
+    /// (success, error, or abort). Retained so the host can classify
+    /// the just-finished turn — context overflow, occupancy — without
+    /// re-reading the log. See [`Agent::last_assistant`]. `None` before
+    /// the first turn; meaningless after a [`Agent::reseed_transcript`]
+    /// until the next turn runs, so the host reads it only right after
+    /// driving a turn.
+    last_assistant: Option<AssistantMessage>,
 }
 
 impl Agent {
@@ -260,6 +268,7 @@ impl Agent {
             sub_agent_registry: SubAgentRegistry::default(),
             task_registry: TaskRegistry::default(),
             message_queues: MessageQueues::default(),
+            last_assistant: None,
         }
     }
 
@@ -440,6 +449,23 @@ impl Agent {
     /// assistant).
     pub fn messages(&self) -> &[AgentMessage] {
         &self.transcript
+    }
+
+    /// The terminal assistant message of the most recent inference
+    /// (success, error, or abort), or `None` before the first turn.
+    ///
+    /// Retained so the host's post-turn policy can classify the turn it
+    /// just drove — context overflow via
+    /// [`aj_models::errors::is_context_overflow`], occupancy via
+    /// `usage` — without re-reading the log. An error/overflow turn's
+    /// assistant message is *not* pushed onto the transcript (only
+    /// aborts are), so this is the only in-memory handle on it.
+    ///
+    /// NOTE: reflects the most recent inference only. Its value is
+    /// meaningless after a [`Agent::reseed_transcript`] until the next
+    /// turn runs; callers read it solely right after driving a turn.
+    pub fn last_assistant(&self) -> Option<&AssistantMessage> {
+        self.last_assistant.as_ref()
     }
 
     /// Apply a session seed: replace the transcript, set the
@@ -1155,6 +1181,12 @@ impl Agent {
                 })
                 .await
                 .map_err(TurnError::Fatal)?;
+
+            // Retain the terminal message for the host's post-turn
+            // policy (overflow classification, occupancy). Captured
+            // here, before the abort branches below move `final_message`,
+            // so it covers success, error, and abort alike.
+            self.last_assistant = Some(final_message.clone());
 
             if aborted_during_stream {
                 // Push the aborted partial onto the transcript so
@@ -3272,6 +3304,33 @@ mod event_protocol_tests {
         ]
     }
 
+    /// Build a script whose terminal event is a non-retryable
+    /// context-overflow `Error`. The agent surfaces it after a single
+    /// inference (no retry), so a turn driven against it errors out
+    /// while retaining the message as `last_assistant`.
+    fn overflow_error_script() -> Vec<AssistantMessageEvent> {
+        use aj_models::streaming::ErrorReason;
+        use aj_models::types::{AssistantError, ErrorCategory};
+        let mut partial = AssistantMessage::empty();
+        partial.api = SCRIPT_API.to_string();
+        partial.provider = SCRIPT_PROVIDER.to_string();
+        partial.model = SCRIPT_MODEL.to_string();
+        partial.stop_reason = StopReason::Error;
+        partial.error = Some(AssistantError::new(
+            ErrorCategory::ContextOverflow,
+            "prompt is too long: 250000 tokens > 200000 maximum",
+        ));
+        vec![
+            AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            },
+            AssistantMessageEvent::Error {
+                reason: ErrorReason::Error,
+                error: partial,
+            },
+        ]
+    }
+
     /// Compact, comparable representation of an [`AgentEvent`] for
     /// snapshot assertions. We don't `derive(PartialEq)` on the
     /// real enum because some payloads (e.g. the legacy
@@ -4320,6 +4379,50 @@ mod event_protocol_tests {
             _ => panic!("expected trailing assistant message"),
         };
         assert_eq!(last_assistant.stop_reason, StopReason::Stop);
+    }
+
+    /// `last_assistant` exposes the terminal success message right after
+    /// a turn so the host's post-turn policy can classify it.
+    #[tokio::test]
+    async fn last_assistant_reflects_terminal_message() {
+        let scripts = vec![finalize_script(finalize_text("hello world"))];
+        let mut agent = build_agent(scripts, Vec::new());
+
+        let text = agent
+            .run_single_turn("hi".to_string())
+            .await
+            .expect("scripted success turn");
+        assert_eq!(text, "hello world");
+
+        let last = agent.last_assistant().expect("terminal message retained");
+        assert_eq!(last.stop_reason, StopReason::Stop);
+        let body: String = last
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(body.contains("hello world"));
+    }
+
+    /// `last_assistant` retains a non-retryable error terminal even
+    /// though the turn surfaces as an error and the failed message is
+    /// not pushed onto the transcript.
+    #[tokio::test]
+    async fn last_assistant_reflects_error_terminal() {
+        let mut agent = build_agent(vec![overflow_error_script()], Vec::new());
+
+        let result = agent.run_single_turn("hi".to_string()).await;
+        assert!(result.is_err(), "non-retryable overflow surfaces as error");
+
+        let last = agent.last_assistant().expect("terminal message retained");
+        assert_eq!(last.stop_reason, StopReason::Error);
+        assert_eq!(
+            last.error.as_ref().expect("error retained").category,
+            aj_models::types::ErrorCategory::ContextOverflow
+        );
     }
 
     #[test]

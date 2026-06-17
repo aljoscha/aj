@@ -107,6 +107,36 @@ pub(crate) fn scripted_run_config(
     }))
 }
 
+/// Like [`scripted_run_config`] but with a non-zero `context_window`,
+/// for tests that exercise occupancy-driven triggers (threshold
+/// compaction, silent overflow).
+pub(crate) fn scripted_run_config_with_window(
+    messages: Vec<AssistantMessage>,
+    context_window: u64,
+) -> Arc<StdMutex<RunConfigSnapshot>> {
+    let mut model_info = scripted_model_info();
+    model_info.context_window = context_window;
+    Arc::new(StdMutex::new(RunConfigSnapshot {
+        provider: Arc::new(
+            ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
+                .on_exhausted(ExhaustedBehavior::Panic),
+        ),
+        model_info: Arc::new(model_info),
+        stream_options: StreamOptions::default(),
+        thinking: None,
+        speed: None,
+        model_key: ("scripted".to_string(), "scripted".to_string()),
+    }))
+}
+
+/// [`finalized_text_message`] carrying a non-zero input-token `usage`,
+/// so occupancy-driven triggers see a real context size.
+pub(crate) fn finalized_text_message_with_usage(text: &str, input_tokens: u64) -> AssistantMessage {
+    let mut m = finalized_text_message(text);
+    m.usage.input = input_tokens;
+    m
+}
+
 /// [`SessionWorld::build`] with a default config, bundled theme,
 /// and fixed render settings. The agent's env is read from the
 /// host (cwd, git, context files); tests therefore never assert

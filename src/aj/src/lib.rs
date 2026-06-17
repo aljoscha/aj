@@ -33,4 +33,5 @@ pub mod modes;
 pub mod persistence;
 pub mod scripted;
 pub mod tmux_notice;
+pub mod turn;
 pub mod usage;
