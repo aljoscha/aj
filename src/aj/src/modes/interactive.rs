@@ -96,6 +96,9 @@ use crate::modes::interactive::components::skills_window::{
     ChangesHandle as SkillsChangesHandle, OutcomeHandle as SkillsOutcomeHandle, SkillRow,
     SkillsWindowComponent, SkillsWindowOutcome,
 };
+use crate::modes::interactive::components::task_output::{
+    TaskOutputComponent, TaskOutputOutcome, TaskOutputOutcomeHandle,
+};
 use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
 };
@@ -2388,6 +2391,13 @@ enum OpenSelector {
         outcome: AgentPickerOutcomeHandle,
         parent_palette: Option<ParentPalette>,
     },
+    /// Read-only viewer for a background bash task's output, opened by
+    /// confirming a task row in the agent picker. Both Esc and Enter
+    /// close straight to chat; it carries no parent back-stack.
+    TaskOutput {
+        handle: OverlayHandle,
+        outcome: TaskOutputOutcomeHandle,
+    },
     Palette {
         handle: OverlayHandle,
         outcome: CommandPaletteOutcomeHandle,
@@ -3000,6 +3010,21 @@ fn subtitle_close() -> String {
     }
 }
 
+/// Subtitle for the task-output viewer: scroll, kill, and close hints,
+/// with key labels resolved from the keybindings manager.
+fn subtitle_task_output() -> String {
+    let up = aj_tui::keybindings::format_action_shortcut("tui.select.up")
+        .unwrap_or_else(|| "Up".to_string());
+    let down = aj_tui::keybindings::format_action_shortcut("tui.select.down")
+        .unwrap_or_else(|| "Down".to_string());
+    let kill =
+        aj_tui::keybindings::format_action_shortcut(crate::config::keybindings::ACTION_TASK_KILL)
+            .unwrap_or_else(|| "Ctrl+K".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    format!("{up}/{down} scroll  \u{2022}  {kill} kill  \u{2022}  {cancel} to close")
+}
+
 /// Subtitle for stay-open editing overlays (settings, skills): how to
 /// change/toggle the highlighted value and how to close. `verb` is the
 /// per-window activation word (`"change"`, `"toggle"`). Space is a
@@ -3061,6 +3086,9 @@ fn subtitle_settings_window(child: &dyn aj_tui::component::Component) -> String 
 fn close_all_overlays(tui: &mut Tui, sel: OpenSelector) {
     match sel {
         OpenSelector::Palette { handle, .. } => {
+            tui.hide_overlay(&handle);
+        }
+        OpenSelector::TaskOutput { handle, .. } => {
             tui.hide_overlay(&handle);
         }
         OpenSelector::Thinking {
@@ -4936,21 +4964,46 @@ async fn handle_selector_outcome(
                     if let Some(parent) = parent_palette {
                         tui.hide_overlay(&parent.handle);
                     }
-                    // Jump to the owning agent's transcript, which
-                    // holds the task's live launch cell. The chat is
-                    // terminal scrollback, so there is no app-side
-                    // viewport to position; the live-tailing cell is
-                    // at (or near) the bottom of the view.
-                    if let Some(owner) = world.pump.task_owner(id) {
-                        world.pump.set_active_view(tui, owner);
-                        apply_editor_agent_marker(tui, owner);
-                        apply_editor_border_for_view(tui, theme, &world.pump, &run_config, owner);
-                    }
-                    SelectorPollOutcome::Closed {
-                        notice: None,
-                        follow_up: None,
-                        start_login: None,
-                        session_request: None,
+                    // The picker only lists bash tasks, so resolve the
+                    // command line for the viewer header. If the task is
+                    // gone from the registry, there is nothing to show;
+                    // close to chat with a notice.
+                    let command = world.task_registry.summary(id).and_then(|s| match s.kind {
+                        aj_agent::tool::TaskKind::Bash { command } => Some(command),
+                        aj_agent::tool::TaskKind::Agent { .. } => None,
+                    });
+                    match command {
+                        Some(command) => {
+                            let initial_inner_rows =
+                                large_overlay_inner_rows(usize::from(tui.terminal().rows()));
+                            let inner =
+                                TaskOutputComponent::new(world.task_registry.clone(), id, command);
+                            let outcome = inner.outcome_handle();
+                            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                                format!("Task #{id}"),
+                                Box::new(inner),
+                                crate::config::theme::overlay_window_theme(theme),
+                                initial_inner_rows,
+                            )
+                            .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
+                            .with_subtitle(&subtitle_task_output());
+                            let handle =
+                                tui.show_overlay(Box::new(window), large_overlay_options());
+                            // Open the viewer in place of the picker and
+                            // keep polling it. This is the one overlay
+                            // opened from inside the poll handler rather
+                            // than `handle_command`.
+                            SelectorPollOutcome::StillOpen(OpenSelector::TaskOutput {
+                                handle,
+                                outcome,
+                            })
+                        }
+                        None => SelectorPollOutcome::Closed {
+                            notice: Some(format!("Background task #{id} is no longer available.")),
+                            follow_up: None,
+                            start_login: None,
+                            session_request: None,
+                        },
                     }
                 }
                 Some(AgentPickerOutcome::KillTask(id)) => {
@@ -5006,6 +5059,18 @@ async fn handle_selector_outcome(
                 }
             }
         }
+        OpenSelector::TaskOutput { handle, outcome } => match outcome.take() {
+            None => SelectorPollOutcome::StillOpen(OpenSelector::TaskOutput { handle, outcome }),
+            Some(TaskOutputOutcome::Closed) => {
+                tui.hide_overlay(&handle);
+                SelectorPollOutcome::Closed {
+                    notice: None,
+                    follow_up: None,
+                    start_login: None,
+                    session_request: None,
+                }
+            }
+        },
         OpenSelector::Settings {
             handle,
             outcome,
