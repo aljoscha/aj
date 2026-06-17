@@ -227,12 +227,15 @@ in order, after each group's outcomes are collected — it builds the
 `ToolResultMessage`, pushes it to `self.transcript`, and emits
 `MessageStart` / `MessageEnd` / `ToolExecutionEnd`.
 
-**Cap.** A single tunable read once at agent construction (or via a
-small helper), `max_tool_concurrency()`:
+**Cap.** A single tunable read once at agent construction and stored on
+the `Agent` (`Agent::max_tool_concurrency`), `max_tool_concurrency()`:
 `AJ_MAX_TOOL_CONCURRENCY` parsed as a positive integer if set, else a
 built-in default of **8**. Groups run sequentially, so this caps
 per-turn concurrency. Nested sub-agents each cap their own turn — same
 per-agent model as the reference implementation, no global pool.
+Storing it on the agent (rather than re-reading the env each turn)
+also lets tests inject a small cap without racing on a process-global
+env var.
 
 > NOTE: `buffered(cap)` keeps up to `cap` futures in flight and yields
 > results in input order, which gives us bounded concurrency and
