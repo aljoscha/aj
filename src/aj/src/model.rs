@@ -22,7 +22,8 @@
 
 use std::sync::Arc;
 
-use aj_conf::ConfigThinkingDisplay;
+use aj_conf::{ConfigThinkingDisplay, ConfigThinkingLevel};
+use aj_models::ThinkingConfig;
 use aj_models::auth::{AuthStorage, find_env_keys};
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
@@ -269,6 +270,21 @@ pub fn apply_thinking_display(options: &mut StreamOptions, display: Option<Confi
     };
     options.thinking_display = anthropic;
     options.reasoning_summary = openai;
+}
+
+/// Map a `config.toml` thinking level onto the wire-level
+/// [`ThinkingConfig`] the agent runs with. [`ConfigThinkingLevel::Off`]
+/// collapses to `None` (no reasoning requested), so the result type is
+/// the same `Option` the agent's `set_default_thinking` takes.
+pub fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Option<ThinkingConfig> {
+    level.and_then(|level| match level {
+        ConfigThinkingLevel::Off => None,
+        ConfigThinkingLevel::Low => Some(ThinkingConfig::Low),
+        ConfigThinkingLevel::Medium => Some(ThinkingConfig::Medium),
+        ConfigThinkingLevel::High => Some(ThinkingConfig::High),
+        ConfigThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
+        ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
+    })
 }
 
 #[cfg(test)]

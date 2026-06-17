@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-use aj_conf::{AgentEnv, ConfigThinkingLevel};
+use aj_models::ThinkingConfig;
 use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
@@ -30,7 +30,6 @@ use aj_models::types::{
     Speed, StopReason, StreamOptions, ThinkingLevel, ToolCall,
     ToolDefinition as UnifiedToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
 };
-use aj_models::ThinkingConfig;
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
 use crate::events::{AgentEvent, AgentId, AgentSettings};
@@ -46,7 +45,7 @@ use crate::types::TokenUsage;
 use anyhow::anyhow;
 use futures::StreamExt;
 use std::sync::Arc;
-use tokio_retry2::strategy::{jitter, ExponentialBackoff};
+use tokio_retry2::strategy::{ExponentialBackoff, jitter};
 use tokio_util::sync::CancellationToken;
 
 /// One-shot session seed applied at construction time: the resumed
@@ -62,10 +61,10 @@ pub struct AgentSeed {
     pub transcript: Vec<AgentMessage>,
     /// The fully-assembled system prompt for the session: either
     /// reused verbatim from the log (cache-warm resume) or freshly
-    /// assembled via [`Agent::assemble_system_prompt`]. Inference
-    /// reads it directly, so it must be seeded before any turn
-    /// runs. `None` leaves the agent's prompt unset (the seed
-    /// targets a fresh agent, where it is unset already).
+    /// assembled by the host. Inference reads it directly, so it
+    /// must be seeded before any turn runs. `None` leaves the
+    /// agent's prompt unset (the seed targets a fresh agent, where
+    /// it is unset already).
     pub assembled_system_prompt: Option<String>,
     /// Floor for sub-agent ids: subsequently minted ids are
     /// strictly greater than this value, so freshly spawned
@@ -75,7 +74,6 @@ pub struct AgentSeed {
 }
 
 pub struct Agent {
-    env: AgentEnv,
     /// The fully-assembled system prompt for the current run.
     /// Populated by [`Agent::seed_session`] (resume path or fresh
     /// assembly) before any turn runs; inference reads it directly.
@@ -212,14 +210,19 @@ impl Agent {
     /// `model_info`, and `stream_options` (per
     /// `docs/aj-next-plan.md` §1.6) so the whole hierarchy talks to
     /// the same backend.
+    ///
+    /// `working_directory` roots the tools' filesystem view and is
+    /// the only piece of host environment the runtime keeps. The
+    /// host assembles the system prompt and seeds it via
+    /// [`Agent::seed_session`].
     pub fn with_provider(
-        env: AgentEnv,
+        working_directory: PathBuf,
         tools: Vec<ErasedToolDefinition>,
         disabled_tools: Vec<String>,
         provider: Arc<dyn Provider>,
         model_info: Arc<ModelInfo>,
         stream_options: StreamOptions,
-        default_thinking: Option<ConfigThinkingLevel>,
+        default_thinking: Option<ThinkingConfig>,
     ) -> Self {
         // Convert ErasedToolDefinition to Tool for Model API
         let api_tools: Vec<Tool> = tools
@@ -238,19 +241,9 @@ impl Agent {
             .map(|tool_def| (tool_def.name.clone(), tool_def))
             .collect();
 
-        let session_state = SessionState::new(env.working_directory.clone());
-
-        let default_thinking = default_thinking.and_then(|level| match level {
-            ConfigThinkingLevel::Off => None,
-            ConfigThinkingLevel::Low => Some(ThinkingConfig::Low),
-            ConfigThinkingLevel::Medium => Some(ThinkingConfig::Medium),
-            ConfigThinkingLevel::High => Some(ThinkingConfig::High),
-            ConfigThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
-            ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
-        });
+        let session_state = SessionState::new(working_directory);
 
         Self {
-            env,
             assembled_system_prompt: None,
             tool_definitions,
             tools: api_tools,
@@ -538,45 +531,6 @@ impl Agent {
         self.assembled_system_prompt.as_deref()
     }
 
-    /// Assemble the system prompt from the env's base prompt plus
-    /// the agent's environment context. The binary calls this when
-    /// no persisted prompt exists on the log and uses the result
-    /// as the freshly-frozen system prompt for the session.
-    pub fn assemble_system_prompt(&self) -> String {
-        let mut text = self.env.system_prompt.content.clone();
-
-        // Stitch in every context file, in order. Each file is
-        // wrapped in an `<agents-md>` block so the model can
-        // clearly tell where instructions start and end, with the
-        // kind-specific prefix text introducing it.
-        for file in &self.env.context_files {
-            text.push_str(&format!(
-                "\n\n{}\n<agents-md>\n{}\n</agents-md>",
-                file.kind.prompt_prefix(),
-                file.content
-            ));
-        }
-
-        // Skills are progressive disclosure: the listing carries only
-        // name/description/location and the model loads the full
-        // SKILL.md with `read_file` when a task matches. Without a
-        // `read_file` tool the listing is unreachable, so it is
-        // omitted entirely.
-        if self.tools.iter().any(|t| t.name == "read_file") {
-            if let Some(block) = aj_conf::skills::format_skills_for_prompt(&self.env.skills) {
-                text.push_str("\n\n");
-                text.push_str(&block);
-            }
-        }
-
-        text.push_str(&format!(
-            "\n\nHere's useful information about your environment:\n<env>\n{}\n</env>",
-            self.env
-        ));
-
-        text
-    }
-
     /// Run a single, bus-silent completion against the agent's provider
     /// and return the concatenated assistant text. Does not touch the
     /// transcript, emits no events, and does not accumulate usage.
@@ -670,13 +624,6 @@ impl Agent {
         self.provider = provider;
         self.model_info = model_info;
         self.stream_options = stream_options;
-    }
-
-    /// Borrow the agent's environment. The binary uses this to
-    /// render the startup `Context:` notice listing every
-    /// agents.md file injected into the system prompt.
-    pub fn env(&self) -> &AgentEnv {
-        &self.env
     }
 
     /// Borrow the agent's current default thinking configuration.
@@ -1864,7 +1811,6 @@ impl Agent {
         // concurrently within one turn.
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_state: self.session_state.clone(),
-            env: &self.env,
             assembled_system_prompt: self
                 .assembled_system_prompt
                 .clone()
@@ -2570,7 +2516,6 @@ mod task_registry_tests {
 /// [`Agent::execute_tool`].
 struct SessionContextWrapper<'a> {
     session_state: SessionState,
-    env: &'a AgentEnv,
     /// The fully-assembled system prompt for the current run,
     /// captured at the moment the tool is invoked. Sub-agents
     /// spawned through this wrapper inherit it verbatim so the
@@ -2707,19 +2652,17 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                 .cloned()
                 .collect();
 
-            // Create a new agent rooted in this session's env and
-            // tools. Its transcript starts empty; the prompt the
-            // tool invoked us with is appended as the first user
-            // message inside `run_single_turn`. Sub-agents share the
-            // parent's provider / model_info / stream_options triple
-            // (per `docs/aj-next-plan.md` §1.6) so the whole
+            // Create a new agent rooted in this session's working
+            // directory and tools. Its transcript starts empty; the
+            // prompt the tool invoked us with is appended as the first
+            // user message inside `run_single_turn`. Sub-agents share
+            // the parent's provider / model_info / stream_options
+            // triple (per `docs/aj-next-plan.md` §1.6) so the whole
             // hierarchy talks to the same backend. The thinking level
             // is applied separately below via `set_default_thinking`
-            // because `with_provider` takes a `ConfigThinkingLevel`
-            // while the parent already holds a resolved
-            // `ThinkingConfig`.
+            // so the child inherits the parent's resolved value.
             let mut sub_agent = Agent::with_provider(
-                self.env.clone(),
+                self.session_state.working_directory(),
                 sub_agent_tools,
                 disabled_tools,
                 Arc::clone(&self.provider),
@@ -3264,10 +3207,8 @@ mod event_protocol_tests {
     //! (no log, no UI), with a scripted model, and the test
     //! observes events directly.
 
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use aj_conf::{AgentEnv, SystemPrompt, SystemPromptSource};
     use aj_models::provider::Provider;
     use aj_models::registry::{InputModality, ModelCost, ModelInfo};
     use aj_models::scripted::{ExhaustedBehavior, ProviderScript, ScriptedProvider};
@@ -3719,26 +3660,6 @@ mod event_protocol_tests {
         }
     }
 
-    /// Build an [`AgentEnv`] that doesn't pull instructions from the
-    /// host — context loading is environment-dependent, and we want
-    /// a deterministic event sequence regardless of where the test
-    /// runs.
-    fn empty_env(working_directory: PathBuf) -> AgentEnv {
-        AgentEnv {
-            working_directory,
-            git_root_directory: None,
-            operating_system: "test".to_string(),
-            today_date: "2024-01-01".to_string(),
-            system_prompt: SystemPrompt {
-                content: "irrelevant".to_string(),
-                source: SystemPromptSource::Builtin,
-            },
-            context_files: Vec::new(),
-            skills: Vec::new(),
-            skill_diagnostics: Vec::new(),
-        }
-    }
-
     fn build_agent(
         scripts: Vec<Vec<AssistantMessageEvent>>,
         tools: Vec<ErasedToolDefinition>,
@@ -3779,9 +3700,8 @@ mod event_protocol_tests {
         let provider: Arc<dyn Provider> =
             Arc::new(ScriptedProvider::new(scripts).on_exhausted(ExhaustedBehavior::Panic));
         let model_info = Arc::new(scripted_model_info());
-        let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::with_provider(
-            env,
+            std::env::temp_dir(),
             tools,
             Vec::new(),
             provider,
@@ -3829,83 +3749,6 @@ mod event_protocol_tests {
             }
             other => panic!("expected user message, got {other:?}"),
         }
-    }
-
-    /// Stub with the builtin `read_file` tool's name, so prompt-assembly
-    /// tests can flip the skills listing's read-tool gate without pulling
-    /// in `aj-tools`.
-    #[derive(Clone)]
-    struct ReadFileStubTool;
-
-    impl ToolDefinition for ReadFileStubTool {
-        type Input = PingInput;
-
-        fn name(&self) -> &'static str {
-            "read_file"
-        }
-
-        fn description(&self) -> &'static str {
-            "Test stub"
-        }
-
-        async fn execute(
-            &self,
-            _ctx: &mut dyn ToolContext,
-            _input: PingInput,
-        ) -> anyhow::Result<ToolOutcome> {
-            unreachable!("never executed in prompt-assembly tests")
-        }
-    }
-
-    #[test]
-    fn assemble_system_prompt_lists_skills_behind_read_file_gate() {
-        let skill = |name: &str, enabled: bool, dmi: bool| aj_conf::skills::Skill {
-            name: name.to_string(),
-            description: format!("{name} description"),
-            path: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
-            enabled,
-            disable_model_invocation: dmi,
-        };
-        let mut env = empty_env(std::env::temp_dir());
-        env.skills = vec![
-            skill("alpha", true, false),
-            skill("beta", false, false),
-            skill("gamma", true, true),
-        ];
-
-        let agent_with_tools = |env: AgentEnv, tools: Vec<ErasedToolDefinition>| {
-            let provider: Arc<dyn Provider> = Arc::new(
-                ScriptedProvider::from_event_vecs(vec![]).on_exhausted(ExhaustedBehavior::Panic),
-            );
-            Agent::with_provider(
-                env,
-                tools,
-                Vec::new(),
-                provider,
-                Arc::new(scripted_model_info()),
-                StreamOptions::default(),
-                None,
-            )
-        };
-
-        // With a read_file tool: only the enabled, model-visible skill
-        // is listed.
-        let agent = agent_with_tools(env.clone(), vec![ReadFileStubTool.into()]);
-        let prompt = agent.assemble_system_prompt();
-        assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<name>alpha</name>"));
-        assert!(!prompt.contains("beta"));
-        assert!(!prompt.contains("gamma"));
-        // The listing precedes the trailing <env> block.
-        assert!(
-            prompt.find("</available_skills>").unwrap() < prompt.find("<env>").unwrap(),
-            "skills listing must come before the env block"
-        );
-
-        // Without a read_file tool the listing is omitted.
-        let agent = agent_with_tools(env, vec![PingTool.into()]);
-        let prompt = agent.assemble_system_prompt();
-        assert!(!prompt.contains("<available_skills>"));
     }
 
     #[tokio::test]
@@ -4566,9 +4409,8 @@ mod event_protocol_tests {
                 .on_exhausted(ExhaustedBehavior::Panic),
         );
         let model_info = Arc::new(scripted_model_info());
-        let env = empty_env(std::env::temp_dir());
         let mut agent = Agent::with_provider(
-            env,
+            std::env::temp_dir(),
             Vec::new(),
             Vec::new(),
             provider,
@@ -5082,8 +4924,8 @@ mod event_protocol_tests {
     /// not dropped when `spawn_agent` returns.
     #[tokio::test]
     async fn spawn_agent_retains_sub_agent_in_registry() {
-        use crate::message::{AgentMessage, AgentMessageKind};
         use crate::SubAgentRegistry;
+        use crate::message::{AgentMessage, AgentMessageKind};
 
         // The parent and the sub-agent share one `ScriptedProvider`,
         // so scripts are consumed in run order across both:
@@ -5810,10 +5652,12 @@ mod event_protocol_tests {
         ];
         let mut agent = build_agent(
             scripts,
-            vec![SteerTool {
-                queues: queues.clone(),
-            }
-            .into()],
+            vec![
+                SteerTool {
+                    queues: queues.clone(),
+                }
+                .into(),
+            ],
         );
         agent.set_message_queues(queues.clone());
 
@@ -5937,10 +5781,12 @@ mod event_protocol_tests {
         ];
         let mut agent = build_agent(
             scripts,
-            vec![SteerTool {
-                queues: queues.clone(),
-            }
-            .into()],
+            vec![
+                SteerTool {
+                    queues: queues.clone(),
+                }
+                .into(),
+            ],
         );
         agent.set_message_queues(queues.clone());
 
@@ -6318,7 +6164,7 @@ mod event_protocol_tests {
 
 #[cfg(test)]
 mod grouping_tests {
-    use super::{group_tool_calls, PendingToolCall};
+    use super::{PendingToolCall, group_tool_calls};
 
     fn call(id: &str, name: &str) -> PendingToolCall {
         (id.to_string(), name.to_string(), serde_json::Value::Null)

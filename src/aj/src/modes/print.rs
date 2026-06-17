@@ -156,6 +156,10 @@ pub async fn run(args: Args) -> Result<()> {
         tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
         tracing::info!(disabled = ?config.disabled_tools, "filtered disabled tools");
     }
+    // Skills are progressive disclosure reachable only with a
+    // `read_file` tool, so the listing is gated on its presence in the
+    // assembled system prompt below.
+    let include_skills = tools.iter().any(|tool| tool.name == "read_file");
 
     let env = AgentEnv::new(SYSTEM_PROMPT, &config.disabled_skills);
     for d in &env.skill_diagnostics {
@@ -244,13 +248,13 @@ pub async fn run(args: Args) -> Result<()> {
         let mut stream_options = aj_models::types::StreamOptions::default();
         crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
         let mut agent = Agent::with_provider(
-            env,
+            env.working_directory.clone(),
             tools,
             config.disabled_tools.clone(),
             provider,
             model_info,
             stream_options,
-            config.thinking,
+            crate::model::default_thinking_from_config(config.thinking),
         );
         agent.set_speed(speed);
         agent
@@ -330,13 +334,13 @@ pub async fn run(args: Args) -> Result<()> {
         let mut stream_options = stream_options;
         crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
         let mut agent = Agent::with_provider(
-            env,
+            env.working_directory.clone(),
             tools,
             config.disabled_tools.clone(),
             provider,
             model_info,
             stream_options,
-            config.thinking,
+            crate::model::default_thinking_from_config(config.thinking),
         );
         agent.set_speed(speed);
 
@@ -392,7 +396,7 @@ pub async fn run(args: Args) -> Result<()> {
     let system_prompt = if let Some(persisted) = log.system_prompt() {
         persisted.to_string()
     } else {
-        let assembled = agent.assemble_system_prompt();
+        let assembled = crate::system_prompt::assemble_system_prompt(&env, include_skills);
         if log.is_empty() {
             log.set_system_prompt(assembled.clone())?;
             let model_info = agent.model_info();

@@ -43,6 +43,19 @@ use crate::modes::interactive::render_settings::RenderSettings;
 use crate::modes::interactive::shutdown::build_usage_summary;
 use crate::modes::interactive::{RunConfigSnapshot, SubAgentOverrides};
 
+/// An agent plus the host context the caller needs after
+/// construction: the [`AgentEnv`] it was built against (for the
+/// startup context notice, footer, and autocomplete) and whether the
+/// active tool set gates in the skills listing.
+struct BuiltAgent {
+    agent: Agent,
+    env: AgentEnv,
+    /// Whether the active tools include `read_file`. Skills are
+    /// progressive disclosure reachable only with that tool, so this
+    /// gates the skills listing in the assembled system prompt.
+    include_skills: bool,
+}
+
 /// Construct a fresh, not-yet-shared [`Agent`] from the persisted
 /// config and a provider bundle cloned out of the live run-config
 /// snapshot.
@@ -59,15 +72,17 @@ fn build_agent(
     stream_options: StreamOptions,
     thinking: Option<ThinkingConfig>,
     speed: Option<Speed>,
-) -> Agent {
+) -> BuiltAgent {
     let mut tools = get_builtin_tools(&BuiltinToolOptions {
         image_auto_resize: config.image_auto_resize,
     });
     if !config.disabled_tools.is_empty() {
         tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
     }
+    let include_skills = tools.iter().any(|tool| tool.name == "read_file");
+    let env = AgentEnv::new(SYSTEM_PROMPT, &config.disabled_skills);
     let mut agent = Agent::with_provider(
-        AgentEnv::new(SYSTEM_PROMPT, &config.disabled_skills),
+        env.working_directory.clone(),
         tools,
         config.disabled_tools.clone(),
         provider,
@@ -80,7 +95,11 @@ fn build_agent(
     agent.set_block_images(config.image_block);
     agent.set_default_thinking(thinking);
     agent.set_speed(speed);
-    agent
+    BuiltAgent {
+        agent,
+        env,
+        include_skills,
+    }
 }
 
 /// Dependencies for resume-time settings restoration: the model
@@ -276,6 +295,13 @@ pub struct SessionWorld {
     /// Shared because the submit handler spawns a task that holds it
     /// across `agent.prompt(...).await`.
     pub agent: Arc<TokioMutex<Agent>>,
+    /// The environment the agent was built against: base prompt,
+    /// AGENTS.md/CLAUDE.md context files, discovered skills, working
+    /// directory. The runtime no longer holds this (it took only the
+    /// assembled prompt), so the world keeps it for the startup
+    /// context notice, the footer cwd, and the editor's autocomplete
+    /// root.
+    pub env: AgentEnv,
     /// Sub-agent registry injected into `agent`; starts empty, so
     /// only sub-agents spawned in this session are promptable.
     pub registry: SubAgentRegistry,
@@ -395,7 +421,11 @@ impl SessionWorld {
                 cfg.model_key.clone(),
             )
         };
-        let mut agent = build_agent(
+        let BuiltAgent {
+            mut agent,
+            env,
+            include_skills,
+        } = build_agent(
             config,
             provider,
             model_info,
@@ -414,7 +444,7 @@ impl SessionWorld {
         let system_prompt = if let Some(persisted) = log.system_prompt() {
             persisted.to_string()
         } else {
-            let assembled = agent.assemble_system_prompt();
+            let assembled = crate::system_prompt::assemble_system_prompt(&env, include_skills);
             if log.is_empty() {
                 log.set_system_prompt(assembled.clone())?;
                 log.append_model_change(ThreadFilter::USER, &model_key.0, &model_key.1)?;
@@ -482,6 +512,7 @@ impl SessionWorld {
 
         Ok(SessionWorld {
             agent: Arc::new(TokioMutex::new(agent)),
+            env,
             registry,
             task_registry,
             message_queues,
@@ -715,7 +746,8 @@ mod tests {
             StreamOptions::default(),
             None,
             None,
-        );
+        )
+        .agent;
         world_a
             .registry
             .insert(7, Arc::new(TokioMutex::new(throwaway)));

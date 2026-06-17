@@ -197,25 +197,10 @@ fn build_run_config(
         provider,
         model_info,
         stream_options,
-        thinking: default_thinking_from_config(config.thinking),
+        thinking: crate::model::default_thinking_from_config(config.thinking),
         speed,
         model_key,
     }
-}
-
-/// Map a persisted `config.toml` thinking level onto the wire-level
-/// default. Mirrors the mapping `Agent::with_provider` applies
-/// (`Off` collapses to `None`); [`config_thinking_level`] is the
-/// exact inverse.
-fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Option<ThinkingConfig> {
-    level.and_then(|level| match level {
-        ConfigThinkingLevel::Off => None,
-        ConfigThinkingLevel::Low => Some(ThinkingConfig::Low),
-        ConfigThinkingLevel::Medium => Some(ThinkingConfig::Medium),
-        ConfigThinkingLevel::High => Some(ThinkingConfig::High),
-        ConfigThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
-        ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
-    })
 }
 
 /// User-facing notice shown when a session-changing command
@@ -561,10 +546,7 @@ impl InteractiveMode {
         // path completion live here. Typing `/` at the empty prompt
         // opens the command palette overlay (see the editor's
         // palette trigger), not an inline popup.
-        let working_directory = {
-            let a = world.agent.lock().await;
-            a.env().working_directory.clone()
-        };
+        let working_directory = world.env.working_directory.clone();
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
             let provider =
                 aj_tui::autocomplete::CombinedAutocompleteProvider::new(working_directory);
@@ -625,10 +607,7 @@ impl InteractiveMode {
         // indicator are pushed by `SessionWorld::install`'s footer
         // sync; the header's session id + banner are set by
         // `install` below as well.
-        let footer_cwd = {
-            let a = world.agent.lock().await;
-            format!("{}", a.env().working_directory.display())
-        };
+        let footer_cwd = format!("{}", world.env.working_directory.display());
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
             footer.set_cwd(Some(footer_cwd));
         }
@@ -664,16 +643,13 @@ impl InteractiveMode {
         // doesn't govern what's actually sent. Skill-discovery
         // warnings ride along under the same rule.
         if matches!(spec, SessionSpec::Create { .. }) {
-            let (context_notice, skill_warnings) = {
-                let a = world.agent.lock().await;
-                let env = a.env();
-                let warnings: Vec<String> = env
-                    .skill_diagnostics
-                    .iter()
-                    .map(|d| d.to_string())
-                    .collect();
-                (build_context_notice(env), warnings)
-            };
+            let env = &world.env;
+            let skill_warnings: Vec<String> = env
+                .skill_diagnostics
+                .iter()
+                .map(|d| d.to_string())
+                .collect();
+            let context_notice = build_context_notice(env);
             world.pump.handle(&mut tui, &notice_event(&context_notice));
             for warning in &skill_warnings {
                 world.pump.handle(&mut tui, &warning_event(warning));
@@ -2777,10 +2753,10 @@ fn apply_editor_agent_marker(tui: &mut Tui, id: AgentId) {
 }
 
 /// Map the agent's live default thinking back onto its persisted
-/// `config.toml` representation. The forward map in
-/// `Agent::with_provider` collapses [`ConfigThinkingLevel::Off`] to
-/// `None`; this is its exact inverse, so a popup choice round-trips
-/// through `config.toml` unchanged.
+/// `config.toml` representation. The forward map
+/// [`crate::model::default_thinking_from_config`] collapses
+/// [`ConfigThinkingLevel::Off`] to `None`; this is its exact inverse,
+/// so a popup choice round-trips through `config.toml` unchanged.
 fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> ConfigThinkingLevel {
     use aj_models::ThinkingConfig;
     match thinking {

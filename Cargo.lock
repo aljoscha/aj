@@ -54,7 +54,6 @@ dependencies = [
 name = "aj-agent"
 version = "0.1.0"
 dependencies = [
- "aj-conf",
  "aj-models",
  "anyhow",
  "async-trait",

@@ -1,11 +1,10 @@
 [package]
 name = "aj-agent"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-aj-conf = { path = "../aj-conf" }
 aj-models = { path = "../aj-models" }
 chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }

@@ -116,11 +116,7 @@ impl MessageQueues {
         let mut map = self.lock();
         let q = map.get_mut(&agent)?;
         let text = take_pending_text(q);
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 
     /// Drop `agent`'s pending message without returning it.

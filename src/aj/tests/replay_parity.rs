@@ -38,7 +38,7 @@
 //! sequences without any filtering — the parity comparison runs
 //! over the captured live stream verbatim.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,7 +51,6 @@ use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::{AgentEvent, AgentSettings};
 use aj_agent::tool::ErasedToolDefinition;
 use aj_agent::{Agent, AgentSeed, TurnError};
-use aj_conf::{AgentEnv, SystemPrompt, SystemPromptSource};
 use aj_models::provider::Provider;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
@@ -110,27 +109,6 @@ impl Terminal for StubTerminal {
     fn clear_screen(&mut self) {}
     fn set_title(&mut self, _: &str) {}
     fn flush(&mut self) {}
-}
-
-/// Build an [`AgentEnv`] that doesn't read from the host:
-/// deterministic working directory, no git root probe, no
-/// `AGENTS.md` / `CLAUDE.md` ingestion. Matches the helper in
-/// `src/aj-agent/src/lib.rs` event_protocol_tests so test runs in
-/// CI and on a developer laptop see the same agent surface.
-fn empty_env(working_directory: PathBuf) -> AgentEnv {
-    AgentEnv {
-        working_directory,
-        git_root_directory: None,
-        operating_system: "test".to_string(),
-        today_date: "2024-01-01".to_string(),
-        system_prompt: SystemPrompt {
-            content: "system prompt".to_string(),
-            source: SystemPromptSource::Builtin,
-        },
-        context_files: Vec::new(),
-        skills: Vec::new(),
-        skill_diagnostics: Vec::new(),
-    }
 }
 
 /// Identity stamped on every scripted [`AssistantMessage`] in this
@@ -283,7 +261,7 @@ async fn drive_live_turn(
     );
     let model_info = Arc::new(scripted_model_info());
 
-    let env = empty_env(working_dir.to_path_buf());
+    let env = working_dir.to_path_buf();
     let mut agent = Agent::with_provider(
         env,
         vec![tool],

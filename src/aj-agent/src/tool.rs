@@ -14,16 +14,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aj_models::types::UserContent;
-use schemars::generate::SchemaSettings;
 use schemars::JsonSchema;
+use schemars::generate::SchemaSettings;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::TaskRegistry;
 use crate::bus::EventBus;
 use crate::events::{AgentEvent, AgentId};
-use crate::TaskRegistry;
 
 // ---------------------------------------------------------------------------
 // Execution mode
