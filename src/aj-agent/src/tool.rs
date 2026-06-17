@@ -31,21 +31,23 @@ use crate::TaskRegistry;
 
 /// Per-tool execution mode.
 ///
-/// The agent batches all tool calls from a single assistant turn. If any
-/// tool in the batch declares [`ExecutionMode::Sequential`], the entire
-/// batch runs serially in source order; otherwise tools execute
-/// concurrently. Tools that mutate the filesystem or run arbitrary
-/// commands should opt into [`ExecutionMode::Sequential`] to avoid
-/// interleaving.
+/// The agent partitions a single assistant turn's tool calls into
+/// contiguous groups: a maximal run of [`ExecutionMode::Parallel`]
+/// tools forms one group that runs concurrently, while each
+/// [`ExecutionMode::Sequential`] tool is its own singleton group and
+/// acts as an ordering barrier. Groups run one at a time in source
+/// order and results are recorded in source order regardless of which
+/// calls finish first. Tools that mutate the filesystem or run
+/// arbitrary commands opt into [`ExecutionMode::Sequential`] so they
+/// never interleave with their neighbours.
 ///
 /// Default: [`ExecutionMode::Parallel`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
-    /// Forces serial execution of the whole batch when any tool in the
-    /// batch picks this mode.
+    /// Runs alone, as a barrier: it never overlaps the calls before or
+    /// after it in the batch.
     Sequential,
-    /// Eligible for concurrent execution when every tool in the batch
-    /// picks this mode.
+    /// Runs concurrently with the adjacent run of `Parallel` calls.
     Parallel,
 }
 

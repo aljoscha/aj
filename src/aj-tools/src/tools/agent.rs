@@ -20,10 +20,13 @@
 //! runtime catches them and synthesizes a generic error tool_result
 //! with `is_error: true` — same as the legacy contract.
 //!
-//! Execution mode stays at the trait default ([`Parallel`]). Multiple
-//! `agent` calls in one batch can run concurrently because each one
-//! gets a fresh sub-agent with its own bus framing; nothing about
-//! spawning interleaves on shared state.
+//! Execution mode stays at the trait default ([`Parallel`]), so
+//! several `agent` calls in one assistant message run concurrently:
+//! the runtime groups contiguous `Parallel` tool calls and drives them
+//! together. Each spawn gets its own sub-agent with its own bus
+//! framing, but concurrent agents share one working directory and
+//! filesystem with no isolation or locking. The description warns the
+//! model to scope parallel agents' work accordingly.
 //!
 //! [`Parallel`]: aj_agent::tool::ExecutionMode::Parallel
 
@@ -59,6 +62,14 @@ returns immediately with a task id, and the sub-agent's report is delivered to
 you as a completion notice when it finishes. Don't babysit a background
 sub-agent with task_output calls — the notice arrives on its own; use
 task_stop(id) if you need to stop it early.
+
+Parallel agents share your filesystem. When you launch several agents at once
+(several agent calls in one message, or multiple background agents), they run
+concurrently against the same working directory, with no isolation or locking
+between them. If two agents edit the same files or use the same scratch paths,
+they will clobber each other's work. Only run agents in parallel when their
+tasks are independent. Give each agent its own scratch paths, and keep edits to
+any given file within a single agent, or run those tasks one at a time.
 "#;
 
 #[derive(Debug, Clone)]
