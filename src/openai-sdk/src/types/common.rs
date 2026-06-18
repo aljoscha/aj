@@ -1,6 +1,9 @@
 use std::fmt::Display;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Unexpected},
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -13,13 +16,39 @@ pub struct ApiError {
     pub r#type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub param: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Provider error code. Deserialized from either a JSON string or
+    /// number (OpenRouter sends numeric codes like `402`). Always
+    /// stored as a string.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_code",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub code: Option<String>,
 }
 
 impl Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "OpenAI API error: {}", self.message)
+    }
+}
+
+/// Deserialize a provider error code from either a JSON string or
+/// number. OpenRouter sends numeric codes (e.g. `402`) while OpenAI
+/// itself sends string codes (e.g. `"context_length_exceeded"`).
+fn deserialize_code<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(s) => Ok(Some(s)),
+        Value::Number(n) => Ok(Some(n.to_string())),
+        Value::Null => Ok(None),
+        _ => Err(de::Error::invalid_type(
+            Unexpected::Other("a non-string, non-number value"),
+            &"a string or number",
+        )),
     }
 }
 
@@ -89,4 +118,43 @@ pub struct JsonSchemaDefinition {
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_code_string() {
+        let error: ApiError =
+            serde_json::from_str(r#"{"message": "boom", "code": "context_length_exceeded"}"#)
+                .unwrap();
+        assert_eq!(error.code.as_deref(), Some("context_length_exceeded"));
+    }
+
+    #[test]
+    fn error_code_number() {
+        // OpenRouter sends numeric codes like `402`.
+        let error: ApiError = serde_json::from_str(r#"{"message": "boom", "code": 402}"#).unwrap();
+        assert_eq!(error.code.as_deref(), Some("402"));
+    }
+
+    #[test]
+    fn error_code_null() {
+        let error: ApiError = serde_json::from_str(r#"{"message": "boom", "code": null}"#).unwrap();
+        assert_eq!(error.code, None);
+    }
+
+    #[test]
+    fn error_code_absent() {
+        let error: ApiError = serde_json::from_str(r#"{"message": "boom"}"#).unwrap();
+        assert_eq!(error.code, None);
+    }
+
+    #[test]
+    fn error_code_invalid_type() {
+        assert!(
+            serde_json::from_str::<ApiError>(r#"{"message": "boom", "code": ["nope"]}"#).is_err()
+        );
+    }
 }
