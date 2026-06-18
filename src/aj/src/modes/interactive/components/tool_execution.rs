@@ -111,12 +111,21 @@ pub(crate) enum HintKind {
 /// the user can't trigger. The returned string is `style::dim`-wrapped
 /// so it reads as muted next to the surrounding body content.
 pub(crate) fn expand_hint(more: usize, kind: HintKind) -> String {
+    style::dim(&expand_hint_text(more, kind))
+}
+
+/// Plain (unstyled) form of [`expand_hint`], with the bound key
+/// resolved the same way. Callers that feed the hint through a renderer
+/// applying its own styling (e.g. the markdown widget's italic) want
+/// the text without an embedded `style::dim` escape, which such a
+/// renderer would otherwise show literally.
+pub(crate) fn expand_hint_text(more: usize, kind: HintKind) -> String {
     let kb = aj_tui::keybindings::get();
     let keys = kb.get_keys(crate::config::keybindings::ACTION_TOOLS_EXPAND);
     let key = keys
         .first()
         .map(|k| aj_tui::keybindings::format_keybinding(k));
-    style::dim(&format_expand_hint(more, kind, key.as_deref()))
+    format_expand_hint(more, kind, key.as_deref())
 }
 
 /// Pure formatting half of [`expand_hint`]; takes the display-formatted

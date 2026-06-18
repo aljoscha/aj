@@ -1430,8 +1430,10 @@ impl Agent {
             // renders as regular markdown between them instead of
             // being glued to the tag text.
             let text = format!(
-                "<task-notification>\n{}\n</task-notification>",
-                notice.body.trim_end()
+                "{}\n{}\n{}",
+                crate::tool::TASK_NOTIFICATION_OPEN_TAG,
+                notice.body.trim_end(),
+                crate::tool::TASK_NOTIFICATION_CLOSE_TAG,
             );
             let message = AgentMessage::wire(Message::User(UserMessage::text(text)));
             self.transcript.push(message.clone());

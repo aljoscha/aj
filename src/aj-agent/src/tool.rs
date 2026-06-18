@@ -438,9 +438,20 @@ pub struct StartedTask {
     pub events: TaskEventSink,
 }
 
+/// Opening tag wrapping a harness-injected task-completion notice in
+/// the transcript. `Agent::drain_task_notices` emits each notice body
+/// between this tag and [`TASK_NOTIFICATION_CLOSE_TAG`] as a user
+/// message, marking it as harness-injected rather than a user reply.
+/// Frontends key their rendering off the open tag, so the format lives
+/// here as the single source of truth.
+pub const TASK_NOTIFICATION_OPEN_TAG: &str = "<task-notification>";
+
+/// Closing tag paired with [`TASK_NOTIFICATION_OPEN_TAG`].
+pub const TASK_NOTIFICATION_CLOSE_TAG: &str = "</task-notification>";
+
 /// Completion notice queued when a background task reaches a terminal
 /// status, drained into the owner's transcript at the next drain
-/// point as a `<task-notification>` user message.
+/// point as a user message wrapped in [`TASK_NOTIFICATION_OPEN_TAG`].
 #[derive(Clone, Debug)]
 pub struct TaskNotice {
     /// The agent that started the task and receives the notice.

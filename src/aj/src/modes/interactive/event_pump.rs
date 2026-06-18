@@ -30,7 +30,7 @@ use std::time::Instant;
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionPhase};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::queue::MessageQueues;
-use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
+use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskId, TaskKind, TaskStatus};
 use aj_agent::types::TokenUsage;
 use aj_models::registry::ModelInfo;
 use aj_models::streaming::AssistantMessageEvent;
@@ -911,8 +911,23 @@ impl EventPump {
         if text.is_empty() {
             return;
         }
-        let component = UserMessageComponent::new(&text, &self.theme);
-        self.push_chat_child(tui, agent_id, Box::new(component));
+        // Harness-injected task-completion notices arrive as user
+        // messages wrapped in the task-notification tag (see
+        // `Agent::drain_task_notices`). They can be long, so render them
+        // foldable under the shared `aj.tools.expand` toggle instead of
+        // dumping the whole notice into scrollback. Typed prompts never
+        // start with the tag.
+        let component: Box<dyn aj_tui::component::Component> =
+            if text.trim_start().starts_with(TASK_NOTIFICATION_OPEN_TAG) {
+                Box::new(UserMessageComponent::new_collapsible(
+                    &text,
+                    &self.theme,
+                    self.render_settings.clone(),
+                ))
+            } else {
+                Box::new(UserMessageComponent::new(&text, &self.theme))
+            };
+        self.push_chat_child(tui, agent_id, component);
     }
 
     /// Handle [`AgentEvent::MessageStart`]. A no-op on the TUI
