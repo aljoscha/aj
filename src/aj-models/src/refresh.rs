@@ -26,6 +26,12 @@ use crate::registry::{
 /// CLI wiring) can override it without re-deriving the URL.
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
+/// OpenRouter's live model list. We fetch this in addition to
+/// models.dev because OpenRouter aggregates a large, fast-moving set of
+/// models that models.dev does not enumerate. Public for the same
+/// override reasons as [`MODELS_DEV_URL`].
+pub const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+
 // ---------------------------------------------------------------------------
 // Provider-specific fixed values (§3.4.3).
 // ---------------------------------------------------------------------------
@@ -58,6 +64,21 @@ const PROVIDER_FIXED_VALUES: &[ProviderFixedValues] = &[
         base_url: "https://api.openai.com/v1",
     },
 ];
+
+// ---------------------------------------------------------------------------
+// OpenRouter fixed values.
+// ---------------------------------------------------------------------------
+
+/// Catalog provider id for OpenRouter models.
+const OPENROUTER_PROVIDER_ID: &str = "openrouter";
+/// Wire shape we route OpenRouter through. OpenRouter exposes an
+/// OpenAI-compatible Responses API, so the existing responses provider
+/// serves it with only a `base_url` override. See
+/// `docs/openrouter-spec.md`.
+const OPENROUTER_API: &str = "openai-responses";
+/// Base URL for OpenRouter's Responses endpoint (the provider appends
+/// `/responses`).
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 // ---------------------------------------------------------------------------
 // models.dev API shape (only the fields we need).
@@ -114,6 +135,62 @@ struct RawModalities {
 }
 
 // ---------------------------------------------------------------------------
+// OpenRouter API shape (only the fields we need).
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug)]
+struct OpenRouterList {
+    #[serde(default)]
+    data: Vec<OpenRouterModel>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenRouterModel {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    architecture: Option<OpenRouterArch>,
+    #[serde(default)]
+    pricing: Option<OpenRouterPricing>,
+    #[serde(default)]
+    top_provider: Option<OpenRouterTopProvider>,
+    /// Capability flags. We key tool support and reasoning off this:
+    /// `"tools"` gates eligibility, `"reasoning"` sets the flag.
+    #[serde(default)]
+    supported_parameters: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct OpenRouterArch {
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    output_modalities: Vec<String>,
+}
+
+/// Per-token USD prices as strings (OpenRouter's wire format).
+#[derive(Deserialize, Debug, Default)]
+struct OpenRouterPricing {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct OpenRouterTopProvider {
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
 
@@ -152,22 +229,50 @@ impl RefreshSummary {
     }
 }
 
-/// Fetch models.dev, normalize, apply overrides, and atomically write
-/// the user cache at `~/.aj/models.json`. On any failure (network
-/// error, non-200 response, parse failure, write error) the existing
-/// cache is left untouched and an error is returned.
+/// Fetch models.dev and OpenRouter, normalize, apply overrides, and
+/// atomically write the user cache at `~/.aj/models.json`. On any
+/// failure the existing cache is left untouched and an error is
+/// returned. models.dev is the baseline source and its failure is
+/// fatal. An OpenRouter fetch failure is not: we warn and carry forward
+/// the OpenRouter rows from the existing cache (if any) so a third-party
+/// outage never blocks a first-party refresh.
 pub async fn refresh_user_cache() -> Result<RefreshSummary> {
-    refresh_user_cache_from(MODELS_DEV_URL).await
+    refresh_user_cache_from(MODELS_DEV_URL, OPENROUTER_MODELS_URL).await
 }
 
 /// Same as [`refresh_user_cache`] but lets the caller override the
-/// upstream URL. The two-arg form exists for tests that point at a
+/// upstream URLs. The override form exists for tests that point at a
 /// local fixture server, and for any future override needs.
-pub async fn refresh_user_cache_from(url: &str) -> Result<RefreshSummary> {
+pub async fn refresh_user_cache_from(
+    models_dev_url: &str,
+    openrouter_url: &str,
+) -> Result<RefreshSummary> {
     let dest = user_cache_path()
         .context("could not determine user cache path; HOME env var may be unset")?;
-    let body = fetch_models_dev(url).await?;
-    let new_catalog = build_catalog_from_json(&body)?;
+    let models_dev_body = fetch_url(models_dev_url).await?;
+
+    // A reachable OpenRouter gives the live catalog. When it is
+    // unreachable we keep whatever OpenRouter rows the cache already has
+    // rather than dropping the provider, which also keeps the refresh
+    // diff from reporting every OpenRouter model as removed.
+    let new_catalog = match fetch_url(openrouter_url).await {
+        Ok(openrouter_body) => build_catalog_from_json(&models_dev_body, Some(&openrouter_body))?,
+        Err(err) => {
+            tracing::warn!(
+                "OpenRouter model list fetch failed ({err}); keeping previously cached OpenRouter models"
+            );
+            let mut models = parse_models_dev(&models_dev_body)?;
+            let cached = cached_openrouter_models(&dest);
+            let source = if cached.is_empty() {
+                "models.dev"
+            } else {
+                "models.dev+openrouter (cached)"
+            };
+            models.extend(cached);
+            assemble_catalog(models, source)
+        }
+    };
+
     let summary = build_summary(&dest, &new_catalog);
     write_catalog_atomically(&dest, &new_catalog)?;
     Ok(summary)
@@ -177,10 +282,10 @@ pub async fn refresh_user_cache_from(url: &str) -> Result<RefreshSummary> {
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Fetch the raw JSON body from models.dev. Surfaces the HTTP status on
+/// Fetch the raw JSON body from `url`. Surfaces the HTTP status on
 /// non-2xx responses so the user understands why the cache wasn't
 /// touched.
-async fn fetch_models_dev(url: &str) -> Result<String> {
+async fn fetch_url(url: &str) -> Result<String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("aj/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -200,10 +305,32 @@ async fn fetch_models_dev(url: &str) -> Result<String> {
         .with_context(|| format!("reading body from {url}"))
 }
 
-/// Parse a models.dev JSON payload into a normalized [`Catalog`] with
-/// overrides applied. Public-in-crate so the round-trip test below can
-/// exercise it without hitting the network.
-fn build_catalog_from_json(body: &str) -> Result<Catalog> {
+/// Parse the models.dev and (optional) OpenRouter payloads into a
+/// normalized [`Catalog`] with the Codex seed spliced in and overrides
+/// applied. Public-in-crate so the round-trip tests below can exercise
+/// it without hitting the network. Pass `None` for `openrouter_body` to
+/// build a models.dev-only catalog.
+fn build_catalog_from_json(
+    models_dev_body: &str,
+    openrouter_body: Option<&str>,
+) -> Result<Catalog> {
+    let mut models = parse_models_dev(models_dev_body)?;
+
+    let source = match openrouter_body {
+        Some(body) => {
+            models.extend(parse_openrouter(body)?);
+            "models.dev+openrouter"
+        }
+        None => "models.dev",
+    };
+
+    Ok(assemble_catalog(models, source))
+}
+
+/// Parse a models.dev JSON payload into the mapped, tool-filtered model
+/// list. Does not splice the Codex seed, sort, or apply overrides. That
+/// is [`assemble_catalog`]'s job.
+fn parse_models_dev(body: &str) -> Result<Vec<ModelInfo>> {
     // The top-level object is keyed by provider id; we only care about
     // a fixed subset, so parse into a flexible map and look up the keys
     // we need. Unknown providers are ignored silently.
@@ -238,7 +365,45 @@ fn build_catalog_from_json(body: &str) -> Result<Catalog> {
             models.push(mapped);
         }
     }
+    Ok(models)
+}
 
+/// Parse OpenRouter's `/api/v1/models` payload into the mapped,
+/// tool-filtered model list. Drops models that lack tool support or
+/// cannot emit text (e.g. pure image generators).
+fn parse_openrouter(body: &str) -> Result<Vec<ModelInfo>> {
+    let list: OpenRouterList =
+        serde_json::from_str(body).context("parsing openrouter models response as JSON")?;
+
+    let mut models = Vec::new();
+    for m in &list.data {
+        // NOTE: we do not dedup by id. OpenRouter ids are unique in the
+        // `/models` response, so a duplicate would indicate an upstream
+        // bug. On load the registry keys by `(provider, id)` and would
+        // collapse any dup anyway.
+        // Agent use requires tool calling.
+        if !m.supported_parameters.iter().any(|p| p == "tools") {
+            continue;
+        }
+        // Drop models that declare output modalities none of which are
+        // text. An empty/absent list is treated as text-capable.
+        if let Some(arch) = &m.architecture
+            && !arch.output_modalities.is_empty()
+            && !arch
+                .output_modalities
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("text"))
+        {
+            continue;
+        }
+        models.push(map_openrouter_model(m));
+    }
+    Ok(models)
+}
+
+/// Splice the hand-curated Codex seed, sort, apply overrides, and stamp
+/// catalog metadata. Shared tail of catalog construction across sources.
+fn assemble_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
     // §3.4.7: re-emit Codex models from the hand-curated seed after
     // upstream filtering. Refresh writes the codex entries into the
     // user cache so subsequent refreshes diff cleanly (without the
@@ -263,11 +428,11 @@ fn build_catalog_from_json(body: &str) -> Result<Catalog> {
         apply_override(&mut models, entry);
     }
 
-    Ok(Catalog {
+    Catalog {
         updated_at: chrono::Utc::now().timestamp_millis(),
-        source: "models.dev".to_string(),
+        source: source.to_string(),
         models,
-    })
+    }
 }
 
 /// Normalize a single models.dev entry into our [`ModelInfo`] shape.
@@ -319,6 +484,63 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         // own that for providers that need static identity headers.
         headers: None,
     }
+}
+
+/// Normalize a single OpenRouter `/models` entry into our [`ModelInfo`]
+/// shape. The full slash-namespaced id is kept verbatim (e.g.
+/// `anthropic/claude-sonnet-4`). All entries map to the Responses wire
+/// shape against OpenRouter's base URL.
+fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
+    let arch = m.architecture.as_ref();
+    let pricing = m.pricing.as_ref();
+
+    let mut input = vec![InputModality::Text];
+    if let Some(a) = arch
+        && a.input_modalities
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("image"))
+    {
+        input.push(InputModality::Image);
+    }
+
+    ModelInfo {
+        id: m.id.clone(),
+        name: m.name.clone().unwrap_or_else(|| m.id.clone()),
+        api: OPENROUTER_API.to_string(),
+        provider: OPENROUTER_PROVIDER_ID.to_string(),
+        base_url: OPENROUTER_BASE_URL.to_string(),
+        reasoning: m.supported_parameters.iter().any(|p| p == "reasoning"),
+        // Adaptive thinking is an Anthropic-native concept.
+        supports_adaptive_thinking: false,
+        input,
+        cost: ModelCost {
+            input: openrouter_price_per_million(pricing.and_then(|p| p.prompt.as_deref())),
+            output: openrouter_price_per_million(pricing.and_then(|p| p.completion.as_deref())),
+            cache_read: openrouter_price_per_million(
+                pricing.and_then(|p| p.input_cache_read.as_deref()),
+            ),
+            cache_write: openrouter_price_per_million(
+                pricing.and_then(|p| p.input_cache_write.as_deref()),
+            ),
+        },
+        context_window: m.context_length.unwrap_or(4096),
+        max_tokens: m
+            .top_provider
+            .as_ref()
+            .and_then(|t| t.max_completion_tokens)
+            .unwrap_or(4096),
+        headers: None,
+    }
+}
+
+/// OpenRouter prices are per-token USD strings. Convert to the
+/// per-million-token figure our [`ModelCost`] uses. A missing or
+/// unparseable price becomes zero so we never bill against an unknown
+/// rate.
+fn openrouter_price_per_million(raw: Option<&str>) -> f64 {
+    raw.and_then(|s| s.parse::<f64>().ok())
+        .map(|p| p * 1_000_000.0)
+        .unwrap_or(0.0)
 }
 
 /// Compare the new catalog against whatever is currently on disk and
@@ -380,6 +602,20 @@ fn load_previous_catalog(dest: &Path) -> Option<Catalog> {
     }
     let body = fs::read_to_string(dest).ok()?;
     serde_json::from_str(&body).ok()
+}
+
+/// OpenRouter rows from the existing cache, used to carry the provider
+/// forward when a live OpenRouter fetch fails. Empty when there is no
+/// readable prior cache.
+fn cached_openrouter_models(dest: &Path) -> Vec<ModelInfo> {
+    load_previous_catalog(dest)
+        .map(|c| {
+            c.models
+                .into_iter()
+                .filter(|m| m.provider == OPENROUTER_PROVIDER_ID)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Write the catalog to `dest` atomically: serialize to a temp file in
@@ -463,7 +699,7 @@ mod tests {
 
     #[test]
     fn build_catalog_filters_and_maps() {
-        let cat = build_catalog_from_json(FIXTURE).expect("parses");
+        let cat = build_catalog_from_json(FIXTURE, None).expect("parses");
         // Two upstream models survive filtering plus the bundled
         // Codex seed appended at the end. google must be ignored (not
         // a target provider) and the non-tool anthropic model must be
@@ -474,9 +710,9 @@ mod tests {
         assert_eq!(cat.source, "models.dev");
         assert!(cat.updated_at > 0);
 
-        // Upstream entries come first, sorted by (provider, id): the
-        // codex seed is appended after them (no global resort across
-        // upstream + seed) so its position is deterministic.
+        // The whole catalog is sorted by (provider, id). The codex
+        // seed lands last here because `openai-codex` orders after
+        // `anthropic`/`openai` in this fixture.
         let upstream_identities: Vec<_> = cat
             .models
             .iter()
@@ -535,7 +771,7 @@ mod tests {
                 }
             }
         }"#;
-        let cat = build_catalog_from_json(body).expect("parses");
+        let cat = build_catalog_from_json(body, None).expect("parses");
         // One upstream model + the bundled codex seed.
         assert_eq!(cat.models.len(), 1 + bundled_codex_seed().len());
         let m = cat
@@ -559,7 +795,7 @@ mod tests {
         let dest = tmp.path().join("models.json");
 
         // First write: everything is "added".
-        let cat1 = build_catalog_from_json(FIXTURE).expect("parses");
+        let cat1 = build_catalog_from_json(FIXTURE, None).expect("parses");
         let codex_count = bundled_codex_seed().len();
         let expected_total = 2 + codex_count;
         assert_eq!(cat1.models.len(), expected_total);
@@ -630,7 +866,7 @@ mod tests {
         let dest = tmp.path().join("models.json");
 
         // First refresh: writes upstream + codex seed.
-        let cat1 = build_catalog_from_json(FIXTURE).expect("parses");
+        let cat1 = build_catalog_from_json(FIXTURE, None).expect("parses");
         write_catalog_atomically(&dest, &cat1).expect("writes");
 
         let codex_count = bundled_codex_seed().len();
@@ -643,7 +879,7 @@ mod tests {
 
         // Second refresh from an identical upstream feed: the catalog
         // is unchanged on disk (after rewrite, the diff is empty).
-        let cat2 = build_catalog_from_json(FIXTURE).expect("parses");
+        let cat2 = build_catalog_from_json(FIXTURE, None).expect("parses");
         let summary = build_summary(&dest, &cat2);
         assert!(
             summary.removed.is_empty(),
@@ -669,5 +905,155 @@ mod tests {
             .map(|m| m.id.as_str())
             .collect();
         assert_eq!(codex_ids_1, codex_ids_2);
+    }
+
+    /// OpenRouter fixture covering the cases we map: a tool+reasoning
+    /// model with image input, a tool-only non-reasoning model, a model
+    /// without tool support (dropped), and a pure image-output model
+    /// (dropped).
+    const OPENROUTER_FIXTURE: &str = r#"{
+        "data": [
+            {
+                "id": "vendor/reasoner-1",
+                "name": "Vendor Reasoner 1",
+                "context_length": 200000,
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"]
+                },
+                "pricing": {
+                    "prompt": "0.000002",
+                    "completion": "0.000012",
+                    "input_cache_read": "0.0000002",
+                    "input_cache_write": "0.000000375"
+                },
+                "top_provider": {"max_completion_tokens": 32768},
+                "supported_parameters": ["tools", "reasoning", "temperature"]
+            },
+            {
+                "id": "vendor/chat-1",
+                "name": "Vendor Chat 1",
+                "context_length": 64000,
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"]
+                },
+                "pricing": {"prompt": "0.0000005", "completion": "0.0000015"},
+                "supported_parameters": ["tools", "temperature"]
+            },
+            {
+                "id": "vendor/minimal",
+                "pricing": {"prompt": "not-a-number"},
+                "supported_parameters": ["tools"]
+            },
+            {
+                "id": "vendor/no-tools",
+                "name": "No Tools",
+                "supported_parameters": ["temperature"]
+            },
+            {
+                "id": "vendor/image-only",
+                "name": "Image Only",
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["image"]
+                },
+                "supported_parameters": ["tools"]
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn build_catalog_includes_openrouter() {
+        let cat = build_catalog_from_json(FIXTURE, Some(OPENROUTER_FIXTURE)).expect("parses");
+        assert_eq!(cat.source, "models.dev+openrouter");
+
+        let or: Vec<_> = cat
+            .models
+            .iter()
+            .filter(|m| m.provider == "openrouter")
+            .collect();
+        // Only the tool-capable, text-output models survive.
+        let ids: Vec<&str> = or.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["vendor/chat-1", "vendor/minimal", "vendor/reasoner-1"]
+        );
+
+        let reasoner = or
+            .iter()
+            .find(|m| m.id == "vendor/reasoner-1")
+            .expect("reasoner present");
+        assert_eq!(reasoner.api, "openai-responses");
+        assert_eq!(reasoner.base_url, "https://openrouter.ai/api/v1");
+        assert!(reasoner.reasoning);
+        assert!(!reasoner.supports_adaptive_thinking);
+        assert_eq!(
+            reasoner.input,
+            vec![InputModality::Text, InputModality::Image]
+        );
+        assert_eq!(reasoner.context_window, 200_000);
+        assert_eq!(reasoner.max_tokens, 32_768);
+        // Per-token USD strings convert to per-million figures.
+        assert!((reasoner.cost.input - 2.0).abs() < 1e-9);
+        assert!((reasoner.cost.output - 12.0).abs() < 1e-9);
+        assert!((reasoner.cost.cache_read - 0.2).abs() < 1e-9);
+        assert!((reasoner.cost.cache_write - 0.375).abs() < 1e-9);
+
+        let chat = or
+            .iter()
+            .find(|m| m.id == "vendor/chat-1")
+            .expect("chat present");
+        assert!(!chat.reasoning);
+        assert_eq!(chat.input, vec![InputModality::Text]);
+        // No cache pricing in the fixture defaults to zero.
+        assert_eq!(chat.cost.cache_read, 0.0);
+        // No `top_provider` falls back to the default output cap.
+        assert_eq!(chat.max_tokens, 4096);
+
+        // The bare entry exercises every fallback: name->id, default
+        // context/output limits, text-only input, and an unparseable
+        // price collapsing to zero.
+        let minimal = or
+            .iter()
+            .find(|m| m.id == "vendor/minimal")
+            .expect("minimal present");
+        assert_eq!(minimal.name, "vendor/minimal");
+        assert_eq!(minimal.context_window, 4096);
+        assert_eq!(minimal.max_tokens, 4096);
+        assert_eq!(minimal.input, vec![InputModality::Text]);
+        assert!(!minimal.reasoning);
+        assert_eq!(minimal.cost.input, 0.0);
+    }
+
+    #[test]
+    fn openrouter_price_conversion() {
+        // Per-token USD string to per-million figure.
+        assert!((openrouter_price_per_million(Some("0.000002")) - 2.0).abs() < 1e-9);
+        // Missing or unparseable prices collapse to zero.
+        assert_eq!(openrouter_price_per_million(None), 0.0);
+        assert_eq!(openrouter_price_per_million(Some("")), 0.0);
+        assert_eq!(openrouter_price_per_million(Some("free")), 0.0);
+    }
+
+    #[test]
+    fn cached_openrouter_models_filters_prior_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("models.json");
+
+        // No prior cache yields nothing to carry forward.
+        assert!(cached_openrouter_models(&dest).is_empty());
+
+        let cat = build_catalog_from_json(FIXTURE, Some(OPENROUTER_FIXTURE)).expect("parses");
+        write_catalog_atomically(&dest, &cat).expect("writes");
+
+        let carried = cached_openrouter_models(&dest);
+        let expected = cat
+            .models
+            .iter()
+            .filter(|m| m.provider == "openrouter")
+            .count();
+        assert_eq!(carried.len(), expected);
+        assert!(carried.iter().all(|m| m.provider == "openrouter"));
     }
 }
