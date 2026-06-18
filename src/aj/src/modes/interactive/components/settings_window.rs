@@ -606,6 +606,7 @@ fn text_submenu_factory() -> SubmenuFactory {
     Box::new(move |current: &str, done: SubmenuDoneCallback| {
         let mut input = TextInput::new("> ");
         input.set_value(current);
+        input.move_to_end();
         input.set_focused(true);
         Box::new(TextEditSubmenu {
             input,

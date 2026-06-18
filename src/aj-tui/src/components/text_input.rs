@@ -96,6 +96,17 @@ impl TextInput {
         self.cursor
     }
 
+    /// Move the cursor to the end of the value.
+    ///
+    /// `set_value` deliberately preserves the cursor, so pre-filling a
+    /// freshly built input (which starts at cursor 0) leaves the caret
+    /// at the start. Callers that open an editor on existing text use
+    /// this to place the caret where the user expects to continue
+    /// typing.
+    pub fn move_to_end(&mut self) {
+        self.cursor = self.value.len();
+    }
+
     /// Clear the input.
     pub fn clear(&mut self) {
         self.undo_stack.push((self.value.clone(), self.cursor));
