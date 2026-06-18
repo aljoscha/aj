@@ -1,30 +1,30 @@
 //! Model-selector overlay (`/model`).
 //!
-//! Pairs a [`aj_tui::components::text_input::TextInput`] for live
-//! filtering with a [`aj_tui::components::select_list::SelectList`]
+//! Pairs a search box with a [`aj_tui::components::select_list::SelectList`]
 //! that shows the matching entries from a snapshotted
-//! [`aj_models::registry::ModelRegistry`]. The host opens this
-//! overlay from `/model`; pressing Enter commits the highlighted
-//! entry, Esc cancels.
+//! [`aj_models::registry::ModelRegistry`]. The host opens this overlay
+//! from `/model`; pressing Enter commits the highlighted entry, Esc
+//! cancels.
 //!
-//! The component owns the catalog and rebuilds the inner
-//! [`SelectList`] on every text change so the visible rows track the
-//! current query through a fuzzy matcher
-//! ([`aj_tui::fuzzy::FuzzyMatcher`]). The current model (the one
-//! already wired into the agent) is pre-selected on open and tagged
-//! `(current)` so a no-op confirm is obvious.
-//!
-//! See `docs/aj-next-plan.md` Phase 1 "Selectors and theming".
+//! The shared [`FilterableSelect`] owns the search box and key routing.
+//! Filtering can't be expressed as a [`SelectList`] filter mode here — the
+//! model filter fuzzy-scores each entry's `provider`, `id`, and `name`
+//! fields independently — so this component installs an `on_query` handler
+//! that repopulates the list via [`SelectList::set_items`] on each
+//! keystroke. The current model (the one already wired into the agent) is
+//! pre-selected on open and tagged `(current)` so a no-op confirm is
+//! obvious.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aj_models::registry::ModelInfo;
 use aj_tui::component::Component;
+use aj_tui::components::filterable_select::FilterableSelect;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
-use aj_tui::components::text_input::TextInput;
 use aj_tui::fuzzy::FuzzyMatcher;
-use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
+
+use crate::modes::interactive::components::outcome::OutcomeSlot;
 
 /// Outcome of a single overlay session.
 ///
@@ -40,49 +40,17 @@ pub enum ModelSelectorOutcome {
 
 /// Cheap-to-clone handle pointing at the same outcome slot the
 /// overlay component writes into.
-pub type OutcomeHandle = Arc<Mutex<Option<ModelSelectorOutcome>>>;
+pub type OutcomeHandle = OutcomeSlot<ModelSelectorOutcome>;
 
-/// The overlay's top-level component.
-///
-/// Owns the search input (`search`), the inner [`SelectList`]
-/// (`list`), the cached catalog (`catalog`), and the outcome slot
-/// (`outcome`). The host keeps another clone of `outcome` and polls
-/// it after each input event to decide whether to close the overlay.
+/// `(provider, id)` of the agent's current model, used to pre-select and
+/// tag the active row.
+type CurrentKey = Option<(String, String)>;
+
+/// The overlay's top-level component: a [`FilterableSelect`] whose query
+/// handler re-scores the catalog.
 pub struct ModelSelectorComponent {
-    /// Search box at the top of the overlay. Typing into it
-    /// rebuilds `list`; Enter on this field is intercepted at the
-    /// component level so it commits the highlighted list item
-    /// instead of firing `TextInput::on_submit`.
-    search: TextInput,
-    /// Result list. Rebuilt every time `search` changes so the
-    /// fuzzy-filtered entries reflect the current query.
-    list: SelectList,
-    /// Full unfiltered catalog. The component clones each entry it
-    /// emits on confirm; keeping the source of truth here avoids
-    /// any chance of drifting between filter and confirm.
-    catalog: Vec<ModelInfo>,
-    /// `(provider, id)` of the model the agent is currently using.
-    /// Used to pre-select the active row on open and mark it
-    /// `(current)` so a no-op confirm is obvious.
-    current_key: Option<(String, String)>,
-    /// Shared outcome slot. The host clones this handle once at
-    /// construction and polls it after every input event.
+    inner: FilterableSelect,
     outcome: OutcomeHandle,
-    /// Theme used to build the inner [`SelectList`]. Stored so a
-    /// rebuild (after a search-text change) can reuse the same
-    /// palette without the host having to pass it back in.
-    theme: SelectListTheme,
-    /// Reusable fuzzy matcher. Pulled out as a field so we don't
-    /// reconstruct the underlying nucleo state on every keystroke
-    /// (it allocates ~135 KB up front per `FuzzyMatcher::new`).
-    matcher: FuzzyMatcher,
-    /// Visible-row budget for the inner [`SelectList`]. Seeded with
-    /// [`DEFAULT_VISIBLE_ROWS`] and updated by
-    /// [`Component::set_available_height`] so the list fills the
-    /// overlay's content area. Remembered as a field because
-    /// `rebuild_list` reconstructs the `SelectList` on every keystroke
-    /// and must reapply the current budget.
-    max_visible_rows: usize,
 }
 
 /// Initial visible-row budget for the result list, used before the
@@ -100,155 +68,136 @@ impl ModelSelectorComponent {
     /// the agent's active model — used to pre-select the matching
     /// row and mark it `(current)`. `initial_query`, when set,
     /// pre-fills the search box so the overlay opens already
-    /// filtered; the host passes `None`, but the parameter
-    /// is kept as a general capability. `theme` styles the
-    /// underlying [`SelectList`].
+    /// filtered; the host passes `None`, but the parameter is kept as a
+    /// general capability. `theme` styles the underlying [`SelectList`].
     pub fn new(
         theme: SelectListTheme,
         catalog: Vec<ModelInfo>,
         current: Option<&dyn ModelIdentity>,
         initial_query: Option<String>,
     ) -> Self {
-        let current_key = current.map(|m| (m.provider().to_string(), m.id().to_string()));
+        let current_key: CurrentKey =
+            current.map(|m| (m.provider().to_string(), m.id().to_string()));
+        let catalog = Arc::new(catalog);
+        let status_style = Arc::clone(&theme.description);
 
-        let mut search = TextInput::new("search: ");
-        if let Some(q) = initial_query {
-            search.set_value(&q);
-        }
-        search.set_focused(true);
-
-        // Placeholder list — rebuilt by `rebuild_list` below to apply
-        // the initial filter and pre-selection.
         let list = SelectList::new(
             Vec::new(),
             DEFAULT_VISIBLE_ROWS,
-            theme.clone(),
+            theme,
             SelectListLayout::default(),
         );
+        let mut inner = FilterableSelect::new("search: ", list, status_style);
 
-        let outcome: OutcomeHandle = Arc::new(Mutex::new(None));
-        let mut component = Self {
-            search,
-            list,
-            catalog,
-            current_key,
-            outcome,
-            theme,
-            matcher: FuzzyMatcher::new(),
-            max_visible_rows: DEFAULT_VISIBLE_ROWS,
-        };
-        component.rebuild_list();
-        component
+        // Score policy: empty query returns the full catalog in stable
+        // catalog order; non-empty query fuzzy-scores each entry's
+        // `provider`, `id`, and `name` independently and sorts
+        // highest-first. The matcher is reused across keystrokes (only
+        // its scratch buffers are cleared), so it lives in the closure.
+        let query_catalog = Arc::clone(&catalog);
+        let query_current = current_key.clone();
+        let mut matcher = FuzzyMatcher::new();
+        inner.on_query = Some(Box::new(move |query, list| {
+            let (items, selected) =
+                score_items(&query_catalog, &query_current, &mut matcher, query);
+            list.set_items(items);
+            list.set_selected_index(selected);
+        }));
+
+        let outcome = OutcomeHandle::new();
+        let confirm = outcome.clone();
+        let confirm_catalog = Arc::clone(&catalog);
+        inner.on_select = Some(Box::new(move |item| {
+            if let Some(info) = lookup(&confirm_catalog, &item.value) {
+                confirm.set(ModelSelectorOutcome::Confirmed(info));
+            }
+        }));
+        let cancel = outcome.clone();
+        inner.on_cancel = Some(Box::new(move || {
+            cancel.set(ModelSelectorOutcome::Cancelled)
+        }));
+
+        // Populate the initial list (and pre-selection) through the same
+        // scoring path the query handler uses, so the open state and every
+        // subsequent keystroke agree.
+        inner.set_query(&initial_query.unwrap_or_default());
+
+        Self { inner, outcome }
     }
 
     /// Hand the host a clone of the outcome slot. After each input
-    /// event the host calls `lock().take()` on this handle; on
-    /// `Some(_)` it hides the overlay and applies the result.
+    /// event the host calls `take()` on this handle; on `Some(_)` it
+    /// hides the overlay and applies the result.
     pub fn outcome_handle(&self) -> OutcomeHandle {
-        Arc::clone(&self.outcome)
+        self.outcome.clone()
     }
+}
 
-    /// Rebuild `list` from `catalog` filtered by the current search
-    /// value.
-    ///
-    /// Score policy: empty query returns the full catalog in stable
-    /// catalog order; non-empty query fuzzy-scores each entry's
-    /// `provider`, `id`, and `name` fields independently (taking the
-    /// best per-token field score, see
-    /// [`FuzzyMatcher::score_fields`]) and sorts highest-score-first
-    /// with a catalog-order tiebreak (so equally strong matches stay
-    /// in the registry's intentional sequence). Scoring fields
-    /// separately keeps a query like `gpt-5.5` from matching a
-    /// `gpt-5.1` entry by spanning its id and name. The matcher
-    /// (`self.matcher`) is reused across calls — only its scratch
-    /// buffers are cleared.
-    fn rebuild_list(&mut self) {
-        let query = self.search.value().trim().to_string();
-        let mut scored: Vec<(usize, u32)> = Vec::new();
-        if query.is_empty() {
-            scored.extend((0..self.catalog.len()).map(|i| (i, 0u32)));
-        } else {
-            for (idx, info) in self.catalog.iter().enumerate() {
-                let fields = [info.provider.as_str(), info.id.as_str(), info.name.as_str()];
-                if let Some(score) = self.matcher.score_fields(&query, &fields) {
-                    scored.push((idx, score));
-                }
+/// Score `catalog` against `query` and return the row items plus the index
+/// to pre-select (the current model's row, else `0`).
+///
+/// Scoring each field separately keeps a query like `gpt-5.5` from matching
+/// a `gpt-5.1` entry by spanning its id and name (see
+/// [`FuzzyMatcher::score_fields`]). An empty query returns the full catalog
+/// in registry order.
+fn score_items(
+    catalog: &[ModelInfo],
+    current_key: &CurrentKey,
+    matcher: &mut FuzzyMatcher,
+    query: &str,
+) -> (Vec<SelectItem>, usize) {
+    let query = query.trim();
+    let mut scored: Vec<(usize, u32)> = Vec::new();
+    if query.is_empty() {
+        scored.extend((0..catalog.len()).map(|i| (i, 0u32)));
+    } else {
+        for (idx, info) in catalog.iter().enumerate() {
+            let fields = [info.provider.as_str(), info.id.as_str(), info.name.as_str()];
+            if let Some(score) = matcher.score_fields(query, &fields) {
+                scored.push((idx, score));
             }
-            scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         }
-
-        let mut selected_index = 0;
-        let items: Vec<SelectItem> = scored
-            .iter()
-            .enumerate()
-            .map(|(row, (idx, _))| {
-                let info = &self.catalog[*idx];
-                let is_current = self
-                    .current_key
-                    .as_ref()
-                    .is_some_and(|(p, id)| p == &info.provider && id == &info.id);
-                if is_current {
-                    selected_index = row;
-                }
-                let label = if is_current {
-                    format!("{} (current)", info.name)
-                } else {
-                    info.name.clone()
-                };
-                // The description column carries the wire-level
-                // identifier and provider tag so the user can
-                // disambiguate same-name models across providers.
-                let description = format!("{} · {}", info.provider, info.id);
-                SelectItem::new(&format!("{}/{}", info.provider, info.id), &label)
-                    .with_description(&description)
-            })
-            .collect();
-
-        // SelectList isn't mutator-friendly for items / layout — the
-        // documented path is to rebuild on change. New layout + theme
-        // mirror the construction in `new()` so the visual presentation
-        // stays consistent across rebuilds.
-        let mut list = SelectList::new(
-            items,
-            self.max_visible_rows,
-            self.theme.clone(),
-            SelectListLayout::default(),
-        );
-        list.set_focused(true);
-        list.set_selected_index(selected_index);
-        self.list = list;
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     }
 
-    /// Commit the currently-highlighted list entry into the outcome
-    /// slot. Looks the entry up in `catalog` by its `(provider, id)`
-    /// key to recover the full [`ModelInfo`].
-    fn commit_selection(&self) {
-        let Some(item) = self.list.selected_item().cloned() else {
-            return;
-        };
-        // `item.value` was constructed as "{provider}/{id}". Split
-        // once on the first '/' so model ids containing slashes
-        // (rare but possible) stay intact.
-        let Some((provider, id)) = item.value.split_once('/') else {
-            return;
-        };
-        let Some(info) = self
-            .catalog
-            .iter()
-            .find(|m| m.provider == provider && m.id == id)
-            .cloned()
-        else {
-            return;
-        };
-        *self.outcome.lock().expect("outcome mutex poisoned") =
-            Some(ModelSelectorOutcome::Confirmed(info));
-    }
+    let mut selected_index = 0;
+    let items: Vec<SelectItem> = scored
+        .iter()
+        .enumerate()
+        .map(|(row, (idx, _))| {
+            let info = &catalog[*idx];
+            let is_current = current_key
+                .as_ref()
+                .is_some_and(|(p, id)| p == &info.provider && id == &info.id);
+            if is_current {
+                selected_index = row;
+            }
+            let label = if is_current {
+                format!("{} (current)", info.name)
+            } else {
+                info.name.clone()
+            };
+            // The description column carries the wire-level identifier and
+            // provider tag so the user can disambiguate same-name models
+            // across providers.
+            let description = format!("{} · {}", info.provider, info.id);
+            SelectItem::new(&format!("{}/{}", info.provider, info.id), &label)
+                .with_description(&description)
+        })
+        .collect();
 
-    /// Record a cancellation in the outcome slot.
-    fn commit_cancel(&self) {
-        *self.outcome.lock().expect("outcome mutex poisoned") =
-            Some(ModelSelectorOutcome::Cancelled);
-    }
+    (items, selected_index)
+}
+
+/// Recover the full [`ModelInfo`] for a row `value` of the form
+/// `"{provider}/{id}"`. Splits on the first `/` so ids containing slashes
+/// (rare but possible) stay intact.
+fn lookup(catalog: &[ModelInfo], value: &str) -> Option<ModelInfo> {
+    let (provider, id) = value.split_once('/')?;
+    catalog
+        .iter()
+        .find(|m| m.provider == provider && m.id == id)
+        .cloned()
 }
 
 /// Minimal trait the host uses to identify the agent's current
@@ -291,80 +240,23 @@ impl Component for ModelSelectorComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        // Chrome (title + border) is provided by the surrounding
-        // `OverlayWindow` at mount time; we render just the search
-        // input stacked above the result list.
-        let mut lines = Vec::with_capacity(self.max_visible_rows + 2);
-        lines.extend(self.search.render(width));
-        lines.push(String::new());
-        lines.extend(self.list.render(width));
-        lines
+        self.inner.render(width)
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
-        let kb = keybindings::get();
-
-        // Esc cancels regardless of where focus appears to be (the
-        // search input and the list both bind Esc to cancel under
-        // `tui.select.cancel`; we intercept here so we fire exactly
-        // one Cancelled outcome and don't rely on either component's
-        // callbacks).
-        if kb.matches(event, "tui.select.cancel") {
-            self.commit_cancel();
-            return true;
-        }
-
-        // Enter commits the highlighted list row. We deliberately
-        // do NOT route Enter into `TextInput::handle_input` — its
-        // `on_submit` callback path isn't wired (we own the outcome
-        // slot directly) and routing it there would just swallow the
-        // event without committing.
-        if kb.matches(event, "tui.input.submit") {
-            self.commit_selection();
-            return true;
-        }
-
-        // Navigation keys belong to the list: up/down/page-up/page-
-        // down move the highlight without disturbing the search
-        // text. We route through `SelectList::handle_input` so its
-        // wraparound / scroll-window logic stays the single source
-        // of truth.
-        if kb.matches(event, "tui.select.up")
-            || kb.matches(event, "tui.select.down")
-            || kb.matches(event, "tui.select.pageUp")
-            || kb.matches(event, "tui.select.pageDown")
-        {
-            drop(kb);
-            return self.list.handle_input(event);
-        }
-
-        // Everything else goes to the search box. Drop the
-        // keybinding registry guard first so the rebuild below can
-        // re-acquire it without contention.
-        drop(kb);
-
-        let before = self.search.value().to_string();
-        let handled = self.search.handle_input(event);
-        if handled && self.search.value() != before {
-            self.rebuild_list();
-        }
-        handled
+        self.inner.handle_input(event)
     }
 
     fn set_focused(&mut self, focused: bool) {
-        self.search.set_focused(focused);
-        self.list.set_focused(focused);
+        self.inner.set_focused(focused);
     }
 
     fn set_available_height(&mut self, rows: usize) {
-        // Chrome above the list (mirrored in `render`): search input +
-        // blank separator + the list's own scroll-info line.
-        self.max_visible_rows = rows.saturating_sub(3).max(1);
-        self.list.set_max_visible(self.max_visible_rows);
+        self.inner.set_available_height(rows);
     }
 
     fn is_focused(&self) -> bool {
-        self.search.is_focused()
+        self.inner.is_focused()
     }
 }
 
@@ -458,7 +350,7 @@ mod tests {
         // Sonnet is pre-selected (it's the "current" model); Enter
         // should commit it.
         sel.handle_input(&enter_event());
-        let result = outcome.lock().unwrap().take().expect("outcome was set");
+        let result = outcome.take().expect("outcome was set");
         match result {
             ModelSelectorOutcome::Confirmed(info) => {
                 assert_eq!(info.provider, "anthropic");
@@ -474,7 +366,7 @@ mod tests {
         let mut sel = ModelSelectorComponent::new(identity_theme(), catalog, None, None);
         let outcome = sel.outcome_handle();
         sel.handle_input(&escape_event());
-        let result = outcome.lock().unwrap().take().expect("outcome was set");
+        let result = outcome.take().expect("outcome was set");
         assert!(
             matches!(result, ModelSelectorOutcome::Cancelled),
             "got {result:?}"
@@ -489,7 +381,7 @@ mod tests {
         let outcome = sel.outcome_handle();
         sel.handle_input(&down_event());
         sel.handle_input(&enter_event());
-        let result = outcome.lock().unwrap().take().expect("outcome was set");
+        let result = outcome.take().expect("outcome was set");
         match result {
             ModelSelectorOutcome::Confirmed(info) => {
                 // First row was anthropic/claude-sonnet-4; one down
@@ -514,7 +406,7 @@ mod tests {
         assert!(body.contains("Claude Opus 4"), "got: {body}");
         assert!(!body.contains("GPT-5"), "got: {body}");
         sel.handle_input(&enter_event());
-        let result = outcome.lock().unwrap().take().expect("outcome was set");
+        let result = outcome.take().expect("outcome was set");
         match result {
             ModelSelectorOutcome::Confirmed(info) => {
                 assert_eq!(info.id, "claude-opus-4-20250514");
@@ -603,7 +495,7 @@ mod tests {
         let mut sel = ModelSelectorComponent::new(identity_theme(), catalog, Some(&current), None);
         let outcome = sel.outcome_handle();
         sel.handle_input(&enter_event());
-        let result = outcome.lock().unwrap().take().expect("outcome was set");
+        let result = outcome.take().expect("outcome was set");
         match result {
             ModelSelectorOutcome::Confirmed(info) => {
                 // First catalog entry is anthropic/claude-sonnet-4-...

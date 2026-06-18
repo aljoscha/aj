@@ -884,6 +884,38 @@ fn truncate_fragment_to_width(text: &str, max_width: usize) -> (String, usize) {
     (result, width)
 }
 
+/// Strip every recognized ANSI escape sequence from `text`, returning
+/// only the visible characters.
+///
+/// Uses the same [`extract_ansi_code`] recognizer the width/truncation
+/// helpers use, so it removes exactly the sequences those helpers treat
+/// as zero-width and leaves any unrecognized `ESC` as a literal byte.
+/// The visible width of the result equals [`visible_width`] of the
+/// input.
+///
+/// Useful when a string must end up as plain text after passing through
+/// an ANSI-aware transform: e.g. a label fed back into a styling layer,
+/// where an embedded `\x1b[0m` would prematurely reset the outer style.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(ansi) = extract_ansi_code(text, i) {
+            i += ansi.byte_len;
+            continue;
+        }
+        // Not an escape: copy one whole char so we never split UTF-8.
+        let ch = text[i..]
+            .chars()
+            .next()
+            .expect("byte index sits on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Truncate text to fit within `max_width` visible columns, adding an ellipsis if needed.
 ///
 /// If `pad` is true, the result is right-padded with spaces to exactly `max_width`.
@@ -1538,6 +1570,25 @@ pub fn apply_background_to_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- strip_ansi --
+
+    #[test]
+    fn strip_ansi_removes_recognized_sequences_and_preserves_width() {
+        let styled = "\x1b[1m\x1b[31mhello\x1b[0m world";
+        assert_eq!(strip_ansi(styled), "hello world");
+        // Stripping removes only zero-width escapes, so the visible width
+        // is unchanged.
+        assert_eq!(visible_width(styled), visible_width(&strip_ansi(styled)));
+    }
+
+    #[test]
+    fn strip_ansi_keeps_plain_and_multibyte_text() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        // Non-ANSI content (including the ellipsis a truncator appends and
+        // multibyte glyphs) is copied verbatim without splitting UTF-8.
+        assert_eq!(strip_ansi("café…\x1b[0m"), "café…");
+    }
 
     // -- extract_ansi_code --
 

@@ -559,6 +559,20 @@ impl Component for SettingsList {
             self.move_down();
             return true;
         }
+        // Page keys move a full window at a time. `SelectList` honors the
+        // same bindings, so both lists navigate identically.
+        if kb.matches(event, "tui.select.pageUp") {
+            for _ in 0..self.max_visible {
+                self.move_up();
+            }
+            return true;
+        }
+        if kb.matches(event, "tui.select.pageDown") {
+            for _ in 0..self.max_visible {
+                self.move_down();
+            }
+            return true;
+        }
         // Confirm activates; Space is also a hardcoded alias for
         // activation regardless of the registry. Space is therefore
         // reserved and never reaches the search input even when

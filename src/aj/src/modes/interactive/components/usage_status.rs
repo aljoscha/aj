@@ -9,14 +9,13 @@
 //! and `Enter` close the overlay, mirroring
 //! [`crate::modes::interactive::components::auth_status`].
 
-use std::sync::{Arc, Mutex};
-
 use aj_tui::component::Component;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 use tokio::sync::oneshot;
 
+use crate::modes::interactive::components::outcome::OutcomeSlot;
 use crate::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
 
 /// Outcome of a single usage-overlay session. Read-only, so the only
@@ -27,26 +26,7 @@ pub enum UsageStatusOutcome {
 }
 
 /// Cheap-to-clone handle pointing at the overlay's outcome slot.
-#[derive(Clone)]
-pub struct UsageStatusOutcomeHandle(Arc<Mutex<Option<UsageStatusOutcome>>>);
-
-impl UsageStatusOutcomeHandle {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-
-    /// Take the current outcome (if any), leaving the slot empty.
-    pub fn take(&self) -> Option<UsageStatusOutcome> {
-        self.0
-            .lock()
-            .expect("usage status outcome mutex poisoned")
-            .take()
-    }
-
-    fn set(&self, value: UsageStatusOutcome) {
-        *self.0.lock().expect("usage status outcome mutex poisoned") = Some(value);
-    }
-}
+pub type UsageStatusOutcomeHandle = OutcomeSlot<UsageStatusOutcome>;
 
 /// Read-only usage list with an async-fill loading state.
 pub struct UsageStatusComponent {
@@ -188,6 +168,8 @@ impl Component for UsageStatusComponent {
 mod tests {
     use aj_models::usage::{ProviderUsage, UsageWindow};
     use aj_tui::keys::Key;
+
+    use std::sync::Arc;
 
     use super::*;
 

@@ -9,12 +9,11 @@
 //!
 //! See `docs/aj-next-plan.md` "Selectors and theming" step.
 
-use std::sync::{Arc, Mutex};
-
 use aj_models::ThinkingConfig;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
 
 use crate::config::commands::{THINKING_LEVELS, parse_thinking_level, thinking_level_name};
+use crate::modes::interactive::components::outcome::OutcomeSlot;
 
 /// Outcome of a single overlay session.
 ///
@@ -30,7 +29,7 @@ pub enum ThinkingSelectorOutcome {
 
 /// Cheap-to-clone handle pointing at the same outcome slot the
 /// overlay component writes into.
-pub type OutcomeHandle = Arc<Mutex<Option<ThinkingSelectorOutcome>>>;
+pub type OutcomeHandle = OutcomeSlot<ThinkingSelectorOutcome>;
 
 /// The overlay's top-level component. Owns the underlying
 /// [`SelectList`] (`inner`) and a clone of the outcome slot
@@ -73,32 +72,30 @@ impl ThinkingSelectorComponent {
         );
         inner.set_selected_index(initial_index);
 
-        let outcome: OutcomeHandle = Arc::new(Mutex::new(None));
+        let outcome = OutcomeHandle::new();
 
         // Wire the SelectList's on_select / on_cancel callbacks to
-        // the shared outcome slot. The closures clone an `Arc` of
-        // the slot rather than borrowing — the SelectList stores
-        // them as `Box<dyn FnMut>`, which can't capture `&self`.
-        let confirm_outcome = Arc::clone(&outcome);
+        // the shared outcome slot. The closures clone the slot handle
+        // rather than borrowing — the SelectList stores them as
+        // `Box<dyn FnMut>`, which can't capture `&self`.
+        let confirm_outcome = outcome.clone();
         inner.on_select = Some(Box::new(move |item| {
             let level = parse_thinking_level(&item.value).unwrap_or(None);
-            *confirm_outcome.lock().expect("outcome mutex poisoned") =
-                Some(ThinkingSelectorOutcome::Confirmed(level));
+            confirm_outcome.set(ThinkingSelectorOutcome::Confirmed(level));
         }));
-        let cancel_outcome = Arc::clone(&outcome);
+        let cancel_outcome = outcome.clone();
         inner.on_cancel = Some(Box::new(move || {
-            *cancel_outcome.lock().expect("outcome mutex poisoned") =
-                Some(ThinkingSelectorOutcome::Cancelled);
+            cancel_outcome.set(ThinkingSelectorOutcome::Cancelled);
         }));
 
         Self { inner, outcome }
     }
 
     /// Hand the host a clone of the outcome slot. After each
-    /// input event the host calls `lock().take()` on this handle;
+    /// input event the host calls `take()` on this handle;
     /// on `Some(_)` it hides the overlay and applies the result.
     pub fn outcome_handle(&self) -> OutcomeHandle {
-        Arc::clone(&self.outcome)
+        self.outcome.clone()
     }
 }
 
@@ -177,7 +174,7 @@ mod tests {
         let outcome = sel.outcome_handle();
         // Simulate confirm on the highlighted (medium) row.
         sel.handle_input(&enter_event());
-        let result = outcome.lock().unwrap().take();
+        let result = outcome.take();
         assert_eq!(
             result,
             Some(ThinkingSelectorOutcome::Confirmed(Some(
@@ -191,7 +188,7 @@ mod tests {
         let mut sel = ThinkingSelectorComponent::new(identity_theme(), Some(ThinkingConfig::Low));
         let outcome = sel.outcome_handle();
         sel.handle_input(&escape_event());
-        let result = outcome.lock().unwrap().take();
+        let result = outcome.take();
         assert_eq!(result, Some(ThinkingSelectorOutcome::Cancelled));
     }
 
@@ -203,7 +200,7 @@ mod tests {
         // medium is index 2; pressing down once lands on high.
         sel.handle_input(&down_event());
         sel.handle_input(&enter_event());
-        let result = outcome.lock().unwrap().take();
+        let result = outcome.take();
         assert_eq!(
             result,
             Some(ThinkingSelectorOutcome::Confirmed(Some(
@@ -218,7 +215,7 @@ mod tests {
         let mut sel = ThinkingSelectorComponent::new(identity_theme(), None);
         let outcome = sel.outcome_handle();
         sel.handle_input(&enter_event());
-        let result = outcome.lock().unwrap().take();
+        let result = outcome.take();
         assert_eq!(result, Some(ThinkingSelectorOutcome::Confirmed(None)));
     }
 }

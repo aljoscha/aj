@@ -573,7 +573,7 @@ impl Component for ModelPickerSubmenu {
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
         let handled = self.inner.handle_input(event);
-        let outcome = self.outcome.lock().expect("outcome mutex poisoned").take();
+        let outcome = self.outcome.take();
         if let Some(outcome) = outcome
             && let Some(done) = self.done.take()
         {

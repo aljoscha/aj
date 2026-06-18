@@ -23,7 +23,6 @@
 //! return home. `ctrl+t` ([`ACTION_AGENT_TOGGLE_SCOPE`]) toggles between
 //! the two, rebuilding the list in place.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aj_agent::events::AgentId;
@@ -35,6 +34,7 @@ use aj_tui::style;
 
 use crate::config::keybindings::{ACTION_AGENT_TOGGLE_SCOPE, ACTION_TASK_KILL};
 use crate::modes::interactive::components::chat_view::AgentEntry;
+use crate::modes::interactive::components::outcome::OutcomeSlot;
 use crate::modes::interactive::components::subagent_box::SubAgentStatus;
 
 /// A description of a known background bash task, suitable for a
@@ -63,7 +63,7 @@ pub enum AgentPickerOutcome {
 
 /// Cheap-to-clone handle pointing at the same outcome slot the overlay
 /// writes into.
-pub type AgentPickerOutcomeHandle = Arc<Mutex<Option<AgentPickerOutcome>>>;
+pub type AgentPickerOutcomeHandle = OutcomeSlot<AgentPickerOutcome>;
 
 /// Which agents the picker lists.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,7 +98,7 @@ impl AgentPickerComponent {
         tasks: Vec<TaskPickerEntry>,
         active: AgentId,
     ) -> Self {
-        let outcome: AgentPickerOutcomeHandle = Arc::new(Mutex::new(None));
+        let outcome = AgentPickerOutcomeHandle::new();
         let scope = Scope::Active;
         let inner = Self::build_list(theme.clone(), &agents, &tasks, active, scope, &outcome);
         Self {
@@ -181,7 +181,7 @@ impl AgentPickerComponent {
         // ignore the result.
         list.select_by_value(&encode(active));
 
-        let confirm = Arc::clone(outcome);
+        let confirm = outcome.clone();
         list.on_select = Some(Box::new(move |item| {
             let chosen = if let Some(id) = decode_agent_id(&item.value) {
                 Some(AgentPickerOutcome::Confirmed(id))
@@ -189,13 +189,12 @@ impl AgentPickerComponent {
                 decode_task_id(&item.value).map(AgentPickerOutcome::ConfirmedTask)
             };
             if let Some(chosen) = chosen {
-                *confirm.lock().expect("agent picker outcome poisoned") = Some(chosen);
+                confirm.set(chosen);
             }
         }));
-        let cancel = Arc::clone(outcome);
+        let cancel = outcome.clone();
         list.on_cancel = Some(Box::new(move || {
-            *cancel.lock().expect("agent picker outcome poisoned") =
-                Some(AgentPickerOutcome::Cancelled);
+            cancel.set(AgentPickerOutcome::Cancelled);
         }));
 
         list
@@ -203,7 +202,7 @@ impl AgentPickerComponent {
 
     /// Hand the host a clone of the outcome slot.
     pub fn outcome_handle(&self) -> AgentPickerOutcomeHandle {
-        Arc::clone(&self.outcome)
+        self.outcome.clone()
     }
 
     /// Whether the picker is currently showing all agents (as opposed
@@ -373,8 +372,7 @@ impl aj_tui::component::Component for AgentPickerComponent {
                     .iter()
                     .any(|t| t.id == id && t.status == TaskStatus::Running)
             {
-                *self.outcome.lock().expect("agent picker outcome poisoned") =
-                    Some(AgentPickerOutcome::KillTask(id));
+                self.outcome.set(AgentPickerOutcome::KillTask(id));
             }
             return true;
         }
@@ -487,7 +485,7 @@ mod tests {
         // Main is pre-selected (it's the active agent in the fixture).
         assert!(picker.handle_input(&Key::enter()));
         assert_eq!(
-            handle.lock().unwrap().take(),
+            handle.take(),
             Some(AgentPickerOutcome::Confirmed(AgentId::Main))
         );
     }
@@ -498,10 +496,7 @@ mod tests {
         let mut picker = picker(fixture(), Vec::new(), AgentId::Main);
         let handle = picker.outcome_handle();
         assert!(picker.handle_input(&Key::escape()));
-        assert_eq!(
-            handle.lock().unwrap().take(),
-            Some(AgentPickerOutcome::Cancelled)
-        );
+        assert_eq!(handle.take(), Some(AgentPickerOutcome::Cancelled));
     }
 
     #[test]
@@ -575,10 +570,7 @@ mod tests {
         // Move from the pre-selected Main row onto the task row.
         assert!(picker.handle_input(&Key::down()));
         assert!(picker.handle_input(&Key::enter()));
-        assert_eq!(
-            handle.lock().unwrap().take(),
-            Some(AgentPickerOutcome::ConfirmedTask(3))
-        );
+        assert_eq!(handle.take(), Some(AgentPickerOutcome::ConfirmedTask(3)));
     }
 
     #[test]
@@ -590,15 +582,12 @@ mod tests {
 
         // On the Main row the chord is consumed but emits nothing.
         assert!(picker.handle_input(&Key::ctrl('k')));
-        assert_eq!(handle.lock().unwrap().take(), None);
+        assert_eq!(handle.take(), None);
 
         // On the running task row it requests the kill.
         assert!(picker.handle_input(&Key::down()));
         assert!(picker.handle_input(&Key::ctrl('k')));
-        assert_eq!(
-            handle.lock().unwrap().take(),
-            Some(AgentPickerOutcome::KillTask(3))
-        );
+        assert_eq!(handle.take(), Some(AgentPickerOutcome::KillTask(3)));
     }
 
     #[test]
@@ -611,7 +600,7 @@ mod tests {
         let handle = picker.outcome_handle();
         assert!(picker.handle_input(&Key::down()));
         assert!(picker.handle_input(&Key::ctrl('k')));
-        assert_eq!(handle.lock().unwrap().take(), None);
+        assert_eq!(handle.take(), None);
     }
 
     #[test]

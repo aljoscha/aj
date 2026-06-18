@@ -10,16 +10,20 @@
 //! Visual layout per row: `<category>  <name>  …  <shortcut-or-hint>`,
 //! supplied to [`SelectList`] via the `prefix` / primary label /
 //! `shortcut` / `description` columns.
+//!
+//! The search box, list, and key routing are the shared
+//! [`FilterableSelect`]; this component supplies the command items, the
+//! confirm mapping (name → [`CommandAction`]), and the outcome slot.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aj_tui::component::Component;
+use aj_tui::components::filterable_select::FilterableSelect;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
-use aj_tui::components::text_input::TextInput;
-use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 
 use crate::config::commands::{COMMANDS, CommandAction};
+use crate::modes::interactive::components::outcome::OutcomeSlot;
 
 /// Outcome of a single palette session.
 ///
@@ -32,37 +36,15 @@ pub enum CommandPaletteOutcome {
 }
 
 /// Cheap-to-clone handle pointing at the palette's outcome slot.
-#[derive(Clone)]
-pub struct CommandPaletteOutcomeHandle(Arc<Mutex<Option<CommandPaletteOutcome>>>);
+pub type CommandPaletteOutcomeHandle = OutcomeSlot<CommandPaletteOutcome>;
 
-impl CommandPaletteOutcomeHandle {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-
-    /// Take the current outcome (if any), leaving the slot empty.
-    pub fn take(&self) -> Option<CommandPaletteOutcome> {
-        self.0
-            .lock()
-            .expect("palette outcome mutex poisoned")
-            .take()
-    }
-
-    fn set(&self, value: CommandPaletteOutcome) {
-        *self.0.lock().expect("palette outcome mutex poisoned") = Some(value);
-    }
-}
-
-/// Palette component: search input over a fuzzy-filtered
-/// [`SelectList`] of builtin commands.
+/// Palette component: a [`FilterableSelect`] over the builtin commands.
 ///
-/// The list is built **once** from [`COMMANDS`]; each
-/// keystroke calls [`SelectList::set_filter`] rather than rebuilding
-/// the list, so the prefix/label columns stay anchored and no
-/// per-keystroke allocation churn occurs.
+/// The list is built **once** from [`COMMANDS`]; the shared
+/// [`FilterableSelect`] calls [`SelectList::set_filter`] on each keystroke
+/// rather than rebuilding it, so the prefix/label columns stay anchored.
 pub struct CommandPaletteComponent {
-    search: TextInput,
-    list: SelectList,
+    inner: FilterableSelect,
     outcome: CommandPaletteOutcomeHandle,
 }
 
@@ -75,51 +57,42 @@ impl CommandPaletteComponent {
     /// grows to fill the overlay's inner-row budget; the constructor
     /// value only governs the first render (and direct-render tests).
     pub fn new(list_theme: SelectListTheme, max_visible_rows: usize) -> Self {
-        let mut search = TextInput::new("search: ");
-        search.set_focused(true);
-
-        let mut list = SelectList::new(
+        let status_style = Arc::clone(&list_theme.description);
+        let list = SelectList::new(
             build_items(),
             max_visible_rows,
             list_theme,
             SelectListLayout::default(),
         );
-        list.set_focused(true);
+        let mut inner = FilterableSelect::new("search: ", list, status_style);
 
-        Self {
-            search,
-            list,
-            outcome: CommandPaletteOutcomeHandle::new(),
-        }
+        let outcome = CommandPaletteOutcomeHandle::new();
+        let confirm = outcome.clone();
+        inner.on_select = Some(Box::new(move |item| {
+            // The list item's `value` is the command `name`; map it back
+            // to the catalog entry to recover the action to dispatch.
+            if let Some(cmd) = COMMANDS.iter().find(|c| c.name == item.value) {
+                confirm.set(CommandPaletteOutcome::Confirmed { action: cmd.action });
+            }
+        }));
+        let cancel = outcome.clone();
+        inner.on_cancel = Some(Box::new(move || {
+            cancel.set(CommandPaletteOutcome::Cancelled)
+        }));
+
+        Self { inner, outcome }
     }
 
     /// Hand the host a clone of the outcome slot.
     pub fn outcome_handle(&self) -> CommandPaletteOutcomeHandle {
-        CommandPaletteOutcomeHandle(Arc::clone(&self.outcome.0))
-    }
-
-    fn commit_selection(&self) {
-        let Some(item) = self.list.selected_item().cloned() else {
-            return;
-        };
-        // The list item's `value` is the command `name`; map it back
-        // to the catalog entry to recover the action to dispatch.
-        let Some(cmd) = COMMANDS.iter().find(|c| c.name == item.value) else {
-            return;
-        };
-        self.outcome
-            .set(CommandPaletteOutcome::Confirmed { action: cmd.action });
-    }
-
-    fn commit_cancel(&self) {
-        self.outcome.set(CommandPaletteOutcome::Cancelled);
+        self.outcome.clone()
     }
 }
 
 /// Build one [`SelectItem`] per command.
 ///
-/// - `value` is the command `name`; `commit_selection` maps it back
-///   to the catalog entry to recover the [`CommandAction`].
+/// - `value` is the command `name`; the confirm mapping turns it back
+///   into the catalog entry to recover the [`CommandAction`].
 /// - `label` is the friendly `title` shown in the primary column.
 /// - `prefix` is the dim `category` column.
 /// - `filter_key` is `"{category} {title}"` so typing a category
@@ -149,62 +122,23 @@ impl Component for CommandPaletteComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        // Chrome (title + border) is supplied by the surrounding
-        // `OverlayWindow` mount; render only the search input and
-        // the filtered list here.
-        let mut lines = Vec::new();
-        lines.extend(self.search.render(width));
-        lines.push(String::new());
-        lines.extend(self.list.render(width));
-        lines
+        self.inner.render(width)
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
-        let kb = keybindings::get();
-
-        if kb.matches(event, "tui.select.cancel") {
-            self.commit_cancel();
-            return true;
-        }
-
-        if kb.matches(event, "tui.input.submit") {
-            self.commit_selection();
-            return true;
-        }
-
-        if kb.matches(event, "tui.select.up")
-            || kb.matches(event, "tui.select.down")
-            || kb.matches(event, "tui.select.pageUp")
-            || kb.matches(event, "tui.select.pageDown")
-        {
-            drop(kb);
-            return self.list.handle_input(event);
-        }
-
-        drop(kb);
-
-        let before = self.search.value().to_string();
-        let handled = self.search.handle_input(event);
-        if handled && self.search.value() != before {
-            self.list.set_filter(self.search.value());
-        }
-        handled
+        self.inner.handle_input(event)
     }
 
     fn set_focused(&mut self, focused: bool) {
-        self.search.set_focused(focused);
-        self.list.set_focused(focused);
+        self.inner.set_focused(focused);
     }
 
     fn set_available_height(&mut self, rows: usize) {
-        // Grow the list to fill the overlay's inner-row budget. Chrome
-        // above the list (mirrored in `render`): search input + blank
-        // separator + the list's own scroll-info line.
-        self.list.set_max_visible(rows.saturating_sub(3).max(1));
+        self.inner.set_available_height(rows);
     }
 
     fn is_focused(&self) -> bool {
-        self.search.is_focused()
+        self.inner.is_focused()
     }
 }
 

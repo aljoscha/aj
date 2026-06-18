@@ -361,6 +361,20 @@ impl SelectList {
         }
     }
 
+    /// Replace the entire item set, recomputing the visible rows against
+    /// the retained filter and resetting the selection to the top match.
+    ///
+    /// Use this when the caller owns filtering and produces a fresh item
+    /// set per query (e.g. custom per-field scoring that
+    /// [`FilterMode`]'s built-in modes can't express); for lists that grow
+    /// incrementally prefer [`SelectList::extend_items`], which preserves
+    /// the highlighted row.
+    pub fn set_items(&mut self, items: Vec<SelectItem>) {
+        self.items = items;
+        self.apply_filter();
+        self.selected = 0;
+    }
+
     /// Get the currently selected item, if any.
     pub fn selected_item(&self) -> Option<&SelectItem> {
         self.filtered_indices

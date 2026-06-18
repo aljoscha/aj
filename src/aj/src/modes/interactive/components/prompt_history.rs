@@ -1,9 +1,8 @@
 //! Prompt-history search overlay (`/history`).
 //!
-//! Pairs a [`TextInput`] for live fuzzy filtering with a read-only
-//! [`SelectList`] of prompts the user has submitted before. `Enter`
-//! recalls the highlighted prompt into the editor (it is *not*
-//! submitted); `Esc` cancels.
+//! Pairs a search box with a read-only [`SelectList`] of prompts the user
+//! has submitted before. `Enter` recalls the highlighted prompt into the
+//! editor (it is *not* submitted); `Esc` cancels.
 //!
 //! The overlay searches one of two scopes, toggled in-place with the
 //! `aj.history.toggle_scope` chord (default `Ctrl+T`):
@@ -13,37 +12,37 @@
 //! - **All workspaces**: prompts from every project under
 //!   `~/.aj/sessions`, each tagged with its project label.
 //!
-//! Both scopes are scanned on a blocking thread, not on the TUI event
-//! loop: the overlay opens immediately (showing a loading indicator)
-//! and the list fills in incrementally as the scan streams batches
-//! (one per session file, newest-first) through an internal channel
-//! drained at the top of `render`. The current-workspace scan starts
-//! as soon as the overlay is built; the all-workspaces scan is
-//! deferred until the first toggle so it costs nothing when the user
-//! never leaves the workspace scope.
+//! Both scopes are scanned on a blocking thread (a [`StreamingScan`] per
+//! scope), not on the TUI event loop: the overlay opens immediately
+//! (showing a loading indicator) and the list fills in incrementally as
+//! the scan streams batches (one per session file, newest-first). The
+//! current-workspace scan starts as soon as the overlay is built; the
+//! all-workspaces scan is deferred until the first toggle so it costs
+//! nothing when the user never leaves the workspace scope.
 //!
-//! Like the command palette, the list is built once per scope and
-//! filtered via [`SelectList::set_filter`] on each keystroke rather
-//! than rebuilt.
+//! The shared [`FilterableSelect`] owns the search box, the scope status
+//! line, and the loading body; this component owns the scope state, the
+//! per-scope entry accumulators, and the toggle chord.
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aj_session::{ConversationEntry, ConversationEntryKind, ConversationPersistence, ThreadKind};
 use aj_tui::component::Component;
+use aj_tui::components::filterable_select::FilterableSelect;
 use aj_tui::components::select_list::{
     FilterMode, SelectItem, SelectList, SelectListLayout, SelectListTheme,
 };
-use aj_tui::components::text_input::TextInput;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 use aj_tui::tui::RenderHandle;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::config::keybindings::ACTION_HISTORY_TOGGLE_SCOPE;
+use crate::modes::interactive::components::outcome::OutcomeSlot;
+use crate::modes::interactive::components::streaming_scan::StreamingScan;
 use crate::modes::interactive::editor_ext::extract_user_prompt_text;
 
 /// Cap on how many prompts a single scope retains. Generous enough
@@ -85,42 +84,7 @@ pub enum PromptHistoryOutcome {
 }
 
 /// Cheap-to-clone handle pointing at the overlay's outcome slot.
-#[derive(Clone)]
-pub struct PromptHistoryOutcomeHandle(Arc<Mutex<Option<PromptHistoryOutcome>>>);
-
-impl PromptHistoryOutcomeHandle {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-
-    /// Take the current outcome (if any), leaving the slot empty.
-    pub fn take(&self) -> Option<PromptHistoryOutcome> {
-        self.0
-            .lock()
-            .expect("prompt-history outcome mutex poisoned")
-            .take()
-    }
-
-    fn set(&self, value: PromptHistoryOutcome) {
-        *self
-            .0
-            .lock()
-            .expect("prompt-history outcome mutex poisoned") = Some(value);
-    }
-}
-
-/// Result of a background scan, delivered to the live overlay. The
-/// component drains these at the top of `render`, appending batches and
-/// clearing the loading indicator on `Done`.
-enum PromptHistoryLoad {
-    /// A batch of entries for `scope`, appended in arrival order.
-    Batch {
-        scope: Scope,
-        entries: Vec<PromptHistoryEntry>,
-    },
-    /// `scope`'s scan finished; clears its loading indicator.
-    Done { scope: Scope },
-}
+pub type PromptHistoryOutcomeHandle = OutcomeSlot<PromptHistoryOutcome>;
 
 /// A streaming scan: given an `emit` sink, drives the scan and calls
 /// `emit` once per session file. Boxed so the all-workspaces scan can
@@ -129,24 +93,19 @@ type Scan = Box<dyn FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send>;
 
 /// Prompt-history search component.
 pub struct PromptHistorySearchComponent {
-    search: TextInput,
-    list: SelectList,
-    theme: SelectListTheme,
-    max_visible_rows: usize,
+    inner: FilterableSelect,
     scope: Scope,
-    /// Entries per scope, appended as background batches arrive.
+    /// Per-scope background scans. The all-workspaces scan is spawned on
+    /// the first toggle (consuming `all_scan_factory`), so it costs
+    /// nothing until then.
+    workspace_scan: StreamingScan<PromptHistoryEntry>,
+    all_scan: Option<StreamingScan<PromptHistoryEntry>>,
+    all_scan_factory: Option<Scan>,
+    /// Entries per scope, accumulated as batches arrive. Kept so a scope
+    /// toggle can rebuild the list from the other scope's already-loaded
+    /// rows without re-scanning.
     workspace_entries: Vec<PromptHistoryEntry>,
     all_entries: Vec<PromptHistoryEntry>,
-    /// Whether each scope's background scan is still in flight. Used to
-    /// show a loading indicator and a scope-line hint.
-    workspace_loading: bool,
-    all_loading: bool,
-    /// The all-workspaces scan, taken and started on the first toggle to
-    /// that scope; `None` thereafter so it never re-scans.
-    all_scan: Option<Scan>,
-    /// Inbound scan results, drained in `render`.
-    loads_tx: UnboundedSender<PromptHistoryLoad>,
-    loads_rx: UnboundedReceiver<PromptHistoryLoad>,
     render_handle: RenderHandle,
     outcome: PromptHistoryOutcomeHandle,
 }
@@ -164,41 +123,41 @@ impl PromptHistorySearchComponent {
         workspace_scan: impl FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send + 'static,
         all_scan: impl FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send + 'static,
     ) -> Self {
-        let mut search = TextInput::new("search: ");
-        search.set_focused(true);
+        let status_style = Arc::clone(&theme.description);
+        let list = SelectList::new(Vec::new(), max_visible_rows, theme, list_layout());
+        let mut inner = FilterableSelect::new("search: ", list, status_style).with_status_line();
+        inner.set_loading_message("Loading prompt history…");
 
-        let mut list = SelectList::new(Vec::new(), max_visible_rows, theme.clone(), list_layout());
-        list.set_focused(true);
+        let outcome = PromptHistoryOutcomeHandle::new();
+        let confirm = outcome.clone();
+        inner.on_select = Some(Box::new(move |item| {
+            confirm.set(PromptHistoryOutcome::Recalled {
+                text: item.value.clone(),
+            });
+        }));
+        let cancel = outcome.clone();
+        inner.on_cancel = Some(Box::new(move || {
+            cancel.set(PromptHistoryOutcome::Cancelled)
+        }));
 
-        let (loads_tx, loads_rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_scan(
-            Scope::Workspace,
-            workspace_scan,
-            loads_tx.clone(),
-            render_handle.clone(),
-        );
-
-        Self {
-            search,
-            list,
-            theme,
-            max_visible_rows,
+        let mut component = Self {
+            inner,
             scope: Scope::Workspace,
+            workspace_scan: StreamingScan::spawn(workspace_scan, render_handle.clone()),
+            all_scan: None,
+            all_scan_factory: Some(Box::new(all_scan)),
             workspace_entries: Vec::new(),
             all_entries: Vec::new(),
-            workspace_loading: true,
-            all_loading: false,
-            all_scan: Some(Box::new(all_scan)),
-            loads_tx,
-            loads_rx,
             render_handle,
-            outcome: PromptHistoryOutcomeHandle::new(),
-        }
+            outcome,
+        };
+        component.sync_status();
+        component
     }
 
     /// Hand the host a clone of the outcome slot.
     pub fn outcome_handle(&self) -> PromptHistoryOutcomeHandle {
-        PromptHistoryOutcomeHandle(Arc::clone(&self.outcome.0))
+        self.outcome.clone()
     }
 
     /// Whether the overlay is currently showing the all-workspaces
@@ -207,9 +166,7 @@ impl PromptHistorySearchComponent {
         self.scope == Scope::All
     }
 
-    /// Entries backing the currently-selected scope. The all-workspaces
-    /// scope is empty until its scan streams in (the loading indicator
-    /// covers that window).
+    /// Entries backing the currently-selected scope.
     fn current_entries(&self) -> &[PromptHistoryEntry] {
         match self.scope {
             Scope::Workspace => &self.workspace_entries,
@@ -220,67 +177,78 @@ impl PromptHistorySearchComponent {
     /// Whether the visible scope's background scan is still running.
     fn is_current_loading(&self) -> bool {
         match self.scope {
-            Scope::Workspace => self.workspace_loading,
-            Scope::All => self.all_loading,
+            Scope::Workspace => self.workspace_scan.is_loading(),
+            Scope::All => self
+                .all_scan
+                .as_ref()
+                .is_some_and(StreamingScan::is_loading),
         }
     }
 
-    /// Apply scan results delivered since the last render: append each
-    /// batch to its scope and stream the visible scope's new rows into
-    /// the live list, clearing the loading flag on `Done`.
-    ///
-    /// New rows for the visible scope are coalesced into a single
-    /// [`SelectList::extend_items`] call so a burst of batches in one
-    /// frame costs one append (and, when a search filter is active, one
-    /// re-rank) rather than one per batch.
-    fn drain_loads(&mut self) {
-        let mut new_visible: Vec<SelectItem> = Vec::new();
-        while let Ok(load) = self.loads_rx.try_recv() {
-            match load {
-                PromptHistoryLoad::Batch { scope, entries } => {
-                    if scope == self.scope {
-                        new_visible.extend(build_items(&entries));
-                    }
-                    match scope {
-                        Scope::Workspace => self.workspace_entries.extend(entries),
-                        Scope::All => self.all_entries.extend(entries),
-                    }
-                }
-                PromptHistoryLoad::Done { scope } => match scope {
-                    Scope::Workspace => self.workspace_loading = false,
-                    Scope::All => self.all_loading = false,
-                },
+    /// Drain both scans' delivered batches: accumulate each into its
+    /// scope, stream the visible scope's new rows into the live list
+    /// (coalesced into one [`SelectList::extend_items`]), then refresh
+    /// the status line and loading indicator.
+    fn drain(&mut self) {
+        let workspace = self.workspace_scan.drain();
+        if !workspace.is_empty() {
+            if self.scope == Scope::Workspace {
+                let items = build_items(&workspace);
+                self.inner.list_mut().extend_items(items);
             }
+            self.workspace_entries.extend(workspace);
         }
-        if !new_visible.is_empty() {
-            self.list.extend_items(new_visible);
+
+        // `as_mut().map(drain)` releases the `all_scan` borrow before we
+        // touch the other fields below.
+        if let Some(all) = self.all_scan.as_mut().map(StreamingScan::drain)
+            && !all.is_empty()
+        {
+            if self.scope == Scope::All {
+                let items = build_items(&all);
+                self.inner.list_mut().extend_items(items);
+            }
+            self.all_entries.extend(all);
         }
+
+        self.sync_status();
     }
 
-    /// Rebuild the list from scratch for the current scope, re-applying
-    /// the active search filter and restoring the highlighted row when
-    /// it survives. Used on scope toggle, where the whole item set
-    /// changes; incremental fill within a scope appends via
-    /// [`SelectList::extend_items`] instead (see `drain_loads`).
+    /// Refresh the scope status line and the loading-body flag from the
+    /// current scope's state.
+    fn sync_status(&mut self) {
+        let loading = self.is_current_loading();
+        let mut text = match self.scope {
+            Scope::Workspace => "Showing: this workspace".to_string(),
+            Scope::All => "Showing: all workspaces".to_string(),
+        };
+        // While the visible scope is still streaming, advertise it so a
+        // partial list doesn't look complete. The toggle chord itself is
+        // advertised on the overlay border, not here.
+        if loading {
+            text.push_str("  \u{2022}  loading\u{2026}");
+        }
+        self.inner.set_status_line(Some(text));
+        self.inner.set_loading(loading);
+    }
+
+    /// Rebuild the list for the current scope, re-applying the active
+    /// search filter and restoring the highlighted row when it survives.
+    /// Used on scope toggle, where the whole item set changes.
     fn rebuild_list(&mut self) {
-        let selected_value = self.list.selected_item().map(|item| item.value.clone());
+        let selected_value = self.inner.selected_item().map(|item| item.value.clone());
         let items = build_items(self.current_entries());
-        let mut list = SelectList::new(
-            items,
-            self.max_visible_rows,
-            self.theme.clone(),
-            list_layout(),
-        );
-        list.set_focused(true);
-        list.set_filter(self.search.value());
+        // `set_items` re-applies the list's retained filter (kept in sync
+        // with the search box on every keystroke), so the new scope shows
+        // the same query's matches.
+        self.inner.list_mut().set_items(items);
         if let Some(value) = selected_value {
-            list.select_by_value(&value);
+            self.inner.list_mut().select_by_value(&value);
         }
-        self.list = list;
     }
 
-    /// Flip the scope, kicking off the all-workspaces scan the first
-    /// time it's needed, then rebuild the list for the new scope.
+    /// Flip the scope, spawning the all-workspaces scan the first time
+    /// it's needed, then rebuild the list for the new scope.
     fn toggle_scope(&mut self) {
         self.scope = match self.scope {
             Scope::Workspace => {
@@ -290,49 +258,15 @@ impl PromptHistorySearchComponent {
             Scope::All => Scope::Workspace,
         };
         self.rebuild_list();
+        self.sync_status();
     }
 
-    /// Kick off the all-workspaces scan on a blocking thread the first
-    /// time the scope is toggled. The scan is consumed here, so repeated
-    /// toggles never re-scan.
+    /// Spawn the all-workspaces scan on the first toggle. The factory is
+    /// consumed here, so repeated toggles never re-scan.
     fn request_all_load(&mut self) {
-        if let Some(scan) = self.all_scan.take() {
-            self.all_loading = true;
-            spawn_scan(
-                Scope::All,
-                scan,
-                self.loads_tx.clone(),
-                self.render_handle.clone(),
-            );
+        if let Some(factory) = self.all_scan_factory.take() {
+            self.all_scan = Some(StreamingScan::spawn(factory, self.render_handle.clone()));
         }
-    }
-
-    fn commit_selection(&self) {
-        let Some(item) = self.list.selected_item().cloned() else {
-            return;
-        };
-        self.outcome
-            .set(PromptHistoryOutcome::Recalled { text: item.value });
-    }
-
-    fn commit_cancel(&self) {
-        self.outcome.set(PromptHistoryOutcome::Cancelled);
-    }
-
-    /// Dim status line advertising the current scope, rendered between
-    /// the search box and the list. The toggle chord itself is
-    /// advertised on the overlay border, not here. While the visible
-    /// scope is still streaming results the line also carries a
-    /// `loading…` hint so partial lists don't look complete.
-    fn scope_line(&self) -> String {
-        let mut text = match self.scope {
-            Scope::Workspace => "Showing: this workspace".to_string(),
-            Scope::All => "Showing: all workspaces".to_string(),
-        };
-        if self.is_current_loading() {
-            text.push_str("  \u{2022}  loading\u{2026}");
-        }
-        (self.theme.description)(&text)
     }
 }
 
@@ -402,112 +336,42 @@ impl Component for PromptHistorySearchComponent {
     aj_tui::impl_component_any!();
 
     fn render(&mut self, width: usize) -> Vec<String> {
-        self.drain_loads();
-        let mut lines = Vec::with_capacity(self.max_visible_rows + 3);
-        lines.extend(self.search.render(width));
-        lines.push(self.scope_line());
-        lines.push(String::new());
-        if self.is_current_loading() && self.current_entries().is_empty() {
-            lines.push((self.theme.description)("Loading prompt history…"));
-        } else {
-            lines.extend(self.list.render(width));
-        }
-        lines
+        self.drain();
+        self.inner.render(width)
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
-        self.drain_loads();
-        let kb = keybindings::get();
+        self.drain();
 
+        // The scope toggle is this overlay's own chord; intercept it
+        // before the shared selector sees the key.
+        let kb = keybindings::get();
         if kb.matches(event, ACTION_HISTORY_TOGGLE_SCOPE) {
             drop(kb);
             self.toggle_scope();
             return true;
         }
-
-        if kb.matches(event, "tui.select.cancel") {
-            self.commit_cancel();
-            return true;
-        }
-
-        if kb.matches(event, "tui.input.submit") {
-            self.commit_selection();
-            return true;
-        }
-
-        if kb.matches(event, "tui.select.up")
-            || kb.matches(event, "tui.select.down")
-            || kb.matches(event, "tui.select.pageUp")
-            || kb.matches(event, "tui.select.pageDown")
-        {
-            drop(kb);
-            return self.list.handle_input(event);
-        }
-
         drop(kb);
 
-        let before = self.search.value().to_string();
-        let handled = self.search.handle_input(event);
-        if handled && self.search.value() != before {
-            self.list.set_filter(self.search.value());
-        }
-        handled
+        self.inner.handle_input(event)
     }
 
     fn set_focused(&mut self, focused: bool) {
-        self.search.set_focused(focused);
-        self.list.set_focused(focused);
+        self.inner.set_focused(focused);
     }
 
     fn set_available_height(&mut self, rows: usize) {
-        // Chrome above the list: search input + scope line + blank
-        // separator + the list's scroll-info line.
-        self.max_visible_rows = rows.saturating_sub(4).max(1);
-        // The list is rebuilt with `max_visible_rows` on scope toggle
-        // (see `toggle_scope`), so the new budget flows through there
-        // too; this keeps the current list in sync without a rebuild.
-        self.list.set_max_visible(self.max_visible_rows);
+        self.inner.set_available_height(rows);
     }
 
     fn is_focused(&self) -> bool {
-        self.search.is_focused()
+        self.inner.is_focused()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Scanning: extract submitted prompts from on-disk session logs.
 // ---------------------------------------------------------------------------
-
-/// Drive a streaming `scan` on a blocking thread, forwarding each
-/// batch it emits to the overlay's channel tagged with `scope` and
-/// waking the TUI; a `Done` marker follows so the overlay can drop its
-/// loading indicator. Outside a Tokio runtime (unit tests) the scan
-/// runs inline so results are delivered synchronously.
-fn spawn_scan(
-    scope: Scope,
-    scan: impl FnOnce(&mut dyn FnMut(Vec<PromptHistoryEntry>)) + Send + 'static,
-    tx: UnboundedSender<PromptHistoryLoad>,
-    render_handle: RenderHandle,
-) {
-    let run = move || {
-        let mut emit = |entries: Vec<PromptHistoryEntry>| {
-            if entries.is_empty() {
-                return;
-            }
-            let _ = tx.send(PromptHistoryLoad::Batch { scope, entries });
-            render_handle.request_render();
-        };
-        scan(&mut emit);
-        let _ = tx.send(PromptHistoryLoad::Done { scope });
-        render_handle.request_render();
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => {
-            tokio::task::spawn_blocking(run);
-        }
-        Err(_) => run(),
-    }
-}
 
 /// Stream the current workspace's submitted prompts, newest-first and
 /// deduplicated, invoking `emit` once per session file (each call

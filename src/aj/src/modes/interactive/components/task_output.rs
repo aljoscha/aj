@@ -18,7 +18,6 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use aj_agent::TaskRegistry;
 use aj_agent::tool::{TaskId, TaskStatus};
@@ -29,6 +28,7 @@ use aj_tui::keys::InputEvent;
 use aj_tui::style;
 
 use crate::config::keybindings::ACTION_TASK_KILL;
+use crate::modes::interactive::components::outcome::OutcomeSlot;
 
 /// Outcome of a viewer session.
 ///
@@ -41,26 +41,7 @@ pub enum TaskOutputOutcome {
 }
 
 /// Cheap-to-clone handle pointing at the viewer's outcome slot.
-#[derive(Clone)]
-pub struct TaskOutputOutcomeHandle(Arc<Mutex<Option<TaskOutputOutcome>>>);
-
-impl TaskOutputOutcomeHandle {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-
-    /// Take the current outcome (if any), leaving the slot empty.
-    pub fn take(&self) -> Option<TaskOutputOutcome> {
-        self.0
-            .lock()
-            .expect("task output outcome mutex poisoned")
-            .take()
-    }
-
-    fn set(&self, value: TaskOutputOutcome) {
-        *self.0.lock().expect("task output outcome mutex poisoned") = Some(value);
-    }
-}
+pub type TaskOutputOutcomeHandle = OutcomeSlot<TaskOutputOutcome>;
 
 /// Header rows the viewer renders above the scrollable body: the command
 /// line, the status line, and a blank separator.
@@ -445,6 +426,7 @@ impl Component for TaskOutputComponent {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::Arc;
 
     use aj_agent::events::AgentId;
     use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead};

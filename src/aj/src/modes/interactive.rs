@@ -68,9 +68,7 @@ use crate::modes::interactive::components::agent_picker::{
 use crate::modes::interactive::components::auth_picker::{
     AuthPickerComponent, AuthProviderItem, OutcomeHandle as AuthPickerOutcomeHandle,
 };
-use crate::modes::interactive::components::auth_status::{
-    AuthStatusComponent, AuthStatusOutcomeHandle,
-};
+use crate::modes::interactive::components::auth_status::AuthStatusOutcomeHandle;
 use crate::modes::interactive::components::command_palette::CommandPaletteOutcomeHandle;
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::login_dialog::{
@@ -3275,7 +3273,10 @@ async fn handle_command(
         }
         CommandAction::OpenAuthStatus => {
             let statuses = crate::auth::collect_statuses(auth).await;
-            let inner = AuthStatusComponent::new(select_list_theme(theme), statuses);
+            let inner = crate::modes::interactive::components::auth_status::build_overlay(
+                select_list_theme(theme),
+                statuses,
+            );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Auth status",
@@ -3617,8 +3618,9 @@ async fn handle_command(
             }
         }
         CommandAction::Help => {
-            use crate::modes::interactive::components::help_overlay::HelpOverlayComponent;
-            let inner = HelpOverlayComponent::new(select_list_theme(theme));
+            let inner = crate::modes::interactive::components::help_overlay::build_overlay(
+                select_list_theme(theme),
+            );
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Help",
@@ -4356,7 +4358,7 @@ async fn handle_selector_outcome(
         OpenSelector::Thinking {
             outcome, target, ..
         } => {
-            let outcome_value = outcome.lock().expect("thinking outcome poisoned").take();
+            let outcome_value = outcome.take();
             match outcome_value {
                 None => SelectorTransition::Stay,
                 Some(ThinkingSelectorOutcome::Confirmed(level)) => {
@@ -4385,7 +4387,7 @@ async fn handle_selector_outcome(
         OpenSelector::Model {
             outcome, target, ..
         } => {
-            let outcome_value = outcome.lock().expect("model outcome poisoned").take();
+            let outcome_value = outcome.take();
             match outcome_value {
                 None => SelectorTransition::Stay,
                 Some(ModelSelectorOutcome::Confirmed(info)) => {
@@ -4402,17 +4404,16 @@ async fn handle_selector_outcome(
             }
         }
         OpenSelector::Session { outcome, .. } => {
-            let outcome_value = outcome.lock().expect("session outcome poisoned").take();
+            let outcome_value = outcome.take();
             match outcome_value {
                 None => SelectorTransition::Stay,
-                Some(SessionSelectorOutcome::Confirmed(preview)) => {
+                Some(SessionSelectorOutcome::Confirmed(session_id)) => {
                     // No-op when the user picks the row that's already
                     // active. Saves the rebuild (and the chat-container
                     // clear that would briefly hide the scrollback).
-                    if world.session_id == preview.session_id {
+                    if world.session_id == session_id {
                         return SelectorTransition::Close(CloseEffects::notice(format!(
-                            "Already on session {}.",
-                            preview.session_id
+                            "Already on session {session_id}."
                         )));
                     }
                     // Hand the pick to the outer session loop, which
@@ -4420,7 +4421,7 @@ async fn handle_selector_outcome(
                     // chosen session (and emits the switch notice after
                     // the new world is installed).
                     SelectorTransition::Close(CloseEffects {
-                        session_request: Some(SessionRequest::Resume(preview.session_id)),
+                        session_request: Some(SessionRequest::Resume(session_id)),
                         ..CloseEffects::default()
                     })
                 }
@@ -4440,16 +4441,13 @@ async fn handle_selector_outcome(
             }
             Some(PromptHistoryOutcome::Cancelled) => SelectorTransition::Back,
         },
-        OpenSelector::Help { outcome, .. } => {
-            use crate::modes::interactive::components::help_overlay::HelpOverlayOutcome;
-            match outcome.take() {
-                None => SelectorTransition::Stay,
-                Some(HelpOverlayOutcome::Closed) => SelectorTransition::Back,
-            }
-        }
+        OpenSelector::Help { outcome, .. } => match outcome.take() {
+            None => SelectorTransition::Stay,
+            Some(()) => SelectorTransition::Back,
+        },
         OpenSelector::AuthPicker { outcome, mode, .. } => {
             use crate::modes::interactive::components::auth_picker::AuthPickerOutcome;
-            let value = outcome.lock().expect("auth picker outcome poisoned").take();
+            let value = outcome.take();
             match value {
                 None => SelectorTransition::Stay,
                 Some(AuthPickerOutcome::Cancelled) => SelectorTransition::Back,
@@ -4472,13 +4470,10 @@ async fn handle_selector_outcome(
                 },
             }
         }
-        OpenSelector::AuthStatus { outcome, .. } => {
-            use crate::modes::interactive::components::auth_status::AuthStatusOutcome;
-            match outcome.take() {
-                None => SelectorTransition::Stay,
-                Some(AuthStatusOutcome::Closed) => SelectorTransition::Back,
-            }
-        }
+        OpenSelector::AuthStatus { outcome, .. } => match outcome.take() {
+            None => SelectorTransition::Stay,
+            Some(()) => SelectorTransition::Back,
+        },
         OpenSelector::UsageStatus { outcome, .. } => {
             use crate::modes::interactive::components::usage_status::UsageStatusOutcome;
             match outcome.take() {
@@ -4487,10 +4482,7 @@ async fn handle_selector_outcome(
             }
         }
         OpenSelector::AgentPicker { outcome, .. } => {
-            let outcome_value = outcome
-                .lock()
-                .expect("agent picker outcome poisoned")
-                .take();
+            let outcome_value = outcome.take();
             match outcome_value {
                 None => SelectorTransition::Stay,
                 Some(AgentPickerOutcome::Confirmed(id)) => {
@@ -5288,8 +5280,7 @@ mod tests {
         let inner = ThinkingSelectorComponent::new(select_list_theme(&theme), None);
         let outcome = inner.outcome_handle();
         let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
-        *outcome.lock().expect("outcome poisoned") =
-            Some(ThinkingSelectorOutcome::Confirmed(level));
+        outcome.set(ThinkingSelectorOutcome::Confirmed(level));
         let dir = TempDir::new().expect("tempdir");
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         handle_selector_outcome(
@@ -5444,8 +5435,7 @@ mod tests {
             ModelSelectorComponent::new(select_list_theme(&theme), vec![info.clone()], None, None);
         let outcome = inner.outcome_handle();
         let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
-        *outcome.lock().expect("outcome poisoned") =
-            Some(ModelSelectorOutcome::Confirmed(info.clone()));
+        outcome.set(ModelSelectorOutcome::Confirmed(info.clone()));
 
         let result = handle_selector_outcome(
             &mut tui,
@@ -5546,7 +5536,7 @@ mod tests {
         );
         let outcome = inner.outcome_handle();
         let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
-        *outcome.lock().expect("outcome poisoned") = Some(AgentPickerOutcome::KillTask(task_id));
+        outcome.set(AgentPickerOutcome::KillTask(task_id));
 
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let result = handle_selector_outcome(
@@ -5584,8 +5574,9 @@ mod tests {
     /// tracking [`OpenSelector`] for it. Handy for exercising the
     /// stack's reveal/teardown mechanics without a full command flow.
     fn show_help_selector(tui: &mut Tui, theme: &ThemeHandle) -> OpenSelector {
-        use crate::modes::interactive::components::help_overlay::HelpOverlayComponent;
-        let inner = HelpOverlayComponent::new(select_list_theme(theme));
+        let inner = crate::modes::interactive::components::help_overlay::build_overlay(
+            select_list_theme(theme),
+        );
         let outcome = inner.outcome_handle();
         let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
         OpenSelector::Help { handle, outcome }
@@ -5670,7 +5661,7 @@ mod tests {
         );
         let outcome = inner.outcome_handle();
         let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
-        *outcome.lock().expect("outcome poisoned") = Some(outcome_value);
+        outcome.set(outcome_value);
 
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         handle_selector_outcome(

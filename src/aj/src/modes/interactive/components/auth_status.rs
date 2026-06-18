@@ -4,75 +4,33 @@
 //! A non-interactive [`SelectList`] (selection indicator suppressed),
 //! one row per provider: the provider id as a dim prefix column, the
 //! credential method/source summary as the primary label, and the
-//! optional detail (e.g. OAuth token expiry) in the right column.
-//! Both `Esc` and `Enter` close it, mirroring
-//! [`crate::modes::interactive::components::help_overlay`].
+//! optional detail (e.g. OAuth token expiry) in the right column. The
+//! list/close-key mechanics are the shared [`ReadOnlyListOverlay`]; this
+//! module only builds the rows.
 
-use std::sync::{Arc, Mutex};
-
-use aj_tui::component::Component;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
-use aj_tui::keybindings;
-use aj_tui::keys::InputEvent;
 
 use crate::auth::ProviderAuthStatus;
+use crate::modes::interactive::components::read_only_list::{
+    ReadOnlyCloseHandle, ReadOnlyListOverlay,
+};
 
-/// Outcome of a single status-overlay session. Read-only, so the only
-/// terminal state is `Closed`.
-#[derive(Clone, Debug)]
-pub enum AuthStatusOutcome {
-    Closed,
-}
+/// Cheap-to-clone handle the host polls to learn the overlay was closed.
+pub type AuthStatusOutcomeHandle = ReadOnlyCloseHandle;
 
-/// Cheap-to-clone handle pointing at the overlay's outcome slot.
-#[derive(Clone)]
-pub struct AuthStatusOutcomeHandle(Arc<Mutex<Option<AuthStatusOutcome>>>);
-
-impl AuthStatusOutcomeHandle {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-
-    /// Take the current outcome (if any), leaving the slot empty.
-    pub fn take(&self) -> Option<AuthStatusOutcome> {
-        self.0
-            .lock()
-            .expect("auth status outcome mutex poisoned")
-            .take()
-    }
-
-    fn set(&self, value: AuthStatusOutcome) {
-        *self.0.lock().expect("auth status outcome mutex poisoned") = Some(value);
-    }
-}
-
-/// Read-only status list.
-pub struct AuthStatusComponent {
-    list: SelectList,
-    outcome: AuthStatusOutcomeHandle,
-    focused: bool,
-}
-
-impl AuthStatusComponent {
-    /// Build the overlay from pre-computed per-provider statuses.
-    pub fn new(list_theme: SelectListTheme, statuses: Vec<ProviderAuthStatus>) -> Self {
-        let layout = SelectListLayout {
-            show_selection_indicator: false,
-            ..Default::default()
-        };
-        let visible = statuses.len().max(1);
-        let list = SelectList::new(build_items(&statuses), visible, list_theme, layout);
-        Self {
-            list,
-            outcome: AuthStatusOutcomeHandle::new(),
-            focused: true,
-        }
-    }
-
-    /// Hand the host a clone of the outcome slot.
-    pub fn outcome_handle(&self) -> AuthStatusOutcomeHandle {
-        self.outcome.clone()
-    }
+/// Build a read-only status overlay from pre-computed per-provider
+/// statuses.
+pub fn build_overlay(
+    list_theme: SelectListTheme,
+    statuses: Vec<ProviderAuthStatus>,
+) -> ReadOnlyListOverlay {
+    let layout = SelectListLayout {
+        show_selection_indicator: false,
+        ..Default::default()
+    };
+    let visible = statuses.len().max(1);
+    let list = SelectList::new(build_items(&statuses), visible, list_theme, layout);
+    ReadOnlyListOverlay::new(list)
 }
 
 fn build_items(statuses: &[ProviderAuthStatus]) -> Vec<SelectItem> {
@@ -88,34 +46,11 @@ fn build_items(statuses: &[ProviderAuthStatus]) -> Vec<SelectItem> {
         .collect()
 }
 
-impl Component for AuthStatusComponent {
-    aj_tui::impl_component_any!();
-
-    fn render(&mut self, width: usize) -> Vec<String> {
-        self.list.render(width)
-    }
-
-    fn handle_input(&mut self, event: &InputEvent) -> bool {
-        let kb = keybindings::get();
-        if kb.matches(event, "tui.select.cancel") || kb.matches(event, "tui.input.submit") {
-            self.outcome.set(AuthStatusOutcome::Closed);
-            return true;
-        }
-        // Swallow every other key — the list is read-only.
-        true
-    }
-
-    fn set_focused(&mut self, focused: bool) {
-        self.focused = focused;
-    }
-
-    fn is_focused(&self) -> bool {
-        self.focused
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use aj_tui::component::Component;
     use aj_tui::keys::Key;
 
     use super::*;
@@ -132,8 +67,8 @@ mod tests {
         }
     }
 
-    fn sample() -> AuthStatusComponent {
-        AuthStatusComponent::new(
+    fn sample() -> ReadOnlyListOverlay {
+        build_overlay(
             identity_theme(),
             vec![
                 ProviderAuthStatus {
@@ -167,11 +102,11 @@ mod tests {
         let mut c = sample();
         let h = c.outcome_handle();
         c.handle_input(&Key::escape());
-        assert!(matches!(h.take(), Some(AuthStatusOutcome::Closed)));
+        assert!(h.take().is_some(), "Esc should close");
 
         let mut c = sample();
         let h = c.outcome_handle();
         c.handle_input(&Key::enter());
-        assert!(matches!(h.take(), Some(AuthStatusOutcome::Closed)));
+        assert!(h.take().is_some(), "Enter should close");
     }
 }

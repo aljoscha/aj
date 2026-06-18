@@ -12,9 +12,9 @@
 //! which providers to list and what to do on confirm. This component
 //! only surfaces the choice.
 
-use std::sync::{Arc, Mutex};
-
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
+
+use crate::modes::interactive::components::outcome::OutcomeSlot;
 
 /// Outcome of a single picker session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub enum AuthPickerOutcome {
 }
 
 /// Cheap-to-clone handle pointing at the picker's outcome slot.
-pub type OutcomeHandle = Arc<Mutex<Option<AuthPickerOutcome>>>;
+pub type OutcomeHandle = OutcomeSlot<AuthPickerOutcome>;
 
 /// One selectable provider row supplied by the host.
 pub struct AuthProviderItem {
@@ -58,16 +58,14 @@ impl AuthPickerComponent {
         let visible = select_items.len().max(1);
         let mut inner = SelectList::new(select_items, visible, theme, SelectListLayout::default());
 
-        let outcome: OutcomeHandle = Arc::new(Mutex::new(None));
-        let confirm = Arc::clone(&outcome);
+        let outcome = OutcomeHandle::new();
+        let confirm = outcome.clone();
         inner.on_select = Some(Box::new(move |item| {
-            *confirm.lock().expect("auth picker outcome poisoned") =
-                Some(AuthPickerOutcome::Confirmed(item.value.clone()));
+            confirm.set(AuthPickerOutcome::Confirmed(item.value.clone()));
         }));
-        let cancel = Arc::clone(&outcome);
+        let cancel = outcome.clone();
         inner.on_cancel = Some(Box::new(move || {
-            *cancel.lock().expect("auth picker outcome poisoned") =
-                Some(AuthPickerOutcome::Cancelled);
+            cancel.set(AuthPickerOutcome::Cancelled);
         }));
 
         Self { inner, outcome }
@@ -75,7 +73,7 @@ impl AuthPickerComponent {
 
     /// Hand the host a clone of the outcome slot.
     pub fn outcome_handle(&self) -> OutcomeHandle {
-        Arc::clone(&self.outcome)
+        self.outcome.clone()
     }
 }
 
@@ -103,6 +101,8 @@ impl aj_tui::component::Component for AuthPickerComponent {
 mod tests {
     use aj_tui::component::Component;
     use aj_tui::keys::Key;
+
+    use std::sync::Arc;
 
     use super::*;
 
@@ -142,7 +142,7 @@ mod tests {
         let outcome = p.outcome_handle();
         p.handle_input(&Key::enter());
         assert_eq!(
-            outcome.lock().unwrap().take(),
+            outcome.take(),
             Some(AuthPickerOutcome::Confirmed("anthropic".into()))
         );
     }
@@ -154,7 +154,7 @@ mod tests {
         p.handle_input(&Key::down());
         p.handle_input(&Key::enter());
         assert_eq!(
-            outcome.lock().unwrap().take(),
+            outcome.take(),
             Some(AuthPickerOutcome::Confirmed("openai-codex".into()))
         );
     }
@@ -164,9 +164,6 @@ mod tests {
         let mut p = sample();
         let outcome = p.outcome_handle();
         p.handle_input(&Key::escape());
-        assert_eq!(
-            outcome.lock().unwrap().take(),
-            Some(AuthPickerOutcome::Cancelled)
-        );
+        assert_eq!(outcome.take(), Some(AuthPickerOutcome::Cancelled));
     }
 }
