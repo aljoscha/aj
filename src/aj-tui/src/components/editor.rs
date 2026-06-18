@@ -901,6 +901,46 @@ impl Editor {
         self.history_index = None;
     }
 
+    /// Splice older history entries in beneath whatever the ring
+    /// already holds.
+    ///
+    /// `entries` are oldest-first (newest last), the same order
+    /// [`Editor::add_to_history`] consumes. They land *before* any
+    /// prompts already in the ring, so submissions made this session
+    /// stay the most-recent ones an Up press reaches first. The
+    /// [`Editor::HISTORY_LIMIT`] cap then drops the oldest.
+    ///
+    /// This installs the cross-session prompt history once its
+    /// background scan finishes, which is why it tolerates a
+    /// partially-populated ring rather than assuming it is empty.
+    ///
+    /// Safe to call while the user is mid-browse: a browse cursor (and
+    /// the temporary draft entry browsing parks at the tail) index into
+    /// `self.history`, so we shift `history_index` by the net change at
+    /// the front. The draft stays at the tail because we only ever drop
+    /// from the front, keeping [`Editor::history_down`]'s "draft is the
+    /// last entry" invariant intact.
+    pub fn seed_history(&mut self, entries: &[String]) {
+        if entries.is_empty() {
+            return;
+        }
+        let added = entries.len();
+        let mut seeded = Vec::with_capacity(added + self.history.len());
+        seeded.extend(entries.iter().cloned());
+        seeded.append(&mut self.history);
+        self.history = seeded;
+        if let Some(idx) = self.history_index.as_mut() {
+            *idx += added;
+        }
+        if self.history.len() > Self::HISTORY_LIMIT {
+            let overflow = self.history.len() - Self::HISTORY_LIMIT;
+            self.history.drain(..overflow);
+            if let Some(idx) = self.history_index.as_mut() {
+                *idx = idx.saturating_sub(overflow);
+            }
+        }
+    }
+
     /// Insert text at the current cursor position atomically.
     ///
     /// The whole insertion is one undo unit — callers can undo it with a
@@ -3950,5 +3990,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn seed_history_into_empty_orders_newest_last() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_focused(true);
+        editor.seed_history(&[
+            "oldest".to_string(),
+            "middle".to_string(),
+            "newest".to_string(),
+        ]);
+        // Up walks back from the newest entry.
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "newest");
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "middle");
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "oldest");
+    }
+
+    #[test]
+    fn seed_history_keeps_live_submissions_most_recent() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_focused(true);
+        // A prompt submitted this session, before the background scan lands.
+        editor.add_to_history("live prompt");
+        // Older cross-session prompts arrive afterwards.
+        editor.seed_history(&["old a".to_string(), "old b".to_string()]);
+        // The live prompt is still the first thing Up reaches.
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "live prompt");
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "old b");
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "old a");
+    }
+
+    #[test]
+    fn seed_history_applies_while_browsing_without_losing_the_cursor() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_focused(true);
+        editor.add_to_history("submitted");
+        // Enter browse mode (history_index set), showing the live entry.
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "submitted");
+        // A scan landing mid-browse splices in beneath the cursor; the
+        // displayed entry is unchanged because the cursor shifts with it.
+        editor.seed_history(&["older".to_string()]);
+        assert_eq!(editor.get_text(), "submitted");
+        // The seed is not lost: walking further up surfaces it.
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(editor.get_text(), "older");
+    }
+
+    #[test]
+    fn seed_history_respects_cap() {
+        let mut editor = Editor::new(RenderHandle::detached(), identity_theme());
+        editor.set_focused(true);
+        let entries: Vec<String> = (0..Editor::HISTORY_LIMIT + 50)
+            .map(|i| format!("p{i}"))
+            .collect();
+        editor.seed_history(&entries);
+        // The cap keeps the newest HISTORY_LIMIT entries; the very
+        // newest is what the first Up surfaces.
+        editor.handle_input(&crate::keys::Key::up());
+        assert_eq!(
+            editor.get_text(),
+            format!("p{}", Editor::HISTORY_LIMIT + 50 - 1)
+        );
     }
 }

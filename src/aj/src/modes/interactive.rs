@@ -412,23 +412,25 @@ impl InteractiveMode {
             editor.set_autocomplete_provider(Arc::new(provider));
         }
 
-        // Bootstrap the editor's prompt-history ring from every
-        // `*.jsonl` file under the project's sessions directory so
-        // pressing Up surfaces cross-session prompts the user has
-        // ever submitted in this project. Live submissions update
-        // the same ring through
-        // [`aj_tui::components::editor::Editor::add_to_history`]
-        // in the submit branch below; this bootstrap covers the
-        // "I just relaunched the binary" case where the in-memory
-        // ring would otherwise start empty. No persistence layer
-        // is involved — the conversation log files are the source
-        // of truth, so two `aj` processes running side by
-        // side can't clobber each other's history.
-        let prompt_history =
-            PromptHistory::bootstrap(&conversation_persistence, DEFAULT_MAX_ENTRIES);
-        if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
-            prompt_history.install(editor);
-        }
+        // Bootstrap the editor's prompt-history ring from the
+        // project's `*.jsonl` session logs so pressing Up surfaces
+        // cross-session prompts the user has ever submitted here. The
+        // scan runs on a background thread (see
+        // [`spawn_prompt_history_bootstrap`]) and the result is
+        // installed by the session loop's select arm once it lands, so
+        // a large session backlog never delays first paint. Live
+        // submissions update the same ring through
+        // [`aj_tui::components::editor::Editor::add_to_history`] in the
+        // submit branch below. The backgrounded seed lands *beneath*
+        // anything typed in the meantime (see
+        // [`aj_tui::components::editor::Editor::seed_history`]). No
+        // persistence layer is involved. The conversation log files
+        // are the source of truth, so two `aj` processes running side
+        // by side can't clobber each other's history.
+        let mut prompt_history_rx = Some(spawn_prompt_history_bootstrap(
+            conversation_persistence.clone(),
+            DEFAULT_MAX_ENTRIES,
+        ));
 
         // Shared flag tripped by the editor's `/`-at-empty-prompt
         // callback and by the global `Ctrl+O` chord. The main loop
@@ -571,6 +573,7 @@ impl InteractiveMode {
                 &mut shell,
                 &mut world,
                 &mut theme_watch,
+                &mut prompt_history_rx,
                 std::mem::take(&mut launch_content),
             )
             .await
@@ -888,6 +891,7 @@ async fn run_session(
     shell: &mut Shell,
     world: &mut SessionWorld,
     theme_watch: &mut ThemeWatch,
+    prompt_history_rx: &mut Option<UnboundedReceiver<PromptHistory>>,
     launch_content: Vec<UserContent>,
 ) -> Result<SessionExit> {
     // ---- Main event loop ------------------------------------------
@@ -1906,6 +1910,24 @@ async fn run_session(
                     &notice_event(&format!("Theme '{name}' reloaded.")),
                 );
             }
+
+            // --- Prompt-history bootstrap delivered ---
+            // The cross-session Up-arrow ring is scanned off-thread at
+            // startup (a large session backlog would otherwise block
+            // first paint). When it lands, seed it beneath any prompts
+            // already submitted this session, then drop the receiver so
+            // the arm pends forever for the rest of the process.
+            seeded = recv_prompt_history(prompt_history_rx.as_mut()) => {
+                // Seeding the ring changes nothing on screen (history
+                // only surfaces on Up), so no render is requested.
+                if let Some(history) = seeded
+                    && let Some(editor) =
+                        shell.tui.get_mut_as::<Editor>(SlotIndex::Editor.idx())
+                {
+                    history.install(editor);
+                }
+                *prompt_history_rx = None;
+            }
         }
     };
 
@@ -2181,6 +2203,37 @@ async fn join_next_or_pending(
 /// (no watcher / `None`), the future pends forever — the arm
 /// effectively becomes a no-op in the `select!`.
 async fn recv_theme(rx: Option<&mut UnboundedReceiver<Theme>>) -> Option<Theme> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Spawn the prompt-history bootstrap on a blocking thread, delivering
+/// the finished [`PromptHistory`] over the returned channel.
+///
+/// The scan is bounded (newest-first, stops at `max`), but we still
+/// keep it off the startup path so first paint never waits on disk.
+/// The session loop polls the receiver via [`recv_prompt_history`] and
+/// seeds the editor when the result arrives.
+fn spawn_prompt_history_bootstrap(
+    persistence: ConversationPersistence,
+    max: usize,
+) -> UnboundedReceiver<PromptHistory> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        let _ = tx.send(PromptHistory::bootstrap(&persistence, max));
+    });
+    rx
+}
+
+/// Await the backgrounded prompt-history bootstrap. Mirrors
+/// [`recv_theme`]: an absent receiver (already delivered, so the host
+/// cleared it) pends forever, making the `select!` arm a no-op once
+/// the ring is seeded.
+async fn recv_prompt_history(
+    rx: Option<&mut UnboundedReceiver<PromptHistory>>,
+) -> Option<PromptHistory> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,

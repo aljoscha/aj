@@ -25,12 +25,10 @@
 //! per-scope entry accumulators, and the toggle chord.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
 
-use aj_session::{ConversationEntry, ConversationEntryKind, ConversationPersistence, ThreadKind};
+use aj_session::ConversationPersistence;
 use aj_tui::component::Component;
 use aj_tui::components::filterable_select::FilterableSelect;
 use aj_tui::components::select_list::{
@@ -43,7 +41,7 @@ use aj_tui::tui::RenderHandle;
 use crate::config::keybindings::ACTION_HISTORY_TOGGLE_SCOPE;
 use crate::modes::interactive::components::outcome::OutcomeSlot;
 use crate::modes::interactive::components::streaming_scan::StreamingScan;
-use crate::modes::interactive::editor_ext::extract_user_prompt_text;
+use crate::modes::interactive::editor_ext::scan_file_user_prompts;
 
 /// Cap on how many prompts a single scope retains. Generous enough
 /// to cover any realistic history while bounding the scan + the
@@ -497,42 +495,18 @@ fn collect_dir(
 }
 
 /// Extract the user-submitted prompt texts from a single session file,
-/// in chronological (file) order. Mirrors the failure-isolation
-/// contract of [`crate::modes::interactive::editor_ext::PromptHistory`]:
-/// non-UTF-8 lines, unparseable lines, and non-top-level entries are
-/// skipped without aborting the file.
+/// in chronological (file) order. Delegates to the shared
+/// [`scan_file_user_prompts`] (cheap pre-filter, failure isolation) and
+/// applies this overlay's own trim: a fully-trimmed display string,
+/// dropping blanks.
 fn load_file_prompts(path: &Path) -> Vec<String> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!("skipping unreadable session file {}: {e}", path.display());
-            return Vec::new();
-        }
-    };
-
-    let mut prompts = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: ConversationEntry = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !matches!(entry.thread, ThreadKind::User) {
-            continue;
-        }
-        if let ConversationEntryKind::Message { message } = entry.entry
-            && let Some(text) = extract_user_prompt_text(&message)
-        {
+    scan_file_user_prompts(path)
+        .into_iter()
+        .filter_map(|text| {
             let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                prompts.push(trimmed.to_string());
-            }
-        }
-    }
-    prompts
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -688,6 +662,7 @@ mod tests {
 
     // --- Scanner tests (fs-backed) ---
 
+    use std::fs::File;
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -68,9 +68,15 @@ impl PromptHistory {
         }
     }
 
-    /// Walk every `*.jsonl` file in the project's sessions directory,
-    /// extract user-text prompts in chronological order, and load
-    /// them into a fresh [`PromptHistory`].
+    /// Extract the most recent `max` user-text prompts from the
+    /// project's sessions directory, in chronological order.
+    ///
+    /// Session files are walked newest-first and the scan stops as
+    /// soon as `max` prompts are collected, so a project with a large
+    /// backlog of old logs only pays for the newest file or two rather
+    /// than parsing every log. (This runs on a background thread off
+    /// the startup path, but the early stop keeps that thread's work
+    /// bounded regardless.)
     ///
     /// Robustness contract:
     ///
@@ -107,91 +113,50 @@ impl PromptHistory {
             .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
             .collect();
 
-        // Filenames are timestamps; lex sort = chronological.
-        // Oldest first so the most recently submitted prompts end
-        // up most recent in the queue.
+        // Filenames are timestamps. Reverse-lex sort puts the newest
+        // file first, so collecting newest-first lets the early stop at
+        // `max` touch only recent logs. We reverse back to chronological
+        // before storing.
         files.sort();
+        files.reverse();
 
-        for path in &files {
-            history.load_file(path);
+        // Consecutive-duplicate suppression is symmetric under reversal
+        // (a run of equal prompts collapses the same forwards or
+        // backwards), so comparing each prompt against the previously
+        // kept one while walking newest-first yields the same deduped
+        // chronological sequence a forward walk would, bounded to the
+        // most recent `max`.
+        let mut newest_first: Vec<String> = Vec::new();
+        'outer: for path in &files {
+            for text in scan_file_user_prompts(path).into_iter().rev() {
+                let Some(norm) = normalize_prompt(&text) else {
+                    continue;
+                };
+                if newest_first.last().map(String::as_str) == Some(norm) {
+                    continue;
+                }
+                newest_first.push(norm.to_string());
+                if newest_first.len() >= history.max {
+                    break 'outer;
+                }
+            }
         }
 
+        newest_first.reverse();
+        history.entries = newest_first.into();
         history
     }
 
-    fn load_file(&mut self, path: &Path) {
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::debug!("skipping unreadable session file {}: {e}", path.display());
-                return;
-            }
-        };
-
-        for (lineno, line) in BufReader::new(file).lines().enumerate() {
-            let line = match line {
-                Ok(s) => s,
-                Err(_) => {
-                    // Invalid UTF-8 on this line: skip it, keep
-                    // going. This is the failure-isolation
-                    // property a flat-file history format lacks.
-                    continue;
-                }
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let entry: ConversationEntry = match serde_json::from_str(&line) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::debug!(
-                        "skipping unparseable line {} in {}: {e}",
-                        lineno + 1,
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-            if !matches!(entry.thread, ThreadKind::User) {
-                continue;
-            }
-            if let ConversationEntryKind::Message { message: msg } = entry.entry
-                && let Some(text) = extract_user_prompt_text(&msg)
-            {
-                self.push_internal(text);
-            }
-        }
-    }
-
-    fn push_internal(&mut self, text: String) {
-        let trimmed = text.trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
-        let trimmed = trimmed.trim_start_matches(|c: char| c == ' ' || c == '\t');
-        if trimmed.is_empty() {
-            return;
-        }
-        // Don't materially re-allocate if no trim happened.
-        let entry = if trimmed.len() == text.len() {
-            text
-        } else {
-            trimmed.to_string()
-        };
-        if self.entries.back().is_some_and(|s| s == &entry) {
-            return;
-        }
-        self.entries.push_back(entry);
-        while self.entries.len() > self.max {
-            self.entries.pop_front();
-        }
-    }
-
-    /// Push every entry into `editor`, oldest first. Pressing Up
-    /// once after this returns surfaces the most recently submitted
-    /// prompt; the editor's own [`Editor::HISTORY_LIMIT`] cap and
-    /// consecutive-duplicate dedup apply naturally as entries land.
+    /// Seed `editor`'s history ring with these prompts, oldest first.
+    ///
+    /// Delegates to [`Editor::seed_history`], so the entries land
+    /// beneath any prompts already submitted this session (the scan is
+    /// backgrounded and can finish after the first submission). After
+    /// it returns, pressing Up surfaces the most recent prompt and the
+    /// editor's own [`Editor::HISTORY_LIMIT`] cap applies.
     pub fn install(&self, editor: &mut Editor) {
-        for entry in &self.entries {
-            editor.add_to_history(entry);
-        }
+        let entries: Vec<String> = self.entries.iter().cloned().collect();
+        editor.seed_history(&entries);
     }
 
     /// Total entries currently retained.
@@ -230,6 +195,107 @@ pub(crate) fn extract_user_prompt_text(msg: &AgentMessage) -> Option<String> {
         None
     } else {
         Some(parts.join("\n"))
+    }
+}
+
+/// Read the user-typed prompt texts from one session file, in
+/// chronological (file) order. Shared by the editor's Up-arrow ring
+/// and the `/history` overlay; each caller applies its own trimming
+/// and dedup to the raw joined text returned here.
+///
+/// A session log is mostly assistant turns and tool results whose
+/// bodies dwarf the occasional user prompt. To keep a scan of a large
+/// project's logs cheap, each line is first parsed into a tiny
+/// [`PromptHead`] capturing only the thread and message role; the
+/// expensive full [`ConversationEntry`] parse (which allocates the
+/// message-content tree) runs only for lines that really are top-level
+/// user messages.
+///
+/// Honors the failure-isolation contract documented on
+/// [`PromptHistory::bootstrap`]: an unreadable file yields no prompts,
+/// and non-UTF-8 or unparseable lines are skipped without aborting the
+/// rest of the file.
+pub(crate) fn scan_file_user_prompts(path: &Path) -> Vec<String> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!("skipping unreadable session file {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
+
+    let mut prompts = Vec::new();
+    for (lineno, line) in BufReader::new(file).lines().enumerate() {
+        // A non-UTF-8 (or IO-erroring) line is skipped, not fatal:
+        // the failure-isolation property a flat-file format lacks.
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let head: PromptHead = match serde_json::from_str(&line) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(
+                    "skipping unparseable line {} in {}: {e}",
+                    lineno + 1,
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if !head.is_user_prompt() {
+            continue;
+        }
+        // Confirmed a top-level user message; the full parse is what
+        // actually pulls the text content out.
+        if let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line)
+            && let ConversationEntryKind::Message { message: msg } = entry.entry
+            && let Some(text) = extract_user_prompt_text(&msg)
+        {
+            prompts.push(text);
+        }
+    }
+    prompts
+}
+
+/// A minimal view of one log line: just enough to tell whether it is a
+/// top-level user message. Unlisted fields (including the message
+/// `content`) are ignored, so serde walks past the heavy body without
+/// allocating it.
+#[derive(serde::Deserialize)]
+struct PromptHead {
+    thread: ThreadKind,
+    #[serde(default)]
+    message: Option<PromptHeadMessage>,
+}
+
+#[derive(serde::Deserialize)]
+struct PromptHeadMessage {
+    #[serde(default)]
+    role: Option<String>,
+}
+
+impl PromptHead {
+    /// A line is a user prompt when it is on the user thread and its
+    /// message role is `user` (the `role` tag of [`Message::User`]).
+    /// Assistant / tool-result messages and non-message entries
+    /// (system prompt, settings records) are excluded.
+    fn is_user_prompt(&self) -> bool {
+        matches!(self.thread, ThreadKind::User)
+            && self.message.as_ref().and_then(|m| m.role.as_deref()) == Some("user")
+    }
+}
+
+/// Trim a prompt for storage: drop trailing whitespace (keeping any
+/// trailing newline) and leading spaces/tabs. Returns `None` when only
+/// whitespace remains.
+fn normalize_prompt(text: &str) -> Option<&str> {
+    let trimmed = text.trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
+    let trimmed = trimmed.trim_start_matches(|c: char| c == ' ' || c == '\t');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -432,6 +498,28 @@ mod tests {
         let h = bootstrap_for(&dir, 100);
         let entries: Vec<&str> = h.iter().collect();
         assert_eq!(entries, vec!["a", "b", "a"]);
+    }
+
+    #[test]
+    fn bootstrap_dedupes_consecutive_across_file_boundaries() {
+        let dir = scratch_dir("dedup-cross-file");
+        // Older file ends with "x"; the newer file starts with "x". In
+        // chronological order those two are adjacent, so the duplicate
+        // collapses even though it straddles the file boundary. This
+        // locks the newest-first scan's central equivalence claim.
+        write_jsonl(
+            &dir,
+            "2024-01-01-00-00-00",
+            &[&user_message_line("a", "1"), &user_message_line("x", "2")],
+        );
+        write_jsonl(
+            &dir,
+            "2024-02-01-00-00-00",
+            &[&user_message_line("x", "1"), &user_message_line("b", "2")],
+        );
+        let h = bootstrap_for(&dir, 100);
+        let entries: Vec<&str> = h.iter().collect();
+        assert_eq!(entries, vec!["a", "x", "b"]);
     }
 
     #[test]
