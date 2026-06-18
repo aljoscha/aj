@@ -13,7 +13,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(about = "AI-driven agent for software engineering")]
 #[command(flatten_help = true)]
 pub struct Args {
-    /// Model API to use (e.g. `anthropic`, `openai`, `openai-codex`).
+    /// Model API to use (e.g. `anthropic`, `openai`, `openai-codex`,
+    /// `openrouter`).
     #[arg(long, env = "MODEL_API")]
     pub model_api: Option<String>,
 

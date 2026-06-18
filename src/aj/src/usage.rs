@@ -48,7 +48,7 @@ pub enum UsageOutcome {
 /// Providers surfaced on the `/usage` page even without a usage
 /// source, so the page self-documents that it covers all providers
 /// and not just Anthropic. Mirrors the `/auth` page's known set.
-const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex"];
+const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openrouter"];
 
 /// Fetch usage from every registered source concurrently and append
 /// "no usage source" rows for the remaining known providers. Rows
@@ -260,7 +260,10 @@ mod tests {
         let auth = AuthStorage::with_providers(dir.join("auth.json"), Default::default());
         let statuses = collect_usage(&auth).await;
         let ids: Vec<&str> = statuses.iter().map(|s| s.provider_id.as_str()).collect();
-        assert_eq!(ids, vec!["anthropic", "openai", "openai-codex"]);
+        assert_eq!(
+            ids,
+            vec!["anthropic", "openai", "openai-codex", "openrouter"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

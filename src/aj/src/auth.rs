@@ -25,7 +25,7 @@ use aj_models::auth::{AuthCredential, AuthStorage, find_env_keys};
 /// available to log into / configure. The union with
 /// [`AuthStorage::oauth_provider_ids`] and any hand-added entry in
 /// `auth.json` is computed at display time.
-const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex"];
+const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openrouter"];
 
 /// A provider's resolved authentication status, ready to render.
 ///
