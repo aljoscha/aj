@@ -24,10 +24,10 @@ use openai_sdk::types::common::{
 };
 use openai_sdk::types::responses::{
     CreateResponseRequest, FunctionCallOutputContent, ImageDetail, InputRole, ItemStatus,
-    MessagePhase, Reasoning, ReasoningSummary, ReasoningSummaryMode, Response, ResponseIncludable,
-    ResponseInput, ResponseInputContentPart, ResponseInputItem, ResponseInputMessageContent,
-    ResponseOutputItem, ResponseStatus, ResponseStreamEvent, ResponseTool, ResponseToolChoice,
-    ResponseUsage,
+    MessagePhase, Reasoning, ReasoningContent, ReasoningSummary, ReasoningSummaryMode, Response,
+    ResponseIncludable, ResponseInput, ResponseInputContentPart, ResponseInputItem,
+    ResponseInputMessageContent, ResponseOutputItem, ResponseStatus, ResponseStreamEvent,
+    ResponseTool, ResponseToolChoice, ResponseUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -886,6 +886,27 @@ fn join_reasoning_summary(summary: &[ReasoningSummary]) -> String {
         .join("\n\n")
 }
 
+/// Visible thinking text for a finished reasoning item: the summary when
+/// present, otherwise the raw `reasoning_text` content parts. Returns an
+/// empty string when the item carries neither, in which case the caller
+/// falls back to whatever live deltas accumulated.
+fn reasoning_display_text(
+    summary: &[ReasoningSummary],
+    content: Option<&[ReasoningContent]>,
+) -> String {
+    if !summary.is_empty() {
+        return join_reasoning_summary(summary);
+    }
+    match content {
+        Some(parts) => parts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        None => String::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stream state machine (§7.3.6)
 // ---------------------------------------------------------------------------
@@ -1051,9 +1072,18 @@ impl StreamState {
                 output_index,
                 ..
             } => self.on_reasoning_delta(output_index, &delta, &mut out),
+            // Raw reasoning text. Some OpenAI-compatible endpoints stream
+            // the chain-of-thought as plain `reasoning_text` and send no
+            // summary, so we route it into the same thinking block. A
+            // model streams either a summary or a raw chain, never both,
+            // so this does not double-count.
+            ResponseStreamEvent::ReasoningTextDelta {
+                delta,
+                output_index,
+                ..
+            } => self.on_reasoning_delta(output_index, &delta, &mut out),
             ResponseStreamEvent::ReasoningSummaryPartDone { .. }
             | ResponseStreamEvent::ReasoningSummaryTextDone { .. }
-            | ResponseStreamEvent::ReasoningTextDelta { .. }
             | ResponseStreamEvent::ReasoningTextDone { .. } => {}
             ResponseStreamEvent::ResponseCompleted { response, .. } => {
                 self.ensure_started(&response, &mut out);
@@ -1189,28 +1219,39 @@ impl StreamState {
                 },
                 Some(ItemSlot::Reasoning { content_index, .. }),
             ) => {
+                // Prefer the summary for the visible thinking text. When
+                // it is empty (models that stream a raw `reasoning_text`
+                // chain instead of a summary), fall back to the content
+                // parts, then to whatever live deltas accumulated. We
+                // compute this before moving the fields into the
+                // signature below.
+                let joined = reasoning_display_text(&summary, content.as_deref());
                 // Re-serialize the reasoning item into a stable
                 // signature so the next turn can replay it.
                 let signature = serde_json::to_string(&ResponseInputItem::Reasoning {
                     id,
-                    summary: summary.clone(),
+                    summary,
                     content,
                     encrypted_content,
                     status,
                 })
                 .ok();
-                let joined = join_reasoning_summary(&summary);
                 if let Some(AssistantContent::Thinking(t)) =
                     self.partial.content.get_mut(content_index)
                 {
-                    t.thinking = joined.clone();
+                    let text = if joined.is_empty() && !t.thinking.is_empty() {
+                        t.thinking.clone()
+                    } else {
+                        joined
+                    };
+                    t.thinking = text.clone();
                     t.thinking_signature = signature;
+                    out.push(AssistantMessageEvent::ThinkingEnd {
+                        content_index,
+                        content: text,
+                        partial: self.partial.clone(),
+                    });
                 }
-                out.push(AssistantMessageEvent::ThinkingEnd {
-                    content_index,
-                    content: joined,
-                    partial: self.partial.clone(),
-                });
             }
             (
                 ResponseOutputItem::Message { id, phase, .. },
@@ -1861,6 +1902,118 @@ mod tests {
             state.finalize_or_truncate(),
             AssistantMessageEvent::Done { .. }
         ));
+    }
+
+    /// Models that stream the raw chain via `reasoning_text` and send an
+    /// empty `summary` must still surface the reasoning text, both live
+    /// (delta events) and in the finalized thinking block.
+    #[test]
+    fn raw_reasoning_text_populates_thinking_block() {
+        let model = fake_model(true);
+        let mut state = StreamState::new(&model, None);
+
+        let _ = state.process(ResponseStreamEvent::OutputItemAdded {
+            item: ResponseOutputItem::Reasoning {
+                id: "rs_1".into(),
+                summary: vec![],
+                content: None,
+                encrypted_content: None,
+                status: None,
+            },
+            output_index: 0,
+            sequence_number: 0,
+        });
+        let delta_events = state.process(ResponseStreamEvent::ReasoningTextDelta {
+            delta: "Compute 17*23".into(),
+            item_id: "rs_1".into(),
+            output_index: 0,
+            content_index: 0,
+            sequence_number: 1,
+        });
+        assert!(
+            delta_events
+                .iter()
+                .any(|e| matches!(e, AssistantMessageEvent::ThinkingDelta { .. })),
+            "raw reasoning_text delta must emit a ThinkingDelta"
+        );
+        let _ = state.process(ResponseStreamEvent::OutputItemDone {
+            item: ResponseOutputItem::Reasoning {
+                id: "rs_1".into(),
+                summary: vec![],
+                content: Some(vec![ReasoningContent {
+                    text: "Compute 17*23 = 391.".into(),
+                    r#type: "reasoning_text".into(),
+                }]),
+                encrypted_content: None,
+                status: Some(ItemStatus::Completed),
+            },
+            output_index: 0,
+            sequence_number: 2,
+        });
+
+        let thinking = state
+            .partial
+            .content
+            .iter()
+            .find_map(|b| match b {
+                AssistantContent::Thinking(t) => Some(t),
+                _ => None,
+            })
+            .expect("thinking block present");
+        // The finished item's content text wins over the (empty) summary.
+        assert_eq!(thinking.thinking, "Compute 17*23 = 391.");
+        assert!(thinking.thinking_signature.is_some());
+    }
+
+    /// When the finished reasoning item carries neither a summary nor
+    /// content (only the live `reasoning_text` deltas arrived), the
+    /// accumulated delta text must survive into the finalized block.
+    #[test]
+    fn raw_reasoning_text_falls_back_to_live_deltas() {
+        let model = fake_model(true);
+        let mut state = StreamState::new(&model, None);
+
+        let _ = state.process(ResponseStreamEvent::OutputItemAdded {
+            item: ResponseOutputItem::Reasoning {
+                id: "rs_1".into(),
+                summary: vec![],
+                content: None,
+                encrypted_content: None,
+                status: None,
+            },
+            output_index: 0,
+            sequence_number: 0,
+        });
+        let _ = state.process(ResponseStreamEvent::ReasoningTextDelta {
+            delta: "live reasoning".into(),
+            item_id: "rs_1".into(),
+            output_index: 0,
+            content_index: 0,
+            sequence_number: 1,
+        });
+        // Done carries no summary and no content.
+        let _ = state.process(ResponseStreamEvent::OutputItemDone {
+            item: ResponseOutputItem::Reasoning {
+                id: "rs_1".into(),
+                summary: vec![],
+                content: None,
+                encrypted_content: None,
+                status: Some(ItemStatus::Completed),
+            },
+            output_index: 0,
+            sequence_number: 2,
+        });
+
+        let thinking = state
+            .partial
+            .content
+            .iter()
+            .find_map(|b| match b {
+                AssistantContent::Thinking(t) => Some(t),
+                _ => None,
+            })
+            .expect("thinking block present");
+        assert_eq!(thinking.thinking, "live reasoning");
     }
 
     #[test]
