@@ -455,12 +455,12 @@ fn default_path() -> Result<PathBuf, AuthError> {
 /// Environment variables that can supply an API key for `provider_id`,
 /// in order of preference.
 ///
-/// Per §9.5 we cover three providers today: `"anthropic"`
+/// Per §9.5 we cover four providers today: `"anthropic"`
 /// (`ANTHROPIC_OAUTH_TOKEN` then `ANTHROPIC_API_KEY`), `"openai"`
-/// (`OPENAI_API_KEY`), and `"openai-codex"`
-/// (`OPENAI_CODEX_OAUTH_TOKEN`). The codex var carries a short-lived
-/// JWT minted by the §9.4 OAuth flow; on its own it cannot be
-/// refreshed, so persistent use should rely on a stored OAuth
+/// (`OPENAI_API_KEY`), `"openai-codex"` (`OPENAI_CODEX_OAUTH_TOKEN`),
+/// and `"openrouter"` (`OPENROUTER_API_KEY`). The codex var carries a
+/// short-lived JWT minted by the §9.4 OAuth flow; on its own it cannot
+/// be refreshed, so persistent use should rely on a stored OAuth
 /// credential rather than this env var. Unknown providers return an
 /// empty slice so callers can treat absence as "no env mapping
 /// configured".
@@ -469,6 +469,7 @@ pub fn find_env_keys(provider_id: &str) -> &'static [&'static str] {
         "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openai" => &["OPENAI_API_KEY"],
         "openai-codex" => &["OPENAI_CODEX_OAUTH_TOKEN"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
         _ => &[],
     }
 }
@@ -1002,6 +1003,11 @@ mod tests {
     #[test]
     fn find_env_keys_openai() {
         assert_eq!(find_env_keys("openai"), &["OPENAI_API_KEY"]);
+    }
+
+    #[test]
+    fn find_env_keys_openrouter() {
+        assert_eq!(find_env_keys("openrouter"), &["OPENROUTER_API_KEY"]);
     }
 
     /// The OAuth-only `openai-codex` pool resolves to its own env var
