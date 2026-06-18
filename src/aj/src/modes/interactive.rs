@@ -989,7 +989,7 @@ fn build_next_world(
 
 /// Why [`run_session`]'s per-session loop returned.
 enum SessionExit {
-    /// The user quit (Ctrl+C / Ctrl+D / the quit command, or the terminal
+    /// The user quit (Ctrl+C / the quit command, or the terminal
     /// stream ended); the process shuts down.
     Quit,
     /// A resume pick: rebuild onto the identified session.
@@ -1210,8 +1210,7 @@ async fn run_session(
             // --- TUI input / render ---
             maybe_event = shell.tui.next_event() => {
                 let Some(event) = maybe_event else {
-                    // Terminal stream ended: equivalent to
-                    // Ctrl-C/Ctrl-D from the user's POV.
+                    // Terminal stream ended: treat it as a quit.
                     break Ok(SessionExit::Quit);
                 };
                 match event {
@@ -1261,10 +1260,9 @@ async fn run_session(
                         //      the second press.
                         //    - Nothing running anywhere: exit.
                         //
-                        // Ctrl+D always exits regardless. The
-                        // terminal is in raw mode so neither
-                        // chord raises SIGINT; both arrive here
-                        // as ordinary key events.
+                        // The terminal is in raw mode, so Ctrl+C
+                        // doesn't raise SIGINT. It arrives here as
+                        // an ordinary key event.
 
                         // Any non-Ctrl+C key disarms a pending
                         // "press again to quit".
@@ -1337,9 +1335,6 @@ async fn run_session(
                                     break Ok(SessionExit::Quit);
                                 }
                             }
-                        }
-                        if input.is_ctrl('d') {
-                            break Ok(SessionExit::Quit);
                         }
                         // Toggle the thinking-block render mode for
                         // the session. Bound via `aj.thinking.toggle`

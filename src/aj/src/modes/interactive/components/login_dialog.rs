@@ -233,7 +233,7 @@ impl Component for LoginDialogComponent {
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
         // Copy the authorization URL to the clipboard. Hard-coded
-        // (like the global Ctrl+C / Ctrl+D handling) rather than a
+        // (like the global Ctrl+C handling) rather than a
         // rebindable action; checked before routing to the text input
         // so it works even while the manual-paste field is focused.
         if event.is_ctrl('y') {
