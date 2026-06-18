@@ -24,9 +24,10 @@
 //!   `snake_case` variant names. Persistence runs alongside the JSONL
 //!   writer; both observe the same event sequence.
 //!
-//! Print mode opens (or for `continue`, resumes) a [`ConversationLog`]
-//! the same way interactive mode does, so a `aj --print "do X"`
-//! invocation leaves a resumable session on disk.
+//! Print mode opens (or for `continue`, resumes) a
+//! [`ConversationLog`](aj_session::ConversationLog) the same way
+//! interactive mode does, so a `aj --print "do X"` invocation leaves a
+//! resumable session on disk.
 //!
 //! With `aj continue --print "Q"` (optionally specifying a
 //! session id), the resume flow does the same disk handshake as the
@@ -52,41 +53,40 @@ use std::sync::Arc;
 
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
-use aj_agent::{Agent, AgentSeed, TaskRegistry, TurnError};
-use aj_conf::{AgentEnv, Config, ConfigSpeed, Severity};
-use aj_models::registry::ModelRegistry;
+use aj_agent::{Agent, TaskRegistry, TurnError};
+use aj_conf::{Config, ConfigSpeed, Severity};
+use aj_models::auth::AuthStorage;
 use aj_models::types::Speed;
-use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener,
-    repair_interrupted_tool_uses, replay,
-};
-use aj_tools::{BuiltinToolOptions, get_builtin_tools};
+use aj_session::{ConversationPersistence, ThreadFilter, persistence_listener, replay};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::SYSTEM_PROMPT;
 use crate::cli::args::{Args, Command, PrintFormat};
-use crate::model::ResolvedModel;
+use crate::session_setup::{
+    BuiltAgent, PreparedLog, SessionSource, build_agent, build_initial_run_config, freeze_and_seed,
+    prepare_log,
+};
 
 /// Drive a single print-mode run from `args`.
 ///
-/// The flow mirrors the interactive mode's session setup (load
-/// config, resolve model args with CLI > env > config precedence,
-/// build the agent + tool list, open the [`ConversationLog`]) but
-/// skips the readline loop: a single [`Agent::prompt`] runs to
-/// completion, then the function either prints the final assistant
-/// text (text mode) or relies on the JSONL listener to have
-/// streamed every live event already (JSON mode).
+/// The flow mirrors interactive mode's session setup through the
+/// shared [`crate::session_setup`] primitives (resolve the run config
+/// with CLI > env > config precedence, open + repair the
+/// [`ConversationLog`](aj_session::ConversationLog), build the agent,
+/// freeze + seed) but skips the
+/// readline loop: a single [`Agent::prompt`] runs to completion, then
+/// the function either prints the final assistant text (text mode) or
+/// relies on the JSONL listener to have streamed every live event
+/// already (JSON mode).
 ///
-/// When invoked under the `continue` subcommand, the run resumes
-/// the requested session (or "latest for this project") rather than
+/// When invoked under the `continue` subcommand, the run resumes the
+/// requested session (or "latest for this project") rather than
 /// creating a fresh log. On resume the persisted system prompt is
-/// reused, any dangling tool_use ids are repaired via
-/// [`repair_interrupted_tool_uses`], the agent's transcript is
-/// seeded from the linearized user thread, and in JSON mode the
-/// historical events from [`replay`] are drained through the JSON
-/// sink before the new turn begins so the consumer sees the full
+/// reused, any dangling tool_use ids are repaired, the agent's
+/// transcript is seeded from the linearized user thread, and in JSON
+/// mode the historical events from [`replay`] are drained through the
+/// JSON sink before the new turn begins so the consumer sees the full
 /// event trace in emit order.
 pub async fn run(args: Args) -> Result<()> {
     // Validate dispatch shape early so the user sees a clear error
@@ -132,10 +132,10 @@ pub async fn run(args: Args) -> Result<()> {
         eprintln!("aj: {label}: {d}");
     }
 
-    // Resolve model args with the same precedence the legacy binary
-    // uses: CLI flags > env vars > config.toml > defaults. The CLI
-    // struct already pulled env vars via clap's `env = ...` attr, so
-    // by the time we get here `args.model_*` is the post-env value.
+    // Speed selection follows the same precedence as the model:
+    // CLI flag > config.toml > default. `--speed` is parsed here; the
+    // model bundle itself is resolved in `build_initial_run_config`
+    // below.
     let speed = match args.speed.as_deref() {
         Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
         None => config.speed,
@@ -145,236 +145,122 @@ pub async fn run(args: Args) -> Result<()> {
         ConfigSpeed::Fast => Speed::Fast,
     });
 
-    // Build the tool list. Disabled tools are filtered up-front so
-    // the agent never advertises them to the model; this matches the
-    // legacy binary's behaviour and keeps the print/interactive
-    // surfaces uniform.
-    let mut tools = get_builtin_tools(&BuiltinToolOptions {
-        image_auto_resize: config.image_auto_resize,
-    });
-    if !config.disabled_tools.is_empty() {
-        tools.retain(|tool| !config.disabled_tools.contains(&tool.name));
-        tracing::info!(disabled = ?config.disabled_tools, "filtered disabled tools");
-    }
-    // Skills are progressive disclosure reachable only with a
-    // `read_file` tool, so the listing is gated on its presence in the
-    // assembled system prompt below.
-    let include_skills = tools.iter().any(|tool| tool.name == "read_file");
+    // Resolve the credential store up front: the registry path of
+    // `build_initial_run_config` installs the lazy API-key resolver
+    // against it, and the `--api-key` override below targets it.
+    let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
-    let env = AgentEnv::new(SYSTEM_PROMPT, &config.disabled_skills);
-    for d in &env.skill_diagnostics {
-        eprintln!("aj: warning: {d}");
+    // Resolve the initial run config (provider / model / thinking /
+    // speed, merged CLI > env > config) plus the resume-time
+    // `RestoreContext`; scripted mode skips restoration. Print has no
+    // loop, so the snapshot is built, optionally overwritten by the
+    // resumed log's recorded settings (inside `prepare_log`), and read
+    // once to build the agent.
+    let (run_config, restore_context) = build_initial_run_config(&args, &config, &auth, speed)?;
+    let run_config = Arc::new(std::sync::Mutex::new(run_config));
+
+    // Apply a `--api-key` runtime override to the resolved provider.
+    // Skipped for the scripted fake provider, which needs no creds.
+    // Key resolution is lazy, so it's read on the next inference
+    // regardless of when the override lands.
+    if args.scripted.is_none()
+        && let Some(key) = args.api_key.clone()
+    {
+        let provider_id = {
+            let cfg = run_config.lock().expect("run config mutex poisoned");
+            cfg.model_key.0.clone()
+        };
+        auth.set_runtime_api_key(&provider_id, key).await;
     }
 
-    // Resolve the [`ConversationLog`] for this run before the model:
-    // a resumed session's recorded settings take precedence over the
-    // CLI/config model selection, so the log must be read first. The
-    // log stays unwrapped until after we mutate it (system-prompt
-    // freeze, repair walk); it moves behind an `Arc<TokioMutex<_>>`
-    // once the persistence listener takes a stake in it.
+    // Resolve which session to open. `continue` with neither an
+    // explicit id nor a latest session on disk is a hard error here:
+    // print mode is one-shot and has no readline to fall back on.
     let sessions_dir = Config::get_sessions_dir_path()?;
     let conversation_persistence = ConversationPersistence::new(sessions_dir);
-    let mut log = match &resume_request {
-        Some(Some(id)) => ConversationLog::resume(&conversation_persistence, id)
-            .with_context(|| format!("failed to resume session {id}"))?,
+    let source = match &resume_request {
+        Some(Some(id)) => SessionSource::Resume {
+            session_id: id.clone(),
+        },
         Some(None) => match conversation_persistence.get_latest_session_id()? {
-            Some(latest) => ConversationLog::resume(&conversation_persistence, &latest)
-                .with_context(|| format!("failed to resume latest session {latest}"))?,
+            Some(latest) => SessionSource::Resume { session_id: latest },
             None => bail!(
                 "no conversation sessions to resume; invoke `aj --print \"...\"` \
                  without `continue` to start a fresh session"
             ),
         },
-        None => ConversationLog::create(&conversation_persistence)?,
+        None => SessionSource::Create,
     };
 
-    // Resume-time history replay & repair:
-    //
-    // - Walk the user thread, synthesize tool_results for any
-    //   dangling `tool_use` ids the previous run left behind, and
-    //   re-linearize so the seed sees the post-repair view.
-    // - Capture the linearized user thread as the agent's seed
-    //   transcript so the next `prompt(...)` call sees the same
-    //   transcript the model saw on the previous run, and its
-    //   recorded settings for the restore step below.
-    // - In JSON mode, replay the same disk events through the JSON
-    //   sink **before** subscribing any listeners to the bus, so
-    //   the consumer sees the full historical trace in emit order
-    //   without double-firing the persistence listener (events
-    //   that are already on disk would otherwise be re-written).
-    //   Text mode skips the historical events: callers piping the
-    //   binary's stdout into another process want a clean final
-    //   answer, not the prior conversation re-stamped.
-    let is_resuming = resume_request.is_some();
-    let mut transcript = Vec::new();
-    let mut session_settings: Option<aj_session::SessionSettings> = None;
-    if is_resuming && let Some(head) = log.latest_leaf(ThreadFilter::USER) {
-        let conversation = log.linearize(&head, ThreadFilter::USER);
-        repair_interrupted_tool_uses(&mut log, &conversation)?;
+    // Resolve + repair the log and, on a resume, restore its recorded
+    // settings into the run config before the agent is built off it.
+    // The log stays unwrapped until after the system-prompt freeze
+    // below; it moves behind an `Arc<TokioMutex<_>>` once the
+    // persistence listener takes a stake in it.
+    let PreparedLog {
+        mut log,
+        transcript,
+        restore_notices,
+    } = prepare_log(
+        &conversation_persistence,
+        &source,
+        &config,
+        &run_config,
+        restore_context.as_ref(),
+    )?;
+    for notice in &restore_notices {
+        eprintln!("aj: {notice}");
+    }
 
-        // Re-linearize after repair to capture any synthesized
-        // tool_result message the walker just wrote.
-        let head = log
-            .latest_leaf(ThreadFilter::USER)
-            .expect("post-repair head exists when pre-repair head did");
-        let conversation = log.linearize(&head, ThreadFilter::USER);
-        session_settings = Some(conversation.settings());
-        transcript = conversation.agent_messages();
-
-        if matches!(args.format, PrintFormat::Json) {
-            let json = json_event_listener();
-            for event in replay(&log) {
-                json(&event)
-                    .await
-                    .context("failed to write replayed event to stdout during print-mode resume")?;
-            }
+    // JSON mode: replay the persisted history through the JSON sink
+    // **before** subscribing any listeners, so the consumer sees the
+    // full historical trace in emit order without double-firing the
+    // persistence listener (events already on disk would otherwise be
+    // re-written). Text mode skips the historical events: callers
+    // piping the binary's stdout into another process want a clean
+    // final answer, not the prior conversation re-stamped.
+    if matches!(source, SessionSource::Resume { .. })
+        && matches!(args.format, PrintFormat::Json)
+        && log.latest_leaf(ThreadFilter::USER).is_some()
+    {
+        let json = json_event_listener();
+        for event in replay(&log) {
+            json(&event)
+                .await
+                .context("failed to write replayed event to stdout during print-mode resume")?;
         }
     }
 
-    // Build the agent in one of two ways depending on the
-    // `--scripted` flag. The scripted path keeps the legacy
-    // `Arc<dyn Model>` surface (step 6.8 of
-    // `docs/aj-next-progress.md` will port it onto
-    // `ScriptedProvider`) and never restores session settings; the
-    // real-model path goes through the registry so the binary owns
-    // provider dispatch, API key resolution, and speed-driven beta
-    // headers, and on a resume applies the session's recorded
-    // settings with precedence over the CLI/config selection.
-    let mut agent = if let Some(name) = &args.scripted {
-        let crate::scripted::ResolvedScriptedModel {
-            provider,
-            model_info,
-        } = crate::scripted::resolve_or_explain(name)?;
-        let mut stream_options = aj_models::types::StreamOptions::default();
-        crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
-        let mut agent = Agent::with_provider(
-            env.working_directory.clone(),
-            tools,
-            config.disabled_tools.clone(),
-            provider,
-            model_info,
-            stream_options,
-            crate::model::default_thinking_from_config(config.thinking),
-        );
-        agent.set_speed(speed);
-        agent
-    } else {
-        let registry = ModelRegistry::load();
-        // Credential store backing the lazy API-key resolver. Print
-        // mode has no interactive `/login`, but it still benefits from
-        // the full resolution chain (runtime override → env → stored
-        // key → stored OAuth) so a credential obtained via the
-        // interactive TUI works here too.
-        let auth = aj_models::auth::AuthStorage::at_default_path()
-            .context("failed to open ~/.aj/auth.json")?;
-        let provider_id = args
-            .model_api
-            .as_deref()
-            .or(config.model_api.as_deref())
-            .unwrap_or(crate::model::DEFAULT_PROVIDER_ID)
-            .to_string();
-        if let Some(key) = args.api_key.clone() {
-            auth.set_runtime_api_key(&provider_id, key).await;
-        }
-
-        // Session-recorded speed wins over the CLI/config value;
-        // unknown recorded strings keep the current value with a
-        // stderr notice, like the config diagnostics above.
-        let mut speed = speed;
-        if let Some(s) = session_settings
-            .as_ref()
-            .and_then(|settings| settings.speed.as_deref())
-        {
-            match s.parse::<ConfigSpeed>() {
-                Ok(ConfigSpeed::Standard) => speed = Some(Speed::Standard),
-                Ok(ConfigSpeed::Fast) => speed = Some(Speed::Fast),
-                Err(_) => eprintln!("aj: session recorded unknown speed {s:?}; ignoring"),
-            }
-        }
-
-        // Session-recorded model wins over the CLI/config selection;
-        // a catalog miss (or provider-dispatch failure) falls back
-        // to the CLI/config resolution with a stderr notice.
-        let recorded_model = session_settings
-            .as_ref()
-            .and_then(|settings| settings.model.clone());
-        let restored = recorded_model.as_ref().and_then(|(prov, id)| {
-            match registry
-                .get(prov, id)
-                .cloned()
-                .context("not in the model catalog")
-                .and_then(|info| crate::model::from_model_info(&auth, info, speed))
-            {
-                Ok(resolved) => Some(resolved),
-                Err(err) => {
-                    eprintln!(
-                        "aj: session used {prov}/{id}, which is not available \
-                         ({err:#}); falling back to the configured model"
-                    );
-                    None
-                }
-            }
-        });
-        let ResolvedModel {
-            provider,
-            model_info,
-            stream_options,
-        } = match restored {
-            Some(resolved) => resolved,
-            None => crate::model::resolve(
-                &registry,
-                &auth,
-                args.model_api.as_deref().or(config.model_api.as_deref()),
-                args.model_name.as_deref().or(config.model_name.as_deref()),
-                args.model_url.as_deref().or(config.model_url.as_deref()),
-                speed,
-            )
-            .context("failed to resolve model from registry")?,
-        };
-        let mut stream_options = stream_options;
-        crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
-        let mut agent = Agent::with_provider(
-            env.working_directory.clone(),
-            tools,
-            config.disabled_tools.clone(),
-            provider,
-            model_info,
-            stream_options,
-            crate::model::default_thinking_from_config(config.thinking),
-        );
-        agent.set_speed(speed);
-
-        // Session-recorded thinking level wins over `config.thinking`
-        // when it parses and the (possibly restored) model accepts
-        // it; otherwise keep the config default with a stderr notice.
-        if let Some(level_str) = session_settings
-            .as_ref()
-            .and_then(|settings| settings.thinking.as_deref())
-        {
-            match aj_models::thinking_config_from_name(level_str) {
-                None => {
-                    eprintln!("aj: session recorded unknown thinking level {level_str:?}; ignoring")
-                }
-                Some(level) => {
-                    let validation = match &level {
-                        None => Ok(()),
-                        Some(tc) => aj_models::registry::validate_thinking_level(
-                            &agent.model_info(),
-                            &thinking_level_for(tc),
-                        ),
-                    };
-                    match validation {
-                        Ok(()) => agent.set_default_thinking(level),
-                        Err(msg) => eprintln!(
-                            "aj: can't restore session thinking level {level_str:?}: {msg}"
-                        ),
-                    }
-                }
-            }
-        }
-        agent
+    // Build the agent from the (post-restore) run config: a fresh
+    // provider/model/thinking/speed bundle plus the disabled-tools
+    // filter and a freshly-read `AgentEnv`. Surface any
+    // skill-discovery diagnostics to stderr.
+    let (provider, model_info, stream_options, thinking, agent_speed, model_key) = {
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        (
+            Arc::clone(&cfg.provider),
+            Arc::clone(&cfg.model_info),
+            cfg.stream_options.clone(),
+            cfg.thinking.clone(),
+            cfg.speed,
+            cfg.model_key.clone(),
+        )
     };
-    agent.set_block_images(config.image_block);
+    let BuiltAgent {
+        mut agent,
+        env,
+        include_skills,
+    } = build_agent(
+        &config,
+        provider,
+        model_info,
+        stream_options,
+        thinking.clone(),
+        agent_speed,
+    );
+    for d in &env.skill_diagnostics {
+        eprintln!("aj: warning: {d}");
+    }
 
     // Inject a task registry so background tasks started during the
     // run can be killed at exit instead of orphaned. Print mode has
@@ -385,41 +271,21 @@ pub async fn run(args: Args) -> Result<()> {
     let task_registry = TaskRegistry::default();
     agent.set_task_registry(task_registry.clone());
 
-    // Resolve the system prompt: reuse a persisted one on resume
-    // (cache-warm — the model has the same bytes from the previous
-    // run), or assemble fresh from the env and freeze it as the
-    // log's root entry on a brand-new session, followed by the
-    // initial settings record so a later resume restores them.
-    // Mirrors the interactive path exactly so a session looks
-    // identical on disk whether it was bootstrapped through
+    // Freeze the system prompt (fresh log) or reuse the persisted one
+    // (cache-warm resume), then seed the agent's transcript, prompt,
+    // and sub-agent counter floor. Mirrors the interactive path so a
+    // session looks identical on disk whether bootstrapped through
     // `--print` or the TUI.
-    let system_prompt = if let Some(persisted) = log.system_prompt() {
-        persisted.to_string()
-    } else {
-        let assembled = crate::system_prompt::assemble_system_prompt(&env, include_skills);
-        if log.is_empty() {
-            log.set_system_prompt(assembled.clone())?;
-            let model_info = agent.model_info();
-            log.append_model_change(ThreadFilter::USER, &model_info.provider, &model_info.id)?;
-            log.append_thinking_change(
-                ThreadFilter::USER,
-                aj_models::thinking_config_name(agent.default_thinking().as_ref()),
-            )?;
-            log.append_speed_change(ThreadFilter::USER, aj_models::speed_name(speed))?;
-        }
-        assembled
-    };
-
-    // One-shot session seed: the resumed transcript (empty on a
-    // fresh log), the frozen system prompt, and the sub-agent
-    // counter floor so freshly-minted ids in this run don't collide
-    // with sub-agent subtrees already persisted in the log (a fresh
-    // log has no subtrees and seeds the counter's initial 0).
-    agent.seed_session(AgentSeed {
+    freeze_and_seed(
+        &mut log,
+        &mut agent,
         transcript,
-        assembled_system_prompt: Some(system_prompt),
-        sub_agent_counter: log.max_agent_id().unwrap_or(0),
-    });
+        &env,
+        include_skills,
+        &model_key,
+        thinking.as_ref(),
+        agent_speed,
+    )?;
 
     let log = Arc::new(TokioMutex::new(log));
 
@@ -528,22 +394,6 @@ pub async fn run(args: Args) -> Result<()> {
     // another process don't lose buffered bytes.
     let _ = io::stdout().flush();
     Ok(())
-}
-
-/// Project a [`aj_models::ThinkingConfig`] onto the wire-level
-/// [`aj_models::types::ThinkingLevel`] for validation against a
-/// model's effort vocabulary. One-to-one, mirroring the projection
-/// the agent applies before each inference.
-fn thinking_level_for(level: &aj_models::ThinkingConfig) -> aj_models::types::ThinkingLevel {
-    use aj_models::ThinkingConfig;
-    use aj_models::types::ThinkingLevel;
-    match level {
-        ThinkingConfig::Low => ThinkingLevel::Low,
-        ThinkingConfig::Medium => ThinkingLevel::Medium,
-        ThinkingConfig::High => ThinkingLevel::High,
-        ThinkingConfig::XHigh => ThinkingLevel::XHigh,
-        ThinkingConfig::Max => ThinkingLevel::Max,
-    }
 }
 
 /// Build a [`Listener`] that writes each event as one JSONL line on

@@ -161,7 +161,7 @@ When presenting a proposal, cover:
 
 ## STRUCT — high-leverage structural refactors (each retires many findings)
 
-### R8 — Introduce a composition root for session setup  [refactor · TODO]
+### R8 — Introduce a composition root for session setup  [refactor · DONE]
 - **Sources:** A2 (Major), A3 (Major), A1 (Major), TO1; `_SUMMARY` theme 1.
 - **Problem:** the session-setup pipeline is duplicated ~120 lines between
   print and interactive mode and four times within `interactive.rs`,
@@ -432,3 +432,42 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   protocol are unaffected. Verified the whole workspace compiles +
   tests pass in an isolated worktree (the change landed alongside
   concurrent work, so it was built and tested in isolation).
+- 2026-06-17 · R8 · DONE · baf6234 · Built the composition root
+  around the interactive refactor that had already landed since the
+  audit: R2/R7's `SessionWorld` retired A3's four-times-within-
+  `interactive.rs` duplication, so the live R8 scope was the
+  print↔interactive split (A2), the precedence merge (A1), and the
+  disabled-tools filter (A1/TO1). Did full convergence (user call):
+  extracted a new mode-agnostic `aj::session_setup` module (sibling of
+  `turn`/`model`) owning `RunConfigSnapshot` + `build_run_config`,
+  `build_initial_run_config` (the CLI>env>config model resolution +
+  scripted/registry branch + `RestoreContext`), `build_agent`,
+  `restore_session_settings`, and two new pure helpers `prepare_log`
+  (log resolve + repair + re-linearize + restore) and `freeze_and_seed`
+  (system-prompt freeze + initial settings record + transcript seed).
+  Both `SessionWorld::build` and `print::run` now ride these identical
+  primitives, so the restore logic that had drifted (print printed
+  ad-hoc stderr lines and lacked the same-model-different-speed header
+  rebuild; recorded the scripted model as `scripted/scripted` rather
+  than the merged provider id) lives once. For A1, added
+  `model::ModelSelection::{merge, provider_id}` as the single home for
+  the overlay and changed `model::resolve` to take it (collapsing the
+  4 hand-rolled `.or(config)` sites + 2 divergent provider-id-default
+  idioms). For TO1/A1, added `aj_tools::builtin_tools(opts, disabled)`
+  so the disabled-tools filter + its `tracing::info!` live behind the
+  catalog seam, called by both `build_agent` and (nothing else now);
+  `get_builtin_tools` stays for the unfiltered autocomplete consumer.
+  Net -406 lines. Behavior change is intentional and small: print's
+  resume-restore now emits the uniform notice text and gains the
+  same-model-different-speed header rebuild, and print's model
+  resolution becomes eager (the CLI/config model is resolved up front,
+  matching what interactive already did) rather than lazy, so a dead
+  configured-model pin no longer silently rescues itself off the
+  resumed log's recorded model. Tests: `ModelSelection` precedence +
+  default, `builtin_tools` filtering, `build_initial_run_config`
+  scripted-path provider-id merge, and a same-model-different-speed
+  resume that exercises the bundle-rebuild branch; the existing
+  `SessionWorld` restore/seed suite now covers print's setup too since
+  both call the same code. Full print `run`-loop test stays R17
+  (depends on R12). `fmt`/`check`/`clippy` clean; `aj` + `aj-tools`
+  suites green.

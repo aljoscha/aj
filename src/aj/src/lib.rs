@@ -32,6 +32,7 @@ pub mod model;
 pub mod modes;
 pub mod persistence;
 pub mod scripted;
+pub mod session_setup;
 pub mod system_prompt;
 pub mod tmux_notice;
 pub mod turn;

@@ -40,7 +40,7 @@ use aj_conf::{
 };
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
-use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
+use aj_models::registry::{ModelInfo, validate_thinking_level};
 use aj_models::types::{Speed, StreamOptions, UserContent};
 use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, ThreadFilter};
@@ -111,49 +111,12 @@ use crate::modes::interactive::event_pump::{
 };
 use crate::modes::interactive::layout::{SlotIndex, build_layout};
 use crate::modes::interactive::render_settings::RenderSettings;
-use crate::modes::interactive::session::{RestoreContext, SessionEntry, SessionSpec, SessionWorld};
+use crate::modes::interactive::session::{SessionEntry, SessionSpec, SessionWorld};
 use crate::modes::interactive::shutdown::{
     print_resume_hint, print_session_usage, print_usage_summary,
 };
+use crate::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
 use crate::turn::{TurnPolicy, TurnStart};
-
-/// Loop-side snapshot of the agent's run configuration.
-///
-/// The interactive loop spawns each turn into a task that holds the
-/// agent `TokioMutex` for the turn's entire duration, so the loop
-/// itself must never `agent.lock().await` — that would suspend the
-/// whole `select!` (including its Ctrl+C arm) until the turn ends.
-///
-/// This snapshot is therefore the loop-side source of truth for "what
-/// the next turn runs against". The model and thinking selectors
-/// mutate it without touching the agent; the footer renders the active
-/// model and effort from it; and the submit handler copies it into the
-/// agent just before each turn starts (while holding the turn's own
-/// lock, which is uncontended because no turn is in flight yet). A
-/// model or thinking change made mid-turn is thus accepted — and shown
-/// in the footer — immediately, but only takes effect on the *next*
-/// turn: the in-flight turn keeps the config it captured when it
-/// started.
-pub(crate) struct RunConfigSnapshot {
-    /// Provider handle the next turn streams against.
-    provider: Arc<dyn Provider>,
-    /// Registry (or scripted) metadata for `provider`'s model.
-    model_info: Arc<ModelInfo>,
-    /// Per-call stream options (thinking-display mode, etc.).
-    stream_options: StreamOptions,
-    /// Default thinking effort for the next turn.
-    thinking: Option<ThinkingConfig>,
-    /// Inference speed mode baked into `stream_options`' headers.
-    /// Tracked explicitly so bundle rebuilds (model swap, resume
-    /// restore) preserve it and so it can be recorded in the
-    /// session log. `None` means standard.
-    speed: Option<Speed>,
-    /// `(provider_id, model_id)` the model selector pre-selects.
-    /// Tracked explicitly rather than read off `model_info` because
-    /// the scripted path's provider id (from `--model-api`) differs
-    /// from `model_info.provider`, which is always `"scripted"`.
-    model_key: (String, String),
-}
 
 /// Loop-side staged settings for one sub-agent. Each axis is
 /// `Some(..)` only if the user changed it for this agent; axes left
@@ -176,31 +139,6 @@ pub(crate) struct SubAgentOverrides {
     )>,
     pub(crate) thinking: Option<Option<ThinkingConfig>>,
     pub(crate) speed: Option<Option<Speed>>,
-}
-
-/// Construct the loop-side run-config snapshot from a resolved
-/// provider bundle.
-///
-/// The snapshot lives for the whole process and is the source of
-/// truth both for the next turn's configuration and for the agents
-/// built per session world (see [`session::SessionWorld::build`]).
-fn build_run_config(
-    config: &Config,
-    provider: Arc<dyn Provider>,
-    model_info: Arc<ModelInfo>,
-    mut stream_options: StreamOptions,
-    model_key: (String, String),
-    speed: Option<Speed>,
-) -> RunConfigSnapshot {
-    crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
-    RunConfigSnapshot {
-        provider,
-        model_info,
-        stream_options,
-        thinking: crate::model::default_thinking_from_config(config.thinking),
-        speed,
-        model_key,
-    }
 }
 
 /// User-facing notice shown when a session-changing command
@@ -304,99 +242,22 @@ impl InteractiveMode {
             ConfigSpeed::Fast => Speed::Fast,
         });
 
-        // Resolve the model in one of two ways depending on the
-        // `--scripted` flag. The scripted path keeps the legacy
-        // `Arc<dyn Model>` surface (step 6.8 of
-        // `docs/aj-next-progress.md` will port it onto
-        // `ScriptedProvider`); the real-model path goes through the
-        // registry so the binary owns provider dispatch + API key
-        // resolution + speed-driven beta headers, and the agent only
-        // sees the resulting `(Provider, ModelInfo, StreamOptions)`
-        // bundle.
-        //
-        // `run_config` is the loop-side snapshot of what the next
-        // turn runs against (provider, model, stream options, thinking
-        // effort, and `(provider_id, model_id)` for the model
-        // selector to pre-select). The selectors mutate it without
-        // locking the agent; the submit handler copies it into the
-        // agent just before each turn. See [`RunConfigSnapshot`].
         // Credential store backing API-key resolution and the login /
-        // logout / auth-status overlays. Cheap to clone
-        // (`Arc`-backed); the resolver installed in
-        // `crate::model::from_model_info` captures a clone and reads
-        // it on every inference, so a mid-session login takes effect
-        // without a restart.
+        // logout / auth-status overlays. Cheap to clone (`Arc`-backed);
+        // the resolver installed in `crate::model::from_model_info`
+        // captures a clone and reads it on every inference, so a
+        // mid-session login takes effect without a restart.
         let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
-        // Resume-time settings restoration needs the registry +
-        // auth store; scripted mode runs without either and skips
-        // restoration entirely.
-        let mut restore_context: Option<RestoreContext> = None;
-
-        let run_config = if let Some(name) = &self.args.scripted {
-            let crate::scripted::ResolvedScriptedModel {
-                provider,
-                model_info,
-            } = crate::scripted::resolve_or_explain(name)?;
-            let current_provider = self
-                .args
-                .model_api
-                .clone()
-                .or_else(|| config.model_api.clone())
-                .unwrap_or_else(|| crate::model::DEFAULT_PROVIDER_ID.to_string());
-            let current_id = model_info.id.clone();
-            build_run_config(
-                &config,
-                provider,
-                model_info,
-                StreamOptions::default(),
-                (current_provider, current_id),
-                speed,
-            )
-        } else {
-            // Load the registry once at startup; the same handle
-            // also feeds resume-time settings restoration via the
-            // `RestoreContext` below. (`load_model_catalog` further
-            // down does its own cheap JSON read for the model
-            // selector's snapshot.)
-            let registry = ModelRegistry::load();
-            let resolved = crate::model::resolve(
-                &registry,
-                &auth,
-                self.args
-                    .model_api
-                    .as_deref()
-                    .or(config.model_api.as_deref()),
-                self.args
-                    .model_name
-                    .as_deref()
-                    .or(config.model_name.as_deref()),
-                self.args
-                    .model_url
-                    .as_deref()
-                    .or(config.model_url.as_deref()),
-                speed,
-            )
-            .context("failed to resolve model from registry")?;
-            restore_context = Some(RestoreContext {
-                registry: Arc::new(registry),
-                auth: auth.clone(),
-            });
-            let ResolvedModel {
-                provider,
-                model_info,
-                stream_options,
-            } = resolved;
-            let model_key = (model_info.provider.clone(), model_info.id.clone());
-            build_run_config(
-                &config,
-                provider,
-                model_info,
-                stream_options,
-                model_key,
-                speed,
-            )
-        };
+        // Resolve the initial run config (provider / model / thinking /
+        // speed, merged CLI > env > config) plus the resume-time
+        // `RestoreContext` the registry path needs; scripted mode skips
+        // restoration. `run_config` is the loop-side snapshot of what
+        // the next turn runs against: the selectors mutate it without
+        // locking the agent, and the submit handler copies it into the
+        // agent just before each turn. See [`RunConfigSnapshot`].
+        let (run_config, restore_context) =
+            build_initial_run_config(&self.args, &config, &auth, speed)?;
         let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
         // Apply a `--api-key` runtime override (if supplied) to the
@@ -3886,10 +3747,8 @@ async fn confirm_thinking_for_sub(
             })
         });
         if let Some(info) = target_info
-            && let Err(msg) = validate_thinking_level(
-                &info,
-                &crate::modes::interactive::session::thinking_level_for(tc),
-            )
+            && let Err(msg) =
+                validate_thinking_level(&info, &crate::session_setup::thinking_level_for(tc))
         {
             return format!("Can't set thinking level {name:?} for agent {n}: {msg}");
         }

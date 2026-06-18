@@ -1,6 +1,7 @@
-//! Resolve a CLI / config triple `(api, model_name, url)` into a
-//! ready-to-plug-in [`Provider`] handle plus the
-//! registry-resolved [`ModelInfo`] and a baseline [`StreamOptions`].
+//! Resolve a [`ModelSelection`] (the CLI > env > config merge of
+//! `(api, model_name, url)`) into a ready-to-plug-in [`Provider`]
+//! handle plus the registry-resolved [`ModelInfo`] and a baseline
+//! [`StreamOptions`].
 //!
 //! The binary loads the
 //! [`ModelRegistry`](aj_models::registry::ModelRegistry), picks a
@@ -22,13 +23,15 @@
 
 use std::sync::Arc;
 
-use aj_conf::{ConfigThinkingDisplay, ConfigThinkingLevel};
+use aj_conf::{Config, ConfigThinkingDisplay, ConfigThinkingLevel};
 use aj_models::ThinkingConfig;
 use aj_models::auth::{AuthStorage, find_env_keys};
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
 use aj_models::types::{ApiKeyResolver, ReasoningSummary, Speed, StreamOptions, ThinkingDisplay};
 use anyhow::{Result, anyhow};
+
+use crate::cli::args::Args;
 
 /// Fallback provider id used when neither CLI / env / config supplies
 /// one. Anthropic is the default so existing user setups keep
@@ -46,6 +49,46 @@ pub const DEFAULT_PROVIDER_ID: &str = "anthropic";
 /// catalog refresh that drops or renames the preferred model degrades
 /// gracefully instead of erroring.
 const PREFERRED_DEFAULT_MODELS: &[(&str, &str)] = &[("anthropic", "claude-opus-4-8")];
+
+/// The model-selection triple after applying CLI > env > config
+/// precedence. [`merge`](ModelSelection::merge) is the single place
+/// that overlay lives. The fields are the post-merge `(api, name,
+/// url)` the registry lookup consumes.
+pub struct ModelSelection {
+    /// Provider id (catalog `provider`, e.g. `"anthropic"`). `None`
+    /// defers to [`DEFAULT_PROVIDER_ID`] via
+    /// [`provider_id`](ModelSelection::provider_id).
+    pub api: Option<String>,
+    /// Model id within the provider's catalog. `None` picks the
+    /// provider's preferred default.
+    pub name: Option<String>,
+    /// Base-URL override applied after lookup.
+    pub url: Option<String>,
+}
+
+impl ModelSelection {
+    /// Overlay CLI flags over config values. `args.model_*` is already
+    /// post-env because clap populates it from the `MODEL_*` env vars
+    /// at parse time, so this realizes the full CLI > env > config
+    /// precedence in one place.
+    pub fn merge(args: &Args, config: &Config) -> ModelSelection {
+        ModelSelection {
+            api: args.model_api.clone().or_else(|| config.model_api.clone()),
+            name: args
+                .model_name
+                .clone()
+                .or_else(|| config.model_name.clone()),
+            url: args.model_url.clone().or_else(|| config.model_url.clone()),
+        }
+    }
+
+    /// Provider id with the [`DEFAULT_PROVIDER_ID`] fallback applied.
+    /// Used both for the registry lookup and as the `--api-key` /
+    /// credential-resolution target.
+    pub fn provider_id(&self) -> &str {
+        self.api.as_deref().unwrap_or(DEFAULT_PROVIDER_ID)
+    }
+}
 
 /// A model handle assembled by [`resolve`] (or [`from_model_info`])
 /// ready to plug into [`aj_agent::Agent::with_provider`] or
@@ -66,19 +109,17 @@ pub struct ResolvedModel {
     pub stream_options: StreamOptions,
 }
 
-/// Build a [`ResolvedModel`] from a CLI / config triple.
+/// Build a [`ResolvedModel`] from a merged [`ModelSelection`].
 ///
-/// `provider_id` is the catalog `provider` value (e.g. `"anthropic"`,
-/// `"openai"`, `"openai-codex"`). When [`None`] the helper falls back
-/// to [`DEFAULT_PROVIDER_ID`] so an unconfigured run still works.
+/// `selection.provider_id()` is the catalog `provider` value (with
+/// the [`DEFAULT_PROVIDER_ID`] fallback). `selection.name` selects an
+/// entry from the provider's catalog; when [`None`] the helper picks
+/// the provider's preferred default (see [`PREFERRED_DEFAULT_MODELS`]),
+/// falling back to the first listed entry. The registry preserves
+/// insertion order, so the fallback is deterministic given a fixed
+/// catalog.
 ///
-/// `model_id` selects an entry from the provider's catalog. When
-/// [`None`] the helper picks the provider's preferred default (see
-/// [`PREFERRED_DEFAULT_MODELS`]), falling back to the first listed
-/// entry; the registry preserves insertion order so the fallback is
-/// deterministic given a fixed catalog.
-///
-/// `url_override` replaces `model_info.base_url` after lookup so a
+/// `selection.url` replaces `model_info.base_url` after lookup so a
 /// caller can point at a staging proxy or a self-hosted endpoint
 /// without editing the catalog file.
 ///
@@ -91,19 +132,14 @@ pub struct ResolvedModel {
 pub fn resolve(
     registry: &ModelRegistry,
     auth: &AuthStorage,
-    provider_id: Option<&str>,
-    model_id: Option<&str>,
-    url_override: Option<&str>,
+    selection: &ModelSelection,
     speed: Option<Speed>,
 ) -> Result<ResolvedModel> {
-    let provider_id = provider_id.unwrap_or(DEFAULT_PROVIDER_ID);
-    let mut model_info = pick_model(registry, provider_id, model_id)?;
-    if let Some(url) = url_override {
-        // Mirrors the legacy `ModelArgs::url` precedence: a custom
-        // URL trumps the catalog default but everything else
-        // (capability flags, pricing) stays sourced from the
-        // registry.
-        model_info.base_url = url.to_string();
+    let mut model_info = pick_model(registry, selection.provider_id(), selection.name.as_deref())?;
+    if let Some(url) = &selection.url {
+        // A custom URL trumps the catalog default, but everything else
+        // (capability flags, pricing) stays sourced from the registry.
+        model_info.base_url = url.clone();
     }
     from_model_info(auth, model_info, speed)
 }
@@ -440,5 +476,38 @@ mod tests {
             Some(ThinkingDisplay::Omitted)
         ));
         assert!(opts.reasoning_summary.is_none());
+    }
+
+    #[test]
+    fn model_selection_cli_overrides_config() {
+        use clap::Parser;
+        let args = Args::parse_from(["aj", "--model-api", "openai", "--model-name", "gpt-x"]);
+        let config = Config {
+            model_api: Some("anthropic".to_string()),
+            model_name: Some("claude-x".to_string()),
+            model_url: Some("https://config.example".to_string()),
+            ..Config::default()
+        };
+        let sel = ModelSelection::merge(&args, &config);
+        assert_eq!(sel.api.as_deref(), Some("openai"));
+        assert_eq!(sel.name.as_deref(), Some("gpt-x"));
+        // No `--model-url` on the CLI, so it falls back to config.
+        assert_eq!(sel.url.as_deref(), Some("https://config.example"));
+        assert_eq!(sel.provider_id(), "openai");
+    }
+
+    #[test]
+    fn model_selection_falls_back_to_config_then_default() {
+        use clap::Parser;
+        let args = Args::parse_from(["aj"]);
+        let config = Config {
+            model_name: Some("claude-x".to_string()),
+            ..Config::default()
+        };
+        let sel = ModelSelection::merge(&args, &config);
+        assert!(sel.api.is_none());
+        assert_eq!(sel.name.as_deref(), Some("claude-x"));
+        // No provider anywhere falls back to the built-in default.
+        assert_eq!(sel.provider_id(), DEFAULT_PROVIDER_ID);
     }
 }

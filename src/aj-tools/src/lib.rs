@@ -50,12 +50,11 @@ impl Default for BuiltinToolOptions {
     }
 }
 
-/// Build the catalog of every builtin tool, ready for `Agent::with_provider`.
+/// Build the catalog of every builtin tool, unfiltered.
 ///
-/// The binary further filters this list against any tools the user
-/// has disabled before handing it to the agent. Sub-agents inherit
-/// the filtered list (minus the `agent` tool) by cloning, so this
-/// function is called exactly once per process.
+/// Most callers want [`builtin_tools`], which applies the user's
+/// disabled-tools set. This raw catalog is for callers that need the
+/// full list regardless of config (e.g. argument-name completion).
 pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefinition> {
     vec![
         AgentTool.into(),
@@ -69,4 +68,56 @@ pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefiniti
         TodoReadTool.into(),
         TodoWriteTool.into(),
     ]
+}
+
+/// Build the builtin tool catalog with the user's disabled tools
+/// filtered out, ready for `Agent::with_provider`.
+///
+/// `disabled` is the `disabled_tools` name set from
+/// `~/.aj/config.toml`. Filtering behind this one seam keeps the
+/// name-set contract in a single place rather than re-applied at each
+/// frontend's call site. The agent never advertises a filtered tool
+/// to the model; sub-agents inherit the filtered list (minus the
+/// `agent` tool) by cloning.
+pub fn builtin_tools(
+    options: &BuiltinToolOptions,
+    disabled: &[String],
+) -> Vec<ErasedToolDefinition> {
+    let mut tools = get_builtin_tools(options);
+    if !disabled.is_empty() {
+        tools.retain(|tool| !disabled.contains(&tool.name));
+        tracing::info!(?disabled, "filtered disabled tools");
+    }
+    tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_tools_empty_disabled_is_full_catalog() {
+        let opts = BuiltinToolOptions::default();
+        let all = get_builtin_tools(&opts).len();
+        assert_eq!(builtin_tools(&opts, &[]).len(), all);
+    }
+
+    #[test]
+    fn builtin_tools_drops_disabled_names() {
+        let opts = BuiltinToolOptions::default();
+        let disabled = vec!["bash".to_string(), "write_file".to_string()];
+        let tools = builtin_tools(&opts, &disabled);
+        assert!(
+            tools.iter().all(|t| !disabled.contains(&t.name)),
+            "disabled tools must not appear in the catalog"
+        );
+        assert_eq!(tools.len(), get_builtin_tools(&opts).len() - disabled.len());
+    }
+
+    #[test]
+    fn builtin_tools_ignores_unknown_disabled_names() {
+        let opts = BuiltinToolOptions::default();
+        let tools = builtin_tools(&opts, &["no_such_tool".to_string()]);
+        assert_eq!(tools.len(), get_builtin_tools(&opts).len());
+    }
 }

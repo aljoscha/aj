@@ -2,8 +2,8 @@
 //! `session.rs` and `interactive.rs`.
 //!
 //! Lives as a `#[cfg(test)]` child of `modes::interactive` so it can
-//! construct [`RunConfigSnapshot`] (whose fields are private to that
-//! module) while staying out of release builds.
+//! construct [`RunConfigSnapshot`] (whose fields are `pub(crate)`)
+//! while staying out of release builds.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -20,9 +20,9 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::theme::{Theme, ThemeHandle};
-use crate::modes::interactive::RunConfigSnapshot;
 use crate::modes::interactive::render_settings::RenderSettings;
 use crate::modes::interactive::session::{SessionEntry, SessionSpec, SessionWorld};
+use crate::session_setup::RunConfigSnapshot;
 
 /// Headless [`Terminal`]: fixed 100×24, writes discarded.
 /// Component output is read via `Component::render`, not the
