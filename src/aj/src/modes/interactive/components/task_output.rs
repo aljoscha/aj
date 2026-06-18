@@ -273,15 +273,17 @@ impl TaskOutputComponent {
         }
     }
 
-    /// Adjust the scroll position by `delta` rows and drop follow mode.
-    /// The upper bound is clamped in `render` against the live row total.
-    fn scroll_by(&mut self, delta: isize) {
+    /// Scroll up by `rows`, dropping follow mode. The upper bound is
+    /// clamped in `render` against the live row total.
+    fn scroll_up(&mut self, rows: usize) {
         self.follow = false;
-        if delta < 0 {
-            self.scroll = self.scroll.saturating_sub((-delta) as usize);
-        } else {
-            self.scroll = self.scroll.saturating_add(delta as usize);
-        }
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+
+    /// Scroll down by `rows`, dropping follow mode.
+    fn scroll_down(&mut self, rows: usize) {
+        self.follow = false;
+        self.scroll = self.scroll.saturating_add(rows);
     }
 }
 
@@ -319,6 +321,9 @@ fn render_carriage_returns(s: &str) -> &str {
 }
 
 /// Format a byte count as `B` / `KB` / `MB` / `GB`.
+// Lossy `u64 as f64` is fine here: these values are small display sizes
+// and a fractional rounding error in a human-readable count is harmless.
+#[allow(clippy::as_conversions)]
 fn human_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -386,31 +391,31 @@ impl Component for TaskOutputComponent {
         }
         if kb.matches(event, "tui.select.up") {
             drop(kb);
-            self.scroll_by(-1);
+            self.scroll_up(1);
             return true;
         }
         if kb.matches(event, "tui.select.down") {
             drop(kb);
-            self.scroll_by(1);
+            self.scroll_down(1);
             return true;
         }
         if kb.matches(event, "tui.select.pageUp") {
             drop(kb);
-            self.scroll_by(-(self.viewport as isize));
+            self.scroll_up(self.viewport);
             return true;
         }
         if kb.matches(event, "tui.select.pageDown") {
             drop(kb);
-            self.scroll_by(self.viewport as isize);
+            self.scroll_down(self.viewport);
             return true;
         }
         drop(kb);
 
         // Vim-style extras the keybinding actions don't cover.
         match event.as_char() {
-            Some('k') => self.scroll_by(-1),
-            Some('j') => self.scroll_by(1),
-            Some(' ') => self.scroll_by(self.viewport as isize),
+            Some('k') => self.scroll_up(1),
+            Some('j') => self.scroll_down(1),
+            Some(' ') => self.scroll_down(self.viewport),
             Some('g') => {
                 self.scroll = 0;
                 self.follow = false;
@@ -473,7 +478,7 @@ mod tests {
         file.flush().expect("flush spill");
         let read = TaskRead {
             spill_path: Some(file.path().to_path_buf()),
-            stdout_total_bytes: contents.len() as u64,
+            stdout_total_bytes: u64::try_from(contents.len()).expect("spill length fits u64"),
             ..TaskRead::default()
         };
         let registry = TaskRegistry::default();
