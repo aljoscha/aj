@@ -171,7 +171,7 @@ When presenting a proposal, cover:
   modes call. This is the single biggest finding-count win; do it as a real
   abstraction, not a shared free function grab-bag.
 
-### R9 — Share one filterable-overlay-list for the selectors  [refactor · TODO]
+### R9 — Share one filterable-overlay-list for the selectors  [refactor · DONE]
 - **Sources:** A4 (Major), T4 (Major); `_SUMMARY` theme 2.
 - **Problem:** model/session/command-palette/prompt-history hand-copy a
   filterable-list + background-scan skeleton, while thinking/auth use the
@@ -471,3 +471,39 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   both call the same code. Full print `run`-loop test stays R17
   (depends on R12). `fmt`/`check`/`clippy` clean; `aj` + `aj-tools`
   suites green.
+- 2026-06-18 · R9 · DONE · 2fc6b74 · Converged the selector overlays
+  onto a single `aj-tui` `FilterableSelect` (search `TextInput` +
+  `SelectList` + the cancel/confirm/navigate/type-to-filter routing +
+  `on_select`/`on_cancel` + an `on_query` hook that defaults to
+  `SelectList::set_filter`), retiring the four hand-copied
+  search-overlay impls and the two divergent wiring patterns
+  (manual-routing vs. callbacks). model keeps its per-field fuzzy
+  scoring through `on_query` (+ new `SelectList::set_items`); the two
+  streaming selectors share a generic `StreamingScan<T>` (background
+  scan + coalesced drain + loading flag), and prompt-history's two
+  scopes became a lazily-spawned second `StreamingScan` instead of a
+  tagged channel. Read-only `auth_status`/`help_overlay` became
+  `build_overlay` fns over a shared `ReadOnlyListOverlay`. Unified the
+  three outcome-handle shapes into one `OutcomeSlot<T>` and applied it
+  across all the picker/viewer overlays (the 7 A4-flagged ones plus
+  `agent_picker`/`task_output`/`usage_status`) so a single shape
+  remains; `settings_window`/`skills_window` keep their distinct
+  submenu/changes protocol. Decision A (user call): kept `SelectList`
+  and `SettingsList` separate (genuinely different semantics, the
+  reference keeps two too) and only unified the nav-key set — gave
+  `SettingsList` the page keys `SelectList` already had. Folded in the
+  A4 minors: routed the session preview through the display-width
+  authority (`ansi::truncate_to_width` + new `ansi::strip_ansi`, so a
+  truncated current-session row no longer bleeds the selection
+  highlight via an injected reset) and reworded the model rebuild
+  comment to name the real reason (custom field scoring, not a
+  `SelectList` limitation). `SessionSelectorOutcome::Confirmed` now
+  carries the session id the host used, not the whole preview. A fresh
+  sub-agent review caught two should-fixes, both addressed: the
+  streaming current-row chase now yields on any navigation key (even a
+  no-op boundary Up, which a before/after selection compare missed),
+  and the preview-truncation reset-bleed (above). Net -624 lines.
+  Tests: FilterableSelect routing/query/loading/status, StreamingScan
+  drain, `strip_ansi`, the boundary-navigation chase yield, and every
+  migrated selector's existing suite carried over; `fmt`/`clippy`
+  clean, full `cargo test --workspace` green (85 binaries).
