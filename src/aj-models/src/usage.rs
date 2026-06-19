@@ -24,7 +24,7 @@ use crate::auth::{AuthError, AuthStorage};
 /// One rate-limit window, ready to render.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageWindow {
-    /// Human-readable window name, e.g. "Current session".
+    /// Human-readable window name, e.g. "5h limit".
     pub label: String,
     /// Fraction of the window used, `0.0..=1.0`.
     pub used: f64,
@@ -80,9 +80,48 @@ pub trait UsageSource: Send + Sync {
     async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError>;
 }
 
-/// Usage sources shipped out of the box. Today: Anthropic.
+/// Usage sources shipped out of the box: Anthropic (Claude
+/// Pro/Max) and OpenAI Codex (ChatGPT subscription).
 pub fn default_usage_sources() -> Vec<Arc<dyn UsageSource>> {
-    vec![Arc::new(anthropic::AnthropicUsageSource)]
+    vec![
+        Arc::new(anthropic::AnthropicUsageSource),
+        Arc::new(codex::OpenAICodexUsageSource),
+    ]
+}
+
+/// Concrete, provider-independent label for a usage window of the
+/// given length in minutes, e.g. `"5h limit"` or `"Weekly limit"`.
+///
+/// Anthropic and Codex both expose 5-hour and weekly rolling windows,
+/// so deriving the label from the window length keeps the two
+/// providers' rows reading identically in the same overlay. We match
+/// each familiar bucket with a 5% tolerance to absorb servers that
+/// report e.g. 4h59m or 6d23h. Lengths that don't map to a known
+/// bucket (or an unknown length) fall back to a generic `"Usage
+/// limit"`.
+pub fn window_label(window_minutes: Option<i64>) -> String {
+    const HOUR: i64 = 60;
+    const DAY: i64 = 24 * HOUR;
+    const BUCKETS: &[(i64, &str)] = &[
+        (5 * HOUR, "5h limit"),
+        (DAY, "Daily limit"),
+        (7 * DAY, "Weekly limit"),
+        (30 * DAY, "Monthly limit"),
+        (365 * DAY, "Annual limit"),
+    ];
+
+    let Some(minutes) = window_minutes.filter(|m| *m > 0) else {
+        return "Usage limit".to_string();
+    };
+    for (expected, label) in BUCKETS {
+        // Integer 5% tolerance band, no float conversion needed.
+        let lower = expected * 95 / 100;
+        let upper = expected * 105 / 100;
+        if (lower..=upper).contains(&minutes) {
+            return (*label).to_string();
+        }
+    }
+    "Usage limit".to_string()
 }
 
 pub mod anthropic {
@@ -133,25 +172,44 @@ pub mod anthropic {
 
     /// Map the wire response to the generic report: known windows in
     /// display order, plus a usage-credits note when enabled.
+    ///
+    /// Anthropic doesn't report window lengths numerically, but its
+    /// field names pin them down: `five_hour` is the 5-hour session
+    /// window and every `seven_day*` field is a weekly window. We pass
+    /// those known lengths through [`window_label`] so the rows read
+    /// the same as Codex's, and append the per-model scope (Sonnet,
+    /// Opus, ...) as a qualifier where Anthropic splits the weekly
+    /// budget by model.
     fn map_usage(usage: &OAuthUsage) -> ProviderUsage {
-        let labeled: &[(&Option<OAuthUsageWindow>, &str)] = &[
-            (&usage.five_hour, "Current session"),
-            (&usage.seven_day, "Current week (all models)"),
-            (&usage.seven_day_sonnet, "Current week (Sonnet)"),
-            (&usage.seven_day_opus, "Current week (Opus)"),
-            (&usage.seven_day_oauth_apps, "Current week (OAuth apps)"),
+        const FIVE_HOURS_MINS: i64 = 5 * 60;
+        const SEVEN_DAYS_MINS: i64 = 7 * 24 * 60;
+        let labeled: &[(&Option<OAuthUsageWindow>, i64, Option<&str>)] = &[
+            (&usage.five_hour, FIVE_HOURS_MINS, None),
+            (&usage.seven_day, SEVEN_DAYS_MINS, Some("all models")),
+            (&usage.seven_day_sonnet, SEVEN_DAYS_MINS, Some("Sonnet")),
+            (&usage.seven_day_opus, SEVEN_DAYS_MINS, Some("Opus")),
+            (
+                &usage.seven_day_oauth_apps,
+                SEVEN_DAYS_MINS,
+                Some("OAuth apps"),
+            ),
         ];
 
         let mut windows = Vec::new();
-        for (window, label) in labeled {
+        for (window, minutes, qualifier) in labeled {
             let Some(window) = window else { continue };
             // A window without a utilization number carries no
             // information; skip it rather than rendering "?% used".
             let Some(utilization) = window.utilization else {
                 continue;
             };
+            let base = super::window_label(Some(*minutes));
+            let label = match qualifier {
+                Some(qualifier) => format!("{base} ({qualifier})"),
+                None => base,
+            };
             windows.push(UsageWindow {
-                label: (*label).to_string(),
+                label,
                 used: (utilization / 100.0).clamp(0.0, 1.0),
                 resets_at: window.resets_at.as_deref().and_then(parse_reset),
             });
@@ -214,7 +272,7 @@ pub mod anthropic {
             .unwrap();
             let report = map_usage(&usage);
             let labels: Vec<&str> = report.windows.iter().map(|w| w.label.as_str()).collect();
-            assert_eq!(labels, vec!["Current session", "Current week (Opus)"]);
+            assert_eq!(labels, vec!["5h limit", "Weekly limit (Opus)"]);
             assert_eq!(report.windows[0].used, 0.5);
             assert!(report.windows[0].resets_at.is_some());
             assert!(report.windows[1].resets_at.is_none());
@@ -246,6 +304,382 @@ pub mod anthropic {
             let disabled: OAuthExtraUsage =
                 serde_json::from_str(r#"{"is_enabled": false}"#).unwrap();
             assert!(extra_usage_note(&disabled).is_none());
+        }
+    }
+}
+
+pub mod codex {
+    //! Usage source for OpenAI Codex (ChatGPT subscription) accounts.
+
+    use async_trait::async_trait;
+    use reqwest::header::{AUTHORIZATION, USER_AGENT};
+    use serde::Deserialize;
+    use std::time::Duration;
+
+    use super::{ProviderUsage, UsageError, UsageReport, UsageSource, UsageWindow};
+    use crate::auth::AuthStorage;
+    use crate::oauth::openai::extract_account_id;
+
+    /// Provider id this source reports on, matching the OAuth pool the
+    /// Codex Responses provider uses (see `auth.rs` §7.4.1).
+    const PROVIDER_ID: &str = "openai-codex";
+
+    /// Account usage endpoint on the ChatGPT backend. The same JSON
+    /// shape backs the `wham/usage` path; the leading host is fixed
+    /// because the OAuth JWT is only valid against `chatgpt.com`.
+    const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+
+    /// Tight timeout so a stalled request can't hang the `/usage`
+    /// overlay (the outer collection also caps each source, but the
+    /// HTTP-level bound keeps connection setup honest too).
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Reports plan rate-limit utilization via the ChatGPT backend's
+    /// account usage endpoint. Requires the OAuth JWT minted by the
+    /// §9.4 Codex login flow; the token carries the `chatgpt_account_id`
+    /// claim that the endpoint requires as a header.
+    pub struct OpenAICodexUsageSource;
+
+    #[async_trait]
+    impl UsageSource for OpenAICodexUsageSource {
+        fn provider_id(&self) -> &str {
+            PROVIDER_ID
+        }
+
+        async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError> {
+            let Some(token) = auth.get_api_key(PROVIDER_ID).await? else {
+                return Ok(UsageReport::NotConfigured);
+            };
+            // The endpoint authenticates the account via the
+            // `chatgpt_account_id` JWT claim. A token without it (e.g.
+            // a plain API key dropped into this pool) can't query usage.
+            let Some(account_id) = extract_account_id(&token) else {
+                return Ok(UsageReport::Unsupported {
+                    reason: "only available with a ChatGPT subscription login".to_string(),
+                });
+            };
+
+            let client = reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .map_err(|err| UsageError::Fetch(err.to_string()))?;
+            let response = client
+                .get(USAGE_URL)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header("ChatGPT-Account-Id", account_id)
+                .header(USER_AGENT, user_agent())
+                .send()
+                .await
+                .map_err(|err| UsageError::Fetch(err.to_string()))?;
+
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| UsageError::Fetch(err.to_string()))?;
+            if !status.is_success() {
+                return Err(UsageError::Fetch(format!(
+                    "usage request failed ({status}): {body}"
+                )));
+            }
+
+            let payload: UsagePayload = serde_json::from_str(&body).map_err(|err| {
+                UsageError::Fetch(format!("could not parse usage response: {err}"))
+            })?;
+            Ok(UsageReport::Usage(map_usage(&payload)))
+        }
+    }
+
+    /// `User-Agent` matching the Codex Responses provider:
+    /// `aj/<version> (<os> <arch>)`.
+    fn user_agent() -> String {
+        format!(
+            "aj/{} ({} {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    }
+
+    /// Map the wire payload into the generic report. Windows come from
+    /// the primary/secondary rolling limits, the per-feature
+    /// `additional_rate_limits`, and the workspace monthly credit cap.
+    /// Credits balance and available rate-limit reset credits ride
+    /// along as notes.
+    fn map_usage(payload: &UsagePayload) -> ProviderUsage {
+        let mut windows = Vec::new();
+
+        if let Some(rate_limit) = payload.rate_limit.as_ref() {
+            windows.extend(rate_limit.windows(None));
+        }
+        for additional in payload.additional_rate_limits.iter().flatten() {
+            let qualifier = additional
+                .limit_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty());
+            if let Some(rate_limit) = additional.rate_limit.as_ref() {
+                windows.extend(rate_limit.windows(qualifier));
+            }
+        }
+        if let Some(window) = payload
+            .spend_control
+            .as_ref()
+            .and_then(|spend| spend.individual_limit.as_ref())
+            .and_then(SpendControlLimit::window)
+        {
+            windows.push(window);
+        }
+
+        let mut notes = Vec::new();
+        if let Some(note) = payload.credits.as_ref().and_then(Credits::note) {
+            notes.push(note);
+        }
+        if let Some(reset_credits) = payload.rate_limit_reset_credits.as_ref()
+            && reset_credits.available_count > 0
+        {
+            notes.push(format!(
+                "Rate-limit reset credits available: {}",
+                reset_credits.available_count
+            ));
+        }
+
+        ProviderUsage { windows, notes }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UsagePayload {
+        rate_limit: Option<RateLimit>,
+        #[serde(default)]
+        additional_rate_limits: Option<Vec<AdditionalRateLimit>>,
+        credits: Option<Credits>,
+        spend_control: Option<SpendControl>,
+        rate_limit_reset_credits: Option<ResetCredits>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RateLimit {
+        primary_window: Option<Window>,
+        secondary_window: Option<Window>,
+    }
+
+    impl RateLimit {
+        /// Build display windows for the primary and secondary limits,
+        /// labeling each from its own length and appending `qualifier`
+        /// (the metered feature name, for `additional_rate_limits`).
+        fn windows(&self, qualifier: Option<&str>) -> Vec<UsageWindow> {
+            [self.primary_window.as_ref(), self.secondary_window.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|window| window.to_usage_window(qualifier))
+                .collect()
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Window {
+        used_percent: Option<f64>,
+        limit_window_seconds: Option<i64>,
+        /// Window reset, unix seconds.
+        reset_at: Option<i64>,
+    }
+
+    impl Window {
+        fn to_usage_window(&self, qualifier: Option<&str>) -> Option<UsageWindow> {
+            let used_percent = self.used_percent?;
+            let base = super::window_label(self.limit_window_seconds.map(|secs| secs / 60));
+            let label = match qualifier {
+                Some(qualifier) => format!("{base} ({qualifier})"),
+                None => base,
+            };
+            Some(UsageWindow {
+                label,
+                used: (used_percent / 100.0).clamp(0.0, 1.0),
+                resets_at: self.reset_at.map(seconds_to_millis),
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AdditionalRateLimit {
+        limit_name: Option<String>,
+        rate_limit: Option<RateLimit>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Credits {
+        #[serde(default)]
+        has_credits: bool,
+        #[serde(default)]
+        unlimited: bool,
+        balance: Option<String>,
+    }
+
+    impl Credits {
+        /// One note line describing the credit balance, or `None` when
+        /// the account has no credit tracking (matching the windows-only
+        /// view those accounts get).
+        fn note(&self) -> Option<String> {
+            if !self.has_credits {
+                return None;
+            }
+            if self.unlimited {
+                return Some("Credits: unlimited".to_string());
+            }
+            let balance = self.balance.as_deref()?.trim();
+            (!balance.is_empty()).then(|| format!("Credits: {balance}"))
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SpendControl {
+        individual_limit: Option<SpendControlLimit>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SpendControlLimit {
+        remaining_percent: Option<i64>,
+        /// Reset, unix seconds.
+        reset_at: Option<i64>,
+    }
+
+    impl SpendControlLimit {
+        /// The workspace monthly credit cap as a usage window. We render
+        /// it like a rate-limit window (percent used + reset) so it sits
+        /// naturally alongside the rolling limits.
+        fn window(&self) -> Option<UsageWindow> {
+            // remaining_percent is server-clamped to 0..=100; the u8
+            // conversion is therefore lossless and avoids a silent `as`.
+            let remaining = self.remaining_percent?.clamp(0, 100);
+            let used = f64::from(u8::try_from(100 - remaining).unwrap_or(0)) / 100.0;
+            Some(UsageWindow {
+                label: "Monthly credit limit".to_string(),
+                used,
+                resets_at: self.reset_at.map(seconds_to_millis),
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ResetCredits {
+        #[serde(default)]
+        available_count: i64,
+    }
+
+    /// Convert a unix-seconds timestamp to the unix-milliseconds the
+    /// generic [`UsageWindow`] carries.
+    fn seconds_to_millis(seconds: i64) -> i64 {
+        seconds * 1000
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A real Team-plan response captured from the live endpoint.
+        const TEAM_PLAN_RESPONSE: &str = r#"{
+            "plan_type": "team",
+            "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 17192,
+                    "reset_at": 1781872115
+                },
+                "secondary_window": {
+                    "used_percent": 27,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 603992,
+                    "reset_at": 1782458915
+                }
+            },
+            "additional_rate_limits": null,
+            "credits": {
+                "has_credits": false,
+                "unlimited": false,
+                "balance": null
+            },
+            "spend_control": { "reached": false, "individual_limit": null },
+            "rate_limit_reset_credits": { "available_count": 2 }
+        }"#;
+
+        #[test]
+        fn maps_primary_and_secondary_windows_with_concrete_labels() {
+            let payload: UsagePayload = serde_json::from_str(TEAM_PLAN_RESPONSE).unwrap();
+            let report = map_usage(&payload);
+
+            let labels: Vec<&str> = report.windows.iter().map(|w| w.label.as_str()).collect();
+            assert_eq!(labels, vec!["5h limit", "Weekly limit"]);
+            assert_eq!(report.windows[0].used, 1.0);
+            assert_eq!(report.windows[1].used, 0.27);
+            // reset_at is unix seconds on the wire, unix millis in the model.
+            assert_eq!(report.windows[0].resets_at, Some(1781872115 * 1000));
+        }
+
+        #[test]
+        fn team_plan_without_credits_reports_only_reset_credits_note() {
+            let payload: UsagePayload = serde_json::from_str(TEAM_PLAN_RESPONSE).unwrap();
+            let report = map_usage(&payload);
+            // has_credits is false, so no credit-balance note; the two
+            // available reset credits do surface.
+            assert_eq!(
+                report.notes,
+                vec!["Rate-limit reset credits available: 2".to_string()]
+            );
+        }
+
+        #[test]
+        fn maps_credits_spend_control_and_additional_limits() {
+            let payload: UsagePayload = serde_json::from_str(
+                r#"{
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 10.5,
+                            "limit_window_seconds": 18000,
+                            "reset_at": 1000
+                        }
+                    },
+                    "additional_rate_limits": [
+                        {
+                            "limit_name": "gpt-5-codex",
+                            "metered_feature": "codex_other",
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 50,
+                                    "limit_window_seconds": 604800,
+                                    "reset_at": 2000
+                                }
+                            }
+                        }
+                    ],
+                    "credits": { "has_credits": true, "unlimited": false, "balance": "1234" },
+                    "spend_control": {
+                        "reached": false,
+                        "individual_limit": {
+                            "remaining_percent": 40,
+                            "reset_at": 3000
+                        }
+                    },
+                    "rate_limit_reset_credits": { "available_count": 0 }
+                }"#,
+            )
+            .unwrap();
+            let report = map_usage(&payload);
+
+            let labels: Vec<&str> = report.windows.iter().map(|w| w.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec![
+                    "5h limit",
+                    "Weekly limit (gpt-5-codex)",
+                    "Monthly credit limit"
+                ]
+            );
+            // remaining_percent 40 => 60% used.
+            assert_eq!(report.windows[2].used, 0.6);
+            // available_count 0 omits the reset-credits note.
+            assert_eq!(report.notes, vec!["Credits: 1234".to_string()]);
         }
     }
 }

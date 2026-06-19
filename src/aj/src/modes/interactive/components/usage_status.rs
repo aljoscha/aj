@@ -192,12 +192,12 @@ mod tests {
                 outcome: UsageOutcome::Usage(ProviderUsage {
                     windows: vec![
                         UsageWindow {
-                            label: "Current session".into(),
+                            label: "5h limit".into(),
                             used: 0.12,
                             resets_at: None,
                         },
                         UsageWindow {
-                            label: "Current week (all models)".into(),
+                            label: "Weekly limit (all models)".into(),
                             used: 0.34,
                             resets_at: None,
                         },
@@ -223,7 +223,7 @@ mod tests {
         let body = c.render(120).join("\n");
         assert!(!body.contains("Loading"), "{body}");
         assert!(body.contains("anthropic"), "{body}");
-        assert!(body.contains("Current session"), "{body}");
+        assert!(body.contains("5h limit"), "{body}");
         assert!(body.contains("12% used"), "{body}");
         assert!(body.contains("Extra usage credits"), "{body}");
         assert!(body.contains("usage reporting not supported"), "{body}");
