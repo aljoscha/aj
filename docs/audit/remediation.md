@@ -199,7 +199,7 @@ When presenting a proposal, cover:
   is the highest-impact and most delicate (touches all tools) — may warrant
   its own staged proposal.
 
-### R12 — Extract a shared test-support crate  [refactor · TODO]
+### R12 — Extract a shared test-support crate  [refactor · DONE]
 - **Sources:** M5, TO1, T5, A5; `_SUMMARY` themes 5 & 7.
 - **Problem:** the `aj-tui` `VirtualTerminal` harness is trapped in
   `tests/support`; the binary re-rolls a no-op `StubTerminal`; test doubles
@@ -574,3 +574,37 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   byte-equivalent, `oauth_usage` intentionally kept off the helper,
   overflow give-up rendering faithful) and caught a CLAUDE.md
   scope-creep slip (two unrelated lines dropped), now restored.
+- 2026-06-19 · R12 · DONE · e5d8155 · Three-part test-support
+  extraction, no runtime behavior change. (1) Promoted `aj-tui`'s
+  `tests/support` harness into a new dev-dependency-only crate
+  `aj-tui-testkit` (depends on `aj-tui` + `vt100-ctt`/`tokio`; the
+  `aj-tui` → testkit edge is a dev-dep so Cargo permits the cycle).
+  `support.rs` became the crate's `lib.rs`; the seven submodules moved
+  verbatim with `super::` → `crate::` path fixes. The 54 integration
+  tests switched `mod support;` → `use aj_tui_testkit as support;`, one
+  uniform line each (five files that declared but never used `support`
+  dropped the import). So the `VirtualTerminal` is now reusable across
+  crates and no longer ships in `aj-tui`'s public API. (2) A5: deleted
+  the binary's no-op `StubTerminal` and pointed `replay_parity` at the
+  shared `VirtualTerminal` (testkit added as an `aj` dev-dep), so the
+  parity test now drives the real compositor path; the full run-loop
+  test that asserts on rendered frames stays R17, which this unblocks.
+  (3) TO1: gated `aj-tools::testing` behind `#[cfg(any(test, feature =
+  "testing"))]` + a new `testing` feature, removing `DummyToolContext`
+  from production builds (nothing outside the crate's own `cfg(test)`
+  used it). Left `tempfile` a normal dep — `tools::bash` needs it on
+  the live spill-file path — and noted the deviation from the finding's
+  "move tempfile to dev-deps" sub-point. (4) M5: kept `scripted` in
+  prod (the `--scripted` flag legitimizes `ScriptedProvider`/`demos`/
+  `ScriptBuilder`) and documented `ExhaustedBehavior::Panic` as the one
+  reachable, opt-in, test-only `panic!` (default and `--scripted` both
+  use `EndTurn`), an ACCEPT-the-module-as-prod call rather than a
+  cfg-gated enum variant. Rejected one mega test-support crate
+  (would invert layering by pulling `aj-models`/`aj-tools` into a TUI
+  testkit); each double got the treatment matching its dependency
+  reality. Also fixed the now-wrong `tests/support/` doc references
+  across `aj-tui/src` (lib/terminal/components/example) to point at the
+  testkit; left the README's chronology sections for R18. `fmt`/`clippy
+  --workspace --all-targets` clean; `cargo build --workspace` confirms
+  no double leaks into a default build; full `cargo test --workspace`
+  green (88 binaries incl. the new crate).
