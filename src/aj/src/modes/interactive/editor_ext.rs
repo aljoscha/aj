@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use aj_agent::message::{AgentMessage, AgentMessageKind};
+use aj_agent::tool::TASK_NOTIFICATION_OPEN_TAG;
 use aj_models::types::{Message, UserContent};
 use aj_session::{ConversationEntry, ConversationEntryKind, ConversationPersistence, ThreadKind};
 use aj_tui::components::editor::Editor;
@@ -251,6 +252,10 @@ pub(crate) fn scan_file_user_prompts(path: &Path) -> Vec<String> {
         if let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line)
             && let ConversationEntryKind::Message { message: msg } = entry.entry
             && let Some(text) = extract_user_prompt_text(&msg)
+            // Task-completion notices are persisted as user-role messages so
+            // the model sees them, but they're harness-injected, not typed by
+            // the user. They must not surface in prompt history.
+            && !text.trim_start().starts_with(TASK_NOTIFICATION_OPEN_TAG)
         {
             prompts.push(text);
         }
@@ -585,6 +590,28 @@ mod tests {
         let h = bootstrap_for(&dir, 100);
         let entries: Vec<&str> = h.iter().collect();
         assert_eq!(entries, vec!["the only real prompt"]);
+    }
+
+    #[test]
+    fn bootstrap_ignores_task_notification_messages() {
+        let dir = scratch_dir("task-notification");
+        let notice = format!(
+            "{}\nBackground task #1 finished: ls (exit 0)\n{}",
+            TASK_NOTIFICATION_OPEN_TAG,
+            aj_agent::tool::TASK_NOTIFICATION_CLOSE_TAG,
+        );
+        write_jsonl(
+            &dir,
+            "2024-01-01-00-00-00",
+            &[
+                &user_message_line("real prompt", "1"),
+                &user_message_line(&notice, "2"),
+                &user_message_line("another real prompt", "3"),
+            ],
+        );
+        let h = bootstrap_for(&dir, 100);
+        let entries: Vec<&str> = h.iter().collect();
+        assert_eq!(entries, vec!["real prompt", "another real prompt"]);
     }
 
     #[test]
