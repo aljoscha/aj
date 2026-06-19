@@ -7,7 +7,7 @@
 //! both the formula itself and the wiring that delivers terminal
 //! dimensions through the handle.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::components::editor::Editor;
 use aj_tui::tui::{RenderHandle, Tui};

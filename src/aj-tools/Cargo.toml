@@ -3,6 +3,13 @@ name = "aj-tools"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes the `testing` module (no-op `ToolContext` doubles) to downstream
+# test code. Off by default so the doubles never ship in production builds.
+# `tempfile` stays a normal dependency regardless: `tools::bash` uses it for
+# the spill file on the live path.
+testing = []
+
 [dependencies]
 aj-agent = { path = "../aj-agent/" }
 aj-models = { path = "../aj-models/" }

@@ -8,7 +8,7 @@
 //! pre-segmented atomic units for paste markers) lives in
 //! `tests/word_wrap.rs`.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::ansi::visible_width;
 use aj_tui::component::Component;

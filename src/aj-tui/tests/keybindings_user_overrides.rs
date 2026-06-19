@@ -15,7 +15,7 @@
 //! because they mutate process-wide state, and reset to defaults at
 //! both ends so neighboring tests see the canonical set.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

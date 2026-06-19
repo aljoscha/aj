@@ -129,7 +129,7 @@ impl MutableLines {
     }
 
     /// Snapshot the current lines. Rarely needed in tests; the viewport
-    /// read-back surfaces on [`super::virtual_terminal::VirtualTerminal`]
+    /// read-back surfaces on [`crate::virtual_terminal::VirtualTerminal`]
     /// are usually what you want.
     pub fn snapshot(&self) -> Vec<String> {
         self.lines.borrow().clone()

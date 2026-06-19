@@ -42,7 +42,7 @@ struct State {
     progress_active: bool,
     kitty_protocol_active: bool,
     /// Every `write` call, captured verbatim. Used directly by
-    /// [`super::logging_terminal::LoggingVirtualTerminal`] and available to
+    /// [`crate::logging_terminal::LoggingVirtualTerminal`] and available to
     /// tests that need to assert on emitted escape sequences.
     writes: Vec<String>,
     /// Number of times [`Terminal::start`] has been invoked on this handle.

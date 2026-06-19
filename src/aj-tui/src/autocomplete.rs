@@ -1461,8 +1461,8 @@ impl AutocompleteSession for FuzzyFileSession {
         // already rewards matches at path-delimiter boundaries —
         // so a query like `src` naturally scores `src/` above a
         // file like `src.txt`, and a query like `auto` scores
-        // `autocomplete.rs` above a scattered subsequence match in
-        // `tests/support/`. We trust nucleo's ranking and just
+        // `autocomplete.rs` above a scattered subsequence match
+        // elsewhere in the tree. We trust nucleo's ranking and just
         // cap to the popup's display window.
         let snap = self.matcher.snapshot();
         let take = u32::try_from(FUZZY_SESSION_SUGGESTION_LIMIT).unwrap_or(u32::MAX);

@@ -6,7 +6,7 @@
 //! the component through `handle_input` and asserts on `value()` and
 //! `cursor()`.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::text_input::TextInput;

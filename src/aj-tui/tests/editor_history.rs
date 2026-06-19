@@ -9,7 +9,7 @@
 //! autocomplete, ...) live in their own files so each batch stays
 //! reviewable.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

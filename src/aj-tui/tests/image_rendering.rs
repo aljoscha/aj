@@ -7,8 +7,6 @@
 //! [`Image`]: aj_tui::components::image::Image
 //! [`Tui`]: aj_tui::tui::Tui
 
-mod support;
-
 use aj_tui::capabilities::{
     ImageProtocol, TerminalCapabilities, reset_capabilities_cache, set_capabilities,
 };

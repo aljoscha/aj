@@ -14,7 +14,7 @@
 //! the [`ProcessTerminal`] boundary — the crate deliberately does not
 //! ship a hand-rolled stdin state machine. See the "in-process only"
 //! and "out-of-scope features" sections of `src/lib.rs` and
-//! `tests/support/README.md` for the rationale.
+//! `aj-tui-testkit`'s README for the rationale.
 //!
 //! If a test key shows up here with a surprising code, the culprit is
 //! before this example in the input pipeline: either your terminal

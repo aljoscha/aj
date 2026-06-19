@@ -6,7 +6,7 @@
 //! [`Tui::unfocus_overlay`]. Input routing also respects the
 //! `focused_overlay_id` trumping normal stack-order overlay routing.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

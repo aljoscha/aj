@@ -2,7 +2,7 @@
 //! with `min_width`), anchor positioning, margins, explicit row/col,
 //! offsets, `max_height`, and overlay stacking.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::impl_component_any;

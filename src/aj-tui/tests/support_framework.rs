@@ -6,7 +6,7 @@
 //! guards, fixtures, and theme factories — so they don't silently drift
 //! out of sync with the types they wrap.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::env;
 

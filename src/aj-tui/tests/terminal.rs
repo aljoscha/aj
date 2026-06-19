@@ -5,7 +5,7 @@
 //! cargo parent, so `crossterm::terminal::size()` returns `Err` and
 //! the env-var fallback is the path under test.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::fs;
 use std::path::PathBuf;

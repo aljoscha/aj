@@ -5,7 +5,7 @@
 //! their docs describe. If these regress, every other integration test
 //! that depends on them becomes unreliable.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::keys::InputEvent;
 use aj_tui::terminal::Terminal;

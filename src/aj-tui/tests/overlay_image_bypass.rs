@@ -15,7 +15,7 @@
 //! on the image row. A companion test confirms overlay rows that don't
 //! intersect the image still composite normally.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::image_protocol::{iterm2_sequence, kitty_sequence};

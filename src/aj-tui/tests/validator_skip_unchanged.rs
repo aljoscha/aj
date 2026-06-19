@@ -20,7 +20,7 @@
 //!
 //! See [`Tui::validate_line_widths`] in `src/aj-tui/src/tui.rs`.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::{Cell, RefCell};
 use std::io;

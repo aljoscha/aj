@@ -6,7 +6,7 @@
 //! needed — so the assertions only care about what the component put on
 //! each line.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::ansi::visible_width;
 use aj_tui::component::Component;

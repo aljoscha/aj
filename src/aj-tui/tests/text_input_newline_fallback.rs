@@ -21,8 +21,6 @@
 //! registry can route user-rebound submit / newLine bindings without
 //! interference. Those cases are covered by the keybindings tests.
 
-mod support;
-
 use std::cell::RefCell;
 use std::rc::Rc;
 

@@ -1,9 +1,14 @@
 //! Shared test support for `aj-tui` integration tests.
 //!
-//! This module is included by every integration test via `mod support;`. It is
-//! deliberately not a library: it lives under `tests/support/` so it is only
-//! compiled in test builds and can reach for `dev-dependencies` (`vt100-ctt`,
-//! `serial_test`) without polluting the public crate surface.
+//! This is a dev-dependency-only crate: it depends on `aj-tui` and is pulled
+//! in by `aj-tui`'s own integration tests and by other crates' tests (e.g.
+//! the `aj` binary's replay-parity test) that need to drive a real `Tui`
+//! against a headless terminal. Living in its own crate keeps the harness out
+//! of `aj-tui`'s shipped public API while still letting any test in the
+//! workspace share one `VirtualTerminal`.
+//!
+//! Test files pull it in with `use aj_tui_testkit as support;`, so every
+//! `support::*` reference in the suite resolves here.
 //!
 //! The submodules provide:
 //!
@@ -19,23 +24,14 @@
 //!   `InputRecorder`, etc.).
 //! - [`themes`]: shared theme fixtures for themable components.
 //!
-//! See `tests/support/README.md` for the broader testing philosophy.
+//! See `README.md` for the broader testing philosophy.
 
-#![allow(dead_code, unused_imports)]
-
-#[path = "support/ansi.rs"]
 pub mod ansi;
-#[path = "support/async_tui.rs"]
 pub mod async_tui;
-#[path = "support/env.rs"]
 pub mod env;
-#[path = "support/fixtures.rs"]
 pub mod fixtures;
-#[path = "support/logging_terminal.rs"]
 pub mod logging_terminal;
-#[path = "support/themes.rs"]
 pub mod themes;
-#[path = "support/virtual_terminal.rs"]
 pub mod virtual_terminal;
 
 pub use ansi::{plain_lines, plain_lines_trim_end, strip_ansi, visible_index_of};
@@ -66,8 +62,8 @@ pub fn render_now(tui: &mut Tui) {
 /// sequence that dominates component-mutation tests.
 ///
 /// The sync engine doesn't gate `render()` on `request_render()` (see the
-/// "Intentional simplifications" section of `tests/support/README.md`), so
-/// the `request_render()` call is purely about intent. Using this helper
+/// "Intentional simplifications" section of `README.md`), so the
+/// `request_render()` call is purely about intent. Using this helper
 /// keeps that intent visible while cutting the two-line mutation-then-
 /// render ceremony down to one.
 pub fn request_and_render_now(tui: &mut Tui) {

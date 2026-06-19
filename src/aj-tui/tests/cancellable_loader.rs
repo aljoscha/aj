@@ -5,8 +5,6 @@
 //! that `CancellableLoader` adds on top. By default that keybinding
 //! resolves to Escape and Ctrl+C.
 
-mod support;
-
 use std::cell::Cell;
 use std::rc::Rc;
 

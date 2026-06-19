@@ -15,8 +15,6 @@
 //! Every test that touches the filesystem uses a fresh `TempDir` and does
 //! not depend on the layout of the host's `/tmp`.
 
-mod support;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 

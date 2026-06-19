@@ -4,7 +4,7 @@
 //! cycling, search filtering, on-change / on-cancel callbacks, and
 //! render shape.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::RefCell;
 use std::rc::Rc;

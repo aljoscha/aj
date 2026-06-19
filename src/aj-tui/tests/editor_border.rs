@@ -9,7 +9,7 @@
 //! indicators entirely is exactly the kind of regression that won't
 //! surface in a content-only assertion.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::ansi::visible_width;
 use aj_tui::component::Component;

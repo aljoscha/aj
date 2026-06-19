@@ -6,7 +6,7 @@
 //! `Tui` + `VirtualTerminal` to catch style-leakage regressions that
 //! only show up after the compositor has run.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::sync::Arc;
 

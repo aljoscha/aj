@@ -19,7 +19,7 @@
 //!   editor's `layout_width` cache reflects the wrap geometry the
 //!   assertions assume.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

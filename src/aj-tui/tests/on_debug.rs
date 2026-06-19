@@ -2,7 +2,7 @@
 //! fires before input routing and consumes the chord so components
 //! never see it.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::RefCell;
 use std::rc::Rc;

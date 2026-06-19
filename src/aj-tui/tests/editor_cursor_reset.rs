@@ -7,7 +7,7 @@
 //! the cursor cell on the same row — visible bleed in real terminals
 //! when a styled line is being edited.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

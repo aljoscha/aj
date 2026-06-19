@@ -9,7 +9,7 @@
 //! semantics (requires an immediate-preceding yank, and replaces the
 //! yanked region atomically).
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

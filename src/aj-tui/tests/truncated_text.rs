@@ -2,7 +2,7 @@
 //! virtual terminal needed — we call `render(width)` directly and assert on
 //! the returned lines.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::ansi::visible_width;
 use aj_tui::component::Component;

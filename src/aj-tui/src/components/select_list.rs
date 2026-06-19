@@ -96,7 +96,7 @@ impl SelectItem {
 /// central palette and pass the populated theme in at construction
 /// time. We deliberately do not provide a `Default` impl: the tui
 /// crate stays palette-agnostic, and tests build themes via
-/// `tests/support/themes.rs`.
+/// `aj-tui-testkit`'s `themes` module.
 ///
 /// The closures use `Arc` rather than `Box` so a single theme can be
 /// cheaply cloned into nested or sibling components (e.g. an
@@ -782,7 +782,7 @@ mod tests {
     /// Identity theme used by in-module tests — every closure passes its
     /// input through verbatim. Lets these tests assert on layout/structure
     /// without stripping ANSI escapes from the output. Matches the
-    /// integration-test fixture in `tests/support/themes.rs::identity_select_list_theme`.
+    /// integration-test fixture in `aj_tui_testkit::themes::identity_select_list_theme`.
     fn identity_theme() -> SelectListTheme {
         SelectListTheme {
             selected_prefix: Arc::new(|s| s.to_string()),

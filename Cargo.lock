@@ -27,6 +27,7 @@ dependencies = [
  "aj-session",
  "aj-tools",
  "aj-tui",
+ "aj-tui-testkit",
  "anyhow",
  "arboard",
  "async-trait",
@@ -146,6 +147,7 @@ dependencies = [
 name = "aj-tui"
 version = "0.1.0"
 dependencies = [
+ "aj-tui-testkit",
  "async-trait",
  "base64",
  "bitflags",
@@ -167,6 +169,16 @@ dependencies = [
  "tokio-util",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "vt100-ctt",
+]
+
+[[package]]
+name = "aj-tui-testkit"
+version = "0.1.0"
+dependencies = [
+ "aj-tui",
+ "tokio",
+ "tokio-stream",
  "vt100-ctt",
 ]
 

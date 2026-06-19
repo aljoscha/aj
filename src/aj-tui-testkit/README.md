@@ -1,14 +1,16 @@
-# `aj-tui` integration test support
+# `aj-tui-testkit`
 
-This directory holds shared helpers used by every file under `aj-tui/tests/`.
+This crate holds the shared terminal harness and component fixtures used by
+`aj-tui`'s integration tests and by other crates' tests (e.g. the `aj`
+binary's replay-parity test). It is a dev-dependency-only crate: it depends
+on `aj-tui` and is never linked into a production build. Test files pull it
+in with `use aj_tui_testkit as support;`, so every `support::*` reference
+resolves here.
 
 ## Structure
 
-- `tests/support.rs` — top-level module declarations (re-exports and the
-  sync `render_now`). Uses `#[path]` to load sibling files from
-  `support/`. Cargo compiles every file under `tests/` as a separate
-  integration-test binary, so `support.rs` itself produces an empty
-  "running 0 tests" line when the suite runs — that's expected.
+- `lib.rs` — crate root: module re-exports plus the sync `render_now` /
+  `request_and_render_now` / `send_keys` helpers.
 - `virtual_terminal.rs` — `VirtualTerminal`, a [`Terminal`] implementation
   backed by the [`vt100-ctt`] crate (maintained fork of `vt100`). Writes are
   fed into a VT parser; tests read back `viewport()`, `viewport_trimmed()`,
@@ -54,9 +56,8 @@ This directory holds shared helpers used by every file under `aj-tui/tests/`.
   `aj_tui::tui::Tui::next_event` directly (see [Async vs sync](#async-vs-sync)
   below).
 
-The non-`mod.rs` layout with `#[path]` attributes on each submodule satisfies
-the workspace's `clippy::mod_module_files` lint and keeps all the shared test
-code under one `support/` directory.
+The flat-file module layout (one file per submodule, no `mod.rs`) satisfies
+the workspace's `clippy::mod_module_files` lint.
 
 ## API overview
 
@@ -127,7 +128,7 @@ source need to account for the following:
   flow through. The filter lives on the dispatch path rather than at
   the terminal boundary because crossterm emits the kind directly.
 
-[support::send_keys]: ./support.rs
+[support::send_keys]: ./src/lib.rs
 [wants_key_release]: aj_tui::component::Component::wants_key_release
 [`Terminal::clear_line`]: aj_tui::terminal::Terminal::clear_line
 
@@ -170,7 +171,7 @@ reaching for them keeps assertions short and focused.
   lets a test exercise the no-Kitty code path without touching
   global state. Defaults to `true` (matching the implicit assumption
   in most component tests); flip it off when testing the fallback.
-- **`identity_*` theme variants.** `tests/support/themes.rs` exposes
+- **`identity_*` theme variants.** `themes.rs` exposes
   both the styled `default_*` themes and matching `identity_*`
   themes whose closures pass strings through verbatim. Use the
   identity flavor for structural tests that don't want to strip
@@ -195,9 +196,9 @@ reaching for them keeps assertions short and focused.
   so timing is deterministic. The sync tier (`support::render_now`)
   is a one-line `tui.render()`; only graduate to the async tier
   when the test cares about coalescing.
-- **Framework self-tests.** `tests/support_smoke.rs`,
-  `tests/virtual_terminal_helpers.rs`, and
-  `tests/support_framework.rs` guard the support layer itself.
+- **Framework self-tests.** `aj-tui/tests/support_smoke.rs`,
+  `aj-tui/tests/virtual_terminal_helpers.rs`, and
+  `aj-tui/tests/support_framework.rs` guard the support layer itself.
   When `VirtualTerminal::cell()` regresses or
   `fixtures::MutableLines::set` silently swaps semantics, these
   fail first with a focused message — much cheaper to diagnose
@@ -207,23 +208,25 @@ reaching for them keeps assertions short and focused.
 ## How to add a new test file
 
 1. Create `tests/<topic>.rs`.
-2. Declare `mod support;` at the top of the file.
+2. Add `use aj_tui_testkit as support;` at the top of the file (and the
+   `aj-tui-testkit` dev-dependency to the crate's `Cargo.toml` if it isn't
+   there yet).
 3. Use `support::VirtualTerminal`, `support::render_now`,
    `support::StaticLines`, etc.
 
-Every integration test file is compiled as its own binary by Cargo, so
-`support/` is compiled once per test binary. That overhead is acceptable at
-our scale, and the pattern is idiomatic for Rust integration tests.
+Cargo compiles `aj-tui-testkit` once and links it into each integration-test
+binary, so the harness is no longer recompiled per test file the way an
+in-`tests/` `mod support;` module was.
 
 ## Smoke-test coverage of the support framework itself
 
-- `tests/support_smoke.rs` — the bare "plug `VirtualTerminal` into `Tui`,
+- `aj-tui/tests/support_smoke.rs` — the bare "plug `VirtualTerminal` into `Tui`,
   render, read viewport" path. If this breaks, every other integration
   test breaks for the same reason; failing early makes the cause obvious.
-- `tests/virtual_terminal_helpers.rs` — guards `VirtualTerminal`'s own
+- `aj-tui/tests/virtual_terminal_helpers.rs` — guards `VirtualTerminal`'s own
   helpers: `clear_viewport`, `reset`, `resize`, the writes log, the
   per-cell `CellInfo`, and `scroll_buffer`.
-- `tests/support_framework.rs` — guards `env::with_env`, the
+- `aj-tui/tests/support_framework.rs` — guards `env::with_env`, the
   `StaticLines` / `MutableLines` / `InputRecorder` fixtures, the theme
   factories (both `default_*` and `identity_*`) in `themes.rs`, and
   the `ansi::strip_ansi` / `visible_index_of` helpers. Keeps silent

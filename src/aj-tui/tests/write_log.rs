@@ -8,7 +8,7 @@
 //! two tests running in parallel would still race on the env var and
 //! on the captured log path.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::fs;
 use std::path::PathBuf;

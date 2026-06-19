@@ -387,7 +387,7 @@ struct VisualLine {
 /// The agent layer builds one from its central palette and passes it
 /// to [`Editor::new`]. We deliberately do not provide a `Default`
 /// impl: the tui crate stays palette-agnostic, and tests build themes
-/// via `tests/support/themes.rs`.
+/// via `aj-tui-testkit`'s `themes` module.
 ///
 /// The closures use `Arc` (and the nested `SelectListTheme` is also
 /// `Clone`-able via `Arc`), so the editor can hand the same theme
@@ -3651,7 +3651,7 @@ mod tests {
 
     /// Identity theme for in-module tests — every closure passes its
     /// input through verbatim. Mirrors
-    /// `tests/support/themes.rs::identity_editor_theme`.
+    /// `aj_tui_testkit::themes::identity_editor_theme`.
     fn identity_theme() -> EditorTheme {
         EditorTheme {
             border_color: Arc::new(|s| s.to_string()),

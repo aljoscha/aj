@@ -7,7 +7,7 @@
 //! check, so users on terminals that report `Backspace + SHIFT` get
 //! the same delete behavior as plain Backspace.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

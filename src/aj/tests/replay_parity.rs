@@ -58,8 +58,8 @@ use aj_models::types::{AssistantContent, AssistantMessage, StopReason, StreamOpt
 use aj_session::{ConversationLog, ConversationPersistence, persistence_listener, replay};
 use aj_tools::{BashTool, EditFileTool, TodoWriteTool};
 use aj_tui::component::Component;
-use aj_tui::terminal::Terminal;
 use aj_tui::tui::Tui;
+use aj_tui_testkit::VirtualTerminal;
 use tempfile::TempDir;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
@@ -72,43 +72,6 @@ use tokio_util::sync::CancellationToken;
 /// container doesn't truncate. 100×24 is a comfortable default.
 const SCREEN_WIDTH: u16 = 100;
 const SCREEN_HEIGHT: u16 = 24;
-
-/// Headless [`Terminal`] used for both Tuis: width/height come
-/// back, every write is dropped on the floor. The chat container's
-/// rendered lines are read directly via `Container::render`, not
-/// from the terminal's write buffer, so a no-op write sink is
-/// sufficient.
-struct StubTerminal {
-    columns: u16,
-    rows: u16,
-}
-
-impl StubTerminal {
-    fn new() -> Self {
-        Self {
-            columns: SCREEN_WIDTH,
-            rows: SCREEN_HEIGHT,
-        }
-    }
-}
-
-impl Terminal for StubTerminal {
-    fn write(&mut self, _: &str) {}
-    fn columns(&self) -> u16 {
-        self.columns
-    }
-    fn rows(&self) -> u16 {
-        self.rows
-    }
-    fn move_by(&mut self, _: i32) {}
-    fn hide_cursor(&mut self) {}
-    fn show_cursor(&mut self) {}
-    fn clear_line(&mut self) {}
-    fn clear_from_cursor(&mut self) {}
-    fn clear_screen(&mut self) {}
-    fn set_title(&mut self, _: &str) {}
-    fn flush(&mut self) {}
-}
 
 /// Identity stamped on every scripted [`AssistantMessage`] in this
 /// test module. Matches what [`ScriptedProvider`] stamps on every
@@ -177,7 +140,12 @@ fn one_tool_use_message(
 /// only difference between them is the event sequence each
 /// receives.
 fn build_tui_and_pump() -> (Tui, EventPump) {
-    let mut tui = Tui::new(Box::new(StubTerminal::new()));
+    // The chat container's rendered lines are read directly via
+    // `render_chat` (a `ChatView::render` call), not scraped from the
+    // terminal's write buffer, so the `VirtualTerminal` here only needs to
+    // report its dimensions. We share aj-tui's real terminal double rather
+    // than a bespoke stub so both Tuis drive the same compositor path.
+    let mut tui = Tui::new(Box::new(VirtualTerminal::new(SCREEN_WIDTH, SCREEN_HEIGHT)));
     let theme = ThemeHandle::new(Theme::bundled_dark());
     build_layout(&mut tui, &theme, true);
     let pump = EventPump::new(

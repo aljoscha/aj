@@ -14,7 +14,7 @@
 //! Key-repeat events (`KeyEventKind::Repeat`) are always delivered; a
 //! regression guard covers that too.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::RefCell;
 use std::rc::Rc;

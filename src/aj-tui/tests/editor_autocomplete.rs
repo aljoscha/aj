@@ -6,7 +6,7 @@
 //! open, retains exact-typed values on Enter, and respects the
 //! debounce / cancel contract on `@` and `#` autocomplete.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

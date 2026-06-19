@@ -22,7 +22,7 @@
 //! flips its reported value the moment the engine asks for it the
 //! second time within a single render pass.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::Cell;
 use std::io;

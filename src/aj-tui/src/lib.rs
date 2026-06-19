@@ -51,10 +51,10 @@
 //!
 //! # Testing
 //!
-//! Integration tests live under `tests/` and share a support layer at
-//! `tests/support/` — a headless `VirtualTerminal` backed by a VT parser,
-//! env-var RAII guards, theme factories, and small component fixtures.
-//! See `tests/support/README.md` for the full shape.
+//! Integration tests live under `tests/` and share the `aj-tui-testkit`
+//! crate, which provides a headless `VirtualTerminal` backed by a VT parser,
+//! env-var RAII guards, theme factories, and small component fixtures. See
+//! `aj-tui-testkit`'s README for the full shape.
 
 pub mod ansi;
 pub mod autocomplete;

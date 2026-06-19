@@ -3,7 +3,7 @@
 //! the content below it doesn't extend far enough to "push" the overlay
 //! region into the paint pass.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::impl_component_any;

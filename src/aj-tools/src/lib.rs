@@ -14,6 +14,11 @@
 
 pub mod image;
 pub mod sanitize;
+/// Test-only [`aj_agent::tool::ToolContext`] doubles for exercising tools
+/// without a live agent runtime. Gated behind `cfg(test)` plus the `testing`
+/// feature so it never ships in the production public API. Other crates'
+/// tests opt in via `aj-tools = { features = ["testing"] }` in dev-deps.
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod tools;
 pub mod truncate;

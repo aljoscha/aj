@@ -2,7 +2,7 @@
 //!
 //! Provides a [`Terminal`] trait and a [`ProcessTerminal`] implementation
 //! that drives a real terminal over stdin/stdout. Headless test doubles
-//! live alongside the integration tests under `tests/support/`.
+//! live in the `aj-tui-testkit` crate.
 //!
 //! # Input pipeline
 //!

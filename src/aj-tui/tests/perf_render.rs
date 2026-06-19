@@ -14,7 +14,7 @@
 //! actually performs: walk every child, allocate cached lines,
 //! normalize / validate / diff against `previous_lines`.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::RefCell;
 use std::rc::Rc;

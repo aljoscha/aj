@@ -4,7 +4,7 @@
 //! per-line layout (margins + full-width pad, with and without a
 //! background function), and cache stability across renders.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::text::Text;

@@ -15,8 +15,6 @@
 //! themes), so every integration test threads a theme through these
 //! helpers.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use aj_tui::components::editor::EditorTheme;

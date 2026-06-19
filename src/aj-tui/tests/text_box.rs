@@ -2,8 +2,6 @@
 //! application, and the render cache that avoids rebuilding output on
 //! frames where no input changed.
 
-mod support;
-
 use std::cell::Cell;
 use std::rc::Rc;
 

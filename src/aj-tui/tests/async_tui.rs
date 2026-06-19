@@ -10,7 +10,7 @@
 //! interval is driven by `tokio::time::advance` rather than real wall-clock
 //! time. That keeps the tests deterministic and fast.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::time::Duration;
 

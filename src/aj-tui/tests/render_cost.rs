@@ -14,7 +14,7 @@
 //! enough that random CI jitter won't trip them. The point is the
 //! printed numbers, not the pass/fail.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::RefCell;
 use std::rc::Rc;

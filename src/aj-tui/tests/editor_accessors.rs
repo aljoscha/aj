@@ -5,7 +5,7 @@
 //! `lines()` returning a defensive copy that callers can freely mutate
 //! without disturbing the editor.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

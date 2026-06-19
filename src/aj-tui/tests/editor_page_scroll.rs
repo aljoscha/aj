@@ -6,7 +6,7 @@
 //! defaults all along, but the previous hand-rolled `KeyCode` match
 //! never bound them.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

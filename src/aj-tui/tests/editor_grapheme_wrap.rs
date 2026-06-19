@@ -13,7 +13,7 @@
 //! width` to catch wide-glyph overflow regressions, and assert on
 //! exact split points where they matter (e.g. the CJK cases).
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::ansi::visible_width;
 use aj_tui::component::Component;

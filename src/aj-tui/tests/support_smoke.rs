@@ -1,9 +1,9 @@
-//! Smoke test: verifies the `tests/support/` module compiles and the
+//! Smoke test: verifies the `aj-tui-testkit` harness compiles and the
 //! `VirtualTerminal` can be plugged into a `Tui`. If this file fails to
 //! build, every other integration test will fail for the same reason, so
 //! keeping the smoke check minimal and explicit makes debugging easier.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::tui::Tui;
 

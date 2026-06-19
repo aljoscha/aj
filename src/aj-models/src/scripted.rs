@@ -124,6 +124,13 @@ impl ProviderScript {
 pub enum ExhaustedBehavior {
     /// Panic the inference task. Used by tests where an extra inference
     /// indicates a regression that needs to be diagnosed immediately.
+    ///
+    /// This is the one reachable `panic!` in this module and is a
+    /// deliberate test-only affordance. It is never selected on the
+    /// production `--scripted` path, which uses [`Self::EndTurn`]. The
+    /// default from [`ScriptedProvider::new`] is also `EndTurn`, so an
+    /// embedder only ever reaches the panic by opting in explicitly with
+    /// `.on_exhausted(Panic)`.
     Panic,
     /// Emit a minimal "end turn" finalized message so the agent loop
     /// terminates cleanly. Used by demos and the `--scripted` CLI flag,

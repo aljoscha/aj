@@ -14,7 +14,7 @@ use aj_tui::keys::InputEvent;
 use aj_tui::tui::{Tui, TuiEvent};
 use tokio::sync::mpsc;
 
-use super::virtual_terminal::VirtualTerminal;
+use crate::virtual_terminal::VirtualTerminal;
 
 /// Build a `Tui` wrapped around a fresh [`VirtualTerminal`] and return
 /// the input sender alongside it so the test can push synthetic
@@ -61,7 +61,7 @@ pub async fn drain_ready(tui: &mut Tui) -> Vec<TuiEvent> {
 /// pending writes. Conceptual contract: "wait for the throttled render
 /// to settle."
 ///
-/// Distinct from the sync-tier [`super::render_now`] helper, which is
+/// Distinct from the sync-tier [`crate::render_now`] helper, which is
 /// a one-shot `tui.render()` with no waiting. The deliberate name
 /// asymmetry (`render_now()` vs `wait_for_render().await`) makes the
 /// engine choice obvious at the call site.

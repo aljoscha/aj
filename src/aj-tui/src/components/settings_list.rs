@@ -103,7 +103,7 @@ impl SettingItem {
 /// No `Default` impl is provided on purpose: this crate stays
 /// palette-agnostic and the host application supplies a theme built
 /// from its own palette. Tests construct themes via
-/// `tests/support/themes.rs`.
+/// `aj-tui-testkit`'s `themes` module.
 ///
 /// The closures use `Arc` rather than `Box` so a single theme can be
 /// cheaply cloned (e.g. for snapshot purposes or sharing with a sibling

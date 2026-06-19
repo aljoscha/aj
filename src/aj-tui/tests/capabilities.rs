@@ -5,7 +5,7 @@
 //! capabilities cache is process-wide state and they mutate both the
 //! environment and the cache.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::capabilities::{
     ImageProtocol, TerminalCapabilities, detect_capabilities, detect_capabilities_with,

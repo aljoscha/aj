@@ -40,7 +40,7 @@ const TAB_AS_SPACES: &str = "   ";
 /// We deliberately do not provide a `Default` impl: the tui crate stays
 /// palette-agnostic, and the agent layer builds a theme from its central
 /// palette and passes it to [`Markdown::new`]. Tests build themes via
-/// `tests/support/themes.rs`.
+/// `aj-tui-testkit`'s `themes` module.
 ///
 /// The closures use `Arc` rather than `Box` so a single theme can be
 /// cheaply cloned (e.g. for snapshot purposes or sharing with a sibling
@@ -2441,7 +2441,7 @@ mod tests {
 
     /// Identity theme for in-module tests — every closure passes its
     /// input through verbatim. Matches
-    /// `tests/support/themes.rs::identity_markdown_theme` so unit
+    /// `aj_tui_testkit::themes::identity_markdown_theme` so unit
     /// tests and integration tests share the same convention.
     fn identity_theme() -> MarkdownTheme {
         MarkdownTheme {

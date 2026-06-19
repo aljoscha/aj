@@ -9,7 +9,7 @@
 //! file already guards one of those axes, its file-level doc comment
 //! calls out the gap explicitly.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::tui::Tui;
 

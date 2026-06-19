@@ -20,7 +20,7 @@
 //! lost before reaching us; that's a known gap documented on
 //! `is_newline_event`.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

@@ -1,4 +1,4 @@
-//! Naming alias for [`super::virtual_terminal::VirtualTerminal`] used by
+//! Naming alias for [`crate::virtual_terminal::VirtualTerminal`] used by
 //! tests that specifically care about the raw escape sequences written to
 //! the terminal.
 //!
@@ -7,7 +7,7 @@
 //! [`VirtualTerminal::clear_writes`]. This alias exists so a test's type
 //! signature makes its intent obvious at a glance.
 
-use super::virtual_terminal::VirtualTerminal;
+use crate::virtual_terminal::VirtualTerminal;
 
 /// A `VirtualTerminal` whose `write` log is the point of interest for the
 /// test (e.g. asserting "no `\x1b[2J` was emitted on resize").

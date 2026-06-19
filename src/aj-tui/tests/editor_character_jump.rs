@@ -8,7 +8,7 @@
 //! cancels, and any other key either executes the jump or falls back
 //! to normal handling.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

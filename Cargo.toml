@@ -6,6 +6,7 @@ members = [
     "src/aj-models",
     "src/aj-session",
     "src/aj-tools",
+    "src/aj-tui-testkit",
     "src/anthropic-sdk",
     "src/openai-sdk",
     "src/aj-tui",

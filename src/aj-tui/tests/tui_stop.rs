@@ -13,7 +13,7 @@
 //!   (the safety-net case) and must still produce a valid
 //!   terminal-restore sequence.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::capabilities::{
     ImageProtocol, TerminalCapabilities, reset_capabilities_cache, set_capabilities,

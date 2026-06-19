@@ -12,7 +12,7 @@
 //! model (whitespace / punctuation / word) and cross-line wrapping —
 //! see `Editor::word_boundary_left` in the source for the classifier.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

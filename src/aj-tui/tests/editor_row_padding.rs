@@ -13,7 +13,7 @@
 //! row equals the requested render width, regardless of where the
 //! cursor sits and whether `padding_x` is zero or non-zero.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::ansi::visible_width;
 use aj_tui::component::Component;

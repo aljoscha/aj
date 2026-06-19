@@ -10,7 +10,7 @@
 //! typically `enter` to `tui.input.newLine`). In that config, plain
 //! `\<Enter>` should *submit* instead of inserting a newline.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -13,7 +13,7 @@
 //! 4. Removing a listener preserves the relative order of the rest.
 //! 5. Two listeners chain: the second observes the first's rewrite.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::cell::RefCell;
 use std::rc::Rc;

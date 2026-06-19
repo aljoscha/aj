@@ -11,7 +11,7 @@
 //! These tests assert that neither the base-only render path nor the
 //! overlay-slicing path leaks style attributes onto the next line.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::impl_component_any;

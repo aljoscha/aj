@@ -9,7 +9,7 @@
 //! intervals. They're tight enough that the tests run quickly and
 //! loose enough to survive CI jitter.
 
-mod support;
+use aj_tui_testkit as support;
 
 use std::thread;
 use std::time::Duration;

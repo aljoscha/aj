@@ -7,7 +7,7 @@
 //! interactions where entering browse mode is an undoable step that
 //! restores to the pre-browse draft exactly.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;

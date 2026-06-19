@@ -11,7 +11,7 @@
 //! character, otherwise a `Super+c` keyboard shortcut would type a literal
 //! `c` into the buffer.
 
-mod support;
+use aj_tui_testkit as support;
 
 use aj_tui::component::Component;
 use aj_tui::components::editor::Editor;
