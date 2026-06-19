@@ -188,7 +188,7 @@ When presenting a proposal, cover:
   seam and a single error-classifier; keep only the genuinely
   provider-specific bits per adapter. Absorbs R4's redaction fix.
 
-### R11 — Standardize library error handling (no `anyhow` in lib crates)  [refactor · TODO]
+### R11 — Standardize library error handling (no `anyhow` in lib crates)  [refactor · DONE]
 - **Sources:** S1, S2, M1, AG2, SE1; `_SUMMARY` theme 3.
 - **Problem:** `anyhow` reaches into `aj-models::refresh`, the `aj-agent`
   public tool trait (so every tool inherits it), `aj-session::repair`, and
@@ -539,3 +539,38 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   `auth.rs::current_unix_ms` comment nit for the RESIDUAL pass (separate
   module, outside this seam). `fmt`/`clippy` clean; `cargo test
   -p aj-models` + `cargo check --workspace` green.
+- 2026-06-19 · R11 · DONE · 2593ea6 · Resolved (with the user) to a
+  relaxed-but-principled stance after auditing every `anyhow` library
+  site by the only question that matters: does a caller branch on the
+  error or only render it. Typed `thiserror` errors where callers
+  branch, a named opaque `Box<dyn Error + Send + Sync>` (new
+  `aj_agent::BoxError`) where the cause is only rendered, and no
+  `anyhow` in any public library signature. The SDKs' non-streaming
+  `messages`/`chat_completions`/`responses` were *converted* (not
+  removed, per the user: keep them for future use) to `ClientError`
+  through a new shared `classify_error_response`/`retry_after_header`
+  that the streaming paths now share too, retiring the copy-pasted
+  non-2xx mapping; anthropic's `anyhow` became a dev-dependency for its
+  example, openai's was dropped. `aj-models` gained a typed
+  `RefreshError` (Fetch/Http/Parse/Write/NoCachePath). In `aj-agent`
+  the tool trait (`execute`/`spawn_agent`/`ErasedToolFn`), the
+  event-bus `Listener`/`emit`, and `TurnError`'s `Recoverable`/`Fatal`
+  payloads now carry `BoxError` (`From<anyhow::Error>` became
+  `From<BoxError>`); `run_single_turn`/`execute_tool` return it.
+  `aj-session`'s `repair` returns `ConversationError` and the
+  persistence listener returns `BoxError`. Every tool in `aj-tools`
+  returns `BoxError`. `anyhow` is now confined to the `aj` binary,
+  which bridges `TurnError` payloads via `anyhow::Error::msg` (not
+  `Error::from`, which doesn't compile for a boxed trait object). The
+  CLAUDE.md error-handling rule was rewritten to this stance. Rejected
+  the stricter "rich `thiserror` enum everywhere" because the
+  render-only seams have no caller that branches, so extra variants
+  would be unused; rejected "just keep `anyhow`" because that leaks the
+  dep into the public tool-author and bus surface. Tests: shared
+  `classify_error_response` parity in both SDKs plus a
+  `RefreshError::Parse` regression; full `cargo test --workspace` green
+  (86 binaries), `fmt`/`clippy` clean. A fresh-agent review confirmed
+  no behavioral regression on the live paths (streaming classification
+  byte-equivalent, `oauth_usage` intentionally kept off the helper,
+  overflow give-up rendering faithful) and caught a CLAUDE.md
+  scope-creep slip (two unrelated lines dropped), now restored.
