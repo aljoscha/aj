@@ -212,7 +212,7 @@ When presenting a proposal, cover:
 
 ## WIRING — finish or remove half-wired / dead surface
 
-### R13 — Resolve `emit_update` / `ToolExecutionUpdate` end to end  [decision + change · TODO]
+### R13 — Resolve `emit_update` / `ToolExecutionUpdate` end to end  [decision + change · DONE]
 - **Sources:** AG1, AG2, TO2, A3, A4; `_SUMMARY` theme 4.
 - **Problem:** the feature is wired across three layers but the runtime
   impl is a permanent no-op, leaving a dead event variant, bash
@@ -608,3 +608,29 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   --workspace --all-targets` clean; `cargo build --workspace` confirms
   no double leaks into a default build; full `cargo test --workspace`
   green (88 binaries incl. the new crate).
+- 2026-06-19 · R13 · DONE · 3450980 · The audit's premise (runtime emit
+  is a permanent no-op) was stale: the "yes, this is a feature we want"
+  branch had already been taken and shipped by `3450980` ("stream
+  foreground tool progress to the bus"), so R13's decision + change were
+  done before this session. Verified the path is coherent across every
+  layer the finding named: the runtime `emit_update` builds and
+  `bus.emit().await`s a real `ToolExecutionUpdate` inline (lib.rs:2827,
+  best-effort, ordered before the terminal `ToolExecutionEnd`); the
+  `ToolContext::emit_update` contract doc (tool.rs) and the `events.rs`
+  variant doc describe the live inline-await emit, not a no-op; bash's
+  foreground loop awaits `emit_update` so its self-throttle now feeds a
+  real consumer (no longer dead work); the interactive `event_pump`
+  dispatches it to `ToolExecutionComponent::update_partial` (live, not
+  dead); and print mode deliberately skips it (high-frequency transient
+  render data, not structured output). Tests confirm it end to end
+  (`aj-agent::foreground_tool_progress_emits_update_before_end` asserting
+  Start→Update→End ordering, `aj-tools::emit_update_fires_during_execution`),
+  both green. No new code change in this session: the behavioral change
+  happened in `3450980`, so DONE crediting that commit is the honest
+  label over ACCEPTED-AS-IS. Left the residual `bash_execution.rs`
+  comment chronology ("Today the formatting is text-only", `docs/
+  aj-next-plan.md §1.2/§1.3` refs) for R18's per-crate sweep, and treated
+  the TO2 "duplicated debounce constant" sub-note as a non-issue (both
+  sites reference the single `UPDATE_DEBOUNCE` constant, can't drift; the
+  "skip snapshot when no sink" optimization is moot now the production
+  wrapper always consumes).
