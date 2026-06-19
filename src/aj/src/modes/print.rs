@@ -397,18 +397,16 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 /// Build a [`Listener`] that writes each event as one JSONL line on
-/// stdout. The listener is synchronous (`listener_from_sync`); the
-/// bus awaits it inline so events appear in stdout in the same order
+/// stdout. The listener is synchronous (`listener_from_sync`), and the
+/// bus awaits it inline, so events appear in stdout in the same order
 /// the agent emits them.
 ///
-/// A serialization or write failure prints a one-line warning to
-/// stderr and skips the offending event. We deliberately do **not**
-/// fail the run on a stdout write error: today's deferred
-/// `MessageStart`/`MessageUpdate`/`MessageEnd` variants are
-/// `#[serde(skip)]` (see `aj-agent/src/events.rs`), so a future event
-/// emit those would otherwise abort the whole prompt with a confusing
-/// "variant cannot be serialized" message. Logging and continuing
-/// keeps the run alive while making the gap visible.
+/// Every `AgentEvent` the agent emits is serializable (see
+/// `aj-agent/src/events.rs`), so serialization is not expected to fail.
+/// We still log-and-continue rather than abort the run on a write or
+/// serialize error: a downstream consumer that hangs up (broken pipe),
+/// or some future non-serializable payload, should surface as a stderr
+/// warning and a visible gap, not kill the whole prompt.
 fn json_event_listener() -> Listener {
     listener_from_sync(move |event: &AgentEvent| {
         // `ToolExecutionUpdate` is a high-frequency (~10/s) transient
@@ -426,8 +424,8 @@ fn json_event_listener() -> Listener {
                 }
             }
             Err(e) => {
-                // The skipped variants land here. Surface enough
-                // detail to debug but don't kill the run.
+                // A non-serializable payload would land here. Surface
+                // enough detail to debug but don't kill the run.
                 eprintln!("aj: failed to serialize event: {e}");
             }
         }
