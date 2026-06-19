@@ -11,22 +11,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Format code: `cargo fmt`
 - Lint: `cargo clippy --workspace --all-targets`
 
+The workspace enables strict custom lints (see `[workspace.lints]` in
+`Cargo.toml`), so run `cargo fmt` and `cargo check` before reporting a
+change done, and `cargo clippy` for anything non-trivial.
+
 ## Architecture
 
 AJ is an AI-driven agent for software engineering. The agent follows a
 minimal loop pattern, focusing on providing the right set of builtin tools
 rather than complex scaffolding.
 
-The workspace is split along the dependency graph from
-`docs/aj-next-plan.md`:
-
-```
-aj-models  ←  aj-agent  ←  aj-tools
-                ↑              ↑
-                └─  aj-session  ─┘
-                        ↑
-                        aj
-```
+The workspace splits into focused crates (run `cargo tree` for the
+exact dependency edges):
 
 - `aj-models` — wire layer: provider SDKs, unified `Message` /
   `AssistantMessage` / streaming types, model registry.
@@ -34,7 +30,10 @@ aj-models  ←  aj-agent  ←  aj-tools
   tool trait, `ToolDetails` for structured tool rendering, and the
   `TaskRegistry` for background tasks (detached bash commands and
   sub-agent runs that outlive their turn).
-- `aj-session` — on-disk thread format, `ConversationLog`, replay.
+- `aj-session` — on-disk session format, `ConversationLog`, replay. The
+  user-facing surface (CLI, storage) says "session"; internally a
+  session's `ConversationLog` holds threads and branches, so both terms
+  are intentional.
 - `aj-tools` — the builtin tool implementations.
 - `aj-tui` — in-process text-UI framework (layout, components, theming).
 - `aj-conf` — `~/.aj/config.toml` loader and path helpers.
@@ -61,7 +60,7 @@ Persistent state lives under `~/.aj/`:
   `.aj/`/`.agents/`/`.claude/` `skills/` dirs up to the git root.
 - `themes/<name>.json` — optional user themes layered on top of the
   bundled `dark` / `light` palettes. Hot-reloads on file changes.
-- `threads/<project>/` — JSONL conversation logs, one file per thread.
+- `sessions/<project>/` — JSONL conversation logs, one file per session.
 
 Model selection precedence (highest to lowest): CLI flags
 (`--model-api`, `--model-url`, `--model-name`) → env vars (`MODEL_API`,
@@ -76,8 +75,6 @@ commit secrets.
 - Merge imports from same module, don't merge different modules.
 - Error handling: Use `thiserror` for defining error types in library crates. `anyhow` is acceptable for top-level application error propagation.
 - Follow clippy/rustfmt (enforced with strict workspace lints).
-- `snake_case` for functions/variables, `PascalCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
-- Use proper capitalization and punctuation when writing docstrings or comments.
 
 ## Testing
 
