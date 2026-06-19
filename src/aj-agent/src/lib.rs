@@ -449,6 +449,16 @@ impl Agent {
         &self.transcript
     }
 
+    /// This agent's identity on the event bus (`Main` or `Sub(n)`).
+    ///
+    /// Hosts use it to stamp out-of-band events they emit on the
+    /// agent's behalf (e.g. a turn-driver notice) with the same
+    /// `agent_id` the agent's own events carry, so the renderer routes
+    /// them to the right transcript.
+    pub fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
     /// The terminal assistant message of the most recent inference
     /// (success, error, or abort), or `None` before the first turn.
     ///
@@ -1191,19 +1201,15 @@ impl Agent {
                     }
                     let retry_sleep = retry_strategy.as_mut().expect("known to be some").next();
                     if let Some(retry_sleep) = retry_sleep {
+                        // The failed attempt's error already travels on
+                        // its `MessageEnd` (`AssistantMessage.error`). We
+                        // emit only the retry cadence here so a renderer
+                        // can show a "retrying…" indicator without
+                        // duplicating that error.
                         let err_text = assistant_err
                             .as_ref()
                             .map(|e| e.message.clone())
                             .unwrap_or_else(|| "model stream failed".to_string());
-                        let message =
-                            format!("{err_text}, retrying in {}s...", retry_sleep.as_secs(),);
-                        self.bus
-                            .emit(AgentEvent::Error {
-                                agent_id: self.agent_id,
-                                text: message,
-                            })
-                            .await
-                            .map_err(TurnError::Fatal)?;
                         retry_attempt = retry_attempt.saturating_add(1);
                         self.bus
                             .emit(AgentEvent::StreamRetry {

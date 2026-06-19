@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use aj_agent::events::CompactionReason;
+use aj_agent::events::{AgentEvent, CompactionReason};
 use aj_agent::{Agent, TurnError};
 use aj_models::errors::is_context_overflow;
 use aj_models::types::UserContent;
@@ -124,6 +124,17 @@ pub async fn drive_turn(
             && last_turn_overflowed(agent)
         {
             if overflow_recovered {
+                // The raw overflow error already rendered in transcript
+                // order from the turn's terminal `MessageEnd`. Surface
+                // the actionable give-up guidance on the bus too, in
+                // order, so the interactive transcript shows it. The
+                // returned (wrapped) error keeps the same guidance for
+                // print mode's stderr path.
+                let warning = AgentEvent::Warning {
+                    agent_id: agent.agent_id(),
+                    text: OVERFLOW_GIVEUP.to_string(),
+                };
+                let _ = agent.emit_event(warning).await;
                 return result.map_err(wrap_overflow_giveup);
             }
             overflow_recovered = true;
@@ -209,13 +220,17 @@ fn wrap_overflow_giveup(err: TurnError) -> TurnError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use aj_agent::TurnError;
+    use aj_agent::bus::listener_from_sync;
+    use aj_agent::events::AgentEvent;
     use aj_models::types::{AssistantContent, AssistantMessage};
     use aj_session::ConversationPersistence;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{TurnPolicy, TurnStart, drive_turn};
+    use super::{OVERFLOW_GIVEUP, TurnPolicy, TurnStart, drive_turn};
     use crate::modes::interactive::test_support::{
         build_test_world, create_spec, finalized_text_message, finalized_text_message_with_usage,
         scripted_run_config, scripted_run_config_with_window,
@@ -331,6 +346,47 @@ mod tests {
             }
             other => panic!("expected wrapped recoverable give-up, got {other:?}"),
         }
+    }
+
+    /// On a repeat-overflow give-up the driver emits the actionable
+    /// guidance as a `Warning` on the bus, so it renders in transcript
+    /// order alongside the in-band overflow error (which travels on its
+    /// own `MessageEnd`).
+    #[tokio::test]
+    async fn overflow_giveup_emits_guidance_warning() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config =
+            scripted_run_config(vec![overflow_error_message(), overflow_error_message()]);
+        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
+
+        let mut agent = world.agent.lock().await;
+
+        let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&warnings);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::Warning { text, .. } = event {
+                recorded.lock().unwrap().push(text.clone());
+            }
+        }));
+
+        let policy = recover_policy();
+        let result = drive_turn(
+            &mut agent,
+            &world.log,
+            &policy,
+            TurnStart::Prompt("hi".into()),
+            |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(TurnError::Recoverable(_))));
+
+        let warnings = warnings.lock().unwrap();
+        assert!(
+            warnings.iter().any(|w| w == OVERFLOW_GIVEUP),
+            "give-up guidance should be emitted as a Warning, got: {warnings:?}",
+        );
     }
 
     /// With `recover_overflow` disabled, an overflow surfaces raw — no

@@ -1005,19 +1005,17 @@ async fn run_session(
                                 // alive.
                                 world.pump.handle(&mut shell.tui, &notice_event("Turn cancelled."));
                             }
-                            Err(TurnError::Recoverable(err)) => {
-                                // The driver already exhausted overflow
-                                // recovery (folding the give-up message
-                                // into the error chain) before handing
-                                // this back, so surface it and keep the
-                                // session going.
-                                world.pump.handle(
-                                    &mut shell.tui,
-                                    &AgentEvent::Error {
-                                        agent_id: id,
-                                        text: format!("agent error: {err:#}"),
-                                    },
-                                );
+                            Err(TurnError::Recoverable(_)) => {
+                                // A recoverable failure already rendered
+                                // in transcript order from the turn's
+                                // terminal `MessageEnd`
+                                // (`AssistantMessage.error`). For an
+                                // overflow give-up the driver also emitted
+                                // its guidance on the bus. Re-rendering the
+                                // error here would float it above events
+                                // still buffered in the event channel, so
+                                // we only keep the session alive and let
+                                // the in-band error stand.
                             }
                             Err(TurnError::Fatal(err)) => {
                                 break Err(err);

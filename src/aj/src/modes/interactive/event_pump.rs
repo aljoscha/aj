@@ -34,7 +34,7 @@ use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskId, TaskKind, TaskStatus};
 use aj_agent::types::TokenUsage;
 use aj_models::registry::ModelInfo;
 use aj_models::streaming::AssistantMessageEvent;
-use aj_models::types::{AssistantContent, Message, UserContent};
+use aj_models::types::{AssistantContent, ErrorCategory, Message, StopReason, UserContent};
 use aj_tui::components::editor::Editor;
 use aj_tui::components::spacer::Spacer;
 use aj_tui::components::text::Text;
@@ -634,10 +634,13 @@ impl EventPump {
                 agent_id,
                 attempt,
                 delay,
-                error,
+                ..
             } => {
+                // The failed attempt's error already rendered in-band
+                // from its `MessageEnd`, so this line carries only the
+                // retry cadence.
                 let msg = format!(
-                    "Retrying inference (attempt {attempt}, in {}ms): {error}",
+                    "Retrying inference (attempt {attempt}, in {}ms)…",
                     delay.as_millis()
                 );
                 self.append_styled_notice(tui, *agent_id, &msg, aj_tui::style::yellow);
@@ -1099,6 +1102,33 @@ impl EventPump {
                 }
                 if let Some(state) = self.agents.get_mut(&agent_id) {
                     state.current_assistant = None;
+                }
+                // A failed turn carries its error in-band on the
+                // finalized assistant message. We render it here, on
+                // `MessageEnd`, so it lands in transcript order right
+                // after the turn's partial content and tool calls
+                // rather than out-of-band from the turn's return value.
+                //
+                // Cancellations are confirmed on the turn-completion
+                // path (a cancel can return without an in-band aborted
+                // `MessageEnd`), so we skip every abort shape here to
+                // avoid a duplicate notice.
+                let is_abort = matches!(a.stop_reason, StopReason::Aborted)
+                    || a.error
+                        .as_ref()
+                        .is_some_and(|e| e.category == ErrorCategory::Aborted);
+                if !is_abort {
+                    if let Some(err) = &a.error {
+                        let line = format!("Error: {}", err.message);
+                        self.append_styled_notice(tui, agent_id, &line, aj_tui::style::red);
+                    } else if matches!(a.stop_reason, StopReason::Error) {
+                        self.append_styled_notice(
+                            tui,
+                            agent_id,
+                            "Error: the model stream failed",
+                            aj_tui::style::red,
+                        );
+                    }
                 }
             }
             AgentMessageKind::Wire(Message::ToolResult(_)) => {
@@ -2305,6 +2335,193 @@ mod tests {
         assert!(
             joined.contains("\x1b[2m"),
             "row should be wrapped in the dim ANSI escape",
+        );
+    }
+
+    /// Number of children currently in the main agent's transcript
+    /// container.
+    fn chat_child_count(tui: &mut aj_tui::tui::Tui) -> usize {
+        tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut()
+            .len()
+    }
+
+    /// Build an `AgentEvent::MessageEnd` for an assistant turn that
+    /// terminated with `error` and `stop`.
+    fn errored_assistant_message_end(
+        category: ErrorCategory,
+        message: &str,
+        stop: StopReason,
+    ) -> AgentEvent {
+        let mut m = empty_assistant_partial();
+        m.stop_reason = stop;
+        m.error = Some(aj_models::types::AssistantError::new(category, message));
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::Assistant(m)),
+        }
+    }
+
+    #[test]
+    fn terminal_error_message_end_appends_inband_error_row() {
+        // A non-retryable failure (e.g. missing credentials) carries
+        // its detail on the finalized assistant message. The pump
+        // renders it in-band from `MessageEnd` so it lands in
+        // transcript order rather than out-of-band from the turn's
+        // return value.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let before = chat_child_count(&mut tui);
+        pump.handle(
+            &mut tui,
+            &errored_assistant_message_end(
+                ErrorCategory::Auth,
+                "anthropic provider: no credentials for provider \"anthropic\"",
+                StopReason::Error,
+            ),
+        );
+        assert_eq!(
+            chat_child_count(&mut tui),
+            before + 1,
+            "errored MessageEnd should append exactly one chat row",
+        );
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
+        let row = chat
+            .get_mut_as::<aj_tui::components::text::Text>(before)
+            .expect("appended row should be a Text component");
+        let joined = row.render(120).join("\n");
+        assert!(
+            joined.contains("Error: anthropic provider: no credentials"),
+            "row should carry the in-band error, got: {joined:?}",
+        );
+    }
+
+    #[test]
+    fn aborted_message_end_does_not_append_error_row() {
+        // Cancellations are confirmed on the turn-completion path, not
+        // from the message stream, so an aborted `MessageEnd` must not
+        // append an error row (that would duplicate the cancel notice).
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let before = chat_child_count(&mut tui);
+        pump.handle(
+            &mut tui,
+            &errored_assistant_message_end(
+                ErrorCategory::Aborted,
+                "turn aborted by client",
+                StopReason::Aborted,
+            ),
+        );
+        assert_eq!(
+            chat_child_count(&mut tui),
+            before,
+            "aborted MessageEnd must not append an error row",
+        );
+    }
+
+    #[test]
+    fn terminal_error_renders_after_preceding_turn_events() {
+        // The bug this fix targets: the error used to render out of
+        // band, ahead of events still buffered in the channel. Driving
+        // it from `MessageEnd` keeps it in arrival order, so a preceding
+        // turn event (here a usage row) stays above the error row.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        pump.handle(
+            &mut tui,
+            &AgentEvent::TurnUsage {
+                agent_id: AgentId::Main,
+                usage: token_usage([10, 5, 0, 0], [0, 0, 0, 0]),
+            },
+        );
+        let after_usage = chat_child_count(&mut tui);
+        pump.handle(
+            &mut tui,
+            &errored_assistant_message_end(
+                ErrorCategory::Auth,
+                "no credentials",
+                StopReason::Error,
+            ),
+        );
+        let total = chat_child_count(&mut tui);
+        assert!(
+            total > after_usage,
+            "error should append a row after the usage row",
+        );
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
+        let last = chat
+            .get_mut_as::<aj_tui::components::text::Text>(total - 1)
+            .expect("last child should be the error Text row");
+        let joined = last.render(120).join("\n");
+        assert!(
+            joined.contains("Error: no credentials"),
+            "error row should land last, after the usage row, got: {joined:?}",
+        );
+    }
+
+    #[test]
+    fn retryable_terminal_error_renders_in_band() {
+        // Retry exhaustion surfaces as a `Recoverable` whose last
+        // `MessageEnd` carries a retryable category. Rendering keys off
+        // "any non-abort error", not retryable-vs-not, so the exhausted
+        // attempt's error still shows.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let before = chat_child_count(&mut tui);
+        pump.handle(
+            &mut tui,
+            &errored_assistant_message_end(
+                ErrorCategory::Transient,
+                "stream ended without a terminal event",
+                StopReason::Error,
+            ),
+        );
+        assert_eq!(chat_child_count(&mut tui), before + 1);
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
+        let row = chat
+            .get_mut_as::<aj_tui::components::text::Text>(before)
+            .expect("appended row should be a Text component");
+        assert!(
+            row.render(120).join("\n").contains("Error: stream ended"),
+            "retryable terminal error should render in-band",
+        );
+    }
+
+    #[test]
+    fn errored_stop_without_detail_renders_generic_line() {
+        // A stream that ends in `Error` without an `AssistantError`
+        // detail still gets a generic in-band line rather than
+        // rendering nothing.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let before = chat_child_count(&mut tui);
+        let mut m = empty_assistant_partial();
+        m.stop_reason = StopReason::Error;
+        m.error = None;
+        pump.handle(
+            &mut tui,
+            &AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::Assistant(m)),
+            },
+        );
+        assert_eq!(chat_child_count(&mut tui), before + 1);
+        let chat = tui
+            .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+            .expect("chat slot")
+            .container_mut();
+        let row = chat
+            .get_mut_as::<aj_tui::components::text::Text>(before)
+            .expect("appended row should be a Text component");
+        assert!(
+            row.render(120)
+                .join("\n")
+                .contains("Error: the model stream failed"),
         );
     }
 
