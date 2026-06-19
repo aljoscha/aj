@@ -23,6 +23,13 @@
 //!   `codex_cli_simplified_flow=true`, and a caller-chosen
 //!   `originator` identifier are required for the simplified Codex
 //!   CLI flow.
+//!
+//! The local callback server, manual-paste parsing, and token-endpoint
+//! plumbing are shared with the Anthropic flow via [`super::callback`],
+//! [`super::paste`], and [`super::token`]; only the endpoint constants,
+//! the form token-body shape, the random-state policy, and
+//! [`token_to_credentials`] (with its JWT account-id extraction) are
+//! OpenAI-specific.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -30,15 +37,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Utc;
 use rand::TryRngCore;
 use reqwest::Client;
-use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
-use super::page::{error_page, success_page};
+use super::callback::{CallbackConfig, await_callback};
+use super::paste::parse_authorization_input;
 use super::pkce::generate_pkce;
+use super::token::{
+    REFRESH_SAFETY_MARGIN_MS, REQUEST_TIMEOUT_SECS, TokenResponse, now_unix_ms, send_token_request,
+};
 use super::{OAuthAuthInfo, OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
 
 // ---------------------------------------------------------------------------
@@ -75,6 +83,10 @@ const CALLBACK_PATH: &str = "/auth/callback";
 /// requests. Must be exactly the value registered upstream.
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
+/// Provider word shown on the local callback server's success/error
+/// pages.
+const PROVIDER_NAME: &str = "OpenAI";
+
 /// Scope string requested at authorize time. The Codex CLI flow
 /// expects exactly this set; trimming or extending it causes the
 /// upstream to either refuse or downgrade.
@@ -89,22 +101,6 @@ const JWT_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 /// authorize request. Can be overridden on the provider so embedders
 /// can identify themselves separately if they want to.
 const DEFAULT_ORIGINATOR: &str = "aj";
-
-/// Bound on every HTTP call we make. Long enough to cover the
-/// network round-trip even on slow connections, short enough that a
-/// hung server doesn't strand the user staring at a blinking cursor.
-const REQUEST_TIMEOUT_SECS: u64 = 30;
-
-/// Refresh tokens this many milliseconds before the upstream
-/// `expires_in` would otherwise lapse. Guards against clock skew
-/// between our machine and the auth server, and against slow
-/// network calls during which the token would expire mid-request.
-const REFRESH_SAFETY_MARGIN_MS: i64 = 5 * 60 * 1000;
-
-/// Cap on how much HTTP request data we'll buffer while reading the
-/// callback's request line and headers. The browser sends a single
-/// short GET; anything larger is malformed.
-const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 
 /// Length, in bytes, of the random `state` value. 16 bytes (128 bits)
 /// is well above the threshold needed for CSRF protection.
@@ -274,10 +270,14 @@ async fn obtain_code(
     listener: TcpListener,
     expected_state: &str,
 ) -> Result<String, OAuthError> {
+    let config = CallbackConfig {
+        path: CALLBACK_PATH,
+        provider_name: PROVIDER_NAME,
+    };
     let mut code: Option<String> = None;
 
     if callbacks.supports_manual_code_input() {
-        let server_fut = await_callback(listener, expected_state);
+        let server_fut = await_callback(listener, expected_state, &config);
         tokio::pin!(server_fut);
         tokio::select! {
             biased;
@@ -302,7 +302,7 @@ async fn obtain_code(
             }
         }
     } else {
-        code = Some(await_callback(listener, expected_state).await?);
+        code = Some(await_callback(listener, expected_state, &config).await?);
     }
 
     if code.is_none() {
@@ -322,192 +322,7 @@ async fn obtain_code(
 }
 
 // ---------------------------------------------------------------------------
-// Local callback server
-// ---------------------------------------------------------------------------
-
-/// Accept connections on `listener` until one of them carries a
-/// valid OAuth callback. Connections that hit the wrong route, are
-/// missing parameters, or fail the state check are answered with an
-/// HTTP error and the loop continues — those are either stale
-/// browser tabs or misrouted requests, not the callback we care
-/// about.
-async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<String, OAuthError> {
-    loop {
-        let (mut stream, _) = listener
-            .accept()
-            .await
-            .map_err(|e| OAuthError::Other(format!("accept: {e}")))?;
-        match handle_callback_connection(&mut stream, expected_state).await? {
-            Some(code) => return Ok(code),
-            None => continue,
-        }
-    }
-}
-
-/// Service a single TCP connection from the upstream server's
-/// browser redirect. Returns `Ok(Some(code))` on success,
-/// `Ok(None)` for noise (wrong path, malformed request, state
-/// mismatch — write a 4xx and let the caller keep listening), or
-/// `Err(...)` for fatal errors (the upstream returned an `error=`
-/// param, indicating the user denied the flow or the server failed).
-async fn handle_callback_connection(
-    stream: &mut TcpStream,
-    expected_state: &str,
-) -> Result<Option<String>, OAuthError> {
-    let head = match read_http_request_head(stream).await {
-        Ok(h) => h,
-        Err(_) => return Ok(None),
-    };
-
-    let request_line = head.split("\r\n").next().unwrap_or("");
-    let path_and_query = request_line.split(' ').nth(1).unwrap_or("");
-
-    let parsed = match parse_callback_request(path_and_query) {
-        Some(p) => p,
-        None => {
-            let _ = write_response(stream, 400, &error_page("Invalid request.", None)).await;
-            return Ok(None);
-        }
-    };
-
-    if parsed.path != CALLBACK_PATH {
-        let _ = write_response(stream, 404, &error_page("Callback route not found.", None)).await;
-        return Ok(None);
-    }
-
-    if let Some(err) = parsed.error {
-        let detail = format!("Error: {err}");
-        let _ = write_response(
-            stream,
-            400,
-            &error_page("OpenAI authentication did not complete.", Some(&detail)),
-        )
-        .await;
-        return Err(OAuthError::Authorization(err));
-    }
-
-    let (code, state) = match (parsed.code, parsed.state) {
-        (Some(c), Some(s)) => (c, s),
-        _ => {
-            let _ = write_response(
-                stream,
-                400,
-                &error_page("Missing code or state parameter.", None),
-            )
-            .await;
-            return Ok(None);
-        }
-    };
-
-    if state != expected_state {
-        // Don't surface state mismatches as fatal — a stale browser
-        // tab from a previous attempt could legitimately hit us with
-        // an old state. Reject it and keep listening for the real
-        // callback.
-        let _ = write_response(stream, 400, &error_page("State mismatch.", None)).await;
-        return Ok(None);
-    }
-
-    let _ = write_response(
-        stream,
-        200,
-        &success_page("OpenAI authentication completed. You can close this window."),
-    )
-    .await;
-    Ok(Some(code))
-}
-
-/// Read bytes from the stream until we see the HTTP head terminator
-/// (`\r\n\r\n`) or hit our size cap. We deliberately ignore the
-/// request body — the browser sends a GET with no body, and the
-/// OAuth callback only ever uses query parameters.
-async fn read_http_request_head(stream: &mut TcpStream) -> std::io::Result<String> {
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if find_subsequence(&buf, b"\r\n\r\n").is_some() {
-            break;
-        }
-        if buf.len() >= MAX_REQUEST_HEAD_BYTES {
-            break;
-        }
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// Find a subsequence in a byte slice. Used to detect the end of
-/// the HTTP head; pulled out for readability.
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Send a minimal HTTP/1.1 response with the supplied status code
-/// and body, then close the connection. Errors are intentionally
-/// ignored — by the time we're writing, we already know whether the
-/// callback was good; a write failure is a network blip we can't do
-/// anything useful with.
-async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Error",
-    };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n{body}",
-        len = body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await?;
-    Ok(())
-}
-
-/// Parsed callback request. Either `code`+`state` are populated (the
-/// happy path), or `error` is populated (the upstream rejected the
-/// request), or none of them are populated (an unrelated GET hit
-/// our port and we should keep waiting).
-struct CallbackParams {
-    path: String,
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
-}
-
-/// Parse the `path?query` portion of an HTTP request line into a
-/// [`CallbackParams`]. Returns `None` for genuinely malformed input;
-/// missing query parameters are represented as `None` fields.
-fn parse_callback_request(path_and_query: &str) -> Option<CallbackParams> {
-    let url = reqwest::Url::parse(&format!("http://localhost{path_and_query}")).ok()?;
-    let mut code = None;
-    let mut state = None;
-    let mut error = None;
-    for (k, v) in url.query_pairs() {
-        match k.as_ref() {
-            "code" => code = Some(v.into_owned()),
-            "state" => state = Some(v.into_owned()),
-            "error" => error = Some(v.into_owned()),
-            _ => {}
-        }
-    }
-    Some(CallbackParams {
-        path: url.path().to_string(),
-        code,
-        state,
-        error,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// URL construction & input parsing
+// URL construction & state
 // ---------------------------------------------------------------------------
 
 /// Build the authorize URL the user opens in their browser. All
@@ -544,102 +359,9 @@ fn generate_state() -> Result<String, OAuthError> {
     Ok(hex)
 }
 
-/// Result of parsing user-pasted manual input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedAuth {
-    code: Option<String>,
-    state: Option<String>,
-}
-
-/// Parse a string the user pasted in response to the manual-code
-/// prompt. Tolerates four common shapes:
-///
-/// - A full redirect URL (`http://localhost:1455/auth/callback?code=X&state=Y`)
-/// - The `code=X&state=Y` query fragment alone
-/// - The `code#state` shorthand the upstream sometimes presents
-/// - A bare authorization code (no state)
-///
-/// Empty input returns both fields as `None` so the caller can fall
-/// through to the prompt fallback.
-fn parse_authorization_input(input: &str) -> ParsedAuth {
-    let value = input.trim();
-    if value.is_empty() {
-        return ParsedAuth {
-            code: None,
-            state: None,
-        };
-    }
-
-    // Full URL form.
-    if let Ok(url) = reqwest::Url::parse(value) {
-        let mut code = None;
-        let mut state = None;
-        for (k, v) in url.query_pairs() {
-            match k.as_ref() {
-                "code" => code = Some(v.into_owned()),
-                "state" => state = Some(v.into_owned()),
-                _ => {}
-            }
-        }
-        if code.is_some() || state.is_some() {
-            return ParsedAuth { code, state };
-        }
-    }
-
-    // `code#state` shorthand.
-    if let Some((code, state)) = value.split_once('#')
-        && !code.is_empty()
-        && !state.is_empty()
-    {
-        return ParsedAuth {
-            code: Some(code.to_string()),
-            state: Some(state.to_string()),
-        };
-    }
-
-    // Bare query string. We re-parse via `reqwest::Url` so percent
-    // decoding and `+` handling match the URL form above.
-    if value.contains("code=")
-        && let Ok(url) = reqwest::Url::parse(&format!("http://localhost?{value}"))
-    {
-        let mut code = None;
-        let mut state = None;
-        for (k, v) in url.query_pairs() {
-            match k.as_ref() {
-                "code" => code = Some(v.into_owned()),
-                "state" => state = Some(v.into_owned()),
-                _ => {}
-            }
-        }
-        if code.is_some() {
-            return ParsedAuth { code, state };
-        }
-    }
-
-    // Bare code, no state.
-    ParsedAuth {
-        code: Some(value.to_string()),
-        state: None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Token exchange
 // ---------------------------------------------------------------------------
-
-/// Wire shape of a successful token-exchange response. Fields not
-/// listed here (`token_type`, `id_token`, `scope`, ...) are ignored —
-/// we don't use them, and ignoring them silently keeps us
-/// forward-compatible with future upstream additions.
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
-    /// Lifetime in seconds. We convert this into an absolute
-    /// timestamp at parse time so callers don't have to remember it
-    /// was relative.
-    expires_in: i64,
-}
 
 /// Exchange an authorization code for credentials. Used by
 /// [`login_with`] after the callback or manual-input path produced a
@@ -660,42 +382,21 @@ async fn exchange_authorization_code(
     post_token_request(client, token_url, &body).await
 }
 
-/// Shared core of the two token-endpoint POSTs (`authorization_code`
-/// and `refresh_token`): both endpoints take a form-encoded body and
-/// return the same response shape. The returned credentials carry
-/// the ChatGPT account id in the `extra` map under [`ACCOUNT_ID_FIELD`].
+/// OpenAI's token-endpoint POST: a form-encoded body for both the
+/// `authorization_code` and `refresh_token` grants. The send /
+/// status / redaction handling is shared via [`send_token_request`];
+/// the returned credentials carry the ChatGPT account id in the
+/// `extra` map under [`ACCOUNT_ID_FIELD`].
 async fn post_token_request(
     client: &Client,
     token_url: &str,
     body: &[(&str, &str)],
 ) -> Result<OAuthCredentials, OAuthError> {
-    let resp = client
+    let request = client
         .post(token_url)
         .header("Accept", "application/json")
-        .form(body)
-        .send()
-        .await
-        .map_err(|e| OAuthError::Http(format!("{token_url}: {e}")))?;
-
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| OAuthError::Http(format!("read body: {e}")))?;
-
-    if !status.is_success() {
-        return Err(OAuthError::Server {
-            status: status.as_u16(),
-            body: text,
-        });
-    }
-
-    let token: TokenResponse = serde_json::from_str(&text).map_err(|e| {
-        OAuthError::Parse(format!(
-            "token response: {e}; body={}",
-            crate::oauth::redacted_body_summary(&text)
-        ))
-    })?;
+        .form(body);
+    let token = send_token_request(request, token_url).await?;
     token_to_credentials(token)
 }
 
@@ -753,29 +454,19 @@ pub(crate) fn extract_account_id(access_token: &str) -> Option<String> {
     Some(id.to_string())
 }
 
-/// Current unix time in milliseconds, expressed as an `i64` to match
-/// the persisted format in [`OAuthCredentials::expires`].
-fn now_unix_ms() -> i64 {
-    Utc::now().timestamp_millis()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use tokio::io::AsyncWriteExt as _;
-    use tokio::net::TcpStream;
-    use tokio::sync::Mutex;
 
     use super::*;
+    use crate::oauth::test_support::MockTokenServer;
 
     /// Build a JWT-shaped string with the given JSON payload. The
     /// header and signature segments are fixed dummies — the
@@ -793,33 +484,6 @@ mod tests {
         make_jwt(&serde_json::json!({
             JWT_CLAIM_NAMESPACE: { "chatgpt_account_id": account }
         }))
-    }
-
-    /// `parse_authorization_input` must accept all four supported
-    /// input shapes and return the right combination of fields. The
-    /// four cases live in one test so the contract is easy to read.
-    #[test]
-    fn parse_authorization_input_handles_all_shapes() {
-        let parsed =
-            parse_authorization_input("http://localhost:1455/auth/callback?code=ABC&state=DEF");
-        assert_eq!(parsed.code.as_deref(), Some("ABC"));
-        assert_eq!(parsed.state.as_deref(), Some("DEF"));
-
-        let parsed = parse_authorization_input("code=ABC&state=DEF");
-        assert_eq!(parsed.code.as_deref(), Some("ABC"));
-        assert_eq!(parsed.state.as_deref(), Some("DEF"));
-
-        let parsed = parse_authorization_input("ABC#DEF");
-        assert_eq!(parsed.code.as_deref(), Some("ABC"));
-        assert_eq!(parsed.state.as_deref(), Some("DEF"));
-
-        let parsed = parse_authorization_input("ABC123");
-        assert_eq!(parsed.code.as_deref(), Some("ABC123"));
-        assert!(parsed.state.is_none());
-
-        let parsed = parse_authorization_input("   ");
-        assert!(parsed.code.is_none());
-        assert!(parsed.state.is_none());
     }
 
     /// Authorize URL must contain every parameter OpenAI's server
@@ -862,23 +526,6 @@ mod tests {
             Some("true")
         );
         assert_eq!(pairs.get("originator").map(String::as_str), Some("aj"));
-    }
-
-    /// `parse_callback_request` should split the path from the query
-    /// and surface the three OAuth-relevant params, ignoring others.
-    #[test]
-    fn parse_callback_request_extracts_known_params() {
-        let parsed = parse_callback_request("/auth/callback?code=A&state=B&extra=C")
-            .expect("valid path parses");
-        assert_eq!(parsed.path, "/auth/callback");
-        assert_eq!(parsed.code.as_deref(), Some("A"));
-        assert_eq!(parsed.state.as_deref(), Some("B"));
-        assert!(parsed.error.is_none());
-
-        let parsed =
-            parse_callback_request("/auth/callback?error=access_denied").expect("error parses");
-        assert_eq!(parsed.error.as_deref(), Some("access_denied"));
-        assert!(parsed.code.is_none());
     }
 
     /// `extract_account_id` must read the `chatgpt_account_id` claim
@@ -1138,89 +785,6 @@ mod tests {
         );
     }
 
-    /// Drive the local callback server end-to-end: bind on a random
-    /// port, run a synthetic browser GET to the OpenAI-style
-    /// `/auth/callback` route, and verify the returned code plus
-    /// the success HTML.
-    #[tokio::test]
-    async fn callback_server_accepts_valid_redirect() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = tokio::spawn(async move { await_callback(listener, "STATE").await });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let response = send_get(port, "/auth/callback?code=THE-CODE&state=STATE").await;
-        assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains("Authentication successful"));
-
-        let code = server.await.unwrap().expect("callback should succeed");
-        assert_eq!(code, "THE-CODE");
-    }
-
-    /// Wrong-path requests (including the Anthropic-style `/callback`
-    /// route, which would be a likely mistype) get a 404 and the
-    /// listener keeps waiting until a real `/auth/callback` arrives.
-    #[tokio::test]
-    async fn callback_server_ignores_wrong_path() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = tokio::spawn(async move { await_callback(listener, "STATE").await });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let resp1 = send_get(port, "/callback?code=C&state=STATE").await;
-        assert!(resp1.starts_with("HTTP/1.1 404"));
-
-        let resp2 = send_get(port, "/auth/callback?code=C&state=STATE").await;
-        assert!(resp2.starts_with("HTTP/1.1 200"));
-
-        let code = server.await.unwrap().expect("eventually succeeds");
-        assert_eq!(code, "C");
-    }
-
-    /// State mismatches (a stale browser tab from a previous attempt)
-    /// must not be fatal — the listener answers 400 and keeps
-    /// waiting for the real callback.
-    #[tokio::test]
-    async fn callback_server_keeps_waiting_on_state_mismatch() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = tokio::spawn(async move { await_callback(listener, "STATE").await });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let resp1 = send_get(port, "/auth/callback?code=C&state=WRONG").await;
-        assert!(resp1.starts_with("HTTP/1.1 400"));
-
-        let resp2 = send_get(port, "/auth/callback?code=C&state=STATE").await;
-        assert!(resp2.starts_with("HTTP/1.1 200"));
-
-        let code = server.await.unwrap().expect("eventually succeeds");
-        assert_eq!(code, "C");
-    }
-
-    /// Upstream `error=` redirects propagate as
-    /// `OAuthError::Authorization` so the host can show the user
-    /// what went wrong (denied scopes, server downtime, etc.).
-    #[tokio::test]
-    async fn callback_server_propagates_upstream_error() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = tokio::spawn(async move { await_callback(listener, "STATE").await });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let resp = send_get(port, "/auth/callback?error=access_denied").await;
-        assert!(resp.starts_with("HTTP/1.1 400"));
-        assert!(resp.contains("access_denied"));
-
-        match server.await.unwrap() {
-            Err(OAuthError::Authorization(msg)) => assert_eq!(msg, "access_denied"),
-            other => panic!("expected Authorization error, got {other:?}"),
-        }
-    }
-
     /// `OAuthProvider` trait wiring smoke-test: build an
     /// `OpenAIOAuth`, ask for its id/name/flags and use it as a
     /// trait object (the same shape the auth-storage layer needs).
@@ -1264,151 +828,5 @@ mod tests {
             new.extra.get(ACCOUNT_ID_FIELD),
             Some(&serde_json::Value::String("acc-trait".into()))
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Test helpers
-    // -----------------------------------------------------------------------
-
-    /// Send a synthetic GET to the local callback server and return
-    /// the raw response as a `String`.
-    async fn send_get(port: u16, path_and_query: &str) -> String {
-        let mut stream = TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("connect");
-        let req = format!(
-            "GET {path_and_query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(req.as_bytes()).await.expect("write");
-        let mut buf = Vec::new();
-        let _ = stream.read_to_end(&mut buf).await;
-        String::from_utf8_lossy(&buf).into_owned()
-    }
-
-    /// Captured request from the mock token server. We grab both the
-    /// body and the Content-Type so tests can lock the wire format.
-    #[derive(Clone)]
-    struct CapturedRequest {
-        body: String,
-        content_type: Option<String>,
-    }
-
-    /// Tiny HTTP/1.1 server that answers exactly N requests with a
-    /// fixed status + body, capturing each request body and
-    /// Content-Type for later inspection. Just enough machinery to
-    /// round-trip token exchanges in tests without pulling in a
-    /// mocking crate.
-    struct MockTokenServer {
-        url: String,
-        captured: Arc<Mutex<Vec<CapturedRequest>>>,
-        _counter: Arc<AtomicUsize>,
-    }
-
-    impl MockTokenServer {
-        async fn start(response_body: &str, status: u16) -> Self {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let url = format!("http://127.0.0.1:{port}/oauth/token");
-            let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
-            let counter = Arc::new(AtomicUsize::new(0));
-            let response_body = response_body.to_string();
-
-            {
-                let captured = Arc::clone(&captured);
-                let counter = Arc::clone(&counter);
-                tokio::spawn(async move {
-                    loop {
-                        let (mut stream, _) = match listener.accept().await {
-                            Ok(s) => s,
-                            Err(_) => return,
-                        };
-                        let mut buf = Vec::with_capacity(1024);
-                        let mut tmp = [0u8; 1024];
-                        let head_end = loop {
-                            let n = stream.read(&mut tmp).await.unwrap_or(0);
-                            if n == 0 {
-                                break None;
-                            }
-                            buf.extend_from_slice(&tmp[..n]);
-                            if let Some(idx) = find_subsequence(&buf, b"\r\n\r\n") {
-                                break Some(idx + 4);
-                            }
-                        };
-                        let head_end = head_end.unwrap_or(buf.len());
-                        let head_str = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-
-                        let mut content_length: usize = 0;
-                        let mut content_type: Option<String> = None;
-                        for line in head_str.lines() {
-                            let mut parts = line.splitn(2, ':');
-                            let key = match parts.next() {
-                                Some(k) => k.trim(),
-                                None => continue,
-                            };
-                            let val = match parts.next() {
-                                Some(v) => v.trim(),
-                                None => continue,
-                            };
-                            if key.eq_ignore_ascii_case("Content-Length") {
-                                content_length = val.parse().unwrap_or(0);
-                            } else if key.eq_ignore_ascii_case("Content-Type") {
-                                content_type = Some(val.to_string());
-                            }
-                        }
-
-                        while buf.len() - head_end < content_length {
-                            let n = stream.read(&mut tmp).await.unwrap_or(0);
-                            if n == 0 {
-                                break;
-                            }
-                            buf.extend_from_slice(&tmp[..n]);
-                        }
-                        let body =
-                            String::from_utf8_lossy(&buf[head_end..head_end + content_length])
-                                .into_owned();
-                        captured
-                            .lock()
-                            .await
-                            .push(CapturedRequest { body, content_type });
-
-                        let reason = match status {
-                            200 => "OK",
-                            400 => "Bad Request",
-                            _ => "Error",
-                        };
-                        let response = format!(
-                            "HTTP/1.1 {status} {reason}\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {len}\r\n\
-                             Connection: close\r\n\
-                             \r\n{response_body}",
-                            len = response_body.len()
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        let _ = stream.shutdown().await;
-                        counter.fetch_add(1, Ordering::SeqCst);
-                    }
-                });
-            }
-
-            Self {
-                url,
-                captured,
-                _counter: counter,
-            }
-        }
-
-        async fn captured(&self) -> CapturedRequest {
-            for _ in 0..50 {
-                {
-                    let lock = self.captured.lock().await;
-                    if let Some(b) = lock.last() {
-                        return b.clone();
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!("no request was captured by the mock server");
-        }
     }
 }

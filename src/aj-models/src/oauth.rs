@@ -25,6 +25,13 @@ pub mod openai;
 pub mod page;
 pub mod pkce;
 
+mod callback;
+mod paste;
+mod token;
+
+#[cfg(test)]
+mod test_support;
+
 use std::collections::HashMap;
 
 use async_trait::async_trait;
