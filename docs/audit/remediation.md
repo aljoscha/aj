@@ -180,7 +180,7 @@ When presenting a proposal, cover:
 - **Architecture angle:** converge on one list/overlay abstraction in
   `aj-tui` and have all binary selectors use it via callbacks.
 
-### R10 — De-duplicate sibling provider code  [refactor · TODO]
+### R10 — De-duplicate sibling provider code  [refactor · DONE]
 - **Sources:** M5 (Major), M4 (Major); `_SUMMARY` theme 2.
 - **Problem:** anthropic/openai OAuth modules are ~80% identical; OpenAI
   `classify_client_error` is copied three times.
@@ -507,3 +507,35 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   drain, `strip_ansi`, the boundary-navigation chase yield, and every
   migrated selector's existing suite carried over; `fmt`/`clippy`
   clean, full `cargo test --workspace` green (85 binaries).
+- 2026-06-19 · R10 · DONE · a25d599,99da18f · Two-part sibling-provider
+  de-dup, no behavior change. (A) The three OpenAI adapters each carried
+  the same `ClientError → AssistantError` fan-out (Completions/Responses
+  byte-identical, Codex re-spelling all four arms to overlay a friendly
+  429 message). Factored one `crate::openai::errors::classify_client_error`
+  plus a `classify_client_error_with` that lets a caller rewrite a typed
+  `ApiError`'s message (not its category) before classification; Codex's
+  wrapper now passes its overlay through the latter. Put it at the
+  adapter layer, not `crate::errors`, so that module stays free of any
+  `openai-sdk` type (its helpers take decomposed primitives). The
+  Anthropic provider's `classify_client_error` is a genuinely different
+  classifier (different SDK, `classify_anthropic_error`) and stayed out.
+  (B) The Anthropic/OpenAI OAuth modules were ~80% identical. Extracted
+  three private `oauth` submodules — `callback` (the loopback listener
+  loop + request-head reader + response writer + query parsing, behind a
+  `CallbackConfig { path, provider_name }`; `await_callback` returns just
+  the code since both providers already validate `state == expected_state`
+  in the handler, so Anthropic's carried-out state was always
+  `expected_state`), `paste` (`ParsedAuth` + `parse_authorization_input`),
+  and `token` (`TokenResponse`, `send_token_request` as the single home
+  for the non-2xx→`Server` and redacted 2xx-parse-failure handling,
+  `now_unix_ms`, and the timeout/refresh-margin constants with a note
+  relating the margin to the auth lock + request timeouts) — plus a
+  test-only `test_support` with one `MockTokenServer` (the superset
+  capturing body + `Content-Type`) shared by both provider suites. Each
+  provider keeps only its endpoint constants, `build_authorize_url`,
+  state policy, body encoding (JSON vs form), redirect tracking, and
+  `token_to_credentials` (OpenAI's JWT account-id extraction). Net
+  ~-437 lines; moved tests live with the code they exercise. Left the
+  `auth.rs::current_unix_ms` comment nit for the RESIDUAL pass (separate
+  module, outside this seam). `fmt`/`clippy` clean; `cargo test
+  -p aj-models` + `cargo check --workspace` green.
