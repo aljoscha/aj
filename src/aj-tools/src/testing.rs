@@ -70,13 +70,10 @@ impl ToolContext for DummyToolContext {
         &'a mut self,
         _task: String,
         _mode: SpawnMode,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            Err(anyhow::anyhow!(
-                "spawn_agent not supported in DummyToolContext"
-            ))
-        })
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SpawnResult, aj_agent::BoxError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Err("spawn_agent not supported in DummyToolContext".into()) })
     }
 
     fn emit_update<'a>(

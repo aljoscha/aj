@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::TaskRegistry;
 use crate::bus::EventBus;
+use crate::error::BoxError;
 use crate::events::{AgentEvent, AgentId};
 
 // ---------------------------------------------------------------------------
@@ -629,7 +630,7 @@ pub trait ToolDefinition: Send + Sync {
         &self,
         ctx: &mut dyn ToolContext,
         input: Self::Input,
-    ) -> impl Future<Output = anyhow::Result<ToolOutcome>> + Send;
+    ) -> impl Future<Output = Result<ToolOutcome, BoxError>> + Send;
 }
 
 /// Boxed-future signature used by [`ErasedToolDefinition::func`].
@@ -643,7 +644,7 @@ pub type ErasedToolFn = Arc<
             &'a mut dyn ToolContext,
             Value,
         )
-            -> Pin<Box<dyn Future<Output = anyhow::Result<ToolOutcome>> + Send + 'a>>
+            -> Pin<Box<dyn Future<Output = Result<ToolOutcome, BoxError>> + Send + 'a>>
         + Send
         + Sync,
 >;
@@ -721,7 +722,7 @@ pub trait ToolContext: Send {
         &'a mut self,
         task: String,
         mode: SpawnMode,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<SpawnResult, BoxError>> + Send + 'a>>;
 
     /// Emit a partial [`ToolDetails`] snapshot through the bus as a
     /// [`crate::events::AgentEvent::ToolExecutionUpdate`]. Tools that

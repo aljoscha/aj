@@ -4,7 +4,6 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-anyhow = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
@@ -14,6 +13,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 dotenv = { workspace = true }
 tokio = { workspace = true }
 

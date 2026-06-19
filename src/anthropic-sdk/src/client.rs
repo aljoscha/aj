@@ -1,7 +1,6 @@
 use std::pin::Pin;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use reqwest;
@@ -212,41 +211,35 @@ impl Client {
 }
 
 impl Client {
-    pub async fn messages(&self, mut messages: Messages) -> Result<Message, anyhow::Error> {
+    pub async fn messages(&self, mut messages: Messages) -> Result<Message, ClientError> {
         let caller_tool_names = self.prepare_request(&mut messages);
 
         self.debug_log_request(&messages);
         let request_builder = self.build_request().json(&messages);
 
-        let response = request_builder
-            .send()
-            .await
-            .context("failed to send request");
-
-        let response = response?;
+        let response = request_builder.send().await?;
 
         let status = response.status();
         if status.is_success() {
-            let json_text = response
-                .text()
-                .await
-                .context("failed to read response text")?;
-            let mut response: Message = serde_json::from_str(&json_text)?;
+            let json_text = response.text().await?;
+            let mut response: Message = serde_json::from_str(&json_text).map_err(|err| {
+                ClientError::ParseError(format!("could not parse response body: {err}"))
+            })?;
             if !caller_tool_names.is_empty() {
                 reverse_map_message(&mut response, &caller_tool_names);
             }
             return Ok(response);
         }
 
+        let http_status = status.as_u16();
+        let retry_after = retry_after_header(&response);
         let error_text = response.text().await?;
-        if status.is_client_error() || status.is_server_error() {
-            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                Ok(error_response) => Err(anyhow!(error_response.error)),
-                Err(_) => Err(anyhow!("request failed ({status}): {}", error_text)),
-            }
-        } else {
-            Err(anyhow!("unexpected status code ({status}): {}", error_text))
-        }
+        Err(classify_error_response(
+            status,
+            http_status,
+            retry_after,
+            error_text,
+        ))
     }
 
     /// Stream the raw server-sent events from `POST /v1/messages`.
@@ -309,29 +302,14 @@ impl Client {
         // Capture status + Retry-After before consuming the response
         // body — `text()` takes the response by value.
         let http_status = status.as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let retry_after = retry_after_header(&response);
         let error_text = response.text().await?;
-        if status.is_client_error() || status.is_server_error() {
-            let error = match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                Ok(error_response) => error_response.error,
-                Err(_) => ApiError::ApiError {
-                    message: format!("request failed ({status}): {error_text}"),
-                },
-            };
-            Err(ClientError::ApiError {
-                error,
-                http_status,
-                retry_after,
-            })
-        } else {
-            Err(ClientError::InternalError(format!(
-                "unexpected status code ({status}): {error_text}"
-            )))
-        }
+        Err(classify_error_response(
+            status,
+            http_status,
+            retry_after,
+            error_text,
+        ))
     }
 
     /// Fetch plan rate-limit utilization from `GET /api/oauth/usage`.
@@ -380,6 +358,45 @@ impl Client {
             http_status,
             retry_after,
         })
+    }
+}
+
+/// Extract the raw `Retry-After` header value, if present and printable.
+fn retry_after_header(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Map a non-success HTTP response into a [`ClientError`].
+///
+/// `error_text` is the already-read response body. A client/server
+/// error becomes a structured [`ClientError::ApiError`] (with a
+/// synthetic [`ApiError`] when the body isn't the expected shape) and
+/// carries the status plus `Retry-After` for the retry layer. Any other
+/// non-success status maps to [`ClientError::InternalError`].
+fn classify_error_response(
+    status: reqwest::StatusCode,
+    http_status: u16,
+    retry_after: Option<String>,
+    error_text: String,
+) -> ClientError {
+    if status.is_client_error() || status.is_server_error() {
+        let error = match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+            Ok(error_response) => error_response.error,
+            Err(_) => ApiError::ApiError {
+                message: format!("request failed ({status}): {error_text}"),
+            },
+        };
+        ClientError::ApiError {
+            error,
+            http_status,
+            retry_after,
+        }
+    } else {
+        ClientError::InternalError(format!("unexpected status code ({status}): {error_text}"))
     }
 }
 
@@ -508,5 +525,34 @@ mod tests {
             }
             _ => panic!("expected text block"),
         }
+    }
+
+    #[test]
+    fn classify_error_response_structures_a_client_error() {
+        // The non-streaming `messages()` and the streaming path both
+        // route non-2xx responses through this helper, so a structured
+        // error with status + Retry-After is the shared contract.
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        let err = classify_error_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            429,
+            Some("5".to_string()),
+            body.to_string(),
+        );
+        assert_eq!(err.http_status(), Some(429));
+        assert_eq!(err.retry_after(), Some("5"));
+        assert!(err.to_string().contains("slow down"), "got: {err}");
+    }
+
+    #[test]
+    fn classify_error_response_synthesizes_unparseable_body() {
+        let err = classify_error_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            500,
+            None,
+            "upstream boom".to_string(),
+        );
+        assert_eq!(err.http_status(), Some(500));
+        assert!(err.to_string().contains("upstream boom"), "got: {err}");
     }
 }

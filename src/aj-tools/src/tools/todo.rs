@@ -137,7 +137,7 @@ impl ToolDefinition for TodoReadTool {
         &self,
         ctx: &mut dyn ToolContext,
         _input: Self::Input,
-    ) -> anyhow::Result<ToolOutcome> {
+    ) -> Result<ToolOutcome, aj_agent::BoxError> {
         // Snapshot the session's current todo list. The wire content
         // is the text rendering the LLM reads; `details::Todos` is the
         // structured snapshot the UI / persistence consumers use.
@@ -176,7 +176,7 @@ impl ToolDefinition for TodoWriteTool {
         &self,
         ctx: &mut dyn ToolContext,
         input: Self::Input,
-    ) -> anyhow::Result<ToolOutcome> {
+    ) -> Result<ToolOutcome, aj_agent::BoxError> {
         // Validate that there's at most one in-progress item. Returning
         // a recoverable `is_error: true` outcome (instead of bubbling
         // an `Err`) lets the model correct its call without aborting

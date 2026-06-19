@@ -73,7 +73,7 @@ commit secrets.
 - Import grouping: std → external crates (including aj_*) → crate imports.
 - Use absolute paths for crate imports (`crate::` not `super::`).
 - Merge imports from same module, don't merge different modules.
-- Error handling: Use `thiserror` for defining error types in library crates. `anyhow` is acceptable for top-level application error propagation.
+- Error handling: a library boundary exposes a typed error where callers branch on the failure (a `thiserror` enum, e.g. the SDK `ClientError` carrying status + `Retry-After`), and a named opaque error (`Box<dyn std::error::Error + Send + Sync>`, aliased `aj_agent::BoxError`) at render-only seams where the caller only ever displays the cause (tool execution, the event bus, `TurnError`'s `Recoverable`/`Fatal` payloads). Never put `anyhow` in a public library signature. `anyhow` is for top-level application error propagation in the `aj` binary only.
 - Follow clippy/rustfmt (enforced with strict workspace lints).
 
 ## Testing

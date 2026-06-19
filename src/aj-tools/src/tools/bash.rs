@@ -174,7 +174,7 @@ impl ToolDefinition for BashTool {
         &self,
         ctx: &mut dyn ToolContext,
         input: Self::Input,
-    ) -> anyhow::Result<ToolOutcome> {
+    ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let working_dir = ctx.working_directory();
         let cancellation = ctx.cancellation();
         let timeout = Duration::from_secs(input.timeout);
@@ -215,9 +215,9 @@ impl ToolDefinition for BashTool {
         // that reaps the zombie, so this never trips in practice.
         let child_pid: i32 = child
             .id()
-            .ok_or_else(|| anyhow::anyhow!("child PID unavailable after spawn"))?
+            .ok_or("child PID unavailable after spawn")?
             .try_into()
-            .map_err(|e| anyhow::anyhow!("child PID does not fit in i32: {e}"))?;
+            .map_err(|e| format!("child PID does not fit in i32: {e}"))?;
         let stdout = child.stdout.take().expect("stdout was piped above");
         let stderr = child.stderr.take().expect("stderr was piped above");
 
@@ -1183,8 +1183,9 @@ mod tests {
             mode: aj_agent::tool::SpawnMode,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = anyhow::Result<aj_agent::tool::SpawnResult>>
-                    + Send
+                dyn std::future::Future<
+                        Output = Result<aj_agent::tool::SpawnResult, aj_agent::BoxError>,
+                    > + Send
                     + 'a,
             >,
         > {

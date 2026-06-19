@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 anthropic-sdk = { path = "../anthropic-sdk" }
 async-stream.workspace = true
 async-trait = "0.1"

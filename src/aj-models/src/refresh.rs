@@ -14,13 +14,51 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::registry::{
     CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelInfo, apply_override,
     bundled_codex_seed, bundled_overrides, splice_codex_seed, user_cache_path,
 };
+
+/// Failure modes of a catalog refresh.
+///
+/// The two public entry points return this so a caller can tell a
+/// network failure from a non-success status from a parse or write
+/// failure. `Write` carries a context message rather than a typed
+/// source because the write path mixes I/O, serialization, and
+/// temp-file rename errors that the caller only ever renders.
+#[derive(Debug, thiserror::Error)]
+pub enum RefreshError {
+    /// The user cache path couldn't be determined (e.g. `HOME` unset).
+    #[error("could not determine user cache path; HOME env var may be unset")]
+    NoCachePath,
+    /// A catalog source couldn't be fetched (transport, DNS, TLS, or
+    /// reading the response body).
+    #[error("fetching {url}")]
+    Fetch {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    /// A catalog source returned a non-success HTTP status.
+    #[error("{url} returned status {status}: {body}")]
+    Http {
+        url: String,
+        status: u16,
+        body: String,
+    },
+    /// A fetched payload couldn't be parsed as JSON.
+    #[error("{context}")]
+    Parse {
+        context: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Writing the catalog cache to disk failed.
+    #[error("{0}")]
+    Write(String),
+}
 
 /// Upstream catalog endpoint. Public so callers (tests, alternative
 /// CLI wiring) can override it without re-deriving the URL.
@@ -236,7 +274,7 @@ impl RefreshSummary {
 /// fatal. An OpenRouter fetch failure is not: we warn and carry forward
 /// the OpenRouter rows from the existing cache (if any) so a third-party
 /// outage never blocks a first-party refresh.
-pub async fn refresh_user_cache() -> Result<RefreshSummary> {
+pub async fn refresh_user_cache() -> Result<RefreshSummary, RefreshError> {
     refresh_user_cache_from(MODELS_DEV_URL, OPENROUTER_MODELS_URL).await
 }
 
@@ -246,9 +284,8 @@ pub async fn refresh_user_cache() -> Result<RefreshSummary> {
 pub async fn refresh_user_cache_from(
     models_dev_url: &str,
     openrouter_url: &str,
-) -> Result<RefreshSummary> {
-    let dest = user_cache_path()
-        .context("could not determine user cache path; HOME env var may be unset")?;
+) -> Result<RefreshSummary, RefreshError> {
+    let dest = user_cache_path().ok_or(RefreshError::NoCachePath)?;
     let models_dev_body = fetch_url(models_dev_url).await?;
 
     // A reachable OpenRouter gives the live catalog. When it is
@@ -285,24 +322,35 @@ pub async fn refresh_user_cache_from(
 /// Fetch the raw JSON body from `url`. Surfaces the HTTP status on
 /// non-2xx responses so the user understands why the cache wasn't
 /// touched.
-async fn fetch_url(url: &str) -> Result<String> {
+async fn fetch_url(url: &str) -> Result<String, RefreshError> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("aj/", env!("CARGO_PKG_VERSION")))
         .build()
-        .context("building reqwest client")?;
+        .map_err(|source| RefreshError::Fetch {
+            url: url.to_string(),
+            source,
+        })?;
     let resp = client
         .get(url)
         .send()
         .await
-        .with_context(|| format!("fetching {url}"))?;
+        .map_err(|source| RefreshError::Fetch {
+            url: url.to_string(),
+            source,
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        bail!("{url} returned status {status}: {body}");
+        return Err(RefreshError::Http {
+            url: url.to_string(),
+            status: status.as_u16(),
+            body,
+        });
     }
-    resp.text()
-        .await
-        .with_context(|| format!("reading body from {url}"))
+    resp.text().await.map_err(|source| RefreshError::Fetch {
+        url: url.to_string(),
+        source,
+    })
 }
 
 /// Parse the models.dev and (optional) OpenRouter payloads into a
@@ -313,7 +361,7 @@ async fn fetch_url(url: &str) -> Result<String> {
 fn build_catalog_from_json(
     models_dev_body: &str,
     openrouter_body: Option<&str>,
-) -> Result<Catalog> {
+) -> Result<Catalog, RefreshError> {
     let mut models = parse_models_dev(models_dev_body)?;
 
     let source = match openrouter_body {
@@ -330,12 +378,15 @@ fn build_catalog_from_json(
 /// Parse a models.dev JSON payload into the mapped, tool-filtered model
 /// list. Does not splice the Codex seed, sort, or apply overrides. That
 /// is [`assemble_catalog`]'s job.
-fn parse_models_dev(body: &str) -> Result<Vec<ModelInfo>> {
+fn parse_models_dev(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
     // The top-level object is keyed by provider id; we only care about
     // a fixed subset, so parse into a flexible map and look up the keys
     // we need. Unknown providers are ignored silently.
     let raw: HashMap<String, RawProvider> =
-        serde_json::from_str(body).context("parsing models.dev response as JSON")?;
+        serde_json::from_str(body).map_err(|source| RefreshError::Parse {
+            context: "parsing models.dev response as JSON".to_string(),
+            source,
+        })?;
 
     let mut models = Vec::new();
     for fixed in PROVIDER_FIXED_VALUES {
@@ -371,9 +422,12 @@ fn parse_models_dev(body: &str) -> Result<Vec<ModelInfo>> {
 /// Parse OpenRouter's `/api/v1/models` payload into the mapped,
 /// tool-filtered model list. Drops models that lack tool support or
 /// cannot emit text (e.g. pure image generators).
-fn parse_openrouter(body: &str) -> Result<Vec<ModelInfo>> {
+fn parse_openrouter(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
     let list: OpenRouterList =
-        serde_json::from_str(body).context("parsing openrouter models response as JSON")?;
+        serde_json::from_str(body).map_err(|source| RefreshError::Parse {
+            context: "parsing openrouter models response as JSON".to_string(),
+            source,
+        })?;
 
     let mut models = Vec::new();
     for m in &list.data {
@@ -623,22 +677,33 @@ fn cached_openrouter_models(dest: &Path) -> Vec<ModelInfo> {
 /// atomic on POSIX and adequate on Windows for our purposes — readers
 /// of `models.json` either see the old contents or the new contents,
 /// never a torn write.
-fn write_catalog_atomically(dest: &Path, catalog: &Catalog) -> Result<()> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("catalog destination {} has no parent", dest.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating parent directory {}", parent.display()))?;
+fn write_catalog_atomically(dest: &Path, catalog: &Catalog) -> Result<(), RefreshError> {
+    let parent = dest.parent().ok_or_else(|| {
+        RefreshError::Write(format!(
+            "catalog destination {} has no parent",
+            dest.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|e| {
+        RefreshError::Write(format!(
+            "creating parent directory {}: {e}",
+            parent.display()
+        ))
+    })?;
 
-    let body = serde_json::to_vec_pretty(catalog).context("serializing catalog")?;
+    let body = serde_json::to_vec_pretty(catalog)
+        .map_err(|e| RefreshError::Write(format!("serializing catalog: {e}")))?;
 
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+        RefreshError::Write(format!("creating temp file in {}: {e}", parent.display()))
+    })?;
     tmp.write_all(&body)
-        .context("writing catalog to temp file")?;
-    tmp.flush().context("flushing catalog temp file")?;
-    tmp.persist(dest)
-        .with_context(|| format!("persisting catalog to {}", dest.display()))?;
+        .map_err(|e| RefreshError::Write(format!("writing catalog to temp file: {e}")))?;
+    tmp.flush()
+        .map_err(|e| RefreshError::Write(format!("flushing catalog temp file: {e}")))?;
+    tmp.persist(dest).map_err(|e| {
+        RefreshError::Write(format!("persisting catalog to {}: {e}", dest.display()))
+    })?;
     Ok(())
 }
 
@@ -696,6 +761,19 @@ mod tests {
             }
         }
     }"#;
+
+    #[test]
+    fn parse_failure_surfaces_refresh_error_parse() {
+        let err = build_catalog_from_json("{ not json", None).expect_err("invalid JSON must fail");
+        assert!(
+            matches!(err, RefreshError::Parse { .. }),
+            "expected RefreshError::Parse, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("models.dev"),
+            "parse error should name the source, got: {err}"
+        );
+    }
 
     #[test]
     fn build_catalog_filters_and_maps() {

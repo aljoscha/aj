@@ -1,6 +1,5 @@
 use std::pin::Pin;
 
-use anyhow::{Context, Result, anyhow};
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use reqwest::{Client as ReqwestClient, StatusCode};
@@ -78,7 +77,7 @@ impl Client {
     pub async fn chat_completions(
         &self,
         request: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, anyhow::Error> {
+    ) -> Result<CreateChatCompletionResponse, ClientError> {
         let url = format!("{}/chat/completions", self.base_url);
         debug_log_request(&url, &request);
         let request_builder = self.apply_extra_headers(
@@ -88,30 +87,26 @@ impl Client {
                 .json(&request),
         );
 
-        let response = request_builder
-            .send()
-            .await
-            .context("failed to send request")?;
+        let response = request_builder.send().await?;
 
         let status = response.status();
         if status == StatusCode::OK {
-            let json_text = response
-                .text()
-                .await
-                .context("failed to read response text")?;
-            let response: CreateChatCompletionResponse = serde_json::from_str(&json_text)?;
+            let json_text = response.text().await?;
+            let response = serde_json::from_str(&json_text).map_err(|err| {
+                ClientError::ParseError(format!("could not parse response body: {err}"))
+            })?;
             return Ok(response);
         }
 
+        let http_status = status.as_u16();
+        let retry_after = retry_after_header(&response);
         let error_text = response.text().await?;
-        if status.is_client_error() || status.is_server_error() {
-            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                Ok(error_response) => Err(anyhow!(error_response.error)),
-                Err(_) => Err(anyhow!("request failed ({status}): {}", error_text)),
-            }
-        } else {
-            Err(anyhow!("unexpected status code ({status}): {}", error_text))
-        }
+        Err(classify_error_response(
+            status,
+            http_status,
+            retry_after,
+            error_text,
+        ))
     }
 
     pub async fn chat_completions_stream(
@@ -164,38 +159,20 @@ impl Client {
         }
 
         let http_status = status.as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let retry_after = retry_after_header(&response);
         let error_text = response.text().await?;
-        if status.is_client_error() || status.is_server_error() {
-            let error = match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                Ok(error_response) => error_response.error,
-                Err(_) => ApiError {
-                    message: format!("request failed ({status}): {error_text}"),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                },
-            };
-            Err(ClientError::ApiError {
-                error,
-                http_status,
-                retry_after,
-            })
-        } else {
-            Err(ClientError::InternalError(format!(
-                "unexpected status code ({status}): {error_text}"
-            )))
-        }
+        Err(classify_error_response(
+            status,
+            http_status,
+            retry_after,
+            error_text,
+        ))
     }
 
     pub async fn responses(
         &self,
         request: CreateResponseRequest,
-    ) -> Result<ResponsesResponse, anyhow::Error> {
+    ) -> Result<ResponsesResponse, ClientError> {
         let url = format!("{}/responses", self.base_url);
         debug_log_request(&url, &request);
         let request_builder = self.apply_extra_headers(
@@ -205,30 +182,26 @@ impl Client {
                 .json(&request),
         );
 
-        let response = request_builder
-            .send()
-            .await
-            .context("failed to send request")?;
+        let response = request_builder.send().await?;
 
         let status = response.status();
         if status == StatusCode::OK {
-            let json_text = response
-                .text()
-                .await
-                .context("failed to read response text")?;
-            let response: ResponsesResponse = serde_json::from_str(&json_text)?;
+            let json_text = response.text().await?;
+            let response = serde_json::from_str(&json_text).map_err(|err| {
+                ClientError::ParseError(format!("could not parse response body: {err}"))
+            })?;
             return Ok(response);
         }
 
+        let http_status = status.as_u16();
+        let retry_after = retry_after_header(&response);
         let error_text = response.text().await?;
-        if status.is_client_error() || status.is_server_error() {
-            match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                Ok(error_response) => Err(anyhow!(error_response.error)),
-                Err(_) => Err(anyhow!("request failed ({status}): {}", error_text)),
-            }
-        } else {
-            Err(anyhow!("unexpected status code ({status}): {}", error_text))
-        }
+        Err(classify_error_response(
+            status,
+            http_status,
+            retry_after,
+            error_text,
+        ))
     }
 
     pub async fn responses_stream(
@@ -313,32 +286,56 @@ impl Client {
         }
 
         let http_status = status.as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let retry_after = retry_after_header(&response);
         let error_text = response.text().await?;
-        if status.is_client_error() || status.is_server_error() {
-            let error = match serde_json::from_str::<ApiErrorResponse>(&error_text) {
-                Ok(error_response) => error_response.error,
-                Err(_) => ApiError {
-                    message: format!("request failed ({status}): {error_text}"),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                },
-            };
-            Err(ClientError::ApiError {
-                error,
-                http_status,
-                retry_after,
-            })
-        } else {
-            Err(ClientError::InternalError(format!(
-                "unexpected status code ({status}): {error_text}"
-            )))
+        Err(classify_error_response(
+            status,
+            http_status,
+            retry_after,
+            error_text,
+        ))
+    }
+}
+
+/// Extract the raw `Retry-After` header value, if present and printable.
+fn retry_after_header(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Map a non-success HTTP response into a [`ClientError`].
+///
+/// `error_text` is the already-read response body. A client/server
+/// error becomes a structured [`ClientError::ApiError`] (with a
+/// synthetic [`ApiError`] when the body isn't the expected shape) and
+/// carries the status plus `Retry-After` for the retry layer. Any other
+/// non-success status maps to [`ClientError::InternalError`].
+fn classify_error_response(
+    status: StatusCode,
+    http_status: u16,
+    retry_after: Option<String>,
+    error_text: String,
+) -> ClientError {
+    if status.is_client_error() || status.is_server_error() {
+        let error = match serde_json::from_str::<ApiErrorResponse>(&error_text) {
+            Ok(error_response) => error_response.error,
+            Err(_) => ApiError {
+                message: format!("request failed ({status}): {error_text}"),
+                r#type: None,
+                param: None,
+                code: None,
+            },
+        };
+        ClientError::ApiError {
+            error,
+            http_status,
+            retry_after,
         }
+    } else {
+        ClientError::InternalError(format!("unexpected status code ({status}): {error_text}"))
     }
 }
 
@@ -377,5 +374,39 @@ impl ClientError {
             Self::ApiError { retry_after, .. } => retry_after.as_deref(),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_error_response_structures_a_client_error() {
+        // Both the non-streaming and streaming entry points route
+        // non-2xx responses through this helper, so a structured error
+        // with status + Retry-After is the shared contract.
+        let body = r#"{"error":{"message":"slow down","type":"rate_limit_error"}}"#;
+        let err = classify_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            429,
+            Some("5".to_string()),
+            body.to_string(),
+        );
+        assert_eq!(err.http_status(), Some(429));
+        assert_eq!(err.retry_after(), Some("5"));
+        assert!(err.to_string().contains("slow down"), "got: {err}");
+    }
+
+    #[test]
+    fn classify_error_response_synthesizes_unparseable_body() {
+        let err = classify_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            500,
+            None,
+            "upstream boom".to_string(),
+        );
+        assert_eq!(err.http_status(), Some(500));
+        assert!(err.to_string().contains("upstream boom"), "got: {err}");
     }
 }

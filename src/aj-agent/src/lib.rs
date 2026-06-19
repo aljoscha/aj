@@ -7,6 +7,7 @@
 // dependency graph in `docs/aj-next-plan.md` §1) and owns the
 // readline loop, log management, and history display.
 pub mod bus;
+pub mod error;
 pub mod events;
 pub mod hooks;
 pub mod message;
@@ -14,6 +15,8 @@ pub mod projection;
 pub mod queue;
 pub mod tool;
 pub mod types;
+
+pub use error::BoxError;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -42,7 +45,6 @@ use crate::tool::{
     ToolContext, ToolDetails, ToolOutcome,
 };
 use crate::types::TokenUsage;
-use anyhow::anyhow;
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio_retry2::strategy::{ExponentialBackoff, jitter};
@@ -590,7 +592,7 @@ impl Agent {
                     .error
                     .map(|e| e.message)
                     .unwrap_or_else(|| "summary generation failed".to_string());
-                Err(TurnError::Recoverable(anyhow!(detail)))
+                Err(TurnError::Recoverable(detail.into()))
             }
             _ => {
                 let mut out = String::new();
@@ -768,9 +770,9 @@ impl Agent {
             Some(Message::User(_)) | Some(Message::ToolResult(_))
         );
         if !last_is_user_or_tool_result {
-            return Err(TurnError::Fatal(anyhow!(
-                "continue_run requires the transcript to end in a user-role message"
-            )));
+            return Err(TurnError::Fatal(
+                "continue_run requires the transcript to end in a user-role message".into(),
+            ));
         }
         self.cancellation = cancel;
         self.run_top_level_turn(None).await
@@ -864,7 +866,7 @@ impl Agent {
     /// Appends `prompt` as a user message on the sub-agent's own
     /// transcript, runs the assistant turn loop, and returns the
     /// final assistant text the sub-agent produced.
-    pub async fn run_single_turn(&mut self, prompt: String) -> Result<String, anyhow::Error> {
+    pub async fn run_single_turn(&mut self, prompt: String) -> Result<String, BoxError> {
         // Sub-agent runs share the same lifecycle framing as the
         // top-level agent — `AgentStart` / `AgentEnd` events
         // bracket the entire run so listeners that group by
@@ -887,7 +889,7 @@ impl Agent {
         outcome
     }
 
-    async fn run_single_turn_inner(&mut self, prompt: String) -> Result<String, anyhow::Error> {
+    async fn run_single_turn_inner(&mut self, prompt: String) -> Result<String, BoxError> {
         // Same prompt-top drain point as the top-level path: a
         // sub-agent that backgrounded a command hears about it on its
         // next continuation even when the task finished between runs.
@@ -925,7 +927,7 @@ impl Agent {
                 Some(Message::Assistant(a)) => Some(a),
                 _ => None,
             })
-            .ok_or_else(|| anyhow!("sub-agent produced no assistant text output"))?;
+            .ok_or("sub-agent produced no assistant text output")?;
 
         let last_assistant_text: String = last_assistant
             .content
@@ -1238,7 +1240,7 @@ impl Agent {
                 let detail = assistant_err
                     .map(|e| e.message)
                     .unwrap_or_else(|| "model stream failed without details".to_string());
-                return Err(TurnError::Recoverable(anyhow!(detail)));
+                return Err(TurnError::Recoverable(detail.into()));
             }
 
             // Reset the retry budget after a successful inference.
@@ -1798,11 +1800,11 @@ impl Agent {
         call_id: &str,
         tool_name: &str,
         tool_input: serde_json::Value,
-    ) -> Result<ToolOutcome, anyhow::Error> {
+    ) -> Result<ToolOutcome, BoxError> {
         let tool_def = if let Some(tool_def) = self.tool_definitions.get(tool_name) {
             tool_def
         } else {
-            return Err(anyhow!("tool not found!"));
+            return Err("tool not found!".into());
         };
 
         // Build the sub-agent tool template now (cheap clone: every
@@ -2615,8 +2617,9 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         &'b mut self,
         task: String,
         mode: SpawnMode,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'b>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SpawnResult, BoxError>> + Send + 'b>,
+    > {
         Box::pin(async move {
             // Get the next agent ID
             let agent_id = self.session_state.next_sub_agent_id();
@@ -3064,13 +3067,13 @@ pub enum TurnError {
     /// An ephemeral error encountered while talking to the model.
     /// The transcript is in a consistent state and the user can
     /// retry by submitting another message.
-    #[error("{0:#}")]
-    Recoverable(anyhow::Error),
+    #[error("{0}")]
+    Recoverable(BoxError),
     /// A persistent failure (e.g. failed disk write through the
     /// persistence listener) or an internal invariant violation.
     /// Bubble out to the top level.
     #[error(transparent)]
-    Fatal(anyhow::Error),
+    Fatal(BoxError),
     /// The current turn was cancelled via the agent's
     /// [`CancellationToken`]. Before returning the agent has already
     /// emitted the synthetic
@@ -3082,8 +3085,8 @@ pub enum TurnError {
     Aborted,
 }
 
-impl From<anyhow::Error> for TurnError {
-    fn from(e: anyhow::Error) -> Self {
+impl From<BoxError> for TurnError {
+    fn from(e: BoxError) -> Self {
         TurnError::Fatal(e)
     }
 }
@@ -3261,7 +3264,7 @@ mod event_protocol_tests {
             &self,
             _ctx: &mut dyn ToolContext,
             _input: PingInput,
-        ) -> anyhow::Result<ToolOutcome> {
+        ) -> Result<ToolOutcome, crate::BoxError> {
             Ok(ToolOutcome {
                 content: vec![aj_models::types::UserContent::text("pong".to_string())],
                 details: ToolDetails::Text {
@@ -3298,7 +3301,7 @@ mod event_protocol_tests {
             &self,
             ctx: &mut dyn ToolContext,
             _input: ProgressInput,
-        ) -> anyhow::Result<ToolOutcome> {
+        ) -> Result<ToolOutcome, crate::BoxError> {
             ctx.emit_update(ToolDetails::Text {
                 summary: "working".to_string(),
                 body: "halfway".to_string(),
@@ -4628,7 +4631,7 @@ mod event_protocol_tests {
                 &self,
                 _ctx: &mut dyn ToolContext,
                 input: EchoInput,
-            ) -> anyhow::Result<ToolOutcome> {
+            ) -> Result<ToolOutcome, crate::BoxError> {
                 Ok(ToolOutcome {
                     content: vec![aj_models::types::UserContent::text(format!(
                         "flag={}",
@@ -4712,7 +4715,7 @@ mod event_protocol_tests {
                 &self,
                 _ctx: &mut dyn ToolContext,
                 _input: EmptyInput,
-            ) -> anyhow::Result<ToolOutcome> {
+            ) -> Result<ToolOutcome, crate::BoxError> {
                 panic!("execute should not run when the before-hook short-circuits");
             }
         }
@@ -4900,7 +4903,7 @@ mod event_protocol_tests {
             &self,
             ctx: &mut dyn ToolContext,
             input: SpawnInput,
-        ) -> anyhow::Result<ToolOutcome> {
+        ) -> Result<ToolOutcome, crate::BoxError> {
             match ctx.spawn_agent(input.task, self.mode).await? {
                 crate::tool::SpawnResult::Completed(spawned) => Ok(ToolOutcome {
                     content: vec![aj_models::types::UserContent::text(spawned.report.clone())],
@@ -5361,7 +5364,7 @@ mod event_protocol_tests {
             &self,
             ctx: &mut dyn ToolContext,
             _input: PingInput,
-        ) -> anyhow::Result<ToolOutcome> {
+        ) -> Result<ToolOutcome, crate::BoxError> {
             ctx.task_registry().push_notice(TaskNotice {
                 owner: AgentId::Main,
                 task_id: 1,
@@ -5634,7 +5637,7 @@ mod event_protocol_tests {
             &self,
             _ctx: &mut dyn ToolContext,
             _input: PingInput,
-        ) -> anyhow::Result<ToolOutcome> {
+        ) -> Result<ToolOutcome, crate::BoxError> {
             self.queues.append_steering(AgentId::Main, "steer now");
             Ok(ToolOutcome {
                 content: vec![aj_models::types::UserContent::text("ok".to_string())],
@@ -5939,7 +5942,7 @@ mod event_protocol_tests {
             &self,
             _ctx: &mut dyn ToolContext,
             input: ProbeInput,
-        ) -> anyhow::Result<ToolOutcome> {
+        ) -> Result<ToolOutcome, crate::BoxError> {
             let now = {
                 let mut active = self.state.active.lock().unwrap();
                 *active += 1;

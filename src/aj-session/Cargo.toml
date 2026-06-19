@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 aj-agent = { path = "../aj-agent" }
 aj-models = { path = "../aj-models" }
-anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 rand = { workspace = true }
 serde = { workspace = true }

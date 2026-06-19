@@ -23,8 +23,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use anyhow::Result;
-
+use crate::error::BoxError;
 use crate::events::AgentEvent;
 
 /// Async listener invoked for every event on the bus.
@@ -36,7 +35,9 @@ use crate::events::AgentEvent;
 /// on a `tokio` task and the bus is cloned into both the agent and
 /// any future helpers (e.g. sub-agent spawn paths).
 pub type Listener = Arc<
-    dyn for<'a> Fn(&'a AgentEvent) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>
+    dyn for<'a> Fn(
+            &'a AgentEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'a>>
         + Send
         + Sync,
 >;
@@ -109,7 +110,7 @@ impl EventBus {
     /// observed (or rejected) the event. If a listener returns
     /// `Err`, that error is propagated and remaining listeners are
     /// not invoked for this event.
-    pub async fn emit(&self, event: AgentEvent) -> Result<()> {
+    pub async fn emit(&self, event: AgentEvent) -> Result<(), BoxError> {
         // Snapshot the listener list under the lock so that an
         // in-flight emit cannot race a `subscribe` or a `drop`.
         // Each slot holds an `Arc<...>`, so cloning the snapshot is
@@ -273,9 +274,7 @@ mod tests {
 
         let later_called: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
-        let _h1 = bus.subscribe(Arc::new(|_event| {
-            Box::pin(async { Err(anyhow::anyhow!("boom")) })
-        }));
+        let _h1 = bus.subscribe(Arc::new(|_event| Box::pin(async { Err("boom".into()) })));
         let later = Arc::clone(&later_called);
         let _h2 = bus.subscribe(listener_from_sync(move |_| {
             *later.lock().unwrap() = true;

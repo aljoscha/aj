@@ -225,9 +225,10 @@ pub async fn run(args: Args) -> Result<()> {
     {
         let json = json_event_listener();
         for event in replay(&log) {
-            json(&event)
-                .await
-                .context("failed to write replayed event to stdout during print-mode resume")?;
+            json(&event).await.map_err(|e| {
+                anyhow::Error::msg(e)
+                    .context("failed to write replayed event to stdout during print-mode resume")
+            })?;
         }
     }
 
@@ -377,10 +378,10 @@ pub async fn run(args: Args) -> Result<()> {
             return Err(anyhow!("agent run cancelled (sigint)"));
         }
         Err(TurnError::Recoverable(err)) => {
-            return Err(err.context("agent run failed (recoverable)"));
+            return Err(anyhow::Error::msg(err).context("agent run failed (recoverable)"));
         }
         Err(TurnError::Fatal(err)) => {
-            return Err(err.context("agent run failed (fatal)"));
+            return Err(anyhow::Error::msg(err).context("agent run failed (fatal)"));
         }
     }
 

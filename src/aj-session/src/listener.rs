@@ -39,10 +39,10 @@
 
 use std::sync::Arc;
 
+use aj_agent::BoxError;
 use aj_agent::bus::Listener;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::AgentMessage;
-use anyhow::{Result, anyhow};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::log::{ConversationLog, ConversationView, ThreadFilter};
@@ -70,14 +70,14 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
                     settings,
                 } => {
                     let AgentId::Sub(child_n) = child else {
-                        return Err(anyhow!("SubAgentStart with non-Sub child {child:?}"));
+                        return Err(format!("SubAgentStart with non-Sub child {child:?}").into());
                     };
                     let parent_filter = filter_for(parent);
                     let mut log_guard = log.lock().await;
                     let parent_head = log_guard.latest_leaf(parent_filter).ok_or_else(|| {
-                        anyhow!(
+                        BoxError::from(format!(
                             "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
-                        )
+                        ))
                     })?;
                     log_guard.append_subagent_spawn(child_n, parent_head, &task, &settings)?;
                 }
@@ -101,7 +101,11 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// never empty for a legitimately spawned sub-agent because
 /// [`AgentEvent::SubAgentStart`] seeds it with a `SubAgentSpawn`
 /// entry.
-fn persist(log: &mut ConversationLog, agent_id: AgentId, message: AgentMessage) -> Result<()> {
+fn persist(
+    log: &mut ConversationLog,
+    agent_id: AgentId,
+    message: AgentMessage,
+) -> Result<(), BoxError> {
     let mut view = match agent_id {
         AgentId::Main => {
             // `latest_leaf` returning `None` is fine here: the user
@@ -116,9 +120,9 @@ fn persist(log: &mut ConversationLog, agent_id: AgentId, message: AgentMessage) 
             let head = log
                 .latest_leaf(ThreadFilter::subagent(n))
                 .ok_or_else(|| {
-                    anyhow!(
+                    BoxError::from(format!(
                         "persistence listener: sub-agent {n} thread has no head entry; was SubAgentStart emitted?"
-                    )
+                    ))
                 })?;
             ConversationView::subagent(log, head, n)
         }

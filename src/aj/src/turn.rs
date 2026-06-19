@@ -213,7 +213,12 @@ fn over_threshold(agent: &Agent, threshold: f64) -> bool {
 
 fn wrap_overflow_giveup(err: TurnError) -> TurnError {
     match err {
-        TurnError::Recoverable(e) => TurnError::Recoverable(e.context(OVERFLOW_GIVEUP)),
+        // `Recoverable` carries an opaque boxed cause we can only
+        // render, so we fold the give-up guidance into a fresh
+        // message rather than chaining onto a typed error.
+        TurnError::Recoverable(e) => {
+            TurnError::Recoverable(format!("{OVERFLOW_GIVEUP}: {e}").into())
+        }
         other => other,
     }
 }

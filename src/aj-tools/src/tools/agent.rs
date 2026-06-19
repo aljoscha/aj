@@ -111,7 +111,7 @@ impl ToolDefinition for AgentTool {
         &self,
         ctx: &mut dyn ToolContext,
         input: Self::Input,
-    ) -> anyhow::Result<ToolOutcome> {
+    ) -> Result<ToolOutcome, aj_agent::BoxError> {
         // The sub-agent's id is allocated inside `spawn_agent`; we
         // need it for the structured `SubAgentReport` payload below.
         // Bubble the error up if the spawn fails — the agent runtime
@@ -199,8 +199,13 @@ mod tests {
             &'a mut self,
             task: String,
             mode: SpawnMode,
-        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>
-        {
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<SpawnResult, aj_agent::BoxError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
             self.last_task = Some(task);
             self.last_mode = Some(mode);
             let response = self.response.clone();
@@ -254,9 +259,14 @@ mod tests {
             &'a mut self,
             _task: String,
             _mode: SpawnMode,
-        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SpawnResult>> + Send + 'a>>
-        {
-            Box::pin(async move { Err(anyhow::anyhow!("model exploded")) })
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<SpawnResult, aj_agent::BoxError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Err("model exploded".into()) })
         }
 
         fn emit_update<'a>(

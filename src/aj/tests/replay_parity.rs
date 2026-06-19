@@ -60,7 +60,6 @@ use aj_tools::{BashTool, EditFileTool, TodoWriteTool};
 use aj_tui::component::Component;
 use aj_tui::terminal::Terminal;
 use aj_tui::tui::Tui;
-use anyhow::anyhow;
 use tempfile::TempDir;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
@@ -220,7 +219,7 @@ fn render_chat(tui: &mut Tui) -> Vec<String> {
 fn kill_switch_listener() -> Listener {
     Arc::new(|event: &AgentEvent| {
         if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
-            Box::pin(async { Err(anyhow!("kill switch: stop before next inference")) })
+            Box::pin(async { Err("kill switch: stop before next inference".into()) })
         } else {
             Box::pin(async { Ok(()) })
         }

@@ -7,7 +7,6 @@ edition.workspace = true
 aj-agent = { path = "../aj-agent/" }
 aj-models = { path = "../aj-models/" }
 
-anyhow = { workspace = true }
 base64 = { workspace = true }
 futures = { workspace = true }
 image = { workspace = true }

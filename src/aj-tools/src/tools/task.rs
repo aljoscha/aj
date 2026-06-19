@@ -90,7 +90,7 @@ impl ToolDefinition for TaskOutputTool {
         &self,
         ctx: &mut dyn ToolContext,
         input: Self::Input,
-    ) -> anyhow::Result<ToolOutcome> {
+    ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let registry = ctx.task_registry();
         let Some(status) = registry.status(input.id) else {
             return Ok(unknown_id_outcome(&registry, input.id));
@@ -136,7 +136,7 @@ impl ToolDefinition for TaskStopTool {
         &self,
         ctx: &mut dyn ToolContext,
         input: Self::Input,
-    ) -> anyhow::Result<ToolOutcome> {
+    ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let registry = ctx.task_registry();
         let Some(status) = registry.status(input.id) else {
             return Ok(unknown_id_outcome(&registry, input.id));

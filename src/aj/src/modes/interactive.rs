@@ -1018,7 +1018,7 @@ async fn run_session(
                                 // the in-band error stand.
                             }
                             Err(TurnError::Fatal(err)) => {
-                                break Err(err);
+                                break Err(anyhow::Error::msg(err));
                             }
                         }
                     }

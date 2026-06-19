@@ -21,7 +21,8 @@ use aj_agent::message::AgentMessage;
 use aj_models::types::{AssistantContent, Message, ToolResultMessage};
 
 use crate::log::{
-    Conversation, ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter,
+    Conversation, ConversationEntryKind, ConversationError, ConversationLog, ConversationView,
+    ThreadFilter,
 };
 
 /// Scan the linearized user thread for `tool_call` blocks that never
@@ -42,7 +43,7 @@ use crate::log::{
 pub fn repair_interrupted_tool_uses(
     log: &mut ConversationLog,
     conversation: &Conversation,
-) -> Result<bool, anyhow::Error> {
+) -> Result<bool, ConversationError> {
     let mut used: HashSet<(String, String)> = HashSet::new();
     let mut resolved: HashSet<String> = HashSet::new();
     for entry in conversation.entries() {

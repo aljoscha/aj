@@ -102,7 +102,7 @@ impl ToolDefinition for ReadFileTool {
         &self,
         ctx: &mut dyn ToolContext,
         input: Self::Input,
-    ) -> anyhow::Result<ToolOutcome> {
+    ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let path = Path::new(&input.path);
         if !path.is_absolute() {
             return Ok(error_outcome(

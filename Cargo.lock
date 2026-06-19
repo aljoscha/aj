@@ -55,7 +55,6 @@ name = "aj-agent"
 version = "0.1.0"
 dependencies = [
  "aj-models",
- "anyhow",
  "async-trait",
  "chrono",
  "futures",
@@ -89,7 +88,6 @@ name = "aj-models"
 version = "0.1.0"
 dependencies = [
  "anthropic-sdk",
- "anyhow",
  "async-stream",
  "async-trait",
  "base64",
@@ -115,7 +113,6 @@ version = "0.1.0"
 dependencies = [
  "aj-agent",
  "aj-models",
- "anyhow",
  "chrono",
  "rand",
  "serde",
@@ -132,7 +129,6 @@ version = "0.1.0"
 dependencies = [
  "aj-agent",
  "aj-models",
- "anyhow",
  "base64",
  "futures",
  "image",
@@ -1867,7 +1863,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "openai-sdk"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-stream",
  "eventsource-stream",
  "futures",
