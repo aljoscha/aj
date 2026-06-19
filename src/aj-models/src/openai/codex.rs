@@ -40,7 +40,6 @@ use openai_sdk::types::responses::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::errors::{classify_openai_error, parse_retry_after, transport_error};
 use crate::oauth::openai::extract_account_id;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, validate_thinking_level};
@@ -54,6 +53,7 @@ use crate::types::{
     StreamOptions, ThinkingLevel, ToolDefinition,
 };
 
+use super::errors::classify_client_error_with;
 use super::responses::{
     CostMultiplierFn, StreamState, append_assistant_message, convert_messages, empty_partial,
     error_from_code, map_reasoning_effort, map_service_tier, parse_assistant_input_items_with_api,
@@ -297,35 +297,13 @@ fn user_agent() -> String {
 // Error classification (§7.4.6)
 // ---------------------------------------------------------------------------
 
-/// Wrap [`classify_client_error`] to overlay the Codex-specific
-/// friendly 429 message from §7.4.6.
+/// Overlay the Codex-specific friendly 429 message (§7.4.6) on the
+/// shared OpenAI client-error classifier.
 fn classify_codex_client_error(err: &ClientError) -> AssistantError {
-    match err {
-        ClientError::ApiError {
-            error,
-            http_status,
-            retry_after,
-        } => {
-            let retry_after_ms = parse_retry_after(retry_after.as_deref());
-            let friendly = friendly_codex_message(
-                error.code.as_deref(),
-                error.r#type.as_deref(),
-                *http_status,
-                &error.message,
-            );
-            let message = friendly.unwrap_or_else(|| error.message.clone());
-            classify_openai_error(
-                error.code.as_deref(),
-                error.r#type.as_deref(),
-                Some(*http_status),
-                retry_after_ms,
-                message,
-            )
-        }
-        ClientError::TransportError(t) => transport_error(format!("transport: {t}")),
-        ClientError::ParseError(s) => transport_error(format!("parse: {s}")),
-        ClientError::InternalError(s) => transport_error(format!("internal: {s}")),
-    }
+    classify_client_error_with(err, |code, r#type, http_status, message| {
+        friendly_codex_message(code, r#type, http_status, message)
+            .unwrap_or_else(|| message.to_string())
+    })
 }
 
 /// Build the §7.4.6 "You have hit your ChatGPT usage limit" message

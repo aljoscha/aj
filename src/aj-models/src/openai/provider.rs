@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use futures::StreamExt;
-use openai_sdk::client::{Client, ClientError};
+use openai_sdk::client::Client;
 use openai_sdk::types::chat_completions::{
     ChatCompletionRequestMessage, ChatCompletionTextContent, ChatCompletionUserContent,
     ChatCompletionUserContentPart, CreateChatCompletionRequest, CreateChatCompletionStreamResponse,
@@ -30,9 +30,8 @@ use openai_sdk::types::chat_completions::{
 use openai_sdk::types::common::ReasoningEffort;
 use serde_json::Value;
 
-use crate::errors::{
-    classify_openai_error, classify_openai_finish_reason, parse_retry_after, transport_error,
-};
+use crate::errors::classify_openai_finish_reason;
+use crate::openai::errors::classify_client_error;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, validate_thinking_level};
@@ -234,27 +233,6 @@ fn empty_partial(model: &ModelInfo) -> AssistantMessage {
     partial.provider = model.provider.clone();
     partial.model = model.id.clone();
     partial
-}
-
-/// Classify a transport-layer or SDK-surfaced error into the unified
-/// [`AssistantError`] shape per `docs/models-spec.md` §10.3.
-fn classify_client_error(err: &ClientError) -> AssistantError {
-    match err {
-        ClientError::ApiError {
-            error,
-            http_status,
-            retry_after,
-        } => classify_openai_error(
-            error.code.as_deref(),
-            error.r#type.as_deref(),
-            Some(*http_status),
-            parse_retry_after(retry_after.as_deref()),
-            error.message.clone(),
-        ),
-        ClientError::TransportError(t) => transport_error(format!("transport: {t}")),
-        ClientError::ParseError(s) => transport_error(format!("parse: {s}")),
-        ClientError::InternalError(s) => transport_error(format!("internal: {s}")),
-    }
 }
 
 // ---------------------------------------------------------------------------

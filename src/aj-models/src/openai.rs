@@ -7,6 +7,7 @@
 //! [`codex`] (per §7.4).
 
 pub mod codex;
+pub mod errors;
 pub mod provider;
 pub mod responses;
 

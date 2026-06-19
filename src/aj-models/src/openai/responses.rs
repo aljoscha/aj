@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use futures::StreamExt;
-use openai_sdk::client::{Client, ClientError};
+use openai_sdk::client::Client;
 use openai_sdk::types::common::{
     PromptCacheRetention, ReasoningEffort, ServiceTier as OpenAIServiceTier,
 };
@@ -32,7 +32,8 @@ use openai_sdk::types::responses::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::errors::{classify_openai_error, parse_retry_after, transport_error};
+use crate::errors::classify_openai_error;
+use crate::openai::errors::classify_client_error;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, calculate_cost, validate_thinking_level};
@@ -317,25 +318,6 @@ pub(super) fn empty_partial(api: &str, model: &ModelInfo) -> AssistantMessage {
     partial.provider = model.provider.clone();
     partial.model = model.id.clone();
     partial
-}
-
-pub(super) fn classify_client_error(err: &ClientError) -> AssistantError {
-    match err {
-        ClientError::ApiError {
-            error,
-            http_status,
-            retry_after,
-        } => classify_openai_error(
-            error.code.as_deref(),
-            error.r#type.as_deref(),
-            Some(*http_status),
-            parse_retry_after(retry_after.as_deref()),
-            error.message.clone(),
-        ),
-        ClientError::TransportError(t) => transport_error(format!("transport: {t}")),
-        ClientError::ParseError(s) => transport_error(format!("parse: {s}")),
-        ClientError::InternalError(s) => transport_error(format!("internal: {s}")),
-    }
 }
 
 pub(super) fn is_openai_host(base_url: &str) -> bool {
