@@ -69,12 +69,11 @@ commit secrets.
 
 ## Code Style
 
-- Rust edition 2024, 4-space indentation (spaces, not tabs).
 - Import grouping: std → external crates (including aj_*) → crate imports.
-- Use absolute paths for crate imports (`crate::` not `super::`).
+- Use absolute paths for crate imports (`crate::` not `super::`), except `use super::*;` in `#[cfg(test)]` modules.
 - Merge imports from same module, don't merge different modules.
 - Error handling: a library boundary exposes a typed error where callers branch on the failure (a `thiserror` enum, e.g. the SDK `ClientError` carrying status + `Retry-After`), and a named opaque error (`Box<dyn std::error::Error + Send + Sync>`, aliased `aj_agent::BoxError`) at render-only seams where the caller only ever displays the cause (tool execution, the event bus, `TurnError`'s `Recoverable`/`Fatal` payloads). Never put `anyhow` in a public library signature. `anyhow` is for top-level application error propagation in the `aj` binary only.
-- Follow clippy/rustfmt (enforced with strict workspace lints).
+- Follow clippy/rustfmt.
 
 ## Testing
 
