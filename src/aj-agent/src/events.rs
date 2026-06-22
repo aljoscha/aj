@@ -139,9 +139,13 @@ pub enum AgentEvent {
         messages: Vec<AgentMessage>,
     },
     /// Beginning of an assistant-message turn (one inference + any
-    /// tool calls it triggers).
+    /// tool calls it triggers). Paired with a closing [`TurnEnd`], but
+    /// only on a clean completion: a turn that aborts or errors emits
+    /// its `TurnStart` and then returns without a `TurnEnd`, so a
+    /// consumer pairing the two must tolerate an unclosed bracket.
     TurnStart { agent_id: AgentId },
     /// End of an assistant-message turn, after tools have finalized.
+    /// Emitted only when the turn completes cleanly (see [`TurnStart`]).
     TurnEnd {
         agent_id: AgentId,
         message: AssistantMessage,

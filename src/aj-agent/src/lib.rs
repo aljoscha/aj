@@ -789,12 +789,9 @@ impl Agent {
     /// to the model unchanged).
     async fn run_top_level_turn(&mut self, prompt: Option<UserMessage>) -> Result<(), TurnError> {
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
-        // bus. `AgentEnd.messages` will eventually carry a snapshot
-        // of the agent's transcript per `docs/aj-next-plan.md` §1.4;
-        // until §2.4 migrates the agent to the unified message
-        // types, we ship an empty snapshot so the protocol shape
-        // (event ordering, agent_id routing) is exercised without
-        // forcing a premature legacy→unified bridge.
+        // bus. `AgentEnd` carries a clone of the agent's transcript
+        // so a listener can take a final snapshot without replaying
+        // the message stream.
         self.bus
             .emit(AgentEvent::AgentStart {
                 agent_id: self.agent_id,
@@ -807,7 +804,7 @@ impl Agent {
         self.bus
             .emit(AgentEvent::AgentEnd {
                 agent_id: self.agent_id,
-                messages: Vec::new(),
+                messages: self.transcript.clone(),
             })
             .await
             .map_err(TurnError::Fatal)?;
@@ -882,7 +879,7 @@ impl Agent {
         self.bus
             .emit(AgentEvent::AgentEnd {
                 agent_id: self.agent_id,
-                messages: Vec::new(),
+                messages: self.transcript.clone(),
             })
             .await?;
 
@@ -978,23 +975,19 @@ impl Agent {
     async fn execute_turn(&mut self) -> Result<(), TurnError> {
         self.session_state.bump_turn_counter();
 
-        // `TurnStart` mirrors entry to the assistant-message cycle.
-        // The matching `TurnEnd` event (which carries the finalized
-        // assistant message and tool-result list per
-        // `docs/aj-next-plan.md` §1.1) lands in §2.4 once
-        // `aj-agent` migrates to the unified message types.
-        self.bus
-            .emit(AgentEvent::TurnStart {
-                agent_id: self.agent_id,
-            })
-            .await
-            .map_err(TurnError::Fatal)?;
-
         // Number of streaming retries observed for the current
         // inference. Reported on `StreamRetry` events so listeners
         // can render "retrying… (attempt N)" indicators.
         let mut retry_attempt: u32 = 0;
         let mut retry_strategy = None;
+
+        // A turn is one inference plus the tool batch it triggers,
+        // bracketed by `TurnStart` / `TurnEnd`. A transient-error
+        // retry re-enters the loop for the *same* turn, so it must not
+        // re-emit `TurnStart`: `retrying` is set on the retry path and
+        // suppresses the emit on that one re-entry. A fresh turn (the
+        // first, or a tool-continuation) emits it.
+        let mut retrying = false;
 
         'outer: loop {
             // Pre-iteration cancel check (cheap atomic). Lets us
@@ -1003,6 +996,16 @@ impl Agent {
             if self.cancellation.is_cancelled() {
                 return Err(TurnError::Aborted);
             }
+
+            if !retrying {
+                self.bus
+                    .emit(AgentEvent::TurnStart {
+                        agent_id: self.agent_id,
+                    })
+                    .await
+                    .map_err(TurnError::Fatal)?;
+            }
+            retrying = false;
 
             let mut response_stream = self.run_inference_streaming();
             // Cheap clone — `CancellationToken` is `Arc`-backed and
@@ -1230,6 +1233,7 @@ impl Agent {
                             _ = cancel.cancelled() => return Err(TurnError::Aborted),
                             _ = tokio::time::sleep(retry_sleep) => {}
                         }
+                        retrying = true;
                         continue 'outer;
                     }
                 }
@@ -1315,6 +1319,11 @@ impl Agent {
                 });
 
                 let mut aborted = false;
+                // This turn's tool results, collected in call order for
+                // the `TurnEnd` payload below. Only the non-aborted
+                // path reaches `TurnEnd`, so the cancelled-drain branch
+                // doesn't bother collecting.
+                let mut turn_tool_results: Vec<ToolResultMessage> = Vec::new();
                 for group in groups {
                     if aborted {
                         // An earlier group was cancelled. Synthesize
@@ -1367,8 +1376,10 @@ impl Agent {
                             outcome,
                             aborted: call_aborted,
                         } = result?;
-                        self.finalize_tool_result(&call_id, &tool_name, outcome)
+                        let tool_result = self
+                            .finalize_tool_result(&call_id, &tool_name, outcome)
                             .await?;
+                        turn_tool_results.push(tool_result);
                         aborted = aborted || call_aborted;
                     }
                 }
@@ -1376,6 +1387,20 @@ impl Agent {
                 if aborted {
                     return Err(TurnError::Aborted);
                 }
+
+                // The turn (this inference plus its tool batch) is
+                // complete. `TurnEnd` carries the finalized assistant
+                // message and the batch's tool results. The
+                // should-stop hook below runs after it, mirroring the
+                // documented ordering.
+                self.bus
+                    .emit(AgentEvent::TurnEnd {
+                        agent_id: self.agent_id,
+                        message: response,
+                        tool_results: turn_tool_results,
+                    })
+                    .await
+                    .map_err(TurnError::Fatal)?;
 
                 // Consult the should-stop-after-turn hook (if
                 // installed). Returning `true` ends the turn here
@@ -1404,9 +1429,19 @@ impl Agent {
                 // response to tool results.
                 continue;
             } else {
-                // We are now ready to finish this turn. Every event
-                // that belongs to this turn has already been
-                // emitted individually; there is no per-turn save.
+                // We are now ready to finish this turn. Every message
+                // event that belongs to it has already been emitted
+                // individually; there is no per-turn save. `TurnEnd`
+                // closes the turn with the finalized assistant message
+                // and no tool results (this turn called none).
+                self.bus
+                    .emit(AgentEvent::TurnEnd {
+                        agent_id: self.agent_id,
+                        message: response,
+                        tool_results: Vec::new(),
+                    })
+                    .await
+                    .map_err(TurnError::Fatal)?;
                 break;
             }
         }
@@ -1521,12 +1556,15 @@ impl Agent {
     /// success and cancellation paths of [`Self::execute_turn`] so
     /// the persisted shape is identical regardless of why the
     /// outcome was produced.
+    ///
+    /// Returns the projected [`ToolResultMessage`] so the caller can
+    /// collect a turn's results for its `TurnEnd` payload.
     async fn finalize_tool_result(
         &mut self,
         tool_id: &str,
         tool_name: &str,
         outcome: ToolOutcome,
-    ) -> Result<(), TurnError> {
+    ) -> Result<ToolResultMessage, TurnError> {
         // Project the outcome onto a unified
         // [`Message::ToolResult`] entry. The structured `details`
         // ride twice: once on the per-call
@@ -1551,7 +1589,7 @@ impl Agent {
             is_error: outcome.is_error,
             timestamp: 0,
         };
-        let tool_result_message = AgentMessage::wire(Message::ToolResult(tool_result));
+        let tool_result_message = AgentMessage::wire(Message::ToolResult(tool_result.clone()));
         self.transcript.push(tool_result_message.clone());
         self.bus
             .emit(AgentEvent::MessageStart {
@@ -1579,7 +1617,7 @@ impl Agent {
             })
             .await
             .map_err(TurnError::Fatal)?;
-        Ok(())
+        Ok(tool_result)
     }
 
     /// Creates a retry strategy for handling overloaded API errors.
@@ -3865,6 +3903,11 @@ mod event_protocol_tests {
                 body: "pong".to_string(),
                 is_error: false,
             },
+            // The tool turn closes with `TurnEnd` (carrying the
+            // assistant message + the ping tool result), then the
+            // next turn opens with a fresh `TurnStart`.
+            EventLabel::Other("TurnEnd"),
+            EventLabel::TurnStart(AgentId::Sub(1)),
             // Second inference: same Start/stream/End bracket as
             // the first; the model returned plain text this time.
             EventLabel::Message {
@@ -3886,9 +3929,100 @@ mod event_protocol_tests {
                 kind: "Assistant",
             },
             EventLabel::TurnUsage(AgentId::Sub(1)),
+            EventLabel::Other("TurnEnd"),
             EventLabel::AgentEnd(AgentId::Sub(1)),
         ];
         assert_eq!(events, expected, "unexpected event sequence: {events:#?}");
+    }
+
+    #[tokio::test]
+    async fn turn_end_carries_message_and_results_agent_end_carries_transcript() {
+        // A tool-use turn followed by a text turn. Each `TurnEnd`
+        // carries that turn's finalized assistant message. The tool
+        // turn also carries its one tool result, the text turn none.
+        // `AgentEnd` carries the full transcript snapshot.
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "ping")),
+            finalize_script(finalize_text("done")),
+        ];
+        let mut agent = build_agent(scripts, vec![PingTool.into()]);
+        agent.set_agent_id(AgentId::Main);
+
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if matches!(
+                event,
+                AgentEvent::TurnEnd { .. } | AgentEvent::AgentEnd { .. }
+            ) {
+                captured_clone.lock().unwrap().push(event.clone());
+            }
+        }));
+
+        agent
+            .run_single_turn("run ping".to_string())
+            .await
+            .expect("run");
+
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            3,
+            "two TurnEnds then one AgentEnd: {events:#?}"
+        );
+
+        // First turn: the tool-use assistant message + the ping result.
+        match &events[0] {
+            AgentEvent::TurnEnd {
+                message,
+                tool_results,
+                ..
+            } => {
+                assert!(
+                    message
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::ToolCall(_))),
+                    "first turn's message carries the tool call"
+                );
+                assert_eq!(tool_results.len(), 1, "one tool result this turn");
+                assert_eq!(tool_results[0].tool_name, "ping");
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+
+        // Second turn: the text reply, no tools.
+        match &events[1] {
+            AgentEvent::TurnEnd {
+                message,
+                tool_results,
+                ..
+            } => {
+                assert!(tool_results.is_empty(), "text turn calls no tools");
+                assert!(
+                    message
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, AssistantContent::Text(_))),
+                    "second turn's message carries text"
+                );
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+
+        // AgentEnd snapshots the whole transcript: user prompt, the
+        // tool-use assistant message, its tool result, and the final
+        // text assistant message.
+        match &events[2] {
+            AgentEvent::AgentEnd { messages, .. } => {
+                assert_eq!(
+                    messages.len(),
+                    4,
+                    "transcript snapshot: user + assistant + tool_result + assistant"
+                );
+            }
+            other => panic!("expected AgentEnd, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4105,6 +4239,7 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::TurnUsage(AgentId::Sub(7)),
+                EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Sub(7)),
             ],
             "unexpected event sequence: {events:#?}"
@@ -4168,6 +4303,7 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
             "unexpected event sequence: {events:#?}"
@@ -4240,6 +4376,7 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
             "unexpected event sequence: {events:#?}"
@@ -4522,6 +4659,25 @@ mod event_protocol_tests {
             })
             .collect();
         assert_eq!(retries, vec![1], "expected exactly one stream retry");
+
+        // The retry re-runs the same turn's inference, so it must not
+        // re-bracket the turn: exactly one `TurnStart` and one
+        // `TurnEnd` despite the two inference attempts.
+        let recorded = recorded.lock().unwrap();
+        let turn_starts = recorded
+            .iter()
+            .filter(|l| matches!(l, EventLabel::TurnStart(_)))
+            .count();
+        let turn_ends = recorded
+            .iter()
+            .filter(|l| matches!(l, EventLabel::Other("TurnEnd")))
+            .count();
+        assert_eq!(turn_starts, 1, "a retry must not emit a second TurnStart");
+        assert_eq!(
+            turn_ends, 1,
+            "the turn closes once, after the retry succeeds"
+        );
+        drop(recorded);
 
         // Only the recovered turn — not the truncated one — landed on
         // the transcript.
@@ -5577,6 +5733,7 @@ mod event_protocol_tests {
                     kind: "Assistant",
                 },
                 EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
             "unexpected event sequence: {events:#?}"

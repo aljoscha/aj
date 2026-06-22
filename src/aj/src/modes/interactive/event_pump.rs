@@ -860,10 +860,13 @@ impl EventPump {
                 }
             }
             AgentEvent::TurnEnd { .. } => {
-                // The `TurnEnd` summary lands in a follow-up commit.
-                // Holding the arm here keeps the exhaustiveness check
-                // active so a newly-emitted event variant shows up as a
-                // compile error.
+                // The TUI renders incrementally from `MessageStart` /
+                // `MessageUpdate` / `MessageEnd` and the per-turn usage
+                // line from `TurnUsage`, so it needs nothing from
+                // `TurnEnd`'s finalized snapshot. The arm stays
+                // explicit so a future renderer can hook in here
+                // and the exhaustiveness check still flags new
+                // variants.
             }
         }
 
