@@ -212,9 +212,7 @@ pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
 /// triggered by its keyboard shortcut).
 ///
 /// The interactive host applies the action: opening an overlay,
-/// mutating agent state inline, or surfacing a notice. Variants not
-/// yet wired return [`CommandAction::NotYetImplemented`] so the user
-/// sees a clear "soon, not silently dropped" message.
+/// mutating agent state inline, or surfacing a notice.
 ///
 /// A few variants are internal dispatch targets rather than catalog
 /// commands: they carry data, are emitted by the host (not chosen by
@@ -284,13 +282,6 @@ pub enum CommandAction {
     /// Show the command reference. The host opens the help overlay
     /// listing every entry in [`COMMANDS`].
     Help,
-    /// A recognised command whose UI lives in a follow-up commit. No
-    /// command maps here today; the variant is preserved so future
-    /// deferred commands can land without re-introducing the type.
-    NotYetImplemented {
-        command: &'static str,
-        message: &'static str,
-    },
     /// User asked to quit. The host breaks out of its main loop.
     Quit,
 }

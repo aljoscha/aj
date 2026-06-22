@@ -18,7 +18,6 @@ pub mod components;
 pub mod editor_ext;
 pub mod event_pump;
 pub mod footer_data;
-pub mod keys;
 pub mod layout;
 pub mod render_settings;
 pub mod session;
@@ -3723,10 +3722,6 @@ async fn handle_command(
                 notice: None,
             }
         }
-        CommandAction::NotYetImplemented { message, .. } => CommandOutcome::Continue {
-            selector: None,
-            notice: Some(message.to_string()),
-        },
         CommandAction::Quit => CommandOutcome::Quit,
     }
 }
