@@ -230,7 +230,7 @@ When presenting a proposal, cover:
   local. Confirm no external/test consumer first (T1's dead methods are
   exercised only by test doubles).
 
-### R15 — Make `@file` expansion real or remove the contract  [decision + change · TODO]
+### R15 — Make `@file` expansion real or remove the contract  [decision + change · DONE]
 - **Sources:** A1 (Major), A2; `_SUMMARY` theme 4.
 - **Problem:** `cli/file_args.rs::expand` returns input unchanged, yet
   `CLAUDE.md` + four code docs advertise `@path` expansion, and it's only
@@ -672,3 +672,26 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   folded back into the bucket commits. Tests: `TurnEnd` payload +
   `AgentEnd` snapshot, single-bracket-across-retry, the progress
   indicator following main busy/idle, and `minimal` round-trips.
+- 2026-06-22 · R15 · DONE · ff18b0e · Like R13, the finding's premise was
+  stale: the no-op `expand` passthrough had already been replaced with
+  real argument-level resolution by `ff18b0e` ("resolve @file launch
+  arguments into prompt content"). Verified the implementation matches the
+  finding's first option (implement once, shared between both modes) rather
+  than the remove-the-contract option. `cli::file_args::process_file_args`
+  resolves each `@`-prefixed positional cwd-relative (with `~` expansion):
+  text files become a `<file name="ABS">…</file>` block, images are resized
+  under the inline budget and attached as real `UserContent::Image` blocks,
+  a missing file is a hard error, empty files are skipped. The resolver is
+  owned by `cli::initial_input` and called by **both** modes (`print.rs:114`,
+  `interactive.rs:322`), retiring the print-only / interactive-never-called
+  asymmetry the finding flagged. All four docs the finding named now
+  describe the live behavior (`Args::prompt` and `Command::Continue` in
+  `cli/args.rs:58,121`, the `cli` module doc, and `lib.rs`); `CLAUDE.md` no
+  longer mentions `@file` at all. The editor's separate `@file` autocomplete
+  (interactive typing, `editor_ext`) is a distinct real, tested feature, not
+  a stale contract. No new code change this session: the behavioral change
+  happened in `ff18b0e`, so DONE crediting that commit is the honest label
+  over ACCEPTED-AS-IS. The lone residual is a historical progress-log line
+  (`docs/aj-next-progress.md:792`, "passthrough stub for `@file`
+  expansion") which correctly records a past development state and is left
+  as-is. `cargo test -p aj --lib cli` green (24 tests).
