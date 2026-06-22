@@ -760,9 +760,24 @@ mod tests {
             history < live,
             "history replays before the new turn:\n{out}"
         );
+
+        // The full historical trace, not just the user message, drains
+        // before the new turn: the replayed assistant reply (the first
+        // occurrence of the demo fragment) precedes the live prompt.
+        // JSON mode streams cumulative deltas, so the fragment recurs
+        // many times within the live turn. We therefore check positions,
+        // not a count: a replayed copy before the live prompt and at
+        // least one live copy after it.
+        let replayed_reply = out
+            .find(DEMO_REPLY_FRAGMENT)
+            .expect("the historical assistant reply was replayed");
         assert!(
-            out.contains(DEMO_REPLY_FRAGMENT),
-            "assistant text present in the json stream:\n{out}"
+            replayed_reply < live,
+            "the historical assistant reply precedes the new turn:\n{out}"
+        );
+        assert!(
+            out[live..].contains(DEMO_REPLY_FRAGMENT),
+            "the live assistant turn produced text after its prompt:\n{out}"
         );
     }
 
