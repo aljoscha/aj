@@ -119,6 +119,23 @@ fn install_panic_hook() {
 }
 
 /// Abstraction over a terminal for input/output.
+///
+/// This is the framework's portability seam: a non-stdout backend
+/// implements it in full. It is deliberately a complete terminal verb
+/// set, so the cursor-move and clear operations
+/// ([`Terminal::move_by`], [`Terminal::clear_line`],
+/// [`Terminal::clear_from_cursor`], [`Terminal::clear_screen`]) are
+/// part of the contract even though the bundled differential renderer
+/// does not call them. The renderer assembles a single frame string
+/// and inlines the few escapes it needs on its hot path (`\x1b[2K`,
+/// `\x1b[2J\x1b[H`) directly into that buffer, then commits with one
+/// [`Terminal::write`] plus [`Terminal::flush`]. An implementor of a
+/// new backend still has to honour these verbs, since a component or an
+/// alternative renderer may call them. Where a verb has an inlined
+/// counterpart on the hot path (`clear_line` mirrors `\x1b[2K`,
+/// `clear_screen` mirrors `\x1b[2J\x1b[H`), its output must match so
+/// the two surfaces stay interchangeable. `clear_line` spells that
+/// contract out on its own doc.
 pub trait Terminal {
     /// Write a string to the terminal output.
     fn write(&mut self, data: &str);
