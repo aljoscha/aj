@@ -29,10 +29,10 @@
 //! loop with `TurnError::Fatal`, exactly mirroring a real crash
 //! between persistence and the next inference.
 //!
-//! ## `TurnUsage` parity
+//! ## `UsageUpdate` parity
 //!
 //! Both the live agent and `replay(&log)` emit one
-//! [`aj_agent::events::AgentEvent::TurnUsage`] per assistant turn,
+//! [`aj_agent::events::AgentEvent::UsageUpdate`] per assistant turn,
 //! in the same position (immediately after the assistant's
 //! `MessageEnd`). The two pumps therefore see matching event
 //! sequences without any filtering — the parity comparison runs

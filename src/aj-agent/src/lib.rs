@@ -1291,7 +1291,7 @@ impl Agent {
                 turn_cache_read: turn_usage.cache_read,
             };
             self.bus
-                .emit(AgentEvent::TurnUsage {
+                .emit(AgentEvent::UsageUpdate {
                     agent_id: self.agent_id,
                     usage,
                 })
@@ -3591,7 +3591,7 @@ mod event_protocol_tests {
             agent_id: AgentId,
             event_kind: &'static str,
         },
-        TurnUsage(AgentId),
+        UsageUpdate(AgentId),
         Other(&'static str),
     }
 
@@ -3651,7 +3651,7 @@ mod event_protocol_tests {
             AgentEvent::StreamRetry {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),
-            AgentEvent::TurnUsage { agent_id, .. } => EventLabel::TurnUsage(*agent_id),
+            AgentEvent::UsageUpdate { agent_id, .. } => EventLabel::UsageUpdate(*agent_id),
             AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
             AgentEvent::MessageStart { agent_id, message } => EventLabel::Message {
                 agent_id: *agent_id,
@@ -3876,7 +3876,7 @@ mod event_protocol_tests {
                 phase: "end",
                 kind: "Assistant",
             },
-            EventLabel::TurnUsage(AgentId::Sub(1)),
+            EventLabel::UsageUpdate(AgentId::Sub(1)),
             EventLabel::ToolExecutionStart {
                 agent_id: AgentId::Sub(1),
                 call_id: "tu-1".to_string(),
@@ -3928,7 +3928,7 @@ mod event_protocol_tests {
                 phase: "end",
                 kind: "Assistant",
             },
-            EventLabel::TurnUsage(AgentId::Sub(1)),
+            EventLabel::UsageUpdate(AgentId::Sub(1)),
             EventLabel::Other("TurnEnd"),
             EventLabel::AgentEnd(AgentId::Sub(1)),
         ];
@@ -4238,7 +4238,7 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "Assistant",
                 },
-                EventLabel::TurnUsage(AgentId::Sub(7)),
+                EventLabel::UsageUpdate(AgentId::Sub(7)),
                 EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Sub(7)),
             ],
@@ -4302,7 +4302,7 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "Assistant",
                 },
-                EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::UsageUpdate(AgentId::Main),
                 EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
@@ -4375,7 +4375,7 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "Assistant",
                 },
-                EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::UsageUpdate(AgentId::Main),
                 EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],
@@ -5673,7 +5673,7 @@ mod event_protocol_tests {
     /// A wake drains the queued notices and runs a full turn with the
     /// same event bracketing every top-level run gets: AgentStart,
     /// the notice's user-message pair, TurnStart, the assistant
-    /// stream, TurnUsage, AgentEnd.
+    /// stream, UsageUpdate, AgentEnd.
     #[tokio::test]
     async fn wake_drains_notices_and_runs_bracketed_turn() {
         let scripts = vec![finalize_script(finalize_text("reacted"))];
@@ -5732,7 +5732,7 @@ mod event_protocol_tests {
                     phase: "end",
                     kind: "Assistant",
                 },
-                EventLabel::TurnUsage(AgentId::Main),
+                EventLabel::UsageUpdate(AgentId::Main),
                 EventLabel::Other("TurnEnd"),
                 EventLabel::AgentEnd(AgentId::Main),
             ],

@@ -426,7 +426,7 @@ compaction-specific (no prompts, no thresholds) lives in `aj-agent`.
 ```rust
 /// Run a single, bus-silent completion against the agent's provider and
 /// return the concatenated assistant text. Does not touch the
-/// transcript, emits no `Message*` / `TurnUsage` events (so persistence
+/// transcript, emits no `Message*` / `UsageUpdate` events (so persistence
 /// never sees it), and does not accumulate usage. Honors the supplied
 /// cancellation token.
 ///
@@ -452,7 +452,7 @@ turns without disturbing transcript or persistence.
 
 NOTE: it is bus-silent by design. We do *not* want a summarizer turn to
 produce a `MessageEnd` (which the persistence listener would write to the
-log) or a `TurnUsage` (which would move the footer occupancy). The
+log) or a `UsageUpdate` (which would move the footer occupancy). The
 summary's only durable record is the `Compaction` log entry.
 
 ### 6.2 `Agent::reseed_transcript`
@@ -544,7 +544,7 @@ Set wherever the terminal assistant `MessageEnd` is emitted
 This subsumes the earlier log-reading overflow detection and, by also
 exposing `usage`, lets the threshold trigger read occupancy from the
 agent rather than the UI footer (`footer_data.rs:113` derives the same
-`input + cache_read + cache_write` sum from the same `TurnUsage`).
+`input + cache_read + cache_write` sum from the same `UsageUpdate`).
 
 ## 7. Host orchestration (`aj`)
 
@@ -796,7 +796,7 @@ renderer events so a resumed session looks like a live one. The
   None, error: None }`, where `tokens_after` is
   `estimate_conversation_context` of the user thread linearized up to the
   compaction (the reduced projection's occupancy). This mirrors the live
-  path: a compaction emits no `TurnUsage` and the retained tail's usage
+  path: a compaction emits no `UsageUpdate` and the retained tail's usage
   is stale, so without it a resumed footer would keep showing the
   pre-compaction occupancy. `summary` is omitted to keep replay events
   lean — the durable record is the log's compaction entry.
@@ -883,7 +883,7 @@ Log + projection (`aj-session::log`):
 Replay: a `Compaction` entry yields the summary row; the prefix entries
 still replay into scrollback.
 
-Agent (`aj-agent`): `complete_oneshot` emits no `Message*`/`TurnUsage`
+Agent (`aj-agent`): `complete_oneshot` emits no `Message*`/`UsageUpdate`
 and leaves the transcript untouched (scripted provider);
 `reseed_transcript` replaces the transcript. Event serialization cases
 for `CompactionStart`/`End`.

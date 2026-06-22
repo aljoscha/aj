@@ -312,11 +312,16 @@ pub enum AgentEvent {
         error: String,
     },
 
-    /// Per-turn token usage snapshot. Bridging variant emitted at the
-    /// end of each assistant turn so renderers can show a one-line
-    /// usage indicator without having to re-aggregate from
-    /// [`AgentEvent::MessageEnd`] payloads.
-    TurnUsage {
+    /// Cumulative token-usage snapshot, emitted once at the end of
+    /// each assistant turn. The [`TokenUsage`] payload carries both
+    /// this turn's delta (`turn_*`) and the session running totals
+    /// (`accumulated_*`, which the agent maintains across turns), so a
+    /// renderer can show a usage indicator without re-aggregating from
+    /// [`AgentEvent::MessageEnd`] payloads. Distinct from
+    /// [`AgentEvent::TurnEnd`]: that closes a turn's lifecycle and
+    /// carries the turn's message + tool results, whereas this carries
+    /// the running usage figures.
+    UsageUpdate {
         agent_id: AgentId,
         usage: TokenUsage,
     },
@@ -397,7 +402,7 @@ impl AgentEvent {
             | Self::Warning { agent_id, .. }
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
-            | Self::TurnUsage { agent_id, .. }
+            | Self::UsageUpdate { agent_id, .. }
             | Self::CompactionStart { agent_id, .. }
             | Self::CompactionProgress { agent_id, .. }
             | Self::CompactionEnd { agent_id, .. }

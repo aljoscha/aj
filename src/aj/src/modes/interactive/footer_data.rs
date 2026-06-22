@@ -32,7 +32,7 @@ struct AgentFooter {
     /// indicator.
     context_window: u64,
     /// Prompt size of the agent's most recent turn, `None` until
-    /// the first `TurnUsage` arrives.
+    /// the first `UsageUpdate` arrives.
     last_turn_context_tokens: Option<u64>,
 }
 
@@ -85,7 +85,7 @@ impl AgentFooters {
         );
     }
 
-    /// Fold a freshly-arrived `TurnUsage` into `id`'s entry.
+    /// Fold a freshly-arrived `UsageUpdate` into `id`'s entry.
     ///
     /// The numerator we display is
     /// `turn_input + turn_cache_read + turn_cache_write` — the
@@ -126,7 +126,7 @@ impl AgentFooters {
     }
 
     /// Overwrite `id`'s context-occupancy numerator. Used after a
-    /// compaction reseeds the transcript: no `TurnUsage` follows a
+    /// compaction reseeds the transcript: no `UsageUpdate` follows a
     /// compaction, so without this the footer would keep showing the
     /// pre-compaction occupancy until the next real turn. A missing
     /// entry is left untouched (nothing to display against yet).

@@ -13,9 +13,9 @@ which agent the chat view is observing:
   (`src/aj/src/modes/interactive.rs`, `refresh_footer_model`).
 - The context-occupancy indicator is fed by one `FooterData`
   snapshot in the event pump that deliberately drops every
-  non-main `TurnUsage`
+  non-main `UsageUpdate`
   (`src/aj/src/modes/interactive/event_pump.rs`, the
-  `TurnUsage` arm).
+  `UsageUpdate` arm).
 - `EventPump::set_active_view` switches the transcript, the spinner,
   and the editor's `agent N` marker — but never touches the footer.
 
@@ -55,7 +55,7 @@ When the chat view's active agent is `id`, the footer shows:
   immediately, an in-flight turn keeps the config it captured (same
   wording the run-config docs use for main today).
 - **Context usage**: `tokens/window (p%)` for `id` — numerator from
-  `id`'s last `TurnUsage`, denominator from `id`'s model's context
+  `id`'s last `UsageUpdate`, denominator from `id`'s model's context
   window. `?` before the first usage event; suppressed entirely when
   the window is unknown (existing `context_window == 0` semantics).
 - **Unchanged, view-independent parts**: cwd and the aggregate
@@ -111,7 +111,7 @@ struct AgentFooter {
     /// unknown and suppresses the indicator.
     context_window: u64,
     /// Prompt size of the agent's most recent turn (turn_input +
-    /// cache read + cache write), `None` until the first TurnUsage.
+    /// cache read + cache write), `None` until the first UsageUpdate.
     last_turn_context_tokens: Option<u64>,
 }
 
@@ -131,7 +131,7 @@ API (all keyed by `AgentId`):
 - `note_settings(id, settings, context_window)` — insert-or-replace
   the settings identity, preserving `last_turn_context_tokens` (a
   model swap doesn't erase what the last prompt cost).
-- `record_turn_usage(id, usage)` — fold a `TurnUsage` into `id`'s
+- `record_turn_usage(id, usage)` — fold a `UsageUpdate` into `id`'s
   entry; creates the entry with empty settings if it's somehow
   missing (defensive, e.g. event order in tests).
 - `context_usage(id) -> ContextUsage` — view for the footer; falls
@@ -174,7 +174,7 @@ pub fn new(
   usage for that agent. This centralizes all footer model-line
   writes in the pump; `refresh_footer_model` and the direct
   `footer.set_model(..)` at startup go away (cwd stays where it is).
-- `TurnUsage { agent_id, usage }`: always
+- `UsageUpdate { agent_id, usage }`: always
   `footer_data.record_turn_usage(*agent_id, usage)`; call
   `sync_footer` when `*agent_id` is the active view. The
   per-transcript dim usage lines are unchanged.
@@ -316,7 +316,7 @@ skip validation (same lenient posture as scripted mode).
 
 Replay already synthesizes `SubAgentStart` with the recorded
 `AgentSettings` (or `fallback_settings()` for legacy logs) and
-per-agent `TurnUsage` events; pumping them through
+per-agent `UsageUpdate` events; pumping them through
 `EventPump::handle` populates the per-agent entries like a live run.
 
 Mid-thread settings entries (`ModelChange` / `ThinkingChange` /
@@ -378,7 +378,7 @@ API):
 - Sub usage leaves the footer alone **while main is viewed**
   (existing test, reworded rationale).
 - `SubAgentStart` + switch to the sub view: footer shows the sub's
-  model line and `?/<resolved window>`; its `TurnUsage` then updates
+  model line and `?/<resolved window>`; its `UsageUpdate` then updates
   the indicator live; switching back restores main's line and usage.
 - Window resolution: catalog hit; catalog miss with identity match
   → main's window; full miss → indicator suppressed.
@@ -386,7 +386,7 @@ API):
   repaint; the new line shows after switching back to main.
 - `note_agent_settings` for the viewed sub repaints immediately.
 - A replayed event sequence (`SubAgentStart` with recorded settings,
-  then `TurnUsage(Sub)`) populates the sub view's footer on resume.
+  then `UsageUpdate(Sub)`) populates the sub view's footer on resume.
 
 `interactive.rs` / integration tests (scripted provider):
 

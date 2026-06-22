@@ -673,7 +673,7 @@ impl EventPump {
             }
 
             // ---- Per-turn token usage. ----
-            AgentEvent::TurnUsage { agent_id, usage } => {
+            AgentEvent::UsageUpdate { agent_id, usage } => {
                 self.append_turn_usage(tui, *agent_id, usage);
                 // Every agent's usage folds into its own footer
                 // entry; the footer itself tracks the viewed agent,
@@ -741,7 +741,7 @@ impl EventPump {
                         self.render_settings.clone(),
                     );
                     self.push_chat_child(tui, *agent_id, Box::new(component));
-                    // No `TurnUsage` follows a compaction, so refresh the
+                    // No `UsageUpdate` follows a compaction, so refresh the
                     // footer occupancy directly to the post-compaction
                     // estimate.
                     self.footer_data
@@ -862,7 +862,7 @@ impl EventPump {
             AgentEvent::TurnEnd { .. } => {
                 // The TUI renders incrementally from `MessageStart` /
                 // `MessageUpdate` / `MessageEnd` and the per-turn usage
-                // line from `TurnUsage`, so it needs nothing from
+                // line from `UsageUpdate`, so it needs nothing from
                 // `TurnEnd`'s finalized snapshot. The arm stays
                 // explicit so a future renderer can hook in here
                 // and the exhaustiveness check still flags new
@@ -1421,7 +1421,7 @@ fn agent_picker_hint() -> String {
         .unwrap_or_else(|| "Alt+A".to_string())
 }
 
-/// Render the `Token Usage - ...` line for a single `TurnUsage`
+/// Render the `Token Usage - ...` line for a single `UsageUpdate`
 /// event. Sub-agents are tagged with their `(sub agent N)` prefix
 /// so their per-turn counts stand apart from the main agent's.
 /// Visible for testing.
@@ -1483,7 +1483,7 @@ mod tests {
     /// Build a TokenUsage carrying the supplied per-turn deltas
     /// and the running accumulator state observed *before* this
     /// turn was folded in (`already`). Matches the wire semantic
-    /// on [`aj_agent::events::AgentEvent::TurnUsage`]: each
+    /// on [`aj_agent::events::AgentEvent::UsageUpdate`]: each
     /// `accumulated_*` field is the running total before this
     /// turn, and `turn_*` is the delta the turn is contributing
     /// on top.
@@ -1855,7 +1855,7 @@ mod tests {
 
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
                 usage: token_usage([1_000, 999, 50, 200], [0, 0, 0, 0]),
             },
@@ -1883,7 +1883,7 @@ mod tests {
 
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Sub(1),
                 usage: token_usage([5_000, 1_000, 200, 100], [0, 0, 0, 0]),
             },
@@ -1892,7 +1892,7 @@ mod tests {
         assert_eq!(
             rendered_footer(&mut tui),
             before,
-            "sub-agent TurnUsage should not move the main footer indicator",
+            "sub-agent UsageUpdate should not move the main footer indicator",
         );
     }
 
@@ -1904,7 +1904,7 @@ mod tests {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
                 usage: token_usage([10_000, 0, 0, 0], [0, 0, 0, 0]),
             },
@@ -1946,7 +1946,7 @@ mod tests {
             fresh_tui_with_catalog(vec![catalog_model("openai", "gpt-sub", 400_000)]);
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
                 usage: token_usage([10_000, 0, 0, 0], [0, 0, 0, 0]),
             },
@@ -1963,7 +1963,7 @@ mod tests {
         // A sub turn updates the viewed footer live.
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Sub(1),
                 usage: token_usage([4_000, 0, 0, 0], [0, 0, 0, 0]),
             },
@@ -2047,7 +2047,7 @@ mod tests {
     #[test]
     fn replayed_spawn_and_usage_populate_the_sub_views_footer() {
         // Replay synthesizes `SubAgentStart` with the recorded
-        // settings followed by per-agent `TurnUsage` events; pumping
+        // settings followed by per-agent `UsageUpdate` events; pumping
         // them through `handle` must populate the sub view's footer
         // like a live run.
         let (mut tui, mut pump, _theme) =
@@ -2055,7 +2055,7 @@ mod tests {
         pump.handle(&mut tui, &sub_agent_start(1, "openai", "gpt-sub"));
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Sub(1),
                 usage: token_usage([4_000, 0, 0, 0], [0, 0, 0, 0]),
             },
@@ -2385,8 +2385,8 @@ mod tests {
     }
 
     #[test]
-    fn turn_usage_event_appends_one_chat_row() {
-        // End-to-end: dispatch a `TurnUsage` event and verify a
+    fn usage_update_event_appends_one_chat_row() {
+        // End-to-end: dispatch a `UsageUpdate` event and verify a
         // new child landed in the chat container with the
         // formatted line inside it (the dim escape wraps the
         // visible body verbatim, so `.contains` is enough).
@@ -2401,7 +2401,7 @@ mod tests {
         let usage = token_usage([42, 17, 0, 3], [0, 0, 0, 0]);
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
                 usage,
             },
@@ -2413,7 +2413,7 @@ mod tests {
         assert_eq!(
             chat.len(),
             chat_len_before + 1,
-            "TurnUsage should append exactly one chat row",
+            "UsageUpdate should append exactly one chat row",
         );
         let row = chat
             .get_mut_as::<aj_tui::components::text::Text>(chat_len_before)
@@ -2527,7 +2527,7 @@ mod tests {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         pump.handle(
             &mut tui,
-            &AgentEvent::TurnUsage {
+            &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
                 usage: token_usage([10, 5, 0, 0], [0, 0, 0, 0]),
             },

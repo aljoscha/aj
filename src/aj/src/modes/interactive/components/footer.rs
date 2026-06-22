@@ -3,7 +3,7 @@
 //! Renders a single dim row underneath the editor with the model
 //! name, working directory, and a context-window occupancy
 //! indicator. State is mutated through the typed setters below
-//! so the event pump can refresh individual fields as `TurnUsage`
+//! so the event pump can refresh individual fields as `UsageUpdate`
 //! / `Notice` events arrive.
 //!
 //! Theming (the color thresholds on the context-occupancy

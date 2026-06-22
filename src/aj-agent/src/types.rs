@@ -2,7 +2,7 @@
 //!
 //! [`TokenUsage`], [`SubAgentUsage`], and [`UsageSummary`] are
 //! structured token-count snapshots the renderer formats.
-//! [`TokenUsage`] rides on [`crate::events::AgentEvent::TurnUsage`]
+//! [`TokenUsage`] rides on [`crate::events::AgentEvent::UsageUpdate`]
 //! at the end of every assistant turn; the summary types are
 //! synthesized by the binary at end-of-session.
 
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// `docs/models-spec.md` §1.3.
 ///
 /// Polling [`crate::Agent::accumulated_usage`] *between* turns
-/// returns the post-add total (i.e. the next `TurnUsage` event's
+/// returns the post-add total (i.e. the next `UsageUpdate` event's
 /// `accumulated_* + turn_*`), so a consumer that needs the
 /// "current running total at any instant" can either read the
 /// getter or maintain its own sum off the bus events.

@@ -39,7 +39,7 @@ The `agent` builtin (`src/aj-tools/src/tools/agent.rs`) calls
   failure — the report carries the error string on failure).
 
 Because the bus is shared, **every** child event (`AgentStart/End`,
-`TurnStart`, `MessageStart/Update/End`, `ToolExecution*`, `TurnUsage`)
+`TurnStart`, `MessageStart/Update/End`, `ToolExecution*`, `UsageUpdate`)
 reaches the parent's listeners tagged with `AgentId::Sub(n)`. The
 parent *model* only ever sees the final text report (the tool result);
 the intermediate events are for the UI and persistence.
@@ -63,7 +63,7 @@ sub-agent. `AgentId` is `Main | Sub(usize)`
   calls are appended into the **same** chat `Container` as the main
   agent, interleaved with no grouping.
 - `SubAgentStart` / `SubAgentEnd` are **no-op placeholders**.
-- `TurnUsage { Sub(n) }` appends a dim `(sub agent N) Token Usage…` row
+- `UsageUpdate { Sub(n) }` appends a dim `(sub agent N) Token Usage…` row
   to the shared scrollback and does **not** move the footer.
 - `AgentStart/End` drive only the loader spinner via a
   `running_agents: HashSet<AgentId>` refcount. Main's `AgentEnd` is the
@@ -428,7 +428,7 @@ Event handling changes:
   "don't clear main" handling — each agent owns its own map). Keep
   Main's `AgentEnd` as the authoritative loader drain.
 - `TurnStart { agent_id }`: reset that agent's `current_assistant`.
-- `TurnUsage { Sub(n) }`: route the dim usage row into box n's inner
+- `UsageUpdate { Sub(n) }`: route the dim usage row into box n's inner
   container (not the shared scrollback). `Main` unchanged (drives
   footer).
 

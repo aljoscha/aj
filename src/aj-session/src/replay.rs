@@ -24,7 +24,7 @@
 //! - [`ConversationEntryKind::Message`] (assistant): one
 //!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair
 //!   wrapping the projected [`AssistantMessage`], followed by an
-//!   [`AgentEvent::TurnUsage`] carrying the per-turn `usage`
+//!   [`AgentEvent::UsageUpdate`] carrying the per-turn `usage`
 //!   recorded on the assistant message and a running
 //!   accumulated total. Listeners (the TUI footer, end-of-session
 //!   summaries) therefore see the same shape on resume as on a
@@ -59,7 +59,7 @@
 //! - [`ConversationEntryKind::Compaction`]: a single
 //!   [`AgentEvent::CompactionEnd`] marking the boundary, mirroring the
 //!   live path so the footer occupancy drops to the reduced size (no
-//!   `TurnUsage` follows a compaction, and the retained tail's usage is
+//!   `UsageUpdate` follows a compaction, and the retained tail's usage is
 //!   stale). The summarized prefix entries still replay in order, so
 //!   the scrollback shows the full history even though the model
 //!   context (rebuilt via `agent_messages`) is the reduced projection.
@@ -118,12 +118,12 @@ struct ReplayState {
     tool_calls: HashMap<String, (String, Value)>,
     /// Per-agent accumulated [`Usage`] running totals, used to
     /// build the `accumulated_*` fields on synthesized
-    /// [`AgentEvent::TurnUsage`] events. The map starts empty and
+    /// [`AgentEvent::UsageUpdate`] events. The map starts empty and
     /// grows on demand the first time we see an assistant message
     /// for an [`AgentId`]; the value stored at `agent_id` is the
     /// accumulator *as observed before* the next turn is emitted,
     /// matching the live agent's event order (see
-    /// `aj_agent::Agent::prompt`: `TurnUsage` carries the
+    /// `aj_agent::Agent::prompt`: `UsageUpdate` carries the
     /// pre-add total, and the per-turn delta is added afterwards).
     usage_accumulators: HashMap<AgentId, Usage>,
     /// The `Sub(n)` index of the sub-agent run currently being
@@ -311,7 +311,7 @@ impl ReplayState {
                 ..
             } => {
                 // Mirror the live path: a compaction reduces context
-                // but emits no `TurnUsage`, and the retained tail's
+                // but emits no `UsageUpdate`, and the retained tail's
                 // assistant `usage` is stale, so the footer would keep
                 // showing the pre-compaction occupancy without this.
                 // `tokens_after` is the occupancy of the reduced
@@ -423,13 +423,13 @@ impl ReplayState {
             self.open_sub_report = report;
         }
 
-        // Synthesize the matching `TurnUsage`. Live runs emit one
+        // Synthesize the matching `UsageUpdate`. Live runs emit one
         // per assistant turn on the bus; without this resumed
         // sessions would only paint the footer's context indicator
         // (and any other usage listener) starting from the first
         // post-resume turn, even though every persisted assistant
         // message has its `usage` on disk. Ordering matches the
-        // live agent: `TurnUsage.accumulated_*` reflects the total
+        // live agent: `UsageUpdate.accumulated_*` reflects the total
         // *before* this turn is folded in, then we add the per-turn
         // delta into the accumulator for the next emission.
         let acc = self.usage_accumulators.entry(agent_id).or_default();
@@ -443,7 +443,7 @@ impl ReplayState {
             accumulated_cache_read: acc.cache_read,
             turn_cache_read: assistant.usage.cache_read,
         };
-        out.push(AgentEvent::TurnUsage {
+        out.push(AgentEvent::UsageUpdate {
             agent_id,
             usage: turn_usage,
         });
@@ -680,7 +680,7 @@ mod tests {
         //   MessageEnd(User "hi")
         //   MessageStart(Assistant empty)
         //   MessageEnd(Assistant {thinking, text, tool_call})
-        //   TurnUsage(Main)
+        //   UsageUpdate(Main)
         //   ToolExecutionStart { tool: "read_file", call_id: "call-1", args }
         //   MessageStart(ToolResult)
         //   MessageEnd(ToolResult)
@@ -709,13 +709,13 @@ mod tests {
             other => panic!("expected assistant MessageEnd, got {other:?}"),
         }
 
-        // TurnUsage immediately follows the assistant MessageEnd —
+        // UsageUpdate immediately follows the assistant MessageEnd —
         // same shape and ordering the live agent uses on its bus.
         match &events[4] {
-            AgentEvent::TurnUsage { agent_id, .. } => {
+            AgentEvent::UsageUpdate { agent_id, .. } => {
                 assert_eq!(*agent_id, AgentId::Main);
             }
-            other => panic!("expected TurnUsage, got {other:?}"),
+            other => panic!("expected UsageUpdate, got {other:?}"),
         }
 
         match &events[5] {
@@ -1088,13 +1088,13 @@ mod tests {
     }
 
     /// Two persisted main-agent assistant turns produce two
-    /// synthesized `TurnUsage` events. The first carries its
+    /// synthesized `UsageUpdate` events. The first carries its
     /// per-turn deltas against a zero accumulator; the second
     /// carries its deltas against an accumulator equal to the
     /// first turn's contribution (live-agent ordering: emit
     /// before adding into the accumulator).
     #[test]
-    fn replay_synthesizes_turn_usage_per_assistant_message() {
+    fn replay_synthesizes_usage_update_per_assistant_message() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -1128,14 +1128,18 @@ mod tests {
         let turn_usages: Vec<&aj_agent::types::TokenUsage> = events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::TurnUsage {
+                AgentEvent::UsageUpdate {
                     agent_id: AgentId::Main,
                     usage,
                 } => Some(usage),
                 _ => None,
             })
             .collect();
-        assert_eq!(turn_usages.len(), 2, "one TurnUsage per assistant message");
+        assert_eq!(
+            turn_usages.len(),
+            2,
+            "one UsageUpdate per assistant message"
+        );
 
         let first = turn_usages[0];
         assert_eq!(first.turn_input, 100);
@@ -1153,7 +1157,7 @@ mod tests {
         assert_eq!(second.turn_cache_read, 30);
         assert_eq!(second.turn_cache_write, 10);
         // After the first turn was emitted the accumulator
-        // absorbed the first turn's deltas; the second TurnUsage
+        // absorbed the first turn's deltas; the second UsageUpdate
         // sees those as its `accumulated_*`.
         assert_eq!(second.accumulated_input, 100);
         assert_eq!(second.accumulated_output, 50);
@@ -1292,23 +1296,23 @@ mod tests {
         let main_turn = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::TurnUsage {
+                AgentEvent::UsageUpdate {
                     agent_id: AgentId::Main,
                     usage,
                 } => Some(usage),
                 _ => None,
             })
-            .expect("main TurnUsage present");
+            .expect("main UsageUpdate present");
         let sub_turn = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::TurnUsage {
+                AgentEvent::UsageUpdate {
                     agent_id: AgentId::Sub(1),
                     usage,
                 } => Some(usage),
                 _ => None,
             })
-            .expect("sub(1) TurnUsage present");
+            .expect("sub(1) UsageUpdate present");
 
         // Each agent's first turn has a zero accumulator — they
         // don't share state.
