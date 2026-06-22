@@ -26,7 +26,8 @@ use aj_models::openai::responses::{
 };
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::types::{
-    AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
+    AssistantContent, AssistantMessage, ErrorCategory, StopReason, TextContent, ThinkingContent,
+    ToolCall, Usage,
 };
 
 use crate::common::{assert_content_eq, parse_sse, read_fixture, read_fixture_json};
@@ -295,4 +296,66 @@ fn serialize_tool_call() {
 #[test]
 fn semantic_roundtrip_tool_call() {
     run_semantic_roundtrip_test("tool_call", canonical_tool_call());
+}
+
+// ---------------------------------------------------------------------------
+// Error / truncation scenarios
+//
+// An errored or truncated turn is never serialized back into a request
+// item, so these scenarios only assert the terminal classification
+// (`stop_reason` + `error.category`) and that partial content survives.
+// They pin the §10.3 / §7.3.8 terminal legs against captured wire
+// fixtures.
+// ---------------------------------------------------------------------------
+
+/// Replay an SSE fixture and return the finalized message.
+fn replay_fixture(scenario: &str) -> AssistantMessage {
+    replay_sse_events(&fixture_model(), load_sse(scenario), None)
+}
+
+fn first_text(msg: &AssistantMessage) -> &str {
+    match msg.content.first() {
+        Some(AssistantContent::Text(t)) => &t.text,
+        other => panic!("expected leading Text block, got {other:?}"),
+    }
+}
+
+#[test]
+fn truncated_stream_is_transient_error() {
+    // A stream that ends before any terminal lifecycle event
+    // (`response.completed` / `.incomplete` / `.failed`) is a mid-flight
+    // drop: a retryable transient error with partial deltas preserved.
+    let parsed = replay_fixture("truncated");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Transient)
+    );
+    assert_eq!(first_text(&parsed), "This answer was cut o");
+}
+
+#[test]
+fn incomplete_length_is_clean_done() {
+    // §7.3.8: a `response.incomplete` with `incomplete_details.reason:
+    // max_output_tokens` is a *length cutoff* — a clean `Done(Length)`,
+    // not an error. This is the positive control that distinguishes a
+    // real length stop from a transport truncation.
+    let parsed = replay_fixture("incomplete_length");
+    assert_eq!(parsed.stop_reason, StopReason::Length);
+    assert!(parsed.error.is_none());
+    assert_eq!(first_text(&parsed), "A long answer that ran out of room");
+}
+
+#[test]
+fn response_failed_is_classified_error() {
+    // A `response.failed` terminates with an error whose category derives
+    // from the wire error code. A bare `server_error` carries no HTTP
+    // status on the SSE frame, so it lands in `Unknown` (deliberately not
+    // auto-retried) rather than `Transient`.
+    let parsed = replay_fixture("response_failed");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Unknown)
+    );
 }

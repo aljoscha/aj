@@ -1,0 +1,5 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_failed_1","object":"response","created_at":0,"model":"gpt-5","output":[],"parallel_tool_calls":true,"tools":[],"status":"in_progress"}}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_failed_1","object":"response","created_at":0,"model":"gpt-5","output":[],"parallel_tool_calls":true,"tools":[],"status":"failed","error":{"code":"server_error","message":"The model encountered an error while generating the response."}}}

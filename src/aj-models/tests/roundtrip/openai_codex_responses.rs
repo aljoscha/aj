@@ -36,7 +36,8 @@ use aj_models::openai::codex::{
 use aj_models::openai::responses::TextSignatureV1;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::types::{
-    AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
+    AssistantContent, AssistantMessage, ErrorCategory, StopReason, TextContent, ThinkingContent,
+    ToolCall, Usage,
 };
 
 use crate::common::{assert_content_eq, parse_sse, read_fixture, read_fixture_json};
@@ -366,4 +367,56 @@ fn legacy_done_terminator_normalized() {
     assert_eq!(parsed.response_id.as_deref(), Some("resp_codex_legacy_1"));
     assert_eq!(parsed.usage.input, 10);
     assert_eq!(parsed.usage.output, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Error / truncation scenarios
+//
+// An errored or truncated turn is never serialized back into a request
+// item, so these scenarios only assert the terminal classification
+// (`stop_reason` + `error.category`). They pin the §10.3 / §7.4.5
+// terminal legs against captured wire fixtures.
+// ---------------------------------------------------------------------------
+
+/// Replay an SSE fixture and return the finalized message.
+fn replay_fixture(scenario: &str) -> AssistantMessage {
+    replay_sse_events(&fixture_model(), load_sse(scenario), None)
+}
+
+#[test]
+fn truncated_stream_is_transient_error() {
+    // A stream that ends before any terminal lifecycle event is a
+    // mid-flight drop: a retryable transient error with partial deltas
+    // preserved.
+    let parsed = replay_fixture("truncated");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Transient)
+    );
+    match parsed.content.first() {
+        Some(AssistantContent::Text(t)) => assert_eq!(t.text, "This answer was cut o"),
+        other => panic!("expected preserved partial text, got {other:?}"),
+    }
+}
+
+#[test]
+fn error_frame_is_classified_error() {
+    // A top-level `error` frame (here `rate_limit_exceeded`) short-
+    // circuits through `normalize_codex_event`'s `Err` arm, so the turn
+    // finalizes with the classified category. NOTE: unlike the public
+    // Responses adapter, the Codex error path discards the partial
+    // content accumulated so far (the M4 "divergent terminal-error
+    // handling" finding); this asserts that current behavior.
+    let parsed = replay_fixture("error_frame");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::RateLimit)
+    );
+    assert!(
+        parsed.content.is_empty(),
+        "Codex error path drops the partial; got {:?}",
+        parsed.content
+    );
 }

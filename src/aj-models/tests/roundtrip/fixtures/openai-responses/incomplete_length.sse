@@ -1,0 +1,14 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_incomplete_1","object":"response","created_at":0,"model":"gpt-5","output":[],"parallel_tool_calls":true,"tools":[],"status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_incomplete_1","content":[],"role":"assistant","status":"in_progress"}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":2,"item_id":"msg_incomplete_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_incomplete_1","output_index":0,"content_index":0,"delta":"A long answer that ran out of room"}
+
+event: response.incomplete
+data: {"type":"response.incomplete","sequence_number":4,"response":{"id":"resp_incomplete_1","object":"response","created_at":0,"model":"gpt-5","output":[],"parallel_tool_calls":true,"tools":[],"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":12,"output_tokens":50,"total_tokens":62,"input_tokens_details":{"cached_tokens":0}}}}

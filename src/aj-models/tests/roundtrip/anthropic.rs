@@ -23,7 +23,8 @@ use aj_models::anthropic::provider::{
 };
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::types::{
-    AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
+    AssistantContent, AssistantMessage, ErrorCategory, StopReason, TextContent, ThinkingContent,
+    ToolCall, Usage,
 };
 
 use crate::common::{assert_content_eq, parse_sse, read_fixture, read_fixture_json};
@@ -334,4 +335,71 @@ fn serialize_redacted_thinking() {
 #[test]
 fn semantic_roundtrip_redacted_thinking() {
     run_semantic_roundtrip_test("redacted_thinking", canonical_redacted_thinking());
+}
+
+// ---------------------------------------------------------------------------
+// Error / truncation scenarios
+//
+// Unlike the happy-path trio, an errored or truncated turn is never
+// serialized back into a request item (the agent retries or surfaces the
+// error instead), so these scenarios only assert the terminal
+// classification the adapter produces — `stop_reason` plus
+// `error.category` — and that any partial content accumulated before the
+// failure survives. They pin the §10.3 error legs against captured wire
+// fixtures rather than hand-built events, the same way the happy path is
+// pinned.
+// ---------------------------------------------------------------------------
+
+/// Replay an SSE fixture and return the finalized message. Thin wrapper
+/// over the happy-path loader so the error scenarios share the exact
+/// same parse path.
+fn replay_fixture(scenario: &str) -> AssistantMessage {
+    replay_sse_events(&fixture_model(), load_sse(scenario))
+}
+
+fn first_text(msg: &AssistantMessage) -> &str {
+    match msg.content.first() {
+        Some(AssistantContent::Text(t)) => &t.text,
+        other => panic!("expected leading Text block, got {other:?}"),
+    }
+}
+
+#[test]
+fn truncated_stream_is_transient_error() {
+    // A byte stream that drops after content but before `message_stop`
+    // must finalize as a retryable transient error, not a `Done`, and
+    // must preserve the partial deltas (the R1 bug this fixture guards).
+    let parsed = replay_fixture("truncated");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Transient)
+    );
+    assert_eq!(first_text(&parsed), "This answer was cut o");
+}
+
+#[test]
+fn mid_stream_error_frame_is_classified_error() {
+    // A mid-stream `error` frame (here `overloaded_error`) terminates the
+    // turn with the classified category and keeps the partial content.
+    let parsed = replay_fixture("error_frame");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Overloaded)
+    );
+    assert_eq!(first_text(&parsed), "Working on it");
+}
+
+#[test]
+fn refusal_stop_reason_is_content_filter() {
+    // A `message_delta` carrying `stop_reason: refusal` + refusal
+    // `stop_details` finalizes as a content-filter error.
+    let parsed = replay_fixture("refusal");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::ContentFilter)
+    );
+    assert_eq!(first_text(&parsed), "I can't help with that.");
 }

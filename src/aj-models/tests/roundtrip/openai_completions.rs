@@ -33,7 +33,8 @@ use aj_models::openai::provider::{
 };
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::types::{
-    AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
+    AssistantContent, AssistantMessage, ErrorCategory, StopReason, TextContent, ThinkingContent,
+    ToolCall, Usage,
 };
 
 use crate::common::{assert_content_eq, parse_sse, read_fixture, read_fixture_json};
@@ -363,4 +364,52 @@ fn serialize_reasoning_text() {
 #[test]
 fn semantic_roundtrip_reasoning_text() {
     run_semantic_roundtrip_drops_reasoning("reasoning_text", canonical_reasoning_text());
+}
+
+// ---------------------------------------------------------------------------
+// Error / truncation scenarios
+//
+// An errored or truncated turn is never serialized back into a request
+// item, so these scenarios only assert the terminal classification
+// (`stop_reason` + `error.category`) and that partial content survives.
+// They pin the §10.3 error legs against captured wire fixtures.
+// ---------------------------------------------------------------------------
+
+/// Replay an SSE fixture and return the finalized message.
+fn replay_fixture(scenario: &str) -> AssistantMessage {
+    replay_sse_events(&fixture_model(), load_sse(scenario))
+}
+
+fn first_text(msg: &AssistantMessage) -> &str {
+    match msg.content.first() {
+        Some(AssistantContent::Text(t)) => &t.text,
+        other => panic!("expected leading Text block, got {other:?}"),
+    }
+}
+
+#[test]
+fn truncated_stream_is_transient_error() {
+    // A stream that ends with no `finish_reason` chunk (and no `[DONE]`)
+    // is a mid-flight drop: a retryable transient error, not a `Done`,
+    // with the partial deltas preserved.
+    let parsed = replay_fixture("truncated");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Transient)
+    );
+    assert_eq!(first_text(&parsed), "This answer was cut o");
+}
+
+#[test]
+fn content_filter_finish_is_classified_error() {
+    // A `finish_reason: content_filter` chunk finalizes as a
+    // content-filter error rather than a successful stop.
+    let parsed = replay_fixture("content_filter");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::ContentFilter)
+    );
+    assert_eq!(first_text(&parsed), "Here is the first part");
 }

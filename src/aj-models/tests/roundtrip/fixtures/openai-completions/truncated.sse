@@ -1,0 +1,3 @@
+data: {"id":"chatcmpl_round_trip_truncated","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_round_trip_truncated","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"This answer was cut o"},"finish_reason":null}]}
