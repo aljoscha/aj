@@ -1601,6 +1601,7 @@ mod tests {
             model_id: "claude-main".into(),
             thinking: "off".into(),
             speed: "standard".into(),
+            verbosity: "default".into(),
         }
     }
 
@@ -1703,6 +1704,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![aj_models::registry::InputModality::Text],
             cost: aj_models::registry::ModelCost::default(),
             context_window,
@@ -1723,6 +1725,7 @@ mod tests {
                 model_id: model_id.into(),
                 thinking: "off".into(),
                 speed: "standard".into(),
+                verbosity: "default".into(),
             },
         }
     }
@@ -1826,6 +1829,7 @@ mod tests {
                 model_id: "claude-next".into(),
                 thinking: "high".into(),
                 speed: "standard".into(),
+                verbosity: "default".into(),
             },
             100_000,
         );
@@ -1929,6 +1933,7 @@ mod tests {
                 model_id: "claude-next".into(),
                 thinking: "max".into(),
                 speed: "standard".into(),
+                verbosity: "default".into(),
             },
             100_000,
         );
@@ -2793,6 +2798,7 @@ mod tests {
                     model_id: "scripted-model".into(),
                     thinking: "off".into(),
                     speed: "standard".into(),
+                    verbosity: "default".into(),
                 },
             },
         );
@@ -2856,6 +2862,7 @@ mod tests {
                         model_id: "scripted-model".into(),
                         thinking: "off".into(),
                         speed: "standard".into(),
+                        verbosity: "default".into(),
                     },
                 },
             );
@@ -3292,6 +3299,7 @@ mod tests {
                     model_id: "scripted-model".into(),
                     thinking: "off".into(),
                     speed: "standard".into(),
+                    verbosity: "default".into(),
                 },
             },
         );
@@ -3365,6 +3373,7 @@ mod tests {
                     model_id: "scripted-model".into(),
                     thinking: "off".into(),
                     speed: "standard".into(),
+                    verbosity: "default".into(),
                 },
             },
         );
@@ -3449,6 +3458,7 @@ mod tests {
                     model_id: "scripted-model".into(),
                     thinking: "off".into(),
                     speed: "standard".into(),
+                    verbosity: "default".into(),
                 },
             },
         );
@@ -3524,6 +3534,7 @@ mod tests {
                     model_id: "scripted-model".into(),
                     thinking: "off".into(),
                     speed: "standard".into(),
+                    verbosity: "default".into(),
                 },
             },
         );

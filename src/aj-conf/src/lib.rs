@@ -785,6 +785,7 @@ fn item_value_repr(item: &Option<toml_edit::Item>) -> Option<String> {
 /// model_url = "https://api.anthropic.com"
 /// thinking = "low"
 /// thinking_display = "summarized"
+/// verbosity = "low"
 /// theme = "dark"
 /// disabled_tools = ["todo_read", "todo_write"]
 /// disabled_skills = ["tmux-subagents"]
@@ -811,6 +812,13 @@ pub struct Config {
     /// Inference speed mode (Anthropic only). `fast` enables higher
     /// output-tokens-per-second at some quality cost.
     pub speed: Option<ConfigSpeed>,
+    /// Output verbosity (`text.verbosity`): the visible answer-length
+    /// knob. Defaults to unset (the provider's server default). Only
+    /// takes effect for models that support it (the gpt-5 family on
+    /// the OpenAI Responses / Codex wire); ignored elsewhere. See
+    /// [`ConfigVerbosity`]. Distinct from `thinking_display`, which
+    /// controls the reasoning channel rather than the answer.
+    pub verbosity: Option<ConfigVerbosity>,
     /// Interactive TUI theme name. Resolved against the bundled
     /// catalog (`dark`, `light`) plus any `*.json` files in
     /// `~/.aj/themes/`. Defaults to `light` when unset.
@@ -878,6 +886,7 @@ impl Default for Config {
             thinking: Some(ConfigThinkingLevel::XHigh),
             thinking_display: Some(ConfigThinkingDisplay::Summarized),
             speed: None,
+            verbosity: None,
             theme: None,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
@@ -920,6 +929,46 @@ impl FromStr for ConfigSpeed {
             "standard" => Ok(ConfigSpeed::Standard),
             "fast" => Ok(ConfigSpeed::Fast),
             _ => Err(format!("invalid speed '{s}': expected standard or fast")),
+        }
+    }
+}
+
+/// Output verbosity set in `config.toml`, mapping to OpenAI's
+/// `text.verbosity` (the answer-length knob). Leaving the key unset is
+/// the cross-provider default (server default applies). Only takes
+/// effect for models that support it (the gpt-5 family on the OpenAI
+/// Responses / Codex wire); other models and providers ignore it. This
+/// is distinct from `thinking_display`, which controls the reasoning
+/// channel, not the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigVerbosity {
+    Low,
+    Medium,
+    High,
+}
+
+impl fmt::Display for ConfigVerbosity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigVerbosity::Low => write!(f, "low"),
+            ConfigVerbosity::Medium => write!(f, "medium"),
+            ConfigVerbosity::High => write!(f, "high"),
+        }
+    }
+}
+
+impl FromStr for ConfigVerbosity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(ConfigVerbosity::Low),
+            "medium" => Ok(ConfigVerbosity::Medium),
+            "high" => Ok(ConfigVerbosity::High),
+            _ => Err(format!(
+                "invalid verbosity '{s}': expected low, medium, or high"
+            )),
         }
     }
 }
@@ -1000,6 +1049,17 @@ impl Config {
             },
             display_fn: |c| display_opt(&c.speed),
             to_toml_fn: |c| opt_value_item(&c.speed),
+        },
+        ConfigOption {
+            name: "verbosity",
+            description: "Output answer verbosity (only models that support it, e.g. OpenAI gpt-5).",
+            kind: ValueKind::Enum(&["low", "medium", "high"]),
+            apply_toml_fn: |v, c| {
+                c.verbosity = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.verbosity),
+            to_toml_fn: |c| opt_value_item(&c.verbosity),
         },
         ConfigOption {
             name: "theme",
@@ -1921,6 +1981,7 @@ model_name = "x"
 thinking = "low"
 thinking_display = "summarized"
 speed = "fast"
+verbosity = "low"
 theme = "dark"
 disabled_tools = ["bash"]
 disabled_skills = ["scratch"]
@@ -1939,6 +2000,7 @@ hide_thinking_block = true
             Some(ConfigThinkingDisplay::Summarized)
         );
         assert_eq!(config.speed, Some(ConfigSpeed::Fast));
+        assert_eq!(config.verbosity, Some(ConfigVerbosity::Low));
         assert_eq!(config.theme.as_deref(), Some("dark"));
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
         assert_eq!(config.disabled_skills, vec!["scratch".to_string()]);

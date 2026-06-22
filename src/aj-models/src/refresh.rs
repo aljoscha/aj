@@ -525,6 +525,11 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         // models.
         supports_adaptive_thinking: fixed.api == "anthropic-messages"
             && m.reasoning.unwrap_or(false),
+        // §3.4.4: `supports_verbosity` is not in models.dev. The
+        // OpenAI gpt-5 family on the Responses wire honours
+        // `text.verbosity`; older OpenAI models and other providers
+        // don't. Pinnable per model via overrides for exceptions.
+        supports_verbosity: fixed.api == "openai-responses" && id.starts_with("gpt-5"),
         input,
         cost: ModelCost {
             input: cost.and_then(|c| c.input).unwrap_or(0.0),
@@ -566,6 +571,9 @@ fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
         reasoning: m.supported_parameters.iter().any(|p| p == "reasoning"),
         // Adaptive thinking is an Anthropic-native concept.
         supports_adaptive_thinking: false,
+        // OpenRouter publishes per-model accepted params; `"verbosity"`
+        // there means the model honours OpenAI's `text.verbosity`.
+        supports_verbosity: m.supported_parameters.iter().any(|p| p == "verbosity"),
         input,
         cost: ModelCost {
             input: openrouter_price_per_million(pricing.and_then(|p| p.prompt.as_deref())),

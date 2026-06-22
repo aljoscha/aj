@@ -109,6 +109,19 @@ pub struct ModelInfo {
     /// fixtures); the catalog writes the value explicitly.
     #[serde(default)]
     pub supports_adaptive_thinking: bool,
+    /// Whether the model honours OpenAI's `text.verbosity` parameter
+    /// (the answer-length knob, see [`crate::types::Verbosity`]). The
+    /// gpt-5 family on the Responses / Codex wire supports it; older
+    /// OpenAI models and non-OpenAI models do not. Gates whether a
+    /// caller-set verbosity reaches the request: unsupported models
+    /// silently ignore the knob rather than 400.
+    ///
+    /// Not in models.dev. Derived in the refresh mapper (the OpenAI
+    /// gpt-5 family on `openai-responses`, and OpenRouter's
+    /// `supported_parameters`), hand-set on the Codex seed, and
+    /// pinnable per model via overrides. The serde default is `false`.
+    #[serde(default)]
+    pub supports_verbosity: bool,
     /// Supported input modalities.
     pub input: Vec<InputModality>,
     /// Pricing per million tokens.
@@ -180,6 +193,8 @@ pub struct OverridePatch {
     pub reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_adaptive_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_verbosity: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Vec<InputModality>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +391,12 @@ pub fn models_are_equal(a: &ModelInfo, b: &ModelInfo) -> bool {
 /// accessor over [`ModelInfo::supports_adaptive_thinking`].
 pub fn supports_adaptive_thinking(model: &ModelInfo) -> bool {
     model.supports_adaptive_thinking
+}
+
+/// Whether the model honours OpenAI's `text.verbosity` parameter.
+/// Thin accessor over [`ModelInfo::supports_verbosity`].
+pub fn supports_verbosity(model: &ModelInfo) -> bool {
+    model.supports_verbosity
 }
 
 /// Validate a requested [`ThinkingLevel`] against a model's wire
@@ -596,6 +617,9 @@ pub(crate) fn apply_override(models: &mut [ModelInfo], entry: &OverrideEntry) {
     if let Some(v) = p.supports_adaptive_thinking {
         model.supports_adaptive_thinking = v;
     }
+    if let Some(v) = p.supports_verbosity {
+        model.supports_verbosity = v;
+    }
     if let Some(v) = &p.input {
         model.input = v.clone();
     }
@@ -631,6 +655,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 3.0,
@@ -942,6 +967,7 @@ mod tests {
             base_url: "https://chatgpt.com/backend-api".into(),
             reasoning: true,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text, InputModality::Image],
             cost: ModelCost {
                 input: 9.99,
@@ -988,6 +1014,7 @@ mod tests {
             base_url: "https://api.anthropic.com".into(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 1,

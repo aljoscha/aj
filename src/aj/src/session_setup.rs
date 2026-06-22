@@ -19,8 +19,11 @@ use aj_conf::{AgentEnv, Config, ConfigSpeed};
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
-use aj_models::types::{Speed, StreamOptions, ThinkingLevel};
-use aj_models::{ThinkingConfig, speed_name, thinking_config_from_name, thinking_config_name};
+use aj_models::types::{Speed, StreamOptions, ThinkingLevel, Verbosity};
+use aj_models::{
+    ThinkingConfig, speed_name, thinking_config_from_name, thinking_config_name,
+    verbosity_from_name, verbosity_name,
+};
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, repair_interrupted_tool_uses,
 };
@@ -95,6 +98,7 @@ fn build_run_config(
     speed: Option<Speed>,
 ) -> RunConfigSnapshot {
     crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
+    crate::model::apply_verbosity(&mut stream_options, config.verbosity);
     RunConfigSnapshot {
         provider,
         model_info,
@@ -231,6 +235,7 @@ pub(crate) fn restore_session_settings(
                     &mut cfg.stream_options,
                     config.thinking_display,
                 );
+                crate::model::apply_verbosity(&mut cfg.stream_options, config.verbosity);
                 cfg.model_key = (prov.clone(), id.clone());
                 notices.push(format!("Restored model {name} ({prov}/{id}) from session."));
             }
@@ -254,6 +259,7 @@ pub(crate) fn restore_session_settings(
                     &mut cfg.stream_options,
                     config.thinking_display,
                 );
+                crate::model::apply_verbosity(&mut cfg.stream_options, config.verbosity);
             }
             Err(err) => {
                 tracing::warn!("could not rebuild bundle for restored speed: {err:#}");
@@ -261,6 +267,19 @@ pub(crate) fn restore_session_settings(
                     "Couldn't apply the session's recorded speed: {err:#}"
                 ));
             }
+        }
+    }
+
+    // Verbosity, re-applied onto the (possibly just-rebuilt) stream
+    // options. A recorded value wins over the config default; an
+    // unknown string keeps the current value rather than guessing.
+    if let Some(verbosity_str) = settings.verbosity.as_deref() {
+        let current = verbosity_name(cfg.stream_options.verbosity);
+        match verbosity_from_name(verbosity_str) {
+            Some(v) => cfg.stream_options.verbosity = v,
+            None => notices.push(format!(
+                "Session recorded unknown verbosity {verbosity_str:?}; keeping {current}."
+            )),
         }
     }
 
@@ -448,6 +467,7 @@ pub(crate) fn freeze_and_seed(
     model_key: &(String, String),
     thinking: Option<&ThinkingConfig>,
     speed: Option<Speed>,
+    verbosity: Option<Verbosity>,
 ) -> Result<()> {
     let system_prompt = if let Some(persisted) = log.system_prompt() {
         persisted.to_string()
@@ -458,6 +478,7 @@ pub(crate) fn freeze_and_seed(
             log.append_model_change(ThreadFilter::USER, &model_key.0, &model_key.1)?;
             log.append_thinking_change(ThreadFilter::USER, thinking_config_name(thinking))?;
             log.append_speed_change(ThreadFilter::USER, speed_name(speed))?;
+            log.append_verbosity_change(ThreadFilter::USER, verbosity_name(verbosity))?;
         }
         assembled
     };

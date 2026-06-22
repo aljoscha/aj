@@ -508,6 +508,7 @@ mod tests {
             base_url: "https://example.test".into(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input,
             cost: ModelCost::default(),
             context_window: 100_000,

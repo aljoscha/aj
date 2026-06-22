@@ -18,7 +18,7 @@ use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config};
 use aj_models::registry::ModelInfo;
-use aj_models::{speed_name, thinking_config_name};
+use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_session::{
     ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener, replay,
 };
@@ -190,7 +190,7 @@ impl SessionWorld {
         // this point reflects both runtime `/model` / `/thinking`
         // choices and any settings just restored from the resumed
         // log.
-        let (provider, model_info, stream_options, thinking, speed, model_key) = {
+        let (provider, model_info, stream_options, thinking, speed, verbosity, model_key) = {
             let cfg = run_config.lock().expect("run config mutex poisoned");
             (
                 Arc::clone(&cfg.provider),
@@ -198,6 +198,7 @@ impl SessionWorld {
                 cfg.stream_options.clone(),
                 cfg.thinking.clone(),
                 cfg.speed,
+                cfg.stream_options.verbosity,
                 cfg.model_key.clone(),
             )
         };
@@ -226,6 +227,7 @@ impl SessionWorld {
             &model_key,
             thinking.as_ref(),
             speed,
+            verbosity,
         )?;
 
         // Fresh, empty registry: only sub-agents spawned in this
@@ -260,6 +262,7 @@ impl SessionWorld {
             model_id: model_key.1.clone(),
             thinking: thinking_config_name(thinking.as_ref()).to_string(),
             speed: speed_name(speed).to_string(),
+            verbosity: verbosity_name(verbosity).to_string(),
         };
         let context_window = agent.model_info().context_window;
         let pump = EventPump::new(
@@ -324,7 +327,8 @@ impl SessionWorld {
     /// Overwrite each replayed sub-agent's footer entry with the
     /// last-wins settings fold of its log thread. Replay seeds the
     /// entries from the spawn-time snapshot only; later
-    /// `ModelChange` / `ThinkingChange` / `SpeedChange` entries on a
+    /// `ModelChange` / `ThinkingChange` / `SpeedChange` /
+    /// `VerbosityChange` entries on a
     /// sub thread are projected as plain notices, so without this
     /// pass a resumed footer would show stale spawn-time settings.
     ///
@@ -348,6 +352,7 @@ impl SessionWorld {
                     model_id: String::new(),
                     thinking: "off".to_string(),
                     speed: "standard".to_string(),
+                    verbosity: "default".to_string(),
                 }
             });
             let (provider, model_id) = folded.model.unwrap_or((base.provider, base.model_id));
@@ -356,6 +361,7 @@ impl SessionWorld {
                 model_id,
                 thinking: folded.thinking.unwrap_or(base.thinking),
                 speed: folded.speed.unwrap_or(base.speed),
+                verbosity: folded.verbosity.unwrap_or(base.verbosity),
             };
             self.pump.reconcile_agent_settings(tui, id, settings);
         }
@@ -556,6 +562,7 @@ mod tests {
                 model_id: "scripted-model".into(),
                 thinking: "off".into(),
                 speed: "standard".into(),
+                verbosity: "default".into(),
             },
         })
         .await
@@ -606,6 +613,7 @@ mod tests {
                     model_id: "scripted-model".into(),
                     thinking: "off".into(),
                     speed: "standard".into(),
+                    verbosity: "default".into(),
                 },
             })
             .await
@@ -748,6 +756,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 1_000,

@@ -60,6 +60,10 @@ fn build_items(stats: &SessionStats) -> Vec<SelectItem> {
             "speed",
             stats.settings.speed.as_deref().unwrap_or("(default)"),
         ),
+        kv(
+            "verbosity",
+            stats.settings.verbosity.as_deref().unwrap_or("(default)"),
+        ),
         Row::Blank,
         Row::Header("Activity".to_string()),
         kv("created", &timestamp(stats.created_at, "(unknown)")),
@@ -202,6 +206,7 @@ mod tests {
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
                 thinking: Some("medium".to_string()),
                 speed: None,
+                verbosity: None,
             },
         }
     }

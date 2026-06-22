@@ -102,3 +102,62 @@ pub fn speed_from_name(name: &str) -> Option<Option<types::Speed>> {
         _ => None,
     }
 }
+
+/// Render an optional [`types::Verbosity`] as its canonical name:
+/// `"default"` for `None` (server default), otherwise `"low"`,
+/// `"medium"`, or `"high"`. The `"default"` sentinel lets the session
+/// log record "ran at the server default" distinctly from "nothing
+/// recorded", mirroring `"off"`/`"standard"` for the thinking/speed
+/// axes. Shared by the session log's settings entries, the
+/// sub-agent-spawn snapshot, and the binary's settings window (whose
+/// unset value is also spelled `"default"`).
+pub fn verbosity_name(verbosity: Option<types::Verbosity>) -> &'static str {
+    match verbosity {
+        None => "default",
+        Some(types::Verbosity::Low) => "low",
+        Some(types::Verbosity::Medium) => "medium",
+        Some(types::Verbosity::High) => "high",
+    }
+}
+
+/// Parse a canonical verbosity name back into an optional
+/// [`types::Verbosity`] — the inverse of [`verbosity_name`], with
+/// `"default"` mapping to `None` (server default). Returns `None` for
+/// names outside the vocabulary so callers can keep their current
+/// value and surface a notice.
+pub fn verbosity_from_name(name: &str) -> Option<Option<types::Verbosity>> {
+    match name {
+        // An empty string is the legacy/unset form (e.g. an
+        // `AgentSettings` snapshot written before verbosity tracking,
+        // where the serde default fills `""`). Treat it as the default
+        // so old sessions restore silently.
+        "default" | "" => Some(None),
+        "low" => Some(Some(types::Verbosity::Low)),
+        "medium" => Some(Some(types::Verbosity::Medium)),
+        "high" => Some(Some(types::Verbosity::High)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbosity_name_round_trips() {
+        for v in [
+            None,
+            Some(types::Verbosity::Low),
+            Some(types::Verbosity::Medium),
+            Some(types::Verbosity::High),
+        ] {
+            assert_eq!(verbosity_from_name(verbosity_name(v)), Some(v));
+        }
+        // The `"default"` sentinel is the canonical name for "unset".
+        assert_eq!(verbosity_name(None), "default");
+        // The legacy empty-string form also parses to the default.
+        assert_eq!(verbosity_from_name(""), Some(None));
+        // Unknown strings are rejected so callers keep their value.
+        assert_eq!(verbosity_from_name("loud"), None);
+    }
+}

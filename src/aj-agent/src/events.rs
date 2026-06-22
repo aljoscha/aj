@@ -59,6 +59,12 @@ pub struct AgentSettings {
     pub thinking: String,
     /// Inference speed: "standard" or "fast".
     pub speed: String,
+    /// Output verbosity: "default" (server default), "low", "medium",
+    /// or "high". `#[serde(default)]` so logs and events written before
+    /// verbosity tracking still deserialize (missing -> empty string,
+    /// treated as the default on restore).
+    #[serde(default)]
+    pub verbosity: String,
 }
 
 /// Identifier for the agent emitting an event.
@@ -423,6 +429,7 @@ mod tests {
                 model_id: "scripted-model".into(),
                 thinking: "off".into(),
                 speed: "standard".into(),
+                verbosity: "default".into(),
             },
         };
         assert_eq!(sub_spawn.agent_id(), AgentId::Main);
@@ -508,6 +515,7 @@ mod tests {
                 model_id: "claude-x".into(),
                 thinking: "medium".into(),
                 speed: "fast".into(),
+                verbosity: "high".into(),
             },
         };
         let json = serde_json::to_value(&spawn).expect("SubAgentStart serializes");
@@ -517,6 +525,7 @@ mod tests {
         assert_eq!(json["model_id"], "claude-x");
         assert_eq!(json["thinking"], "medium");
         assert_eq!(json["speed"], "fast");
+        assert_eq!(json["verbosity"], "high");
         assert!(json.get("settings").is_none());
     }
 

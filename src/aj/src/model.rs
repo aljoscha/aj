@@ -23,12 +23,14 @@
 
 use std::sync::Arc;
 
-use aj_conf::{Config, ConfigThinkingDisplay, ConfigThinkingLevel};
+use aj_conf::{Config, ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity};
 use aj_models::ThinkingConfig;
 use aj_models::auth::{AuthStorage, find_env_keys};
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
-use aj_models::types::{ApiKeyResolver, ReasoningSummary, Speed, StreamOptions, ThinkingDisplay};
+use aj_models::types::{
+    ApiKeyResolver, ReasoningSummary, Speed, StreamOptions, ThinkingDisplay, Verbosity,
+};
 use anyhow::{Result, anyhow};
 
 use crate::cli::args::Args;
@@ -308,6 +310,24 @@ pub fn apply_thinking_display(options: &mut StreamOptions, display: Option<Confi
     options.reasoning_summary = openai;
 }
 
+/// Map a `config.toml` verbosity value onto the unified wire enum.
+pub fn config_verbosity_to_unified(verbosity: ConfigVerbosity) -> Verbosity {
+    match verbosity {
+        ConfigVerbosity::Low => Verbosity::Low,
+        ConfigVerbosity::Medium => Verbosity::Medium,
+        ConfigVerbosity::High => Verbosity::High,
+    }
+}
+
+/// Apply the configured output verbosity (if any) onto `options`.
+/// `None` clears the field so the provider sends no `text.verbosity`
+/// and the server default applies. Providers gate the field on
+/// per-model support, so this is a no-op for models and providers
+/// that don't honour verbosity.
+pub fn apply_verbosity(options: &mut StreamOptions, verbosity: Option<ConfigVerbosity>) {
+    options.verbosity = verbosity.map(config_verbosity_to_unified);
+}
+
 /// Map a `config.toml` thinking level onto the wire-level
 /// [`ThinkingConfig`] the agent runs with. [`ConfigThinkingLevel::Off`]
 /// collapses to `None` (no reasoning requested), so the result type is
@@ -337,6 +357,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 1_000,
@@ -476,6 +497,19 @@ mod tests {
             Some(ThinkingDisplay::Omitted)
         ));
         assert!(opts.reasoning_summary.is_none());
+    }
+
+    #[test]
+    fn apply_verbosity_sets_and_clears() {
+        let mut opts = StreamOptions {
+            verbosity: Some(Verbosity::Low),
+            ..StreamOptions::default()
+        };
+        apply_verbosity(&mut opts, Some(ConfigVerbosity::High));
+        assert_eq!(opts.verbosity, Some(Verbosity::High));
+        // `None` clears the field so the server default applies.
+        apply_verbosity(&mut opts, None);
+        assert!(opts.verbosity.is_none());
     }
 
     #[test]

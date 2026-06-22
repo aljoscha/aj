@@ -1408,6 +1408,7 @@ mod tests {
             base_url: "https://api.anthropic.com".into(),
             reasoning: true,
             supports_adaptive_thinking: true,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 3.0,
@@ -1424,6 +1425,7 @@ mod tests {
     fn budget_model() -> ModelInfo {
         ModelInfo {
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             ..fake_model()
         }
     }

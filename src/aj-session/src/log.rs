@@ -138,6 +138,14 @@ pub enum ConversationEntryKind {
     /// "standard" or "fast". Stored as a string so the on-disk format
     /// stays stable; unknown values are tolerated on restore.
     SpeedChange { speed: String },
+    /// The active output verbosity changed (or was first recorded).
+    /// `verbosity` is "default" (server default), "low", "medium", or
+    /// "high". Stored as a string so the on-disk format stays stable;
+    /// unknown values are tolerated on restore. Verbosity changes the
+    /// produced answer, so it's tracked here alongside model/thinking/
+    /// speed (unlike `thinking_display`, a view-only preference that
+    /// stays in config).
+    VerbosityChange { verbosity: String },
     /// The structural root of a sub-agent thread, written when the
     /// sub-agent is spawned and anchored at the parent thread's head
     /// (the assistant message carrying the spawning tool call). It
@@ -201,6 +209,7 @@ impl ConversationEntryKind {
             | Self::ModelChange { .. }
             | Self::ThinkingChange { .. }
             | Self::SpeedChange { .. }
+            | Self::VerbosityChange { .. }
             | Self::SubAgentSpawn { .. } => false,
         }
     }
@@ -260,6 +269,11 @@ pub struct SessionSettings {
     /// [`ConversationEntryKind::SpeedChange`] entry. `None` means
     /// "nothing recorded".
     pub speed: Option<String>,
+    /// Last recorded verbosity string, from the most recent
+    /// [`ConversationEntryKind::VerbosityChange`] entry. `None` means
+    /// "nothing recorded" (inherit the current default) — distinct
+    /// from `Some("default")`, which pins the server default.
+    pub verbosity: Option<String>,
 }
 
 /// A linearized, read-only view of (a slice of) a conversation log. Produced
@@ -407,6 +421,7 @@ impl Conversation {
             model: None,
             thinking: None,
             speed: None,
+            verbosity: None,
         };
         for entry in &self.entries {
             match &entry.entry {
@@ -419,10 +434,14 @@ impl Conversation {
                 ConversationEntryKind::SpeedChange { speed } => {
                     settings.speed = Some(speed.clone());
                 }
+                ConversationEntryKind::VerbosityChange { verbosity } => {
+                    settings.verbosity = Some(verbosity.clone());
+                }
                 ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
                     settings.model = Some((snap.provider.clone(), snap.model_id.clone()));
                     settings.thinking = Some(snap.thinking.clone());
                     settings.speed = Some(snap.speed.clone());
+                    settings.verbosity = Some(snap.verbosity.clone());
                 }
                 ConversationEntryKind::Message { message } => {
                     if let Some(Message::Assistant(a)) = message.as_wire() {
@@ -913,6 +932,21 @@ impl ConversationLog {
             filter,
             ConversationEntryKind::SpeedChange {
                 speed: speed.to_string(),
+            },
+        )
+    }
+
+    /// Record an output-verbosity change on the thread selected by
+    /// `filter`. See [`Self::append_settings_entry`].
+    pub fn append_verbosity_change(
+        &mut self,
+        filter: ThreadFilter,
+        verbosity: &str,
+    ) -> Result<EntryId, ConversationError> {
+        self.append_settings_entry(
+            filter,
+            ConversationEntryKind::VerbosityChange {
+                verbosity: verbosity.to_string(),
             },
         )
     }
@@ -1434,6 +1468,8 @@ mod tests {
                 .expect("thinking change");
             log.append_speed_change(ThreadFilter::USER, "fast")
                 .expect("speed change");
+            log.append_verbosity_change(ThreadFilter::USER, "high")
+                .expect("verbosity change");
             {
                 let head = log.latest_leaf(ThreadFilter::USER);
                 let mut view = ConversationView::user(&mut log, head);
@@ -1444,7 +1480,7 @@ mod tests {
 
         let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
         let entries = resumed.entries_in_order();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 6);
         match &entries[1].entry {
             ConversationEntryKind::ModelChange { provider, model_id } => {
                 assert_eq!(provider, "anthropic");
@@ -1459,6 +1495,10 @@ mod tests {
         match &entries[3].entry {
             ConversationEntryKind::SpeedChange { speed } => assert_eq!(speed, "fast"),
             other => panic!("expected SpeedChange, got {other:?}"),
+        }
+        match &entries[4].entry {
+            ConversationEntryKind::VerbosityChange { verbosity } => assert_eq!(verbosity, "high"),
+            other => panic!("expected VerbosityChange, got {other:?}"),
         }
     }
 
@@ -1549,6 +1589,10 @@ mod tests {
             .expect("tc2");
         log.append_speed_change(ThreadFilter::USER, "fast")
             .expect("sc2");
+        log.append_verbosity_change(ThreadFilter::USER, "default")
+            .expect("vc1");
+        log.append_verbosity_change(ThreadFilter::USER, "high")
+            .expect("vc2");
 
         let head = log.latest_leaf(ThreadFilter::USER).expect("head");
         let settings = log.linearize(&head, ThreadFilter::USER).settings();
@@ -1559,6 +1603,7 @@ mod tests {
         // "off" was explicitly recorded — distinct from None.
         assert_eq!(settings.thinking.as_deref(), Some("off"));
         assert_eq!(settings.speed.as_deref(), Some("fast"));
+        assert_eq!(settings.verbosity.as_deref(), Some("high"));
     }
 
     #[test]
@@ -1706,6 +1751,7 @@ mod tests {
             model_id: "claude-x".to_string(),
             thinking: "high".to_string(),
             speed: "fast".to_string(),
+            verbosity: "high".to_string(),
         }
     }
 

@@ -58,6 +58,7 @@ fn fixture_model() -> ModelInfo {
         base_url: "https://chatgpt.com/backend-api".into(),
         reasoning: true,
         supports_adaptive_thinking: false,
+        supports_verbosity: false,
         input: vec![InputModality::Text],
         cost: ModelCost {
             input: 1.25,

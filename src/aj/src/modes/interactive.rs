@@ -35,14 +35,16 @@ use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
 use aj_conf::{
-    AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel, Severity,
-    SystemPromptSource, display_path,
+    AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity,
+    Severity, SystemPromptSource, display_path,
 };
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, validate_thinking_level};
 use aj_models::types::{Speed, StreamOptions, UserContent};
-use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
+use aj_models::{
+    ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
+};
 use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_tools::{BuiltinToolOptions, get_builtin_tools};
 use aj_tui::EditorComponent;
@@ -3585,6 +3587,10 @@ async fn handle_command(
                     thinking: thinking_level_name(&run_cfg.thinking).to_string(),
                     thinking_display: cfg.thinking_display.map(|d| d.to_string()),
                     speed: speed_name(run_cfg.speed).to_string(),
+                    verbosity: run_cfg
+                        .stream_options
+                        .verbosity
+                        .map(|v| verbosity_name(Some(v)).to_string()),
                     theme: resolve_theme_name(cfg.theme.as_deref()).to_string(),
                     disabled_tools: cfg.disabled_tools.clone(),
                     disabled_skills: cfg.disabled_skills.clone(),
@@ -3751,6 +3757,7 @@ async fn confirm_thinking_for_main(
                 model_id: cfg.model_key.1.clone(),
                 thinking: thinking_level_name(&level).to_string(),
                 speed: speed_name(cfg.speed).to_string(),
+                verbosity: verbosity_name(cfg.stream_options.verbosity).to_string(),
             },
             cfg.model_info.context_window,
         )
@@ -3899,27 +3906,28 @@ async fn confirm_model_for_main(
             model_info,
             mut stream_options,
         }) => {
-            // Re-apply the configured thinking-display mode: the
-            // rebuilt baseline options would otherwise silently drop
-            // it on every model swap.
-            let display = config
-                .lock()
-                .expect("config mutex poisoned")
-                .thinking_display;
+            // Re-apply the configured thinking-display mode and
+            // verbosity: the rebuilt baseline options would otherwise
+            // silently drop them on every model swap.
+            let (display, verbosity) = {
+                let cfg = config.lock().expect("config mutex poisoned");
+                (cfg.thinking_display, cfg.verbosity)
+            };
             crate::model::apply_thinking_display(&mut stream_options, display);
+            crate::model::apply_verbosity(&mut stream_options, verbosity);
             // Stage the swap into the loop-side snapshot (provider +
             // model + options + the pre-select key); the next turn
             // applies it. Never locks the agent, so it's safe
             // mid-turn — the in-flight turn keeps its model and the
             // swap takes effect next turn. Thinking effort is
             // preserved; read it back for the footer entry.
-            let current_thinking = {
+            let (current_thinking, current_verbosity) = {
                 let mut cfg = run_config.lock().expect("run config mutex poisoned");
                 cfg.provider = provider;
                 cfg.model_info = model_info;
                 cfg.stream_options = stream_options;
                 cfg.model_key = (info.provider.clone(), info.id.clone());
-                cfg.thinking.clone()
+                (cfg.thinking.clone(), cfg.stream_options.verbosity)
             };
             // Record the new settings identity so the footer's model
             // line and context-window denominator reflect the swap
@@ -3929,6 +3937,7 @@ async fn confirm_model_for_main(
                 model_id: info.id.clone(),
                 thinking: thinking_level_name(&current_thinking).to_string(),
                 speed: speed_name(speed).to_string(),
+                verbosity: verbosity_name(current_verbosity).to_string(),
             };
             world
                 .pump
@@ -4006,6 +4015,15 @@ async fn confirm_model_for_sub(
         }) => {
             // Stage the standing bundle choice; the sub's next turn
             // applies it.
+            //
+            // NOTE(aljoscha): the rebuilt bundle's `stream_options`
+            // come from `from_model_info` (defaults), so a sub's
+            // `thinking_display` and `verbosity` revert to the server
+            // default on a model swap. Unlike the main path
+            // (`confirm_model_for_main`), we don't re-apply the config
+            // values here. The two settings behave identically, and
+            // sub-agent display tuning isn't exposed, so we accept the
+            // gap rather than thread config through the sub path.
             world
                 .sub_overrides
                 .lock()
@@ -4025,11 +4043,17 @@ async fn confirm_model_for_sub(
                 .agent_settings(target)
                 .map(|s| s.thinking.clone())
                 .unwrap_or_else(|| "off".to_string());
+            let preserved_verbosity = world
+                .pump
+                .agent_settings(target)
+                .map(|s| s.verbosity.clone())
+                .unwrap_or_else(|| "default".to_string());
             let settings = aj_agent::events::AgentSettings {
                 provider: info.provider.clone(),
                 model_id: info.id.clone(),
                 thinking: preserved_thinking,
                 speed: speed_name(effective_speed).to_string(),
+                verbosity: preserved_verbosity,
             };
             world
                 .pump
@@ -4143,6 +4167,17 @@ async fn apply_setting_change(
             ),
             None => Some(format!("Unknown speed {value:?}.")),
         },
+        "verbosity" => {
+            let verbosity = if value == UNSET_VALUE {
+                None
+            } else {
+                match value.parse::<ConfigVerbosity>() {
+                    Ok(v) => Some(v),
+                    Err(err) => return Some(format!("Can't set verbosity: {err}")),
+                }
+            };
+            Some(confirm_verbosity_for_main(verbosity, run_config, config, world).await)
+        }
         "theme" => {
             // Strict load so a broken user theme surfaces instead of
             // silently falling back to the bundled dark palette.
@@ -4295,6 +4330,42 @@ async fn apply_setting_change(
     }
 }
 
+/// Apply a confirmed output-verbosity pick to the main agent: stage
+/// it onto the run config's stream options, persist to `config.toml`,
+/// and record on the session log's user thread. Verbosity is a plain
+/// stream-option field (no headers, no bundle rebuild), so unlike
+/// `confirm_speed_for_main` this neither rebuilds the provider nor
+/// touches the footer. Providers gate the field on per-model support,
+/// so on a model that ignores verbosity this records the preference
+/// without changing what's sent. Returns the user-facing notice.
+async fn confirm_verbosity_for_main(
+    verbosity: Option<ConfigVerbosity>,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    config: &Arc<std::sync::Mutex<Config>>,
+    world: &SessionWorld,
+) -> String {
+    let unified = verbosity.map(crate::model::config_verbosity_to_unified);
+    let name = verbosity_name(unified);
+    {
+        let mut cfg = run_config.lock().expect("run config mutex poisoned");
+        cfg.stream_options.verbosity = unified;
+    }
+    // Record on the user thread so a later resume restores this value.
+    let log_note = {
+        let mut log = world.log.lock().await;
+        log.append_verbosity_change(ThreadFilter::USER, name)
+            .err()
+            .map(|err| format!("(couldn't record in session log: {err})"))
+    };
+    let save_note = persist_config(config, |c| c.verbosity = verbosity);
+    let mut notice = format!("Output verbosity set to {name}. Takes effect next turn.");
+    for note in [save_note, log_note].into_iter().flatten() {
+        notice.push(' ');
+        notice.push_str(&note);
+    }
+    notice
+}
+
 /// Apply a speed change to the main agent: rebuild the provider
 /// bundle at the current model so the speed-derived headers are
 /// re-stamped, stage it into the run config, persist to
@@ -4324,12 +4395,13 @@ async fn confirm_speed_for_main(
             mut stream_options,
         }) => {
             // The rebuilt baseline options would otherwise drop the
-            // configured thinking-display mode.
-            let display = config
-                .lock()
-                .expect("config mutex poisoned")
-                .thinking_display;
+            // configured thinking-display mode and verbosity.
+            let (display, verbosity) = {
+                let cfg = config.lock().expect("config mutex poisoned");
+                (cfg.thinking_display, cfg.verbosity)
+            };
             crate::model::apply_thinking_display(&mut stream_options, display);
+            crate::model::apply_verbosity(&mut stream_options, verbosity);
             // Stage into the loop-side snapshot; the next turn
             // applies it. Never locks the agent, so it's safe
             // mid-turn.
@@ -4345,6 +4417,7 @@ async fn confirm_speed_for_main(
                         model_id: cfg.model_key.1.clone(),
                         thinking: thinking_level_name(&cfg.thinking).to_string(),
                         speed: name.to_string(),
+                        verbosity: verbosity_name(cfg.stream_options.verbosity).to_string(),
                     },
                     cfg.model_info.context_window,
                 )
@@ -4828,6 +4901,7 @@ mod tests {
             model_id: "claude-x".into(),
             thinking: "high".into(),
             speed: "standard".into(),
+            verbosity: "default".into(),
         };
         let fallback = Some(ThinkingConfig::Low);
         assert_eq!(
@@ -4857,6 +4931,7 @@ mod tests {
             model_id: String::new(),
             thinking: String::new(),
             speed: "standard".into(),
+            verbosity: "default".into(),
         };
         assert_eq!(
             resolve_view_thinking(Some(&garbage), &fallback),

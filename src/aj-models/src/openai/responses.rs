@@ -21,13 +21,14 @@ use futures::StreamExt;
 use openai_sdk::client::Client;
 use openai_sdk::types::common::{
     PromptCacheRetention, ReasoningEffort, ServiceTier as OpenAIServiceTier,
+    Verbosity as OpenAIVerbosity,
 };
 use openai_sdk::types::responses::{
     CreateResponseRequest, FunctionCallOutputContent, ImageDetail, InputRole, ItemStatus,
     MessagePhase, Reasoning, ReasoningContent, ReasoningSummary, ReasoningSummaryMode, Response,
     ResponseIncludable, ResponseInput, ResponseInputContentPart, ResponseInputItem,
     ResponseInputMessageContent, ResponseOutputItem, ResponseStatus, ResponseStreamEvent,
-    ResponseTool, ResponseToolChoice, ResponseUsage,
+    ResponseTextConfig, ResponseTool, ResponseToolChoice, ResponseUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,7 +37,7 @@ use crate::errors::classify_openai_error;
 use crate::openai::errors::classify_client_error;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
-use crate::registry::{ModelInfo, calculate_cost, validate_thinking_level};
+use crate::registry::{ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
     select_cancel,
@@ -46,7 +47,7 @@ use crate::types::{
     AssistantContent, AssistantError, AssistantMessage, CacheRetention, Context, ErrorCategory,
     Message, ReasoningSummary as UnifiedReasoningSummary, ServiceTier, SimpleStreamOptions,
     StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, ToolChoice,
-    ToolDefinition, ToolResultMessage, UserContent, UserMessage,
+    ToolDefinition, ToolResultMessage, UserContent, UserMessage, Verbosity as UnifiedVerbosity,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
@@ -396,6 +397,11 @@ fn build_request(
 
     let service_tier = options.service_tier.as_ref().map(map_service_tier);
 
+    // §7.3.2: `text.verbosity` only when the caller set it and the
+    // model supports it; otherwise omit so the server default applies
+    // and unsupported models don't 400.
+    let text = verbosity_text_config(model, options);
+
     CreateResponseRequest {
         model: model.id.clone(),
         input: ResponseInput::Items(input),
@@ -405,6 +411,7 @@ fn build_request(
         max_output_tokens,
         temperature: options.temperature,
         reasoning: reasoning_cfg,
+        text,
         stream: Some(true),
         store: Some(false),
         include,
@@ -413,6 +420,33 @@ fn build_request(
         prompt_cache_retention,
         ..Default::default()
     }
+}
+
+/// Map the unified [`UnifiedVerbosity`] onto the SDK enum. Shared with
+/// the Codex provider (§7.4.3).
+pub(super) fn map_verbosity(verbosity: UnifiedVerbosity) -> OpenAIVerbosity {
+    match verbosity {
+        UnifiedVerbosity::Low => OpenAIVerbosity::Low,
+        UnifiedVerbosity::Medium => OpenAIVerbosity::Medium,
+        UnifiedVerbosity::High => OpenAIVerbosity::High,
+    }
+}
+
+/// Build the `text` field carrying `verbosity`, or `None` when the
+/// caller didn't request a verbosity or the model doesn't support the
+/// parameter. Shared with the Codex provider (§7.4.3).
+pub(super) fn verbosity_text_config(
+    model: &ModelInfo,
+    options: &StreamOptions,
+) -> Option<ResponseTextConfig> {
+    let verbosity = options.verbosity?;
+    if !supports_verbosity(model) {
+        return None;
+    }
+    Some(ResponseTextConfig {
+        format: None,
+        verbosity: Some(map_verbosity(verbosity)),
+    })
 }
 
 fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
@@ -1605,6 +1639,7 @@ fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
         base_url: String::new(),
         reasoning: false,
         supports_adaptive_thinking: false,
+        supports_verbosity: false,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),
         context_window: 0,
@@ -1632,6 +1667,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             reasoning,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.25,
@@ -1643,6 +1679,40 @@ mod tests {
             max_tokens: 16_000,
             headers: None,
         }
+    }
+
+    #[test]
+    fn build_request_emits_verbosity_when_model_supports_it() {
+        let mut model = fake_model(true);
+        model.supports_verbosity = true;
+        let req = build_request(
+            &model,
+            &Context::new("hello"),
+            &StreamOptions {
+                verbosity: Some(crate::types::Verbosity::Low),
+                ..Default::default()
+            },
+            None,
+        );
+        let text = req
+            .text
+            .expect("text present when verbosity set + supported");
+        assert_eq!(text.verbosity, Some(OpenAIVerbosity::Low));
+    }
+
+    #[test]
+    fn build_request_omits_verbosity_when_model_unsupported() {
+        // fake_model defaults supports_verbosity = false.
+        let req = build_request(
+            &fake_model(true),
+            &Context::new("hello"),
+            &StreamOptions {
+                verbosity: Some(crate::types::Verbosity::Low),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(req.text.is_none());
     }
 
     #[test]

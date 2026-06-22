@@ -203,6 +203,7 @@ mod tests {
                 model_id: "claude-x".to_string(),
                 thinking: "medium".to_string(),
                 speed: "standard".to_string(),
+                verbosity: "default".to_string(),
             },
         }
     }

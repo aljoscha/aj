@@ -160,6 +160,7 @@ fn fallback_settings() -> AgentSettings {
         model_id: String::new(),
         thinking: "off".to_string(),
         speed: "standard".to_string(),
+        verbosity: "default".to_string(),
     }
 }
 
@@ -232,6 +233,7 @@ impl ReplayState {
             ConversationEntryKind::ModelChange { .. }
             | ConversationEntryKind::ThinkingChange { .. }
             | ConversationEntryKind::SpeedChange { .. }
+            | ConversationEntryKind::VerbosityChange { .. }
             | ConversationEntryKind::SystemPrompt { .. }
             | ConversationEntryKind::Compaction { .. } => {}
         }
@@ -290,6 +292,13 @@ impl ReplayState {
             }
             ConversationEntryKind::SpeedChange { speed } => {
                 self.settings_notice(agent_id, format!("Speed set to {speed}."), out);
+            }
+            ConversationEntryKind::VerbosityChange { verbosity } => {
+                self.settings_notice(
+                    agent_id,
+                    format!("Output verbosity set to {verbosity}."),
+                    out,
+                );
             }
             ConversationEntryKind::SubAgentSpawn { .. } => {
                 // Seed entry: projected as the synthesized
@@ -1405,6 +1414,7 @@ mod tests {
             model_id: "claude-x".into(),
             thinking: "high".into(),
             speed: "fast".into(),
+            verbosity: "high".into(),
         };
         log.append_subagent_spawn(1, user_head, "subtask", &settings)
             .expect("spawn entry");

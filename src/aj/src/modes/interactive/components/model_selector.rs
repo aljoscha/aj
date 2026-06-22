@@ -297,6 +297,7 @@ mod tests {
             base_url: format!("https://api.{provider}.com"),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![],
             cost: ModelCost::default(),
             context_window: 200_000,

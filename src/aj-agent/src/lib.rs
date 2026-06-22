@@ -2645,6 +2645,8 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                         thinking: aj_models::thinking_config_name(self.default_thinking.as_ref())
                             .to_string(),
                         speed: aj_models::speed_name(self.speed).to_string(),
+                        verbosity: aj_models::verbosity_name(self.stream_options.verbosity)
+                            .to_string(),
                     },
                 })
                 .await?;
@@ -3340,6 +3342,7 @@ mod event_protocol_tests {
             base_url: "scripted://internal".to_string(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 0,

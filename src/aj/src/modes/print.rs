@@ -236,7 +236,7 @@ pub async fn run(args: Args) -> Result<()> {
     // provider/model/thinking/speed bundle plus the disabled-tools
     // filter and a freshly-read `AgentEnv`. Surface any
     // skill-discovery diagnostics to stderr.
-    let (provider, model_info, stream_options, thinking, agent_speed, model_key) = {
+    let (provider, model_info, stream_options, thinking, agent_speed, verbosity, model_key) = {
         let cfg = run_config.lock().expect("run config mutex poisoned");
         (
             Arc::clone(&cfg.provider),
@@ -244,6 +244,7 @@ pub async fn run(args: Args) -> Result<()> {
             cfg.stream_options.clone(),
             cfg.thinking.clone(),
             cfg.speed,
+            cfg.stream_options.verbosity,
             cfg.model_key.clone(),
         )
     };
@@ -286,6 +287,7 @@ pub async fn run(args: Args) -> Result<()> {
         &model_key,
         thinking.as_ref(),
         agent_speed,
+        verbosity,
     )?;
 
     let log = Arc::new(TokioMutex::new(log));

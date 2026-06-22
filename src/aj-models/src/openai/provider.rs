@@ -32,9 +32,10 @@ use serde_json::Value;
 
 use crate::errors::classify_openai_finish_reason;
 use crate::openai::errors::classify_client_error;
+use crate::openai::responses::map_verbosity;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
-use crate::registry::{ModelInfo, calculate_cost, validate_thinking_level};
+use crate::registry::{ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
     select_cancel,
@@ -312,7 +313,12 @@ fn build_request(
         modalities: None,
         audio: None,
         reasoning_effort,
-        verbosity: None,
+        // §7.2: `verbosity` only when the caller set it and the model
+        // supports it; otherwise omitted so the server default applies.
+        verbosity: options
+            .verbosity
+            .filter(|_| supports_verbosity(model))
+            .map(map_verbosity),
         prediction: None,
         seed: None,
         // §7.2: explicitly send `store: false` so conversations are
@@ -1176,6 +1182,7 @@ fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
         base_url: String::new(),
         reasoning: false,
         supports_adaptive_thinking: false,
+        supports_verbosity: false,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),
         context_window: 0,
@@ -1295,6 +1302,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             reasoning: true,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.25,

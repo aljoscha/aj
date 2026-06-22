@@ -57,6 +57,7 @@ use super::errors::classify_client_error_with;
 use super::responses::{
     CostMultiplierFn, StreamState, append_assistant_message, convert_messages, empty_partial,
     error_from_code, map_reasoning_effort, map_service_tier, parse_assistant_input_items_with_api,
+    verbosity_text_config,
 };
 
 /// `api` field reported on assistant messages produced by this provider.
@@ -769,8 +770,10 @@ fn build_request(
         max_output_tokens: None,
         temperature: options.temperature,
         reasoning: reasoning_cfg,
-        // §7.4.3: text.verbosity omitted so the server default applies.
-        text: None,
+        // §7.4.3: `text.verbosity` only when the caller set it and the
+        // model supports it; otherwise omitted so the server default
+        // applies. Shared gate with §7.3.2.
+        text: verbosity_text_config(model, options),
         stream: Some(true),
         // §7.4.3: store hardcoded false; server rejects true.
         store: Some(false),
@@ -821,6 +824,7 @@ mod tests {
             base_url: DEFAULT_BASE_URL.into(),
             reasoning,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.0,
@@ -921,6 +925,47 @@ mod tests {
     }
 
     #[test]
+    fn build_request_emits_verbosity_when_model_supports_it() {
+        let mut model = fake_model("gpt-5.5", true);
+        model.supports_verbosity = true;
+        let ctx = Context::new("hello");
+        let req = build_request(
+            &model,
+            &ctx,
+            &StreamOptions {
+                verbosity: Some(crate::types::Verbosity::High),
+                ..Default::default()
+            },
+            None,
+        );
+        let text = req
+            .text
+            .expect("text present when verbosity set + supported");
+        assert_eq!(
+            text.verbosity,
+            Some(openai_sdk::types::common::Verbosity::High)
+        );
+    }
+
+    #[test]
+    fn build_request_omits_verbosity_when_model_unsupported() {
+        // fake_model defaults supports_verbosity = false.
+        let req = build_request(
+            &fake_model("legacy", true),
+            &Context::new("hello"),
+            &StreamOptions {
+                verbosity: Some(crate::types::Verbosity::High),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(
+            req.text.is_none(),
+            "unsupported model must omit text even when verbosity requested"
+        );
+    }
+
+    #[test]
     fn build_request_omits_strict_text_verbosity_max_output_tokens_and_retention() {
         let ctx = Context::new("hello");
         let req = build_request(
@@ -934,7 +979,7 @@ mod tests {
             },
             None,
         );
-        // text.verbosity omitted.
+        // text omitted: no verbosity requested in these options.
         assert!(req.text.is_none(), "text config must be omitted");
         // max_output_tokens omitted regardless of caller-provided cap.
         assert!(req.max_output_tokens.is_none());

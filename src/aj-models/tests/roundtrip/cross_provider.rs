@@ -59,6 +59,7 @@ fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
         base_url: "https://example.test".into(),
         reasoning: false,
         supports_adaptive_thinking: false,
+        supports_verbosity: false,
         // Vision-on so the §8.2 image downgrade never fires here —
         // these tests focus on §8.1.
         input: vec![InputModality::Text, InputModality::Image],

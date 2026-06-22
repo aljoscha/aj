@@ -106,6 +106,7 @@ impl AgentFooters {
                 model_id: String::new(),
                 thinking: String::new(),
                 speed: String::new(),
+                verbosity: String::new(),
             },
             context_window: 0,
             last_turn_context_tokens: None,
@@ -193,6 +194,7 @@ mod tests {
             model_id: model_id.to_string(),
             thinking: thinking.to_string(),
             speed: "standard".to_string(),
+            verbosity: "default".to_string(),
         }
     }
 

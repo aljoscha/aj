@@ -187,6 +187,7 @@ mod tests {
             base_url: "https://example.invalid".into(),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 1024,

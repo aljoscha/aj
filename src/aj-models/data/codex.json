@@ -8,7 +8,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 1.25,
         "output": 10.0,
@@ -26,7 +30,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 1.25,
         "output": 10.0,
@@ -44,7 +52,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 0.25,
         "output": 2.0,
@@ -62,7 +74,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 1.75,
         "output": 14.0,
@@ -80,7 +96,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 1.75,
         "output": 14.0,
@@ -98,7 +118,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 1.75,
         "output": 14.0,
@@ -116,7 +140,10 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text"],
+      "supports_verbosity": true,
+      "input": [
+        "text"
+      ],
       "cost": {
         "input": 0.0,
         "output": 0.0,
@@ -134,7 +161,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 2.5,
         "output": 15.0,
@@ -152,7 +183,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 0.75,
         "output": 4.5,
@@ -170,7 +205,11 @@
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
       "supports_adaptive_thinking": false,
-      "input": ["text", "image"],
+      "supports_verbosity": true,
+      "input": [
+        "text",
+        "image"
+      ],
       "cost": {
         "input": 5.0,
         "output": 30.0,

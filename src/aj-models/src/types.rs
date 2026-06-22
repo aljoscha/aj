@@ -388,6 +388,26 @@ pub enum ReasoningSummary {
     Concise,
 }
 
+/// Output verbosity for OpenAI text generation (`text.verbosity`).
+///
+/// Controls how long and detailed the model's visible answer is,
+/// independent of reasoning effort. This is the answer-length axis,
+/// not the reasoning-channel axis (see [`ReasoningSummary`] and
+/// [`ThinkingDisplay`] for the latter). OpenAI-only: ignored by
+/// non-OpenAI providers and by OpenAI models that don't support the
+/// parameter (gated on `ModelInfo::supports_verbosity`). When unset
+/// the provider's server default applies.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verbosity {
+    /// Terse answers.
+    Low,
+    /// Balanced answers (close to the server default).
+    Medium,
+    /// Expansive, detailed answers.
+    High,
+}
+
 /// How the assistant's reasoning channel should be surfaced to the
 /// client.
 ///
@@ -576,6 +596,13 @@ pub struct StreamOptions {
     /// when reasoning is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
+    /// OpenAI-only: output verbosity (`text.verbosity`), the visible
+    /// answer-length axis. Ignored by non-OpenAI providers and by
+    /// OpenAI models that don't support it (the provider gates on
+    /// `ModelInfo::supports_verbosity`). When unset the server
+    /// default applies. See [`Verbosity`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<Verbosity>,
     /// Anthropic-only: how the reasoning channel is surfaced to the
     /// client (raw vs summarized vs omitted). Mapped onto the
     /// `display` field of the request's `thinking` config. Ignored

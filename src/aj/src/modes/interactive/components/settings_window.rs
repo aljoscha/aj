@@ -101,6 +101,8 @@ pub struct SettingsCurrentValues {
     pub thinking_display: Option<String>,
     /// `"standard"` or `"fast"`.
     pub speed: String,
+    /// Canonical verbosity name, `None` when unset (server default).
+    pub verbosity: Option<String>,
     /// Configured theme name (the `config.toml` vocabulary, not a
     /// loaded theme's display label).
     pub theme: String,
@@ -333,6 +335,24 @@ fn build_items(
                     enum_values(option),
                 );
                 item.description = Some(describe(option, "Takes effect next turn."));
+                items.push(item);
+            }
+            "verbosity" => {
+                let mut values = vec![UNSET_VALUE.to_string()];
+                values.extend(enum_values(option));
+                let mut item = SettingItem::cycleable(
+                    option.name,
+                    option.name,
+                    current
+                        .verbosity
+                        .clone()
+                        .unwrap_or_else(|| UNSET_VALUE.to_string()),
+                    values,
+                );
+                item.description = Some(describe(
+                    option,
+                    "\"default\" leaves the server default. Takes effect next turn.",
+                ));
                 items.push(item);
             }
             "theme" => {
@@ -780,6 +800,7 @@ mod tests {
             base_url: format!("https://api.{provider}.com"),
             reasoning: false,
             supports_adaptive_thinking: false,
+            supports_verbosity: false,
             input: vec![],
             cost: ModelCost::default(),
             context_window: 200_000,
@@ -795,6 +816,7 @@ mod tests {
             thinking: "medium".to_string(),
             thinking_display: None,
             speed: "standard".to_string(),
+            verbosity: None,
             theme: "dark".to_string(),
             disabled_tools: vec![],
             disabled_skills: vec![],

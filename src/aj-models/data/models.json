@@ -10,6 +10,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -31,6 +32,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -52,6 +54,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -73,6 +76,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -94,6 +98,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -115,6 +120,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -136,6 +142,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -157,6 +164,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -178,6 +186,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -199,6 +208,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -220,6 +230,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -241,6 +252,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -262,6 +274,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -283,6 +296,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -304,6 +318,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -325,6 +340,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -346,6 +362,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": true,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -367,6 +384,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": true,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -388,6 +406,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": true,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -409,6 +428,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -430,6 +450,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -451,6 +472,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -472,6 +494,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -493,6 +516,7 @@
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
       "supports_adaptive_thinking": true,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -514,6 +538,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text"
       ],
@@ -534,6 +559,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -555,6 +581,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -576,6 +603,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -597,6 +625,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -618,6 +647,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -639,6 +669,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -660,6 +691,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -681,6 +713,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -702,6 +735,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -723,6 +757,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -744,6 +779,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -765,6 +801,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -786,6 +823,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -807,6 +845,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -828,6 +867,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -849,6 +889,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -870,6 +911,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -891,6 +933,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -912,6 +955,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -933,6 +977,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -954,6 +999,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -975,6 +1021,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -996,6 +1043,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1017,6 +1065,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1038,6 +1087,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1059,6 +1109,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1080,6 +1131,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1101,6 +1153,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1122,6 +1175,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1143,6 +1197,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1164,6 +1219,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1185,6 +1241,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": true,
       "input": [
         "text",
         "image"
@@ -1206,6 +1263,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -1227,6 +1285,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -1248,6 +1307,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -1269,6 +1329,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -1290,6 +1351,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text"
       ],
@@ -1310,6 +1372,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -1331,6 +1394,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"
@@ -1352,6 +1416,7 @@
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
       "supports_adaptive_thinking": false,
+      "supports_verbosity": false,
       "input": [
         "text",
         "image"

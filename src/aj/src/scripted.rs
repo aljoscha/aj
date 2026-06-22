@@ -92,6 +92,7 @@ fn scripted_model_info(name: &str) -> ModelInfo {
         base_url: "scripted://internal".to_string(),
         reasoning: false,
         supports_adaptive_thinking: false,
+        supports_verbosity: false,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),
         context_window: 0,
