@@ -6232,3 +6232,282 @@ mod tests {
         assert!(!world.message_queues.has_pending(AgentId::Main));
     }
 }
+
+/// Integration tests that drive the per-session select loop
+/// ([`run_session`]) end to end against a headless virtual terminal
+/// and a scripted provider.
+///
+/// These are the binary's only tests that *enter* the loop, so they
+/// guard the control flow the seam tests above can't reach: the
+/// launch-turn auto-submit, the per-view Ctrl+C cancel/quit ladder,
+/// and the agent-bus → pump → chat rendering path. The seam-level
+/// behaviors (selector outcomes, session-world rebuild, wake
+/// delivery) stay covered by the `tests` module above.
+///
+/// ## Why `start_paused`
+///
+/// The loop quits only on a Ctrl+C it reads while idle, but its
+/// `biased` select prefers input over the agent-bus arm, so a naively
+/// timed quit key could preempt the still-draining turn events and
+/// race the assertion. Under `start_paused` the runtime auto-advances
+/// the clock only once every task is parked, i.e. once the loop has
+/// drained every bus event and gone idle. A feeder task whose
+/// `sleep` gates the quit key therefore fires *after* the turn has
+/// fully rendered, making the whole flow deterministic with no
+/// wall-clock waits.
+#[cfg(test)]
+mod run_loop_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
+    use aj_models::types::{AssistantMessage, StreamOptions, UserContent};
+    use aj_tui::component::Component;
+    use aj_tui::keys::Key;
+    use aj_tui::tui::Tui;
+    use aj_tui_testkit::{VirtualTerminal, strip_ansi};
+    use tempfile::TempDir;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+    use super::*;
+    use crate::modes::interactive::components::chat_view::ChatView;
+    use crate::modes::interactive::test_support::{
+        finalized_text_message, scripted_model_info, scripted_run_config,
+    };
+
+    const COLS: u16 = 100;
+    const ROWS: u16 = 24;
+
+    /// A [`Shell`] + [`SessionWorld`] wired to a headless virtual
+    /// terminal, ready to hand to [`run_session`]. Holds the tempdirs
+    /// and the synthetic-input sender so they outlive the run.
+    struct RunLoopHarness {
+        shell: Shell,
+        world: SessionWorld,
+        input: UnboundedSender<aj_tui::keys::InputEvent>,
+        _sessions_dir: TempDir,
+        _auth_dir: TempDir,
+    }
+
+    impl RunLoopHarness {
+        /// Drive [`run_session`] to completion with `launch` as the
+        /// auto-submitted launch turn.
+        async fn run(&mut self, launch: Vec<UserContent>) -> SessionExit {
+            let mut theme_watch = ThemeWatch {
+                _guard: None,
+                rx: None,
+            };
+            let mut history_rx: Option<UnboundedReceiver<PromptHistory>> = None;
+            run_session(
+                &mut self.shell,
+                &mut self.world,
+                &mut theme_watch,
+                &mut history_rx,
+                launch,
+            )
+            .await
+            .expect("run_session returns Ok")
+        }
+
+        /// The chat container's rendered scrollback, ANSI stripped.
+        fn chat_text(&mut self) -> String {
+            let chat = self
+                .shell
+                .tui
+                .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
+                .expect("chat slot present");
+            strip_ansi(&chat.render(usize::from(COLS)).join("\n"))
+        }
+    }
+
+    /// A run-config snapshot over a [`ScriptedProvider`] whose every
+    /// step waits `delay` before emitting. A large `delay` keeps a
+    /// turn in flight (parked on the provider) until the cancel token
+    /// fires, so a mid-turn Ctrl+C has something to cancel.
+    fn scripted_run_config_with_delay(
+        messages: Vec<AssistantMessage>,
+        delay: Duration,
+    ) -> Arc<std::sync::Mutex<RunConfigSnapshot>> {
+        Arc::new(std::sync::Mutex::new(RunConfigSnapshot {
+            provider: Arc::new(
+                ScriptedProvider::from_messages(messages, 0, delay)
+                    .on_exhausted(ExhaustedBehavior::Panic),
+            ),
+            model_info: Arc::new(scripted_model_info()),
+            stream_options: StreamOptions::default(),
+            thinking: None,
+            speed: None,
+            model_key: ("scripted".to_string(), "scripted".to_string()),
+        }))
+    }
+
+    /// Build a `Create`-spec harness around `run_config`: a fresh
+    /// world plus a started `Tui` over a [`VirtualTerminal`], with the
+    /// world installed and a `Shell` assembled exactly as
+    /// `InteractiveMode::run` would (minus the process-global config /
+    /// auth / catalog loads, which the tests inject).
+    async fn build_harness(run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>) -> RunLoopHarness {
+        // The chord interceptions look up the process-global
+        // keybindings manager; install the defaults so the `aj.*`
+        // actions resolve. Idempotent across tests (serialized below).
+        crate::config::keybindings::install_global_manager_defaults();
+
+        let sessions_dir = TempDir::new().expect("sessions tempdir");
+        let auth_dir = TempDir::new().expect("auth tempdir");
+        let persistence = ConversationPersistence::new(sessions_dir.path().to_path_buf());
+        let render_settings = RenderSettings::new(false, false, true);
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let config = Config::default();
+        let spec = SessionSpec::Create {
+            entry: SessionEntry::Startup,
+        };
+
+        let mut world = SessionWorld::build(
+            &config,
+            &run_config,
+            &render_settings,
+            &theme,
+            &persistence,
+            &spec,
+            None,
+            Arc::new(Vec::new()),
+        )
+        .expect("build session world");
+
+        let vt = VirtualTerminal::new(COLS, ROWS);
+        let input = vt.input_sender();
+        let mut tui = Tui::new(Box::new(vt));
+        // No bootstrap render; the loop renders on demand. `start`
+        // takes the terminal's synthetic-input stream so `next_event`
+        // sees keys pushed through `input`.
+        tui.set_initial_render(false);
+        tui.start().expect("start virtual terminal");
+        build_layout(&mut tui, &theme, true);
+        world.install(&mut tui, &spec).await;
+
+        let shell = Shell {
+            tui,
+            theme,
+            config: Arc::new(std::sync::Mutex::new(config)),
+            auth: AuthStorage::new(auth_dir.path().join("auth.json")),
+            model_catalog: Arc::new(Vec::new()),
+            run_config,
+            conversation_persistence: persistence,
+            render_settings,
+            completed_sessions: Vec::new(),
+            restore_context: None,
+            palette_open_request: Arc::new(AtomicBool::new(false)),
+            close_all_request: Arc::new(AtomicBool::new(false)),
+            history_open_request: Arc::new(AtomicBool::new(false)),
+            agent_picker_open_request: Arc::new(AtomicBool::new(false)),
+        };
+
+        RunLoopHarness {
+            shell,
+            world,
+            input,
+            _sessions_dir: sessions_dir,
+            _auth_dir: auth_dir,
+        }
+    }
+
+    /// A launch turn auto-submits, streams a scripted reply through
+    /// the loop into the chat, the turn round-trips to the on-disk
+    /// log, and an idle Ctrl+C quits cleanly.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn drives_a_scripted_turn_then_quits_on_idle_ctrl_c() {
+        let run_config = scripted_run_config(vec![finalized_text_message("scripted reply here")]);
+        let mut h = build_harness(run_config).await;
+
+        // The loop drains the turn and parks; auto-advance then fires
+        // this sleep and the resulting Ctrl+C is read while idle.
+        let input = h.input.clone();
+        let feeder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            let _ = input.send(Key::ctrl('c'));
+        });
+
+        let exit = h.run(vec![UserContent::text("hello agent")]).await;
+        feeder.abort();
+
+        assert!(matches!(exit, SessionExit::Quit));
+        let chat = h.chat_text();
+        assert!(
+            chat.contains("hello agent"),
+            "user prompt rendered:\n{chat}"
+        );
+        assert!(
+            chat.contains("scripted reply here"),
+            "assistant reply rendered:\n{chat}"
+        );
+
+        // The turn reached disk: the resumed log has a user-thread leaf.
+        let log = h.world.log.lock().await;
+        assert!(
+            log.latest_leaf(ThreadFilter::USER).is_some(),
+            "the driven turn was persisted"
+        );
+    }
+
+    /// With nothing running, a single Ctrl+C exits the loop with
+    /// [`SessionExit::Quit`]. No feeder or paused clock needed: the
+    /// pre-queued key is read on the first idle poll.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quits_on_ctrl_c_when_idle() {
+        let mut h = build_harness(scripted_run_config(Vec::new())).await;
+        h.input.send(Key::ctrl('c')).expect("queue ctrl-c");
+
+        let exit = h.run(Vec::new()).await;
+        assert!(matches!(exit, SessionExit::Quit));
+    }
+
+    /// A mid-turn Ctrl+C cancels the in-flight turn without freezing
+    /// the loop (the R2/A3 lost-cancellation regression): the turn
+    /// aborts, the "Turn cancelled." notice renders, the scripted
+    /// reply never lands, and the still-live loop accepts a second
+    /// Ctrl+C to quit.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn ctrl_c_cancels_in_flight_turn_and_keeps_session_alive() {
+        // A long provider delay keeps the turn parked until the cancel
+        // token fires, so the first Ctrl+C lands mid-turn.
+        let run_config = scripted_run_config_with_delay(
+            vec![finalized_text_message("late reply")],
+            Duration::from_secs(3600),
+        );
+        let mut h = build_harness(run_config).await;
+
+        let input = h.input.clone();
+        let feeder = tokio::spawn(async move {
+            // First Ctrl+C: fired once the turn is in flight (parked on
+            // the provider). Auto-advance guarantees the abort cascade
+            // settles before the second sleep, so the second Ctrl+C
+            // sees an idle loop and quits.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = input.send(Key::ctrl('c'));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = input.send(Key::ctrl('c'));
+        });
+
+        let exit = h.run(vec![UserContent::text("do a slow thing")]).await;
+        feeder.abort();
+
+        assert!(matches!(exit, SessionExit::Quit));
+        let chat = h.chat_text();
+        assert!(
+            chat.contains("do a slow thing"),
+            "user prompt rendered before cancel:\n{chat}"
+        );
+        assert!(
+            chat.contains("Turn cancelled."),
+            "cancel notice rendered:\n{chat}"
+        );
+        assert!(
+            !chat.contains("late reply"),
+            "the aborted reply must never land:\n{chat}"
+        );
+    }
+}

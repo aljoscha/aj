@@ -49,7 +49,8 @@
 //! the readline loop drive the recovery turn.
 
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
@@ -70,6 +71,49 @@ use crate::session_setup::{
 
 /// Drive a single print-mode run from `args`.
 ///
+/// Resolves the process-global inputs — `config.toml` (with any
+/// diagnostics surfaced to stderr), the credential store, the sessions
+/// directory, the process working directory, and stdout as the output
+/// sink — then delegates the actual run to [`run_inner`]. Keeping that
+/// resolution here lets [`run_inner`] take every dependency by value so
+/// it is drivable headlessly in tests with a captured sink.
+pub async fn run(args: Args) -> Result<()> {
+    // Load config.toml first (lowest priority). Missing or invalid
+    // config falls back to defaults so a one-shot `aj --print`
+    // works in a freshly-cloned checkout without any setup; any
+    // diagnostics (parse errors, unknown keys) are surfaced to
+    // stderr so the user knows their file wasn't applied as-is.
+    let (config, config_diagnostics) = Config::load();
+    for d in &config_diagnostics {
+        let label = match d.severity() {
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        };
+        eprintln!("aj: {label}: {d}");
+    }
+
+    // Resolve the credential store up front: the registry path of
+    // `build_initial_run_config` installs the lazy API-key resolver
+    // against it, and the `--api-key` override below targets it.
+    let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
+
+    let sessions_dir = Config::get_sessions_dir_path()?;
+    let conversation_persistence = ConversationPersistence::new(sessions_dir);
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    run_inner(
+        args,
+        config,
+        auth,
+        conversation_persistence,
+        cwd,
+        Arc::new(Mutex::new(io::stdout())),
+    )
+    .await
+}
+
+/// Drive a single print-mode run against injected dependencies.
+///
 /// The flow mirrors interactive mode's session setup through the
 /// shared [`crate::session_setup`] primitives (resolve the run config
 /// with CLI > env > config precedence, open + repair the
@@ -88,7 +132,18 @@ use crate::session_setup::{
 /// mode the historical events from [`replay`] are drained through the
 /// JSON sink before the new turn begins so the consumer sees the full
 /// event trace in emit order.
-pub async fn run(args: Args) -> Result<()> {
+///
+/// All output (the JSONL stream and the final text) goes to `out`
+/// rather than directly to stdout, so a test can capture and assert on
+/// it. `@file` attachments resolve relative to `cwd`.
+async fn run_inner<W: Write + Send + 'static>(
+    args: Args,
+    config: Config,
+    auth: AuthStorage,
+    conversation_persistence: ConversationPersistence,
+    cwd: PathBuf,
+    out: Arc<Mutex<W>>,
+) -> Result<()> {
     // Validate dispatch shape early so the user sees a clear error
     // instead of a confusing failure later. `Continue` resolves to
     // either a specific session id or "latest for this project";
@@ -110,27 +165,12 @@ pub async fn run(args: Args) -> Result<()> {
     // back on, so an empty result is a hard error rather than a quiet
     // no-op.
     let content = {
-        let cwd = std::env::current_dir().unwrap_or_default();
         let input = crate::cli::initial_input(&args, &cwd)?;
         if input.is_empty() {
             bail!("aj --print requires a prompt argument");
         }
         input.into_content()
     };
-
-    // Load config.toml first (lowest priority). Missing or invalid
-    // config falls back to defaults so a one-shot `aj --print`
-    // works in a freshly-cloned checkout without any setup; any
-    // diagnostics (parse errors, unknown keys) are surfaced to
-    // stderr so the user knows their file wasn't applied as-is.
-    let (config, config_diagnostics) = Config::load();
-    for d in &config_diagnostics {
-        let label = match d.severity() {
-            Severity::Warning => "warning",
-            Severity::Error => "error",
-        };
-        eprintln!("aj: {label}: {d}");
-    }
 
     // Speed selection follows the same precedence as the model:
     // CLI flag > config.toml > default. `--speed` is parsed here; the
@@ -144,11 +184,6 @@ pub async fn run(args: Args) -> Result<()> {
         ConfigSpeed::Standard => Speed::Standard,
         ConfigSpeed::Fast => Speed::Fast,
     });
-
-    // Resolve the credential store up front: the registry path of
-    // `build_initial_run_config` installs the lazy API-key resolver
-    // against it, and the `--api-key` override below targets it.
-    let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
 
     // Resolve the initial run config (provider / model / thinking /
     // speed, merged CLI > env > config) plus the resume-time
@@ -176,8 +211,6 @@ pub async fn run(args: Args) -> Result<()> {
     // Resolve which session to open. `continue` with neither an
     // explicit id nor a latest session on disk is a hard error here:
     // print mode is one-shot and has no readline to fall back on.
-    let sessions_dir = Config::get_sessions_dir_path()?;
-    let conversation_persistence = ConversationPersistence::new(sessions_dir);
     let source = match &resume_request {
         Some(Some(id)) => SessionSource::Resume {
             session_id: id.clone(),
@@ -223,7 +256,7 @@ pub async fn run(args: Args) -> Result<()> {
         && matches!(args.format, PrintFormat::Json)
         && log.latest_leaf(ThreadFilter::USER).is_some()
     {
-        let json = json_event_listener();
+        let json = json_event_listener(Arc::clone(&out));
         for event in replay(&log) {
             json(&event).await.map_err(|e| {
                 anyhow::Error::msg(e)
@@ -311,7 +344,7 @@ pub async fn run(args: Args) -> Result<()> {
     // `agent.messages()`. The listener is therefore essentially a
     // no-op in text mode but keeps the structure symmetrical.
     let _stream_handle = match args.format {
-        PrintFormat::Json => Some(agent.subscribe(json_event_listener())),
+        PrintFormat::Json => Some(agent.subscribe(json_event_listener(Arc::clone(&out)))),
         PrintFormat::Text => None,
     };
 
@@ -390,18 +423,18 @@ pub async fn run(args: Args) -> Result<()> {
     // Text mode: print the final assistant message's visible text.
     // JSON mode already streamed every event; nothing else to do.
     if matches!(args.format, PrintFormat::Text) {
-        print_final_assistant_text(&agent)?;
+        print_final_assistant_text(&agent, &out)?;
     }
 
-    // Make sure stdout is flushed before exit so callers piping into
+    // Make sure the sink is flushed before exit so callers piping into
     // another process don't lose buffered bytes.
-    let _ = io::stdout().flush();
+    let _ = out.lock().expect("print sink mutex poisoned").flush();
     Ok(())
 }
 
-/// Build a [`Listener`] that writes each event as one JSONL line on
-/// stdout. The listener is synchronous (`listener_from_sync`), and the
-/// bus awaits it inline, so events appear in stdout in the same order
+/// Build a [`Listener`] that writes each event as one JSONL line into
+/// `out`. The listener is synchronous (`listener_from_sync`), and the
+/// bus awaits it inline, so events appear in the sink in the same order
 /// the agent emits them.
 ///
 /// Every `AgentEvent` the agent emits is serializable (see
@@ -410,7 +443,7 @@ pub async fn run(args: Args) -> Result<()> {
 /// serialize error: a downstream consumer that hangs up (broken pipe),
 /// or some future non-serializable payload, should surface as a stderr
 /// warning and a visible gap, not kill the whole prompt.
-fn json_event_listener() -> Listener {
+fn json_event_listener<W: Write + Send + 'static>(out: Arc<Mutex<W>>) -> Listener {
     listener_from_sync(move |event: &AgentEvent| {
         // `ToolExecutionUpdate` is a high-frequency (~10/s) transient
         // progress snapshot for live rendering; it is never persisted
@@ -422,7 +455,8 @@ fn json_event_listener() -> Listener {
         }
         match serde_json::to_string(event) {
             Ok(line) => {
-                if let Err(e) = writeln!(io::stdout(), "{line}") {
+                let mut w = out.lock().expect("print sink mutex poisoned");
+                if let Err(e) = writeln!(w, "{line}") {
                     eprintln!("aj: failed to write event to stdout: {e}");
                 }
             }
@@ -436,12 +470,12 @@ fn json_event_listener() -> Listener {
 }
 
 /// Walk back through the agent's transcript to find the most recent
-/// assistant message, then print every visible text block on its own
-/// line. Callers piping the output into another process get the clean
-/// final answer with no streaming chatter, no tool-result preambles,
-/// and no thinking blocks — same contract as a single round-trip
-/// through `Agent::prompt`.
-fn print_final_assistant_text(agent: &Agent) -> Result<()> {
+/// assistant message, then write every visible text block on its own
+/// line into `out`. Callers piping the output into another process get
+/// the clean final answer with no streaming chatter, no tool-result
+/// preambles, and no thinking blocks — same contract as a single
+/// round-trip through `Agent::prompt`.
+fn print_final_assistant_text<W: Write>(agent: &Agent, out: &Arc<Mutex<W>>) -> Result<()> {
     let messages = agent.messages();
     let last_assistant = messages.iter().rev().find_map(|m| match m.as_wire() {
         Some(aj_models::types::Message::Assistant(a)) => Some(a),
@@ -454,13 +488,13 @@ fn print_final_assistant_text(agent: &Agent) -> Result<()> {
         ));
     };
 
-    let mut stdout = io::stdout().lock();
+    let mut w = out.lock().expect("print sink mutex poisoned");
     for block in &message.content {
         if let aj_models::types::AssistantContent::Text(t) = block {
-            writeln!(stdout, "{}", t.text).context("failed to write assistant text to stdout")?;
+            writeln!(w, "{}", t.text).context("failed to write assistant text to stdout")?;
         }
     }
-    stdout.flush().ok();
+    w.flush().ok();
     Ok(())
 }
 
@@ -564,5 +598,107 @@ mod tests {
         }
         let input = crate::cli::initial_input(&args, std::path::Path::new("/")).unwrap();
         assert!(input.is_empty());
+    }
+
+    // ---- Driven full-turn tests ------------------------------------------
+    //
+    // These drive `run_inner` end to end against the `streaming-text`
+    // scripted demo with injected config / auth / persistence and a
+    // captured byte sink, so they exercise the print-specific assembly
+    // and output path without the process-global resolution `run` does.
+    // `start_paused` makes the demo's per-chunk sleeps auto-advance, so
+    // the turn completes instantly with no wall-clock waits.
+
+    use std::sync::Mutex;
+
+    use aj_models::auth::AuthStorage;
+    use aj_session::ConversationLog;
+    use tempfile::TempDir;
+
+    /// A substring of the `streaming-text` demo's canned reply, stable
+    /// regardless of how the text is chunked across deltas.
+    const DEMO_REPLY_FRAGMENT: &str = "plain text-only demo";
+
+    /// Drive `run_inner` for `cli` (which must select the scripted demo)
+    /// against fresh tempdir-backed dependencies, returning the captured
+    /// output and the persistence handle for on-disk assertions.
+    async fn drive(cli: &[&str]) -> (String, ConversationPersistence, TempDir) {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let auth_dir = TempDir::new().expect("auth tempdir");
+        let cwd = TempDir::new().expect("cwd tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let auth = AuthStorage::new(auth_dir.path().join("auth.json"));
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        run_inner(
+            parse(cli),
+            Config::default(),
+            auth,
+            persistence.clone(),
+            cwd.path().to_path_buf(),
+            Arc::clone(&sink),
+        )
+        .await
+        .expect("print run completes");
+
+        let out = String::from_utf8(sink.lock().expect("sink poisoned").clone())
+            .expect("sink holds valid utf-8");
+        // Keep `sessions` alive (returned) so the persisted log outlives
+        // the assertions; `auth_dir`/`cwd` may drop here.
+        (out, persistence, sessions)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn text_mode_prints_final_assistant_text_and_persists_the_turn() {
+        let (out, persistence, _sessions) =
+            drive(&["--print", "--scripted", "streaming-text", "hello"]).await;
+
+        assert!(
+            out.contains(DEMO_REPLY_FRAGMENT),
+            "final assistant text printed:\n{out}"
+        );
+
+        // The turn round-tripped to disk: a resumable session exists
+        // with a user-thread leaf.
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("a session was written");
+        let log = ConversationLog::resume(&persistence, &id).expect("resume the written log");
+        assert!(
+            log.latest_leaf(ThreadFilter::USER).is_some(),
+            "the driven turn was persisted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn json_mode_streams_one_valid_json_object_per_line() {
+        let (out, _persistence, _sessions) = drive(&[
+            "--print",
+            "--format",
+            "json",
+            "--scripted",
+            "streaming-text",
+            "hello",
+        ])
+        .await;
+
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(!lines.is_empty(), "json mode emitted at least one event");
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("each line is a JSON object ({e}): {line:?}"));
+        }
+        // The high-frequency transient progress frames are filtered from
+        // the structured stream.
+        assert!(
+            !out.contains("tool_execution_update"),
+            "ToolExecutionUpdate frames are excluded:\n{out}"
+        );
+        // The assistant reply rode the event stream.
+        assert!(
+            out.contains(DEMO_REPLY_FRAGMENT),
+            "assistant text present in the json stream:\n{out}"
+        );
     }
 }
