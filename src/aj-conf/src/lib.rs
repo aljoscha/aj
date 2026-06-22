@@ -19,6 +19,7 @@ use crate::skills::{Skill, SkillDiagnostic};
 #[serde(rename_all = "lowercase")]
 pub enum ConfigThinkingLevel {
     Off,
+    Minimal,
     Low,
     Medium,
     High,
@@ -30,6 +31,7 @@ impl fmt::Display for ConfigThinkingLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigThinkingLevel::Off => write!(f, "off"),
+            ConfigThinkingLevel::Minimal => write!(f, "minimal"),
             ConfigThinkingLevel::Low => write!(f, "low"),
             ConfigThinkingLevel::Medium => write!(f, "medium"),
             ConfigThinkingLevel::High => write!(f, "high"),
@@ -45,13 +47,14 @@ impl FromStr for ConfigThinkingLevel {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "off" => Ok(ConfigThinkingLevel::Off),
+            "minimal" => Ok(ConfigThinkingLevel::Minimal),
             "low" => Ok(ConfigThinkingLevel::Low),
             "medium" => Ok(ConfigThinkingLevel::Medium),
             "high" => Ok(ConfigThinkingLevel::High),
             "xhigh" => Ok(ConfigThinkingLevel::XHigh),
             "max" => Ok(ConfigThinkingLevel::Max),
             _ => Err(format!(
-                "invalid thinking level '{s}': expected off, low, medium, high, xhigh, or max"
+                "invalid thinking level '{s}': expected off, minimal, low, medium, high, xhigh, or max"
             )),
         }
     }
@@ -1020,7 +1023,7 @@ impl Config {
         ConfigOption {
             name: "thinking",
             description: "Default thinking level.",
-            kind: ValueKind::Enum(&["off", "low", "medium", "high", "xhigh", "max"]),
+            kind: ValueKind::Enum(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
             apply_toml_fn: |v, c| {
                 c.thinking = v.try_into()?;
                 Ok(())
@@ -1737,6 +1740,10 @@ mod tests {
             ConfigThinkingLevel::Low
         );
         assert_eq!(
+            "minimal".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::Minimal
+        );
+        assert_eq!(
             "XHigh".parse::<ConfigThinkingLevel>().unwrap(),
             ConfigThinkingLevel::XHigh
         );
@@ -1746,6 +1753,7 @@ mod tests {
     #[test]
     fn test_config_thinking_level_display() {
         assert_eq!(ConfigThinkingLevel::Off.to_string(), "off");
+        assert_eq!(ConfigThinkingLevel::Minimal.to_string(), "minimal");
         assert_eq!(ConfigThinkingLevel::Low.to_string(), "low");
         assert_eq!(ConfigThinkingLevel::Medium.to_string(), "medium");
         assert_eq!(ConfigThinkingLevel::High.to_string(), "high");

@@ -129,10 +129,10 @@ pub enum ConversationEntryKind {
     /// and `model_id` key into the model catalog.
     ModelChange { provider: String, model_id: String },
     /// The active thinking effort changed (or was first recorded).
-    /// `level` is one of "off", "low", "medium", "high", "xhigh",
-    /// "max". Stored as a string so the on-disk format stays stable
-    /// if the effort enum evolves; unknown values are tolerated on
-    /// restore.
+    /// `level` is one of "off", "minimal", "low", "medium", "high",
+    /// "xhigh", "max". Stored as a string so the on-disk format stays
+    /// stable if the effort enum evolves; unknown values are tolerated
+    /// on restore.
     ThinkingChange { level: String },
     /// The active speed changed (or was first recorded). `speed` is
     /// "standard" or "fast". Stored as a string so the on-disk format

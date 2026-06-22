@@ -43,10 +43,10 @@ where
 /// Snapshot of an agent's bundle identity: which model it talks to
 /// and at what thinking effort and inference speed.
 ///
-/// `thinking` uses the "off" / "low" / "medium" / "high" / "xhigh" /
-/// "max" vocabulary; `speed` is "standard" or "fast". Carried on
-/// [`AgentEvent::SubAgentStart`] and persisted verbatim in the
-/// conversation log's sub-agent spawn entries, so the strings are
+/// `thinking` uses the "off" / "minimal" / "low" / "medium" / "high"
+/// / "xhigh" / "max" vocabulary; `speed` is "standard" or "fast".
+/// Carried on [`AgentEvent::SubAgentStart`] and persisted verbatim in
+/// the conversation log's sub-agent spawn entries, so the strings are
 /// part of the on-disk contract.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSettings {
@@ -54,8 +54,8 @@ pub struct AgentSettings {
     pub provider: String,
     /// Catalog id of the model.
     pub model_id: String,
-    /// Thinking effort: one of "off", "low", "medium", "high",
-    /// "xhigh", "max".
+    /// Thinking effort: one of "off", "minimal", "low", "medium",
+    /// "high", "xhigh", "max".
     pub thinking: String,
     /// Inference speed: "standard" or "fast".
     pub speed: String,

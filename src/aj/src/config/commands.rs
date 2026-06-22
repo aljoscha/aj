@@ -307,6 +307,11 @@ pub const THINKING_LEVELS: &[ThinkingLevel] = &[
         config: None,
     },
     ThinkingLevel {
+        name: "minimal",
+        description: "Minimal thinking effort",
+        config: Some(ThinkingConfig::Minimal),
+    },
+    ThinkingLevel {
         name: "low",
         description: "Light thinking effort",
         config: Some(ThinkingConfig::Low),

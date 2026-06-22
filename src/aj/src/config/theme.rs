@@ -1343,6 +1343,7 @@ pub fn markdown_theme(theme: &ThemeHandle, syntax_highlight: bool) -> MarkdownTh
 fn thinking_color_token(level: Option<&ThinkingConfig>) -> ThemeColor {
     match level {
         None => ThemeColor::ThinkingOff,
+        Some(ThinkingConfig::Minimal) => ThemeColor::ThinkingMinimal,
         Some(ThinkingConfig::Low) => ThemeColor::ThinkingLow,
         Some(ThinkingConfig::Medium) => ThemeColor::ThinkingMedium,
         Some(ThinkingConfig::High) => ThemeColor::ThinkingHigh,
@@ -1667,6 +1668,10 @@ mod tests {
     #[test]
     fn thinking_color_token_maps_each_level_to_its_token() {
         assert_eq!(thinking_color_token(None), ThemeColor::ThinkingOff);
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Minimal)),
+            ThemeColor::ThinkingMinimal
+        );
         assert_eq!(
             thinking_color_token(Some(&ThinkingConfig::Low)),
             ThemeColor::ThinkingLow

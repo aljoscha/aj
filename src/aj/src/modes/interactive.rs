@@ -2754,6 +2754,7 @@ fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> Config
     use aj_models::ThinkingConfig;
     match thinking {
         None => ConfigThinkingLevel::Off,
+        Some(ThinkingConfig::Minimal) => ConfigThinkingLevel::Minimal,
         Some(ThinkingConfig::Low) => ConfigThinkingLevel::Low,
         Some(ThinkingConfig::Medium) => ConfigThinkingLevel::Medium,
         Some(ThinkingConfig::High) => ConfigThinkingLevel::High,

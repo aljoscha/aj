@@ -335,6 +335,7 @@ pub fn apply_verbosity(options: &mut StreamOptions, verbosity: Option<ConfigVerb
 pub fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Option<ThinkingConfig> {
     level.and_then(|level| match level {
         ConfigThinkingLevel::Off => None,
+        ConfigThinkingLevel::Minimal => Some(ThinkingConfig::Minimal),
         ConfigThinkingLevel::Low => Some(ThinkingConfig::Low),
         ConfigThinkingLevel::Medium => Some(ThinkingConfig::Medium),
         ConfigThinkingLevel::High => Some(ThinkingConfig::High),

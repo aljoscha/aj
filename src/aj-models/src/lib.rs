@@ -34,12 +34,12 @@ pub mod usage;
 /// [`crate::types::ThinkingLevel`] one-to-one before each inference;
 /// each level is sent to the provider verbatim with no remapping.
 /// `None` (i.e. `Option<ThinkingConfig>::None`) means "extended
-/// thinking off" — different from
-/// [`crate::types::ThinkingLevel::Minimal`], which is the lowest
-/// effort rung for reasoning models that don't support disabling
-/// thinking entirely.
+/// thinking off". This is distinct from [`ThinkingConfig::Minimal`],
+/// the lowest effort rung for reasoning models that don't support
+/// disabling thinking entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingConfig {
+    Minimal,
     Low,
     Medium,
     High,
@@ -48,13 +48,14 @@ pub enum ThinkingConfig {
 }
 
 /// Render an optional [`ThinkingConfig`] as its canonical name:
-/// `"off"` for `None`, otherwise one of `"low"`, `"medium"`,
-/// `"high"`, `"xhigh"`, `"max"`. This vocabulary is shared by the
-/// session log's settings entries, the event protocol, and the
-/// binary's level selector.
+/// `"off"` for `None`, otherwise one of `"minimal"`, `"low"`,
+/// `"medium"`, `"high"`, `"xhigh"`, `"max"`. This vocabulary is
+/// shared by the session log's settings entries, the event protocol,
+/// and the binary's level selector.
 pub fn thinking_config_name(level: Option<&ThinkingConfig>) -> &'static str {
     match level {
         None => "off",
+        Some(ThinkingConfig::Minimal) => "minimal",
         Some(ThinkingConfig::Low) => "low",
         Some(ThinkingConfig::Medium) => "medium",
         Some(ThinkingConfig::High) => "high",
@@ -70,6 +71,7 @@ pub fn thinking_config_name(level: Option<&ThinkingConfig>) -> &'static str {
 pub fn thinking_config_from_name(name: &str) -> Option<Option<ThinkingConfig>> {
     match name {
         "off" => Some(None),
+        "minimal" => Some(Some(ThinkingConfig::Minimal)),
         "low" => Some(Some(ThinkingConfig::Low)),
         "medium" => Some(Some(ThinkingConfig::Medium)),
         "high" => Some(Some(ThinkingConfig::High)),
@@ -159,5 +161,32 @@ mod tests {
         assert_eq!(verbosity_from_name(""), Some(None));
         // Unknown strings are rejected so callers keep their value.
         assert_eq!(verbosity_from_name("loud"), None);
+    }
+
+    #[test]
+    fn thinking_config_name_round_trips() {
+        for level in [
+            None,
+            Some(ThinkingConfig::Minimal),
+            Some(ThinkingConfig::Low),
+            Some(ThinkingConfig::Medium),
+            Some(ThinkingConfig::High),
+            Some(ThinkingConfig::XHigh),
+            Some(ThinkingConfig::Max),
+        ] {
+            assert_eq!(
+                thinking_config_from_name(thinking_config_name(level.as_ref())),
+                Some(level)
+            );
+        }
+        // `None` is the canonical "extended thinking off". Minimal is
+        // a distinct lowest reasoning rung, not the same as off.
+        assert_eq!(thinking_config_name(None), "off");
+        assert_eq!(
+            thinking_config_name(Some(&ThinkingConfig::Minimal)),
+            "minimal"
+        );
+        // Unknown strings are rejected so callers keep their level.
+        assert_eq!(thinking_config_from_name("deep"), None);
     }
 }

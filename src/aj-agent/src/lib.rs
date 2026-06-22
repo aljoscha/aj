@@ -3102,6 +3102,7 @@ impl From<BoxError> for TurnError {
 /// silently downgraded here.
 fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
     match level {
+        ThinkingConfig::Minimal => ThinkingLevel::Minimal,
         ThinkingConfig::Low => ThinkingLevel::Low,
         ThinkingConfig::Medium => ThinkingLevel::Medium,
         ThinkingConfig::High => ThinkingLevel::High,

@@ -170,6 +170,7 @@ pub(crate) fn build_initial_run_config(
 /// mirroring the projection the agent applies before each inference.
 pub(crate) fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
     match level {
+        ThinkingConfig::Minimal => ThinkingLevel::Minimal,
         ThinkingConfig::Low => ThinkingLevel::Low,
         ThinkingConfig::Medium => ThinkingLevel::Medium,
         ThinkingConfig::High => ThinkingLevel::High,
