@@ -357,8 +357,7 @@ impl Conversation {
     /// The last compaction wins — its summary already folds in any
     /// earlier compaction and its `first_kept_entry_id` points past the
     /// earlier boundary, so the latest summary plus its retained tail
-    /// reconstruct the full reduced context (see
-    /// `docs/compaction-spec.md` §3.3).
+    /// reconstruct the full reduced context.
     fn projected_agent_messages(&self) -> Vec<AgentMessage> {
         let last_compaction = self
             .entries

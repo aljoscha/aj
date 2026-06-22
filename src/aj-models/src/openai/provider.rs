@@ -1,8 +1,7 @@
 //! OpenAI Chat Completions API provider.
 //!
 //! Implements the unified [`Provider`] trait against OpenAI's
-//! `POST /chat/completions` streaming endpoint. See
-//! `docs/models-spec.md` §7.2.
+//! `POST /chat/completions` streaming endpoint.
 //!
 //! Stateless — per-call HTTP knobs (auth, base URL, reasoning effort,
 //! tool choice) are derived from the per-call [`ModelInfo`] and
@@ -237,7 +236,7 @@ fn empty_partial(model: &ModelInfo) -> AssistantMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Request body construction (§7.2)
+// Request body construction
 // ---------------------------------------------------------------------------
 
 fn build_request(
@@ -252,7 +251,7 @@ fn build_request(
     {
         messages.push(build_system_message(model, prompt));
     }
-    // §8: rewrite the history for cross-provider replay before
+    // rewrite the history for cross-provider replay before
     // serializing into Chat Completions request messages.
     let transformed = transform_messages(&context.messages, model);
     convert_messages(&transformed, &mut messages);
@@ -260,7 +259,7 @@ fn build_request(
     let tools: Vec<ChatTool> = context.tools.iter().map(to_chat_tool).collect();
     let tool_choice = to_chat_tool_choice(options.tool_choice.as_ref(), !tools.is_empty());
 
-    // §7.2: temperature is set normally even when reasoning is on
+    // temperature is set normally even when reasoning is on
     // (unlike Anthropic, where extended thinking conflicts with it).
     let temperature = options.temperature;
 
@@ -298,7 +297,7 @@ fn build_request(
         response_format: None,
         stop: None,
         stream: Some(true),
-        // §7.2: request usage in streaming so we can populate `Usage`.
+        // request usage in streaming so we can populate `Usage`.
         stream_options: Some(ChatStreamOptions {
             include_usage: Some(true),
             include_obfuscation: None,
@@ -313,7 +312,7 @@ fn build_request(
         modalities: None,
         audio: None,
         reasoning_effort,
-        // §7.2: `verbosity` only when the caller set it and the model
+        // `verbosity` only when the caller set it and the model
         // supports it; otherwise omitted so the server default applies.
         verbosity: options
             .verbosity
@@ -321,7 +320,7 @@ fn build_request(
             .map(map_verbosity),
         prediction: None,
         seed: None,
-        // §7.2: explicitly send `store: false` so conversations are
+        // explicitly send `store: false` so conversations are
         // never persisted server-side, even if the API default changes.
         store: Some(false),
         web_search_options: None,
@@ -350,7 +349,7 @@ fn build_request(
 
 /// Build the system / developer message for the request.
 ///
-/// §7.2: reasoning-capable models receive the prompt as a `developer`
+/// reasoning-capable models receive the prompt as a `developer`
 /// turn (consistent with OpenAI's GPT-5 / o-series convention);
 /// everything else takes the classic `system` slot.
 fn build_system_message(model: &ModelInfo, prompt: &str) -> ChatCompletionRequestMessage {
@@ -362,7 +361,7 @@ fn build_system_message(model: &ModelInfo, prompt: &str) -> ChatCompletionReques
 }
 
 // ---------------------------------------------------------------------------
-// Message conversion (§7.2 "Message conversion")
+// Message conversion
 // ---------------------------------------------------------------------------
 
 /// Project the unified message log onto Chat Completions request messages.
@@ -439,7 +438,7 @@ fn is_text_part(p: &ChatCompletionUserContentPart) -> bool {
 /// Translate an [`AssistantMessage`] into a Chat Completions
 /// `assistant` turn.
 ///
-/// §7.2: thinking blocks are dropped (reasoning is not accepted on
+/// thinking blocks are dropped (reasoning is not accepted on
 /// input here), tool calls flatten into the `tool_calls` array, and
 /// text blocks concatenate into a single string. Returns `None` when
 /// the assistant message carries no text and no tool calls — empty
@@ -452,7 +451,7 @@ fn convert_assistant_message(m: &AssistantMessage) -> Option<ChatCompletionReque
         match block {
             AssistantContent::Text(t) => text_buf.push_str(&t.text),
             AssistantContent::Thinking(_) => {
-                // Dropped on outbound per §7.2.
+                // Dropped on outbound
             }
             AssistantContent::ToolCall(tc) => {
                 tool_calls.push(ChatToolCall::Function {
@@ -487,7 +486,7 @@ fn convert_assistant_message(m: &AssistantMessage) -> Option<ChatCompletionReque
 /// Translate a [`ToolResultMessage`] into a `tool` message plus an
 /// optional `user` follow-up carrying any image parts.
 ///
-/// §7.2: Chat Completions' `tool` role only accepts text, so image
+/// Chat Completions' `tool` role only accepts text, so image
 /// attachments from the tool ride along as a subsequent `user` turn.
 fn convert_tool_result(
     t: &ToolResultMessage,
@@ -538,27 +537,26 @@ fn convert_tool_result(
 }
 
 // ---------------------------------------------------------------------------
-// Public round-trip helpers (`docs/models-spec.md` §1.10, §12 step 11b)
+// Public round-trip helpers
 // ---------------------------------------------------------------------------
 
 /// Project an [`AssistantMessage`] onto the Chat Completions request item
 /// shape — the [`ChatCompletionRequestMessage::Assistant`] entry that
 /// gets sent as part of `messages[]` on a follow-up turn.
 ///
-/// Serialize side of the §1.10 round-trip invariant for
+/// Serialize side of the round-trip invariant for
 /// `openai-completions`. Same projection the provider uses internally
 /// when building a request body, exposed publicly so the round-trip
 /// test suite (and any future caller that wants a single assistant turn
 /// materialized into its wire form) can reach it directly.
 ///
-/// Behaviour follows §7.2:
+/// Behaviour follows:
 ///
 /// - Text blocks concatenate into the single `content` string the API
 ///   accepts.
 /// - Thinking blocks are dropped — the public Chat Completions endpoint
-///   does not accept `reasoning_content` on input. §1.10 explicitly
-///   lists reasoning under the deliberately-not-preserved set for this
-///   provider; see §7.2 for the rationale.
+///   does not accept `reasoning_content` on input, so reasoning is in
+///   the deliberately-not-preserved set for this provider.
 /// - Tool calls flatten into the `tool_calls` array, with each block's
 ///   JSON [`Value`] arguments serialized to a string per the wire shape.
 ///
@@ -577,11 +575,11 @@ pub fn assistant_message_to_request_item(
 /// Completions `messages[]` entry whose role is `assistant` back into a
 /// unified [`AssistantMessage`].
 ///
-/// Parse side of the §1.10 round-trip invariant for
+/// Parse side of the round-trip invariant for
 /// `openai-completions` — symmetric to the streaming state machine in
 /// [`StreamState`], because Chat Completions' request and response
-/// assistant content share shapes one-for-one. The mapping from
-/// `docs/models-spec.md` §7.2 preserved here:
+/// assistant content share shapes one-for-one. The mapping
+/// preserved here:
 ///
 /// - `content` (`Option<String>`) → [`AssistantContent::Text`] when
 ///   non-empty.
@@ -595,7 +593,7 @@ pub fn assistant_message_to_request_item(
 ///   than failing the parse.
 ///
 /// Reasoning is intentionally not represented on the request side and
-/// therefore not recovered here — see §7.2 / §1.10.
+/// therefore not recovered here.
 ///
 /// Non-`Assistant` variants (`User`, `System`, `Tool`, `Developer`)
 /// produce an empty `AssistantMessage`; the role is taken on faith,
@@ -684,7 +682,7 @@ pub fn replay_sse_events(
 }
 
 // ---------------------------------------------------------------------------
-// Tools / tool choice (§7.2 "Tool definition format" + "Tool choice mapping")
+// Tools / tool choice
 // ---------------------------------------------------------------------------
 
 fn to_chat_tool(tool: &ToolDefinition) -> ChatTool {
@@ -693,7 +691,7 @@ fn to_chat_tool(tool: &ToolDefinition) -> ChatTool {
             name: tool.name.clone(),
             description: Some(tool.description.clone()),
             parameters: tool.parameters.clone(),
-            // §7.2 hardcodes `strict: false` — strict mode rejects
+            // hardcodes `strict: false` — strict mode rejects
             // many of our tool schemas (open-ended object shapes).
             strict: Some(false),
         },
@@ -718,7 +716,7 @@ fn to_chat_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Option<C
 }
 
 // ---------------------------------------------------------------------------
-// Reasoning effort (§7.2 "Reasoning effort")
+// Reasoning effort
 // ---------------------------------------------------------------------------
 
 /// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
@@ -740,7 +738,7 @@ fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
 }
 
 // ---------------------------------------------------------------------------
-// Stream state machine (§7.2 "Stream event mapping")
+// Stream state machine
 // ---------------------------------------------------------------------------
 
 /// Per-content-block routing state. We thread incoming deltas to the
@@ -1104,8 +1102,8 @@ impl StreamState {
     }
 
     /// Build the stream's terminal event, classifying a stream that ended
-    /// before its `finish_reason` as a retryable truncation error
-    /// (`docs/models-spec.md` §10.3) rather than a successful `Done`.
+    /// before its `finish_reason` as a retryable truncation error rather
+    /// than a successful `Done`.
     /// Otherwise defers to [`Self::finalize`].
     fn finalize_or_truncate(self) -> AssistantMessageEvent {
         if self.saw_terminal() {
@@ -1234,7 +1232,7 @@ fn classify_finish(
 }
 
 // ---------------------------------------------------------------------------
-// Usage merging + cost (§7.2 "Usage parsing")
+// Usage merging + cost
 // ---------------------------------------------------------------------------
 
 fn apply_usage(target: &mut Usage, source: &ChatUsage) {
@@ -1251,7 +1249,7 @@ fn apply_usage(target: &mut Usage, source: &ChatUsage) {
         .map(u64::from)
         .unwrap_or(0);
 
-    // §7.2: when an OpenAI-compatible provider reports cache_write
+    // when an OpenAI-compatible provider reports cache_write
     // tokens *inside* the cached_tokens count, subtract them so the
     // result is a pure cache-read figure.
     let cache_read = if cache_write > 0 {
@@ -1268,13 +1266,13 @@ fn apply_usage(target: &mut Usage, source: &ChatUsage) {
     target.input = input;
     target.cache_read = cache_read;
     target.cache_write = cache_write;
-    // §7.2: completion_tokens already includes reasoning tokens as a
+    // completion_tokens already includes reasoning tokens as a
     // subset on native OpenAI; do not add reasoning_tokens separately.
     target.output = u64::from(source.completion_tokens);
 }
 
 fn finalize_usage(usage: &mut Usage, model: &ModelInfo) {
-    // §7.2: trust our own arithmetic over the wire's `total_tokens`.
+    // trust our own arithmetic over the wire's `total_tokens`.
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
     calculate_cost(model, usage);
 }

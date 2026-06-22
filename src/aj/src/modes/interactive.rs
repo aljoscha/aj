@@ -1,6 +1,6 @@
 //! Interactive TUI mode.
 //!
-//! Per `docs/aj-next-plan.md` §4 the interactive mode owns:
+//! The interactive mode owns:
 //!
 //! - the [`aj_tui::tui::Tui`] event loop (input, render throttle);
 //! - a [`layout`] of named slots that components register into;
@@ -1099,7 +1099,7 @@ async fn run_session(
                         //    below tears the dialog down and
                         //    aborts the task.
                         // 3. Otherwise act on the agent you are
-                        //    *viewing* (spec §4.5):
+                        //    *viewing*:
                         //    - Viewed agent has a binary-driven
                         //      turn (`turn_cancels`): cancel just
                         //      it. The cancel handle is the
@@ -1140,7 +1140,7 @@ async fn run_session(
                                 session.cancel.store(true, Ordering::Relaxed);
                                 continue;
                             } else {
-                                // Per-view Ctrl+C (spec §4.5): act on the agent you're viewing.
+                                // Per-view Ctrl+C: act on the agent you're viewing.
                                 let active = world.pump.active_view(&mut shell.tui);
                                 if let Some(token) = turn_cancels.get(&active) {
                                     // Viewed agent has a binary-driven turn: cancel just it.
@@ -1203,7 +1203,7 @@ async fn run_session(
                         // the session. Bound via `aj.thinking.toggle`
                         // (default `alt+t`); intercepted before
                         // `shell.tui.handle_input` so the editor never sees
-                        // the keystroke. See `docs/aj-next-plan.md` §4.4.
+                        // the keystroke.
                         {
                             let kb = aj_tui::keybindings::get();
                             if kb.matches(
@@ -2668,9 +2668,8 @@ const SANDBOX_WARNING: &str = "WARNING: AJ has no sandboxing or permission check
 
 /// Returns `true` when the sandbox warning should be shown — i.e.
 /// when `AJ_DISABLE_SANDBOX_WARNING` is unset in the environment.
-/// Mirrors the legacy binary's
-/// `std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()` check
-/// exactly: setting the var to *any* value (including the empty
+/// Uses an `std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()`
+/// check: setting the var to *any* value (including the empty
 /// string) suppresses the warning.
 fn sandbox_warning_enabled() -> bool {
     std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()
@@ -5052,8 +5051,8 @@ mod tests {
             "warning should be suppressed when the var is set"
         );
 
-        // Matches legacy `is_err()` semantics: even an empty value
-        // counts as "set" and suppresses the warning.
+        // `is_err()` semantics: even an empty value counts as "set"
+        // and suppresses the warning.
         // SAFETY: same scope as above.
         unsafe {
             std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", "");

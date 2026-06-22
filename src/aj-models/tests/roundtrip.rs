@@ -1,9 +1,9 @@
-//! Round-trip test suite for the §1.10 invariant.
+//! Round-trip test suite for the invariant.
 //!
-//! Per `docs/models-spec.md` §12 step 11b, this suite enforces the
+//! This suite enforces the
 //! "provider SSE → unified `AssistantMessage` → provider request item"
 //! round-trip invariant for each supported provider, plus the
-//! cross-provider transform rules from §8.1.
+//! cross-provider transform rules.
 //!
 //! Layout:
 //! - `fixtures/<api>/<scenario>.sse` — captured / hand-crafted SSE wire
@@ -17,7 +17,7 @@
 //! round-trip). Cross-provider directions live in `cross_provider.rs`,
 //! one end-to-end transform test per direction. The Codex provider's
 //! suite (`openai_codex_responses.rs`) adds a fourth scenario that
-//! exercises the §7.4.5 event-normalization layer (legacy
+//! exercises the event-normalization layer (legacy
 //! `response.done` rewrites).
 
 // Submodules live in a sibling directory matching this file's stem.

@@ -1,22 +1,20 @@
 //! `write_file` builtin — writes (or overwrites) a file on disk.
 //!
-//! Migrated to [`aj_agent::tool::ToolDefinition`] per
-//! `docs/aj-next-plan.md` §2.2. Returns a [`ToolOutcome`] whose
+//! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
+//! [`ToolOutcome`] whose
 //! `details` is [`ToolDetails::Diff`] on success: `before` is the
 //! file's prior content (empty when the file didn't exist, which the
 //! renderer naturally surfaces as a creation diff with all `+` lines),
 //! `after` is the freshly-written content. The wire `content` is the
-//! short success summary the legacy implementation emitted so the
-//! model still sees a deterministic `"Successfully {action} ..."`
-//! line.
+//! short success summary so the model still sees a deterministic
+//! `"Successfully {action} ..."` line.
 //!
 //! Recoverable errors (path-not-absolute, IO write failure) come back
 //! as `is_error: true` outcomes carrying [`ToolDetails::Text`] so the
-//! model can correct its call instead of aborting the turn. Per
-//! `docs/aj-next-plan.md` §1.3, [`execution_mode`] is overridden to
-//! [`ExecutionMode::Sequential`] because this tool mutates the
-//! filesystem — the agent will serialize a batch containing it to
-//! avoid interleaved writes.
+//! model can correct its call instead of aborting the turn.
+//! [`execution_mode`] is overridden to [`ExecutionMode::Sequential`]
+//! because this tool mutates the filesystem — the agent serializes a
+//! batch containing it to avoid interleaved writes.
 //!
 //! [`execution_mode`]: ToolDefinition::execution_mode
 
@@ -60,9 +58,9 @@ impl ToolDefinition for WriteFileTool {
         DESCRIPTION
     }
 
-    /// `write_file` mutates the filesystem; the spec marks it as
-    /// `Sequential` so a batch containing it serializes around any
-    /// other in-flight tool calls (`docs/aj-next-plan.md` §1.3).
+    /// `write_file` mutates the filesystem, so it runs in `Sequential`
+    /// mode: a batch containing it serializes around any other
+    /// in-flight tool calls.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -301,8 +299,7 @@ mod tests {
     }
 
     /// Locks in `Sequential` execution mode — the agent's batching
-    /// logic relies on this to serialize filesystem mutations
-    /// (`docs/aj-next-plan.md` §1.3).
+    /// logic relies on this to serialize filesystem mutations.
     #[test]
     fn execution_mode_is_sequential() {
         assert_eq!(WriteFileTool.execution_mode(), ExecutionMode::Sequential);

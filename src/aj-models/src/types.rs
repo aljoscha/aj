@@ -3,8 +3,6 @@
 //! All provider implementations produce and consume these types. They are the
 //! canonical representation for conversations, tool calls, and streaming
 //! options across Anthropic, OpenAI, and any future providers.
-//!
-//! See `docs/models-spec.md` §1 and §4 for the full design.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +12,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
-// §1.1 Content Types
+// Content Types
 // ---------------------------------------------------------------------------
 
 /// Text content block.
@@ -84,7 +82,7 @@ pub enum UserContent {
 }
 
 // ---------------------------------------------------------------------------
-// §1.2 Messages
+// Messages
 // ---------------------------------------------------------------------------
 
 /// A message from the user.
@@ -112,7 +110,7 @@ pub struct AssistantMessage {
     pub usage: Usage,
     pub stop_reason: StopReason,
     /// Failure detail when `stop_reason` is `Error` or `Aborted`.
-    /// Populated by providers per `docs/models-spec.md` §10.3.
+    /// Populated by providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<AssistantError>,
     /// Unix timestamp in milliseconds.
@@ -155,7 +153,7 @@ pub enum Message {
 }
 
 // ---------------------------------------------------------------------------
-// §1.3 Stop Reason, Usage & Error
+// Stop Reason, Usage & Error
 // ---------------------------------------------------------------------------
 
 /// Why the model stopped generating.
@@ -206,8 +204,7 @@ pub struct UsageCost {
 ///
 /// Providers classify upstream failures into one of the [`ErrorCategory`]
 /// values so callers can decide retry behaviour without regex-matching
-/// the message string. Per-provider classification tables live in
-/// `docs/models-spec.md` §10.3; retry semantics in §10.4.
+/// the message string.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AssistantError {
     pub category: ErrorCategory,
@@ -229,8 +226,7 @@ pub struct AssistantError {
 /// Classification of a failure terminating an assistant turn.
 ///
 /// Categories are stable and form the contract callers key retry
-/// behaviour off. See `docs/models-spec.md` §10.2 for the retryable /
-/// not-retryable split and §10.3 for per-provider mapping tables.
+/// behaviour off.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
@@ -264,7 +260,7 @@ pub enum ErrorCategory {
 
 impl ErrorCategory {
     /// Whether errors in this category are safe to automatically
-    /// retry with backoff. See `docs/models-spec.md` §10.2.
+    /// retry with backoff.
     pub fn is_retryable(self) -> bool {
         matches!(self, Self::RateLimit | Self::Overloaded | Self::Transient)
     }
@@ -285,7 +281,7 @@ impl AssistantError {
 }
 
 // ---------------------------------------------------------------------------
-// §1.4 Tool Definition
+// Tool Definition
 // ---------------------------------------------------------------------------
 
 /// Description of a tool the model can invoke.
@@ -298,7 +294,7 @@ pub struct ToolDefinition {
 }
 
 // ---------------------------------------------------------------------------
-// §1.5 Context (input to a streaming call)
+// Context (input to a streaming call)
 // ---------------------------------------------------------------------------
 
 /// Everything the provider needs to make a streaming inference call.
@@ -311,7 +307,7 @@ pub struct Context {
 }
 
 // ---------------------------------------------------------------------------
-// §1.6 Thinking Level
+// Thinking Level
 // ---------------------------------------------------------------------------
 
 /// Controls the depth of extended thinking / reasoning.
@@ -337,7 +333,7 @@ pub enum ThinkingLevel {
 }
 
 // ---------------------------------------------------------------------------
-// §4 Stream Options
+// Stream Options
 // ---------------------------------------------------------------------------
 
 /// Prompt cache retention preference.
@@ -363,8 +359,7 @@ pub enum Speed {
 }
 
 /// Service tier override for OpenAI Responses requests. Ignored by
-/// non-Responses providers. See `docs/models-spec.md` §7.3 for cost
-/// multipliers.
+/// non-Responses providers.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
@@ -376,7 +371,7 @@ pub enum ServiceTier {
 
 /// Reasoning summary verbosity for OpenAI Responses requests.
 /// Ignored by non-Responses providers. Defaults to [`Self::Auto`]
-/// when reasoning is enabled. See `docs/models-spec.md` §7.3.2.
+/// when reasoning is enabled.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningSummary {
@@ -895,7 +890,7 @@ mod tests {
     #[test]
     fn test_simple_stream_options_flatten() {
         // Verify that SimpleStreamOptions flattens base fields correctly
-        // and that ThinkingLevel uses the spec'd lower-case wire form.
+        // and that ThinkingLevel uses the specified lower-case wire form.
         let opts = SimpleStreamOptions {
             base: StreamOptions {
                 temperature: Some(0.7),
@@ -911,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_thinking_level_xhigh_serde() {
-        // §1.6 wire form: lower-case, single token ("xhigh", not "x-high").
+        // wire form: lower-case, single token ("xhigh", not "x-high").
         let json = serde_json::to_value(ThinkingLevel::XHigh).unwrap();
         assert_eq!(json, "xhigh");
         let back: ThinkingLevel = serde_json::from_str("\"xhigh\"").unwrap();

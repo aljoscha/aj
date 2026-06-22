@@ -1,7 +1,6 @@
 //! Catalog refresh: fetch models.dev, normalize, write the user cache.
 //!
-//! Implements the `aj update-models` flow described in
-//! `docs/models-spec.md` §3.4.2 and §3.4.5: pull
+//! Implements the `aj update-models` flow: pull
 //! `https://models.dev/api.json`, filter to tool-capable Anthropic and
 //! OpenAI models, fill provider-specific fixed values, apply the bundled
 //! overrides, and atomically write the result to `~/.aj/models.json`.
@@ -71,7 +70,7 @@ pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 pub const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
 // ---------------------------------------------------------------------------
-// Provider-specific fixed values (§3.4.3).
+// Provider-specific fixed values.
 // ---------------------------------------------------------------------------
 
 /// Each `(provider, id)` pair in the catalog has exactly one `api`. The
@@ -111,8 +110,7 @@ const PROVIDER_FIXED_VALUES: &[ProviderFixedValues] = &[
 const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 /// Wire shape we route OpenRouter through. OpenRouter exposes an
 /// OpenAI-compatible Responses API, so the existing responses provider
-/// serves it with only a `base_url` override. See
-/// `docs/openrouter-spec.md`.
+/// serves it with only a `base_url` override.
 const OPENROUTER_API: &str = "openai-responses";
 /// Base URL for OpenRouter's Responses endpoint (the provider appends
 /// `/responses`).
@@ -252,7 +250,7 @@ pub struct RefreshSummary {
 }
 
 impl RefreshSummary {
-    /// Render the §3.4.5 short summary: "added X, removed Y, price
+    /// Render the short summary: "added X, removed Y, price
     /// changes on Z". Always reports the totals, even when zero, so
     /// users see the path was written successfully.
     pub fn one_line(&self) -> String {
@@ -398,12 +396,12 @@ fn parse_models_dev(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
             continue;
         };
         for (id, m) in &provider.models {
-            // §3.4.7: only tool-capable models are eligible.
+            // only tool-capable models are eligible.
             if m.tool_call != Some(true) {
                 continue;
             }
             let mapped = map_model(fixed, id, m);
-            // §3.4.7: Codex models are seeded by hand; defensively
+            // Codex models are seeded by hand; defensively
             // drop any upstream re-emission so the seed below is the
             // single source of truth for `(provider="openai-codex",
             // id=*)`. models.dev does not categorize anything under
@@ -458,7 +456,7 @@ fn parse_openrouter(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
 /// Splice the hand-curated Codex seed, sort, apply overrides, and stamp
 /// catalog metadata. Shared tail of catalog construction across sources.
 fn assemble_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
-    // §3.4.7: re-emit Codex models from the hand-curated seed after
+    // re-emit Codex models from the hand-curated seed after
     // upstream filtering. Refresh writes the codex entries into the
     // user cache so subsequent refreshes diff cleanly (without the
     // codex set showing up as "removed" every run because models.dev
@@ -473,7 +471,7 @@ fn assemble_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
         other => other,
     });
 
-    // §3.4.5: the refresh command applies overrides before writing the
+    // the refresh command applies overrides before writing the
     // cache. The load path applies them again on every load (idempotent
     // shallow merges), so authored corrections survive both fresh
     // fetches and stale caches.
@@ -498,7 +496,7 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
     let limit = m.limit.as_ref();
     let modalities = m.modalities.as_ref();
 
-    // §3.4.2: `modalities.input` may include "image"; if so the model
+    // `modalities.input` may include "image"; if so the model
     // accepts both text and images. Otherwise default to text-only —
     // every supported model accepts text.
     let mut input = vec![InputModality::Text];
@@ -516,7 +514,7 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         provider: fixed.provider_id.to_string(),
         base_url: fixed.base_url.to_string(),
         reasoning: m.reasoning.unwrap_or(false),
-        // §3.4.4: `supports_adaptive_thinking` is not in models.dev.
+        // `supports_adaptive_thinking` is not in models.dev.
         // Default to `true` for Anthropic reasoning models so a newly
         // released model uses the modern adaptive API rather than
         // silently falling back to budget-based thinking; legacy
@@ -525,7 +523,7 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         // models.
         supports_adaptive_thinking: fixed.api == "anthropic-messages"
             && m.reasoning.unwrap_or(false),
-        // §3.4.4: `supports_verbosity` is not in models.dev. The
+        // `supports_verbosity` is not in models.dev. The
         // OpenAI gpt-5 family on the Responses wire honours
         // `text.verbosity`; older OpenAI models and other providers
         // don't. Pinnable per model via overrides for exceptions.

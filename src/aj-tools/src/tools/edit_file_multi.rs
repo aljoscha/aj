@@ -1,11 +1,11 @@
 //! `edit_file_multi` builtin — apply multiple exact-string replacements
 //! to a single file, in source order.
 //!
-//! Migrated to [`aj_agent::tool::ToolDefinition`] per
-//! `docs/aj-next-plan.md` §2.2. Returns a [`ToolOutcome`] whose
+//! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
+//! [`ToolOutcome`] whose
 //! `details` is [`ToolDetails::Diff`] on success: `before` is the
 //! file's prior content, `after` is the content after every edit
-//! has been applied. The wire `content` keeps the legacy
+//! has been applied. The wire `content` keeps the
 //! `"Successfully applied N edits ..."` summary so the model still
 //! reads a deterministic confirmation.
 //!
@@ -22,8 +22,8 @@
 //! as `is_error: true` outcomes carrying [`ToolDetails::Text`] so
 //! the model can correct its call instead of aborting the turn.
 //!
-//! Per `docs/aj-next-plan.md` §1.3, [`execution_mode`] is overridden
-//! to [`ExecutionMode::Sequential`] because this tool mutates the
+//! [`execution_mode`] is overridden to [`ExecutionMode::Sequential`]
+//! because this tool mutates the
 //! filesystem — the agent serializes a batch containing it to avoid
 //! interleaved writes.
 //!
@@ -85,9 +85,9 @@ impl ToolDefinition for EditFileMultiTool {
         DESCRIPTION
     }
 
-    /// `edit_file_multi` mutates the filesystem; the spec marks it as
-    /// `Sequential` so a batch containing it serializes around any
-    /// other in-flight tool calls (`docs/aj-next-plan.md` §1.3).
+    /// `edit_file_multi` mutates the filesystem, so it runs in
+    /// `Sequential` mode: a batch containing it serializes around any
+    /// other in-flight tool calls.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -513,8 +513,7 @@ mod tests {
     }
 
     /// Locks in `Sequential` execution mode — the agent's batching
-    /// logic relies on this to serialize filesystem mutations
-    /// (`docs/aj-next-plan.md` §1.3).
+    /// logic relies on this to serialize filesystem mutations.
     #[test]
     fn execution_mode_is_sequential() {
         assert_eq!(

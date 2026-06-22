@@ -5,8 +5,6 @@
 //! drives them through a [`ToolContext`] reference and folds the resulting
 //! [`ToolOutcome`] into both the wire transcript and the typed event
 //! stream.
-//!
-//! See `docs/aj-next-plan.md` §1.2 and §1.3.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -803,7 +801,7 @@ mod tests {
     fn tool_details_round_trips_each_variant() {
         // The persistence listener writes ToolDetails alongside each
         // tool_result message; this locks the {"kind": "..."} framing
-        // so the upcoming `aj-session` migration walker can rely on
+        // so the `aj-session` migration walker can rely on
         // a stable shape.
         let cases = [
             ToolDetails::Text {

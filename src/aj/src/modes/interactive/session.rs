@@ -99,10 +99,9 @@ pub struct SessionWorld {
     pub agent: Arc<TokioMutex<Agent>>,
     /// The environment the agent was built against: base prompt,
     /// AGENTS.md/CLAUDE.md context files, discovered skills, working
-    /// directory. The runtime no longer holds this (it took only the
-    /// assembled prompt), so the world keeps it for the startup
-    /// context notice, the footer cwd, and the editor's autocomplete
-    /// root.
+    /// directory. The runtime takes only the assembled prompt, so the
+    /// world keeps this for the startup context notice, the footer
+    /// cwd, and the editor's autocomplete root.
     pub env: AgentEnv,
     /// Sub-agent registry injected into `agent`; starts empty, so
     /// only sub-agents spawned in this session are promptable.

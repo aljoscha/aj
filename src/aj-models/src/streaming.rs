@@ -1,7 +1,7 @@
 //! Streaming event protocol.
 //!
 //! The unified [`AssistantMessageEvent`] / [`AssistantMessageEventStream`]
-//! protocol described in `docs/models-spec.md` §2. Every event carries an
+//! protocol. Every event carries an
 //! owned `partial` snapshot of the in-progress assistant message, and the
 //! stream terminates with exactly one of [`AssistantMessageEvent::Done`]
 //! or [`AssistantMessageEvent::Error`].
@@ -19,12 +19,12 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::types::{AssistantError, AssistantMessage, ErrorCategory, StopReason, ToolCall};
 
 // ===========================================================================
-// Unified streaming event protocol (docs/models-spec.md §2).
+// Unified streaming event protocol.
 // ===========================================================================
 
 /// Subset of [`StopReason`] valid on an [`AssistantMessageEvent::Done`] event.
 ///
-/// Mirrors the spec constraint that successful terminations are limited to
+/// Mirrors the constraint that successful terminations are limited to
 /// `Stop`, `Length`, or `ToolUse`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -190,9 +190,9 @@ impl AssistantMessageEvent {
     /// frame (`message_stop` / `finish_reason` / `response.completed`).
     ///
     /// A mid-stream transport drop leaves a truncated turn: the accumulated
-    /// deltas are real, but the turn never actually finished. Per
-    /// `docs/models-spec.md` §10.3 this is a retryable
-    /// [`ErrorCategory::Transient`] failure, not a successful `Done` — so a
+    /// deltas are real, but the turn never actually finished. This is a
+    /// retryable [`ErrorCategory::Transient`] failure, not a successful
+    /// `Done` — so a
     /// caller's retry layer re-issues the turn instead of persisting a
     /// cut-off answer as complete. Accumulated content is preserved
     /// verbatim (mirroring [`Self::aborted`]) so a non-retrying consumer
@@ -338,8 +338,8 @@ impl AssistantMessageEventStream {
     }
 
     /// Push an event onto the stream. Pushes after a terminal event (or after
-    /// [`end`](Self::end)) are dropped silently; this matches the spec rule
-    /// that no further events may follow `Done` or `Error`.
+    /// [`end`](Self::end)) are dropped silently: no further events may
+    /// follow `Done` or `Error`.
     pub fn push(&self, event: AssistantMessageEvent) {
         if self.inner.terminated.load(Ordering::SeqCst) {
             return;

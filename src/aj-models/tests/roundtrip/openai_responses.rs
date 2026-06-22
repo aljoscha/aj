@@ -1,15 +1,14 @@
-//! OpenAI Responses round-trip tests (`docs/models-spec.md` §1.10,
-//! §12 step 11b.iv).
+//! OpenAI Responses round-trip tests.
 //!
 //! Three scenarios cover each `AssistantContent` variant the provider
 //! emits:
 //!
 //! - `text_only`: a single message item with one text part.
 //! - `thinking_text`: a reasoning item followed by a message item, the
-//!   §7.3.3 round-trip case where reasoning rides through
+//!   round-trip case where reasoning rides through
 //!   `thinking_signature` for multi-turn replay.
 //! - `tool_call`: a message item plus a function_call item, exercising
-//!   the §7.3.5 composite `{call_id}|{item_id}` ID and the streaming
+//!   the composite `{call_id}|{item_id}` ID and the streaming
 //!   arguments parser.
 //!
 //! For each scenario we run the standard parse / serialize / semantic
@@ -231,7 +230,7 @@ fn run_semantic_roundtrip_test(scenario: &str, canonical: AssistantMessage) {
     let events = load_sse(scenario);
     let parsed = replay_sse_events(&fixture_model(), events, None);
 
-    // §1.10: parsed unified message must serialize to the request item
+    // parsed unified message must serialize to the request item
     // shape and re-parse back into a structurally equivalent message.
     let items: Vec<ResponseInputItem> = assistant_message_to_input_items(&parsed);
     let reparsed = parse_assistant_input_items(&items);
@@ -261,7 +260,7 @@ fn semantic_roundtrip_text_only() {
 }
 
 // ---------------------------------------------------------------------------
-// thinking_text scenario — §7.3.3 reasoning round-trip
+// thinking_text scenario — reasoning round-trip
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -280,7 +279,7 @@ fn semantic_roundtrip_thinking_text() {
 }
 
 // ---------------------------------------------------------------------------
-// tool_call scenario — §7.3.5 composite IDs + streaming arguments
+// tool_call scenario — composite IDs + streaming arguments
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -304,7 +303,7 @@ fn semantic_roundtrip_tool_call() {
 // An errored or truncated turn is never serialized back into a request
 // item, so these scenarios only assert the terminal classification
 // (`stop_reason` + `error.category`) and that partial content survives.
-// They pin the §10.3 / §7.3.8 terminal legs against captured wire
+// They pin the terminal legs against captured wire
 // fixtures.
 // ---------------------------------------------------------------------------
 
@@ -336,7 +335,7 @@ fn truncated_stream_is_transient_error() {
 
 #[test]
 fn incomplete_length_is_clean_done() {
-    // §7.3.8: a `response.incomplete` with `incomplete_details.reason:
+    // a `response.incomplete` with `incomplete_details.reason:
     // max_output_tokens` is a *length cutoff*, a clean `Done(Length)` and
     // not an error. This is the positive control that distinguishes a
     // real length stop from a transport truncation.

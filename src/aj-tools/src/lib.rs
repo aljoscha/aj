@@ -1,11 +1,9 @@
 //! Built-in tool implementations for AJ.
 //!
-//! Tools implement [`aj_agent::tool::ToolDefinition`] (per
-//! `docs/aj-next-plan.md` §1.2 / §1.3) and convert into the
-//! type-erased [`aj_agent::tool::ErasedToolDefinition`] for storage
-//! in the agent's heterogeneous tool collection. The agent drives
-//! them directly — there is no longer a legacy bridge layer in
-//! between.
+//! Tools implement [`aj_agent::tool::ToolDefinition`] and convert into
+//! the type-erased [`aj_agent::tool::ErasedToolDefinition`] for storage
+//! in the agent's heterogeneous tool collection. The agent drives them
+//! directly.
 //!
 //! Rendering of [`aj_agent::tool::ToolDetails`] payloads onto a
 //! terminal lives in the binary that subscribes to the agent's bus

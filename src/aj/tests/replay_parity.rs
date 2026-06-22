@@ -1,7 +1,6 @@
 //! End-to-end replay-vs-live parity test for tool rendering.
 //!
-//! Per `docs/aj-next-progress.md` Step 5 of the "Resume fidelity
-//! follow-up" plan: runs one tool-call turn live, simulates a
+//! Runs one tool-call turn live, simulates a
 //! process kill between the tool-result persistence and the next
 //! inference, resumes from the on-disk log, and asserts that the
 //! chat scrollback rendered from the captured live events matches
@@ -219,9 +218,8 @@ async fn drive_live_turn(
 
     let message = one_tool_use_message(tool_use_id, tool_name, tool_input);
     // `chunk_size = 0` emits the tool call as a single delta carrying
-    // the full serialized arguments — matches the legacy script
-    // shape (one terminal event per inference) so the locked
-    // bus-event sequence is preserved across the migration.
+    // the full serialized arguments, so each inference produces one
+    // terminal event and the locked bus-event sequence stays stable.
     // `ExhaustedBehavior::Panic` makes a runaway extra inference
     // (kill switch failed to bite) panic immediately.
     let provider: Arc<dyn Provider> = Arc::new(

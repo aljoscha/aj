@@ -21,8 +21,7 @@ use serde::{Deserialize, Serialize};
 /// question "what was there before, and what is this turn adding"
 /// — the running total after the turn is exactly
 /// `accumulated_* + turn_*`. Field names mirror the unified usage
-/// shape (`input`, `output`, `cache_read`, `cache_write`) per
-/// `docs/models-spec.md` §1.3.
+/// shape (`input`, `output`, `cache_read`, `cache_write`).
 ///
 /// Polling [`crate::Agent::accumulated_usage`] *between* turns
 /// returns the post-add total (i.e. the next `UsageUpdate` event's

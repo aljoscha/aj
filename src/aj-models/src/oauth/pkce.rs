@@ -8,8 +8,7 @@
 //! client owns both ends of the flow without ever transmitting the
 //! verifier in the redirect.
 //!
-//! Used by both the Anthropic and OpenAI OAuth flows (`docs/models-spec.md`
-//! §9.3 and §9.4).
+//! Used by both the Anthropic and OpenAI OAuth flows.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

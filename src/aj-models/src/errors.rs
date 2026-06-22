@@ -5,9 +5,6 @@
 //! `classify_*` helpers below. Callers then key retry behaviour off
 //! [`ErrorCategory`] without ever pattern-matching message strings.
 //!
-//! See `docs/models-spec.md` §10 for the design — §10.3 owns the
-//! per-provider tables, §10.5 owns context-overflow detection.
-//!
 //! `is_context_overflow` is the public entry point for callers that
 //! want to know whether a turn failed because the request didn't fit
 //! in the model's context window. It uses `error.category` as the
@@ -22,7 +19,7 @@ use regex::RegexSet;
 use crate::types::{AssistantError, AssistantMessage, ErrorCategory, Message, StopReason};
 
 // ---------------------------------------------------------------------------
-// §10.5 Context overflow detection
+// Context overflow detection
 // ---------------------------------------------------------------------------
 
 /// Patterns that indicate a non-overflow failure mode and therefore
@@ -63,8 +60,7 @@ fn overflow_set() -> &'static RegexSet {
 
 /// Whether the message in `error.message` looks like a context-overflow
 /// failure even though its category came in as something other than
-/// [`ErrorCategory::ContextOverflow`]. Used as a defensive fallback;
-/// see `docs/models-spec.md` §10.5.
+/// [`ErrorCategory::ContextOverflow`]. Used as a defensive fallback.
 fn message_matches_overflow(msg: &str) -> bool {
     if exclusion_set().is_match(msg) {
         return false;
@@ -74,7 +70,7 @@ fn message_matches_overflow(msg: &str) -> bool {
 
 /// Whether `message` represents a context-overflow failure.
 ///
-/// Per `docs/models-spec.md` §10.5 the primary signal is
+/// The primary signal is
 /// `error.category == ContextOverflow`; the regex fallback covers
 /// proxy-reshaped errors and upstream message-string churn that left
 /// the failure in `InvalidRequest` or `Unknown`. Also detects "silent
@@ -124,7 +120,7 @@ pub fn last_turn_is_context_overflow(messages: &[Message], context_window: Optio
 }
 
 // ---------------------------------------------------------------------------
-// §10.3 Per-provider classification
+// Per-provider classification
 // ---------------------------------------------------------------------------
 
 /// Classify an Anthropic error envelope into an [`AssistantError`].
@@ -134,8 +130,6 @@ pub fn last_turn_is_context_overflow(messages: &[Message], context_window: Optio
 /// the originating response status. `retry_after_ms` is parsed from
 /// the response's `Retry-After` header by the SDK before this is
 /// called. `message` is the upstream-supplied human message.
-///
-/// See `docs/models-spec.md` §10.3 "Anthropic" table.
 pub fn classify_anthropic_error(
     error_type: Option<&str>,
     http_status: Option<u16>,
@@ -147,7 +141,7 @@ pub fn classify_anthropic_error(
         Some("permission_error") => ErrorCategory::Auth,
         Some("not_found_error") => ErrorCategory::InvalidRequest,
         Some("invalid_request_error") => {
-            // §10.3: 400 messages that match overflow patterns get
+            // 400 messages that match overflow patterns get
             // promoted from InvalidRequest to ContextOverflow so the
             // retry-on-overflow path doesn't have to fall through to
             // the regex net.
@@ -198,9 +192,8 @@ pub fn classify_anthropic_stop_reason(stop_reason_label: &str, message: String) 
 /// Classify an OpenAI Chat Completions / Responses HTTP error.
 ///
 /// `error_code` and `error_type` come from the `{error: {code, type}}`
-/// envelope. See `docs/models-spec.md` §10.3 "OpenAI Chat Completions"
-/// for the table; the Responses initial-HTTP-error path uses the same
-/// mapping per §10.3.
+/// envelope. The Responses initial-HTTP-error path uses the same
+/// mapping.
 pub fn classify_openai_error(
     error_code: Option<&str>,
     error_type: Option<&str>,
@@ -252,7 +245,7 @@ pub fn classify_openai_error(
 /// Classify an OpenAI Chat Completions terminal `finish_reason` that
 /// indicates an in-stream failure rather than a successful end.
 ///
-/// Per §10.3, `content_filter` → `ContentFilter`, `network_error` →
+/// `content_filter` → `ContentFilter`, `network_error` →
 /// `Transient`. Anything else falls through to `Unknown`.
 pub fn classify_openai_finish_reason(label: &str, message: String) -> AssistantError {
     let category = match label {
@@ -270,7 +263,7 @@ pub fn classify_openai_finish_reason(label: &str, message: String) -> AssistantE
 
 /// Classify an OpenAI Responses mid-stream failure event
 /// (`response.failed`, `response.incomplete`, `response.refusal`,
-/// top-level `error` SSE event). See §10.3 "OpenAI Responses".
+/// top-level `error` SSE event).
 pub fn classify_openai_responses_failure(
     response_status: Option<&str>,
     incomplete_reason: Option<&str>,
@@ -281,7 +274,7 @@ pub fn classify_openai_responses_failure(
         (Some("cancelled"), _, _) => ErrorCategory::Aborted,
         (Some("incomplete"), Some("content_filter"), _) => ErrorCategory::ContentFilter,
         // `response.failed` carries a code that mirrors the HTTP-level
-        // tags from §10.3 OpenAI; reuse the Chat Completions classifier.
+        // OpenAI tags; reuse the Chat Completions classifier.
         (Some("failed"), _, Some(code)) => {
             return classify_openai_error(Some(code), None, None, None, message);
         }

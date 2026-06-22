@@ -280,11 +280,10 @@ fn jumping_resets_last_action_so_following_type_starts_new_undo_unit() {
 /// Jump-mode has no explicit `tui.select.cancel` match — only the
 /// same-hotkey cancel, the printable-jump arm, and a silent
 /// fallthrough that clears `jump_mode` for any control character.
-/// An earlier version of the editor added an explicit `KeyCode::Esc`
-/// cancel that consumed the key (returned `true`); that swallowed
-/// Escape the parent surface would otherwise handle. Esc now silently
-/// clears `jump_mode` and falls through to normal handling, returning
-/// `false` so the parent sees the key.
+/// Esc must not consume the key (return `true`): that would swallow
+/// the Escape the parent surface would otherwise handle. Instead Esc
+/// silently clears `jump_mode` and falls through to normal handling,
+/// returning `false` so the parent sees the key.
 #[test]
 fn jump_mode_does_not_consume_escape() {
     let mut e = editor();

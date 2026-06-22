@@ -2,8 +2,7 @@
 //!
 //! [`ScriptedProvider`] is a [`Provider`] that replays canned
 //! [`AssistantMessageEvent`] sequences instead of calling out to a real LLM
-//! provider, speaking the unified streaming protocol from
-//! `docs/models-spec.md` §2.
+//! provider, speaking the unified streaming protocol.
 //!
 //! It serves two audiences:
 //!
@@ -294,8 +293,8 @@ fn spawn_script(
         }
         if !saw_terminal {
             // Safety net: ensure the stream always terminates. The
-            // synthesized error mirrors the spec contract that
-            // dropping a stream without a terminal event yields a
+            // synthesized error matches the contract that dropping a
+            // stream without a terminal event yields a
             // transient-category failure.
             producer.end();
         }

@@ -1,7 +1,7 @@
 //! OpenAI Responses API provider.
 //!
 //! Implements the unified [`Provider`] trait against OpenAI's
-//! `POST /responses` streaming endpoint. See `docs/models-spec.md` §7.3.
+//! `POST /responses` streaming endpoint.
 //!
 //! Stateless — per-call HTTP knobs (auth, base URL, reasoning effort,
 //! tool choice, session correlation) are derived from the per-call
@@ -84,7 +84,7 @@ impl Provider for OpenAiResponsesProvider {
 }
 
 // ---------------------------------------------------------------------------
-// TextSignatureV1 (§7.3.4)
+// TextSignatureV1
 // ---------------------------------------------------------------------------
 
 /// Envelope carried in [`TextContent::text_signature`] for messages
@@ -153,7 +153,7 @@ fn short_hash(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Composite tool-call IDs (§7.3.5)
+// Composite tool-call IDs
 // ---------------------------------------------------------------------------
 
 pub(super) fn split_tool_use_id(tool_use_id: &str) -> (String, Option<String>) {
@@ -251,8 +251,8 @@ async fn run_stream_inner(
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let mut client = Client::new(base_url_opt, api_key);
 
-    // §7.3 preface: forward session_id as session-correlation headers
-    // when the request is going to api.openai.com. Other deployments
+    // Forward session_id as session-correlation headers when the
+    // request is going to api.openai.com. Other deployments
     // (Azure, etc.) may reject unknown headers, so guard on hostname.
     if is_openai_host(&base_url_for_check) {
         if let Some(sid) = options.session_id.as_deref() {
@@ -328,7 +328,7 @@ pub(super) fn is_openai_host(base_url: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Request body construction (§7.3.2)
+// Request body construction
 // ---------------------------------------------------------------------------
 
 fn build_request(
@@ -344,7 +344,7 @@ fn build_request(
         input.push(build_system_item(model, prompt));
     }
 
-    // §8: cross-provider history rewrite first.
+    // cross-provider history rewrite first.
     let transformed = transform_messages(&context.messages, model);
     convert_messages(API_NAME, &transformed, &mut input);
 
@@ -355,7 +355,7 @@ fn build_request(
         .max_tokens
         .map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
-    // §7.3.2 reasoning configuration. Non-reasoning models reject the
+    // reasoning configuration. Non-reasoning models reject the
     // `reasoning` parameter entirely. For reasoning models, "off" (no
     // requested level) floors to `minimal`: a reasoning model can't be
     // told not to reason — `reasoning_effort: "none"` is rejected by
@@ -378,7 +378,7 @@ fn build_request(
         (None, Vec::new())
     };
 
-    // §7.3.2 prompt caching: Responses caching is automatic; these
+    // prompt caching: Responses caching is automatic; these
     // fields are routing/retention hints.
     let prompt_cache_key = match (
         options.cache_retention.clone(),
@@ -397,7 +397,7 @@ fn build_request(
 
     let service_tier = options.service_tier.as_ref().map(map_service_tier);
 
-    // §7.3.2: `text.verbosity` only when the caller set it and the
+    // `text.verbosity` only when the caller set it and the
     // model supports it; otherwise omit so the server default applies
     // and unsupported models don't 400.
     let text = verbosity_text_config(model, options);
@@ -423,7 +423,7 @@ fn build_request(
 }
 
 /// Map the unified [`UnifiedVerbosity`] onto the SDK enum. Shared with
-/// the Codex provider (§7.4.3).
+/// the Codex provider.
 pub(super) fn map_verbosity(verbosity: UnifiedVerbosity) -> OpenAIVerbosity {
     match verbosity {
         UnifiedVerbosity::Low => OpenAIVerbosity::Low,
@@ -434,7 +434,7 @@ pub(super) fn map_verbosity(verbosity: UnifiedVerbosity) -> OpenAIVerbosity {
 
 /// Build the `text` field carrying `verbosity`, or `None` when the
 /// caller didn't request a verbosity or the model doesn't support the
-/// parameter. Shared with the Codex provider (§7.4.3).
+/// parameter. Shared with the Codex provider.
 pub(super) fn verbosity_text_config(
     model: &ModelInfo,
     options: &StreamOptions,
@@ -496,7 +496,7 @@ fn cost_multiplier_from_tier(tier: Option<&OpenAIServiceTier>) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Tools (§7.3.2)
+// Tools
 // ---------------------------------------------------------------------------
 
 fn to_response_tool(tool: &ToolDefinition) -> ResponseTool {
@@ -504,7 +504,7 @@ fn to_response_tool(tool: &ToolDefinition) -> ResponseTool {
         name: tool.name.clone(),
         description: Some(tool.description.clone()),
         parameters: Some(tool.parameters.clone()),
-        // §7.3.2 hardcodes `strict: false`.
+        // hardcodes `strict: false`.
         strict: Some(false),
     }
 }
@@ -527,7 +527,7 @@ fn to_response_tool_choice(
 }
 
 // ---------------------------------------------------------------------------
-// Message conversion (§7.3.1)
+// Message conversion
 // ---------------------------------------------------------------------------
 
 /// Project the unified message log onto Responses input items.
@@ -535,7 +535,7 @@ fn to_response_tool_choice(
 /// `api_name` controls the cross-model check inside
 /// [`append_assistant_message`]: an assistant message tagged with an
 /// `api` that differs from the current provider's identifier is
-/// treated as cross-model replay (per §7.3.1) and its tool-call
+/// treated as cross-model replay and its tool-call
 /// `item_id`s are dropped so the server doesn't try to pair them
 /// with reasoning items it never produced.
 pub(super) fn convert_messages(
@@ -640,10 +640,10 @@ pub(super) fn append_assistant_message(
                     // `ResponseInputItem::Reasoning` (e.g. cross-
                     // provider stale strings) are dropped silently —
                     // the visible text was already demoted to plain
-                    // text by §8.1 rule 2 before reaching here.
+                    // text by rule 2 before reaching here.
                 }
-                // Thinking with no signature is dropped: §7.3.1 says
-                // unsigned thinking demotes to plain text upstream;
+                // Thinking with no signature is dropped: unsigned
+                // thinking demotes to plain text upstream;
                 // any that survives here has been intentionally kept
                 // by the same-model branch and has nothing to replay.
             }
@@ -655,7 +655,7 @@ pub(super) fn append_assistant_message(
                     &mut pending_phase,
                 );
                 let (call_id, item_id) = split_tool_use_id(&tc.id);
-                // §7.3.1 cross-model replay: omit `id` when the call
+                // cross-model replay: omit `id` when the call
                 // came from a different api/model so the server does
                 // not try to pair it with reasoning items it never
                 // emitted.
@@ -714,8 +714,9 @@ pub(super) fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
 
     let output = if image_parts.is_empty() {
         if text_buf.is_empty() {
-            // Same fallback as §7.2: keep the model from seeing an empty
-            // tool result, which it can't react to usefully.
+            // Same fallback as the Chat Completions provider: keep the
+            // model from seeing an empty tool result, which it can't
+            // react to usefully.
             FunctionCallOutputContent::String(if t.is_error {
                 "[tool returned an error with no text payload]".to_string()
             } else {
@@ -742,17 +743,17 @@ pub(super) fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
 }
 
 // ---------------------------------------------------------------------------
-// Public round-trip helpers (§1.10, §12 step 11b)
+// Public round-trip helpers
 // ---------------------------------------------------------------------------
 
-/// Serialize side of the §1.10 invariant for `openai-responses`: project
+/// Serialize side of the invariant for `openai-responses`: project
 /// an [`AssistantMessage`] onto the typed input items the Responses API
 /// expects on the request side.
 ///
 /// One assistant message expands to multiple input items in
 /// `AssistantContent` order — reasoning items, then message items
 /// grouped by `(id, phase)`, interleaved with `function_call` items.
-/// Cross-model replay rules (§7.3.1) are honoured: `id` on
+/// Cross-model replay rules are honoured: `id` on
 /// `function_call` items is omitted when the assistant message came
 /// from a different api so the server doesn't try to pair it with
 /// reasoning items it never produced.
@@ -924,7 +925,7 @@ fn reasoning_display_text(
 }
 
 // ---------------------------------------------------------------------------
-// Stream state machine (§7.3.6)
+// Stream state machine
 // ---------------------------------------------------------------------------
 
 /// Cost-multiplier strategy. Codex uses a different curve than the
@@ -933,7 +934,7 @@ fn reasoning_display_text(
 ///
 /// Arguments:
 /// - `model_id` — the model the assistant message ran against (the
-///   `gpt-5.5` exception in §7.4.4 keys off this).
+///   `gpt-5.5` exception keys off this).
 /// - `server_tier` — `response.service_tier` echoed back by the server.
 /// - `requested_tier` — the tier requested by the caller (used as a
 ///   fallback when the server doesn't echo, and as the "intended" tier
@@ -1003,7 +1004,7 @@ impl StreamState {
 
     /// Provider-customizable constructor used by Codex (see
     /// `openai::codex`) to pick its own api name and cost-multiplier
-    /// curve while reusing the §7.3 streaming machinery.
+    /// curve while reusing the streaming machinery.
     pub(super) fn new_with(
         api_name: &'static str,
         model: &ModelInfo,
@@ -1421,7 +1422,7 @@ impl StreamState {
         if was_first {
             return;
         }
-        // §7.3.6: emit a "\n\n" separator on the second-and-later parts.
+        // emit a "\n\n" separator on the second-and-later parts.
         if let Some(AssistantContent::Thinking(t)) = self.partial.content.get_mut(idx) {
             t.thinking.push_str("\n\n");
         }
@@ -1463,8 +1464,8 @@ impl StreamState {
 
     /// Build the stream's terminal event, classifying a stream that ended
     /// before its terminal lifecycle event as a retryable truncation
-    /// error (`docs/models-spec.md` §10.3) rather than a successful
-    /// `Done`. Otherwise defers to [`Self::finalize`].
+    /// error rather than a successful `Done`. Otherwise defers to
+    /// [`Self::finalize`].
     pub(super) fn finalize_or_truncate(self) -> AssistantMessageEvent {
         if self.saw_terminal() {
             self.finalize()
@@ -1561,7 +1562,7 @@ fn classify_status(
                     AssistantError::new(ErrorCategory::ContentFilter, "Incomplete: content_filter")
                 })),
             ),
-            // §7.3.8 safe default — treat unknown / missing reason as
+            // safe default — treat unknown / missing reason as
             // a length cutoff.
             _ => (StopReason::Length, Some(DoneReason::Length), None),
         },
@@ -1575,7 +1576,7 @@ fn classify_status(
                 )
             })),
         ),
-        // §7.3.8: in_progress / queued shouldn't appear on a finished
+        // in_progress / queued shouldn't appear on a finished
         // response; handle defensively as Stop.
         Some(ResponseStatus::InProgress) | Some(ResponseStatus::Queued) => {
             (StopReason::Stop, Some(DoneReason::Stop), None)
@@ -1600,7 +1601,7 @@ pub(super) fn error_from_code(code: Option<&str>, message: String) -> AssistantE
 }
 
 // ---------------------------------------------------------------------------
-// Usage merging + cost (§7.3.7)
+// Usage merging + cost
 // ---------------------------------------------------------------------------
 
 fn apply_usage(target: &mut crate::types::Usage, source: &ResponseUsage) {
@@ -1612,7 +1613,7 @@ fn apply_usage(target: &mut crate::types::Usage, source: &ResponseUsage) {
         .unwrap_or(0);
     let prompt = u64::from(source.input_tokens);
     target.cache_read = cached;
-    target.cache_write = 0; // §7.3.7: Responses doesn't report cache writes.
+    target.cache_write = 0; // Responses doesn't report cache writes.
     target.input = prompt.saturating_sub(cached);
     target.output = u64::from(source.output_tokens);
 }

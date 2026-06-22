@@ -9,8 +9,6 @@
 //! [`serde_json::from_str`] first, then escalates through a small chain of
 //! repair / completion strategies, and falls back to an empty object so
 //! callers always receive a value.
-//!
-//! See `docs/models-spec.md` §11.1.
 
 use serde_json::Value;
 
@@ -19,7 +17,7 @@ use serde_json::Value;
 /// Returns the most complete value we can recover. Falls back to an empty
 /// object (`{}`) when no strategy succeeds — never panics, never returns
 /// `null`. The empty-object fallback matches the streaming-tool-call
-/// invariant in `docs/models-spec.md` §11.1: callers always observe a
+/// invariant: callers always observe a
 /// usable `arguments` value, even before the final byte arrives.
 ///
 /// Strategy chain:

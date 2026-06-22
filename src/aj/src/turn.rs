@@ -12,7 +12,7 @@
 //! the driver's job: the host starts a [`TurnStart::Wake`] turn when an
 //! agent goes idle with work pending, and that wake turn is itself
 //! driven here. Mid-turn steering is drained inside the agent's own
-//! turn loop, a layer below this. See `docs/compaction-spec.md` §7.2.
+//! turn loop, a layer below this.
 
 use std::sync::Arc;
 

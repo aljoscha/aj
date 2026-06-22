@@ -2,13 +2,12 @@
 //!
 //! Implements the unified [`Provider`] trait against the Codex
 //! deployment of the Responses API at
-//! `https://chatgpt.com/backend-api/codex/responses`. See
-//! `docs/models-spec.md` §7.4 for the full design.
+//! `https://chatgpt.com/backend-api/codex/responses`.
 //!
 //! Codex is a ChatGPT-Plus-gated mirror of [`super::responses`] with a
 //! handful of wire-shape differences:
 //!
-//! - **Authentication.** The credential is the OAuth JWT from §9.4,
+//! - **Authentication.** The credential is the OAuth JWT
 //!   not an API key. The provider decodes the JWT at request time and
 //!   sends the `chatgpt-account-id` claim as a header.
 //! - **System prompt routing.** Sent as the top-level `instructions`
@@ -19,8 +18,8 @@
 //!   are never sent.
 //! - **Event normalization.** Older `response.done` / `response.incomplete`
 //!   event names are rewritten to `response.completed` before reaching
-//!   the shared §7.3.6 state machine, and top-level `error` /
-//!   `response.failed` events surface as terminal errors via the §10
+//!   the shared state machine, and top-level `error` /
+//!   `response.failed` events surface as terminal errors via the
 //!   classifier with a Codex-specific 429 friendly-message overlay.
 //! - **Service-tier pricing.** Same `flex` / `priority` knob, but
 //!   `gpt-5.5 + priority` uses a 2.5× multiplier (vs the default 2×).
@@ -74,9 +73,9 @@ pub(super) const CODEX_COST_MULTIPLIER: CostMultiplierFn = codex_cost_multiplier
 /// an empty `base_url`.
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
-/// Required `OpenAI-Beta` header value for the SSE Codex endpoint
-/// (per §7.4.1). The WebSocket transport uses a different beta tag
-/// and is explicitly out of scope per §7.4.8.
+/// Required `OpenAI-Beta` header value for the SSE Codex endpoint.
+/// The WebSocket transport uses a different beta tag
+/// and is explicitly out of scope.
 const OPENAI_BETA: &str = "responses=experimental";
 
 /// Originator identifier sent on every Codex request. Matches the
@@ -187,7 +186,7 @@ async fn run_stream_inner(
         return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
     }
 
-    // §7.4.1: decode the JWT *at request time* so a refresh in flight
+    // decode the JWT *at request time* so a refresh in flight
     // doesn't desync the header from the bearer token.
     let account_id = extract_account_id(&access_token).ok_or_else(|| {
         AssistantError::new(
@@ -208,8 +207,9 @@ async fn run_stream_inner(
         .with_extra_header("OpenAI-Beta", OPENAI_BETA)
         .with_extra_header("User-Agent", user_agent());
 
-    // §7.4.1: session-correlation headers mirror §7.3. Codex is always
-    // hosted at chatgpt.com so we don't gate on hostname here.
+    // session-correlation headers mirror the Responses provider's.
+    // Codex is always hosted at chatgpt.com so we don't gate on
+    // hostname here.
     if let Some(sid) = options.session_id.as_deref() {
         client = client
             .with_extra_header("session_id", sid)
@@ -295,10 +295,10 @@ fn user_agent() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Error classification (§7.4.6)
+// Error classification
 // ---------------------------------------------------------------------------
 
-/// Overlay the Codex-specific friendly 429 message (§7.4.6) on the
+/// Overlay the Codex-specific friendly 429 message on the
 /// shared OpenAI client-error classifier.
 fn classify_codex_client_error(err: &ClientError) -> AssistantError {
     classify_client_error_with(err, |code, r#type, http_status, message| {
@@ -307,7 +307,7 @@ fn classify_codex_client_error(err: &ClientError) -> AssistantError {
     })
 }
 
-/// Build the §7.4.6 "You have hit your ChatGPT usage limit" message
+/// Build the "You have hit your ChatGPT usage limit" message
 /// from optional `plan_type` / `resets_at` fields on the API error
 /// payload. Returns `None` for non-usage-cap errors so the caller
 /// falls back to the raw server message.
@@ -410,12 +410,12 @@ fn format_friendly_message(plan_type: Option<&str>, mins: Option<u64>) -> String
 }
 
 // ---------------------------------------------------------------------------
-// Event normalization (§7.4.5)
+// Event normalization
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 enum NormalizedEvent {
-    /// Pass the event through to the §7.3.6 state machine unchanged.
+    /// Pass the event through to the state machine unchanged.
     Forward(ResponseStreamEvent),
     /// Pass through, then stop draining the stream. Used for
     /// `response.completed` / rewritten `response.done` /
@@ -423,7 +423,7 @@ enum NormalizedEvent {
     Terminal(ResponseStreamEvent),
 }
 
-/// §7.4.5: normalize the Codex event stream so it looks like a plain
+/// normalize the Codex event stream so it looks like a plain
 /// Responses stream by the time it reaches the shared state machine.
 ///
 /// - `error` and `response.failed` are surfaced as `Err` so the caller
@@ -465,7 +465,7 @@ fn normalize_codex_event(ev: ResponseStreamEvent) -> Result<NormalizedEvent, Ass
             // Rewrite the event type to `Completed` while preserving
             // the inner `status` so the state machine's
             // `classify_status` arm picks up the `Incomplete` branch
-            // (length cutoff, content filter, etc.) from §7.3.8.
+            // (length cutoff, content filter, etc.)
             let mut response = normalize_response_status(response);
             if response.status.is_none() {
                 response.status = Some(ResponseStatus::Incomplete);
@@ -518,7 +518,7 @@ fn rewrite_legacy_done(value: Value) -> Result<NormalizedEvent, AssistantError> 
             && response.is_object()
         {
             // Preserve `Incomplete` status so the state machine picks
-            // the right §7.3.8 branch.
+            // the right branch.
             let response_obj = response.as_object_mut().expect("response is object");
             response_obj
                 .entry("status".to_string())
@@ -533,7 +533,7 @@ fn rewrite_legacy_done(value: Value) -> Result<NormalizedEvent, AssistantError> 
 }
 
 /// In-place version of [`normalize_response_status`] that works on a
-/// `serde_json::Map` so we can rewrite the §7.4.5 unknown-status
+/// `serde_json::Map` so we can rewrite the unknown-status
 /// values before the strict deserializer rejects them.
 fn normalize_response_status_in_value(obj: &mut serde_json::Map<String, Value>) {
     let Some(response) = obj.get_mut("response") else {
@@ -562,8 +562,8 @@ fn normalize_response_status_in_value(obj: &mut serde_json::Map<String, Value>) 
 /// Today our [`ResponseStatus`] enum already enumerates exactly that
 /// set, so deserialization of unknown values fails earlier — meaning
 /// any [`ResponseStatus`] we *do* hold is already in the recognized
-/// set. The function exists for symmetry with the spec text and to
-/// keep the spot we'd patch if the SDK enum gains catch-all variants
+/// set. The function exists for symmetry and to keep the spot we'd
+/// patch if the SDK enum gains catch-all variants
 /// later.
 fn normalize_response_status(
     response: openai_sdk::types::responses::Response,
@@ -572,15 +572,15 @@ fn normalize_response_status(
 }
 
 // ---------------------------------------------------------------------------
-// Cost multiplier (§7.4.4)
+// Cost multiplier
 // ---------------------------------------------------------------------------
 
-/// §7.4.4 service-tier cost curve. Same `flex` / `priority` knobs as
+/// service-tier cost curve. Same `flex` / `priority` knobs as
 /// the public Responses API, except `gpt-5.5 + priority` uses a 2.5×
 /// multiplier (vs the default 2×). The `default` / `auto` / absent
 /// tier always uses 1×.
 ///
-/// Service-tier resolution follows §7.4.4: the server-echoed tier
+/// Service-tier resolution follows: the server-echoed tier
 /// wins, except when the server reports `default` after the caller
 /// asked for `flex` or `priority`. In that case we apply pricing as
 /// if the request had succeeded (the server still serves the response
@@ -609,7 +609,7 @@ fn resolve_codex_service_tier<'a>(
     requested: Option<&'a OpenAIServiceTier>,
 ) -> Option<&'a OpenAIServiceTier> {
     match (server, requested) {
-        // §7.4.4 "response value wins; requested value falls back when
+        // "response value wins; requested value falls back when
         // the response reports `default`". Today `OpenAIServiceTier`
         // doesn't model `default` as a variant — it's either Flex,
         // Priority, or absent — but we keep the resolver structured
@@ -621,10 +621,10 @@ fn resolve_codex_service_tier<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// Round-trip helpers (`docs/models-spec.md` §1.10)
+// Round-trip helpers
 // ---------------------------------------------------------------------------
 
-/// Serialize side of the §1.10 invariant for `openai-codex-responses`:
+/// Serialize side of the round-trip invariant for `openai-codex-responses`:
 /// project an [`AssistantMessage`] onto the typed input items the
 /// Codex endpoint expects on the request side.
 ///
@@ -653,11 +653,11 @@ pub fn parse_assistant_input_items(items: &[ResponseInputItem]) -> AssistantMess
 
 /// Replay a sequence of pre-decoded Codex stream events through the
 /// provider's state machine and return the finalized
-/// [`AssistantMessage`]. Each event runs through the §7.4.5
+/// [`AssistantMessage`]. Each event runs through the
 /// normalization layer first (legacy `response.done` /
 /// `response.incomplete` rewrites, terminal `error` /
 /// `response.failed` events surface as message-level errors), then the
-/// shared §7.3.6 state machine consumes the normalized event under the
+/// shared state machine consumes the normalized event under the
 /// Codex API identifier and pricing curve.
 ///
 /// Mirror of [`super::responses::replay_sse_events`] for round-trip
@@ -702,7 +702,7 @@ pub fn replay_sse_events(
 }
 
 // ---------------------------------------------------------------------------
-// Request body construction (§7.4.3)
+// Request body construction
 // ---------------------------------------------------------------------------
 
 fn build_request(
@@ -711,7 +711,7 @@ fn build_request(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> CreateResponseRequest {
-    // §7.4.2: system prompt routed via the top-level `instructions`
+    // system prompt routed via the top-level `instructions`
     // field, not as a developer/system input item. We seed `input`
     // empty — `convert_messages` only appends user/assistant/tool-
     // result items.
@@ -721,7 +721,7 @@ fn build_request(
 
     let tools: Vec<ResponseTool> = context.tools.iter().map(to_codex_tool).collect();
 
-    // §7.4.3 reasoning configuration. Non-reasoning models reject the
+    // reasoning configuration. Non-reasoning models reject the
     // `reasoning` parameter entirely. For reasoning models, "off" (no
     // requested level) floors to `minimal`: a reasoning model can't be
     // told not to reason, so we treat off identically to minimal.
@@ -743,13 +743,13 @@ fn build_request(
         (None, Vec::new())
     };
 
-    // §7.4.3: `prompt_cache_key` from session_id; `prompt_cache_retention`
+    // `prompt_cache_key` from session_id; `prompt_cache_retention`
     // never sent for Codex (the backend doesn't expose retention tuning).
     let prompt_cache_key = options.session_id.clone();
 
     let service_tier = options.service_tier.as_ref().map(map_service_tier);
 
-    // §7.4.2: instructions carries the system prompt (or the §7.4.3
+    // instructions carries the system prompt (or the
     // default if the caller didn't set one).
     let instructions = context
         .system_prompt
@@ -762,32 +762,32 @@ fn build_request(
         input: ResponseInput::Items(input),
         instructions: Some(ResponseInstructions::String(instructions)),
         tools,
-        // §7.4.3: tool_choice always "auto".
+        // tool_choice always "auto".
         tool_choice: Some(ResponseToolChoice::String("auto".to_string())),
-        // §7.4.3: parallel_tool_calls always true.
+        // parallel_tool_calls always true.
         parallel_tool_calls: Some(true),
-        // §7.4.3: max_output_tokens omitted.
+        // max_output_tokens omitted.
         max_output_tokens: None,
         temperature: options.temperature,
         reasoning: reasoning_cfg,
-        // §7.4.3: `text.verbosity` only when the caller set it and the
+        // `text.verbosity` only when the caller set it and the
         // model supports it; otherwise omitted so the server default
-        // applies. Shared gate with §7.3.2.
+        // applies. Shared gate with the Responses provider.
         text: verbosity_text_config(model, options),
         stream: Some(true),
-        // §7.4.3: store hardcoded false; server rejects true.
+        // store hardcoded false; server rejects true.
         store: Some(false),
         include,
         service_tier,
         prompt_cache_key,
-        // §7.4.3: prompt_cache_retention never sent.
+        // prompt_cache_retention never sent.
         prompt_cache_retention: None,
         ..Default::default()
     }
 }
 
-/// §7.4.3: Codex tools omit `strict` (the endpoint rejects requests
-/// carrying it). Otherwise identical to the §7.3.2 shape.
+/// Codex tools omit `strict` (the endpoint rejects requests
+/// carrying it). Otherwise identical to the Responses tool shape.
 fn to_codex_tool(tool: &ToolDefinition) -> ResponseTool {
     ResponseTool::Function {
         name: tool.name.clone(),

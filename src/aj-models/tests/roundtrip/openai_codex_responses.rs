@@ -1,22 +1,21 @@
-//! OpenAI Codex Responses round-trip tests (`docs/models-spec.md`
-//! §1.10, §7.4, §12 step 8c.v).
+//! OpenAI Codex Responses round-trip tests.
 //!
-//! Four scenarios pin the §1.10 round-trip invariant for the Codex
+//! Four scenarios pin the round-trip invariant for the Codex
 //! deployment of the Responses API:
 //!
 //! - `text_only`: a single message item with one text part. Mirrors the
 //!   public Responses suite's `text_only` and locks the `api`-tagging
 //!   path through the Codex parse helpers.
 //! - `thinking_text`: a reasoning item followed by a message item, the
-//!   §7.3.3 reasoning round-trip exercised under the Codex API
+//!   reasoning round-trip exercised under the Codex API
 //!   identity.
 //! - `tool_call`: a message item plus a function_call item, exercising
-//!   the §7.3.5 composite `{call_id}|{item_id}` ID and the streaming
+//!   the composite `{call_id}|{item_id}` ID and the streaming
 //!   arguments parser on the Codex code path.
 //! - `legacy_done`: a text-only flow whose terminal event is the older
 //!   `response.done` name the Codex backend still emits in places. The
-//!   §7.4.5 normalization layer must rewrite it to
-//!   `response.completed` before the shared §7.3.6 state machine sees
+//!   normalization layer must rewrite it to
+//!   `response.completed` before the shared state machine sees
 //!   it; otherwise the final message's `stop_reason` lands as the
 //!   default `Stop` from the state machine's unterminated path.
 //!
@@ -265,7 +264,7 @@ fn run_semantic_roundtrip_test(scenario: &str, canonical: AssistantMessage) {
     let events = load_sse(scenario);
     let parsed = replay_sse_events(&fixture_model(), events, None);
 
-    // §1.10: parsed unified message must serialize to the request item
+    // parsed unified message must serialize to the request item
     // shape and re-parse back into a structurally equivalent message.
     let items: Vec<ResponseInputItem> = assistant_message_to_input_items(&parsed);
     let reparsed = parse_assistant_input_items(&items);
@@ -295,7 +294,7 @@ fn semantic_roundtrip_text_only() {
 }
 
 // ---------------------------------------------------------------------------
-// thinking_text scenario — §7.3.3 reasoning round-trip under Codex
+// thinking_text scenario — reasoning round-trip under Codex
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -314,7 +313,7 @@ fn semantic_roundtrip_thinking_text() {
 }
 
 // ---------------------------------------------------------------------------
-// tool_call scenario — §7.3.5 composite IDs + streaming arguments
+// tool_call scenario — composite IDs + streaming arguments
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -333,7 +332,7 @@ fn semantic_roundtrip_tool_call() {
 }
 
 // ---------------------------------------------------------------------------
-// legacy_done scenario — §7.4.5 event normalization
+// legacy_done scenario — event normalization
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -351,8 +350,8 @@ fn semantic_roundtrip_legacy_done() {
     run_semantic_roundtrip_test("legacy_done", canonical_legacy_done());
 }
 
-/// §7.4.5: the legacy `response.done` terminator must be rewritten to
-/// `response.completed` so the §7.3.6 state machine's terminal arm
+/// the legacy `response.done` terminator must be rewritten to
+/// `response.completed` so the state machine's terminal arm
 /// fires. If the normalization layer regresses, the state machine
 /// finalizes via its "unterminated stream" path and the resulting
 /// message lacks the `response.completed` usage / response-id payload.
@@ -374,8 +373,8 @@ fn legacy_done_terminator_normalized() {
 //
 // An errored or truncated turn is never serialized back into a request
 // item, so these scenarios only assert the terminal classification
-// (`stop_reason` + `error.category`). They pin the §10.3 / §7.4.5
-// terminal legs against captured wire fixtures.
+// (`stop_reason` + `error.category`). They pin the terminal legs
+// against captured wire fixtures.
 // ---------------------------------------------------------------------------
 
 /// Replay an SSE fixture and return the finalized message.

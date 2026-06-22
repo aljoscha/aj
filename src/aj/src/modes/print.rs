@@ -1,6 +1,6 @@
 //! Non-interactive print mode.
 //!
-//! Per `docs/aj-next-plan.md` §4.2 the same `aj` binary can run
+//! The same `aj` binary can run
 //! without a TUI: it subscribes to the agent's event bus and writes
 //! plain text (or JSONL with `--format json`) to stdout, exiting when
 //! `Agent::prompt` returns. Same code path lets callers script the

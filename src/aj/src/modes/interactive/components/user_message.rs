@@ -11,8 +11,6 @@
 //! the entire visual cue, which also keeps the rendered text
 //! cleanly copy-pasteable.
 //!
-//! See `docs/aj-next-plan.md` §4 — `components/user_message.rs`.
-//!
 //! Harness-injected task-completion notices (see
 //! `aj_agent::Agent::drain_task_notices`) also arrive as user messages.
 //! They can be long, so when one is detected the component is built in a
@@ -290,12 +288,11 @@ mod tests {
 
     #[test]
     fn renders_text_without_a_quote_prefix() {
-        // Regression: we used to prepend `> ` to every line so the
-        // markdown renderer styled the message as a blockquote.
-        // That produced a `│ ` border glyph the user couldn't
-        // exclude when copying the prompt back out. The new bubble
-        // relies entirely on the background tint, so no `│` should
-        // appear in the rendered output.
+        // The bubble must not prepend a `> ` blockquote prefix: that
+        // makes the markdown renderer draw a `│ ` border glyph the
+        // user can't exclude when copying the prompt back out. The
+        // bubble relies entirely on the background tint, so no `│`
+        // should appear in the rendered output.
         let mut c = UserMessageComponent::new("hello world", &theme());
         let lines = c.render(40);
         for line in &lines {

@@ -1,10 +1,10 @@
 //! OpenAI Chat Completions round-trip tests.
 //!
 //! For each scenario covering an `AssistantContent` variant the provider
-//! emits, runs the test shapes from `docs/models-spec.md` §12 step 11b:
+//! emits, runs the test shapes:
 //!
 //! - **Parse**: fixture SSE → unified `AssistantMessage`. Asserts the
-//!   structural fields the spec requires preserving (text, tool-call
+//!   structural fields the round-trip requires preserving (text, tool-call
 //!   ids/names/arguments, reasoning capture from compatible providers)
 //!   against the canonical, hand-built message.
 //! - **Serialize**: hand-built `AssistantMessage` → request item JSON.
@@ -13,12 +13,12 @@
 //!   so field ordering and whitespace don't break the assertion.
 //! - **Semantic round-trip**: parsed `AssistantMessage` → request item
 //!   → re-parsed back to `AssistantMessage`. Asserts the content blocks
-//!   round-trip field-equal modulo metadata that the §1.10 invariant
+//!   round-trip field-equal modulo metadata that the invariant
 //!   explicitly does not require preserving.
 //!
-//! For `openai-completions`, §1.10 explicitly lists reasoning under the
+//! For `openai-completions`, reasoning is explicitly listed under the
 //! deliberately-not-preserved set (the public API does not accept
-//! `reasoning_content` on input — see §7.2). The `reasoning_text`
+//! `reasoning_content` on input). The `reasoning_text`
 //! scenario asserts that drop behavior directly: the parsed message has
 //! a `Thinking` block, the request item drops it, and the reparsed
 //! message contains only the text.
@@ -118,7 +118,7 @@ fn load_request_json(scenario: &str) -> Value {
 // "fixture and code drifted" bugs that two separate expected values
 // would mask.
 //
-// The `reasoning_text` scenario is special: §7.2 drops `Thinking` blocks
+// The `reasoning_text` scenario is special: drops `Thinking` blocks
 // on outbound, so the canonical here is the *parsed* shape (with the
 // thinking block) and the serialized form omits it. The semantic
 // round-trip test asserts that drop directly.
@@ -249,7 +249,7 @@ fn run_semantic_roundtrip_test(scenario: &str, canonical: AssistantMessage) {
     let reparsed = parse_assistant_request_item(&param);
     // Semantic round-trip: the canonical message defines the structural
     // ground truth. Both `parsed` and `reparsed` should match it on the
-    // §1.10 preserved fields.
+    // preserved fields.
     assert_content_eq(&canonical, &parsed, &format!("rt-parse:{scenario}"));
     assert_content_eq(&canonical, &reparsed, &format!("rt-reparse:{scenario}"));
     // The `api` tag survives the projection so listeners can still tell
@@ -257,16 +257,15 @@ fn run_semantic_roundtrip_test(scenario: &str, canonical: AssistantMessage) {
     assert_eq!(reparsed.api, "openai-completions");
 }
 
-/// Variant of [`run_semantic_roundtrip_test`] that asserts §7.2 / §1.10's
+/// Variant of [`run_semantic_roundtrip_test`] that asserts the
 /// explicit drop of reasoning content.
 ///
 /// Used only by the `reasoning_text` scenario: the parsed message holds
 /// a `Thinking` block, but `assistant_message_to_request_item` strips it
 /// (the Chat Completions request shape has no `reasoning_content` field
 /// the API will accept), and the reparsed message therefore contains
-/// only the non-thinking blocks. Tests this drop is the spec's primary
-/// motivation for marking reasoning as "deliberately not preserved" on
-/// this provider.
+/// only the non-thinking blocks. This drop is the reason reasoning is
+/// "deliberately not preserved" on this provider.
 fn run_semantic_roundtrip_drops_reasoning(scenario: &str, canonical: AssistantMessage) {
     let events = load_sse(scenario);
     let parsed = replay_sse_events(&fixture_model(), events);
@@ -343,8 +342,9 @@ fn semantic_roundtrip_tool_call() {
 // ---------------------------------------------------------------------------
 // reasoning_text scenario
 //
-// Reasoning is explicitly listed under §1.10's deliberately-not-preserved
-// set for this provider; see §7.2 for the API-level limitation. The
+// Reasoning is explicitly listed as deliberately not preserved for
+// this provider (the public API does not accept `reasoning_content`
+// on input). The
 // three test shapes here verify (a) the streaming parser does capture
 // reasoning_content into a Thinking block, (b) the request projection
 // drops it, and (c) the round-trip degrades gracefully — no panic, no
@@ -372,7 +372,7 @@ fn semantic_roundtrip_reasoning_text() {
 // An errored or truncated turn is never serialized back into a request
 // item, so these scenarios only assert the terminal classification
 // (`stop_reason` + `error.category`) and that partial content survives.
-// They pin the §10.3 error legs against captured wire fixtures.
+// They pin the error legs against captured wire fixtures.
 // ---------------------------------------------------------------------------
 
 /// Replay an SSE fixture and return the finalized message.

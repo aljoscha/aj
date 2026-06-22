@@ -6,8 +6,7 @@
 //! and returns a plan; there is no provider, no async, and no I/O. The
 //! host (`aj`) calls [`prepare_compaction`] to compute a
 //! [`CompactionPlan`], generates the summary against its model, and
-//! records the result with `ConversationLog::append_compaction`. See
-//! `docs/compaction-spec.md` §4.
+//! records the result with `ConversationLog::append_compaction`.
 
 use serde::{Deserialize, Serialize};
 

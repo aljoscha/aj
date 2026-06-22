@@ -1343,7 +1343,7 @@ impl Tui {
         // Overlay components are constructed with their own
         // [`RenderHandle`] (any component that needs one — Editor,
         // Loader, CancellableLoader — takes it as a required
-        // constructor arg). The Tui no longer injects one on show;
+        // constructor arg). The Tui does not inject one on show;
         // each overlay either already has the handle it needs or has
         // no async work to wake.
 
@@ -1743,8 +1743,8 @@ impl Tui {
         // DEC mode 2026 (Begin/End Synchronized Update) the whole
         // frame, *including* the final cursor placement and visibility,
         // appears atomically — eliminating the brief cursor flicker
-        // that used to land between the paint flush and a separate
-        // cursor-positioning flush. On terminals that don't honor 2026
+        // a separate cursor-positioning flush would otherwise cause.
+        // On terminals that don't honor 2026
         // the bytes still arrive in the right order, so the visible
         // end state is unchanged.
         let mut frame = String::new();

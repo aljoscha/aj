@@ -1,11 +1,11 @@
 //! `agent` builtin — spawns a sub-agent to perform a focused task and
 //! returns its final report.
 //!
-//! Migrated to [`aj_agent::tool::ToolDefinition`] per
-//! `docs/aj-next-plan.md` §2.2. Returns a [`ToolOutcome`] with
+//! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
+//! [`ToolOutcome`] with
 //! [`ToolDetails::SubAgentReport`] so the renderer / persistence
 //! listener gets the structured triple `(agent_id, task, report)`
-//! that the closed-enum design promises in §1.2. The sub-agent's
+//! that the closed-enum design promises. The sub-agent's
 //! final assistant text is also surfaced as `content` so the parent
 //! model sees the report on the wire.
 //!
@@ -18,7 +18,7 @@
 //! Errors from the spawned agent (model failures, tool errors that
 //! bubble up to its turn loop, etc.) propagate as `Err`; the agent
 //! runtime catches them and synthesizes a generic error tool_result
-//! with `is_error: true` — same as the legacy contract.
+//! with `is_error: true`.
 //!
 //! Execution mode stays at the trait default ([`Parallel`]), so
 //! several `agent` calls in one assistant message run concurrently:
@@ -395,8 +395,7 @@ mod tests {
     }
 
     /// `spawn_agent` failures propagate as `Err` so the agent runtime
-    /// can fold them into its standard error-tool_result synthesis —
-    /// matching the legacy contract.
+    /// can fold them into its standard error-tool_result synthesis.
     #[tokio::test]
     async fn spawn_failure_bubbles_up_as_error() {
         let mut ctx = FailingSpawnContext {

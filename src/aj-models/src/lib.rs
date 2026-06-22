@@ -1,7 +1,7 @@
 //! `aj-models` — the wire layer for AJ.
 //!
-//! This crate hosts the unified message and streaming types defined in
-//! `docs/models-spec.md`, the [`Provider`](provider::Provider) trait
+//! This crate hosts the unified message and streaming types, the
+//! [`Provider`](provider::Provider) trait
 //! that concrete API integrations implement, the
 //! [`ModelRegistry`](registry::ModelRegistry) that ships the catalog
 //! of available models, and the runtime types in [`types`] used by

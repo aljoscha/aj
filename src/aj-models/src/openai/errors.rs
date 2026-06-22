@@ -13,7 +13,7 @@ use crate::errors::{classify_openai_error, parse_retry_after, transport_error};
 use crate::types::AssistantError;
 
 /// Classify an `openai-sdk` [`ClientError`] into the unified
-/// [`AssistantError`] shape per `docs/models-spec.md` §10.3.
+/// [`AssistantError`] shape.
 pub(super) fn classify_client_error(err: &ClientError) -> AssistantError {
     classify_client_error_with(err, |_code, _type, _status, message| message.to_string())
 }

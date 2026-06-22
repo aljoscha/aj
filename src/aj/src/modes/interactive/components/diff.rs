@@ -10,9 +10,8 @@
 //!
 //! The rendering is intentionally simple: line-level diff with a
 //! few lines of context around each hunk, +/- prefixed with
-//! red/green colour. Syntax-highlighted unified diffs (the longer-
-//! term goal per `docs/aj-next-plan.md` §1.2) can swap in here
-//! without touching the surrounding component.
+//! red/green colour. Syntax-highlighted unified diffs (a longer-term
+//! goal) can swap in here without touching the surrounding component.
 
 use aj_tui::style;
 use similar::{ChangeTag, TextDiff};

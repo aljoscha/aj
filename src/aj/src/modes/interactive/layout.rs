@@ -1,6 +1,6 @@
 //! Layout slots for the interactive mode.
 //!
-//! Per `docs/aj-next-plan.md` §4 the TUI is laid out as a fixed
+//! The TUI is laid out as a fixed
 //! sequence of named slots, each holding either a single component
 //! or a [`Container`] of dynamically-added components. The event
 //! pump and the input-handling code address slots by index via

@@ -473,7 +473,7 @@ impl Terminal for ProcessTerminal {
     /// while in raw mode leaves the shell unusable.
     ///
     /// Input is surfaced asynchronously via [`Self::take_input_stream`];
-    /// `start` no longer spawns a blocking reader thread.
+    /// `start` does not spawn a blocking reader thread.
     fn start(&mut self) -> io::Result<()> {
         if self.started {
             return Ok(());

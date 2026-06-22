@@ -1,5 +1,5 @@
-//! `read_file` builtin — first tool migrated to the new
-//! [`aj_agent::tool::ToolDefinition`] surface (`docs/aj-next-plan.md` §2.2).
+//! `read_file` builtin — implements the
+//! [`aj_agent::tool::ToolDefinition`] surface.
 //!
 //! For text files: returns a [`ToolOutcome`] with [`ToolDetails::Text`].
 //! The `summary` is the relative display path (with optional `start:end`
@@ -154,8 +154,8 @@ impl ToolDefinition for ReadFileTool {
             None => lines.len(),
         };
 
-        // Out-of-range offset: keep the legacy behaviour (empty body, no
-        // line-range suffix, no footer).
+        // Out-of-range offset: empty body, no line-range suffix, no
+        // footer.
         if start_idx >= lines.len() {
             return Ok(ToolOutcome {
                 content: vec![UserContent::text(String::new())],
@@ -204,8 +204,7 @@ impl ToolDefinition for ReadFileTool {
 
         // Build the wire- and display-bound bodies from the kept lines.
         // The wire body preserves absolute line numbers so the model
-        // can reference them; the display body renumbers from 1 to
-        // match the legacy UI.
+        // can reference them; the display body renumbers from 1.
         let formatted_for_model: Vec<String> = kept
             .iter()
             .enumerate()

@@ -15,8 +15,6 @@
 //! Channel-style subscribers (where the listener forwards events into
 //! a `tokio::sync::mpsc` queue) compose on top of [`EventBus::subscribe`]
 //! without any special-case API: the listener just calls `tx.send(...)`.
-//!
-//! See `docs/aj-next-plan.md` §1.4 — "Hook vs subscriber pattern".
 
 use std::future::Future;
 use std::pin::Pin;
@@ -60,9 +58,9 @@ struct BusInner {
 /// Event bus owned by an [`crate::Agent`].
 ///
 /// Cloning is cheap — clones share the underlying state via `Arc` —
-/// so the bus can be handed to sub-systems (e.g. the future
-/// sub-agent spawn path that shares the parent's bus, per
-/// `docs/aj-next-plan.md` §1.6) without ceremony.
+/// so the bus can be handed to sub-systems (e.g. the
+/// sub-agent spawn path that shares the parent's bus) without
+/// ceremony.
 #[derive(Clone)]
 pub struct EventBus {
     inner: Arc<BusInner>,

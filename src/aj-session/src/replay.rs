@@ -7,10 +7,10 @@
 //! previously recorded log on disk. `replay` is the bridge between
 //! disk and that pipeline.
 //!
-//! See `docs/aj-next-plan.md` §2.5 for the binary-side wiring (the
-//! `aj` binary opens a log, registers persistence and renderer
-//! listeners on the agent, then drains `replay(...)` into the
-//! renderer pipeline before entering its input loop).
+//! The binary-side wiring: the `aj` binary opens a log, registers
+//! persistence and renderer listeners on the agent, then drains
+//! `replay(...)` into the renderer pipeline before entering its
+//! input loop.
 //!
 //! ## Mapping
 //!

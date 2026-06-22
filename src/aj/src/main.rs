@@ -65,8 +65,8 @@ async fn main() -> Result<()> {
 
 /// Dispatch to the interactive or print mode based on `--print`.
 ///
-/// Per `docs/aj-next-plan.md` §4.2 the same binary serves both;
-/// the only difference is which subscriber drives the agent's bus.
+/// The same binary serves both; the only difference is which
+/// subscriber drives the agent's bus.
 async fn dispatch_session_mode(args: Args) -> Result<()> {
     if args.print {
         print::run(args).await

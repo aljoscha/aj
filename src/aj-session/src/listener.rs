@@ -1,7 +1,7 @@
 //! Bus listener that drives the conversation log off of
 //! [`AgentEvent::MessageEnd`].
 //!
-//! Per `docs/aj-next-plan.md` §2.4b, the agent emits a typed
+//! The agent emits a typed
 //! [`AgentEvent::MessageEnd`] for every payload that needs to hit
 //! disk: the user's typed prompt, the assistant message at the end
 //! of every inference, and one tool_result message per tool call in
@@ -10,14 +10,12 @@
 //! [`MessageEnd`] event into one [`ConversationView::add_message`]
 //! call.
 //!
-//! Because the bus awaits each listener inline (`docs/aj-next-plan.md`
-//! §1.4 — "Hook vs subscriber pattern"), the listener returning
-//! `Err` aborts the run with a fatal turn error — preserving the
-//! same durability guarantee the previous direct `view.add_*` calls
-//! had.
+//! Because the bus awaits each listener inline, the listener
+//! returning `Err` aborts the run with a fatal turn error, so a
+//! failed write stops the turn rather than silently losing a message.
 //!
-//! Sub-agent first-entry anchoring (per `docs/aj-next-plan.md` §1.6)
-//! is the listener's responsibility too: when the agent emits
+//! Sub-agent first-entry anchoring is the listener's responsibility
+//! too: when the agent emits
 //! [`AgentEvent::SubAgentStart`] the listener captures the parent
 //! thread's current head and immediately writes the sub-agent's
 //! [`crate::log::ConversationEntryKind::SubAgentSpawn`] root entry

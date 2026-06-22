@@ -321,7 +321,7 @@ pub mod codex {
     use crate::oauth::openai::extract_account_id;
 
     /// Provider id this source reports on, matching the OAuth pool the
-    /// Codex Responses provider uses (see `auth.rs` §7.4.1).
+    /// Codex Responses provider uses (see `auth.rs`).
     const PROVIDER_ID: &str = "openai-codex";
 
     /// Account usage endpoint on the ChatGPT backend. The same JSON
@@ -336,7 +336,7 @@ pub mod codex {
 
     /// Reports plan rate-limit utilization via the ChatGPT backend's
     /// account usage endpoint. Requires the OAuth JWT minted by the
-    /// §9.4 Codex login flow; the token carries the `chatgpt_account_id`
+    /// Codex login flow; the token carries the `chatgpt_account_id`
     /// claim that the endpoint requires as a header.
     pub struct OpenAICodexUsageSource;
 

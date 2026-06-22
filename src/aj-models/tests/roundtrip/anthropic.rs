@@ -1,17 +1,16 @@
 //! Anthropic Messages round-trip tests.
 //!
 //! For each scenario covering an `AssistantContent` variant the provider
-//! emits, runs the three test shapes from `docs/models-spec.md` §12 step
-//! 11b:
+//! emits, runs the three test shapes:
 //!
 //! - **Parse**: fixture SSE → unified `AssistantMessage`. Asserts the
-//!   structural fields the spec requires preserving (text, signatures,
+//!   structural fields the round-trip requires preserving (text, signatures,
 //!   tool-call ids, …) against the canonical, hand-built message.
 //! - **Serialize**: hand-built `AssistantMessage` → request item JSON.
 //!   Compares against the golden `<scenario>.request.json` file.
 //! - **Semantic round-trip**: parsed `AssistantMessage` → request item
 //!   → re-parsed back to `AssistantMessage`. Asserts the content blocks
-//!   round-trip field-equal modulo metadata that the §1.10 invariant
+//!   round-trip field-equal modulo metadata that the invariant
 //!   explicitly does not require preserving (model, usage, response_id,
 //!   stop_reason, timestamp).
 
@@ -253,7 +252,7 @@ fn run_semantic_roundtrip_test(scenario: &str, canonical: AssistantMessage) {
     let reparsed = parse_assistant_request_item(&param);
     // Semantic round-trip: the canonical message defines the structural
     // ground truth. Both `parsed` and `reparsed` should match it on the
-    // §1.10 preserved fields.
+    // preserved fields.
     assert_content_eq(&canonical, &parsed, &format!("rt-parse:{scenario}"));
     assert_content_eq(&canonical, &reparsed, &format!("rt-reparse:{scenario}"));
     // The `api` tag survives the projection so listeners can still tell
@@ -345,7 +344,7 @@ fn semantic_roundtrip_redacted_thinking() {
 // error instead), so these scenarios only assert the terminal
 // classification the adapter produces (`stop_reason` plus
 // `error.category`) and that any partial content accumulated before the
-// failure survives. They pin the §10.3 error legs against captured wire
+// failure survives. They pin the error legs against captured wire
 // fixtures rather than hand-built events, the same way the happy path is
 // pinned.
 // ---------------------------------------------------------------------------

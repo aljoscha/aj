@@ -6,8 +6,6 @@
 //! row above the list ("Thinking effort") and the list itself,
 //! with the current level pre-selected so `Enter` re-applies the
 //! same setting (a no-op confirm).
-//!
-//! See `docs/aj-next-plan.md` "Selectors and theming" step.
 
 use aj_models::ThinkingConfig;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};

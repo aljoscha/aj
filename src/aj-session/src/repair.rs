@@ -12,8 +12,7 @@
 //! Owned by `aj-session` because it operates on log entries and
 //! writes through [`ConversationView`]. The binary calls it once on
 //! startup, after resolving the system prompt and before seeding the
-//! agent's in-memory transcript (per `docs/aj-next-plan.md` §2.4b
-//! and §2.5).
+//! agent's in-memory transcript.
 
 use std::collections::HashSet;
 

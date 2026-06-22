@@ -8,8 +8,6 @@
 //! refresh CLI. Overrides from the bundled `overrides.json` are applied
 //! on top of whichever catalog loads, so authored corrections survive
 //! refreshes.
-//!
-//! See `docs/models-spec.md` §3 for the full design.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,7 +31,7 @@ const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 /// Bundled OpenAI Codex seed. The `openai-codex` provider points at
 /// the ChatGPT subscription backend (`chatgpt.com/backend-api`) and
 /// is not enumerated by models.dev, so its model list is maintained
-/// here alongside the overrides file (per §3.4.7). The list is
+/// here alongside the overrides file. The list is
 /// authoritative: refresh appends these entries to every fresh cache
 /// (defensively filtering any upstream re-emission first), and load
 /// splices them in so users on a stale cache or an older bundled seed
@@ -54,7 +52,7 @@ pub const CODEX_PROVIDER_ID: &str = "openai-codex";
 const STALENESS_THRESHOLD_DAYS: i64 = 90;
 
 // ============================================================================
-// §3.1 Model Metadata
+// Model Metadata
 // ============================================================================
 
 /// Supported input modality. Matches the lowercase string form used by
@@ -137,7 +135,7 @@ pub struct ModelInfo {
 }
 
 // ============================================================================
-// Catalog file schema (§3.4.1)
+// Catalog file schema
 // ============================================================================
 
 /// On-disk catalog format shared by the bundled seed and the user cache.
@@ -152,7 +150,7 @@ pub struct Catalog {
 }
 
 // ============================================================================
-// Overrides file schema (§3.4.4)
+// Overrides file schema
 // ============================================================================
 
 /// On-disk overrides file. Each entry targets one `(provider, id)` pair
@@ -208,7 +206,7 @@ pub struct OverridePatch {
 }
 
 // ============================================================================
-// §3.2 Registry
+// Registry
 // ============================================================================
 
 /// In-memory registry of all known models, organized by provider.
@@ -353,7 +351,7 @@ impl ModelRegistry {
 }
 
 // ============================================================================
-// §3.3 Cost Calculation
+// Cost Calculation
 // ============================================================================
 
 /// Compute dollar costs per token category and the running total, and
@@ -376,7 +374,7 @@ pub fn calculate_cost(model: &ModelInfo, usage: &mut Usage) {
 }
 
 // ============================================================================
-// §3.3.1 Capability Probes
+// Capability Probes
 // ============================================================================
 
 /// Structural equality of two models by `(provider, api, id)`. Two
@@ -862,8 +860,7 @@ mod tests {
         // Seed must contain at least one Anthropic and one OpenAI model.
         assert!(seed.models.iter().any(|m| m.provider == "anthropic"));
         assert!(seed.models.iter().any(|m| m.provider == "openai"));
-        // All seed entries must be on the two filtered providers
-        // (§3.4.7).
+        // All seed entries must be on the two filtered providers.
         for m in &seed.models {
             assert!(
                 m.provider == "anthropic" || m.provider == "openai",
@@ -915,18 +912,18 @@ mod tests {
         let seed = bundled_codex_seed();
         assert!(!seed.is_empty(), "codex seed must be non-empty");
 
-        // §7.4.1 + §3.4.3: every codex entry shares the same fixed
+        // every codex entry shares the same fixed
         // provider/api/base_url triple.
         for m in &seed {
             assert_eq!(m.provider, CODEX_PROVIDER_ID);
             assert_eq!(m.api, "openai-codex-responses");
             assert_eq!(m.base_url, "https://chatgpt.com/backend-api");
-            // §3.4.7: max_tokens hard-coded at 128_000 across the
+            // max_tokens hard-coded at 128_000 across the
             // entire codex set.
             assert_eq!(m.max_tokens, 128_000);
         }
 
-        // §3.4.7 calls out the canonical id list; spot-check the
+        // calls out the canonical id list; spot-check the
         // headline entries.
         let ids: std::collections::HashSet<&str> = seed.iter().map(|m| m.id.as_str()).collect();
         for expected in [
@@ -944,7 +941,7 @@ mod tests {
             assert!(ids.contains(expected), "codex seed missing {expected}");
         }
 
-        // §3.4.7: context_window is 272_000 for the canonical entries
+        // context_window is 272_000 for the canonical entries
         // (the observed server cap). The free-preview spark model is
         // narrower; assert the bulk are at the canonical value.
         let canonical_window_count = seed.iter().filter(|m| m.context_window == 272_000).count();

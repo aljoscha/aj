@@ -352,12 +352,11 @@ fn apply_quote_style(
 /// every visible character is whitespace, or there are no visible
 /// characters at all.
 ///
-/// Used by the trailing-blank trim in [`Markdown::render`]. The trim
-/// ran on `String::is_empty` before the row-emission rewrite that
-/// pads every row to the full render width and optionally wraps it in
-/// a `bg_fn`; both transforms turn what used to be a `""` row into
-/// either `" ".repeat(width)` or `bg_fn(" ".repeat(width))`. This
-/// helper steps over ANSI escape sequences (CSI / OSC / APC, via
+/// Used by the trailing-blank trim in [`Markdown::render`]. Row
+/// emission pads every row to the full render width and optionally
+/// wraps it in a `bg_fn`, so a blank row is `" ".repeat(width)` or
+/// `bg_fn(" ".repeat(width))` rather than `""`. This helper steps over
+/// ANSI escape sequences (CSI / OSC / APC, via
 /// [`extract_ansi_code`]) so an SGR-tinted row of spaces still counts
 /// as blank for the trim.
 fn is_blank_row(s: &str) -> bool {

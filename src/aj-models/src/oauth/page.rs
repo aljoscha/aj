@@ -1,6 +1,6 @@
 //! HTML rendered to the browser when an OAuth callback completes.
 //!
-//! Both Anthropic (§9.3) and OpenAI (§9.4) bind a localhost HTTP
+//! Both Anthropic and OpenAI bind a localhost HTTP
 //! server, wait for the upstream provider to redirect a browser back
 //! to it with `?code=...&state=...`, and then return a small page so
 //! the user knows to switch back to the terminal. We render that page

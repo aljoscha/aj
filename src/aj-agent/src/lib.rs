@@ -3,9 +3,8 @@
 // tools through the [`tool::ToolDefinition`] / [`tool::ToolContext`]
 // surface and emits every state transition through its internal
 // [`bus::EventBus`]; the binary subscribes a renderer listener and a
-// persistence listener (the latter lives in `aj-session` per the
-// dependency graph in `docs/aj-next-plan.md` §1) and owns the
-// readline loop, log management, and history display.
+// persistence listener (the latter lives in `aj-session`) and owns
+// the readline loop, log management, and history display.
 pub mod bus;
 pub mod error;
 pub mod events;
@@ -123,22 +122,20 @@ pub struct Agent {
     /// subscribes a renderer listener and a persistence listener
     /// (the latter lives in `aj_session::persistence_listener`).
     bus: EventBus,
-    /// Cancellation token surfaced to tools through
-    /// [`ToolContext::cancellation`]. Today the agent never fires
-    /// it: cancellation propagation lands in §1.8 of
-    /// `docs/aj-next-plan.md`, but the field is wired through now
-    /// so tools observing `select!` against `ctx.cancellation()`
-    /// compile cleanly.
-    /// Sub-agents inherit a child token derived from their
-    /// parent's per `docs/aj-next-plan.md` §1.6 so a single
-    /// eventual `cancel()` call reaches the whole hierarchy.
+    /// Cancellation token for the in-flight turn. The agent does not
+    /// fire it: the binary installs a fresh token per turn (via
+    /// [`Agent::prompt`] and friends) and calls `cancel()` from a
+    /// different code path to abort the turn. The agent observes it at
+    /// the streaming and tool checkpoints and surfaces it to tools
+    /// through [`ToolContext::cancellation`] so a tool can `select!`
+    /// against `ctx.cancellation()`. Sub-agents inherit a child token
+    /// derived from this one so a single `cancel()` reaches the whole
+    /// hierarchy.
     cancellation: CancellationToken,
     /// In-memory transcript: every [`AgentMessage`] this agent has
-    /// seen, in append order. Replaces the agent's reach into
-    /// [`aj_session::ConversationLog`] (per `docs/aj-next-plan.md`
-    /// §2.4b): the binary owns the log, resumes it on startup, and
-    /// seeds the transcript via [`Agent::seed_session`] before the
-    /// first turn.
+    /// seen, in append order. The binary owns the on-disk log, resumes
+    /// it on startup, and seeds the transcript via
+    /// [`Agent::seed_session`] before the first turn.
     transcript: Vec<AgentMessage>,
     /// Optional hook fired before every tool call. Set via
     /// [`Agent::set_before_tool_call`]; `None` means "skip the
@@ -209,9 +206,8 @@ impl Agent {
     /// pre-computed at startup.
     ///
     /// Sub-agents spawned by this agent inherit the same `provider`,
-    /// `model_info`, and `stream_options` (per
-    /// `docs/aj-next-plan.md` §1.6) so the whole hierarchy talks to
-    /// the same backend.
+    /// `model_info`, and `stream_options` so the whole hierarchy talks
+    /// to the same backend.
     ///
     /// `working_directory` roots the tools' filesystem view and is
     /// the only piece of host environment the runtime keeps. The
@@ -286,10 +282,9 @@ impl Agent {
     /// Replace this agent's event bus.
     ///
     /// Used by [`SessionContextWrapper::spawn_agent`] to make a
-    /// sub-agent share the parent's bus per `docs/aj-next-plan.md`
-    /// §1.6: every event the child emits then reaches every
-    /// listener the binary registered on the parent (rendering,
-    /// persistence, future TUI components), tagged by the child's
+    /// sub-agent share the parent's bus: every event the child emits
+    /// then reaches every listener the binary registered on the parent
+    /// (rendering, persistence), tagged by the child's
     /// [`AgentId::Sub`]. Must be called before any turn runs;
     /// subscriptions registered on the bus that's about to be
     /// replaced are silently dropped.
@@ -301,7 +296,7 @@ impl Agent {
     ///
     /// Used by [`SessionContextWrapper::spawn_agent`] to make a
     /// sub-agent inherit a child token derived from the parent's
-    /// per `docs/aj-next-plan.md` §1.6, and by
+    /// token, and by
     /// [`Agent::prompt`] / [`Agent::continue_run`] /
     /// [`Agent::run_single_turn`] to install the per-turn token the
     /// binary owns and can `cancel()` from a different code path
@@ -396,8 +391,8 @@ impl Agent {
     /// receiver has been dropped, so a renderer that hangs up
     /// mid-run does not fail the agent's turn.
     ///
-    /// This is the channel sugar from `docs/aj-next-plan.md` §1.4:
-    /// the TUI's event pump uses it to decouple itself from the
+    /// This is the channel sugar the TUI's event pump uses to
+    /// decouple itself from the
     /// agent's emit timing. The agent never blocks on a slow
     /// renderer because the forwarder's `send` is non-blocking;
     /// renderers see events at their own pace by polling the
@@ -435,7 +430,7 @@ impl Agent {
 
     /// Snapshot of the per-sub-agent accumulated [`Usage`] map. The
     /// binary uses this to compute the end-of-session usage summary
-    /// (the agent no longer renders one — the binary owns
+    /// (the agent does not render one — the binary owns
     /// presentation).
     pub fn sub_agent_usage(&self) -> HashMap<usize, Usage> {
         self.session_state.sub_agent_usage()
@@ -949,10 +944,9 @@ impl Agent {
     /// listener subscribed on the bus translates them into
     /// `aj_session::ConversationView` appends, one JSONL line per
     /// event, so the on-disk state stays at-most one event behind
-    /// reality (see `docs/aj-next-plan.md` §2.3b).
+    /// reality.
     ///
-    /// Cancellation is honoured at three checkpoints per
-    /// `docs/aj-next-plan.md` §1.8:
+    /// Cancellation is honoured at three checkpoints:
     ///
     /// 1. **Streaming inference.** The `response_stream.next()`
     ///    poll is `select!`-ed against [`Self::cancellation`]; on
@@ -1014,7 +1008,7 @@ impl Agent {
             let cancel = self.cancellation.clone();
 
             // Bracket the streaming inference with `MessageStart` /
-            // `MessageEnd` per `docs/aj-next-plan.md` §1.1.
+            // `MessageEnd`.
             // `MessageStart` carries an identity-stamped empty
             // assistant message so renderers can open their assistant
             // slot before the first content event arrives; the
@@ -1061,7 +1055,7 @@ impl Agent {
                         // can break out of the loop with the finalized
                         // message. The forwarded `MessageUpdate` still flows
                         // through for every event so listeners see the
-                        // complete streaming protocol per the spec.
+                        // complete streaming protocol.
                         match &event {
                             AssistantMessageEvent::Done { message, .. } => {
                                 final_message = Some(message.clone());
@@ -1171,8 +1165,8 @@ impl Agent {
 
             if final_was_error {
                 let assistant_err = final_message.error.clone();
-                // Provider-side cancellation (Phase 1 in the model
-                // layer) surfaces here as a terminal `Error` event
+                // Provider-side cancellation (in the model layer)
+                // surfaces here as a terminal `Error` event
                 // with `category == Aborted`. Route it onto the
                 // same `TurnError::Aborted` path the streaming-side
                 // `select!` uses so callers see one cancellation
@@ -1187,11 +1181,11 @@ impl Agent {
                 }
                 // Auto-retry the transport-transient categories with
                 // backoff. `Transient` covers a stream that dropped
-                // before its terminal frame (a truncated turn,
-                // `docs/models-spec.md` §10.3): retrying re-issues the
-                // turn instead of surfacing a cut-off answer as final.
+                // before its terminal frame (a truncated turn):
+                // retrying re-issues the turn instead of surfacing a
+                // cut-off answer as final.
                 // `Overloaded` (provider 529/503) retries for the same
-                // reason. `RateLimit` is also retryable per §10.4 but
+                // reason. `RateLimit` is also retryable but
                 // must honour `retry_after_ms`, which this fixed backoff
                 // does not; it surfaces as a recoverable error instead.
                 let is_retryable = assistant_err.as_ref().is_some_and(|e| {
@@ -2573,7 +2567,7 @@ struct SessionContextWrapper<'a> {
     disabled_tools: &'a [String],
     /// Unified provider handle threaded into sub-agents. Cloned from
     /// the parent's handle so the whole hierarchy talks to the same
-    /// backend per `docs/aj-next-plan.md` §1.6.
+    /// backend.
     provider: Arc<dyn Provider>,
     model_info: Arc<ModelInfo>,
     stream_options: StreamOptions,
@@ -2583,9 +2577,9 @@ struct SessionContextWrapper<'a> {
     /// closure is `Arc`-shared.
     sub_agent_tools: Vec<ErasedToolDefinition>,
     /// Clone of the parent agent's event bus. Sub-agents share
-    /// this bus per `docs/aj-next-plan.md` §1.6 so every event a
-    /// child emits reaches the listeners the binary registered on
-    /// the parent, tagged with [`AgentId::Sub`]. The wrapper also
+    /// this bus so every event a child emits reaches the listeners
+    /// the binary registered on the parent, tagged with
+    /// [`AgentId::Sub`]. The wrapper also
     /// emits [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
     /// correlation events on this bus before / after the child
     /// runs.
@@ -2708,8 +2702,8 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // prompt the tool invoked us with is appended as the first
             // user message inside `run_single_turn`. Sub-agents share
             // the parent's provider / model_info / stream_options
-            // triple (per `docs/aj-next-plan.md` §1.6) so the whole
-            // hierarchy talks to the same backend. The thinking level
+            // triple so the whole hierarchy talks to the same backend.
+            // The thinking level
             // is applied separately below via `set_default_thinking`
             // so the child inherits the parent's resolved value.
             let mut sub_agent = Agent::with_provider(
@@ -2754,10 +2748,9 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // steer or queue for this sub-agent from its view; the
             // sub-agent drains its own `Sub(n)`-keyed slots.
             sub_agent.set_message_queues(self.message_queues.clone());
-            // Share the parent's bus per `docs/aj-next-plan.md`
-            // §1.6: every event the sub-agent emits during its
-            // run reaches the listeners the binary registered on
-            // the parent (rendering, persistence), tagged with
+            // Share the parent's bus: every event the sub-agent emits
+            // during its run reaches the listeners the binary registered
+            // on the parent (rendering, persistence), tagged with
             // `Sub(n)`. Without this the sub-agent runs on its
             // own bus and the binary's bridge listener never sees
             // its activity.
@@ -3101,7 +3094,7 @@ fn scan_dangling_tool_uses(transcript: &[AgentMessage]) -> std::collections::Has
 /// `Aborted` mirrors `Recoverable` from the binary's perspective —
 /// the session stays alive and the user can re-prompt — but
 /// distinguishes "the user cancelled this turn" from "the model
-/// returned an error", per `docs/aj-next-plan.md` §1.8.
+/// returned an error".
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
     /// An ephemeral error encountered while talking to the model.
@@ -3252,8 +3245,7 @@ fn max_tool_concurrency() -> usize {
 mod event_protocol_tests {
     //! Snapshot the event protocol the agent emits on its bus.
     //!
-    //! Per `docs/aj-next-plan.md` §2.1 / §2.4b, the bus is the
-    //! agent's only output channel. These tests pin the event
+    //! The bus is the agent's only output channel. These tests pin the event
     //! sequence for known-shape turns so subsequent commits cannot
     //! silently regress the protocol; the agent runs in isolation
     //! (no log, no UI), with a scripted model, and the test
@@ -3431,7 +3423,7 @@ mod event_protocol_tests {
 
     /// Build an [`AssistantMessageEvent`] script for a single inference
     /// that finalizes on the given message. The pair `Start + Done`
-    /// matches the spec's minimum-protocol shape: a stream begins with
+    /// matches the minimum-protocol shape: a stream begins with
     /// `Start` and terminates with `Done`, with no per-block streaming
     /// in between. The agent's match arm treats `Start` as a no-op and
     /// drives all rendering off the finalized message blocks, so the
@@ -3484,8 +3476,8 @@ mod event_protocol_tests {
 
     /// Build a script whose terminal event is a retryable transient
     /// `Error` — the shape a provider emits for a stream that dropped
-    /// before its terminal frame (a truncated turn,
-    /// `docs/models-spec.md` §10.3, via `AssistantMessageEvent::truncated`).
+    /// before its terminal frame (a truncated turn, via
+    /// `AssistantMessageEvent::truncated`).
     /// The agent's retry layer should re-issue the turn rather than
     /// surface this as a finished answer.
     fn transient_error_script() -> Vec<AssistantMessageEvent> {
@@ -3540,8 +3532,8 @@ mod event_protocol_tests {
 
     /// Compact, comparable representation of an [`AgentEvent`] for
     /// snapshot assertions. We don't `derive(PartialEq)` on the
-    /// real enum because some payloads (e.g. the legacy
-    /// `AssistantMessage` once it arrives in §2.4) don't implement
+    /// real enum because some payloads (e.g. an `AssistantMessage`)
+    /// don't implement
     /// `PartialEq` cleanly, and a label per variant keeps test
     /// failures readable.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4523,7 +4515,7 @@ mod event_protocol_tests {
 
     #[tokio::test]
     async fn cancel_mid_stream_pushes_aborted_partial_and_allows_followup() {
-        // End-to-end smoke test for the §1.8 cancellation invariant:
+        // End-to-end smoke test for the cancellation invariant:
         // firing the token mid-stream should leave the transcript in
         // a shape that lets a second `prompt` call succeed without
         // any manual repair. We use a scripted provider whose first
@@ -4623,7 +4615,7 @@ mod event_protocol_tests {
     #[tokio::test]
     async fn truncated_turn_is_retried_then_succeeds() {
         // A provider stream that drops before its terminal frame
-        // surfaces as a transient `Error` (docs/models-spec.md §10.3,
+        // surfaces as a transient `Error` (via
         // `AssistantMessageEvent::truncated`). The agent's retry layer
         // must re-issue the turn rather than accept the truncated turn
         // as final. Strict-mode provider: exactly two inferences are

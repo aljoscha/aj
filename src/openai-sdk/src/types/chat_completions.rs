@@ -605,7 +605,7 @@ pub struct WebSearchLocationApproximate {
 
 /// `finish_reason` reported by Chat Completions and OpenAI-compatible
 /// providers. We enumerate the values that AJ classifies explicitly
-/// (per §10.3 of the models spec) and keep an `Other(String)` catch-
+/// and keep an `Other(String)` catch-
 /// all so that a new or vendor-specific value never breaks the parser.
 /// The catch-all preserves the raw wire string so callers can include
 /// it in error messages or fold it into `Unknown` categorization.
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn finish_reason_normalises_end_alias_to_stop() {
         // Some OpenAI-compatible endpoints emit "end" rather than "stop".
-        // §7.2 of the models spec maps both to the same `Stop`.
+        // We map both to the same `Stop`.
         let parsed: FinishReason = serde_json::from_str("\"end\"").unwrap();
         assert_eq!(parsed, FinishReason::Stop);
     }

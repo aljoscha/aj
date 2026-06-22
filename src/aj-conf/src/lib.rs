@@ -836,7 +836,7 @@ pub struct Config {
     /// Replace expanded thinking blocks with a single italic
     /// "Thinking…" placeholder line in the interactive TUI.
     /// Defaults to `true` (collapsed). Toggled at runtime with
-    /// `Ctrl+T`; see `docs/aj-next-plan.md` §4.4.
+    /// `Ctrl+T`.
     pub hide_thinking_block: bool,
     /// Whether `read_file` resizes images to fit within the inline
     /// image budget before attaching them to tool results. Defaults

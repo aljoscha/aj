@@ -1,5 +1,4 @@
-//! OpenAI OAuth flow (ChatGPT Plus/Pro / Codex), per
-//! `docs/models-spec.md` §9.4.
+//! OpenAI OAuth flow (ChatGPT Plus/Pro / Codex).
 //!
 //! Authorization Code + PKCE, with a few OpenAI-specific quirks:
 //!
@@ -15,7 +14,7 @@
 //!   `claims["https://api.openai.com/auth"].chatgpt_account_id` to
 //!   discover the ChatGPT account the user is logging in with.
 //!   That id is persisted in [`OAuthCredentials::extra`] under the
-//!   `accountId` key (see §9.1).
+//!   `accountId` key.
 //! - **Distinct callback route.** The redirect URI registered with
 //!   the upstream is `http://localhost:1455/auth/callback`; both port
 //!   and path are fixed by the upstream.
@@ -108,7 +107,7 @@ const STATE_BYTES: usize = 16;
 
 /// JSON key used to persist the ChatGPT account id inside
 /// [`OAuthCredentials::extra`]. Spelled in camelCase to match the
-/// `auth.json` shape documented in §9.1 (`{ ..., accountId: "..." }`).
+/// `auth.json` shape: `{ ..., accountId: "..." }`.
 pub const ACCOUNT_ID_FIELD: &str = "accountId";
 
 // ---------------------------------------------------------------------------
@@ -172,7 +171,7 @@ impl OpenAIOAuth {
 #[async_trait]
 impl OAuthProvider for OpenAIOAuth {
     fn id(&self) -> &str {
-        // Per spec §7.4.1, OAuth credentials live under the `openai-codex`
+        // OAuth credentials live under the `openai-codex`
         // provider id, separate from the `openai` provider id used for
         // plain `OPENAI_API_KEY` credentials. The JWT issued by this flow
         // is only valid against `chatgpt.com/backend-api`, so the two
@@ -404,7 +403,7 @@ async fn post_token_request(
 /// [`OAuthCredentials`] shape. Computes the absolute expiration
 /// timestamp here so callers don't have to track relative time, and
 /// lifts the ChatGPT account id out of the JWT access token into
-/// `extra[ACCOUNT_ID_FIELD]` (see §9.4 step 5).
+/// `extra[ACCOUNT_ID_FIELD]`.
 fn token_to_credentials(t: TokenResponse) -> Result<OAuthCredentials, OAuthError> {
     let account_id = extract_account_id(&t.access_token).ok_or_else(|| {
         OAuthError::Parse("access token JWT missing chatgpt_account_id claim".into())
@@ -566,7 +565,7 @@ mod tests {
     }
 
     /// State generator produces 32 hex chars (16 bytes) and does not
-    /// repeat itself across calls. Matches the spec's "random" rule.
+    /// repeat itself across calls.
     #[test]
     fn state_is_random_hex() {
         let s1 = generate_state().unwrap();
@@ -602,7 +601,7 @@ mod tests {
             Some(&serde_json::Value::String("acc-xyz".into()))
         );
 
-        // Persistence shape must match §9.1: extra fields flatten to
+        // Persistence shape must match: extra fields flatten to
         // sibling keys, not a nested `extra` object.
         let json = serde_json::to_value(&creds).unwrap();
         assert_eq!(json["accountId"], "acc-xyz");
@@ -788,7 +787,7 @@ mod tests {
     /// `OAuthProvider` trait wiring smoke-test: build an
     /// `OpenAIOAuth`, ask for its id/name/flags and use it as a
     /// trait object (the same shape the auth-storage layer needs).
-    /// The id is the spec §7.4.1 split — OAuth credentials live under
+    /// The id is the split — OAuth credentials live under
     /// `openai-codex`, not `openai` — so the storage layer never
     /// mistakes a JWT for a plain `OPENAI_API_KEY`.
     #[test]

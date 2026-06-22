@@ -10,8 +10,6 @@
 //! HTTP knobs flow in through [`StreamOptions`]. That keeps the dispatch
 //! functions free to construct (or pool) provider instances however they
 //! see fit without leaking lifecycle concerns to callers.
-//!
-//! See `docs/models-spec.md` §5 for the full design.
 
 use futures::StreamExt;
 
@@ -61,8 +59,8 @@ pub trait Provider: Send + Sync {
 ///
 /// Returns [`None`] when no provider has been registered for `api`.
 /// Concrete providers (Anthropic, OpenAI Chat Completions, OpenAI
-/// Responses, OpenAI Codex Responses) plug in here as they land in §6
-/// and §7; until each one arrives the top-level dispatch functions
+/// Responses, OpenAI Codex Responses) plug in here. Until a provider
+/// is registered the top-level dispatch functions
 /// surface the missing provider as an [`AssistantMessageEvent::Error`]
 /// on the resulting stream so callers always observe a uniform stream
 /// shape.

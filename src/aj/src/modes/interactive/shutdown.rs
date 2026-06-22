@@ -86,15 +86,12 @@ pub fn build_usage_summary_from_parts(main: &Usage, subs: &HashMap<usize, Usage>
 }
 
 /// Format a [`UsageSummary`] into the canonical multi-line block
-/// the legacy `aj` binary prints at end-of-session: one row per
-/// agent (`Main Agent` first, `Sub-agent <n>` rows in `agent_id`
-/// order), then a trailing `TOTAL` row. No trailing newline — the
-/// caller adds one when printing.
+/// printed at end-of-session: one row per agent (`Main Agent` first,
+/// `Sub-agent <n>` rows in `agent_id` order), then a trailing `TOTAL`
+/// row. No trailing newline — the caller adds one when printing.
 ///
-/// The per-row shape `Input: A | Output: B | Cache Creation: C |
-/// Cache Read: D` matches the legacy binary's output byte-for-byte
-/// so users who script against either binary see the same numbers
-/// in the same positions.
+/// The per-row shape is `Input: A | Output: B | Cache Creation: C |
+/// Cache Read: D`, a stable format users can script against.
 pub fn format_usage_summary(summary: &UsageSummary) -> String {
     let format_row = |usage: &SubAgentUsage| -> String {
         format!(

@@ -1,21 +1,19 @@
 //! `edit_file` builtin — exact-string replacement on a single file.
 //!
-//! Migrated to [`aj_agent::tool::ToolDefinition`] per
-//! `docs/aj-next-plan.md` §2.2. Returns a [`ToolOutcome`] whose
+//! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
+//! [`ToolOutcome`] whose
 //! `details` is [`ToolDetails::Diff`] on success: `before` is the
 //! file's prior content, `after` is the post-replacement content. The
-//! wire `content` is the short success summary the legacy
-//! implementation emitted so the model still sees a deterministic
-//! `"Successfully replaced ..."` line.
+//! wire `content` is the short success summary so the model still sees
+//! a deterministic `"Successfully replaced ..."` line.
 //!
 //! Recoverable errors (path-not-absolute, file-not-found, read /
 //! write failure, zero or ambiguous matches) come back as
 //! `is_error: true` outcomes carrying [`ToolDetails::Text`] so the
-//! model can correct its call instead of aborting the turn. Per
-//! `docs/aj-next-plan.md` §1.3, [`execution_mode`] is overridden to
-//! [`ExecutionMode::Sequential`] because this tool mutates the
-//! filesystem — the agent will serialize a batch containing it to
-//! avoid interleaved writes.
+//! model can correct its call instead of aborting the turn.
+//! [`execution_mode`] is overridden to [`ExecutionMode::Sequential`]
+//! because this tool mutates the filesystem — the agent serializes a
+//! batch containing it to avoid interleaved writes.
 //!
 //! [`execution_mode`]: ToolDefinition::execution_mode
 
@@ -66,9 +64,9 @@ impl ToolDefinition for EditFileTool {
         DESCRIPTION
     }
 
-    /// `edit_file` mutates the filesystem; the spec marks it as
-    /// `Sequential` so a batch containing it serializes around any
-    /// other in-flight tool calls (`docs/aj-next-plan.md` §1.3).
+    /// `edit_file` mutates the filesystem, so it runs in `Sequential`
+    /// mode: a batch containing it serializes around any other
+    /// in-flight tool calls.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -105,8 +103,7 @@ impl ToolDefinition for EditFileTool {
 
         // Count matches to enforce the "exactly one occurrence unless
         // replace_all" contract before touching the disk. `match_indices`
-        // is non-overlapping which matches the legacy behavior and the
-        // tool description.
+        // is non-overlapping, which matches the tool description.
         let match_count = original_content.matches(&input.old_string).count();
 
         if match_count == 0 {
@@ -405,8 +402,7 @@ mod tests {
     }
 
     /// Locks in `Sequential` execution mode — the agent's batching
-    /// logic relies on this to serialize filesystem mutations
-    /// (`docs/aj-next-plan.md` §1.3).
+    /// logic relies on this to serialize filesystem mutations.
     #[test]
     fn execution_mode_is_sequential() {
         assert_eq!(EditFileTool.execution_mode(), ExecutionMode::Sequential);

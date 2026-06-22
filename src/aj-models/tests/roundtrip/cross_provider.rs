@@ -1,11 +1,11 @@
 //! Cross-provider transform tests.
 //!
-//! Per `docs/models-spec.md` §12 step 11b.iii, each cross-provider
+//! Each cross-provider
 //! direction in the supported pairs (`anthropic-messages` ↔
 //! `openai-completions`, `anthropic-messages` ↔ `openai-responses`)
 //! gets one end-to-end transform test. Each test feeds a multi-turn
 //! history into [`transform_messages`] with a target [`ModelInfo`]
-//! and asserts every §8.1 rule fires correctly on a single, realistic
+//! and asserts every rule fires correctly on a single, realistic
 //! transcript:
 //!
 //! 1. **Same-model passthrough** (rule 1) — a leading assistant turn
@@ -48,7 +48,7 @@ use serde_json::json;
 /// Build a synthetic [`ModelInfo`] for use as a transform target.
 ///
 /// Cross-provider transforms only consult `provider`, `api`, `id`, and
-/// `input` (for the §8.2 image downgrade), so the cost/context numbers
+/// `input` (for the image downgrade), so the cost/context numbers
 /// are fixed to harmless defaults.
 fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
     ModelInfo {
@@ -60,8 +60,8 @@ fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
         reasoning: false,
         supports_adaptive_thinking: false,
         supports_verbosity: false,
-        // Vision-on so the §8.2 image downgrade never fires here —
-        // these tests focus on §8.1.
+        // Vision-on so the image downgrade never fires here —
+        // these tests focus on the cross-provider rewrites.
         input: vec![InputModality::Text, InputModality::Image],
         cost: ModelCost::default(),
         context_window: 100_000,
@@ -135,7 +135,7 @@ fn user_msg(text: &str) -> Message {
 // Assertion helpers shared across the four directions.
 //
 // Each direction's test composes a multi-turn history hitting all five
-// §8.1 rules at once, then we walk the output once and check each
+// rules at once, then we walk the output once and check each
 // assertion against its known-good position. Rule-specific helpers keep
 // the per-direction tests focused on the bits unique to that direction
 // (which IDs to normalize, which signatures to expect dropped).
@@ -219,7 +219,7 @@ fn assert_synthetic_orphan(result: &ToolResultMessage, expected_call_id: &str) {
     match result.content.first() {
         Some(UserContent::Text(t)) => assert_eq!(t.text, ORPHAN_TOOL_RESULT_TEXT),
         other => panic!(
-            "synthetic orphan body should be the §8.1 placeholder, got {:?}",
+            "synthetic orphan body should be the placeholder, got {:?}",
             other
         ),
     }
@@ -430,8 +430,8 @@ fn transform_anthropic_to_completions_full_history() {
 // - Rule 1: same-target Anthropic assistant whose signed thinking and
 //   redacted thinking blocks survive verbatim, and whose `toolu_*` ID
 //   is preserved.
-// - Rule 2: a Completions-source turn (no thinking blocks possible —
-//   §1.10 / §7.2 — but text with a `text_signature` and a tool_call
+// - Rule 2: a Completions-source turn (no thinking blocks possible,
+//   but text with a `text_signature` and a tool_call
 //   ID that needs sanitization).
 // - Rule 3: a `call_…` ID that contains characters outside the allowed
 //   class is sanitized and truncated to ≤64 for Anthropic.
@@ -462,7 +462,7 @@ fn transform_completions_to_anthropic_full_history() {
     );
 
     // Rule 2 + 3 + 4: cross-model Completions turn.
-    // Completions never produces signed thinking (§1.10 / §7.2), so the
+    // Completions never produces signed thinking, so the
     // only cross-model rewrites that fire are: text_signature strip,
     // tool-id sanitize/truncate, and orphan synthesis on the second
     // tool call.
@@ -614,7 +614,7 @@ fn transform_completions_to_anthropic_full_history() {
 //   contrived shape that exercises the foreign-origin item_id rewrite
 //   path: foreign-origin item halves get a stable `fc_<hash>`); an
 //   Anthropic-source non-composite ID, which stays non-composite and
-//   only gets sanitize+truncate per §7.3.5.
+//   only gets sanitize+truncate.
 // - Rule 4: a second tool call from the Anthropic turn has no result —
 //   synthetic orphan is emitted before the next user message.
 // - Rule 5: aborted Anthropic turn + its tool result both vanish.
@@ -642,7 +642,7 @@ fn transform_anthropic_to_responses_full_history() {
 
     // Rule 2 + 3 + 4: cross-model Anthropic turn.
     //
-    // Two tool calls cover the two §8.1-rule-3 paths for Responses
+    // Two tool calls cover the two rule-3 paths for Responses
     // targets: one composite-shaped ID (exercises the foreign-origin
     // item half rewrite to `fc_<hash>`) and one plain `toolu_*` ID
     // (stays non-composite, just sanitized).
@@ -741,7 +741,7 @@ fn transform_anthropic_to_responses_full_history() {
     assert_eq!(matched_call, "toolu_call_composite");
     assert!(
         matched_item.starts_with("fc_"),
-        "rule 3 / §7.3.5: foreign-origin item_id must be `fc_<hash>`, got {}",
+        "rule 3: foreign-origin item_id must be `fc_<hash>`, got {}",
         matched_item
     );
     assert!(
@@ -755,7 +755,7 @@ fn transform_anthropic_to_responses_full_history() {
     assert_eq!(again_id, matched_id, "foreign-origin hash must be stable");
 
     // Second (plain) tool call — non-composite Anthropic ID, stays
-    // non-composite per §7.3.5 (no item_id half to synthesize). Sanitize
+    // non-composite (no item_id half to synthesize). Sanitize
     // + truncate only.
     let (orphan_normalized_id, _) = tool_call_at(&cross.content, 3);
     assert!(

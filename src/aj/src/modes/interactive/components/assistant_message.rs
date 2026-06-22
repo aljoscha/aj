@@ -18,10 +18,6 @@
 //! `Update`s append to the most recent block; `Stop` closes it.
 //! Buffers and widgets are stored 1:1 with the streamed block
 //! sequence so a second thinking block never clobbers the first.
-//!
-//! See `docs/aj-next-plan.md` §1.1 (event protocol), §4
-//! (`components/assistant_message.rs`), and §4.4
-//! (thinking-block rendering modes).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -145,7 +141,7 @@ pub struct AssistantMessageComponent {
     /// coherent because every settings change invalidates and
     /// repaints. `true` renders the thinking channel as a single
     /// `Thinking…` placeholder line instead of the full italic
-    /// markdown widget; see `docs/aj-next-plan.md` §4.4.
+    /// markdown widget.
     hide_thinking_block: bool,
     /// In-order blocks the model has streamed so far.
     blocks: Vec<Block>,
@@ -623,7 +619,7 @@ mod tests {
 
     #[test]
     fn collapsed_mode_emits_blank_row_between_thinking_and_text() {
-        // The component's spacing rule (§4.4) is that exactly one
+        // The component's spacing rule is that exactly one
         // blank row separates a thinking block (expanded *or*
         // collapsed) from a following text block. Collapsed mode
         // must honour the same rule.

@@ -9,9 +9,6 @@
 //! component to forward each incoming event to; components only
 //! know about their own state.
 //!
-//! Filled in by the "Interactive TUI: layout slots, event pump,
-//! components" step in Phase 1.
-//!
 //! [`AgentEvent`]: aj_agent::events::AgentEvent
 
 pub mod agent_picker;

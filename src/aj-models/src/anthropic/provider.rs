@@ -1,7 +1,7 @@
 //! Anthropic Messages API provider.
 //!
 //! Implements the unified [`Provider`] trait against Anthropic's
-//! `POST /v1/messages` streaming endpoint. See `docs/models-spec.md` §6.2.
+//! `POST /v1/messages` streaming endpoint.
 //!
 //! Stateless — per-call HTTP knobs (auth, base URL, betas, caching) are
 //! derived from the per-call [`ModelInfo`] and [`StreamOptions`] so the
@@ -292,7 +292,7 @@ fn extra_betas_from_headers(
 }
 
 /// Classify a transport-layer or SDK-surfaced error into the unified
-/// [`AssistantError`] shape per `docs/models-spec.md` §10.3.
+/// [`AssistantError`] shape.
 fn classify_client_error(err: &ClientError) -> AssistantError {
     match err {
         ClientError::ApiError {
@@ -312,7 +312,7 @@ fn classify_client_error(err: &ClientError) -> AssistantError {
 }
 
 // ---------------------------------------------------------------------------
-// Request body construction (§6.2)
+// Request body construction
 // ---------------------------------------------------------------------------
 
 fn build_request(
@@ -321,7 +321,7 @@ fn build_request(
     options: &StreamOptions,
     reasoning: Option<&ThinkingLevel>,
 ) -> AMessages {
-    // §8: rewrite the history for cross-provider replay (signature
+    // rewrite the history for cross-provider replay (signature
     // strip, tool-call ID normalization, orphan/errored handling, image
     // downgrade) before serializing into Anthropic message params.
     let transformed = transform_messages(&context.messages, model);
@@ -384,7 +384,7 @@ fn to_anthropic_speed(speed: Option<Speed>) -> Option<ASpeed> {
 }
 
 // ---------------------------------------------------------------------------
-// Message conversion (§6.2 "Message conversion")
+// Message conversion
 // ---------------------------------------------------------------------------
 
 /// Convert the unified message log into Anthropic message params,
@@ -473,7 +473,7 @@ fn convert_assistant_message(m: &AssistantMessage) -> MessageParam {
                         thinking: th.thinking.clone(),
                     });
                 } else if !th.thinking.is_empty() {
-                    // Spec §6.2: thinking without a signature (e.g. from
+                    // thinking without a signature (e.g. from
                     // an aborted prior stream) is demoted to plain text on
                     // outgoing requests so the model still has the
                     // context.
@@ -500,20 +500,20 @@ fn convert_assistant_message(m: &AssistantMessage) -> MessageParam {
 }
 
 // ---------------------------------------------------------------------------
-// Public round-trip helpers (`docs/models-spec.md` §1.10, §12 step 11b)
+// Public round-trip helpers
 // ---------------------------------------------------------------------------
 
 /// Project an [`AssistantMessage`] onto the Anthropic Messages request item
 /// shape — the [`MessageParam`] with `role: "assistant"` that gets sent as
 /// part of `messages[]` on a follow-up turn.
 ///
-/// This is the serialize side of the §1.10 round-trip invariant. It is the
+/// This is the serialize side of the round-trip invariant. It is the
 /// same projection the provider uses internally when building a request
 /// body, exposed publicly so the round-trip test suite (and any future
 /// consumer that wants to materialize a single assistant turn into its
 /// wire form without spinning up a full request) can call it directly.
 ///
-/// Behaviour matches the rules in `docs/models-spec.md` §6.2:
+/// Behaviour:
 /// - Text blocks are forwarded verbatim.
 /// - Thinking blocks with a signature ride as `thinking` blocks.
 /// - Redacted thinking blocks ride as `redacted_thinking` with the
@@ -530,11 +530,10 @@ pub fn assistant_message_to_request_item(message: &AssistantMessage) -> MessageP
 /// `messages[]` entry whose role is `assistant` back into a unified
 /// [`AssistantMessage`].
 ///
-/// This is the parse side of the §1.10 round-trip invariant — symmetric to
+/// This is the parse side of the round-trip invariant — symmetric to
 /// the SSE state machine in [`StreamState`], because Anthropic's request
-/// and response content blocks share shapes one-for-one. See
-/// `docs/models-spec.md` §6.2 for the field mapping; the spec rules
-/// preserved here are:
+/// and response content blocks share shapes one-for-one. The field
+/// mapping preserved here is:
 ///
 /// - `text` → [`AssistantContent::Text`].
 /// - `thinking` (with signature) → [`AssistantContent::Thinking`] with
@@ -662,7 +661,7 @@ fn convert_tool_result(t: &ToolResultMessage) -> ContentBlockParam {
 }
 
 // ---------------------------------------------------------------------------
-// System prompt + cache control (§6.2 "Prompt caching")
+// System prompt + cache control
 // ---------------------------------------------------------------------------
 
 fn build_system(
@@ -701,8 +700,8 @@ fn cache_control_for(retention: &CacheRetention, model: &ModelInfo) -> Option<Ca
     }
 }
 
-/// Tag the last content block of the last user message with cache_control
-/// (per spec §6.2). The system prompt's cache marker is set in
+/// Tag the last content block of the last user message with cache_control.
+/// The system prompt's cache marker is set in
 /// [`build_system`].
 fn apply_request_cache_control(
     mut messages: Vec<MessageParam>,
@@ -724,7 +723,7 @@ fn apply_request_cache_control(
 }
 
 // ---------------------------------------------------------------------------
-// Tools / tool choice (§6.2 "Tool choice mapping")
+// Tools / tool choice
 // ---------------------------------------------------------------------------
 
 fn to_anthropic_tool(tool: &ToolDefinition) -> ToolUnion {
@@ -754,14 +753,14 @@ fn to_anthropic_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Opt
             name: name.clone(),
             disable_parallel_tool_use: None,
         }),
-        // Per spec §6.2: omit `tool_choice` entirely when no tools are
+        // Omit `tool_choice` entirely when no tools are
         // defined; the API would reject `{type: "none"}` with no tools.
         Some(ToolChoice::None) => has_tools.then_some(ATC::None),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Thinking config (§6.2 "Thinking/reasoning configuration")
+// Thinking config
 // ---------------------------------------------------------------------------
 
 fn build_thinking(
@@ -928,7 +927,7 @@ fn build_metadata(options: &StreamOptions) -> Option<Metadata> {
 }
 
 // ---------------------------------------------------------------------------
-// SSE → AssistantMessageEvent state machine (§6.2 "Stream event mapping")
+// SSE → AssistantMessageEvent state machine
 // ---------------------------------------------------------------------------
 
 /// Per-block kind, used to route content_block_delta events to the right
@@ -1269,8 +1268,8 @@ impl StreamState {
 
     /// Build the stream's terminal event, classifying a stream that ended
     /// before its wire terminal frame as a retryable truncation error
-    /// (`docs/models-spec.md` §10.3) rather than a successful `Done`.
-    /// Otherwise defers to [`Self::finalize`].
+    /// rather than a successful `Done`. Otherwise defers to
+    /// [`Self::finalize`].
     fn finalize_or_truncate(self) -> AssistantMessageEvent {
         if self.saw_terminal() {
             self.finalize()
@@ -1352,7 +1351,7 @@ impl StreamState {
 }
 
 // ---------------------------------------------------------------------------
-// Usage merging + cost (§6.2 "Usage merging")
+// Usage merging + cost
 // ---------------------------------------------------------------------------
 
 fn into_unified_usage(au: &AUsage) -> Usage {

@@ -40,9 +40,6 @@
 //! `Failed`) still rebuilds because the header glyph changes; the
 //! body is dropped and re-installed in that path too, which is
 //! fine because state changes are rare compared to renders.
-//!
-//! See `docs/aj-next-plan.md` §1.2 (`ToolDetails`) and §4
-//! (`components/tool_execution.rs`).
 
 use std::any::Any;
 use std::sync::Arc;

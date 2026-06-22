@@ -1,20 +1,20 @@
 //! `bash` builtin — execute a command in the system shell.
 //!
-//! Migrated to [`aj_agent::tool::ToolDefinition`] per
-//! `docs/aj-next-plan.md` §2.2. Returns a [`ToolOutcome`] whose
+//! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
+//! [`ToolOutcome`] whose
 //! `details` is [`ToolDetails::Bash`] on completion, carrying a
 //! bounded rolling tail of `stdout` / `stderr`, the process exit code,
 //! a `truncated` flag, an optional `full_output_path` pointing at a
 //! temp file with the complete (un-truncated) capture, and per-stream
 //! [`BashStreamTruncation`] summaries with the line/byte totals
 //! renderers use to compose `[Showing lines X-Y of TOTAL ...]`
-//! markers. The wire `content` keeps the legacy text shape
+//! markers. The wire `content` keeps the text shape
 //! (`<stdout>` then `STDERR:` then `Command failed with exit code: N`)
 //! so the model reads the same transcript it always has, with each
 //! affected stream's marker inserted right after its content when
 //! truncation occurred.
 //!
-//! Per `docs/aj-next-plan.md` §1.2 / §1.8 / §6:
+//! Output handling:
 //!
 //! - **Bounded tail.** Each stream is capped at
 //!   [`crate::truncate::BASH_MAX_BYTES`] / [`crate::truncate::BASH_MAX_LINES`]
@@ -48,8 +48,8 @@
 //!   On Unix we `SIGTERM` the process group, give it a short grace
 //!   period, then escalate to `SIGKILL`; non-Unix builds fall back to
 //!   killing just the immediate child.
-//! - **`Sequential` execution.** `bash` runs arbitrary commands; the
-//!   spec marks it `Sequential` so a batch containing it serializes
+//! - **`Sequential` execution.** `bash` runs arbitrary commands, so it
+//!   runs in `Sequential` mode: a batch containing it serializes
 //!   around any other in-flight tool calls.
 
 use std::path::PathBuf;
@@ -165,7 +165,7 @@ impl ToolDefinition for BashTool {
 
     /// `bash` runs arbitrary commands; serialize a batch containing it
     /// so two shell calls never trample each other or interleave their
-    /// captured output (`docs/aj-next-plan.md` §1.3).
+    /// captured output.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -1231,7 +1231,7 @@ mod tests {
 
     /// Locks in `Sequential` execution mode — bash runs arbitrary
     /// commands and must serialize against any other in-flight tool
-    /// call (`docs/aj-next-plan.md` §1.3).
+    /// call.
     #[test]
     fn execution_mode_is_sequential() {
         assert_eq!(BashTool.execution_mode(), ExecutionMode::Sequential);
@@ -1284,10 +1284,9 @@ mod tests {
     }
 
     /// Non-zero exit code surfaces in both the wire content (the
-    /// legacy "Command failed with exit code: N" line) and the
-    /// structured payload's `exit_code`. Per `docs/aj-next-plan.md` we
-    /// don't mark it as `is_error` — the wire content already carries
-    /// the failure for the model.
+    /// "Command failed with exit code: N" line) and the structured
+    /// payload's `exit_code`. We don't mark it as `is_error` — the wire
+    /// content already carries the failure for the model.
     #[tokio::test]
     async fn nonzero_exit_code_is_not_marked_as_error() {
         let mut ctx = DummyToolContext::default();

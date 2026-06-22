@@ -6,7 +6,7 @@
 //! formats the stdout/stderr/exit-code triple into the line list
 //! the component appends to its scrollback.
 //!
-//! Today the formatting is text-only: each non-empty channel
+//! The formatting is text-only: each non-empty channel
 //! (`stdout`, `stderr`) renders under a one-line dim header, the
 //! per-stream truncation marker (when present) follows the affected
 //! stream, and the exit code goes underneath. Live streaming (the
@@ -14,9 +14,6 @@
 //! snapshot) is wired through the generic component too — this helper
 //! is called for every snapshot, so the on-screen body stays
 //! consistent with the agent's view of the running command.
-//!
-//! See `docs/aj-next-plan.md` §1.2 (`Bash` variant) and §1.3
-//! (tool-update streaming).
 
 use std::path::PathBuf;
 

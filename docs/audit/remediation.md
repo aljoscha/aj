@@ -253,7 +253,7 @@ When presenting a proposal, cover:
 
 ## SWEEP — mechanical, low-risk, batchable
 
-### R18 — Remove comment chronology  [cleanup · TODO]
+### R18 — Remove comment chronology  [cleanup · DONE]
 - **Sources:** every report; `_SUMMARY` theme 8. Strip "previously / used
   to / replaces the old / `docs/aj-next-plan §N` / future PR" framing and
   fix the few now-wrong comments. Batch per crate.
@@ -771,3 +771,32 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   --all-targets` clean. Review nits (vacuous filter assertion, in-memory
   persistence check, em-dash/semicolon comment style) addressed in a
   follow-up commit.
+- 2026-06-22 · R18 · DONE · 61a240d · Stripped comment chronology
+  workspace-wide, with the user broadening scope from just
+  `docs/aj-next-plan.md` to **all** spec-doc mentions. Removed every
+  `docs/*.md` citation in Rust comments (the completed `aj-next-plan.md`
+  migration plan plus the live `models-spec`/`compaction-spec`/
+  `openrouter-spec`/`subagent-observability` design specs, ~137 sites)
+  and the ~337 bare section markers they left behind (`§7.4.3`, `§10.3`,
+  ...), keeping the comment prose self-standing. RFC section refs
+  (`RFC 7231 §7.1.3`) were deliberately kept. Also reworded the
+  code-history chronology the audit named: "Migrated to ... per ...",
+  "Replaces the old", "the legacy `aj` binary / renderer / convention"
+  (kept "legacy logs"/"legacy on-disk shape"/"budget-based (legacy)
+  models" as live data-compat domain terms), "Phase 0/1/2" migration
+  framing, "no longer spawns/injects", "Today the formatting is
+  text-only", "we used to prepend", "an earlier version of the editor",
+  and fixed two now-wrong comments (the dead `[crate::bridge]` rustdoc
+  link in `todo.rs`, and `aj-agent`'s stale "Today the agent never fires
+  [cancellation]" doc, since cancellation is fully wired now). The bare
+  `§` removal was driven by a reviewed regex script (preview + diff
+  review), then the multi-line-reference and dangling-clause artifacts
+  it left were hand-fixed. A fresh-agent review of the full diff caught
+  27 mechanical-strip breakages (dangling "Per"/"as:"/"says", doubled
+  em-dashes, leftover "/", lost sentence objects) plus polish and
+  residual-chronology items, all addressed. Left the orphaned
+  `docs/aj-next-plan.md` file in place (user call: the spec docs are
+  vehicles for implementing changes, fine if unreferenced from code).
+  Comment-only change, no behavior change: `fmt`/`check`/`clippy
+  --workspace --all-targets` clean, full `cargo test --workspace` green
+  (87 binaries). Net 85 files, -116 lines.

@@ -13,8 +13,6 @@
 //! per-phase status of an in-flight compaction — and restores the
 //! default with [`LoaderStatus::reset_message`] when that activity
 //! ends.
-//!
-//! See `docs/aj-next-plan.md` §4 — `components/loader_status.rs`.
 
 use std::any::Any;
 
@@ -24,12 +22,9 @@ use aj_tui::keys::InputEvent;
 use aj_tui::style;
 use aj_tui::tui::RenderHandle;
 
-/// Default working message — kept in sync with the legacy CLI's
-/// `display_loader` so users don't see a different status word
-/// between the two binaries during the Phase 0 → Phase 2 window.
-/// The "(Ctrl+C to cancel)" suffix surfaces the cancellation
-/// affordance per `docs/aj-next-plan.md` §1.8 so users can discover
-/// it without consulting docs.
+/// Default working message. The "(Ctrl+C to cancel)" suffix surfaces
+/// the cancellation affordance so users can discover it without
+/// consulting docs.
 pub fn default_message() -> String {
     format!(
         "Working… ({} to cancel)",

@@ -12,8 +12,6 @@
 //! sites; persistence and projection-to-LLM call sites match
 //! exhaustively on `AgentMessageKind` so any addition forces a
 //! conscious migration.
-//!
-//! See `docs/aj-next-plan.md` §1.4 and §2.0(b).
 
 use aj_models::types::Message;
 use serde::{Deserialize, Serialize};

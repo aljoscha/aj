@@ -18,8 +18,6 @@
 //! - [`compaction`] is the pure planning library for context
 //!   compaction: token estimation, cut-point selection, summary
 //!   prompt templates, and file-op extraction over log entries.
-//!
-//! See `docs/aj-next-plan.md` §1, §2.0(a), and §2.5.
 
 pub mod compaction;
 pub mod listener;

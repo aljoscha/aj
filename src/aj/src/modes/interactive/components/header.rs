@@ -6,12 +6,9 @@
 //! [`Header::set_session_id`] / [`Header::set_notice`] so the
 //! event pump can refresh it as the session evolves.
 //!
-//! The full header (model selector, cost summary,
-//! sandbox banner) lands alongside the "Selectors and theming"
-//! Phase 1 step; this scaffolding gives that work a place to
-//! plug into without changing the layout.
-//!
-//! See `docs/aj-next-plan.md` §4 — `components/header.rs`.
+//! Currently minimal: the full header (model selector, cost summary,
+//! sandbox banner) can plug into this scaffolding without changing the
+//! layout.
 
 use std::any::Any;
 

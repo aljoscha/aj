@@ -8,10 +8,8 @@
 //! get synthetic error results, and incomplete (errored/aborted) turns
 //! are skipped along with their dangling tool results.
 //!
-//! Capability downgrade (§8.2) follows the same call: images on a
+//! Capability downgrade follows the same call: images on a
 //! non-vision target collapse into a fixed placeholder string.
-//!
-//! See `docs/models-spec.md` §8 for the full design.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,7 +20,7 @@ use crate::types::{
 };
 
 // ---------------------------------------------------------------------------
-// §8.2 placeholder strings (publicly observable — downstream consumers may
+// placeholder strings (publicly observable — downstream consumers may
 // match against these exact values)
 // ---------------------------------------------------------------------------
 
@@ -48,18 +46,18 @@ pub const BLOCKED_TOOL_IMAGE_PLACEHOLDER: &str = "(tool image omitted: blocked b
 
 /// Synthetic error text inserted as the body of a tool result when an
 /// assistant tool call has no corresponding `ToolResultMessage` in the
-/// history (§8.1 rule 4).
+/// history (rule 4).
 pub const ORPHAN_TOOL_RESULT_TEXT: &str = "No result provided";
 
 // ---------------------------------------------------------------------------
-// Public API (§8.1)
+// Public API
 // ---------------------------------------------------------------------------
 
 /// Transform a message history so it can be replayed against `target`.
 ///
-/// Applies §8.1 (cross-provider rewrites: thinking blocks, signatures,
-/// tool-call IDs, orphans, errored turns) followed by §8.2 (capability
-/// downgrade: images on non-vision targets).
+/// Applies the cross-provider rewrites (thinking blocks, signatures,
+/// tool-call IDs, orphans, errored turns) followed by the capability
+/// downgrade (images on non-vision targets).
 ///
 /// The function never mutates the input slice; the returned vector
 /// contains owned, freshly-constructed messages.
@@ -84,12 +82,12 @@ pub fn transform_messages(messages: &[Message], target: &ModelInfo) -> Vec<Messa
     // (rule 4).
     let pass2 = align_tool_results(pass1, &id_map);
 
-    // §8.2: downgrade images when the target does not accept image input.
+    // downgrade images when the target does not accept image input.
     downgrade_unsupported_images(pass2, target)
 }
 
 // ---------------------------------------------------------------------------
-// Pass 1: assistant rewrites + tool-call ID normalization (§8.1 rules 2–3)
+// Pass 1: assistant rewrites + tool-call ID normalization (rules 2–3)
 // ---------------------------------------------------------------------------
 
 /// True when `a` was produced by exactly the target model.
@@ -117,7 +115,7 @@ fn signatures_portable(a: &AssistantMessage, target: &ModelInfo) -> bool {
         && a.provider == SIGNATURE_PORTABLE_PROVIDER
 }
 
-/// Apply §8.1 rules 2 and 3 to a single assistant message. Same-model
+/// Apply rules 2 and 3 to a single assistant message. Same-model
 /// messages pass through unchanged so signatures and redacted thinking
 /// survive the round-trip. When the source and target are different models
 /// but signatures remain valid between them (see [`signatures_portable`]),
@@ -208,11 +206,11 @@ fn transform_assistant(
 }
 
 // ---------------------------------------------------------------------------
-// Tool-call ID normalization (§8.1 rule 3, §7.3.5)
+// Tool-call ID normalization (rule 3)
 // ---------------------------------------------------------------------------
 
 /// Rewrite a tool-call ID for `target_api`. `source_provider` controls
-/// the foreign-origin branch for `openai-responses` targets (§7.3.5).
+/// the foreign-origin branch for `openai-responses` targets.
 fn normalize_tool_call_id(target_api: &str, source_provider: &str, id: &str) -> String {
     match target_api {
         "openai-completions" => {
@@ -288,7 +286,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Short stable hash used to rewrite foreign item_ids into the
 /// `fc_<hash>` form Responses requires. FNV-1a over the bytes,
 /// truncated to 12 hex digits — deterministic across runs and
-/// platforms, which is all the spec asks for.
+/// platforms, which is all that's required.
 fn short_hash(s: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -302,7 +300,7 @@ fn short_hash(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: tool-result alignment (§8.1 rules 4–5)
+// Pass 2: tool-result alignment (rules 4–5)
 // ---------------------------------------------------------------------------
 
 /// Walk pass-1 output to:
@@ -392,7 +390,7 @@ fn close_pending(
 }
 
 // ---------------------------------------------------------------------------
-// §8.2 Capability downgrade (images on non-vision models)
+// Capability downgrade (images on non-vision models)
 // ---------------------------------------------------------------------------
 
 fn downgrade_unsupported_images(messages: Vec<Message>, target: &ModelInfo) -> Vec<Message> {
@@ -548,7 +546,7 @@ mod tests {
         Message::ToolResult(ToolResultMessage::text(call_id, name, body, false))
     }
 
-    // -- Same-model passthrough (§8.1 rule 1) ------------------------------
+    // -- Same-model passthrough (rule 1) ------------------------------
 
     #[test]
     fn same_model_preserves_signatures_and_redacted_thinking() {
@@ -613,7 +611,7 @@ mod tests {
         }
     }
 
-    // -- Cross-model thinking handling (§8.1 rule 2) -----------------------
+    // -- Cross-model thinking handling (rule 2) -----------------------
 
     #[test]
     fn anthropic_model_change_preserves_signatures_and_redacted() {
@@ -735,7 +733,7 @@ mod tests {
         }
     }
 
-    // -- Tool call ID normalization (§8.1 rule 3) --------------------------
+    // -- Tool call ID normalization (rule 3) --------------------------
 
     #[test]
     fn anthropic_target_sanitizes_and_truncates() {
@@ -836,7 +834,7 @@ mod tests {
         assert!(!asst_id.contains('|'), "anthropic ids never carry pipes");
     }
 
-    // -- Orphan synthesis (§8.1 rule 4) ------------------------------------
+    // -- Orphan synthesis (rule 4) ------------------------------------
 
     #[test]
     fn orphan_tool_call_gets_synthetic_error_result() {
@@ -901,7 +899,7 @@ mod tests {
         assert!(matches!(out[1], Message::ToolResult(_)));
     }
 
-    // -- Errored / aborted skipping (§8.1 rule 5) --------------------------
+    // -- Errored / aborted skipping (rule 5) --------------------------
 
     #[test]
     fn errored_assistant_dropped_with_its_results() {
@@ -956,7 +954,7 @@ mod tests {
         assert!(matches!(out[0], Message::User(_)));
     }
 
-    // -- Image downgrade (§8.2) --------------------------------------------
+    // -- Image downgrade --------------------------------------------
 
     #[test]
     fn image_downgrade_replaces_runs_with_single_placeholder() {

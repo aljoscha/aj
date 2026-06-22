@@ -8,7 +8,7 @@
 //!
 //! It exercises the same path the binary uses: a `ModelInfo` pointed at
 //! OpenRouter's Responses endpoint, driven through the registered
-//! `openai-responses` provider. See `docs/openrouter-spec.md`.
+//! `openai-responses` provider.
 
 use aj_models::provider::complete_simple;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};

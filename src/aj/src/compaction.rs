@@ -5,8 +5,7 @@
 //! CLI subcommand, and the auto/overflow triggers all call. It locks
 //! the log to plan, runs a bus-silent summarizer inference on the
 //! agent, records a compaction entry, and reseeds the agent's
-//! transcript from the post-compaction projection. See
-//! `docs/compaction-spec.md` §7.1.
+//! transcript from the post-compaction projection.
 
 use std::sync::Arc;
 

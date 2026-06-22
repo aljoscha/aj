@@ -1,7 +1,7 @@
 //! [`clap`]-derived argument parsing for the `aj` binary.
 //!
 //! The `--print` / `--json` toggles select the non-interactive
-//! print mode (§4.2); otherwise the binary runs the interactive
+//! print mode; otherwise the binary runs the interactive
 //! TUI. Subcommands (`list-sessions`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
@@ -85,7 +85,7 @@ pub struct Args {
     pub command: Option<Command>,
 }
 
-/// Output formats supported by print mode (§4.2).
+/// Output formats supported by print mode.
 #[derive(ValueEnum, Copy, Clone, Eq, PartialEq, Debug, Default)]
 #[value(rename_all = "lowercase")]
 pub enum PrintFormat {

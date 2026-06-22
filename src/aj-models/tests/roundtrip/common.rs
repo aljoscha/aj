@@ -120,7 +120,7 @@ fn strip_optional_space(s: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Compare two assistant messages on the fields the round-trip invariant
-/// requires preserving (`docs/models-spec.md` §1.10) and ignore the rest.
+/// requires preserving and ignore the rest.
 ///
 /// Specifically: response metadata (`api`, `provider`, `model`,
 /// `response_id`, `usage`, `timestamp`, `stop_reason`) is *not* a

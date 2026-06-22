@@ -1,6 +1,6 @@
 //! The local HTTP callback server shared by the OAuth provider flows.
 //!
-//! Both the Anthropic (§9.3) and OpenAI (§9.4) flows bind a loopback
+//! Both the Anthropic and OpenAI flows bind a loopback
 //! listener, wait for the browser redirect, validate the `state`
 //! parameter, and answer with a success/error page. The only
 //! provider-specific bits are the callback path and the provider word

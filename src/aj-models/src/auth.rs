@@ -1,4 +1,4 @@
-//! Auth storage & API-key resolution per `docs/models-spec.md` §9.1 / §9.5.
+//! Auth storage & API-key resolution.
 //!
 //! [`AuthStorage`] is the single entry point both the CLI (`aj /login`,
 //! flag plumbing) and the agent (per-request key fetch) hit when they
@@ -15,7 +15,7 @@
 //!   refresh is needed, so the storage layer can mint new access
 //!   tokens without the caller knowing about provider specifics.
 //! - **Resolution chain.** [`AuthStorage::get_api_key`] walks the
-//!   spec §9.1 priority list — runtime override → env vars → stored
+//!   priority list — runtime override → env vars → stored
 //!   API key → stored OAuth (auto-refreshing if expired).
 //!
 //! The on-disk shape is the same `{ "type": "...", ... }` discriminated
@@ -45,7 +45,7 @@ use crate::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
 /// Internally-tagged so the JSON object carries a `"type"` field
 /// alongside the variant's payload. For the OAuth variant the inner
 /// [`OAuthCredentials`] fields are flattened into the same object,
-/// matching the §9.1 disk layout
+/// matching the disk layout
 /// (`{ "type": "oauth", "refresh": ..., "access": ..., "expires": ..., ...extra }`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -158,7 +158,7 @@ impl AuthStorage {
         }
     }
 
-    /// Build a storage at the spec's default location, `~/.aj/auth.json`.
+    /// Build a storage at the default location, `~/.aj/auth.json`.
     ///
     /// Errors if `HOME` isn't set. Doesn't actually create the file —
     /// that happens lazily on first write.
@@ -282,10 +282,10 @@ impl AuthStorage {
     }
 
     /// Resolve a usable bearer token for `provider_id`, walking the
-    /// spec §9.1 priority chain:
+    /// priority chain:
     ///
     /// 1. Runtime override (CLI `--api-key` flag).
-    /// 2. Environment variables (§9.5).
+    /// 2. Environment variables.
     /// 3. Stored API key in `auth.json`.
     /// 4. Stored OAuth tokens — auto-refreshed under the file lock if
     ///    expired.
@@ -306,7 +306,7 @@ impl AuthStorage {
             return Ok(Some(key));
         }
 
-        // 2. Environment variables (§9.5). Per spec, env wins over
+        // 2. Environment variables. Env wins over
         //    `auth.json` so a developer can dev-override stored
         //    credentials for a one-off run without editing the file.
         if let Some(key) = get_env_api_key(provider_id) {
@@ -426,10 +426,9 @@ impl AuthStorage {
 // Default registry / paths
 // ---------------------------------------------------------------------------
 
-/// OAuth providers shipped out of the box, matching the auth section
-/// of the spec (Anthropic Claude Pro/Max in §9.3 → provider id
-/// `"anthropic"`, OpenAI ChatGPT/Codex in §9.4 → provider id
-/// `"openai-codex"`). Per §7.4.1 the Codex flow uses a distinct
+/// OAuth providers shipped out of the box (Anthropic Claude Pro/Max →
+/// provider id `"anthropic"`, OpenAI ChatGPT/Codex → provider id
+/// `"openai-codex"`). The Codex flow uses a distinct
 /// provider id from plain `OPENAI_API_KEY` credentials so the
 /// `chatgpt.com/backend-api` JWT pool never collides with the
 /// `api.openai.com` API-key pool.
@@ -449,17 +448,17 @@ fn default_path() -> Result<PathBuf, AuthError> {
 }
 
 // ---------------------------------------------------------------------------
-// Environment-variable mapping (§9.5)
+// Environment-variable mapping
 // ---------------------------------------------------------------------------
 
 /// Environment variables that can supply an API key for `provider_id`,
 /// in order of preference.
 ///
-/// Per §9.5 we cover four providers today: `"anthropic"`
+/// We cover four providers today: `"anthropic"`
 /// (`ANTHROPIC_OAUTH_TOKEN` then `ANTHROPIC_API_KEY`), `"openai"`
 /// (`OPENAI_API_KEY`), `"openai-codex"` (`OPENAI_CODEX_OAUTH_TOKEN`),
 /// and `"openrouter"` (`OPENROUTER_API_KEY`). The codex var carries a
-/// short-lived JWT minted by the §9.4 OAuth flow; on its own it cannot
+/// short-lived JWT minted by the OAuth flow; on its own it cannot
 /// be refreshed, so persistent use should rely on a stored OAuth
 /// credential rather than this env var. Unknown providers return an
 /// empty slice so callers can treat absence as "no env mapping
@@ -490,7 +489,7 @@ pub fn get_env_api_key(provider_id: &str) -> Option<String> {
 /// empty map so first-run flows don't have to special-case file
 /// creation themselves.
 ///
-/// Applies the §7.4.1 legacy-id migration in-memory before returning:
+/// Applies the legacy-id migration in-memory before returning:
 /// any OAuth-type entry stored under provider id `"openai"` is moved
 /// to `"openai-codex"`, matching the renamed [`OpenAIOAuth`] provider
 /// id. The migration is silent and idempotent — if the destination
@@ -989,7 +988,7 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
-    /// `find_env_keys` mirrors the §9.5 table: anthropic prefers the
+    /// `find_env_keys` mirrors the table: anthropic prefers the
     /// OAuth token env var, then falls back to the API key.
     #[test]
     fn find_env_keys_anthropic_order() {
@@ -1010,8 +1009,8 @@ mod tests {
         assert_eq!(find_env_keys("openrouter"), &["OPENROUTER_API_KEY"]);
     }
 
-    /// The OAuth-only `openai-codex` pool resolves to its own env var
-    /// (per spec §9.5). It deliberately does *not* fall back to
+    /// The OAuth-only `openai-codex` pool resolves to its own env var.
+    /// It deliberately does *not* fall back to
     /// `OPENAI_API_KEY` — a regular OpenAI API key is not accepted
     /// against `chatgpt.com/backend-api`, and a Codex JWT is not
     /// accepted against `api.openai.com`, so leaking either across
@@ -1066,7 +1065,7 @@ mod tests {
     /// Default registry includes Anthropic + OpenAI Codex so out-of-the-box
     /// CLI usage can refresh both. Constructed via `AuthStorage::new`
     /// to exercise the same path embedders use. The OpenAI entry lives
-    /// under `openai-codex` per spec §7.4.1 — the regular `openai`
+    /// under `openai-codex` — the regular `openai`
     /// provider id is reserved for plain `OPENAI_API_KEY` credentials,
     /// which don't need a refresh flow.
     #[tokio::test]
@@ -1090,7 +1089,7 @@ mod tests {
 
     /// A legacy `openai` OAuth entry in `auth.json` is invisibly
     /// migrated to `openai-codex` on read, so a user who logged in
-    /// before the §7.4.1 rename keeps their stored refresh token.
+    /// before the rename keeps their stored refresh token.
     /// `get` against the old id returns `None`; `get` against the
     /// new id returns the migrated credential.
     #[tokio::test]

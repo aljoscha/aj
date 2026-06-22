@@ -1,12 +1,11 @@
 //! `aj` — event-driven core + TUI binary.
 //!
-//! Per `docs/aj-next-plan.md` Phase 1 (§4), this crate hosts the
-//! `aj` binary built on top of `aj-agent`'s typed [`AgentEvent`]
-//! stream and the in-process [`aj-tui`] framework. The same crate
-//! also provides a non-interactive print mode (§4.2) so the agent
-//! can be scripted or embedded in a parent process.
+//! This crate hosts the `aj` binary built on top of `aj-agent`'s
+//! typed [`AgentEvent`] stream and the in-process [`aj-tui`]
+//! framework. The same crate also provides a non-interactive print
+//! mode so the agent can be scripted or embedded in a parent process.
 //!
-//! Structure mirrors the plan's §4 layout:
+//! Structure:
 //!
 //! - [`cli`] — argument parsing and `@file` expansion.
 //! - [`config`] — keybindings, theme, command catalog.

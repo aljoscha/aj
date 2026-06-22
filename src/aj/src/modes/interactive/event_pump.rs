@@ -18,9 +18,6 @@
 //! box's visual representation, so its `ToolExecution*` events are
 //! skipped to avoid duplicating the report.
 //!
-//! See `docs/aj-next-plan.md` §1.1 (event protocol) and §4
-//! (event-pump shape), plus `docs/subagent-observability-spec.md`.
-//!
 //! [`SubAgentBox`]: crate::modes::interactive::components::subagent_box::SubAgentBox
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1375,8 +1372,7 @@ impl EventPump {
     /// Append a dim `Token Usage - ...` row for a freshly-completed
     /// turn into `agent_id`'s transcript. Sub-agents get a leading
     /// `(sub agent N)` tag so their per-turn counts stay
-    /// distinguishable; the format otherwise matches the legacy
-    /// `display_token_usage` line.
+    /// distinguishable.
     fn append_turn_usage(&self, tui: &mut Tui, agent_id: AgentId, usage: &TokenUsage) {
         let line = format_turn_usage_line(agent_id, usage);
         let styled = aj_tui::style::dim(&line);
@@ -1426,10 +1422,10 @@ fn agent_picker_hint() -> String {
 /// so their per-turn counts stand apart from the main agent's.
 /// Visible for testing.
 fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
-    // `format_tokens` keeps the legacy convention: render the
-    // accumulated total bare when the turn contributed nothing
-    // (e.g. a cached read of an existing tool result), or
-    // `acc+turn` so the per-turn delta is visible at a glance.
+    // `format_tokens` renders the accumulated total bare when the turn
+    // contributed nothing (e.g. a cached read of an existing tool
+    // result), or `acc+turn` so the per-turn delta is visible at a
+    // glance.
     let format_tokens = |acc: u64, turn: u64| -> String {
         if turn == 0 {
             format!("{acc}")
@@ -1563,10 +1559,10 @@ mod tests {
 
     #[test]
     fn format_turn_usage_line_drops_turn_part_when_turn_is_zero() {
-        // The legacy renderer hides the `+turn` suffix when the
-        // turn contributed nothing — a cached read of an existing
-        // tool result, for example. Pin that behaviour so we don't
-        // start showing `+0` rows for routine cache hits.
+        // The renderer hides the `+turn` suffix when the turn
+        // contributed nothing — a cached read of an existing tool
+        // result, for example. Pin that behaviour so we don't start
+        // showing `+0` rows for routine cache hits.
         let usage = token_usage([0, 0, 0, 0], [200, 80, 0, 14]);
         let line = format_turn_usage_line(AgentId::Main, &usage);
         assert_eq!(

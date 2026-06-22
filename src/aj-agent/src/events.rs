@@ -10,8 +10,6 @@
 //!
 //! Every variant carries an [`AgentId`] so listeners can route
 //! sub-agent activity into nested transcripts.
-//!
-//! See `docs/aj-next-plan.md` §1.1.
 
 use std::sync::Arc;
 use std::time::Duration;

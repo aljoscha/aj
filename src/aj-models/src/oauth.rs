@@ -1,6 +1,6 @@
 //! OAuth infrastructure shared by all OAuth-capable providers.
 //!
-//! Defines the core trait surface (`docs/models-spec.md` §9.2) without
+//! Defines the core trait surface without
 //! prescribing how any specific provider implements its flow:
 //!
 //! - [`OAuthCredentials`] — what gets persisted on disk after a
@@ -14,7 +14,7 @@
 //!   Object-safe (it lives behind `&dyn` everywhere) so we can build
 //!   a registry of providers and look them up by id.
 //!
-//! Concrete provider flows (Anthropic in §9.3, OpenAI in §9.4) live in
+//! Concrete provider flows (Anthropic and OpenAI) live in
 //! their own submodules. The [`pkce`] submodule provides the
 //! verifier/challenge utilities both flows share, and [`page`] renders
 //! the success/error HTML each provider's local callback server
@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 /// Persisted OAuth tokens for a single provider.
 ///
-/// This type is the wire shape both for `~/.aj/auth.json` (see §9.1)
+/// This type is the wire shape both for `~/.aj/auth.json`
 /// and for return values from [`OAuthProvider::login`] /
 /// [`OAuthProvider::refresh_token`]. Keep it round-trip-safe: any
 /// extra provider-specific fields go in [`OAuthCredentials::extra`]
@@ -56,8 +56,8 @@ pub struct OAuthCredentials {
     /// refresh slightly before this to avoid clock-skew failures.
     pub expires: i64,
     /// Provider-specific fields (e.g. OpenAI's `account_id`). Stored
-    /// flattened into the parent JSON object so the on-disk shape
-    /// matches the §9.1 design (`{ refresh, access, expires, ...extra }`).
+    /// flattened into the parent JSON object so the on-disk shape is
+    /// `{ refresh, access, expires, ...extra }`.
     #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -170,7 +170,7 @@ pub trait OAuthCallbacks: Send + Sync {
 /// Implementations encapsulate everything provider-specific:
 /// authorization URL construction, redirect handling, token exchange,
 /// and refresh. The host code (CLI / agent) only sees the trait
-/// surface, which keeps the auth-storage layer (§9.1) decoupled from
+/// surface, which keeps the auth-storage layer decoupled from
 /// any specific provider's API.
 #[async_trait]
 pub trait OAuthProvider: Send + Sync {
@@ -287,8 +287,8 @@ mod tests {
     use super::*;
 
     /// `OAuthCredentials` must round-trip through serde with the `extra`
-    /// map flattened into the JSON object — the on-disk shape per
-    /// §9.1 is `{ refresh, access, expires, accountId, ... }`, not
+    /// map flattened into the JSON object — the on-disk shape is
+    /// `{ refresh, access, expires, accountId, ... }`, not
     /// `{ refresh, access, expires, extra: { accountId } }`.
     #[test]
     fn credentials_flatten_extra_in_json() {

@@ -2,9 +2,9 @@
 //!
 //! Hosts the unified [`Provider`](crate::provider::Provider)
 //! implementations for the three OpenAI APIs: Chat Completions in
-//! [`provider`] (per `docs/models-spec.md` §7.2), Responses in
-//! [`responses`] (per §7.3), and the Codex Responses variant in
-//! [`codex`] (per §7.4).
+//! [`provider`], Responses in
+//! [`responses`], and the Codex Responses variant in
+//! [`codex`].
 
 pub mod codex;
 pub mod errors;

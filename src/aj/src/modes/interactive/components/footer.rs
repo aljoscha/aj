@@ -10,8 +10,6 @@
 //! percentage) lives entirely inside this component so callers
 //! pass raw data and don't have to know which palette the footer
 //! is rendering against.
-//!
-//! See `docs/aj-next-plan.md` §4 — `components/footer.rs`.
 
 use std::any::Any;
 

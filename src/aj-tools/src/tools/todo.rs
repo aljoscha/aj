@@ -1,7 +1,7 @@
 //! `todo_read` / `todo_write` builtins — session-scoped task list.
 //!
-//! Migrated to [`aj_agent::tool::ToolDefinition`] per
-//! `docs/aj-next-plan.md` §2.2. Both tools return a [`ToolOutcome`]
+//! Implements [`aj_agent::tool::ToolDefinition`]. Both tools return a
+//! [`ToolOutcome`]
 //! whose `details` is [`ToolDetails::Todos`] (the structured snapshot
 //! the UI renders) and whose `content` is a text rendering of the
 //! list (what the LLM reads on the wire). The structured payload
@@ -11,7 +11,7 @@
 //! Validation errors in `todo_write` (more than one in-progress item)
 //! come back as `is_error: true` outcomes with a [`ToolDetails::Text`]
 //! describing the violation, matching the recoverable-error pattern
-//! used by the other migrated tools (see `read_file`, `ls`, `glob`,
+//! used by the other builtin tools (see `read_file`, `ls`, `glob`,
 //! `grep`). The model can correct its call without aborting the turn.
 
 use aj_agent::tool::{ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
@@ -21,19 +21,17 @@ use serde::{Deserialize, Serialize};
 
 // Re-export the canonical todo types from `aj-agent` so external
 // callers (and the new `aj_agent::tool::ToolDetails::Todos` shape)
-// share one definition. The legacy on-disk and wire-schema rendering
+// share one definition. The on-disk and wire-schema rendering
 // is identical: `TodoStatus` uses `kebab-case`, `TodoPriority` uses
 // `lowercase`.
 pub use aj_agent::tool::{TodoItem, TodoPriority, TodoStatus};
 
-/// Render a list of todo items into the human-friendly text shape
-/// the LLM and the legacy CLI both consume.
+/// Render a list of todo items into the human-friendly text shape the
+/// LLM reads on the wire.
 ///
-/// Public so the legacy bridge in [`crate::bridge`] can use the same
-/// output when rendering [`ToolDetails::Todos`] through the existing
-/// `display_tool_result` channel; once the bus drives rendering
-/// (§2.3+), this helper stays here as the canonical text projection
-/// for the wire content.
+/// This is the canonical text projection for both tools' wire
+/// `content`; the structured [`ToolDetails::Todos`] snapshot drives
+/// rendering.
 pub fn format_todo_list(todos: &[TodoItem]) -> String {
     if todos.is_empty() {
         return "TODO list is empty.".to_string();

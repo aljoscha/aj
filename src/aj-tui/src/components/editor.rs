@@ -2264,10 +2264,10 @@ impl Editor {
         self.autocomplete_task = None;
     }
 
-    /// Kick off an async autocomplete request. Replaces the old
-    /// inline synchronous call: this bumps the request id, cancels
-    /// any prior request, snapshots the buffer, and spawns a worker
-    /// that calls into the provider via `tokio::spawn`. The worker
+    /// Kick off an async autocomplete request: this bumps the request
+    /// id, cancels any prior request, snapshots the buffer, and spawns
+    /// a worker that calls into the provider via `tokio::spawn`. The
+    /// worker
     /// delivers results through `autocomplete_tx` and wakes the
     /// driver with `autocomplete_render_handle`.
     ///

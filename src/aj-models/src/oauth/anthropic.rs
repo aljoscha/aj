@@ -1,4 +1,4 @@
-//! Anthropic OAuth flow (Claude Pro/Max), per `docs/models-spec.md` §9.3.
+//! Anthropic OAuth flow (Claude Pro/Max).
 //!
 //! Authorization Code + PKCE. The high-level flow:
 //!
@@ -33,7 +33,7 @@
 //!
 //! The flow exposes itself both as a free-function API (good for
 //! ad-hoc CLI use and tests) and behind the [`OAuthProvider`] trait
-//! (for the auth-storage layer in §9.1, which keys by provider id).
+//! (for the auth-storage layer which keys by provider id).
 //!
 //! The local callback server, manual-paste parsing, and token-endpoint
 //! plumbing are shared with the OpenAI flow via [`super::callback`],
