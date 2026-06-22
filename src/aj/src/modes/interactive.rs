@@ -6349,7 +6349,7 @@ mod run_loop_tests {
     /// auth / catalog loads, which the tests inject).
     async fn build_harness(run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>) -> RunLoopHarness {
         // The chord interceptions look up the process-global
-        // keybindings manager; install the defaults so the `aj.*`
+        // keybindings manager. Install the defaults so the `aj.*`
         // actions resolve. Idempotent across tests (serialized below).
         crate::config::keybindings::install_global_manager_defaults();
 
@@ -6378,7 +6378,7 @@ mod run_loop_tests {
         let vt = VirtualTerminal::new(COLS, ROWS);
         let input = vt.input_sender();
         let mut tui = Tui::new(Box::new(vt));
-        // No bootstrap render; the loop renders on demand. `start`
+        // No bootstrap render, the loop renders on demand. `start`
         // takes the terminal's synthetic-input stream so `next_event`
         // sees keys pushed through `input`.
         tui.set_initial_render(false);
@@ -6421,7 +6421,7 @@ mod run_loop_tests {
         let run_config = scripted_run_config(vec![finalized_text_message("scripted reply here")]);
         let mut h = build_harness(run_config).await;
 
-        // The loop drains the turn and parks; auto-advance then fires
+        // The loop drains the turn and parks. Auto-advance then fires
         // this sleep and the resulting Ctrl+C is read while idle.
         let input = h.input.clone();
         let feeder = tokio::spawn(async move {
@@ -6443,10 +6443,17 @@ mod run_loop_tests {
             "assistant reply rendered:\n{chat}"
         );
 
-        // The turn reached disk: the resumed log has a user-thread leaf.
-        let log = h.world.log.lock().await;
+        // The turn reached disk: re-resume the session from its
+        // persistence root and confirm the log has a user-thread leaf.
+        // The persistence listener flushes `Message` entries on write,
+        // so a fresh resume sees the turn even with the world still live.
+        let resumed = aj_session::ConversationLog::resume(
+            &h.shell.conversation_persistence,
+            &h.world.session_id,
+        )
+        .expect("resume the written log");
         assert!(
-            log.latest_leaf(ThreadFilter::USER).is_some(),
+            resumed.latest_leaf(ThreadFilter::USER).is_some(),
             "the driven turn was persisted"
         );
     }

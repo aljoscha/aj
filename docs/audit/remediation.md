@@ -734,13 +734,14 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   the turn's bus events and gone idle, so a feeder task whose `sleep`
   gates the quit key provably fires *after* the turn has fully rendered
   (no wall-clock waits, no biased-select race against the still-draining
-  event arm). Three cases: a full scripted turn auto-submits via
+  event arm). Three cases. (1) A full scripted turn auto-submits via
   `launch_content`, streams a reply through the loop into the chat, and
-  an idle Ctrl+C quits (plus the turn round-tripped to disk); a bare
-  Ctrl+C quits when idle; and a mid-turn Ctrl+C (provider parked on a
+  an idle Ctrl+C quits (plus the turn round-tripped to disk). (2) A bare
+  Ctrl+C quits when idle. (3) A mid-turn Ctrl+C (provider parked on a
   long delay) cancels the in-flight turn, renders "Turn cancelled.",
   drops the would-be reply, and the still-live loop accepts a second
-  Ctrl+C to quit — the direct R2/A3 lost-cancellation regression.
+  Ctrl+C to quit. Case (3) is the direct R2/A3 lost-cancellation
+  regression.
   Chose `run_session` over `InteractiveMode::run` as the seam because
   `run` does process-global I/O (real `~/.aj`, `ProcessTerminal`) while
   `run_session` is where the consequential control flow lives and takes
@@ -755,9 +756,18 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   write to the injected sink. Two `start_paused` tests drive the
   `streaming-text` scripted demo through `run_inner` with a captured
   buffer: text mode asserts the final assistant text and that the turn
-  persisted; json mode asserts one valid JSON object per line, the
-  assistant text on the stream, and `ToolExecutionUpdate` filtered.
-  No production behavior change beyond routing output through a sink the
-  default caller fills with stdout. Tests run deterministically across
-  repeated runs; `cargo test -p aj` green (443 lib + integration),
-  `fmt`/`clippy --workspace --all-targets` clean.
+  persisted (via a disk resume); json mode asserts one valid JSON object
+  per line and the assistant text on the stream. The
+  `ToolExecutionUpdate` filter is covered by its own unit test feeding
+  synthetic events through `json_event_listener` (the `streaming-text`
+  demo emits no tool updates, so asserting absence in the driven test
+  would be vacuous). The one production behavior change is that the
+  `run`-side dependency resolution (including `get_sessions_dir_path`'s
+  directory creation) now runs before `run_inner`'s argument validation,
+  so a no-prompt misuse opens the credential store and creates the
+  sessions dir before erroring (happy path unaffected, documented on
+  `run`). Tests run deterministically across repeated runs. `cargo test
+  -p aj` green (444 lib + integration), `fmt`/`clippy --workspace
+  --all-targets` clean. Review nits (vacuous filter assertion, in-memory
+  persistence check, em-dash/semicolon comment style) addressed in a
+  follow-up commit.

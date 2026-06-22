@@ -71,12 +71,18 @@ use crate::session_setup::{
 
 /// Drive a single print-mode run from `args`.
 ///
-/// Resolves the process-global inputs — `config.toml` (with any
-/// diagnostics surfaced to stderr), the credential store, the sessions
-/// directory, the process working directory, and stdout as the output
-/// sink — then delegates the actual run to [`run_inner`]. Keeping that
-/// resolution here lets [`run_inner`] take every dependency by value so
-/// it is drivable headlessly in tests with a captured sink.
+/// Resolves the process-global inputs and delegates the run to
+/// [`run_inner`]. Those inputs are `config.toml` (with any diagnostics
+/// surfaced to stderr), the credential store, the sessions directory,
+/// the process working directory, and stdout as the output sink.
+/// Keeping resolution here lets [`run_inner`] take every dependency by
+/// value, so it is drivable headlessly in tests with a captured sink.
+///
+/// NOTE: this resolution runs before `run_inner`'s argument validation,
+/// and `get_sessions_dir_path` creates the sessions directory. So a
+/// misuse such as `aj --print` with no prompt now opens the credential
+/// store and creates that directory before erroring. The happy path is
+/// unaffected.
 pub async fn run(args: Args) -> Result<()> {
     // Load config.toml first (lowest priority). Missing or invalid
     // config falls back to defaults so a one-shot `aj --print`
@@ -500,8 +506,12 @@ fn print_final_assistant_text<W: Write>(agent: &Agent, out: &Arc<Mutex<W>>) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use aj_models::auth::AuthStorage;
+    use aj_session::ConversationLog;
     use clap::Parser;
+    use tempfile::TempDir;
+
+    use super::*;
 
     /// Parse a CLI string into [`Args`] the same way `main.rs` does
     /// at startup. Convenient for tests that exercise the dispatch
@@ -609,12 +619,6 @@ mod tests {
     // `start_paused` makes the demo's per-chunk sleeps auto-advance, so
     // the turn completes instantly with no wall-clock waits.
 
-    use std::sync::Mutex;
-
-    use aj_models::auth::AuthStorage;
-    use aj_session::ConversationLog;
-    use tempfile::TempDir;
-
     /// A substring of the `streaming-text` demo's canned reply, stable
     /// regardless of how the text is chunked across deltas.
     const DEMO_REPLY_FRAGMENT: &str = "plain text-only demo";
@@ -689,16 +693,54 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(line)
                 .unwrap_or_else(|e| panic!("each line is a JSON object ({e}): {line:?}"));
         }
-        // The high-frequency transient progress frames are filtered from
-        // the structured stream.
-        assert!(
-            !out.contains("tool_execution_update"),
-            "ToolExecutionUpdate frames are excluded:\n{out}"
-        );
         // The assistant reply rode the event stream.
         assert!(
             out.contains(DEMO_REPLY_FRAGMENT),
             "assistant text present in the json stream:\n{out}"
+        );
+    }
+
+    /// The JSONL listener drops `ToolExecutionUpdate` (a high-frequency
+    /// transient progress frame) but serializes every other event as one
+    /// line. The driven `streaming-text` demo emits no tool updates, so
+    /// the filter is exercised directly here against synthetic events.
+    #[tokio::test]
+    async fn json_listener_drops_tool_execution_update_and_passes_other_events() {
+        use aj_agent::events::AgentId;
+        use aj_agent::tool::ToolDetails;
+
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let listener = json_event_listener(Arc::clone(&sink));
+
+        let update = AgentEvent::ToolExecutionUpdate {
+            agent_id: AgentId::Main,
+            call_id: "call-1".to_string(),
+            tool: "bash".to_string(),
+            args: serde_json::Value::Null,
+            partial: ToolDetails::Text {
+                summary: "running".to_string(),
+                body: String::new(),
+            },
+            content: Arc::from(Vec::<aj_models::types::UserContent>::new()),
+        };
+        listener(&update).await.expect("listener ran");
+        assert!(
+            sink.lock().expect("sink poisoned").is_empty(),
+            "ToolExecutionUpdate is filtered from the structured stream"
+        );
+
+        let notice = AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: "hello".to_string(),
+        };
+        listener(&notice).await.expect("listener ran");
+        let out = String::from_utf8(sink.lock().expect("sink poisoned").clone())
+            .expect("sink holds valid utf-8");
+        assert!(out.contains("hello"), "ordinary event written:\n{out}");
+        assert_eq!(
+            out.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "exactly one line written (the update produced none):\n{out}"
         );
     }
 }
