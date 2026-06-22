@@ -35,7 +35,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::StreamExt;
 use tokio::sync::mpsc;
@@ -976,7 +976,6 @@ pub struct Tui {
     /// clear. Updated to the new frame's IDs at the end of every
     /// render.
     previous_kitty_image_ids: std::collections::HashSet<u32>,
-    last_render_time: Option<StdInstant>,
     render_requested: bool,
     /// Set by [`Tui::force_full_render`] / [`Tui::request_full_render`]
     /// to flag that the next `render` call must clear the screen before
@@ -1138,7 +1137,6 @@ impl Tui {
             max_lines_rendered: 0,
             previous_viewport_top: 0,
             previous_kitty_image_ids: std::collections::HashSet::new(),
-            last_render_time: None,
             render_requested: false,
             pending_full_clear: false,
             scorched_earth_pending: false,
@@ -1824,7 +1822,6 @@ impl Tui {
         self.previous_lines = lines;
         self.previous_width = current_width;
         self.previous_height = current_height;
-        self.last_render_time = Some(StdInstant::now());
         self.render_requested = false;
 
         // Refresh the Kitty placement registry from the frame
@@ -1861,14 +1858,6 @@ impl Tui {
                 new_lines_snapshot,
             };
             record.append_to(&path);
-        }
-    }
-
-    /// Check if enough time has elapsed since the last render for a new one.
-    pub fn should_render(&self) -> bool {
-        match self.last_render_time {
-            None => true,
-            Some(t) => t.elapsed() >= MIN_RENDER_INTERVAL,
         }
     }
 

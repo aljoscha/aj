@@ -221,7 +221,7 @@ When presenting a proposal, cover:
   a feature we want. If yes, wire the runtime emit; if no, remove all three
   layers. Either way it's one coherent change, not three.
 
-### R14 — Remove dead declared surface  [cleanup · TODO]
+### R14 — Remove dead declared surface  [cleanup · PROPOSED]
 - **Sources:** AG1, T1, A1, A2, A3; `_SUMMARY` theme 4.
 - **Problem:** never-emitted events (`TurnEnd`/`QueueUpdate`), always-empty
   `AgentEnd.messages`, six dead `Terminal` trait methods, empty doc-only
