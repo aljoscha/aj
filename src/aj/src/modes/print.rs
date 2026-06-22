@@ -623,14 +623,12 @@ mod tests {
     /// regardless of how the text is chunked across deltas.
     const DEMO_REPLY_FRAGMENT: &str = "plain text-only demo";
 
-    /// Drive `run_inner` for `cli` (which must select the scripted demo)
-    /// against fresh tempdir-backed dependencies, returning the captured
-    /// output and the persistence handle for on-disk assertions.
-    async fn drive(cli: &[&str]) -> (String, ConversationPersistence, TempDir) {
-        let sessions = TempDir::new().expect("sessions tempdir");
+    /// Drive `run_inner` for `cli` (which must select the scripted
+    /// demo) against `persistence` and fresh tempdir auth / cwd,
+    /// returning the captured output sink as a string.
+    async fn run_capture(persistence: &ConversationPersistence, cli: &[&str]) -> String {
         let auth_dir = TempDir::new().expect("auth tempdir");
         let cwd = TempDir::new().expect("cwd tempdir");
-        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
         let auth = AuthStorage::new(auth_dir.path().join("auth.json"));
         let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
 
@@ -645,10 +643,18 @@ mod tests {
         .await
         .expect("print run completes");
 
-        let out = String::from_utf8(sink.lock().expect("sink poisoned").clone())
-            .expect("sink holds valid utf-8");
-        // Keep `sessions` alive (returned) so the persisted log outlives
-        // the assertions; `auth_dir`/`cwd` may drop here.
+        String::from_utf8(sink.lock().expect("sink poisoned").clone())
+            .expect("sink holds valid utf-8")
+    }
+
+    /// Drive `run_inner` against a fresh session store, returning the
+    /// captured output plus the persistence handle and its backing
+    /// tempdir (returned so the persisted log outlives on-disk
+    /// assertions).
+    async fn drive(cli: &[&str]) -> (String, ConversationPersistence, TempDir) {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let out = run_capture(&persistence, cli).await;
         (out, persistence, sessions)
     }
 
@@ -694,6 +700,69 @@ mod tests {
                 .unwrap_or_else(|e| panic!("each line is a JSON object ({e}): {line:?}"));
         }
         // The assistant reply rode the event stream.
+        assert!(
+            out.contains(DEMO_REPLY_FRAGMENT),
+            "assistant text present in the json stream:\n{out}"
+        );
+    }
+
+    /// Resuming a session in JSON mode drains the persisted history
+    /// through the JSON sink before the new turn's events, so a consumer
+    /// sees the full trace in emit order. This is print's most intricate
+    /// resume-specific seam (the replay-before-subscribe block).
+    #[tokio::test(start_paused = true)]
+    async fn json_resume_replays_history_before_the_new_turn() {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+
+        // First session: a text-mode turn that persists the user prompt
+        // plus the demo reply. Its output goes nowhere we assert on.
+        let _ = run_capture(
+            &persistence,
+            &[
+                "--print",
+                "--scripted",
+                "streaming-text",
+                "alpha-history-marker",
+            ],
+        )
+        .await;
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("first session was persisted");
+
+        // Resume it in JSON mode with a new prompt. The historical events
+        // replay first, then the live turn runs.
+        let out = run_capture(
+            &persistence,
+            &[
+                "--print",
+                "--format",
+                "json",
+                "--scripted",
+                "streaming-text",
+                "continue",
+                id.as_str(),
+                "beta-live-marker",
+            ],
+        )
+        .await;
+
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("each line is a JSON object ({e}): {line:?}"));
+        }
+        let history = out
+            .find("alpha-history-marker")
+            .expect("the persisted history was replayed");
+        let live = out
+            .find("beta-live-marker")
+            .expect("the new turn's prompt was emitted");
+        assert!(
+            history < live,
+            "history replays before the new turn:\n{out}"
+        );
         assert!(
             out.contains(DEMO_REPLY_FRAGMENT),
             "assistant text present in the json stream:\n{out}"
