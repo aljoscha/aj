@@ -187,6 +187,14 @@ pub struct EventPump {
     /// mutates them (the TUI input handlers and the agent do). See
     /// [`Self::sync_pending`].
     message_queues: MessageQueues,
+    /// Whether the OS progress indicator (taskbar / window badge) is
+    /// currently lit. Tracks the main agent's busy state
+    /// (`running_agents.contains(&AgentId::Main)`). Kept here so
+    /// [`Self::sync_progress`] only emits an escape on the
+    /// idle<->busy edge. `set_progress(false)` re-emits its clear
+    /// sequence on every call, so without this gate every sub-agent
+    /// end would needlessly clear an already-off indicator.
+    progress_active: bool,
 }
 
 impl EventPump {
@@ -222,6 +230,7 @@ impl EventPump {
             footer_data: AgentFooters::new(main_settings, main_context_window),
             catalog,
             message_queues,
+            progress_active: false,
         }
     }
 
@@ -281,6 +290,20 @@ impl EventPump {
             footer.set_agent_activity(activity);
         }
         tui.request_render();
+    }
+
+    /// Reflect the main agent's busy state on the terminal's OS
+    /// progress indicator. Lit while [`AgentId::Main`] is running,
+    /// cleared when it goes idle. Scoped to the main agent only
+    /// (unlike the view-scoped spinner and the sub-aggregate footer
+    /// indicator), so background sub-agents don't drive it. Emits an
+    /// escape only on the busy<->idle edge.
+    fn sync_progress(&mut self, tui: &mut Tui) {
+        let active = self.running_agents.contains(&AgentId::Main);
+        if active != self.progress_active {
+            self.progress_active = active;
+            tui.terminal_mut().set_progress(active);
+        }
     }
 
     /// Record `id`'s next-turn settings (and context-window
@@ -498,6 +521,7 @@ impl EventPump {
         }
         self.sync_loader(tui);
         self.sync_agent_indicator(tui);
+        self.sync_progress(tui);
     }
 
     /// Dispatch one [`AgentEvent`] onto `tui`'s slot tree. Returns
@@ -529,6 +553,7 @@ impl EventPump {
                 }
                 self.sync_loader(tui);
                 self.sync_agent_indicator(tui);
+                self.sync_progress(tui);
             }
             AgentEvent::AgentEnd { agent_id, .. } => {
                 self.running_agents.remove(agent_id);
@@ -548,6 +573,7 @@ impl EventPump {
                 }
                 self.sync_loader(tui);
                 self.sync_agent_indicator(tui);
+                self.sync_progress(tui);
             }
             AgentEvent::TurnStart { agent_id } => {
                 // Each new turn starts with a fresh assistant
@@ -1446,6 +1472,7 @@ mod tests {
     use aj_agent::events::AgentSettings;
     use aj_tui::component::Component;
     use aj_tui::terminal::ProcessTerminal;
+    use aj_tui_testkit::VirtualTerminal;
 
     use crate::config::theme::{ChatTheme, ThemeHandle, chat_theme};
     use crate::modes::interactive::layout::build_layout;
@@ -1620,6 +1647,68 @@ mod tests {
             queues,
         );
         (tui, pump)
+    }
+
+    /// Build a `Tui` + `EventPump` backed by a [`VirtualTerminal`]
+    /// whose shared handle is returned so a test can assert on the
+    /// OS progress indicator the pump drives.
+    fn fresh_tui_with_virtual_terminal() -> (aj_tui::tui::Tui, EventPump, VirtualTerminal) {
+        let terminal = VirtualTerminal::new(80, 24);
+        let mut tui = aj_tui::tui::Tui::new(Box::new(terminal.clone()));
+        let theme = ThemeHandle::new(crate::config::theme::Theme::bundled_dark());
+        build_layout(&mut tui, &theme, true);
+        let pump = EventPump::new(
+            chat_theme(&theme, true),
+            RenderSettings::new(false, false, true),
+            main_settings(),
+            200_000,
+            Arc::new(Vec::new()),
+            MessageQueues::default(),
+        );
+        (tui, pump, terminal)
+    }
+
+    /// The OS progress indicator tracks the *main* agent's busy
+    /// state: lit on `AgentStart(Main)`, cleared on `AgentEnd(Main)`,
+    /// and unmoved by sub-agent lifecycle in between.
+    #[test]
+    fn progress_indicator_tracks_main_agent_busy_state() {
+        let (mut tui, mut pump, terminal) = fresh_tui_with_virtual_terminal();
+        assert!(!terminal.is_progress_active(), "starts cleared");
+
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        assert!(terminal.is_progress_active(), "lit while main runs");
+
+        // A sub-agent starting and finishing must not move it while
+        // the main agent is still busy.
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert!(terminal.is_progress_active(), "still lit: main runs");
+
+        pump.handle(
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+        assert!(!terminal.is_progress_active(), "cleared when main idles");
     }
 
     fn render_pending(tui: &mut aj_tui::tui::Tui) -> Vec<String> {

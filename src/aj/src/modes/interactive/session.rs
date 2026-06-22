@@ -60,6 +60,10 @@ pub enum SessionEntry {
     Switch,
 }
 
+/// The application name shown in the header notice and the terminal
+/// window title.
+const APP_TITLE: &str = "AJ";
+
 /// The header notice announced when a world is installed. The
 /// wording depends on both how the log was obtained (create vs.
 /// resume) and whether this is the process's first session.
@@ -68,7 +72,7 @@ fn header_notice(spec: &SessionSpec) -> String {
         SessionSpec::Create {
             entry: SessionEntry::Startup,
         } => format!(
-            "Chat with AJ — {} to quit",
+            "Chat with {APP_TITLE} — {} to quit",
             crate::config::keybindings::fixed_keys::CTRL_C
         ),
         SessionSpec::Create {
@@ -321,7 +325,26 @@ impl SessionWorld {
             header.set_session_id(Some(self.session_id.clone()));
             header.set_notice(Some(header_notice(spec)));
         }
+        tui.terminal_mut().set_title(&self.window_title());
         tui.request_render();
+    }
+
+    /// Terminal window title: `"<APP_TITLE> - <session id> - <cwd
+    /// basename>"`, falling back to `"<APP_TITLE> - <cwd basename>"`
+    /// when the session id is empty. Refreshed by [`Self::install`],
+    /// so a session switch retitles the window.
+    fn window_title(&self) -> String {
+        let cwd = self
+            .env
+            .working_directory
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if self.session_id.is_empty() {
+            format!("{APP_TITLE} - {cwd}")
+        } else {
+            format!("{APP_TITLE} - {} - {cwd}", self.session_id)
+        }
     }
 
     /// Overwrite each replayed sub-agent's footer entry with the
