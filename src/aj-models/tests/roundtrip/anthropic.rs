@@ -343,8 +343,8 @@ fn semantic_roundtrip_redacted_thinking() {
 // Unlike the happy-path trio, an errored or truncated turn is never
 // serialized back into a request item (the agent retries or surfaces the
 // error instead), so these scenarios only assert the terminal
-// classification the adapter produces — `stop_reason` plus
-// `error.category` — and that any partial content accumulated before the
+// classification the adapter produces (`stop_reason` plus
+// `error.category`) and that any partial content accumulated before the
 // failure survives. They pin the §10.3 error legs against captured wire
 // fixtures rather than hand-built events, the same way the happy path is
 // pinned.

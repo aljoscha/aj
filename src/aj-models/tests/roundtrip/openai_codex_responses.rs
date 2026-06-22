@@ -383,6 +383,13 @@ fn replay_fixture(scenario: &str) -> AssistantMessage {
     replay_sse_events(&fixture_model(), load_sse(scenario), None)
 }
 
+fn first_text(msg: &AssistantMessage) -> &str {
+    match msg.content.first() {
+        Some(AssistantContent::Text(t)) => &t.text,
+        other => panic!("expected leading Text block, got {other:?}"),
+    }
+}
+
 #[test]
 fn truncated_stream_is_transient_error() {
     // A stream that ends before any terminal lifecycle event is a
@@ -394,10 +401,7 @@ fn truncated_stream_is_transient_error() {
         parsed.error.as_ref().map(|e| e.category),
         Some(ErrorCategory::Transient)
     );
-    match parsed.content.first() {
-        Some(AssistantContent::Text(t)) => assert_eq!(t.text, "This answer was cut o"),
-        other => panic!("expected preserved partial text, got {other:?}"),
-    }
+    assert_eq!(first_text(&parsed), "This answer was cut o");
 }
 
 #[test]
@@ -407,7 +411,10 @@ fn error_frame_is_classified_error() {
     // finalizes with the classified category. NOTE: unlike the public
     // Responses adapter, the Codex error path discards the partial
     // content accumulated so far (the M4 "divergent terminal-error
-    // handling" finding); this asserts that current behavior.
+    // handling" finding); this asserts that current behavior. The
+    // companion `truncated_stream_is_transient_error` test shows the same
+    // leading delta survives on the non-error path, so the emptiness here
+    // is a real drop, not a fixture that never accumulated content.
     let parsed = replay_fixture("error_frame");
     assert_eq!(parsed.stop_reason, StopReason::Error);
     assert_eq!(

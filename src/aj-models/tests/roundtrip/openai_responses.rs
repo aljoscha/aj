@@ -337,7 +337,7 @@ fn truncated_stream_is_transient_error() {
 #[test]
 fn incomplete_length_is_clean_done() {
     // §7.3.8: a `response.incomplete` with `incomplete_details.reason:
-    // max_output_tokens` is a *length cutoff* — a clean `Done(Length)`,
+    // max_output_tokens` is a *length cutoff*, a clean `Done(Length)` and
     // not an error. This is the positive control that distinguishes a
     // real length stop from a transport truncation.
     let parsed = replay_fixture("incomplete_length");

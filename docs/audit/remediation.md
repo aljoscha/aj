@@ -720,4 +720,4 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   partial (the M4 divergent-terminal-handling Minor), and a streamed
   `response.failed` carrying a bare `server_error` (no HTTP status on the
   SSE frame) lands in `Unknown`, not `Transient`. `cargo test -p aj-models
-  --test roundtrip` green (60, +11); `fmt`/`check`/`clippy --tests` clean.
+  --test roundtrip` green (60, +10); `fmt`/`check`/`clippy --tests` clean.
