@@ -246,7 +246,7 @@ When presenting a proposal, cover:
 - **Problem:** roundtrip suites are happy-path only; the R1 truncation bug
   lives in a path no fixture touches.
 
-### R17 — Test the interactive `run` loop and a print full-turn  [test · TODO]
+### R17 — Test the interactive `run` loop and a print full-turn  [test · DONE]
 - **Sources:** A3, A5; `_SUMMARY` theme 7. Depends on R12.
 - **Problem:** the ~1150-line interactive `run` loop has no test; the one
   integration test never enters `run`.
@@ -721,3 +721,43 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   `response.failed` carrying a bare `server_error` (no HTTP status on the
   SSE frame) lands in `Unknown`, not `Transient`. `cargo test -p aj-models
   --test roundtrip` green (60, +10); `fmt`/`check`/`clippy --tests` clean.
+- 2026-06-22 · R17 · DONE · 4ea8dbd · Added the binary's first tests
+  that *enter* its two most defect-prone seams: the interactive
+  per-session select loop and the print turn driver. **Interactive
+  (the Major):** a `run_loop_tests` module builds a real `Shell` +
+  `SessionWorld` around a headless `aj-tui-testkit` `VirtualTerminal`
+  and drives `run_session` to completion, asserting on the rendered
+  chat scrollback (the `ChatView` slot, same read path as
+  `replay_parity`) and the returned `SessionExit`. Determinism comes
+  from `#[tokio::test(start_paused = true)]`: tokio auto-advances the
+  clock only once every task is parked, i.e. once the loop has drained
+  the turn's bus events and gone idle, so a feeder task whose `sleep`
+  gates the quit key provably fires *after* the turn has fully rendered
+  (no wall-clock waits, no biased-select race against the still-draining
+  event arm). Three cases: a full scripted turn auto-submits via
+  `launch_content`, streams a reply through the loop into the chat, and
+  an idle Ctrl+C quits (plus the turn round-tripped to disk); a bare
+  Ctrl+C quits when idle; and a mid-turn Ctrl+C (provider parked on a
+  long delay) cancels the in-flight turn, renders "Turn cancelled.",
+  drops the would-be reply, and the still-live loop accepts a second
+  Ctrl+C to quit — the direct R2/A3 lost-cancellation regression.
+  Chose `run_session` over `InteractiveMode::run` as the seam because
+  `run` does process-global I/O (real `~/.aj`, `ProcessTerminal`) while
+  `run_session` is where the consequential control flow lives and takes
+  injected state. Session swap/new stays covered at the seam level
+  (`build_next_world*` + selector-outcome tests), not re-driven through
+  the brittle palette-navigation path. **Print (the Minor):** extracted
+  a testable `run_inner` from `print::run` taking the config, auth
+  store, persistence, cwd, and an `Arc<Mutex<W>>` output sink by value;
+  `run` keeps the process-global resolution (`Config::load`,
+  `AuthStorage::at_default_path`, sessions dir, cwd, stdout) and
+  delegates. `json_event_listener`/`print_final_assistant_text` now
+  write to the injected sink. Two `start_paused` tests drive the
+  `streaming-text` scripted demo through `run_inner` with a captured
+  buffer: text mode asserts the final assistant text and that the turn
+  persisted; json mode asserts one valid JSON object per line, the
+  assistant text on the stream, and `ToolExecutionUpdate` filtered.
+  No production behavior change beyond routing output through a sink the
+  default caller fills with stdout. Tests run deterministically across
+  repeated runs; `cargo test -p aj` green (443 lib + integration),
+  `fmt`/`clippy --workspace --all-targets` clean.
