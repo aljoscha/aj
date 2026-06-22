@@ -221,7 +221,7 @@ When presenting a proposal, cover:
   a feature we want. If yes, wire the runtime emit; if no, remove all three
   layers. Either way it's one coherent change, not three.
 
-### R14 — Remove dead declared surface  [cleanup · PROPOSED]
+### R14 — Remove dead declared surface  [cleanup · DONE]
 - **Sources:** AG1, T1, A1, A2, A3; `_SUMMARY` theme 4.
 - **Problem:** never-emitted events (`TurnEnd`/`QueueUpdate`), always-empty
   `AgentEnd.messages`, six dead `Terminal` trait methods, empty doc-only
@@ -634,3 +634,41 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   sites reference the single `UPDATE_DEBOUNCE` constant, can't drift; the
   "skip snapshot when no sink" optimization is moot now the production
   wrapper always consumes).
+- 2026-06-19 · R14 · DONE · 8bd98b8,8250e29,3bedb89,0747a0b,58d8e87,c4b4081
+  · Comparing each flagged item against the reference reframed the
+  finding: most "dead surface" was not invented cruft but **unfinished
+  ports** of real reference contract, so the call (with the user) was to
+  *finish the ports*, not delete. Split into six commits. **Genuinely
+  dead AJ-only scaffolding, deleted:** the empty doc-only `persistence.rs`
+  / interactive `keys.rs` modules, the producer-less
+  `CommandAction::NotYetImplemented`, and `Tui::should_render` +
+  `last_render_time` (no caller, and keyed on the wrong interval). **Real
+  reference features we'd declared but never wired, now finished:** (a)
+  `TurnEnd` is the reference's `turn_end {message, toolResults}` and
+  `AgentEnd.messages` its `agent_end {messages}` — both load-bearing
+  there; we now emit `TurnEnd` once per turn (one inference + its tool
+  batch, bracketed by a `TurnStart` moved into the loop and guarded by a
+  `retrying` flag so a transient retry doesn't re-bracket) and populate
+  `AgentEnd.messages` with the transcript clone; kept our extra
+  `TurnUsage` as the lighter per-turn usage signal (not in the reference).
+  (b) `Terminal::set_title` / `set_progress` are actively wired in the
+  reference's interactive mode; we now set the window title in
+  `SessionWorld::install` and light the OS progress indicator while the
+  main agent runs (edge-gated in the event pump). **Kept + documented
+  (interface completeness):** the `Terminal` move/clear verbs have no
+  render-loop caller in the reference either (it inlines its hot-path
+  escapes like we do), so they stay as the portability seam with a trait
+  doc note. **Reintroduced `minimal`** thinking level end to end (the wire
+  `ThinkingLevel` already had it and the `thinkingMinimal` theme token was
+  orphaned): `ThinkingConfig`/`ConfigThinkingLevel::Minimal`, the name
+  vocabulary, both projections, config↔model maps, the selector catalog,
+  the settings-window schema, and the tint. **Recorded stale, not
+  touched:** `QueueUpdate` (the audit's "no producer" was stale — it's
+  live) and the print-mode no-op listener (already removed; only a stale
+  comment, left for R18). A fresh-agent review confirmed `TurnEnd` fires
+  exactly once per completed turn and never on retry/abort/error, no
+  use-after-move, the `minimal` thread-through is complete, and
+  fmt/clippy/full-workspace tests are green; its doc/style nits were
+  folded back into the bucket commits. Tests: `TurnEnd` payload +
+  `AgentEnd` snapshot, single-bracket-across-retry, the progress
+  indicator following main busy/idle, and `minimal` round-trips.
