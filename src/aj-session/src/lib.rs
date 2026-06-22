@@ -27,6 +27,7 @@ pub mod log;
 pub mod persistence;
 pub mod repair;
 pub mod replay;
+pub mod stats;
 
 pub use compaction::{
     CompactionDetails, CompactionPlan, ContextEstimate, estimate_context_tokens,
@@ -40,3 +41,4 @@ pub use log::{
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;
+pub use stats::SessionStats;

@@ -82,6 +82,7 @@ use crate::modes::interactive::components::prompt_history::{
     PromptHistoryOutcome, PromptHistoryOutcomeHandle, PromptHistorySearchComponent,
     all_workspaces_history_streaming, workspace_history_streaming,
 };
+use crate::modes::interactive::components::session_info::SessionInfoOutcomeHandle;
 use crate::modes::interactive::components::session_selector::{
     OutcomeHandle as SessionOutcomeHandle, SessionSelectorComponent, SessionSelectorOutcome,
 };
@@ -2307,6 +2308,11 @@ enum OpenSelector {
         handle: OverlayHandle,
         outcome: AuthStatusOutcomeHandle,
     },
+    /// Read-only session-info overlay. Both Esc and Enter close it.
+    SessionInfo {
+        handle: OverlayHandle,
+        outcome: SessionInfoOutcomeHandle,
+    },
     /// Read-only usage overlay. Both Esc and Enter close it. The
     /// usage reports stream in from a background fetch after the
     /// overlay opens; closing early just drops the fetch's receiver.
@@ -2351,6 +2357,7 @@ impl OpenSelector {
             | OpenSelector::Help { handle, .. }
             | OpenSelector::AuthPicker { handle, .. }
             | OpenSelector::AuthStatus { handle, .. }
+            | OpenSelector::SessionInfo { handle, .. }
             | OpenSelector::UsageStatus { handle, .. }
             | OpenSelector::Settings { handle, .. }
             | OpenSelector::Skills { handle, .. } => *handle,
@@ -2787,16 +2794,17 @@ fn persist_config(
 }
 
 /// Inner-content row count for the compact overlays (palette, help,
-/// model / thinking pickers). Total rendered height including chrome
-/// is `PALETTE_OVERLAY_INNER_ROWS + 4` (23 rows), which still fits
-/// comfortably on a standard 24-row terminal. Sized so the command
-/// palette shows its whole catalog without scrolling: the palette
-/// reserves three of these rows for its search box, separator, and
-/// scroll indicator (see `CommandPaletteComponent::set_available_height`),
-/// leaving enough list rows for every builtin command. The
-/// content-heavy overlays (session switcher, prompt history) size their
-/// rows dynamically instead — see [`large_overlay_inner_rows`].
-const PALETTE_OVERLAY_INNER_ROWS: usize = 19;
+/// model / thinking pickers, the read-only auth / usage / session-info
+/// pages). Total rendered height including chrome is
+/// `PALETTE_OVERLAY_INNER_ROWS + 4`, so this value plus four is the box's
+/// footprint on screen. Sized so the command palette shows its whole
+/// catalog without scrolling: the palette reserves three of these rows
+/// for its search box, separator, and scroll indicator (see
+/// `CommandPaletteComponent::set_available_height`), so the budget must
+/// stay at least `COMMANDS.len() + 3`. The content-heavy overlays
+/// (session switcher, prompt history) size their rows dynamically
+/// instead. See [`large_overlay_inner_rows`].
+const PALETTE_OVERLAY_INNER_ROWS: usize = 20;
 
 /// Sizing/anchor used by the command palette and the compact pickers
 /// (model / thinking / help). Centered, fills ~75% of the terminal
@@ -3339,6 +3347,29 @@ async fn handle_command(
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             CommandOutcome::Continue {
                 selector: Some(OpenSelector::AuthStatus { handle, outcome }),
+                notice: None,
+            }
+        }
+        CommandAction::OpenSessionInfo => {
+            // Read-only snapshot: lock the log, compute the digest, and
+            // drop the guard at the end of the statement so it is never
+            // held across the overlay's lifetime. Safe mid-turn.
+            let stats = world.log.lock().await.stats();
+            let inner = crate::modes::interactive::components::session_info::build_overlay(
+                select_list_theme(theme),
+                stats,
+            );
+            let outcome = inner.outcome_handle();
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Session info",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                PALETTE_OVERLAY_INNER_ROWS,
+            )
+            .with_subtitle(&subtitle_close());
+            let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
+            CommandOutcome::Continue {
+                selector: Some(OpenSelector::SessionInfo { handle, outcome }),
                 notice: None,
             }
         }
@@ -4522,6 +4553,10 @@ async fn handle_selector_outcome(
             }
         }
         OpenSelector::AuthStatus { outcome, .. } => match outcome.take() {
+            None => SelectorTransition::Stay,
+            Some(()) => SelectorTransition::Back,
+        },
+        OpenSelector::SessionInfo { outcome, .. } => match outcome.take() {
             None => SelectorTransition::Stay,
             Some(()) => SelectorTransition::Back,
         },

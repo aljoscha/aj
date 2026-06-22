@@ -29,8 +29,9 @@ pub fn build_overlay(
         ..Default::default()
     };
     let visible = statuses.len().max(1);
+    let scroll_info = std::sync::Arc::clone(&list_theme.scroll_info);
     let list = SelectList::new(build_items(&statuses), visible, list_theme, layout);
-    ReadOnlyListOverlay::new(list)
+    ReadOnlyListOverlay::new(list, scroll_info)
 }
 
 fn build_items(statuses: &[ProviderAuthStatus]) -> Vec<SelectItem> {

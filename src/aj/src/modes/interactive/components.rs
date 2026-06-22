@@ -33,6 +33,7 @@ pub mod outcome;
 pub mod pending_message;
 pub mod prompt_history;
 pub mod read_only_list;
+pub mod session_info;
 pub mod session_selector;
 pub mod settings_window;
 pub mod skills_window;

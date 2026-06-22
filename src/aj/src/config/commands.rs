@@ -119,6 +119,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::NewSession,
     },
     Command {
+        name: "info",
+        title: "info",
+        category: "session",
+        description: "Show details and statistics for the current session.",
+        action_id: None,
+        action: CommandAction::OpenSessionInfo,
+    },
+    Command {
         name: "compact",
         title: "compact",
         category: "session",
@@ -236,6 +244,10 @@ pub enum CommandAction {
     /// usage and rate-limit windows. The reports load asynchronously
     /// after the overlay opens.
     OpenUsageStatus,
+    /// Open the read-only session-info overlay: the current session's
+    /// id, on-disk path, message and tool-call counts, and recorded
+    /// settings. Read-only, so it's safe mid-turn.
+    OpenSessionInfo,
     /// Open the session selector overlay. The currently-active
     /// session is pre-selected; `Enter` swaps the agent over to the
     /// chosen session, `Esc` cancels.

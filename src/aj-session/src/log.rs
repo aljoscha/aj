@@ -244,7 +244,7 @@ impl ThreadFilter {
 
 /// Session settings recorded on one linearized path, extracted by
 /// [`Conversation::settings`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSettings {
     /// Last (provider, model_id) recorded on this path: the most
     /// recent [`ConversationEntryKind::ModelChange`] entry, falling

@@ -30,8 +30,9 @@ pub fn build_overlay(list_theme: SelectListTheme) -> ReadOnlyListOverlay {
         show_selection_indicator: false,
         ..Default::default()
     };
+    let scroll_info = std::sync::Arc::clone(&list_theme.scroll_info);
     let list = SelectList::new(build_items(), COMMANDS.len().max(1), list_theme, layout);
-    ReadOnlyListOverlay::new(list)
+    ReadOnlyListOverlay::new(list, scroll_info)
 }
 
 /// Build one [`SelectItem`] per command: `category` prefix, `title`

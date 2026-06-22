@@ -435,7 +435,7 @@ fn read_session_preview_file(
 /// Returns `None` for any stem that doesn't conform — placeholder
 /// ids, hand-renamed files, or future format changes. The caller
 /// falls back to file mtime in that case so the row still renders.
-fn parse_session_id_created_at(session_id: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_session_id_created_at(session_id: &str) -> Option<DateTime<Utc>> {
     // Strip a trailing `_<digits>` collision suffix. The mint side
     // never embeds an underscore in the timestamp portion so an
     // underscore unambiguously marks the suffix boundary; we still
