@@ -356,21 +356,8 @@ async fn run_inner<W: Write + Send + 'static>(
 
     let _persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
 
-    // Drive a single prompt and observe the result. Errors fall into
-    // three buckets:
-    //
-    // - `Recoverable`: model errored mid-turn or returned a
-    //   user-facing failure. The transcript and disk state remain
-    //   internally consistent (the agent already synthesized any
-    //   compensating tool_result entries before returning), but the
-    //   run produced no useful output for the caller. Surface the
-    //   error to stderr and exit non-zero.
-    // - `Aborted`: the user (or a parent process) sent SIGINT and we
-    //   tripped the agent's cancel token. Same outward behaviour as
-    //   `Recoverable` — internally-consistent state, non-zero exit.
-    // - `Fatal`: a listener errored or the disk write failed. Same
-    //   outward behaviour but with a fatal-flavoured error context
-    //   so callers can tell them apart in scripts.
+    // Drive a single prompt, then map its outcome to the process exit
+    // status (`finish_result` below documents the error buckets).
     //
     // We honour SIGINT via [`tokio::signal::ctrl_c`] so a Ctrl+C at
     // the shell aborts the in-flight turn instead of killing the
@@ -413,18 +400,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // below can't orphan tasks.
     crate::modes::shutdown_background_tasks(&task_registry).await;
 
-    match prompt_result {
-        Ok(()) => {}
-        Err(TurnError::Aborted) => {
-            return Err(anyhow!("agent run cancelled (sigint)"));
-        }
-        Err(TurnError::Recoverable(err)) => {
-            return Err(anyhow::Error::msg(err).context("agent run failed (recoverable)"));
-        }
-        Err(TurnError::Fatal(err)) => {
-            return Err(anyhow::Error::msg(err).context("agent run failed (fatal)"));
-        }
-    }
+    finish_result(prompt_result)?;
 
     // Text mode: print the final assistant message's visible text.
     // JSON mode already streamed every event; nothing else to do.
@@ -436,6 +412,27 @@ async fn run_inner<W: Write + Send + 'static>(
     // another process don't lose buffered bytes.
     let _ = out.lock().expect("print sink mutex poisoned").flush();
     Ok(())
+}
+
+/// Map a finished turn's outcome to the print run's process result.
+///
+/// `Ok` lets the caller proceed to render output. The three error
+/// buckets all exit non-zero but carry distinct context so a script can
+/// tell them apart. `Recoverable` is a model/turn failure that left the
+/// transcript and disk state internally consistent. `Aborted` is a
+/// SIGINT cancel (same outward behavior, internally consistent). `Fatal`
+/// is a listener or disk-write failure.
+fn finish_result(prompt_result: Result<(), TurnError>) -> Result<()> {
+    match prompt_result {
+        Ok(()) => Ok(()),
+        Err(TurnError::Aborted) => Err(anyhow!("agent run cancelled (sigint)")),
+        Err(TurnError::Recoverable(err)) => {
+            Err(anyhow::Error::msg(err).context("agent run failed (recoverable)"))
+        }
+        Err(TurnError::Fatal(err)) => {
+            Err(anyhow::Error::msg(err).context("agent run failed (fatal)"))
+        }
+    }
 }
 
 /// Build a [`Listener`] that writes each event as one JSONL line into
@@ -810,6 +807,35 @@ mod tests {
             out.lines().filter(|l| !l.trim().is_empty()).count(),
             1,
             "exactly one line written (the update produced none):\n{out}"
+        );
+    }
+
+    /// `finish_result` maps each turn outcome to the right process
+    /// result: `Ok` stays `Ok`, and the three error buckets each exit
+    /// with their own context so scripts can tell them apart.
+    #[test]
+    fn finish_result_maps_each_turn_outcome() {
+        assert!(finish_result(Ok(())).is_ok());
+
+        let aborted = finish_result(Err(TurnError::Aborted)).unwrap_err();
+        assert!(
+            format!("{aborted:#}").contains("cancelled (sigint)"),
+            "aborted carries the sigint message: {aborted:#}"
+        );
+
+        let recoverable =
+            finish_result(Err(TurnError::Recoverable("model blew up".into()))).unwrap_err();
+        let recoverable = format!("{recoverable:#}");
+        assert!(
+            recoverable.contains("recoverable") && recoverable.contains("model blew up"),
+            "recoverable keeps its context and cause: {recoverable}"
+        );
+
+        let fatal = finish_result(Err(TurnError::Fatal("disk write failed".into()))).unwrap_err();
+        let fatal = format!("{fatal:#}");
+        assert!(
+            fatal.contains("fatal") && fatal.contains("disk write failed"),
+            "fatal keeps its context and cause: {fatal}"
         );
     }
 }
