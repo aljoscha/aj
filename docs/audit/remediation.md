@@ -241,7 +241,7 @@ When presenting a proposal, cover:
 
 ## TEST — close key coverage gaps
 
-### R16 — Add truncation / error-frame fixtures to provider roundtrips  [test · TODO]
+### R16 — Add truncation / error-frame fixtures to provider roundtrips  [test · DONE]
 - **Sources:** M3, M4; `_SUMMARY` theme 7. Pairs with R1.
 - **Problem:** roundtrip suites are happy-path only; the R1 truncation bug
   lives in a path no fixture touches.
@@ -695,3 +695,29 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   (`docs/aj-next-progress.md:792`, "passthrough stub for `@file`
   expansion") which correctly records a past development state and is left
   as-is. `cargo test -p aj --lib cli` green (24 tests).
+- 2026-06-22 · R16 · DONE · 90a72f4 · Closed the happy-path-only gap the
+  M3/M4 testing findings flagged (the path the R1 truncation bug hid in):
+  the four roundtrip suites only replayed well-formed SSE ending in a
+  terminal frame, so the §10.3 error legs were pinned only by hand-built
+  in-module events, never against captured wire fixtures. Added 10 `.sse`
+  fixtures + error/truncation scenarios across all four suites, replayed
+  through the existing public `replay_sse_events` seam (same parse path
+  the live provider runs, so they catch fixture/code drift like the happy
+  path does). Each asserts the terminal classification (`stop_reason` +
+  `error.category`) and that partial deltas survive: anthropic
+  truncated→Transient / mid-stream `error` frame→Overloaded / refusal
+  `stop_details`→ContentFilter; completions truncated→Transient /
+  `finish_reason: content_filter`→ContentFilter; responses
+  truncated→Transient / `response.incomplete(max_output_tokens)`→clean
+  `Done(Length)` (the positive control that separates a real length stop
+  from a transport drop) / `response.failed`→Error; codex
+  truncated→Transient / top-level `error` frame→RateLimit. Gave error
+  scenarios their own single "terminal classification" shape rather than
+  forcing them through the parse/serialize/semantic trio (serialize +
+  semantic-roundtrip are meaningless for a turn that's never sent
+  upstream). Two honest behaviors pinned by comment rather than
+  changed (R16 is test-only): the codex error path drops the accumulated
+  partial (the M4 divergent-terminal-handling Minor), and a streamed
+  `response.failed` carrying a bare `server_error` (no HTTP status on the
+  SSE frame) lands in `Unknown`, not `Transient`. `cargo test -p aj-models
+  --test roundtrip` green (60, +11); `fmt`/`check`/`clippy --tests` clean.
