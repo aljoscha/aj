@@ -37,11 +37,11 @@ use serde_json::Value;
 
 pub mod demos;
 
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::provider::Provider;
 use crate::registry::ModelInfo;
 use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
-    select_cancel,
+    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
 };
 use crate::types::{
     AssistantContent, AssistantError, AssistantMessage, Context, ErrorCategory,

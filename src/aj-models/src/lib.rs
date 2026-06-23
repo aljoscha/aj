@@ -13,10 +13,11 @@
 
 pub mod anthropic;
 pub mod auth;
+pub(crate) mod cancel;
 pub mod errors;
 pub mod oauth;
 pub mod openai;
-pub mod partial_json;
+pub(crate) mod partial_json;
 pub mod provider;
 pub mod refresh;
 pub mod registry;

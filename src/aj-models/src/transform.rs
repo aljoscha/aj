@@ -750,6 +750,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn openai_responses_model_change_demotes_thinking() {
+        // Same provider + api but not Anthropic: signatures are
+        // model-bound, so a model-id change within `openai-responses` still
+        // demotes/drops thinking and strips text signatures
+        // (`signatures_portable` is false off-Anthropic even when the api
+        // matches).
+        let target = model("openai", "openai-responses", "gpt-5", false);
+        let asst = assistant(
+            "openai",
+            "openai-responses",
+            "gpt-4.1",
+            vec![
+                AssistantContent::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: Some("enc".into()),
+                    redacted: true,
+                }),
+                AssistantContent::Thinking(ThinkingContent {
+                    thinking: "visible".into(),
+                    thinking_signature: Some("sig".into()),
+                    redacted: false,
+                }),
+                AssistantContent::Text(TextContent {
+                    text: "hello".into(),
+                    text_signature: Some("ts".into()),
+                }),
+            ],
+        );
+        let out = transform_messages(&[Message::Assistant(asst)], &target);
+        let Message::Assistant(a) = &out[0] else {
+            panic!("expected assistant");
+        };
+        // Redacted reasoning dropped, visible reasoning demoted to text,
+        // original text kept with its signature stripped.
+        assert_eq!(a.content.len(), 2);
+        match &a.content[0] {
+            AssistantContent::Text(t) => {
+                assert_eq!(t.text, "visible");
+                assert!(t.text_signature.is_none());
+            }
+            _ => panic!("expected demoted text"),
+        }
+        match &a.content[1] {
+            AssistantContent::Text(t) => {
+                assert_eq!(t.text, "hello");
+                assert!(t.text_signature.is_none());
+            }
+            _ => panic!("expected text with signature stripped"),
+        }
+    }
+
     // -- Tool call ID normalization (rule 3) --------------------------
 
     #[test]

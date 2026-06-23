@@ -295,6 +295,11 @@ Per-crate progress (work top-to-bottom):
   `types::ToolDefinition` per the reference's two-type design; applied the
   2 doc-link + retry-after-contract Minors and the provider chronology
   Nits; command-name Nit already consistent in-crate).
+- aj-models-streaming — `DONE` (moved `select_cancel`/`SelectOutcome` to a
+  `pub(crate)` `cancel` module, tightened `partial_json` to `pub(crate)` /
+  private; dropped `repair_json`'s per-delta `Vec<char>`; doc + tests for
+  the partial-number collapse and the `openai-responses` demotion; trimmed
+  the duplicated strategy-chain comments. R20/R19 retirements verified).
 
 ---
 
@@ -989,3 +994,54 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   `ToolDefinition` end to end); `fmt`/`clippy -p aj-models -p aj-agent
   --all-targets` clean; `cargo check --workspace` confirms no consumer
   drift.
+- 2026-06-23 · RESIDUAL(aj-models-streaming) · DONE · 41267ce · Fourth
+  per-crate residual sweep. Two findings were already retired and
+  verified-only: the `truncate` doc nit (R20 renamed it `truncate_bytes`,
+  fixed the doc, added the `is_ascii` debug-assert) and the unused
+  `async-stream` dep (R19). Five live leftovers, plus the over-broad
+  public-surface theme. **(1) [Minor][Boundaries] `select_cancel`/
+  `SelectOutcome` cohesion:** the streaming-protocol module also housed a
+  generic `select!`-vs-`CancellationToken` helper used by all four
+  providers and `scripted.rs`. Moved both to a new `pub(crate)` `cancel`
+  module (user-approved destination over co-locating in `types.rs`),
+  restoring `streaming.rs` to just the event protocol; the five importers
+  switched to `use crate::cancel::...`. No cross-crate user exists, so the
+  move tightens to `pub(crate)`. **(2) [Minor][Misc] `repair_json`
+  per-delta alloc:** rewrote it over `char_indices().peekable()` with
+  byte-offset lookahead for the `\uXXXX` case, dropping the
+  `input.chars().collect::<Vec<char>>()` it did on every non-strict-parse
+  delta of the streamed tool-call hot path. No behavior change (the 4-hex
+  guard is mirrored exactly). Declined the caller-side O(n²) reparse fix:
+  it changes the snapshot cadence across all four provider accumulation
+  loops, a design change beyond a residual cleanup. **(3) [Minor]
+  [Contracts] collapse-to-`{}`:** documented on `parse_streaming_json`
+  that a buffer ending in a partial number/keyword recovers no value for
+  that one delta (dropping already-complete sibling keys until it
+  completes); did not add the optional trailing-token trim (behavior
+  change, out of scope). **(4) [Minor][Comments] `signatures_portable`
+  unanchored claim:** added a focused test pinning that an
+  `openai-responses` source demotes/drops thinking across a model-id
+  change (`signatures_portable` false off-Anthropic even when the api
+  matches). Kept the prose, which honestly records how the claim was
+  established, and did **not** add a `§8.1` spec citation (R18 stripped
+  those). **(5) [Nit][Style] strategy-chain comment duplication:** trimmed
+  the body's numbered inline comments to just the non-obvious notes (the
+  "skip the repaired parse when `repair_json` was a no-op" optimization
+  and the "both lexical and structural damage" step), letting the function
+  doc be the canonical chain. **Over-broad surface:** narrowed
+  `partial_json` to `pub(crate) mod` with `pub(crate) fn
+  parse_streaming_json` (cross-module, used by the providers) and private
+  `repair_json`/`complete_partial_json` (in-module only; the `#[cfg(test)]`
+  suite reaches them). The `[Nit][Comments]` per-event clone rationale got
+  the cross-reference the finding asked for: a NOTE on
+  `AssistantMessageEvent` that the growing-snapshot clone and the
+  cumulative reparse are the two compounding per-delta costs. The
+  `close_pending` wall-clock `Utc::now()` is a synthesis note, not a
+  numbered finding, and is ACCEPTED-AS-IS (injecting a clock for synthetic
+  orphan timestamps exceeds this sweep). Public-API change is a pure
+  narrowing with no external consumers, so it can't break callers; no
+  on-disk/wire change. Tests: partial-number/keyword collapse, a
+  truncated-`\u`-at-end + multibyte adversarial pair pinning the no-Vec
+  rewrite, and the `openai-responses` demotion. `cargo test -p aj-models`
+  green (60 roundtrip + 319 lib), `fmt`/`clippy -p aj-models --all-targets`
+  clean, `cargo check --workspace` confirms no consumer drift.

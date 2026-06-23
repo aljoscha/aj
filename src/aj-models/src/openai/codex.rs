@@ -39,12 +39,11 @@ use openai_sdk::types::responses::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::oauth::openai::extract_account_id;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, validate_thinking_level};
-use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, ErrorReason, SelectOutcome, select_cancel,
-};
+use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream, ErrorReason};
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantError, AssistantMessage, Context, ErrorCategory,

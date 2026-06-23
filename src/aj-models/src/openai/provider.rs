@@ -29,6 +29,7 @@ use openai_sdk::types::chat_completions::{
 use openai_sdk::types::common::ReasoningEffort;
 use serde_json::Value;
 
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::classify_openai_finish_reason;
 use crate::openai::errors::classify_client_error;
 use crate::openai::responses::map_verbosity;
@@ -38,8 +39,7 @@ use crate::registry::{
     ModelCost, ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level,
 };
 use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
-    select_cancel,
+    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
 };
 use crate::transform::transform_messages;
 use crate::types::{
@@ -590,7 +590,7 @@ pub fn assistant_message_to_request_item(
 ///   does not carry a separate refusal channel).
 /// - `tool_calls` → [`AssistantContent::ToolCall`], one per entry, in
 ///   array order. The wire `function.arguments` string is parsed as
-///   strict JSON first, with [`parse_streaming_json`] as a fallback so
+///   strict JSON first, with `parse_streaming_json` as a fallback so
 ///   a malformed prior turn still yields a structured `Value` rather
 ///   than failing the parse.
 ///

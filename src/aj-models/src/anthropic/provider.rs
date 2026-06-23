@@ -19,6 +19,7 @@ use anthropic_sdk::messages::{
 use futures::StreamExt;
 use serde_json::Value;
 
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::{
     classify_anthropic_error, classify_anthropic_stop_reason, parse_retry_after, transport_error,
 };
@@ -28,8 +29,7 @@ use crate::registry::{
     ModelCost, ModelInfo, calculate_cost, supports_adaptive_thinking, validate_thinking_level,
 };
 use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
-    select_cancel,
+    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
 };
 use crate::transform::transform_messages;
 use crate::types::{

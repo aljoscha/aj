@@ -33,6 +33,7 @@ use openai_sdk::types::responses::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::classify_openai_error;
 use crate::openai::errors::classify_client_error;
 use crate::partial_json::parse_streaming_json;
@@ -41,8 +42,7 @@ use crate::registry::{
     ModelCost, ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level,
 };
 use crate::streaming::{
-    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
-    select_cancel,
+    AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
 };
 use crate::transform::transform_messages;
 use crate::types::{

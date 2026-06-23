@@ -70,6 +70,13 @@ impl From<ErrorReason> for StopReason {
 /// cost of producing the deltas, and gives consumers a self-contained snapshot
 /// they can hand off to UI components without sharing mutable state.
 ///
+/// NOTE: for text/thinking deltas the partial grows with the message, so
+/// each snapshot deep-clones the accumulated content. That is one of two
+/// per-delta costs on the streamed tool-call hot path. The other is the
+/// cumulative-buffer reparse the providers run via `parse_streaming_json`.
+/// Neither is wrong given the snapshot contract, but they compound, so
+/// treat them as one trade-off when tuning.
+///
 /// The stream is terminated by exactly one of [`Done`](Self::Done) or
 /// [`Error`](Self::Error); after either is pushed, no further events may be
 /// emitted (see [`AssistantMessageEventStream::push`]).
@@ -233,42 +240,6 @@ impl AssistantMessageEvent {
             Self::Done { message, .. } => message,
             Self::Error { error, .. } => error,
         }
-    }
-}
-
-/// Outcome of [`select_cancel`].
-pub enum SelectOutcome<T> {
-    /// The future completed with `T` before the cancellation token fired.
-    Ready(T),
-    /// The cancellation token fired before the future completed; the
-    /// future has been dropped.
-    Cancelled,
-}
-
-/// Await `fut` concurrently with `token.cancelled()`. When `token` is
-/// `None` this just awaits `fut` (the cancellation path is unreachable),
-/// matching the "no cancel installed" case providers see when the
-/// caller doesn't set [`StreamOptions::cancel`](crate::types::StreamOptions).
-///
-/// Used by every provider's `run_stream_inner` to drive the streaming
-/// HTTP request inside a `select!` against the per-call cancellation
-/// token so a `cancel()` rapidly tears down both the HTTP connection
-/// (via dropping the SSE handle) and the polling task.
-pub async fn select_cancel<T, F>(
-    token: Option<&tokio_util::sync::CancellationToken>,
-    fut: F,
-) -> SelectOutcome<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    let Some(token) = token else {
-        return SelectOutcome::Ready(fut.await);
-    };
-    tokio::pin!(fut);
-    tokio::select! {
-        biased;
-        _ = token.cancelled() => SelectOutcome::Cancelled,
-        value = &mut fut => SelectOutcome::Ready(value),
     }
 }
 

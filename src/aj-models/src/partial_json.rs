@@ -29,19 +29,25 @@ use serde_json::Value;
 ///    arrays; trim dangling commas / colons — then strict parse.
 /// 4. Repair + complete combined, then strict parse.
 /// 5. Empty object.
-pub fn parse_streaming_json(input: &str) -> Value {
+///
+/// NOTE: when the cumulative buffer ends in a partial number or keyword
+/// (`{"a": 1, "b": 1.`, `{"ok": tru`) no strategy succeeds. Neither
+/// [`repair_json`] nor [`complete_partial_json`] repairs an incomplete
+/// scalar, so the snapshot for that one delta is the step-5 empty object,
+/// dropping any already-complete sibling keys. It recovers on the next
+/// delta once the value completes.
+pub(crate) fn parse_streaming_json(input: &str) -> Value {
     if input.trim().is_empty() {
         return Value::Object(serde_json::Map::new());
     }
 
-    // 1. Strict parse.
     if let Ok(v) = serde_json::from_str::<Value>(input) {
         return v;
     }
 
-    // 2. Repair + strict parse. Skip if `repair_json` was a no-op so we
-    //    don't pay for a redundant parse on the common path where the
-    //    input only has structural (not lexical) damage.
+    // Skip the repaired parse when `repair_json` was a no-op, so the common
+    // case (input has only structural, not lexical, damage) doesn't pay for
+    // a redundant parse.
     let repaired = repair_json(input);
     if repaired != input
         && let Ok(v) = serde_json::from_str::<Value>(&repaired)
@@ -49,21 +55,18 @@ pub fn parse_streaming_json(input: &str) -> Value {
         return v;
     }
 
-    // 3. Complete (close brackets etc.) + strict parse.
     let completed = complete_partial_json(input);
     if let Ok(v) = serde_json::from_str::<Value>(&completed) {
         return v;
     }
 
-    // 4. Repair, then complete, then parse — handles inputs that have
-    //    *both* lexical damage (control chars, bad escapes) and missing
-    //    closers.
+    // Repair then complete, for input with *both* lexical damage (control
+    // chars, bad escapes) and missing closers.
     let completed_repaired = complete_partial_json(&repaired);
     if let Ok(v) = serde_json::from_str::<Value>(&completed_repaired) {
         return v;
     }
 
-    // 5. Total failure — empty object so callers can still render.
     Value::Object(serde_json::Map::new())
 }
 
@@ -85,68 +88,67 @@ const VALID_JSON_ESCAPES: &[char] = &['"', '\\', '/', 'b', 'f', 'n', 'r', 't', '
 /// is to normalize bytes that the model emitted with imperfect JSON
 /// hygiene; structural repairs (unclosed brackets etc.) are
 /// [`complete_partial_json`]'s job.
-pub fn repair_json(input: &str) -> String {
-    let chars: Vec<char> = input.chars().collect();
+///
+/// Runs on the cumulative argument buffer on every streamed tool-call
+/// delta, so it iterates `char_indices` with byte-offset lookahead rather
+/// than materializing the buffer into a `Vec<char>`.
+fn repair_json(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_string = false;
-    let mut i = 0;
+    let mut chars = input.char_indices().peekable();
 
-    while i < chars.len() {
-        let c = chars[i];
-
+    while let Some((_, c)) = chars.next() {
         if !in_string {
             out.push(c);
             if c == '"' {
                 in_string = true;
             }
-            i += 1;
             continue;
         }
 
         if c == '"' {
             out.push(c);
             in_string = false;
-            i += 1;
             continue;
         }
 
         if c == '\\' {
-            // Trailing backslash with no following char: double it so the
-            // next parse stage doesn't see a dangling escape.
-            let Some(&next) = chars.get(i + 1) else {
+            // Inspect the next char without consuming it: an invalid or
+            // incomplete escape leaves it to be re-processed as a literal.
+            let Some(&(next_idx, next)) = chars.peek() else {
+                // Trailing backslash with no following char: double it so the
+                // next parse stage doesn't see a dangling escape.
                 out.push_str("\\\\");
-                i += 1;
                 continue;
             };
 
             if next == 'u' {
-                // `\uXXXX` requires 4 hex digits. Keep it intact only if
-                // all four are present; otherwise double the backslash so
-                // the (possibly incomplete) sequence doesn't fail parse.
-                let digits: String = chars
-                    .iter()
-                    .skip(i + 2)
-                    .take(4)
-                    .copied()
-                    .collect::<String>();
-                if digits.len() == 4 && digits.chars().all(|d| d.is_ascii_hexdigit()) {
+                // `\uXXXX` requires 4 hex digits. Slice them straight from
+                // the input by byte offset (`u` is one byte) instead of
+                // collecting; keep the sequence only when all four are
+                // present, otherwise fall through to doubling the backslash.
+                let after_u = next_idx + 'u'.len_utf8();
+                let digits = input.get(after_u..after_u + 4).unwrap_or("");
+                if digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_hexdigit()) {
                     out.push('\\');
                     out.push('u');
-                    out.push_str(&digits);
-                    i += 6;
+                    out.push_str(digits);
+                    // Consume `u` and the 4 hex digits (5 ASCII chars).
+                    for _ in 0..5 {
+                        chars.next();
+                    }
                     continue;
                 }
-                // Fall through to "double the backslash" path.
             } else if VALID_JSON_ESCAPES.contains(&next) {
                 out.push('\\');
                 out.push(next);
-                i += 2;
+                chars.next();
                 continue;
             }
 
-            // Invalid escape — treat the backslash as a literal.
+            // Invalid escape. Treat the backslash as a literal and let the
+            // following char fall through on the next iteration.
             out.push_str("\\\\");
-            i += 1;
             continue;
         }
 
@@ -155,7 +157,6 @@ pub fn repair_json(input: &str) -> String {
         } else {
             out.push(c);
         }
-        i += 1;
     }
 
     out
@@ -187,7 +188,7 @@ fn escape_control_character(c: char) -> String {
 /// so the object remains parseable. Doesn't try to repair partial
 /// keywords (`tru`, `fals`, `nul`) or partial numbers — those fall
 /// through to the empty-object fallback in [`parse_streaming_json`].
-pub fn complete_partial_json(s: &str) -> String {
+fn complete_partial_json(s: &str) -> String {
     let mut stack: Vec<char> = Vec::new();
     let mut in_string = false;
     let mut escape = false;
@@ -323,6 +324,23 @@ mod tests {
         assert_eq!(v.as_object().unwrap().len(), 0);
     }
 
+    #[test]
+    fn partial_number_collapses_to_empty_object() {
+        // A buffer ending mid-number can't be repaired or completed, so the
+        // whole snapshot collapses to `{}` for this delta. The
+        // already-complete `"a": 1` is dropped until the value finishes.
+        let v = parse_streaming_json("{\"a\": 1, \"b\": 1.");
+        assert!(v.is_object());
+        assert_eq!(v.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn partial_keyword_collapses_to_empty_object() {
+        let v = parse_streaming_json("{\"ok\": tru");
+        assert!(v.is_object());
+        assert_eq!(v.as_object().unwrap().len(), 0);
+    }
+
     // ----- parse_streaming_json: repair path -----
 
     #[test]
@@ -389,6 +407,34 @@ mod tests {
         let raw = "{\"a\": \"\\u00z9\"}";
         let repaired = repair_json(raw);
         assert!(repaired.contains("\\\\u00z9"));
+    }
+
+    #[test]
+    fn repair_truncated_unicode_escape_at_end_doubles_backslash() {
+        // `\u00` with fewer than four hex digits at the very end of the
+        // buffer: the byte-offset lookahead must not slice past the end,
+        // and the backslash is doubled.
+        let raw = "{\"a\": \"x\\u00";
+        let repaired = repair_json(raw);
+        assert!(repaired.contains("\\\\u00"));
+    }
+
+    #[test]
+    fn repair_preserves_multibyte_inside_string() {
+        // Multibyte content inside a string must survive the char_indices
+        // walk untouched (no byte-boundary slicing bug).
+        let raw = "{\"msg\": \"héllo wörld 🎉\"}";
+        assert_eq!(repair_json(raw), raw);
+        let v = parse_streaming_json(raw);
+        assert_eq!(v["msg"], "héllo wörld 🎉");
+    }
+
+    #[test]
+    fn repair_backslash_before_multibyte_doubles() {
+        // A backslash followed by a multibyte char is an invalid escape:
+        // the backslash is doubled and the char preserved.
+        let v = parse_streaming_json("{\"a\": \"\\é\"}");
+        assert_eq!(v["a"], "\\é");
     }
 
     // ----- complete_partial_json -----
