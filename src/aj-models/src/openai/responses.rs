@@ -37,7 +37,9 @@ use crate::errors::classify_openai_error;
 use crate::openai::errors::classify_client_error;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
-use crate::registry::{ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level};
+use crate::registry::{
+    ModelCost, ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level,
+};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
     select_cancel,
@@ -994,6 +996,10 @@ pub(super) struct StreamState {
     api_name: &'static str,
     /// Cost multiplier strategy for this provider; see [`CostMultiplierFn`].
     cost_multiplier: CostMultiplierFn,
+    /// Per-million-token rates for the model, captured at construction.
+    /// We keep an owned copy rather than borrowing the `ModelInfo` so the
+    /// state machine carries no lifetime tie back to the provider call.
+    cost: ModelCost,
 }
 
 impl StreamState {
@@ -1025,6 +1031,7 @@ impl StreamState {
             requested_tier: requested_tier.as_ref().map(map_service_tier),
             api_name,
             cost_multiplier,
+            cost: model.cost.clone(),
         }
     }
 
@@ -1492,8 +1499,7 @@ impl StreamState {
         if let Some(usage) = self.final_response.as_ref().and_then(|r| r.usage.as_ref()) {
             apply_usage(&mut self.partial.usage, usage);
         }
-        let cost_model = model_for_cost(&self.partial);
-        finalize_usage(&mut self.partial.usage, &cost_model, multiplier);
+        finalize_usage(&mut self.partial.usage, &self.cost, multiplier);
 
         // Classify the terminal status.
         let has_tool_use = self
@@ -1618,34 +1624,15 @@ fn apply_usage(target: &mut crate::types::Usage, source: &ResponseUsage) {
     target.output = u64::from(source.output_tokens);
 }
 
-fn finalize_usage(usage: &mut crate::types::Usage, model: &ModelInfo, tier_multiplier: f64) {
+fn finalize_usage(usage: &mut crate::types::Usage, cost: &ModelCost, tier_multiplier: f64) {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-    calculate_cost(model, usage);
+    calculate_cost(cost, usage);
     if (tier_multiplier - 1.0).abs() > f64::EPSILON {
         usage.cost.input *= tier_multiplier;
         usage.cost.output *= tier_multiplier;
         usage.cost.cache_read *= tier_multiplier;
         usage.cost.cache_write *= tier_multiplier;
         usage.cost.total *= tier_multiplier;
-    }
-}
-
-fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
-    use crate::registry::{InputModality, ModelCost};
-    ModelInfo {
-        id: message.model.clone(),
-        name: message.model.clone(),
-        api: message.api.clone(),
-        provider: message.provider.clone(),
-        base_url: String::new(),
-        reasoning: false,
-        supports_adaptive_thinking: false,
-        supports_verbosity: false,
-        input: vec![InputModality::Text],
-        cost: ModelCost::default(),
-        context_window: 0,
-        max_tokens: 0,
-        headers: None,
     }
 }
 
@@ -1656,7 +1643,7 @@ fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{InputModality, ModelCost};
+    use crate::registry::InputModality;
     use crate::types::{Message as UnifiedMessage, UserContent, UserMessage};
 
     fn fake_model(reasoning: bool) -> ModelInfo {
@@ -2071,19 +2058,20 @@ mod tests {
 
     #[test]
     fn cost_multiplier_applied() {
-        let mut m = AssistantMessage::empty();
-        m.api = API_NAME.into();
-        m.provider = "openai".into();
-        m.model = "gpt-5".into();
         let mut state = StreamState::new(&fake_model(false), Some(ServiceTier::Flex));
-        state.partial = m;
-        // No usage report — multiplier still applied (to zero, no-op).
+        // Pre-load token counts. With no terminal response to overwrite
+        // them, finalize prices these against the model's rates and then
+        // scales by the tier multiplier.
+        state.partial.usage.input = 1_000_000;
+        state.partial.usage.output = 1_000_000;
+        state.finish_status = Some(ResponseStatus::Completed);
         let event = state.finalize();
         let msg = match event {
             AssistantMessageEvent::Done { message, .. } => message,
             other => panic!("expected Done, got {other:?}"),
         };
-        assert_eq!(msg.usage.cost.total, 0.0);
+        // 1.25 (input) + 10.0 (output) = 11.25 at full price; flex halves it.
+        assert!((msg.usage.cost.total - 5.625).abs() < 1e-9);
     }
 
     #[test]

@@ -145,9 +145,9 @@
         "text"
       ],
       "cost": {
-        "input": 0.0,
-        "output": 0.0,
-        "cache_read": 0.0,
+        "input": 1.75,
+        "output": 14.0,
+        "cache_read": 0.175,
         "cache_write": 0.0
       },
       "context_window": 128000,

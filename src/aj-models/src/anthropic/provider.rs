@@ -25,7 +25,7 @@ use crate::errors::{
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{
-    ModelInfo, calculate_cost, supports_adaptive_thinking, validate_thinking_level,
+    ModelCost, ModelInfo, calculate_cost, supports_adaptive_thinking, validate_thinking_level,
 };
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
@@ -951,7 +951,10 @@ enum BlockState {
 }
 
 struct StreamState {
-    model: ModelInfo,
+    /// Per-million-token rates for the model, captured at construction.
+    /// We keep an owned copy rather than borrowing the `ModelInfo` so the
+    /// state machine carries no lifetime tie back to the provider call.
+    cost: ModelCost,
     /// Running snapshot of the assistant message. Cloned into every
     /// emitted event.
     partial: AssistantMessage,
@@ -983,7 +986,7 @@ impl StreamState {
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         Self {
-            model: model.clone(),
+            cost: model.cost.clone(),
             partial,
             blocks: Vec::new(),
             stop_reason: None,
@@ -1287,7 +1290,7 @@ impl StreamState {
     /// emitted an `Error` event (which is its own terminator).
     fn finalize(mut self) -> AssistantMessageEvent {
         // Compute total tokens + usage cost on the running message.
-        finalize_usage(&mut self.partial.usage, &self.model);
+        finalize_usage(&mut self.partial.usage, &self.cost);
 
         let (stop_reason, done_reason) = match self.stop_reason {
             Some(AStopReason::EndTurn)
@@ -1380,9 +1383,9 @@ fn apply_usage_delta(usage: &mut Usage, delta: &AUsageDelta) {
     }
 }
 
-fn finalize_usage(usage: &mut Usage, model: &ModelInfo) {
+fn finalize_usage(usage: &mut Usage, cost: &ModelCost) {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-    calculate_cost(model, usage);
+    calculate_cost(cost, usage);
 }
 
 // ---------------------------------------------------------------------------

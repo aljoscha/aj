@@ -34,7 +34,9 @@ use crate::openai::errors::classify_client_error;
 use crate::openai::responses::map_verbosity;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
-use crate::registry::{ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level};
+use crate::registry::{
+    ModelCost, ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level,
+};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason, SelectOutcome,
     select_cancel,
@@ -772,6 +774,10 @@ struct StreamState {
     /// Latest streamed usage — only the last chunk carries the real
     /// totals; replace each time we see one.
     usage: Option<ChatUsage>,
+    /// Per-million-token rates for the model, captured at construction.
+    /// We keep an owned copy rather than borrowing the `ModelInfo` so the
+    /// state machine carries no lifetime tie back to the provider call.
+    cost: ModelCost,
 }
 
 struct ToolCallSlot {
@@ -806,6 +812,7 @@ impl StreamState {
             tool_calls: HashMap::new(),
             finish_reason: None,
             usage: None,
+            cost: model.cost.clone(),
         }
     }
 
@@ -1135,8 +1142,7 @@ impl StreamState {
         if let Some(usage) = self.usage.as_ref() {
             apply_usage(&mut self.partial.usage, usage);
         }
-        let cost_model = model_for_cost(&self.partial);
-        finalize_usage(&mut self.partial.usage, &cost_model);
+        finalize_usage(&mut self.partial.usage, &self.cost);
 
         let (stop_reason, done_reason, error_detail) = classify_finish(&self.finish_reason);
 
@@ -1164,28 +1170,6 @@ impl StreamState {
             reason: ErrorReason::Error,
             error: self.partial,
         }
-    }
-}
-
-/// We finalize cost using only the metadata from the running message;
-/// reconstructing a [`ModelInfo`] purely for cost lookup keeps the
-/// state machine free of a lifetime tie back to the provider call.
-fn model_for_cost(message: &AssistantMessage) -> ModelInfo {
-    use crate::registry::{InputModality, ModelCost};
-    ModelInfo {
-        id: message.model.clone(),
-        name: message.model.clone(),
-        api: message.api.clone(),
-        provider: message.provider.clone(),
-        base_url: String::new(),
-        reasoning: false,
-        supports_adaptive_thinking: false,
-        supports_verbosity: false,
-        input: vec![InputModality::Text],
-        cost: ModelCost::default(),
-        context_window: 0,
-        max_tokens: 0,
-        headers: None,
     }
 }
 
@@ -1271,10 +1255,10 @@ fn apply_usage(target: &mut Usage, source: &ChatUsage) {
     target.output = u64::from(source.completion_tokens);
 }
 
-fn finalize_usage(usage: &mut Usage, model: &ModelInfo) {
+fn finalize_usage(usage: &mut Usage, cost: &ModelCost) {
     // trust our own arithmetic over the wire's `total_tokens`.
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-    calculate_cost(model, usage);
+    calculate_cost(cost, usage);
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,7 +1268,7 @@ fn finalize_usage(usage: &mut Usage, model: &ModelInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{InputModality, ModelCost};
+    use crate::registry::InputModality;
     use crate::types::{AssistantContent, Message, ThinkingContent, UserContent, UserMessage};
     use openai_sdk::types::chat_completions::{
         ChatCompletionStreamChoice, ChatCompletionStreamResponseDelta, FunctionCallDelta,

@@ -355,7 +355,7 @@ impl ModelRegistry {
 // ============================================================================
 
 /// Compute dollar costs per token category and the running total, and
-/// store them in `usage.cost`. Rates in `model.cost` are
+/// store them in `usage.cost`. Rates in `cost` are
 /// dollars-per-million-tokens; the function divides through by 1e6.
 //
 // `u64 → f64` is exact for any value below 2^53; token counts stay
@@ -363,12 +363,12 @@ impl ModelRegistry {
 // practice. There's no stable safe converter for this direction in
 // std.
 #[allow(clippy::as_conversions)]
-pub fn calculate_cost(model: &ModelInfo, usage: &mut Usage) {
+pub fn calculate_cost(cost: &ModelCost, usage: &mut Usage) {
     const PER_MILLION: f64 = 1_000_000.0;
-    usage.cost.input = (model.cost.input / PER_MILLION) * usage.input as f64;
-    usage.cost.output = (model.cost.output / PER_MILLION) * usage.output as f64;
-    usage.cost.cache_read = (model.cost.cache_read / PER_MILLION) * usage.cache_read as f64;
-    usage.cost.cache_write = (model.cost.cache_write / PER_MILLION) * usage.cache_write as f64;
+    usage.cost.input = (cost.input / PER_MILLION) * usage.input as f64;
+    usage.cost.output = (cost.output / PER_MILLION) * usage.output as f64;
+    usage.cost.cache_read = (cost.cache_read / PER_MILLION) * usage.cache_read as f64;
+    usage.cost.cache_write = (cost.cache_write / PER_MILLION) * usage.cache_write as f64;
     usage.cost.total =
         usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
@@ -789,7 +789,7 @@ mod tests {
             total_tokens: 0,
             cost: Default::default(),
         };
-        calculate_cost(&model, &mut usage);
+        calculate_cost(&model.cost, &mut usage);
         assert!((usage.cost.input - 3.0).abs() < 1e-9);
         assert!((usage.cost.output - 7.5).abs() < 1e-9);
         assert!((usage.cost.cache_read - 0.03).abs() < 1e-9);
