@@ -131,31 +131,9 @@ impl Client {
 
         let status = response.status();
         if status == StatusCode::OK {
-            let stream = response.bytes_stream().eventsource();
-
-            let stream = stream.filter_map(|event| async move {
-                match event {
-                    Ok(event) => {
-                        if event.data == "[DONE]" {
-                            return None;
-                        }
-                        match serde_json::from_str::<CreateChatCompletionStreamResponse>(
-                            &event.data,
-                        ) {
-                            Ok(json_event) => Some(Ok(json_event)),
-                            Err(err) => {
-                                let err = format!(
-                                    "could not parse server-sent event {}: {}",
-                                    event.data, err
-                                );
-                                Some(Err(ClientError::ParseError(err)))
-                            }
-                        }
-                    }
-                    Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
-                }
-            });
-            return Ok(stream.boxed());
+            return Ok(parse_sse_stream::<CreateChatCompletionStreamResponse>(
+                response,
+            ));
         }
 
         let http_status = status.as_u16();
@@ -260,29 +238,7 @@ impl Client {
 
         let status = response.status();
         if status == StatusCode::OK {
-            let stream = response.bytes_stream().eventsource();
-
-            let stream = stream.filter_map(|event| async move {
-                match event {
-                    Ok(event) => {
-                        if event.data == "[DONE]" {
-                            return None;
-                        }
-                        match serde_json::from_str::<ResponseStreamEvent>(&event.data) {
-                            Ok(json_event) => Some(Ok(json_event)),
-                            Err(err) => {
-                                let err = format!(
-                                    "could not parse server-sent event {}: {}",
-                                    event.data, err
-                                );
-                                Some(Err(ClientError::ParseError(err)))
-                            }
-                        }
-                    }
-                    Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
-                }
-            });
-            return Ok(stream.boxed());
+            return Ok(parse_sse_stream::<ResponseStreamEvent>(response));
         }
 
         let http_status = status.as_u16();
@@ -294,6 +250,52 @@ impl Client {
             retry_after,
             error_text,
         ))
+    }
+}
+
+/// Turn a 2xx streaming HTTP response into a stream of parsed SSE events.
+///
+/// The consumer must distinguish three channels:
+/// - a transport-level read error is surfaced as
+///   [`ClientError::InternalError`].
+/// - the `[DONE]` sentinel ends the stream cleanly (see [`parse_sse_event`]).
+/// - a protocol-level `error` event is not a transport error. It
+///   deserializes into the event type (e.g. `ResponseStreamEvent::Error`)
+///   and is yielded as `Ok` for the consumer to classify.
+fn parse_sse_stream<T>(
+    response: reqwest::Response,
+) -> Pin<Box<dyn Stream<Item = Result<T, ClientError>> + Send>>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    response
+        .bytes_stream()
+        .eventsource()
+        .filter_map(|event| async move {
+            match event {
+                Ok(event) => parse_sse_event(&event.data),
+                Err(e) => Some(Err(ClientError::InternalError(e.to_string()))),
+            }
+        })
+        .boxed()
+}
+
+/// Parse one SSE `data` payload into a stream item.
+///
+/// `None` signals a clean end of stream: the `[DONE]` sentinel is the
+/// Chat Completions terminator, and is accepted harmlessly on the
+/// Responses path too, where completion is instead signaled by a
+/// `response.completed` event. A payload that isn't the expected event
+/// shape becomes [`ClientError::ParseError`].
+fn parse_sse_event<T: serde::de::DeserializeOwned>(data: &str) -> Option<Result<T, ClientError>> {
+    if data == "[DONE]" {
+        return None;
+    }
+    match serde_json::from_str::<T>(data) {
+        Ok(event) => Some(Ok(event)),
+        Err(err) => Some(Err(ClientError::ParseError(format!(
+            "could not parse server-sent event {data}: {err}"
+        )))),
     }
 }
 
@@ -408,5 +410,30 @@ mod tests {
         );
         assert_eq!(err.http_status(), Some(500));
         assert!(err.to_string().contains("upstream boom"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_sse_event_handles_done_parse_and_error() {
+        // The body both streaming endpoints share via parse_sse_stream:
+        // [DONE] ends the stream, a well-formed payload parses, and a
+        // malformed one becomes a ParseError.
+        assert!(parse_sse_event::<serde_json::Value>("[DONE]").is_none());
+
+        let ok = parse_sse_event::<serde_json::Value>(r#"{"hello":"world"}"#)
+            .expect("a non-sentinel payload yields an item")
+            .expect("valid JSON parses");
+        assert_eq!(ok, serde_json::json!({"hello": "world"}));
+
+        let err = parse_sse_event::<serde_json::Value>("not json")
+            .expect("a non-sentinel payload yields an item")
+            .expect_err("invalid JSON is a ParseError");
+        assert!(matches!(err, ClientError::ParseError(_)), "got: {err}");
+        // The message format is contractual (the consumer logs it), so
+        // pin its prefix against silent drift.
+        assert!(
+            err.to_string()
+                .starts_with("could not parse server-sent event not json:"),
+            "got: {err}"
+        );
     }
 }

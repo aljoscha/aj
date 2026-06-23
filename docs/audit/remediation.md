@@ -288,6 +288,9 @@ Per-crate progress (work top-to-bottom):
 
 - anthropic-sdk — `DONE` (kept all public surface per the user, documented
   it as intentional; applied the 4 doc/attr nits).
+- openai-sdk — `DONE` (kept all public surface per the anthropic-sdk
+  precedent; finished the SSE-parse de-dup R11 left half-done; applied the
+  contract doc + 2 nits).
 
 ---
 
@@ -910,3 +913,38 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   string preservation; `cargo test -p anthropic-sdk` green (20),
   `fmt`/`clippy -p anthropic-sdk --all-targets` clean, `cargo check
   --workspace` confirms no pruned item (none were) and no consumer drift.
+- 2026-06-23 · RESIDUAL(openai-sdk) · DONE · 9b6b303 · Second per-crate
+  residual sweep. Three findings were already retired and were
+  verified-only: the Major `anyhow` non-streaming split and the non-2xx
+  error-mapping duplication by R11 (`chat_completions`/`responses` return
+  `ClientError`, the shared `classify_error_response`/`retry_after_header`
+  feed all five paths, `anyhow` is gone from `Cargo.toml`), and the unused
+  `async-stream` dep by R19. Four live leftovers addressed. (1)
+  [Minor][Simplicity] dead surface (confirmed still unused workspace-wide:
+  the two non-stream methods, `base_url`, `Response::output_text`, the
+  `ResponseInstructions` `From` impls, and ~6 convenience constructors):
+  **kept**, applying the anthropic-sdk precedent (surface tracks the wire
+  API, not just AJ's calls) rather than pruning, with the `lib.rs` module
+  doc now naming the currently-uncalled items so "public on purpose" reads
+  apart from "leaked." (2) [Minor][Errors] the SSE-parse half R11 left
+  duplicated: extracted a pure `parse_sse_event<T>(data) -> Option<Result<
+  T, ClientError>>` plus a thin `parse_sse_stream<T>(response)`, so the two
+  streaming `filter_map` bodies (previously byte-identical apart from the
+  deserialized type) now share one implementation next to the existing
+  error-mapping helpers. (3) [Minor][Contracts] documented the three stream
+  channels on `parse_sse_stream` (transport `Err` → `InternalError`;
+  `[DONE]` → clean end; a protocol `error` event yielded as `Ok` for the
+  consumer to classify) and noted on `parse_sse_event` that `[DONE]` is the
+  Chat Completions terminator, accepted harmlessly on the Responses path
+  where `response.completed` is the real signal (kept defensively rather
+  than dropped, now a single shared check). (4) [Nit][Comments] replaced
+  `ApiError`'s hand-written `Display` with `#[error("OpenAI API error:
+  {message}")]` (message byte-identical, dropped the unused `Display`
+  import). (5) [Nit][Style] converged the section-comment style: removed
+  the 38 full-width `// ---` banner rules in `responses.rs`, keeping the
+  bare labels to match `chat_completions.rs` and our anti-decoration
+  guidance. No behavior change on the live paths; no public-API or on-disk
+  change (surface kept). Tests: `parse_sse_event` (`[DONE]`/valid/garbage)
+  and an `api_error_display_is_stable` string pin; `cargo test -p
+  openai-sdk` green (17), `fmt`/`clippy -p openai-sdk --all-targets` clean,
+  `cargo check -p aj-models` confirms no consumer drift.

@@ -1,5 +1,3 @@
-use std::fmt::Display;
-
 use serde::{
     Deserialize, Serialize,
     de::{self, Unexpected},
@@ -10,6 +8,7 @@ use thiserror::Error;
 // Error types
 
 #[derive(Serialize, Deserialize, Clone, Debug, Error)]
+#[error("OpenAI API error: {message}")]
 pub struct ApiError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25,12 +24,6 @@ pub struct ApiError {
         skip_serializing_if = "Option::is_none"
     )]
     pub code: Option<String>,
-}
-
-impl Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpenAI API error: {}", self.message)
-    }
 }
 
 /// Deserialize a provider error code from either a JSON string or
@@ -123,6 +116,18 @@ pub struct JsonSchemaDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_error_display_is_stable() {
+        // ClientError composes this string, so keep it byte-stable.
+        let error = ApiError {
+            message: "boom".to_string(),
+            r#type: None,
+            param: None,
+            code: None,
+        };
+        assert_eq!(error.to_string(), "OpenAI API error: boom");
+    }
 
     #[test]
     fn error_code_string() {
