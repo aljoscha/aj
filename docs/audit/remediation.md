@@ -273,7 +273,7 @@ When presenting a proposal, cover:
   but `keys::parse_key_id` rejects them, so a configured `cmd+k` never
   fires.
 
-## RESIDUAL — per-crate leftover Minor/Nit cleanup  [TODO]
+## RESIDUAL — per-crate leftover Minor/Nit cleanup  [IN PROGRESS]
 
 Lowest priority. The themes above absorb most findings; what remains are
 localized Minors/Nits in each report not covered elsewhere. When reached,
@@ -283,6 +283,11 @@ entries). Reports: anthropic-sdk, openai-sdk, aj-models-{core,streaming,
 anthropic,openai,auth}, aj-conf, aj-agent-{runtime,contracts}, aj-session,
 aj-tools-{framework,impls}, aj-tui-{core,text,editor,components,tests},
 aj-{cli,core,interactive,components,tests}.
+
+Per-crate progress (work top-to-bottom):
+
+- anthropic-sdk — `DONE` (kept all public surface per the user, documented
+  it as intentional; applied the 4 doc/attr nits).
 
 ---
 
@@ -880,3 +885,28 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   existing `unknown_modifier_names_reject_the_match` in `tests/keys.rs`
   already pins the parser rejection. `fmt`/`check`/`clippy --all-targets`
   clean on `aj-tui`; `cargo test -p aj-tui --lib keybindings` green.
+- 2026-06-23 · RESIDUAL(anthropic-sdk) · DONE · f153563 · First
+  per-crate residual sweep. The report's Major (two error entry points
+  disagree) and two of its Minors (`ParseError` never constructed, the
+  `messages()` keep-or-drop call) were already retired by R11, so the
+  live leftovers were one Boundaries Minor, one Contracts Minor, and
+  three Nits. On the Boundaries fork (prune the unused
+  setters/conversions/`apply_delta` vs. document them as intentional) the
+  user chose **keep everything** since we may drive the SDK for other
+  things later, so nothing was pruned. Instead the `lib.rs` module doc now
+  states the surface tracks the wire API rather than only the current
+  consumer, naming the currently-uncalled items so a future reader can
+  tell "public on purpose" from "leaked" (the finding's documentation
+  option). The four nits applied: documented that `messages_stream` drops
+  a mid-stream transport error as a silent end-of-stream (the consumer
+  must detect a truncated turn itself, which `aj-models` does); removed
+  the redundant bare `use reqwest;`; moved `ApiError`'s per-variant
+  messages onto `#[error("…")]` attributes and deleted the hand-written
+  `impl Display` (+ its now-unused import), keeping the strings
+  byte-identical since `ClientError` composes them; and recorded the
+  `CLAUDE_CODE_VERSION` failure mode (server may reject a stale value as
+  an unrecognized client, OAuth-only) so a maintainer knows when to bump
+  it. Tests: a new `api_error_display_strings_are_stable` pins the #4
+  string preservation; `cargo test -p anthropic-sdk` green (20),
+  `fmt`/`clippy -p anthropic-sdk --all-targets` clean, `cargo check
+  --workspace` confirms no pruned item (none were) and no consumer drift.

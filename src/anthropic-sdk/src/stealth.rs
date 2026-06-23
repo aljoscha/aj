@@ -33,6 +33,12 @@ pub(crate) const CLAUDE_CODE_IDENTITY_PROMPT: &str =
 /// The default Claude Code CLI version used for the `user-agent` header
 /// in OAuth mode. Picked as a recent value the Anthropic server accepts
 /// as a recognized Claude Code client.
+///
+/// If this drifts too far behind the real CLI, the server may reject the
+/// request as an unrecognized client (an auth/forbidden-class failure).
+/// That only affects OAuth mode, since API-key requests don't send this
+/// header. Bump it if OAuth turns start failing authorization for no
+/// other apparent reason.
 pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.75";
 
 /// Canonical tool names from Claude Code 2.x.

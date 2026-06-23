@@ -5,7 +5,6 @@
 //! events, and the tool-definition union.
 
 use std::collections::HashMap;
-use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1719,45 +1718,32 @@ pub struct SkillParam {
 #[serde(tag = "type")]
 pub enum ApiError {
     #[serde(rename = "api_error")]
+    #[error("API error: {message}")]
     ApiError { message: String },
     #[serde(rename = "authentication_error")]
+    #[error("Authentication error: {message}")]
     AuthenticationError { message: String },
     #[serde(rename = "billing_error")]
+    #[error("Billing error: {message}")]
     BillingError { message: String },
     #[serde(rename = "invalid_request_error")]
+    #[error("Invalid request error: {message}")]
     InvalidRequestError { message: String },
     #[serde(rename = "not_found_error")]
+    #[error("Not found error: {message}")]
     NotFoundError { message: String },
     #[serde(rename = "overloaded_error")]
+    #[error("API Overloaded error: {message}")]
     OverloadedError { message: String },
     #[serde(rename = "permission_error")]
+    #[error("Permission error: {message}")]
     PermissionError { message: String },
     #[serde(rename = "rate_limit_error")]
+    #[error("Rate limit error: {message}")]
     RateLimitError { message: String },
     #[serde(rename = "timeout_error")]
+    #[error("Gateway timeout error: {message}")]
     GatewayTimeoutError { message: String },
-}
-
-impl Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::ApiError { message } => write!(f, "API error: {}", message),
-            ApiError::AuthenticationError { message } => {
-                write!(f, "Authentication error: {}", message)
-            }
-            ApiError::BillingError { message } => write!(f, "Billing error: {}", message),
-            ApiError::InvalidRequestError { message } => {
-                write!(f, "Invalid request error: {}", message)
-            }
-            ApiError::NotFoundError { message } => write!(f, "Not found error: {}", message),
-            ApiError::OverloadedError { message } => write!(f, "API Overloaded error: {}", message),
-            ApiError::PermissionError { message } => write!(f, "Permission error: {}", message),
-            ApiError::RateLimitError { message } => write!(f, "Rate limit error: {}", message),
-            ApiError::GatewayTimeoutError { message } => {
-                write!(f, "Gateway timeout error: {}", message)
-            }
-        }
-    }
 }
 
 impl ApiError {
@@ -1894,4 +1880,75 @@ pub struct UsageDelta {
     pub output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_display_strings_are_stable() {
+        // ClientError composes these into its own message, so the
+        // per-variant prefixes are a user-facing contract. Pin every
+        // variant so a typo in any `#[error(...)]` prefix is caught.
+        let cases = [
+            (
+                ApiError::ApiError {
+                    message: "m".to_string(),
+                },
+                "API error: m",
+            ),
+            (
+                ApiError::AuthenticationError {
+                    message: "m".to_string(),
+                },
+                "Authentication error: m",
+            ),
+            (
+                ApiError::BillingError {
+                    message: "m".to_string(),
+                },
+                "Billing error: m",
+            ),
+            (
+                ApiError::InvalidRequestError {
+                    message: "m".to_string(),
+                },
+                "Invalid request error: m",
+            ),
+            (
+                ApiError::NotFoundError {
+                    message: "m".to_string(),
+                },
+                "Not found error: m",
+            ),
+            (
+                ApiError::OverloadedError {
+                    message: "m".to_string(),
+                },
+                "API Overloaded error: m",
+            ),
+            (
+                ApiError::PermissionError {
+                    message: "m".to_string(),
+                },
+                "Permission error: m",
+            ),
+            (
+                ApiError::RateLimitError {
+                    message: "m".to_string(),
+                },
+                "Rate limit error: m",
+            ),
+            (
+                ApiError::GatewayTimeoutError {
+                    message: "m".to_string(),
+                },
+                "Gateway timeout error: m",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 }

@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
-use reqwest;
 use reqwest::Client as ReqwestClient;
 use thiserror::Error;
 
@@ -243,11 +242,19 @@ impl Client {
     }
 
     /// Stream the raw server-sent events from `POST /v1/messages`.
+    ///
     /// The returned stream yields one [`ServerSentEvent`] per parseable
-    /// SSE frame; unparseable frames are logged at `warn` and dropped
-    /// so a future API version that adds new event types doesn't crash
-    /// the stream. OAuth stealth-mode reverse-mapping of tool names is
-    /// applied per-event before yielding.
+    /// SSE frame. Unparseable frames are logged at `warn` and dropped so
+    /// a future API version that adds new event types doesn't crash the
+    /// stream. OAuth stealth-mode reverse-mapping of tool names is applied
+    /// per-event before yielding.
+    ///
+    /// A mid-stream transport error (a dropped connection, a read error
+    /// from the event source) is logged at `error` and surfaced as
+    /// end-of-stream: the stream simply ends. This layer does not
+    /// distinguish an abnormal termination from a clean close, so a
+    /// consumer that needs to detect a truncated turn must check for a
+    /// terminal frame itself.
     pub async fn messages_stream(
         &self,
         mut messages: Messages,
