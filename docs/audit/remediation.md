@@ -268,7 +268,7 @@ When presenting a proposal, cover:
   same-named `truncate` impls; "tab = 3 spaces" duplicated across three
   `aj-tui` files.
 
-### R21 — Fix the keybinding cmd/meta parse-vs-format mismatch  [bug · TODO]
+### R21 — Fix the keybinding cmd/meta parse-vs-format mismatch  [bug · DONE]
 - **Sources:** T3; `_SUMMARY` theme 9. `keybindings` formats `cmd`/`meta`
   but `keys::parse_key_id` rejects them, so a configured `cmd+k` never
   fires.
@@ -852,3 +852,31 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   (`test_visible_width_tab` et al.) unchanged and green; the static assert
   is a compile-time check. `fmt`/`check`/`clippy --all-targets` clean on
   `aj-models`/`aj-tui`, `cargo check --workspace` resolves.
+- 2026-06-23 · R21 · DONE · 2411abf · Aligned the keybinding
+  vocabulary's two halves (the finding's first option). The canonical
+  matcher `keys::parse_key_id` accepts only `ctrl`/`alt`/`shift`/`super`
+  and fails closed on anything else, and its sibling
+  `format_key_descriptor` deliberately refuses to emit `meta`/`hyper`
+  (documented at the call site), so `super` is the one canonical
+  "windows/command/meta" modifier. But the display helper
+  `keybindings::format_key_segment` mapped `"meta" | "cmd" | "super" =>
+  "Meta"`, advertising `meta`/`cmd` as valid input even though a
+  `cmd+k` descriptor never matches a keystroke (and rendering the shared
+  modifier under a different label than its canonical token). Dropped the
+  `"meta"`/`"cmd"` arm and mapped `"super" => "Super"` so the label
+  mirrors the canonical token; unrecognized spellings now title-case
+  through the fallback like any other unknown segment (`cmd+k` →
+  `Cmd+K`), so help text no longer pretends a rejected binding is valid.
+  Latent contract fix, not a live regression: production only installs
+  the built-in defaults (none use `super`/`meta`/`cmd`) and no
+  user-override config path is wired yet, so no current display changes.
+  Rejected the alias route (add `meta`/`cmd` to `parse_key_id`): it
+  softens the fail-closed contract the audit praises and contradicts
+  `format_key_descriptor`'s documented intent to exclude `meta`/`hyper`,
+  turning an S cleanup into a vocabulary redesign over crossterm's
+  separate `META`/`SUPER` modifiers. Tests: `super+k` → `Super+K`, and a
+  regression asserting `cmd+k`/`meta+k` no longer format as a recognized
+  modifier (so re-introducing the alias must touch both halves); the
+  existing `unknown_modifier_names_reject_the_match` in `tests/keys.rs`
+  already pins the parser rejection. `fmt`/`check`/`clippy --all-targets`
+  clean on `aj-tui`; `cargo test -p aj-tui --lib keybindings` green.

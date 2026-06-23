@@ -284,7 +284,14 @@ fn format_key_segment(seg: &str) -> String {
         "ctrl" => "Ctrl".to_string(),
         "alt" => "Alt".to_string(),
         "shift" => "Shift".to_string(),
-        "meta" | "cmd" | "super" => "Meta".to_string(),
+        // `super` is the only "windows/command/meta" modifier the
+        // canonical grammar recognizes (see `keys::parse_key_id` and
+        // `keys::format_key_descriptor`, which deliberately reject
+        // `meta`/`hyper`). We display it under the same `super` spelling
+        // so the label can't advertise a modifier the matcher rejects.
+        // Unknown spellings like `cmd`/`meta` fall through to the
+        // title-case arm, the same as any other unrecognized segment.
+        "super" => "Super".to_string(),
         "escape" | "esc" => "Esc".to_string(),
         "enter" | "return" => "Enter".to_string(),
         "tab" => "Tab".to_string(),
@@ -587,6 +594,27 @@ mod tests {
         assert_eq!(format_keybinding("enter"), "Enter");
         assert_eq!(format_keybinding("pageUp"), "PgUp");
         assert_eq!(format_keybinding("ctrl+]"), "Ctrl+]");
+    }
+
+    #[test]
+    fn format_keybinding_super_matches_canonical_spelling() {
+        // The display label mirrors the canonical `super` token that
+        // `keys::parse_key_id`/`format_key_descriptor` use, so the two
+        // halves of the vocabulary agree. The match arm keys off the
+        // lowercased segment, so a non-canonical casing still resolves.
+        assert_eq!(format_keybinding("super+k"), "Super+K");
+        assert_eq!(format_keybinding("SUPER+k"), "Super+K");
+    }
+
+    #[test]
+    fn format_keybinding_does_not_advertise_unmatched_modifiers() {
+        // `cmd`/`meta` are not part of the canonical grammar
+        // (`parse_key_id` rejects them, so the binding never fires).
+        // The display side must not pretty-print them as a recognized
+        // modifier: they title-case like any other unknown segment, so
+        // the help text can't pretend the binding is valid.
+        assert_eq!(format_keybinding("cmd+k"), "Cmd+K");
+        assert_eq!(format_keybinding("meta+k"), "Meta+K");
     }
 
     #[test]
