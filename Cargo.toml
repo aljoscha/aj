@@ -20,11 +20,12 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0"
 arboard = { version = "3", default-features = false, features = ["image-data"] }
-async-stream = "0.3.6"
 async-trait = "0.1"
 base64 = "0.22"
+bitflags = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
 dotenv = "0.15.0"
 eventsource-stream = "0.2"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
@@ -34,9 +35,13 @@ iana-time-zone = "0.1"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 itertools = "0.14.0"
+memchr = "2"
 nix = { version = "0.29", features = ["signal"] }
 notify = "8.2"
 nu-ansi-term = "0.46"
+nucleo = "0.5"
+nucleo-matcher = "0.3"
+pretty_assertions = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 rand = "0.9"
 regex = "1.0"
@@ -45,18 +50,24 @@ schemars = { version = "0.9.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10"
+serial_test = "3"
 sha2 = "0.10"
 similar = "2.6"
 strsim = "0.11"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 tempfile = "3"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["full"] }
 tokio-retry2 = { version = "0.5", features = ["jitter"] }
+tokio-stream = "0.1"
 tokio-util = { version = "0.7", default-features = false }
 toml = "0.8"
 toml_edit = "0.22"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+vt100-ctt = "0.17"
 
 [workspace.lints.rust]
 unknown_lints = "allow"

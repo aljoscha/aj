@@ -258,7 +258,7 @@ When presenting a proposal, cover:
   to / replaces the old / `docs/aj-next-plan §N` / future PR" framing and
   fix the few now-wrong comments. Batch per crate.
 
-### R19 — Dependency hygiene  [cleanup · TODO]
+### R19 — Dependency hygiene  [cleanup · DONE]
 - **Sources:** S2, M1, T1; `_SUMMARY` theme 9. Drop unused `async-stream`
   (openai-sdk, aj-models); move `aj-tui`'s direct version pins to
   `[workspace.dependencies]`.
@@ -800,3 +800,24 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   Comment-only change, no behavior change: `fmt`/`check`/`clippy
   --workspace --all-targets` clean, full `cargo test --workspace` green
   (87 binaries). Net 85 files, -116 lines.
+- 2026-06-22 · R19 · DONE · 8991e39 · Centralized every external
+  dependency-version pin into `[workspace.dependencies]` (the
+  full-centralization option, matching the established workspace
+  convention, which already routes single-consumer deps like `arboard`/
+  `clap`/`notify` through the table). Removed the dead `async-stream`
+  from both consumers (`openai-sdk`, `aj-models`) and from the workspace
+  table, since `rg async_stream` finds no code reference anywhere (both
+  SDKs stream via `eventsource-stream`). Moved `aj-tui`'s 12 inline pins
+  (`bitflags`, `crossterm`, `memchr`, `nucleo`, `nucleo-matcher`,
+  `syntect`, `tokio-stream`, `unicode-segmentation`, `unicode-width`,
+  `pretty_assertions`, `serial_test`, `vt100-ctt`), plus `aj-tui-testkit`'s
+  `tokio-stream`/`vt100-ctt`, `aj`'s `serial_test`, and `aj-models`'s
+  inline `async-trait` (a workspace entry already existed) to
+  `{ workspace = true }`, carrying features verbatim. Note three of these
+  (`tokio-stream`, `vt100-ctt`, `serial_test`) had become genuinely
+  multi-consumer since R12's testkit extraction, so they could already
+  drift. Versions preserved exactly: the only `Cargo.lock` change is the
+  `async-stream`/`async-stream-impl` removal. Pure manifest change, no
+  code or behavior impact. `cargo check --workspace` resolves; `cargo
+  test -p aj-tui -p aj-tui-testkit` green (covers the moved dev-deps);
+  `fmt` clean.

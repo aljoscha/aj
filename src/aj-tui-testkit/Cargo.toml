@@ -6,8 +6,8 @@ edition.workspace = true
 [dependencies]
 aj-tui = { path = "../aj-tui/" }
 tokio = { workspace = true, features = ["test-util"] }
-tokio-stream = "0.1"
-vt100-ctt = "0.17"
+tokio-stream = { workspace = true }
+vt100-ctt = { workspace = true }
 
 [lints]
 workspace = true

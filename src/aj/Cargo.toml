@@ -36,7 +36,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 aj-tui-testkit = { path = "../aj-tui-testkit/" }
-serial_test = "3"
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
