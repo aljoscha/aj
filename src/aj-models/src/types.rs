@@ -519,8 +519,9 @@ impl ApiKeyResolver {
     }
 
     /// Invoke the resolver. Returns the resolved key or an error
-    /// message the provider surfaces as an [`Auth`]-category
-    /// [`crate::errors::AssistantError`].
+    /// message the provider surfaces as an
+    /// [`Auth`](crate::types::ErrorCategory::Auth)-category
+    /// [`crate::types::AssistantError`].
     pub async fn call(&self) -> Result<String, String> {
         (self.0)().await
     }
@@ -661,7 +662,7 @@ impl StreamOptions {
     /// 2. [`StreamOptions::api_key`] if set — used as the static
     ///    fallback.
     /// 3. `Err` if neither is set; the provider surfaces this as an
-    ///    [`crate::errors::ErrorCategory::Auth`] failure.
+    ///    [`crate::types::ErrorCategory::Auth`] failure.
     pub async fn resolve_api_key(&self) -> Result<String, String> {
         if let Some(resolver) = &self.api_key_resolver {
             return resolver.call().await;

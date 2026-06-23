@@ -26,7 +26,6 @@ use aj_models::ThinkingConfig;
 use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
-use aj_models::tools::Tool;
 use aj_models::types::{
     AssistantContent, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
     Speed, StopReason, StreamOptions, ThinkingLevel, ToolCall,
@@ -80,7 +79,7 @@ pub struct Agent {
     /// assembly) before any turn runs; inference reads it directly.
     assembled_system_prompt: Option<String>,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
-    tools: Vec<Tool>,
+    tools: Vec<UnifiedToolDefinition>,
     /// Names of builtin tools to exclude when spawning subagents.
     /// Mirrors the filter applied to the top-level agent so
     /// subagents inherit the same tool restrictions.
@@ -222,14 +221,15 @@ impl Agent {
         stream_options: StreamOptions,
         default_thinking: Option<ThinkingConfig>,
     ) -> Self {
-        // Convert ErasedToolDefinition to Tool for Model API
-        let api_tools: Vec<Tool> = tools
+        // Project the runtime tool definitions onto the wire-level
+        // shape the provider consumes (the runtime type carries the
+        // execution closure the provider has no use for).
+        let api_tools: Vec<UnifiedToolDefinition> = tools
             .iter()
-            .map(|tool_def| Tool {
+            .map(|tool_def| UnifiedToolDefinition {
                 name: tool_def.name.clone(),
                 description: tool_def.description.clone(),
-                input_schema: tool_def.input_schema.clone(),
-                r#type: None,
+                parameters: tool_def.input_schema.clone(),
             })
             .collect();
 
@@ -1647,9 +1647,7 @@ impl Agent {
     ///
     /// Projects the agent's [`AgentMessage`] transcript onto the
     /// unified [`aj_models::types::Message`] sequence the
-    /// [`Provider`] trait expects, projects the agent's
-    /// `Vec<Tool>` onto the unified
-    /// [`aj_models::types::ToolDefinition`] shape, builds a
+    /// [`Provider`] trait expects, builds a
     /// [`Context`] / [`SimpleStreamOptions`] pair, and hands them
     /// to [`Provider::stream_simple`]. The agent does not block
     /// on the stream here: it's returned to the caller, which
@@ -1680,15 +1678,7 @@ impl Agent {
         } else {
             messages
         };
-        let tools: Vec<UnifiedToolDefinition> = self
-            .tools
-            .iter()
-            .map(|t| UnifiedToolDefinition {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: t.input_schema.clone(),
-            })
-            .collect();
+        let tools = self.tools.clone();
 
         let context = Context {
             system_prompt: Some(system_prompt),

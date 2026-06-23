@@ -291,6 +291,10 @@ Per-crate progress (work top-to-bottom):
 - openai-sdk — `DONE` (kept all public surface per the anthropic-sdk
   precedent; finished the SSE-parse de-dup R11 left half-done; applied the
   contract doc + 2 nits).
+- aj-models-core — `DONE` (collapsed the `tools::Tool` intermediary onto
+  `types::ToolDefinition` per the reference's two-type design; applied the
+  2 doc-link + retry-after-contract Minors and the provider chronology
+  Nits; command-name Nit already consistent in-crate).
 
 ---
 
@@ -948,3 +952,40 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   and an `api_error_display_is_stable` string pin; `cargo test -p
   openai-sdk` green (17), `fmt`/`clippy -p openai-sdk --all-targets` clean,
   `cargo check -p aj-models` confirms no consumer drift.
+- 2026-06-23 · RESIDUAL(aj-models-core) · DONE · 7332eda · Third
+  per-crate residual sweep. Two findings were already retired and
+  verified-only: the unused `async-stream` dep (R19) and `refresh.rs`'s
+  `anyhow` (R11, now a typed `RefreshError`). The live Major was
+  `tools::Tool` (`name`/`description`/`input_schema`/`r#type`), a wire-layer
+  struct that no provider read, existing only so `aj-agent` could map
+  `ErasedToolDefinition → Tool → ToolDefinition` while always setting (and
+  never reading) `r#type: None`. Checked the reference against the user's
+  steer: its wire layer (`packages/ai`) has exactly one tool type,
+  `Tool { name, description, parameters }`, with no `type` field, and its
+  runtime tool (`AgentTool extends Tool`) is passed straight into the
+  inference `Context` with no intermediary. AJ's `ErasedToolDefinition` is
+  the analog of `AgentTool`, so `tools::Tool` was an extraneous third type.
+  Deleted `aj-models/src/tools.rs` + `pub mod tools`, and `aj-agent` now
+  projects `ErasedToolDefinition` straight onto `types::ToolDefinition`
+  (the agent field becomes `Vec<ToolDefinition>`, so the inference site is
+  a plain `self.tools.clone()`), dropping the dead `r#type` field. Kept the
+  runtime's `input_schema` naming (vs the reference's uniform `parameters`)
+  out of scope: unifying it touches every tool impl and the public
+  `ToolDefinition` trait, beyond this finding; noted the divergence for the
+  user. Minors/Nits applied: repointed the two intra-doc links from
+  `crate::errors::*` to `crate::types::{AssistantError,ErrorCategory::Auth}`
+  (both live in `types`), and a review-flagged adjacent bare `[`Auth`]`
+  link in the same block now resolves to `ErrorCategory::Auth`;
+  documented `parse_retry_after`'s past-HTTP-date →
+  `Some(0)` behavior; reworded `provider.rs`'s "until a provider is
+  wired/lands" module doc + two test comments to steady-state. The
+  command-name Nit is ACCEPTED-AS-IS in-crate: the registry warning and
+  `refresh.rs` docs already say `aj update-models`, matching the real
+  `UpdateModels` clap subcommand and CLAUDE.md; the one wrong straggler
+  (`aj models update` in `src/aj/src/model.rs:46`) belongs to the later
+  `aj` binary sweep. No behavior change, no on-disk/wire change (the wire
+  `ToolDefinition` shape is unchanged). Tests: existing `aj-models` +
+  `aj-agent` suites green (the construct→infer path now uses
+  `ToolDefinition` end to end); `fmt`/`clippy -p aj-models -p aj-agent
+  --all-targets` clean; `cargo check --workspace` confirms no consumer
+  drift.

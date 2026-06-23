@@ -22,7 +22,6 @@ pub mod refresh;
 pub mod registry;
 pub mod scripted;
 pub mod streaming;
-pub mod tools;
 pub mod transform;
 pub mod types;
 pub mod usage;

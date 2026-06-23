@@ -342,6 +342,9 @@ fn category_from_status(http_status: Option<u16>, message: &str) -> ErrorCategor
 /// in milliseconds. Accepts integer-seconds form and HTTP-date form.
 /// Returns `None` if the value is missing or unparseable.
 ///
+/// An HTTP-date already in the past returns `Some(0)` (retry
+/// immediately), indistinguishable from a literal `"0"` seconds.
+///
 /// HTTP-date parsing relies on `chrono`'s RFC 2822 / RFC 7231 IMF-fixdate
 /// support; an unparseable date yields `None` rather than spuriously
 /// returning a delay.

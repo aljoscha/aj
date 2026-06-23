@@ -57,13 +57,11 @@ pub trait Provider: Send + Sync {
 
 /// Look up the provider implementation for a given API string.
 ///
-/// Returns [`None`] when no provider has been registered for `api`.
-/// Concrete providers (Anthropic, OpenAI Chat Completions, OpenAI
-/// Responses, OpenAI Codex Responses) plug in here. Until a provider
-/// is registered the top-level dispatch functions
-/// surface the missing provider as an [`AssistantMessageEvent::Error`]
-/// on the resulting stream so callers always observe a uniform stream
-/// shape.
+/// Returns [`None`] for an unrecognized `api`. The registered
+/// providers are Anthropic, OpenAI Chat Completions, OpenAI Responses,
+/// and OpenAI Codex Responses. The top-level dispatch functions turn a
+/// `None` into an [`AssistantMessageEvent::Error`] on the resulting
+/// stream so callers always observe a uniform stream shape.
 ///
 /// Exposed `pub` so the binary can build a provider handle once at
 /// startup and pass it to the agent through [`Provider`]-aware
@@ -196,8 +194,7 @@ mod tests {
 
     /// A trivial provider impl exists in the test module to make sure the
     /// trait shape compiles for downstream impls. It pushes a single
-    /// `Done` event so we can verify the dispatch path end-to-end once a
-    /// provider is wired in.
+    /// `Done` event so we can verify the dispatch path end-to-end.
     struct EchoProvider;
 
     impl Provider for EchoProvider {
@@ -263,8 +260,8 @@ mod tests {
     #[tokio::test]
     async fn provider_trait_drives_dispatch_when_implemented() {
         // Sanity-check that a Provider impl satisfies the trait bounds and
-        // produces a usable stream — guards against drift in the trait
-        // signature once real providers land.
+        // produces a usable stream. Guards against drift in the trait
+        // signature.
         let provider: Box<dyn Provider> = Box::new(EchoProvider);
         let model = fake_model("anthropic-messages");
         let ctx = Context::new("system");
