@@ -1052,7 +1052,7 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   rewrite, and the `openai-responses` demotion. `cargo test -p aj-models`
   green (60 roundtrip + 319 lib), `fmt`/`clippy -p aj-models --all-targets`
   clean, `cargo check --workspace` confirms no consumer drift.
-- 2026-06-23 · RESIDUAL(aj-models-anthropic) · DONE · <commit> · Fifth
+- 2026-06-23 · RESIDUAL(aj-models-anthropic) · DONE · 32545fa · Fifth
   per-crate residual sweep. Two findings were verify-only (already retired
   by themed work): the Major truncated-stream-as-`Done` (R1's
   `finalize_or_truncate` emits a retryable `Transient` error when no
