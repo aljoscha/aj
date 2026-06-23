@@ -221,42 +221,42 @@ fn normalize_tool_call_id(target_api: &str, source_provider: &str, id: &str) -> 
                 Some(i) => &id[..i],
                 None => id,
             };
-            truncate(&sanitize(call_id), 40)
+            truncate_bytes(&sanitize(call_id), 40)
         }
         "openai-responses" => {
             let foreign_origin = source_provider != "openai";
             match id.find('|') {
                 Some(i) => {
                     let (call_id, rest) = (&id[..i], &id[i + 1..]);
-                    let normalized_call = truncate(&sanitize(call_id), 64);
+                    let normalized_call = truncate_bytes(&sanitize(call_id), 64);
                     // Foreign-origin item_ids get a stable hash rewrite
                     // (the upstream value is provider-specific and won't
                     // round-trip); same-provider item_ids just sanitize.
                     let mut normalized_item = if foreign_origin {
                         format!("fc_{}", short_hash(rest))
                     } else {
-                        truncate(&sanitize(rest), 64)
+                        truncate_bytes(&sanitize(rest), 64)
                     };
                     // Responses requires the item_id to start with
                     // `fc_`; inject the prefix when the upstream
                     // half-ID was missing it.
                     if !normalized_item.starts_with("fc_") {
                         normalized_item =
-                            truncate(&sanitize(&format!("fc_{}", normalized_item)), 64);
+                            truncate_bytes(&sanitize(&format!("fc_{}", normalized_item)), 64);
                     } else {
-                        normalized_item = truncate(&normalized_item, 64);
+                        normalized_item = truncate_bytes(&normalized_item, 64);
                     }
                     format!("{}|{}", normalized_call, normalized_item)
                 }
                 // Non-composite (e.g. an Anthropic toolu_xxx or a
                 // Completions call_xxx): treat as call_id only. The
                 // serializer will emit `function_call.id = undefined`.
-                None => truncate(&sanitize(id), 64),
+                None => truncate_bytes(&sanitize(id), 64),
             }
         }
         // Default branch covers `anthropic-messages` and any
         // unrecognized future APIs that follow the same character class.
-        _ => truncate(&sanitize(id), 64),
+        _ => truncate_bytes(&sanitize(id), 64),
     }
 }
 
@@ -273,9 +273,16 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// Truncate a string to at most `max` characters, slicing on UTF-8
-/// boundaries (safe here because [`sanitize`] strips non-ASCII).
-fn truncate(s: &str, max: usize) -> String {
+/// Truncate a string to at most `max` bytes.
+///
+/// Callers must pass ASCII input (the output of [`sanitize`]). The byte
+/// slice would panic on a non-ASCII boundary otherwise. For sanitized
+/// ASCII, bytes and characters coincide, so this is also a character cap.
+fn truncate_bytes(s: &str, max: usize) -> String {
+    debug_assert!(
+        s.is_ascii(),
+        "truncate_bytes requires sanitized ASCII input"
+    );
     if s.len() <= max {
         s.to_string()
     } else {
@@ -544,6 +551,16 @@ mod tests {
 
     fn tool_result(call_id: &str, name: &str, body: &str) -> Message {
         Message::ToolResult(ToolResultMessage::text(call_id, name, body, false))
+    }
+
+    // -- ID helpers ---------------------------------------------------
+
+    #[test]
+    fn truncate_bytes_caps_at_byte_limit() {
+        assert_eq!(truncate_bytes("abcdef", 4), "abcd");
+        assert_eq!(truncate_bytes("abc", 4), "abc");
+        assert_eq!(truncate_bytes("abcd", 4), "abcd");
+        assert_eq!(truncate_bytes("", 4), "");
     }
 
     // -- Same-model passthrough (rule 1) ------------------------------

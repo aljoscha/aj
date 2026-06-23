@@ -490,6 +490,25 @@ pub fn update_tracker_from_text(text: &str, tracker: &mut AnsiStyleTracker) {
 // Visible width calculation
 // ---------------------------------------------------------------------------
 
+/// Display-column width a tab expands to in this layer.
+///
+/// This is the width authority for tabs. The scanners that intercept a raw
+/// `\t` ([`visible_width`], `truncate_fragment_to_width`, [`truncate_to_width`])
+/// measure it as this many columns, and components normalize tabs to
+/// [`TAB_AS_SPACES`] before wrapping so the rendered glyph count matches what
+/// we measured. The compositing scanners ([`slice_with_width`],
+/// [`extract_segments`]) instead measure via [`grapheme_width`] (a tab is
+/// width 0 there) because they run on already-normalized rendered lines that
+/// no longer contain raw tabs.
+pub(crate) const TAB_WIDTH: usize = 3;
+
+/// The spaces a tab normalizes to before wrapping, kept in sync with
+/// [`TAB_WIDTH`] by the assertion below. Components replace `\t` with this so
+/// a measured tab and its rendered form occupy the same columns.
+pub(crate) const TAB_AS_SPACES: &str = "   ";
+
+const _: () = assert!(TAB_AS_SPACES.len() == TAB_WIDTH);
+
 /// Returns true if every byte in the string is printable ASCII (0x20..=0x7E).
 fn is_printable_ascii(s: &str) -> bool {
     s.bytes().all(|b| (0x20..=0x7e).contains(&b))
@@ -512,6 +531,11 @@ fn is_printable_ascii(s: &str) -> bool {
 /// half-arrived flag as a 2-wide tofu glyph during streaming. Holding
 /// at 2 keeps differential-render math stable while a flag pair is
 /// being assembled grapheme by grapheme.
+///
+/// Control characters, including `\t`, are width 0 here: this measures a
+/// single cluster as the terminal advances the cursor, and a tab does not
+/// advance it. Callers that want tabs expanded to columns must use
+/// [`visible_width`] (or normalize tabs to [`TAB_AS_SPACES`] first).
 pub fn grapheme_width(grapheme: &str) -> usize {
     if grapheme.is_empty() {
         return 0;
@@ -683,7 +707,7 @@ fn is_punctuation_char(c: char) -> bool {
 ///
 /// Handles:
 /// - ANSI escape sequences (CSI, OSC, APC) -- zero width
-/// - Tab characters -- counted as 3 columns
+/// - Tab characters -- counted as [`TAB_WIDTH`] columns
 /// - Wide characters (CJK) -- counted as 2 columns
 /// - Grapheme clusters (emoji, combining marks) -- proper width
 ///
@@ -723,7 +747,7 @@ pub fn visible_width(s: &str) -> usize {
             }
         }
         if bytes[i] == b'\t' {
-            clean.push_str("   ");
+            clean.push_str(TAB_AS_SPACES);
             i += 1;
             continue;
         }
@@ -836,7 +860,7 @@ fn truncate_fragment_to_width(text: &str, max_width: usize) -> (String, usize) {
             continue;
         }
         if bytes[i] == b'\t' {
-            if width + 3 > max_width {
+            if width + TAB_WIDTH > max_width {
                 break;
             }
             if !pending_ansi.is_empty() {
@@ -844,7 +868,7 @@ fn truncate_fragment_to_width(text: &str, max_width: usize) -> (String, usize) {
                 pending_ansi.clear();
             }
             result.push('\t');
-            width += 3;
+            width += TAB_WIDTH;
             i += 1;
             continue;
         }
@@ -997,18 +1021,18 @@ pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str, pad: bool
             continue;
         }
         if bytes[i] == b'\t' {
-            if keep_prefix && kept_width + 3 <= target_width {
+            if keep_prefix && kept_width + TAB_WIDTH <= target_width {
                 if !pending_ansi.is_empty() {
                     result.push_str(&pending_ansi);
                     pending_ansi.clear();
                 }
                 result.push('\t');
-                kept_width += 3;
+                kept_width += TAB_WIDTH;
             } else {
                 keep_prefix = false;
                 pending_ansi.clear();
             }
-            visible_so_far += 3;
+            visible_so_far += TAB_WIDTH;
             if visible_so_far > max_width {
                 overflowed = true;
                 break;
@@ -1199,10 +1223,10 @@ fn break_long_word(word: &str, width: usize, tracker: &mut AnsiStyleTracker) -> 
             Segment::Grapheme(g) => {
                 // Use `visible_width` rather than `grapheme_width` so a
                 // tab grapheme contributes its expanded column count
-                // (3) instead of the raw control-char zero. Without
-                // that, a long word containing an embedded tab is
+                // (`TAB_WIDTH`) instead of the raw control-char zero.
+                // Without that, a long word containing an embedded tab is
                 // under-counted and the resulting chunk overflows the
-                // requested width — see
+                // requested width. See
                 // `wrap_text_with_ansi_breaks_long_word_with_embedded_tab`
                 // in `tests/wrap_ansi.rs`.
                 let gw = visible_width(g);

@@ -263,7 +263,7 @@ When presenting a proposal, cover:
   (openai-sdk, aj-models); move `aj-tui`'s direct version pins to
   `[workspace.dependencies]`.
 
-### R20 — Reconcile truncation naming + hoist the tab-width constant  [cleanup · TODO]
+### R20 — Reconcile truncation naming + hoist the tab-width constant  [cleanup · DONE]
 - **Sources:** M2, TO1, T2, T4; `_SUMMARY` theme 9. Three correct-but-
   same-named `truncate` impls; "tab = 3 spaces" duplicated across three
   `aj-tui` files.
@@ -821,3 +821,34 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   code or behavior impact. `cargo check --workspace` resolves; `cargo
   test -p aj-tui -p aj-tui-testkit` green (covers the moved dev-deps);
   `fmt` clean.
+- 2026-06-23 · R20 · DONE · 8a25077 · Two batched consistency nits, no
+  behavior change. (a) Truncation naming: in the live code only one of the
+  three truncation impls was actually bare `truncate` (the others already
+  carry contract-naming suffixes, `truncate_head`/`truncate_tail` in
+  `aj-tools` and `truncate_to_width` in `aj-tui`). Renamed
+  `aj-models/src/transform.rs::truncate` to `truncate_bytes`, corrected its
+  doc (it slices *bytes*, not "characters on UTF-8 boundaries"), and added a
+  `debug_assert!(s.is_ascii())` so the load-bearing post-`sanitize` ASCII
+  invariant (the only thing keeping the byte slice from panicking) is
+  enforced, not just narrated. (b) Tab-width constant: lifted the
+  "tab = 3" magic into `aj-tui`'s `ansi` (the width authority) as
+  `pub(crate) const TAB_WIDTH: usize = 3` and `TAB_AS_SPACES: &str = "   "`,
+  tied together by a `const _: () = assert!(TAB_AS_SPACES.len() ==
+  TAB_WIDTH)`. The three tab-expanding scanners (`visible_width`,
+  `truncate_fragment_to_width`, `truncate_to_width`) and `break_long_word`
+  now reference the constant; both component-local `TAB_AS_SPACES` copies in
+  `text.rs`/`markdown.rs` are gone, retiring the convention-by-comment ("matches
+  the `Text` component's constant"). Documented the genuine fork the T2
+  finding flagged: `grapheme_width` returns 0 for `\t` (and all control
+  chars) while `visible_width` expands it, and the compositing scanners
+  (`slice_with_width`/`extract_segments`) measure via `grapheme_width`
+  because they run on already-normalized rendered lines. Considered, then
+  rejected, reconciling that divergence by making `grapheme_width` expand
+  `\t` (which would let `break_long_word` drop its `visible_width`
+  workaround): changing a width primitive's contract exceeds R20's
+  mechanical scope, so the finding's documentation-only ask is the right
+  fit. Tests:
+  `truncate_bytes_caps_at_byte_limit`; existing ansi tab/width suite
+  (`test_visible_width_tab` et al.) unchanged and green; the static assert
+  is a compile-time check. `fmt`/`check`/`clippy --all-targets` clean on
+  `aj-models`/`aj-tui`, `cargo check --workspace` resolves.

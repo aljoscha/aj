@@ -1,6 +1,6 @@
 //! Multi-line word-wrapping text display component.
 
-use crate::ansi::{apply_background_to_line, visible_width, wrap_text_with_ansi};
+use crate::ansi::{TAB_AS_SPACES, apply_background_to_line, visible_width, wrap_text_with_ansi};
 use crate::component::Component;
 
 /// Default horizontal padding (left/right margin) applied to text content.
@@ -8,11 +8,6 @@ const DEFAULT_PADDING_X: usize = 1;
 
 /// Default vertical padding (top/bottom blank rows) around text content.
 const DEFAULT_PADDING_Y: usize = 1;
-
-/// Tabs in input text are normalized to this many spaces before wrapping
-/// so tab-indented input renders with the right visible width instead of
-/// a single literal `\t` cell.
-const TAB_AS_SPACES: &str = "   ";
 
 /// A component that displays multi-line text with word wrapping.
 ///
