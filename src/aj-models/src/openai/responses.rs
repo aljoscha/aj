@@ -759,6 +759,7 @@ pub(super) fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
 /// `function_call` items is omitted when the assistant message came
 /// from a different api so the server doesn't try to pair it with
 /// reasoning items it never produced.
+#[cfg(any(test, feature = "test-support"))]
 pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<ResponseInputItem> {
     let mut out = Vec::new();
     append_assistant_message(API_NAME, message, &mut out);
@@ -770,17 +771,19 @@ pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<Respo
 /// reasoning / function_call items) back into a unified
 /// [`AssistantMessage`].
 ///
-/// Symmetric to the streaming state machine, exposed publicly so the
-/// round-trip suite can replay request bodies through the same parse
-/// path.
+/// Symmetric to the streaming state machine, surfaced under the
+/// `test-support` feature so the round-trip suite can replay request
+/// bodies through the same parse path.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_assistant_input_items(items: &[ResponseInputItem]) -> AssistantMessage {
     parse_assistant_input_items_with_api(API_NAME, items)
 }
 
-/// Like [`parse_assistant_input_items`] but lets the caller pin the
-/// `api` field on the returned message. Used by sibling providers
-/// (`openai-codex-responses`) that share the Responses wire shape but
-/// have their own api identifier.
+/// Like the public `parse_assistant_input_items` wrapper but lets the
+/// caller pin the `api` field on the returned message. Used by sibling
+/// providers (`openai-codex-responses`) that share the Responses wire
+/// shape but have their own api identifier.
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn parse_assistant_input_items_with_api(
     api_name: &str,
     items: &[ResponseInputItem],
@@ -846,6 +849,7 @@ pub(super) fn parse_assistant_input_items_with_api(
     out
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn push_message_text(
     out: &mut AssistantMessage,
     content: &ResponseInputMessageContent,
@@ -881,6 +885,7 @@ fn push_message_text(
 /// the provider's state machine and return the finalized
 /// [`AssistantMessage`]. Mirror of
 /// [`crate::openai::provider::replay_sse_events`].
+#[cfg(any(test, feature = "test-support"))]
 pub fn replay_sse_events(
     model: &ModelInfo,
     events: impl IntoIterator<Item = ResponseStreamEvent>,

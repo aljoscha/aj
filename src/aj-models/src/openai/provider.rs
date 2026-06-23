@@ -567,6 +567,7 @@ fn convert_tool_result(
 /// projecting a streamed message that has at least one block can rely
 /// on `Some(...)`; the streaming parser never produces empty messages
 /// once any delta has arrived.
+#[cfg(any(test, feature = "test-support"))]
 pub fn assistant_message_to_request_item(
     message: &AssistantMessage,
 ) -> Option<ChatCompletionRequestMessage> {
@@ -600,6 +601,7 @@ pub fn assistant_message_to_request_item(
 /// Non-`Assistant` variants (`User`, `System`, `Tool`, `Developer`)
 /// produce an empty `AssistantMessage`; the role is taken on faith,
 /// matching [`crate::anthropic::provider::parse_assistant_request_item`].
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_assistant_request_item(item: &ChatCompletionRequestMessage) -> AssistantMessage {
     let mut out = AssistantMessage::empty();
     out.api = API_NAME.to_string();
@@ -661,8 +663,9 @@ pub fn parse_assistant_request_item(item: &ChatCompletionRequestMessage) -> Assi
 /// Mirror of [`crate::anthropic::provider::replay_sse_events`] in
 /// shape; the fixture-based round-trip suite uses this to turn captured
 /// SSE wire dumps into unified messages without spinning up a real HTTP
-/// client. Provided publicly so external test suites can share the
-/// exact same parse path the live provider does.
+/// client. Surfaced under the `test-support` feature so those tests share
+/// the exact same parse path the live provider does.
+#[cfg(any(test, feature = "test-support"))]
 pub fn replay_sse_events(
     model: &ModelInfo,
     events: impl IntoIterator<Item = CreateChatCompletionStreamResponse>,

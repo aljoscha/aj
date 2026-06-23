@@ -47,16 +47,20 @@ use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream, Error
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantError, AssistantMessage, Context, ErrorCategory,
-    ReasoningSummary as UnifiedReasoningSummary, ServiceTier, SimpleStreamOptions, StopReason,
-    StreamOptions, ThinkingLevel, ToolDefinition,
+    ReasoningSummary as UnifiedReasoningSummary, SimpleStreamOptions, StopReason, StreamOptions,
+    ThinkingLevel, ToolDefinition,
 };
+// Used only by the `test-support` round-trip helpers below.
+#[cfg(any(test, feature = "test-support"))]
+use crate::types::ServiceTier;
 
 use super::errors::classify_client_error_with;
 use super::responses::{
-    CostMultiplierFn, StreamState, append_assistant_message, convert_messages, empty_partial,
-    error_from_code, map_reasoning_effort, map_service_tier, parse_assistant_input_items_with_api,
-    verbosity_text_config,
+    CostMultiplierFn, StreamState, convert_messages, empty_partial, error_from_code,
+    map_reasoning_effort, map_service_tier, verbosity_text_config,
 };
+#[cfg(any(test, feature = "test-support"))]
+use super::responses::{append_assistant_message, parse_assistant_input_items_with_api};
 
 /// `api` field reported on assistant messages produced by this provider.
 pub(super) const API_NAME: &str = "openai-codex-responses";
@@ -633,6 +637,7 @@ fn resolve_codex_service_tier<'a>(
 /// [`super::responses::append_assistant_message`] see the right
 /// provider identity (a message produced by `openai-codex-responses`
 /// stays "same-provider" when re-serialized through this helper).
+#[cfg(any(test, feature = "test-support"))]
 pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<ResponseInputItem> {
     let mut out = Vec::new();
     append_assistant_message(API_NAME, message, &mut out);
@@ -644,8 +649,10 @@ pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<Respo
 /// reasoning / function_call items) back into a unified
 /// [`AssistantMessage`] tagged with [`API_NAME`].
 ///
-/// Symmetric to the streaming state machine; exposed so the round-trip
-/// suite can replay request bodies through the same parse path.
+/// Symmetric to the streaming state machine, surfaced under the
+/// `test-support` feature so the round-trip suite can replay request
+/// bodies through the same parse path.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_assistant_input_items(items: &[ResponseInputItem]) -> AssistantMessage {
     parse_assistant_input_items_with_api(API_NAME, items)
 }
@@ -662,6 +669,7 @@ pub fn parse_assistant_input_items(items: &[ResponseInputItem]) -> AssistantMess
 /// Mirror of [`super::responses::replay_sse_events`] for round-trip
 /// tests; the live provider uses the same machinery through
 /// [`run_stream_inner`].
+#[cfg(any(test, feature = "test-support"))]
 pub fn replay_sse_events(
     model: &ModelInfo,
     events: impl IntoIterator<Item = ResponseStreamEvent>,

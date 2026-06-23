@@ -509,9 +509,9 @@ fn convert_assistant_message(m: &AssistantMessage) -> MessageParam {
 ///
 /// This is the serialize side of the round-trip invariant. It is the
 /// same projection the provider uses internally when building a request
-/// body, exposed publicly so the round-trip test suite (and any future
-/// consumer that wants to materialize a single assistant turn into its
-/// wire form without spinning up a full request) can call it directly.
+/// body, surfaced under the `test-support` feature so the round-trip
+/// integration tests can materialize a single assistant turn into its
+/// wire form without spinning up a full request.
 ///
 /// Behaviour:
 /// - Text blocks are forwarded verbatim.
@@ -522,6 +522,7 @@ fn convert_assistant_message(m: &AssistantMessage) -> MessageParam {
 ///   stream) are demoted to plain text so the model still sees the
 ///   context.
 /// - Tool calls ride as `tool_use` blocks.
+#[cfg(any(test, feature = "test-support"))]
 pub fn assistant_message_to_request_item(message: &AssistantMessage) -> MessageParam {
     convert_assistant_message(message)
 }
@@ -548,6 +549,7 @@ pub fn assistant_message_to_request_item(message: &AssistantMessage) -> MessageP
 /// content set and are dropped — matching the streaming parser's
 /// `BlockState::Ignored` behaviour. The `role` is taken on faith; passing
 /// in a user-role param yields an empty assistant message.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_assistant_request_item(param: &MessageParam) -> AssistantMessage {
     let mut content = Vec::with_capacity(param.content.len());
     for block in &param.content {
@@ -607,36 +609,31 @@ pub fn parse_assistant_request_item(param: &MessageParam) -> AssistantMessage {
 ///
 /// The fixture-based round-trip tests in `tests/roundtrip/` use this to
 /// turn captured SSE wire dumps into unified messages without spinning up
-/// a real HTTP client. Provided publicly so external test suites can
-/// share the exact same parse path the live provider does.
+/// a real HTTP client. Surfaced under the `test-support` feature so those
+/// tests share the exact same parse path the live provider does.
+#[cfg(any(test, feature = "test-support"))]
 pub fn replay_sse_events(
     model: &ModelInfo,
     events: impl IntoIterator<Item = ServerSentEvent>,
 ) -> AssistantMessage {
     let mut state = StreamState::new(model);
-    let mut last_event: Option<AssistantMessageEvent> = None;
     for ev in events {
         let outcome = state.process(ev);
-        if let Some(last) = outcome.events.into_iter().last() {
-            last_event = Some(last);
-        }
         if outcome.terminal {
-            // `MessageStop` produces no events itself; finalize below.
-            // `Error` already produced an `Error` event with the final
-            // message; keep that.
+            // A terminal frame is either a mid-stream `error` frame, which
+            // emits an `Error` event carrying the finalized message, or
+            // `MessageStop`, which emits nothing and is finalized below.
+            if let Some(AssistantMessageEvent::Error { error, .. }) =
+                outcome.events.into_iter().last()
+            {
+                return error;
+            }
             break;
         }
     }
-    // If the stream emitted its own terminal `Error` event, prefer that
-    // message — it carries the populated `error` and `stop_reason`.
-    if let Some(AssistantMessageEvent::Error { error, .. }) = last_event {
-        return error;
-    }
-    match state.finalize_or_truncate() {
-        AssistantMessageEvent::Done { message, .. }
-        | AssistantMessageEvent::Error { error: message, .. } => message,
-        other => panic!("StreamState::finalize returned non-terminal event: {other:?}"),
-    }
+    // `finalize_or_truncate` is total over `Done`/`Error` (truncation
+    // included), so the terminal message is always available.
+    state.finalize_or_truncate().partial().clone()
 }
 
 fn convert_tool_result(t: &ToolResultMessage) -> ContentBlockParam {
@@ -1002,9 +999,11 @@ impl StreamState {
         match event {
             ServerSentEvent::MessageStart { message } => {
                 self.partial.response_id = Some(message.id);
-                // The server may report a slightly different `model`
-                // than the registry id (e.g. version-pinned). Trust
-                // the wire value.
+                // The server may report a slightly different `model` than
+                // the registry id (e.g. version-pinned). Trust the wire
+                // value. Display-only: cost keys off the registry
+                // `ModelInfo`, not `partial.model`, so the override can't
+                // desync pricing.
                 if !message.model.is_empty() {
                     self.partial.model = message.model;
                 }
@@ -1017,8 +1016,14 @@ impl StreamState {
                 index,
                 content_block,
             } => {
-                let content_index =
-                    usize::try_from(index).expect("content_block_start.index fits in usize");
+                // The wire `index` is untrusted server data. On 64-bit
+                // `usize::try_from(u64)` can't fail, so this branch only
+                // guards 32-bit targets, dropping the block rather than
+                // panicking the spawned stream task. The delta/stop arms
+                // below are likewise defensive about a bad index.
+                let Ok(content_index) = usize::try_from(index) else {
+                    return ProcessOutcome { events, terminal };
+                };
                 self.pad_blocks_to(content_index);
                 match content_block {
                     AContentBlock::TextBlock { text, .. } => {
@@ -1097,8 +1102,9 @@ impl StreamState {
                 }
             }
             ServerSentEvent::ContentBlockDelta { index, delta } => {
-                let content_index =
-                    usize::try_from(index).expect("content_block_delta.index fits in usize");
+                let Ok(content_index) = usize::try_from(index) else {
+                    return ProcessOutcome { events, terminal };
+                };
                 let block = match self.blocks.get_mut(content_index) {
                     Some(b) => b,
                     None => return ProcessOutcome { events, terminal },
@@ -1163,8 +1169,9 @@ impl StreamState {
                 }
             }
             ServerSentEvent::ContentBlockStop { index } => {
-                let content_index =
-                    usize::try_from(index).expect("content_block_stop.index fits in usize");
+                let Ok(content_index) = usize::try_from(index) else {
+                    return ProcessOutcome { events, terminal };
+                };
                 let Some(block) = self.blocks.get(content_index).cloned() else {
                     return ProcessOutcome { events, terminal };
                 };
@@ -1293,6 +1300,11 @@ impl StreamState {
         finalize_usage(&mut self.partial.usage, &self.cost);
 
         let (stop_reason, done_reason) = match self.stop_reason {
+            // `PauseTurn` ("server wants to keep going", e.g. a long
+            // server-side tool call) collapses to a plain `Stop`. We run
+            // tools in the agent loop rather than using server-side tools,
+            // so pause-turn doesn't arise in practice, and treating it as
+            // a completed turn is the safe default.
             Some(AStopReason::EndTurn)
             | Some(AStopReason::PauseTurn)
             | Some(AStopReason::StopSequence)
@@ -1316,12 +1328,9 @@ impl StreamState {
             };
         }
 
-        // Error-flavored terminal (e.g. refusal). Backfill an error
-        // message if we don't already have one — callers should never
-        // see a `StopReason::Error` without an accompanying message.
         // Error-flavored terminal (e.g. refusal). Backfill a structured
-        // error if we don't already have one — callers should never
-        // see a `StopReason::Error` without an accompanying detail.
+        // error if we don't already have one. Callers should never see a
+        // `StopReason::Error` without an accompanying detail.
         if self.partial.error.is_none() {
             let stop_label = match self.stop_reason {
                 Some(AStopReason::Refusal) => "refusal",
@@ -2076,6 +2085,33 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn streamstate_out_of_range_index_drops_block_without_panicking() {
+        // A delta or stop addressing a slot with no open block is dropped
+        // rather than panicking the spawned stream task. The companion
+        // `usize::try_from` guard in each arm only fires on 32-bit targets,
+        // where a u64 index can exceed `usize::MAX`. Here we exercise the
+        // reachable-everywhere out-of-range-slot path instead.
+        let mut state = StreamState::new(&fake_model());
+        let _ = state.process(ServerSentEvent::MessageStart {
+            message: empty_a_message(),
+        });
+
+        let delta = state.process(ServerSentEvent::ContentBlockDelta {
+            index: 7,
+            delta: AContentBlockDelta::TextDelta { text: "x".into() },
+        });
+        assert!(delta.events.is_empty());
+        assert!(!delta.terminal);
+
+        let stop = state.process(ServerSentEvent::ContentBlockStop { index: 7 });
+        assert!(stop.events.is_empty());
+        assert!(!stop.terminal);
+
+        // No phantom block was created for the out-of-range index.
+        assert!(state.partial.content.is_empty());
     }
 
     #[test]

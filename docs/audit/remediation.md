@@ -300,6 +300,13 @@ Per-crate progress (work top-to-bottom):
   private; dropped `repair_json`'s per-delta `Vec<char>`; doc + tests for
   the partial-number collapse and the `openai-responses` demotion; trimmed
   the duplicated strategy-chain comments. R20/R19 retirements verified).
+- aj-models-anthropic — `DONE` (Major + Testing findings verify-only,
+  retired by R1/R16; the boundary finding resolved with a `test-support`
+  cargo feature applied across all four providers, which also retires the
+  round-trip-helper portion of the `aj-models-openai` report's equivalent
+  pub-for-tests finding (its `TextSignatureV1` envelope sub-item, a prod
+  struct, stays for that sweep); plus the anthropic-local
+  index/comment/simplicity cleanups).
 
 ---
 
@@ -1045,3 +1052,68 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   rewrite, and the `openai-responses` demotion. `cargo test -p aj-models`
   green (60 roundtrip + 319 lib), `fmt`/`clippy -p aj-models --all-targets`
   clean, `cargo check --workspace` confirms no consumer drift.
+- 2026-06-23 · RESIDUAL(aj-models-anthropic) · DONE · <commit> · Fifth
+  per-crate residual sweep. Two findings were verify-only (already retired
+  by themed work): the Major truncated-stream-as-`Done` (R1's
+  `finalize_or_truncate` emits a retryable `Transient` error when no
+  terminal frame arrived) and the happy-path-only roundtrip Testing Minor
+  (R16's `truncated`/`error_frame`/`refusal` fixtures). Live changes, all in
+  `anthropic/provider.rs` except the cross-provider feature gate.
+  **[Minor][Boundaries] over-broad public surface for tests (the
+  cross-provider theme):** the per-provider round-trip helpers
+  (`replay_sse_events` + the request/response item projections) were `pub`
+  solely so the `tests/roundtrip/` integration crate (a separate
+  compilation unit) could reach them. A shared crate is a non-starter here
+  because `replay_sse_events` drives the private `StreamState`, so it can
+  only live in the provider module. Resolved (user call: option B over a
+  lighter `#[doc(hidden)]`) with a new default-off `test-support` cargo
+  feature on `aj-models`, gating each helper `#[cfg(any(test, feature =
+  "test-support"))]`, plus a self dev-dependency (`aj-models = { path =
+  ".", features = ["test-support"] }`) that turns the feature on for our own
+  test targets so `cargo test` works without `--features`. So the helpers
+  vanish from a production build entirely (verified: `cargo build
+  --workspace` and `cargo check -p aj-models` compile clean with them
+  absent), matching the `aj-tools::testing` precedent. Applied to **all
+  four providers** at the user's request (anthropic + the three OpenAI
+  adapters), so it also retires the round-trip-helper portion of the
+  `aj-models-openai` report's equivalent pub-for-tests finding. That
+  finding also names the `TextSignatureV1` envelope, a struct used in
+  production (so it can't be feature-gated, only visibility-narrowed) and
+  also reachable by the test crate, so it's a different sub-case left for
+  the `aj-models-openai` sweep. Gating exposed that the reverse-parse
+  path (`parse_assistant_input_items_with_api`, `push_message_text`, and the
+  codex `append_assistant_message`/`parse_assistant_input_items_with_api`/
+  `ServiceTier` imports) is itself entirely test-only (the live provider
+  parses streamed *responses*, never request items back), so those were
+  gated/split out too, keeping both the feature-on and feature-off builds
+  warning-free. **[Minor][Contracts] reachable `expect` on the wire
+  `index`:** replaced the three `usize::try_from(index).expect(...)` in
+  `process` with the file's own defensive early-return (`let Ok(idx) = ...
+  else { return ProcessOutcome { events, terminal } }`). Honest note: the
+  wire type is `u64`, so on 64-bit `try_from` is infallible and the new
+  branch only guards 32-bit targets. The change removes a
+  panic-in-principle and matches the parser's otherwise-total handling, but
+  is not 64-bit-observable. **[Minor][Comments]** deleted the duplicated `finalize`
+  comment paragraph (kept the structured-error wording, dropped the
+  em-dash). **[Nit][Comments]** clarified the `MessageStart` "trust the
+  wire value" comment (display-only: cost keys off the registry `ModelInfo`,
+  not `partial.model`). **[Nit][Simplicity]** simplified `replay_sse_events`
+  (anthropic), dropping the `last_event` accumulator and the unreachable
+  `panic!` arm: capture the terminal `Error` inside the loop and finalize via
+  `finalize_or_truncate().partial().clone()` (total over `Done`/`Error`).
+  **[Nit, from the boundary notes]** added a rationale comment to the
+  `PauseTurn → Stop` arm (we run tools in the agent loop, not server-side,
+  so pause-turn doesn't arise in practice, and a completed-turn mapping is
+  the safe default, with no behavior change). The OpenAI
+  adapters' own non-boundary leftovers (e.g. their `replay_sse_events`
+  panic arm) stay for the `aj-models-openai` sweep. Tests: a new
+  `streamstate_out_of_range_index_drops_block_without_panicking` pins the
+  defensive index path. The existing `streamstate_finalize_maps_stop_reasons`
+  covers PauseTurn→Stop and the roundtrip suite drives the simplified
+  `replay_sse_events` (the error/truncation legs included). `cargo test
+  -p aj-models` green (320 lib + 60 roundtrip), `fmt`/`clippy -p aj-models
+  --all-targets` clean, `cargo check --workspace --all-targets` confirms no
+  consumer drift. The non-leak is established by `cargo build --workspace`
+  / `cargo check -p aj-models` (dev-deps inactive there, so the feature is
+  off and the helpers are absent), not by the `--all-targets` run, which
+  activates the dev-edge and turns the feature on.

@@ -22,10 +22,24 @@ tokio.workspace = true
 tokio-util = { workspace = true }
 tracing.workspace = true
 
+[features]
+# Exposes the per-provider round-trip helpers (`replay_sse_events` and the
+# request/response item projections) used by the integration tests in
+# `tests/roundtrip/`. Those tests are a separate crate, so they can only
+# reach `pub` items. Off by default, so these test-only entry points never
+# appear in a production build. The self dev-dependency below turns the
+# feature on for our own test/bench/example targets, so `cargo test` works
+# without `--features`.
+test-support = []
+
 [dev-dependencies]
 # Integration tests in `tests/roundtrip/` re-use the live SDK shapes
 # directly so the round-trip fixtures stay in sync with the wire.
 anthropic-sdk = { path = "../anthropic-sdk" }
+# Self dev-dependency: enables `test-support` for our own test targets only
+# (dev-dependencies are inactive for normal builds), exposing the gated
+# round-trip helpers to the `tests/roundtrip/` integration crate.
+aj-models = { path = ".", features = ["test-support"] }
 serde_json.workspace = true
 
 [lints]
