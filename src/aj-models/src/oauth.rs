@@ -35,6 +35,7 @@ mod test_support;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// Persisted OAuth tokens for a single provider.
@@ -58,6 +59,13 @@ pub struct OAuthCredentials {
     /// Provider-specific fields (e.g. OpenAI's `account_id`). Stored
     /// flattened into the parent JSON object so the on-disk shape is
     /// `{ refresh, access, expires, ...extra }`.
+    ///
+    /// Because it's `#[serde(flatten)]`, this absorbs *every*
+    /// unrecognized top-level key on deserialize, which is what keeps
+    /// adding a provider field migration-free. The three core fields
+    /// above are required (no `serde(default)`), so a renamed or
+    /// dropped core field surfaces as a loud "missing field" parse
+    /// error rather than being silently swallowed into `extra`.
     #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -84,6 +92,18 @@ impl OAuthCredentials {
     pub fn is_expired_at(&self, now_unix_ms: i64) -> bool {
         now_unix_ms >= self.expires
     }
+}
+
+/// Current Unix time in milliseconds, the clock reading paired with
+/// [`OAuthCredentials::is_expired_at`] and used to stamp absolute
+/// expiry at token-exchange time.
+///
+/// One shared reader for the whole auth/oauth subtree so expiry math
+/// reads the same clock everywhere. The testable seam is
+/// `is_expired_at(now)`, which takes the time as a parameter, so this
+/// reader itself needs no stubbing.
+pub(crate) fn now_unix_ms() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
 /// Information the user needs in order to authorize the application.

@@ -312,6 +312,22 @@ Per-crate progress (work top-to-bottom):
   terminal-error divergence to preserve the partial, removed the dead
   `ProcessOutcome.terminal`, kept+documented `TextSignatureV1`, added the
   tool-call id fallback, and applied the comment/clock/no-op cleanups).
+- aj-models-auth — `DONE` (the two Majors + the scripted-surface
+  Boundaries + the timeout/margin Contracts were verify-only, retired by
+  R4/R10/R12. One behavior change, finding 4(1): a stored OAuth
+  credential under an unregistered provider id now resolves to `Ok(None)`
+  instead of hard-erroring `UnknownProvider`, matching the reference and
+  giving the host's "log in" path instead of a raw error. Cross-checked
+  the resolution chain against the reference, which also returns the
+  none-equivalent for unknown providers. Recorded that the reference
+  deliberately checks env *after* stored creds, the inverse of ours, as a
+  noted-not-changed divergence. Doc'd the env-OAuth-no-refresh contract on
+  `get_api_key` and the `extra` flatten/required-field behavior. Fixed
+  `generate_state`'s per-byte `format!`, softened the request-head cap
+  doc, and finished the clock dedup into one `oauth::now_unix_ms`.
+  ACCEPTED-AS-IS the `find_env_keys` doc, already corrected to "four
+  providers". Added the refresh-failure, unknown-provider, and
+  manual-paste-race tests the report flagged as missing).
 
 ---
 
@@ -1203,3 +1219,82 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   the `TextSignatureV1` codec-visibility note, and two comment
   semicolons), and kept the shift-to-fresh-index fallback regression
   test (the case index-first does recover).
+- 2026-06-24 · RESIDUAL(aj-models-auth) · DONE · 044e142 · Seventh
+  per-crate residual sweep. Four findings were verify-only, already
+  retired by themed work: the Major token-body leak (R4's
+  `redacted_body_summary` in `token::send_token_request`), the Major
+  ~80% OAuth duplication (R10's `callback`/`paste`/`token`/`test_support`
+  seam), the scripted-surface Boundaries Minor (R12 kept `scripted` in
+  prod, documented `ExhaustedBehavior::Panic` test-only), and the
+  timeout-vs-margin Contracts Minor (R10's NOTE on
+  `REFRESH_SAFETY_MARGIN_MS` relating it to `LOCK_TIMEOUT +
+  REQUEST_TIMEOUT_SECS`). The user asked to cross-check the live items
+  against the reference before implementing, which reshaped two of them.
+  **One behavior change (finding 4(1), the key cross-check learning):** a
+  stored OAuth credential whose provider id isn't in the registry (a
+  hand-edited or renamed id) previously hard-errored `UnknownProvider`
+  via `?` even for a fresh token. It now resolves to `Ok(None)`, matching
+  the reference's `getApiKey`, which returns `undefined` for an unknown
+  OAuth provider so the host shows its "log in from the palette" message
+  (the `Ok(None)` arm in `model.rs`) rather than a raw error. We can
+  neither validate nor refresh such a credential, so treating it as
+  unconfigured is both friendlier and the production-tested behavior. The
+  fix is a `let-else` early return that swallows only `UnknownProvider`
+  (the lone error `lookup_oauth_provider` returns). `login()` still errors
+  on an unknown provider, and the refresh-failure path still bubbles
+  `AuthError::OAuth` (our deliberate, documented design, arguably better
+  than the reference's collapse-to-none since a transient refresh blip
+  keeps its cause). Chose this over the proposal's original
+  "document-as-fatal" once the reference showed the gentler path is
+  validated in production. **Finding 4(2):** documented on `get_api_key`
+  that env-supplied OAuth tokens (`ANTHROPIC_OAUTH_TOKEN`,
+  `OPENAI_CODEX_OAUTH_TOKEN`) are returned without refresh, so a stale one
+  surfaces as a 401. **Finding 7 (`extra` flatten):** doc-only, correcting
+  the finding's premise. The reference's `OAuthCredentials` is the same
+  `[key: string]: unknown` catch-all with no guard, but our Rust core
+  fields are *required* (no `serde(default)`), so a renamed core field is
+  a loud parse error, not a silent empty `access`. Documented that, did
+  not add the suggested non-empty assertion (a missing field already
+  errors). **Finding 8:** replaced `generate_state`'s per-byte
+  `push_str(&format!(...))` with `write!` into the pre-sized buffer
+  (byte-identical output), matching the reference's one-shot hex encode.
+  **Finding 5/F10 (`MAX_REQUEST_HEAD_BYTES`):** softened the doc to state
+  we parse-what-we-have on hitting the cap rather than reject (the request
+  line always precedes headers, and an over-cap request line just fails to
+  parse → 400 → keep listening). The reference delegates to Node's HTTP
+  server, so there was no manual reader to mine. **Finding 11
+  (clock dedup + comment):** folded the last two `Utc::now()` readers
+  (`auth::current_unix_ms`, `oauth::token::now_unix_ms`) into one
+  `pub(crate) oauth::now_unix_ms`, next to `is_expired_at` (its semantic
+  home), updating all four callers, and dropped the misleading "so tests
+  can stub it" comment (the real seam is `is_expired_at(now)`). **Finding
+  9:** ACCEPTED-AS-IS, the `find_env_keys` doc already reads "four
+  providers" with the anthropic preference order and the codex
+  no-refresh note, exactly what the finding asked. **Tests (finding 5):**
+  `get_api_key_surfaces_refresh_failure_and_keeps_stale_cred` (refresh
+  `Err` surfaces `AuthError::OAuth` and leaves the stale cred on disk),
+  `get_api_key_unknown_oauth_provider_resolves_to_none` (locks the
+  behavior change), and two `obtain_code_and_state` tests driving the
+  `biased` `select!` manual arm through the state-mismatch reject and the
+  empty-input-then-prompt fallback (the listener never receives a
+  connection, so `accept` stays pending and the ready manual-input future
+  wins deterministically). **Noted, not changed:** the reference checks
+  env *after* stored credentials (`runtime > stored > env > fallback`),
+  the inverse of our `runtime > env > stored` order. A background research
+  pass confirmed the reference's ordering is deliberate and documented
+  (it protects a `/login`'d subscription from being shadowed and
+  mis-billed by an ambient `ANTHROPIC_API_KEY`, recovering the override
+  use case via `--api-key` and `auth.json` env interpolation). Ours
+  optimizes for env-as-quick-override and is a documented deliberate
+  choice, so left as-is and flagged for a possible future call. Also
+  noted a pre-existing divergence the reviewer caught: `aj::auth::
+  provider_status` reads the raw stored credential, so a typo'd-id OAuth
+  entry shows "configured" there while `get_api_key` now returns `None`.
+  Not introduced here, only surfaces in the degenerate typo state, left
+  for awareness. A fresh-agent review confirmed the manual-paste tests are
+  race-free, the behavior change is handled by all three `get_api_key`
+  callers (`model.rs`, `usage.rs` x2), the `let-else` masks no other
+  error, and the docs are accurate; its two doc nits (a semicolon and an
+  overstated cap claim) were fixed. `cargo test -p aj-models --lib` green
+  (329, +4), `fmt`/`clippy -p aj-models --all-targets` clean, `cargo check
+  --workspace` confirms no consumer drift.

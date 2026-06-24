@@ -17,7 +17,13 @@ use super::page::{error_page, success_page};
 
 /// Cap on how much HTTP request data we'll buffer while reading the
 /// callback's request line and headers. The browser sends a single
-/// short GET; anything larger is malformed.
+/// short GET, so this is generous headroom.
+///
+/// On hitting the cap we stop reading and parse whatever we have
+/// rather than rejecting. Only the request line is consulted and it
+/// arrives before any headers, so oversized headers can't hide it. A
+/// request line somehow larger than the cap just fails to parse, which
+/// answers 400 and keeps the listener waiting.
 const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 
 /// Per-provider parameters for the callback server. The path is the

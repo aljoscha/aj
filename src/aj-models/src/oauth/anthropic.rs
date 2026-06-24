@@ -52,9 +52,11 @@ use super::callback::{CallbackConfig, await_callback};
 use super::paste::parse_authorization_input;
 use super::pkce::{generate_pkce, random_token};
 use super::token::{
-    REFRESH_SAFETY_MARGIN_MS, REQUEST_TIMEOUT_SECS, TokenResponse, now_unix_ms, send_token_request,
+    REFRESH_SAFETY_MARGIN_MS, REQUEST_TIMEOUT_SECS, TokenResponse, send_token_request,
 };
-use super::{OAuthAuthInfo, OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
+use super::{
+    OAuthAuthInfo, OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider, now_unix_ms,
+};
 
 // ---------------------------------------------------------------------------
 // Endpoint constants
@@ -447,6 +449,76 @@ fn token_to_credentials(t: TokenResponse) -> OAuthCredentials {
 mod tests {
     use super::*;
     use crate::oauth::test_support::MockTokenServer;
+
+    /// An `OAuthCallbacks` double that supports manual code input,
+    /// returning canned strings for the manual-input race and the
+    /// prompt fallback. Lets us drive `obtain_code_and_state`'s manual
+    /// path without a live browser or any callback connection.
+    struct ManualPasteCallbacks {
+        manual_input: String,
+        prompt_input: String,
+    }
+
+    #[async_trait]
+    impl OAuthCallbacks for ManualPasteCallbacks {
+        fn on_auth(&self, _info: OAuthAuthInfo<'_>) {}
+        async fn on_prompt(&self, _message: &str) -> Result<String, OAuthError> {
+            Ok(self.prompt_input.clone())
+        }
+        fn supports_manual_code_input(&self) -> bool {
+            true
+        }
+        async fn on_manual_code_input(&self) -> Result<String, OAuthError> {
+            Ok(self.manual_input.clone())
+        }
+    }
+
+    /// Manual-paste input whose `state` doesn't match the value we
+    /// issued is a fatal `StateMismatch` (possible CSRF), not a
+    /// proceed. This drives the `biased` select's manual arm: the
+    /// callback listener never receives a connection, so its `accept`
+    /// stays pending and the ready manual-input future wins.
+    #[tokio::test]
+    async fn obtain_code_manual_state_mismatch_is_fatal() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let callbacks = ManualPasteCallbacks {
+            manual_input: "THE-CODE#WRONG-STATE".to_string(),
+            prompt_input: String::new(),
+        };
+        let result = obtain_code_and_state(
+            &callbacks,
+            listener,
+            "EXPECTED-STATE",
+            "http://localhost/cb",
+        )
+        .await;
+        assert!(
+            matches!(result, Err(OAuthError::StateMismatch)),
+            "mismatched manual state must be fatal, got {result:?}"
+        );
+    }
+
+    /// Empty manual input drops through to the prompt fallback: the
+    /// manual arm yields an unparseable empty string, the select ends
+    /// (closing the listener), and `on_prompt` supplies the real code.
+    #[tokio::test]
+    async fn obtain_code_empty_manual_input_falls_through_to_prompt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let callbacks = ManualPasteCallbacks {
+            manual_input: String::new(),
+            prompt_input: "PROMPTED-CODE#EXPECTED-STATE".to_string(),
+        };
+        let (code, state, _redirect) = obtain_code_and_state(
+            &callbacks,
+            listener,
+            "EXPECTED-STATE",
+            "http://localhost/cb",
+        )
+        .await
+        .expect("prompt fallback should yield a code");
+        assert_eq!(code, "PROMPTED-CODE");
+        assert_eq!(state, "EXPECTED-STATE");
+    }
 
     /// Authorize URL must contain every parameter Anthropic's server
     /// requires, with the documented values. Drift here breaks the

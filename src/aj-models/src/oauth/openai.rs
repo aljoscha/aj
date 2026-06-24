@@ -31,6 +31,7 @@
 //! OpenAI-specific.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -44,9 +45,11 @@ use super::callback::{CallbackConfig, await_callback};
 use super::paste::parse_authorization_input;
 use super::pkce::generate_pkce;
 use super::token::{
-    REFRESH_SAFETY_MARGIN_MS, REQUEST_TIMEOUT_SECS, TokenResponse, now_unix_ms, send_token_request,
+    REFRESH_SAFETY_MARGIN_MS, REQUEST_TIMEOUT_SECS, TokenResponse, send_token_request,
 };
-use super::{OAuthAuthInfo, OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
+use super::{
+    OAuthAuthInfo, OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider, now_unix_ms,
+};
 
 // ---------------------------------------------------------------------------
 // Endpoint constants
@@ -353,7 +356,10 @@ fn generate_state() -> Result<String, OAuthError> {
         .map_err(|err| OAuthError::Other(format!("CSPRNG failed: {err}")))?;
     let mut hex = String::with_capacity(STATE_BYTES * 2);
     for byte in bytes {
-        hex.push_str(&format!("{byte:02x}"));
+        // `write!` into the pre-sized buffer formats each byte in place,
+        // avoiding a throwaway `String` allocation per byte. Writing to
+        // a `String` is infallible, so the `Result` can't be an `Err`.
+        let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
 }

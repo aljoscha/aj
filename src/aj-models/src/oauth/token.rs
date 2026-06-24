@@ -8,7 +8,6 @@
 //! the body encoding) and maps the returned [`TokenResponse`] into
 //! [`OAuthCredentials`](super::OAuthCredentials).
 
-use chrono::Utc;
 use serde::Deserialize;
 
 use super::{OAuthError, redacted_body_summary};
@@ -81,11 +80,4 @@ pub(super) async fn send_token_request(
             redacted_body_summary(&text)
         ))
     })
-}
-
-/// Current unix time in milliseconds, expressed as an `i64` to match
-/// the persisted format in
-/// [`OAuthCredentials::expires`](super::OAuthCredentials::expires).
-pub(super) fn now_unix_ms() -> i64 {
-    Utc::now().timestamp_millis()
 }

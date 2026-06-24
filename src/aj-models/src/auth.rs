@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 
 use crate::oauth::anthropic::AnthropicOAuth;
 use crate::oauth::openai::OpenAIOAuth;
-use crate::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
+use crate::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider, now_unix_ms};
 
 // ---------------------------------------------------------------------------
 // On-disk shape
@@ -290,9 +290,16 @@ impl AuthStorage {
     /// 4. Stored OAuth tokens — auto-refreshed under the file lock if
     ///    expired.
     ///
-    /// Returns `Ok(None)` when no source has a key. OAuth refresh
-    /// failures bubble out as [`AuthError::OAuth`]; callers typically
-    /// surface a "log in again" prompt.
+    /// Returns `Ok(None)` when no source has a key. A stored OAuth
+    /// credential whose provider id isn't in the registry (e.g. a
+    /// hand-edited or renamed id) also resolves to `Ok(None)`: we
+    /// can't refresh it, so it's treated as unconfigured and the
+    /// caller prompts a fresh login. Env-supplied OAuth tokens
+    /// (`ANTHROPIC_OAUTH_TOKEN`, `OPENAI_CODEX_OAUTH_TOKEN`) are
+    /// returned verbatim without refresh, so a stale one surfaces as
+    /// an upstream 401 mid-request rather than a re-login prompt.
+    /// OAuth *refresh* failures bubble out as [`AuthError::OAuth`].
+    /// Callers typically surface a "log in again" prompt.
     pub async fn get_api_key(&self, provider_id: &str) -> Result<Option<String>, AuthError> {
         // 1. Runtime override.
         if let Some(key) = self
@@ -318,8 +325,15 @@ impl AuthStorage {
         match cred {
             Some(AuthCredential::ApiKey { key }) => Ok(Some(key)),
             Some(AuthCredential::OAuth(creds)) => {
-                let provider = self.lookup_oauth_provider(provider_id).await?;
-                let now = current_unix_ms();
+                // A stored OAuth credential under a provider id we have
+                // no flow for (a hand-edited or renamed id) can be
+                // neither validated nor refreshed. Treat it as
+                // unconfigured and let the caller prompt a fresh login
+                // rather than hard-erroring on what is effectively a typo.
+                let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
+                    return Ok(None);
+                };
+                let now = now_unix_ms();
                 if !creds.is_expired_at(now) {
                     return Ok(Some(provider.get_api_key(&creds)));
                 }
@@ -409,7 +423,7 @@ impl AuthStorage {
         // Sibling process may have refreshed while we were waiting
         // for the lock — use the freshened token without burning the
         // refresh-token round-trip again.
-        let now = current_unix_ms();
+        let now = now_unix_ms();
         if !creds.is_expired_at(now) {
             return Ok(Some(provider.get_api_key(&creds)));
         }
@@ -684,17 +698,6 @@ fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
         return false;
     }
     std::fs::remove_dir(lock_path).is_ok()
-}
-
-// ---------------------------------------------------------------------------
-// Time
-// ---------------------------------------------------------------------------
-
-/// Current Unix time in milliseconds. Pulled out so tests can stub it
-/// in via the public [`OAuthCredentials::is_expired_at`] entry point
-/// rather than hooking the whole module.
-fn current_unix_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +987,94 @@ mod tests {
             .await
             .unwrap();
         assert!(key.is_none());
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A failing refresh surfaces as `AuthError::OAuth` (so the host
+    /// can prompt a re-login) and must leave the stale stored
+    /// credential on disk untouched, so a later attempt can retry.
+    #[tokio::test]
+    async fn get_api_key_surfaces_refresh_failure_and_keeps_stale_cred() {
+        struct FailingProvider;
+
+        #[async_trait]
+        impl OAuthProvider for FailingProvider {
+            fn id(&self) -> &str {
+                "stub"
+            }
+            fn name(&self) -> &str {
+                "Stub"
+            }
+            async fn login(
+                &self,
+                _callbacks: &dyn OAuthCallbacks,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                Ok(OAuthCredentials::new("r", "a", 0))
+            }
+            async fn refresh_token(
+                &self,
+                _credentials: &OAuthCredentials,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                Err(OAuthError::Other("refresh token rejected".into()))
+            }
+        }
+
+        let path = scratch_path("refresh-fail");
+        let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+        providers.insert("stub".into(), Arc::new(FailingProvider));
+        let storage = AuthStorage::with_providers(path.clone(), providers);
+
+        storage
+            .set(
+                "stub",
+                AuthCredential::OAuth(OAuthCredentials::new("stale-r", "stale-a", 1)),
+            )
+            .await
+            .unwrap();
+
+        match storage.get_api_key("stub").await {
+            Err(AuthError::OAuth(_)) => {}
+            other => panic!("expected AuthError::OAuth, got {other:?}"),
+        }
+
+        // The stale credential must still be there for a retry.
+        match storage.get("stub").await.unwrap() {
+            Some(AuthCredential::OAuth(c)) => {
+                assert_eq!(c.refresh, "stale-r");
+                assert_eq!(c.access, "stale-a");
+            }
+            other => panic!("stale credential should be preserved, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A stored OAuth credential whose provider id isn't in the
+    /// registry (a hand-edited/renamed id) resolves to `Ok(None)`
+    /// rather than a hard error: we can't refresh it, so it's treated
+    /// as unconfigured and the host prompts a fresh login. Even a
+    /// non-expired token takes this path, since we have no flow to
+    /// turn it into a usable key.
+    #[tokio::test]
+    async fn get_api_key_unknown_oauth_provider_resolves_to_none() {
+        let path = scratch_path("unknown-oauth");
+        // No providers registered, so any OAuth lookup misses.
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+        storage
+            .set(
+                "typod-provider",
+                AuthCredential::OAuth(OAuthCredentials::new("r", "fresh-a", i64::MAX)),
+            )
+            .await
+            .unwrap();
+
+        let key = storage.get_api_key("typod-provider").await.unwrap();
+        assert!(
+            key.is_none(),
+            "unknown OAuth provider should resolve to None, got {key:?}"
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
