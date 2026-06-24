@@ -1122,7 +1122,7 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   / `cargo check -p aj-models` (dev-deps inactive there, so the feature is
   off and the helpers are absent), not by the `--all-targets` run, which
   activates the dev-edge and turns the feature on.
-- 2026-06-23 · RESIDUAL(aj-models-openai) · DONE · ad77dfa · Sixth
+- 2026-06-23 · RESIDUAL(aj-models-openai) · DONE · bfca37c · Sixth
   per-crate residual sweep. Four findings were verify-only (retired by
   themed work): both Majors (stream-end-without-terminal → R1's
   `finalize_or_truncate`; the thrice-copied `classify_client_error` →
