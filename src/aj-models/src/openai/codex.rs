@@ -18,9 +18,11 @@
 //!   are never sent.
 //! - **Event normalization.** Older `response.done` / `response.incomplete`
 //!   event names are rewritten to `response.completed` before reaching
-//!   the shared state machine, and top-level `error` /
-//!   `response.failed` events surface as terminal errors via the
-//!   classifier with a Codex-specific 429 friendly-message overlay.
+//!   the shared state machine. In-stream `error` / `response.failed`
+//!   events are forwarded into that state machine and finalized as an
+//!   `Error` that keeps the partial accumulated so far. The
+//!   Codex-specific 429 friendly-message overlay applies to HTTP-level
+//!   errors only.
 //! - **Service-tier pricing.** Same `flex` / `priority` knob, but
 //!   `gpt-5.5 + priority` uses a 2.5× multiplier (vs the default 2×).
 //!
@@ -56,8 +58,8 @@ use crate::types::ServiceTier;
 
 use super::errors::classify_client_error_with;
 use super::responses::{
-    CostMultiplierFn, StreamState, convert_messages, empty_partial, error_from_code,
-    map_reasoning_effort, map_service_tier, verbosity_text_config,
+    CostMultiplierFn, StreamState, convert_messages, empty_partial, map_reasoning_effort,
+    map_service_tier, verbosity_text_config,
 };
 #[cfg(any(test, feature = "test-support"))]
 use super::responses::{append_assistant_message, parse_assistant_input_items_with_api};
@@ -252,7 +254,7 @@ async fn run_stream_inner(
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
-            SelectOutcome::Ready(Some(Ok(ev))) => match normalize_codex_event(ev)? {
+            SelectOutcome::Ready(Some(Ok(ev))) => match normalize_codex_event(ev) {
                 NormalizedEvent::Forward(ev) => {
                     for out in state.process(ev) {
                         producer.push(out);
@@ -377,12 +379,11 @@ fn parse_usage_metadata(body: &str) -> (Option<String>, Option<u64>) {
     (None, None)
 }
 
-/// Convert a unix-seconds reset timestamp to minutes-until-reset,
-/// floored at 0 and rounded to nearest minute. Returns `None` for
-/// absent or already-in-the-past timestamps that round to 0.
-#[allow(clippy::as_conversions)]
+/// Minutes from now until a unix-seconds reset timestamp, reading the
+/// wall clock for "now". Returns `None` for an absent timestamp or if
+/// the system clock is before the unix epoch. The rounding lives in the
+/// pure [`minutes_until_at`] so it stays testable without the clock.
 fn minutes_until(resets_at: Option<i64>) -> Option<u64> {
-    let resets_at = resets_at?;
     let now_secs = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -390,10 +391,16 @@ fn minutes_until(resets_at: Option<i64>) -> Option<u64> {
             .as_secs(),
     )
     .unwrap_or(i64::MAX);
-    let delta_secs = (resets_at - now_secs).max(0);
-    // Round to nearest minute.
+    Some(minutes_until_at(resets_at?, now_secs))
+}
+
+/// Minutes between `now_secs` and `resets_at` (both unix seconds),
+/// floored at 0 and rounded to the nearest minute.
+#[allow(clippy::as_conversions)]
+fn minutes_until_at(resets_at: i64, now_secs: i64) -> u64 {
+    let delta_secs = resets_at.saturating_sub(now_secs).max(0);
     let minutes = (f64::from(i32::try_from(delta_secs).unwrap_or(i32::MAX)) / 60.0).round();
-    Some(minutes.max(0.0) as u64)
+    minutes.max(0.0) as u64
 }
 
 fn format_friendly_message(plan_type: Option<&str>, mins: Option<u64>) -> String {
@@ -420,65 +427,56 @@ fn format_friendly_message(plan_type: Option<&str>, mins: Option<u64>) -> String
 enum NormalizedEvent {
     /// Pass the event through to the state machine unchanged.
     Forward(ResponseStreamEvent),
-    /// Pass through, then stop draining the stream. Used for
-    /// `response.completed` / rewritten `response.done` /
-    /// `response.incomplete`.
+    /// Pass through, then stop draining the stream. Used for the
+    /// lifecycle terminators (`response.completed` / rewritten
+    /// `response.done` / `response.incomplete`) and for in-stream
+    /// `error` / `response.failed`, which the state machine records so
+    /// `finalize` keeps the partial.
     Terminal(ResponseStreamEvent),
 }
 
-/// normalize the Codex event stream so it looks like a plain
-/// Responses stream by the time it reaches the shared state machine.
+/// Normalize the Codex event stream so it looks like a plain Responses
+/// stream by the time it reaches the shared state machine.
 ///
-/// - `error` and `response.failed` are surfaced as `Err` so the caller
-///   classifies them through [`classify_codex_client_error`] (with
-///   the friendly-message overlay) before short-circuiting the run.
+/// - `error` and `response.failed` are forwarded as terminal events so
+///   the shared state machine records them in-state and `finalize`
+///   emits an `Error` carrying the partial accumulated so far. This
+///   keeps a failed Codex turn structurally identical to the Responses
+///   provider's (both preserve streamed content + usage) instead of
+///   discarding the partial.
 /// - `response.done` / `response.incomplete` are rewritten to
 ///   `response.completed` with `response.status` normalized into the
 ///   recognized set, then forwarded as a terminal event.
 /// - Everything else is forwarded unchanged.
-fn normalize_codex_event(ev: ResponseStreamEvent) -> Result<NormalizedEvent, AssistantError> {
+fn normalize_codex_event(ev: ResponseStreamEvent) -> NormalizedEvent {
     match ev {
-        ResponseStreamEvent::Error { code, message, .. } => {
-            Err(error_from_code(code.as_deref(), message))
+        // Forward terminal errors into the state machine rather than
+        // short-circuiting, so the partial survives. `Terminal` stops
+        // us draining the stream afterwards.
+        terminal @ (ResponseStreamEvent::Error { .. }
+        | ResponseStreamEvent::ResponseFailed { .. }) => NormalizedEvent::Terminal(terminal),
+        // A typed `ResponseStatus` is already within the recognized set
+        // (the enum can't deserialize anything else), so the typed path
+        // needs no status normalization. Only the untyped legacy path
+        // in `rewrite_legacy_done` does.
+        completed @ ResponseStreamEvent::ResponseCompleted { .. } => {
+            NormalizedEvent::Terminal(completed)
         }
-        ResponseStreamEvent::ResponseFailed { response, .. } => {
-            let err = if let Some(err) = response.error.as_ref() {
-                error_from_code(Some(err.code.as_str()), err.message.clone())
-            } else {
-                AssistantError::new(
-                    ErrorCategory::Unknown,
-                    "openai-codex-responses: response failed".to_string(),
-                )
-            };
-            Err(err)
-        }
-        ResponseStreamEvent::ResponseCompleted {
-            response,
-            sequence_number,
-        } => Ok(NormalizedEvent::Terminal(
-            ResponseStreamEvent::ResponseCompleted {
-                response: normalize_response_status(response),
-                sequence_number,
-            },
-        )),
         ResponseStreamEvent::ResponseIncomplete {
-            response,
+            mut response,
             sequence_number,
         } => {
             // Rewrite the event type to `Completed` while preserving
             // the inner `status` so the state machine's
             // `classify_status` arm picks up the `Incomplete` branch
             // (length cutoff, content filter, etc.)
-            let mut response = normalize_response_status(response);
             if response.status.is_none() {
                 response.status = Some(ResponseStatus::Incomplete);
             }
-            Ok(NormalizedEvent::Terminal(
-                ResponseStreamEvent::ResponseCompleted {
-                    response,
-                    sequence_number,
-                },
-            ))
+            NormalizedEvent::Terminal(ResponseStreamEvent::ResponseCompleted {
+                response,
+                sequence_number,
+            })
         }
         ResponseStreamEvent::Other(value) => {
             // Catch the legacy `response.done` shape (older event name
@@ -490,9 +488,9 @@ fn normalize_codex_event(ev: ResponseStreamEvent) -> Result<NormalizedEvent, Ass
             {
                 return rewrite_legacy_done(value);
             }
-            Ok(NormalizedEvent::Forward(ResponseStreamEvent::Other(value)))
+            NormalizedEvent::Forward(ResponseStreamEvent::Other(value))
         }
-        other => Ok(NormalizedEvent::Forward(other)),
+        other => NormalizedEvent::Forward(other),
     }
 }
 
@@ -502,9 +500,9 @@ fn normalize_codex_event(ev: ResponseStreamEvent) -> Result<NormalizedEvent, Ass
 /// `response.status`, and rebuild the wire value so serde
 /// deserialization re-fires through the strict variant. On any
 /// failure we surface a `Forward` of the original value rather than
-/// dropping the event — better to feed the state machine an unknown
+/// dropping the event: better to feed the state machine an unknown
 /// event than to silently lose terminal information.
-fn rewrite_legacy_done(value: Value) -> Result<NormalizedEvent, AssistantError> {
+fn rewrite_legacy_done(value: Value) -> NormalizedEvent {
     let mut rewritten = value.clone();
     if let Some(obj) = rewritten.as_object_mut() {
         let old_type = obj
@@ -530,14 +528,16 @@ fn rewrite_legacy_done(value: Value) -> Result<NormalizedEvent, AssistantError> 
         normalize_response_status_in_value(obj);
     }
     match serde_json::from_value::<ResponseStreamEvent>(rewritten) {
-        Ok(event) => Ok(NormalizedEvent::Terminal(event)),
-        Err(_) => Ok(NormalizedEvent::Forward(ResponseStreamEvent::Other(value))),
+        Ok(event) => NormalizedEvent::Terminal(event),
+        Err(_) => NormalizedEvent::Forward(ResponseStreamEvent::Other(value)),
     }
 }
 
-/// In-place version of [`normalize_response_status`] that works on a
-/// `serde_json::Map` so we can rewrite the unknown-status
-/// values before the strict deserializer rejects them.
+/// Normalize the inner `response.status` in a raw JSON event, dropping
+/// any value outside the recognized set so the strict deserializer
+/// doesn't reject the rewritten event. Runs on the untyped legacy
+/// `Other` path. The typed path needs no equivalent because
+/// `ResponseStatus` can only deserialize recognized values.
 fn normalize_response_status_in_value(obj: &mut serde_json::Map<String, Value>) {
     let Some(response) = obj.get_mut("response") else {
         return;
@@ -552,26 +552,10 @@ fn normalize_response_status_in_value(obj: &mut serde_json::Map<String, Value>) 
         status,
         "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress",
     ) {
-        // Drop unrecognized statuses — the state machine's
+        // Drop unrecognized statuses: the state machine's
         // `classify_status` treats `None` as the default Stop branch.
         response_obj.remove("status");
     }
-}
-
-/// Replace any unrecognized [`ResponseStatus`] value on the inner
-/// response with `None`, leaving the recognized set
-/// `{completed, incomplete, failed, cancelled, queued, in_progress}`.
-///
-/// Today our [`ResponseStatus`] enum already enumerates exactly that
-/// set, so deserialization of unknown values fails earlier — meaning
-/// any [`ResponseStatus`] we *do* hold is already in the recognized
-/// set. The function exists for symmetry and to keep the spot we'd
-/// patch if the SDK enum gains catch-all variants
-/// later.
-fn normalize_response_status(
-    response: openai_sdk::types::responses::Response,
-) -> openai_sdk::types::responses::Response {
-    response
 }
 
 // ---------------------------------------------------------------------------
@@ -661,8 +645,8 @@ pub fn parse_assistant_input_items(items: &[ResponseInputItem]) -> AssistantMess
 /// provider's state machine and return the finalized
 /// [`AssistantMessage`]. Each event runs through the
 /// normalization layer first (legacy `response.done` /
-/// `response.incomplete` rewrites, terminal `error` /
-/// `response.failed` events surface as message-level errors), then the
+/// `response.incomplete` rewrites, in-stream `error` /
+/// `response.failed` forwarded as terminal events), then the
 /// shared state machine consumes the normalized event under the
 /// Codex API identifier and pricing curve.
 ///
@@ -678,26 +662,12 @@ pub fn replay_sse_events(
     let mut state = StreamState::new_with(API_NAME, model, requested_tier, CODEX_COST_MULTIPLIER);
     for ev in events {
         match normalize_codex_event(ev) {
-            Ok(NormalizedEvent::Forward(ev)) => {
+            NormalizedEvent::Forward(ev) => {
                 let _ = state.process(ev);
             }
-            Ok(NormalizedEvent::Terminal(ev)) => {
+            NormalizedEvent::Terminal(ev) => {
                 let _ = state.process(ev);
                 break;
-            }
-            Err(err) => {
-                // Codex backends sometimes inject a terminal `error`
-                // SSE frame mid-stream; surface it as a finalized
-                // error message so the round-trip suite can assert on
-                // the classified payload without spinning up a full
-                // provider run.
-                let mut error = AssistantMessage::empty();
-                error.api = API_NAME.to_string();
-                error.provider = model.provider.clone();
-                error.model = model.id.clone();
-                error.stop_reason = StopReason::Error;
-                error.error = Some(err);
-                return error;
             }
         }
     }
@@ -1143,6 +1113,17 @@ mod tests {
     }
 
     #[test]
+    fn minutes_until_at_rounds_to_nearest_minute() {
+        // Exact multiples, the rounding boundary (29s down, 30s up), and
+        // a past timestamp (floored at 0), all without the wall clock.
+        let now = 1_000_000;
+        assert_eq!(minutes_until_at(now + 17 * 60, now), 17);
+        assert_eq!(minutes_until_at(now + 16 * 60 + 29, now), 16);
+        assert_eq!(minutes_until_at(now + 16 * 60 + 30, now), 17);
+        assert_eq!(minutes_until_at(now - 5 * 60, now), 0);
+    }
+
+    #[test]
     fn normalize_codex_event_rewrites_legacy_response_done_to_completed() {
         let raw = serde_json::json!({
             "type": "response.done",
@@ -1159,7 +1140,7 @@ mod tests {
             "sequence_number": 1,
         });
         let event = serde_json::from_value::<ResponseStreamEvent>(raw).expect("parse Other");
-        let normalized = normalize_codex_event(event).expect("ok");
+        let normalized = normalize_codex_event(event);
         match normalized {
             NormalizedEvent::Terminal(ResponseStreamEvent::ResponseCompleted {
                 response, ..
@@ -1187,7 +1168,7 @@ mod tests {
             "sequence_number": 1,
         });
         let event = serde_json::from_value::<ResponseStreamEvent>(raw).expect("parse Other");
-        let normalized = normalize_codex_event(event).expect("ok");
+        let normalized = normalize_codex_event(event);
         match normalized {
             NormalizedEvent::Terminal(ResponseStreamEvent::ResponseCompleted {
                 response, ..
@@ -1199,23 +1180,26 @@ mod tests {
     }
 
     #[test]
-    fn normalize_codex_event_surfaces_top_level_error_as_assistant_error() {
+    fn normalize_codex_event_forwards_terminal_error_into_state_machine() {
+        // `error` / `response.failed` are forwarded as terminal events
+        // (not short-circuited), so the shared state machine records
+        // them and `finalize` keeps the partial accumulated so far.
         let event = ResponseStreamEvent::Error {
             code: Some("rate_limit_exceeded".into()),
             message: "slow down".into(),
             sequence_number: 1,
         };
-        let result = normalize_codex_event(event);
-        let err = result.err().expect("Err");
-        assert_eq!(err.category, ErrorCategory::RateLimit);
-        assert!(err.message.contains("slow down"));
+        assert!(matches!(
+            normalize_codex_event(event),
+            NormalizedEvent::Terminal(ResponseStreamEvent::Error { .. })
+        ));
     }
 
     #[test]
     fn normalize_codex_event_forwards_unknown_other_events() {
         let value = serde_json::json!({"type": "response.unknown_event", "sequence_number": 1});
         let event = ResponseStreamEvent::Other(value.clone());
-        let normalized = normalize_codex_event(event).expect("ok");
+        let normalized = normalize_codex_event(event);
         match normalized {
             NormalizedEvent::Forward(ResponseStreamEvent::Other(v)) => assert_eq!(v, value),
             other => panic!("expected Forward(Other), got {other:?}"),

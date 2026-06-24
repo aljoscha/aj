@@ -404,25 +404,19 @@ fn truncated_stream_is_transient_error() {
 }
 
 #[test]
-fn error_frame_is_classified_error() {
-    // A top-level `error` frame (here `rate_limit_exceeded`) short-
-    // circuits through `normalize_codex_event`'s `Err` arm, so the turn
-    // finalizes with the classified category. NOTE: unlike the public
-    // Responses adapter, the Codex error path discards the partial
-    // content accumulated so far (the M4 "divergent terminal-error
-    // handling" finding); this asserts that current behavior. The
-    // companion `truncated_stream_is_transient_error` test shows the same
-    // leading delta survives on the non-error path, so the emptiness here
-    // is a real drop, not a fixture that never accumulated content.
+fn error_frame_preserves_partial_and_classifies_error() {
+    // A top-level `error` frame (here `rate_limit_exceeded`) is
+    // forwarded into the shared state machine, so the turn finalizes as
+    // an Error that *keeps* the partial content accumulated so far
+    // (matching the Responses adapter) alongside the classified
+    // category. The `truncated_stream_is_transient_error` companion
+    // pins the same partial-preserving behavior on the transport-drop
+    // path.
     let parsed = replay_fixture("error_frame");
     assert_eq!(parsed.stop_reason, StopReason::Error);
     assert_eq!(
         parsed.error.as_ref().map(|e| e.category),
         Some(ErrorCategory::RateLimit)
     );
-    assert!(
-        parsed.content.is_empty(),
-        "Codex error path drops the partial; got {:?}",
-        parsed.content
-    );
+    assert_eq!(first_text(&parsed), "Starting to answer");
 }

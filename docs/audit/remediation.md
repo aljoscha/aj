@@ -307,6 +307,11 @@ Per-crate progress (work top-to-bottom):
   pub-for-tests finding (its `TextSignatureV1` envelope sub-item, a prod
   struct, stays for that sweep); plus the anthropic-local
   index/comment/simplicity cleanups).
+- aj-models-openai — `DONE` (both Majors + the Testing/round-trip-helper
+  Minors verify-only, retired by R1/R10/R16; reconciled the Codex
+  terminal-error divergence to preserve the partial, removed the dead
+  `ProcessOutcome.terminal`, kept+documented `TextSignatureV1`, added the
+  tool-call id fallback, and applied the comment/clock/no-op cleanups).
 
 ---
 
@@ -1117,3 +1122,84 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   / `cargo check -p aj-models` (dev-deps inactive there, so the feature is
   off and the helpers are absent), not by the `--all-targets` run, which
   activates the dev-edge and turns the feature on.
+- 2026-06-23 · RESIDUAL(aj-models-openai) · DONE · ad77dfa · Sixth
+  per-crate residual sweep. Four findings were verify-only (retired by
+  themed work): both Majors (stream-end-without-terminal → R1's
+  `finalize_or_truncate`; the thrice-copied `classify_client_error` →
+  R10's `openai::errors`), the happy-path-only roundtrips (R16's
+  error/truncation fixtures), and the round-trip-helper half of the
+  pub-for-tests Boundaries finding (the four-provider `test-support`
+  gate from the anthropic sweep). Scouted `/tmp/pi` for each live item
+  and it reshaped two calls. **[Minor][Errors] Codex divergent
+  terminal-error handling (reconciled, the one behavior change):** Codex
+  short-circuited `error`/`response.failed` to an `Err` and rebuilt a
+  *fresh empty* `AssistantMessage`, dropping the streamed partial, where
+  the Responses provider forwards the same events into the shared
+  `StreamState` and `finalize` keeps the partial. The reference confirms
+  both of its providers preserve the partial on a terminal error (throw
+  caught into the same accumulated `output`), so our drop diverged from
+  both our own Responses adapter and the reference. Made
+  `normalize_codex_event` forward `Error`/`ResponseFailed` as `Terminal`
+  into the state machine (so `finalize` emits an `Error` carrying the
+  partial + classified category, identical to Responses), which makes
+  the function infallible: dropped its `Result`, the `?` in the run
+  loop, the `replay_sse_events` `Err` arm, and the now-unused
+  `error_from_code` import. The friendly-429 overlay is HTTP-level
+  (`classify_codex_client_error`, unchanged); in-stream error
+  classification was already `error_from_code`/`error_from_response`, so
+  the only message-string change is the bare-failure fallback prefix.
+  **[Minor][Boundaries] `TextSignatureV1` pub-for-tests (kept +
+  documented, reversing the initial plan):** the reference keeps the
+  envelope *type* public (part of the shared message model) and the
+  codec private; our codec is already `pub(super)`, and `types.rs`'s
+  `text_signature` field doc already names the type as its encoding. So
+  the type stays `pub` with a doc note that it's the documented wire
+  encoding, not a test-only leak (matching the SDK residual-sweep
+  precedent), rather than narrowing it behind a gated seam. **[Minor]
+  [Contracts] dead `ProcessOutcome.terminal`:** the field was hardcoded
+  `false` so the `if outcome.terminal { break }` was unreachable (R1
+  fixed the `saw_terminal` method but left this). Collapsed `process` to
+  return `Vec<AssistantMessageEvent>` (aligning Completions with
+  Responses/Codex) and end the loop on stream close, matching the
+  reference's no-terminal-flag loop. **[Minor][Comments]** rewrote the
+  stale `finalize` close-block comment (it narrated a synthetic-`Done`
+  branch that doesn't exist; post-R1 the call is a defensive no-op).
+  **[Nit][Testing]** factored the pure `minutes_until_at(resets_at,
+  now_secs)` out of the wall-clock `minutes_until` and tested the
+  rounding deterministically (the reference reads `Date.now()` inline, so
+  this exceeds it). **[Nit][Simplicity]** inlined + dropped the typed
+  `normalize_response_status` no-op (the SDK `ResponseStatus` has no
+  catch-all, so a typed status is always recognized; the real
+  normalization is the untyped `normalize_response_status_in_value`,
+  kept, which is the analog of the reference's `normalizeCodexStatus`).
+  **[Nit][Comments] tool-call index invariant (the user asked for a
+  proper fix, not just a doc):** the reference defends a shifting/late
+  wire index with a secondary id-keyed map, so beyond documenting the
+  relied-upon invariant we added a `tool_calls_by_id` fallback: when a
+  delta's wire index misses an open slot but its tool-call `id` matches a
+  seen call, we reuse that slot instead of splitting one logical call.
+  (A backend reusing one index for distinct calls would still merge them;
+  noted in the field doc.) No public-API or on-disk change (the type
+  stays `pub`); the one behavior change preserves strictly more data on a
+  failed Codex turn. Tests: Codex terminal-error forwarding +
+  partial-preserving roundtrip (flipped from asserting the drop), the
+  `minutes_until_at` rounding boundaries, and a shifted-index tool-call
+  that must not split. `cargo test -p aj-models` green (324 lib + 60
+  roundtrip), `fmt`/`clippy -p aj-models --all-targets` clean, `cargo
+  check --workspace` + `cargo build -p aj-models` confirm no consumer
+  drift and that the gated helpers stay absent from a prod build. A
+  fresh-agent review then flagged the tool-call id fallback's ordering
+  and suggested id-first resolution (index-first can route a
+  shifted-index continuation onto an occupied sibling slot). On a
+  closer read of the reference its resolution is index-first with an
+  id-fallback (the wire index is the authoritative, always-present key
+  and the id arrives only on a call's first delta, so it serves as a
+  recovery fallback when the index misses). We kept that design rather
+  than the review's id-first, since id-first would diverge from the
+  reference and trade one pathological-backend case for another, and
+  documented the deliberate limitation on the field. The review's other
+  fixes were applied: corrected stale doc/comment wording the reconcile
+  left behind (the codex module/enum docs, the `replay_sse_events` doc,
+  the `TextSignatureV1` codec-visibility note, and two comment
+  semicolons), and kept the shift-to-fresh-index fallback regression
+  test (the case index-first does recover).

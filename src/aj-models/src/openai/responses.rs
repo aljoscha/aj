@@ -89,11 +89,16 @@ impl Provider for OpenAiResponsesProvider {
 // TextSignatureV1
 // ---------------------------------------------------------------------------
 
-/// Envelope carried in [`TextContent::text_signature`] for messages
-/// produced by `openai-responses`. Captures the message item's `id`
-/// and optional `phase` so a follow-up turn can replay the message
-/// with the same identifiers, letting the server pair it with the
-/// prior reasoning chain.
+/// Versioned envelope carried in [`TextContent::text_signature`] for
+/// messages produced by `openai-responses`. Captures the message
+/// item's `id` and optional `phase` so a follow-up turn can replay the
+/// message with the same identifiers, letting the server pair it with
+/// the prior reasoning chain.
+///
+/// Public as the documented wire encoding of the `text_signature`
+/// field, not a test-only export. The encode/decode codec
+/// (`parse_text_signature` / `serialize_text_signature`) is
+/// crate-internal (`pub(super)`), not part of the public API.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TextSignatureV1 {
     /// Schema version. Always `1`.

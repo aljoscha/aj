@@ -200,17 +200,16 @@ async fn run_stream_inner(
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
             SelectOutcome::Ready(Some(Ok(chunk))) => {
-                let outcome = state.process(chunk);
-                for ev in outcome.events {
+                for ev in state.process(chunk) {
                     producer.push(ev);
-                }
-                if outcome.terminal {
-                    break;
                 }
             }
             SelectOutcome::Ready(Some(Err(err))) => {
                 return Err(classify_client_error(&err));
             }
+            // The server closes the stream after the trailing
+            // usage-only chunk (there is no protocol terminator to
+            // break on), so we consume to stream end.
             SelectOutcome::Ready(None) => break,
             SelectOutcome::Cancelled => {
                 producer.push(AssistantMessageEvent::aborted(state.partial.clone()));
@@ -765,11 +764,27 @@ struct StreamState {
     /// Index of the in-progress `Thinking` block within
     /// `partial.content`, if any.
     thinking_index: Option<usize>,
-    /// Map from the wire's `tool_calls[i].index` to the unified
-    /// `partial.content[content_index]` slot. Each entry tracks the
-    /// cumulative arguments JSON bytes alongside the index so we can
-    /// re-parse on every delta.
+    /// Streamed tool calls keyed by the wire `tool_calls[i].index`.
+    /// Deltas for one call accumulate into a single slot. Each slot
+    /// tracks the cumulative arguments JSON bytes so we can re-parse on
+    /// every delta. The wire index is the authoritative, always-present
+    /// position of a call within the stream, so it is the primary key.
+    ///
+    /// `tool_calls_by_id` is a belt-and-suspenders fallback for
+    /// OpenAI-compatible backends that don't keep the index stable. The
+    /// tool-call `id` arrives only on a call's first delta, so we
+    /// resolve by index first and consult the id only when the index
+    /// misses an open slot. That recovers the common non-conforming
+    /// case, a call whose index shifts to a fresh value across its
+    /// deltas, without changing conforming behavior. We deliberately do
+    /// not defend against a backend that moves an existing index onto
+    /// another open call's slot, or reuses one index for distinct
+    /// calls. Both require distrusting the authoritative index, and no
+    /// client-side keying recovers them reliably.
     tool_calls: HashMap<i32, ToolCallSlot>,
+    /// Maps a seen tool-call `id` to its `tool_calls` key. See
+    /// `tool_calls` for why this fallback exists and what it omits.
+    tool_calls_by_id: HashMap<String, i32>,
     /// Latest finish_reason seen across choices. Set on the chunk
     /// that carried a non-null finish_reason; finalized into a
     /// terminal event on stream end.
@@ -790,17 +805,6 @@ struct ToolCallSlot {
     arguments: String,
 }
 
-/// Result of processing a single stream chunk.
-struct ProcessOutcome {
-    events: Vec<AssistantMessageEvent>,
-    /// Whether the upstream stream has terminated. The API closes the
-    /// stream after the chunk that carries `finish_reason`, but we
-    /// don't `break` on it — the next chunk usually carries usage —
-    /// so this stays `false` here. Reserved for protocol-level
-    /// terminators if any get added.
-    terminal: bool,
-}
-
 impl StreamState {
     fn new(model: &ModelInfo) -> Self {
         let mut partial = AssistantMessage::empty();
@@ -813,13 +817,14 @@ impl StreamState {
             text_index: None,
             thinking_index: None,
             tool_calls: HashMap::new(),
+            tool_calls_by_id: HashMap::new(),
             finish_reason: None,
             usage: None,
             cost: model.cost.clone(),
         }
     }
 
-    fn process(&mut self, chunk: CreateChatCompletionStreamResponse) -> ProcessOutcome {
+    fn process(&mut self, chunk: CreateChatCompletionStreamResponse) -> Vec<AssistantMessageEvent> {
         let mut events = Vec::new();
 
         if !self.started {
@@ -877,10 +882,7 @@ impl StreamState {
             }
         }
 
-        ProcessOutcome {
-            events,
-            terminal: false,
-        }
+        events
     }
 
     fn handle_text_delta(&mut self, text: &str, events: &mut Vec<AssistantMessageEvent>) {
@@ -971,8 +973,25 @@ impl StreamState {
             self.close_thinking(events);
         }
 
+        // Resolve which slot this delta belongs to. The wire index is
+        // the authoritative, always-present key, so prefer it. When it
+        // misses an open slot, fall back to a previously-seen tool-call
+        // id, which recovers a call whose index shifted to a fresh
+        // value across its deltas.
         let wire_index = delta.index;
-        let slot = self.tool_calls.entry(wire_index).or_insert_with(|| {
+        let key = if self.tool_calls.contains_key(&wire_index) {
+            wire_index
+        } else if let Some(key) = delta
+            .id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.tool_calls_by_id.get(id).copied())
+        {
+            key
+        } else {
+            wire_index
+        };
+        let slot = self.tool_calls.entry(key).or_insert_with(|| {
             let content_index = self.partial.content.len();
             self.partial
                 .content
@@ -990,6 +1009,7 @@ impl StreamState {
         let content_index = slot.content_index;
         let mut emit_start = false;
         let mut delta_arg_str: Option<String> = None;
+        let mut id_to_register: Option<String> = None;
 
         if let Some(AssistantContent::ToolCall(tc)) = self.partial.content.get_mut(content_index) {
             // First touch of this slot fixes id and name; either field
@@ -999,6 +1019,7 @@ impl StreamState {
                 && tc.id.is_empty()
             {
                 tc.id = id.to_string();
+                id_to_register = Some(id.to_string());
                 emit_start = true;
             }
             if let Some(func) = delta.function.as_ref() {
@@ -1017,6 +1038,13 @@ impl StreamState {
                     delta_arg_str = Some(args.to_string());
                 }
             }
+        }
+
+        // Record the id -> key mapping once the content borrow is
+        // released, so the fallback above can find this slot if a later
+        // delta carries the same id under a different wire index.
+        if let Some(id) = id_to_register {
+            self.tool_calls_by_id.insert(id, key);
         }
 
         // Order on the wire: Start before Delta. Both pushes need a
@@ -1134,12 +1162,12 @@ impl StreamState {
         // still have open here.
         let mut tail = Vec::new();
         self.close_open_blocks(&mut tail);
-        // Drop the intermediate close-block events on the floor —
-        // they should already have been emitted on the chunk that
-        // carried `finish_reason`. We keep them only if the stream
-        // ended abruptly, in which case attaching them to the
-        // terminal event is too late anyway; we emit a synthetic
-        // `Done` directly instead.
+        // On the normal terminal path the close-block events were
+        // already emitted in `process` when the `finish_reason` chunk
+        // arrived. We only reach `finalize` after `saw_terminal`, so
+        // this is a defensive no-op and `tail` is empty. Drop whatever
+        // it produces: the terminal snapshot in `partial.content`
+        // already carries the complete, closed content.
         let _ = tail;
 
         if let Some(usage) = self.usage.as_ref() {
@@ -1574,9 +1602,9 @@ mod tests {
     fn streamstate_text_pipeline() {
         let mut state = StreamState::new(&fake_model());
         let mut events = Vec::new();
-        events.extend(state.process(delta_chunk(text_delta("he"))).events);
-        events.extend(state.process(delta_chunk(text_delta("llo"))).events);
-        events.extend(state.process(finish_chunk(FinishReason::Stop)).events);
+        events.extend(state.process(delta_chunk(text_delta("he"))));
+        events.extend(state.process(delta_chunk(text_delta("llo"))));
+        events.extend(state.process(finish_chunk(FinishReason::Stop)));
 
         assert!(matches!(events[0], AssistantMessageEvent::Start { .. }));
         assert!(matches!(events[1], AssistantMessageEvent::TextStart { .. }));
@@ -1609,9 +1637,9 @@ mod tests {
     fn streamstate_thinking_then_text() {
         let mut state = StreamState::new(&fake_model());
         let mut events = Vec::new();
-        events.extend(state.process(delta_chunk(thinking_delta("hmm"))).events);
-        events.extend(state.process(delta_chunk(text_delta("answer"))).events);
-        events.extend(state.process(finish_chunk(FinishReason::Stop)).events);
+        events.extend(state.process(delta_chunk(thinking_delta("hmm"))));
+        events.extend(state.process(delta_chunk(text_delta("answer"))));
+        events.extend(state.process(finish_chunk(FinishReason::Stop)));
 
         // Order: Start, ThinkingStart, ThinkingDelta, ThinkingEnd,
         // TextStart, TextDelta, TextEnd.
@@ -1647,29 +1675,21 @@ mod tests {
         let mut state = StreamState::new(&fake_model());
         let mut events = Vec::new();
         // First delta: id + name + initial arguments.
-        events.extend(
-            state
-                .process(delta_chunk(tool_call_delta(
-                    0,
-                    Some("call_abc"),
-                    Some("read_file"),
-                    Some("{\"path\": "),
-                )))
-                .events,
-        );
+        events.extend(state.process(delta_chunk(tool_call_delta(
+            0,
+            Some("call_abc"),
+            Some("read_file"),
+            Some("{\"path\": "),
+        ))));
         // Second delta: more arguments.
-        events.extend(
-            state
-                .process(delta_chunk(tool_call_delta(
-                    0,
-                    None,
-                    None,
-                    Some("\"/tmp/x\"}"),
-                )))
-                .events,
-        );
+        events.extend(state.process(delta_chunk(tool_call_delta(
+            0,
+            None,
+            None,
+            Some("\"/tmp/x\"}"),
+        ))));
         // Final: finish_reason closes the call.
-        events.extend(state.process(finish_chunk(FinishReason::ToolCalls)).events);
+        events.extend(state.process(finish_chunk(FinishReason::ToolCalls)));
 
         assert!(matches!(events[0], AssistantMessageEvent::Start { .. }));
         assert!(matches!(
@@ -1698,6 +1718,46 @@ mod tests {
             }
             other => panic!("expected Done(ToolUse), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn streamstate_tool_call_id_fallback_when_index_shifts() {
+        // Belt-and-suspenders for non-conforming backends: the same
+        // tool call's arguments arrive split across two deltas whose
+        // wire index changes (0 then 7). With the `id` constant, the
+        // second delta must land in the first slot via the id fallback
+        // rather than opening a second tool call.
+        let mut state = StreamState::new(&fake_model());
+        let _ = state.process(delta_chunk(tool_call_delta(
+            0,
+            Some("call_abc"),
+            Some("read_file"),
+            Some("{\"path\": "),
+        )));
+        let _ = state.process(delta_chunk(tool_call_delta(
+            7,
+            Some("call_abc"),
+            None,
+            Some("\"/tmp/x\"}"),
+        )));
+        let _ = state.process(finish_chunk(FinishReason::ToolCalls));
+
+        let final_event = state.finalize();
+        let message = match final_event {
+            AssistantMessageEvent::Done { message, .. } => message,
+            other => panic!("expected Done, got {other:?}"),
+        };
+        let tool_calls: Vec<_> = message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                AssistantContent::ToolCall(tc) => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "shifted index must not split the call");
+        assert_eq!(tool_calls[0].id, "call_abc");
+        assert_eq!(tool_calls[0].arguments["path"], "/tmp/x");
     }
 
     #[test]
