@@ -509,6 +509,24 @@ pub(crate) const TAB_AS_SPACES: &str = "   ";
 
 const _: () = assert!(TAB_AS_SPACES.len() == TAB_WIDTH);
 
+/// Expand tabs to [`TAB_AS_SPACES`], the form the rest of this layer expects.
+///
+/// Components must call this on text before wrapping or handing it to an
+/// overlay. The width authority measures a raw tab as [`TAB_WIDTH`], but the
+/// overlay compositing scanners ([`slice_with_width`], [`extract_segments`])
+/// measure it as zero on the assumption that rendered rows no longer contain
+/// raw tabs. A tab that survives into composited content therefore paints
+/// wider than the compositor accounted for and shifts the row. Expanding at
+/// the source keeps every downstream measurement in agreement.
+///
+/// The render pipeline's [`sanitize_render_line`] expands any tab that still
+/// slips through, but that pass runs after compositing, so it is only a
+/// backstop for misbehaving components, not the place overlay-bound content
+/// should rely on.
+pub fn expand_tabs(text: &str) -> String {
+    text.replace('\t', TAB_AS_SPACES)
+}
+
 /// Returns true if every byte in the string is printable ASCII (0x20..=0x7E).
 fn is_printable_ascii(s: &str) -> bool {
     s.bytes().all(|b| (0x20..=0x7e).contains(&b))
@@ -635,6 +653,91 @@ fn contains_thai_lao_am(bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Flatten a rendered line into a single safe terminal row.
+///
+/// A component's rendered row is contractually one visual line: ANSI
+/// SGR/OSC/APC escapes are allowed, but the raw C0 control characters that
+/// move the cursor or break width are not. A `\n`, `\r`, `\v`, or `\f`
+/// relocates the cursor off the row (or back to column 0), and because the
+/// diff engine tracks the wandered cells as part of one logical row it can
+/// never reclaim them, leaving persistent on-screen corruption. Backspace
+/// overprints within the row. A raw `\t` advances to the terminal's own
+/// 8-column stop, which disagrees with the [`TAB_WIDTH`] our width math
+/// assumed.
+///
+/// This pass enforces the contract defensively, right where a row is about
+/// to be written. When a row carries one of those controls:
+/// - tabs expand to [`TAB_AS_SPACES`] so the painted glyphs occupy the
+///   columns the width math already assumed,
+/// - recognized escape sequences (via [`extract_ansi_code`]) pass through
+///   untouched,
+/// - every other control character (a co-occurring DEL, a stray ESC that
+///   starts no valid sequence, ...) is dropped.
+///
+/// We drop the zero-width controls rather than substitute a space so the
+/// visible width never changes. The width validator runs after this pass
+/// and would otherwise trip on a row we widened.
+///
+/// The fast-path scan keys on the cursor-moving and width-breaking C0
+/// controls, the contiguous range `0x08..=0x0d` (BS, HT, LF, VT, FF, CR),
+/// via a SIMD `memchr` pair, so the common styled or plain row bails
+/// without a byte-by-byte walk. A control that neither moves the cursor nor
+/// shifts columns (NUL, BEL, DEL, ...) appearing on its own is harmless to
+/// the row model and left in place rather than charged a slower scan.
+///
+/// NOTE: this is a backstop, not the primary tab handler. It runs after
+/// overlay compositing, so content bound for an overlay must expand its own
+/// tabs up front (see [`expand_tabs`]). A tab reaching this pass has already
+/// been mis-measured by the compositor.
+///
+/// NOTE: run this after cursor-marker extraction. The marker is an APC
+/// sequence `extract_ansi_code` recognizes, so it would survive regardless,
+/// but keeping the marker out of this pass leaves it purely about
+/// control-character hygiene.
+pub(crate) fn sanitize_render_line(s: &mut String) {
+    // Fast path: bail unless the row carries a cursor-moving or
+    // width-breaking C0 control (`0x08..=0x0d`). Two `memchr3` SIMD scans
+    // cover that contiguous range, the common `\t`/`\n`/`\r` needles first
+    // so a dirty row short-circuits. ESC is excluded so the common styled
+    // row (SGR only) stays off the slow walk.
+    let bytes = s.as_bytes();
+    if memchr::memchr3(b'\t', b'\n', b'\r', bytes).is_none()
+        && memchr::memchr3(0x08, 0x0b, 0x0c, bytes).is_none()
+    {
+        return;
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' {
+            if let Some(ansi) = extract_ansi_code(s, i) {
+                out.push_str(&s[i..i + ansi.byte_len]);
+                i += ansi.byte_len;
+                continue;
+            }
+            // Stray ESC that begins no recognized sequence: drop it.
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\t' {
+            out.push_str(TAB_AS_SPACES);
+            i += 1;
+            continue;
+        }
+        // `unwrap` is safe: `i` sits on a char boundary because every
+        // branch advances by a whole UTF-8 char or a full escape.
+        let ch = s[i..].chars().next().unwrap();
+        if ch.is_control() {
+            i += ch.len_utf8();
+            continue;
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    *s = out;
 }
 
 /// Whether `g` contains any whitespace scalar. Empty input returns `false`.
@@ -1594,6 +1697,166 @@ pub fn apply_background_to_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- sanitize_render_line --
+
+    /// Helper: sanitize a copy and return it.
+    fn sanitized(s: &str) -> String {
+        let mut owned = s.to_string();
+        sanitize_render_line(&mut owned);
+        owned
+    }
+
+    #[test]
+    fn expand_tabs_replaces_each_tab_and_leaves_clean_text() {
+        assert_eq!(expand_tabs("a\tb"), format!("a{TAB_AS_SPACES}b"));
+        assert_eq!(
+            expand_tabs("\t\tx"),
+            format!("{TAB_AS_SPACES}{TAB_AS_SPACES}x")
+        );
+        // No tab: returned unchanged.
+        assert_eq!(expand_tabs("plain text"), "plain text");
+    }
+
+    /// Per-frame cost of the render pipeline's `sanitize_render_line` pass.
+    ///
+    /// Phase 4 of `Tui::render` runs this on every line of every frame, so
+    /// the number that matters is the steady-state cost over a realistic
+    /// frame where the overwhelming majority of rows are clean and hit the
+    /// fast-path bail. We also report the worst case (every row tabbed,
+    /// forcing the allocate-and-rewrite slow path) and
+    /// `normalize_terminal_output` as a reference, since it is an existing
+    /// per-line pass in the same loop.
+    #[test]
+    #[ignore = "perf measurement; run with --release --ignored --nocapture"]
+    fn sanitize_render_line_frame_cost() {
+        use std::time::{Duration, Instant};
+
+        const NUM_LINES: usize = 4000;
+        const WIDTH: usize = 199;
+        const ITERATIONS: u32 = 200;
+
+        // Mostly plain ASCII with ~6% SGR-styled rows, mirroring a long
+        // chat scrollback. Every row is clean, so each hits the fast-path
+        // bail. That is the cost the render loop actually pays each frame.
+        let body = "x".repeat(WIDTH - 2);
+        let styled = format!(
+            "\x1b[36m\u{25cf}\x1b[39m \x1b[1massistant\x1b[22m {}",
+            "x".repeat(WIDTH - 12)
+        );
+        let clean: Vec<String> = (0..NUM_LINES)
+            .map(|i| {
+                if i % 17 == 0 {
+                    styled.clone()
+                } else {
+                    body.clone()
+                }
+            })
+            .collect();
+
+        // Worst case: every row carries tabs, forcing the slow path
+        // (allocate + rewrite) on every line.
+        let dirty: Vec<String> = (0..NUM_LINES).map(|_| format!("\tcol\t{body}")).collect();
+
+        let per_line_ns =
+            |frame_us: f64| frame_us * 1000.0 / f64::from(u32::try_from(NUM_LINES).unwrap());
+
+        // Time `op` over a fresh clone of `frame` each iteration (the clone
+        // is outside the timed region) and return the average frame cost.
+        let bench = |frame: &[String], op: &dyn Fn(&mut String)| -> f64 {
+            let mut total = Duration::ZERO;
+            for _ in 0..ITERATIONS {
+                let mut f = frame.to_vec();
+                let t = Instant::now();
+                for line in &mut f {
+                    op(line);
+                }
+                total += t.elapsed();
+                std::hint::black_box(&f);
+            }
+            (total.as_secs_f64() * 1_000_000.0) / f64::from(ITERATIONS)
+        };
+
+        let clean_us = bench(&clean, &|l| sanitize_render_line(l));
+        let dirty_us = bench(&dirty, &|l| sanitize_render_line(l));
+        let normalize_us = bench(&clean, &|l| normalize_terminal_output(l));
+
+        eprintln!(
+            "[sanitize_cost] {NUM_LINES} lines x {WIDTH} cols\n\
+             [sanitize_cost]   sanitize clean (fast path): {clean_us:.1}µs/frame ({:.1} ns/line)\n\
+             [sanitize_cost]   sanitize all-tabbed (slow path): {dirty_us:.1}µs/frame ({:.1} ns/line)\n\
+             [sanitize_cost]   normalize_terminal_output (ref): {normalize_us:.1}µs/frame ({:.1} ns/line)",
+            per_line_ns(clean_us),
+            per_line_ns(dirty_us),
+            per_line_ns(normalize_us),
+        );
+    }
+
+    #[test]
+    fn sanitize_leaves_clean_lines_untouched() {
+        // Plain text and SGR-styled text take the fast-path bail.
+        assert_eq!(sanitized("hello world"), "hello world");
+        assert_eq!(sanitized("\x1b[1mbold\x1b[0m"), "\x1b[1mbold\x1b[0m");
+        // Multibyte glyphs survive.
+        assert_eq!(sanitized("café…"), "café…");
+    }
+
+    #[test]
+    fn sanitize_drops_newlines_and_carriage_returns() {
+        assert_eq!(sanitized("line1\nline2"), "line1line2");
+        assert_eq!(sanitized("a\r\nb"), "ab");
+        // Visible width is preserved: the dropped controls were zero-width.
+        assert_eq!(visible_width(&sanitized("a\nb")), visible_width("ab"));
+    }
+
+    #[test]
+    fn sanitize_expands_tabs_to_spaces() {
+        assert_eq!(sanitized("a\tb"), format!("a{TAB_AS_SPACES}b"));
+        // A leading tab becomes indentation of the matching width.
+        assert_eq!(
+            visible_width(&sanitized("\tset")),
+            TAB_WIDTH + visible_width("set")
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_osc8_hyperlinks_with_bel_terminator() {
+        // OSC 8 hyperlinks may use a BEL (0x07) terminator. When the slow
+        // path runs (here triggered by a trailing newline), it must copy
+        // the whole escape through `extract_ansi_code` rather than drop the
+        // BEL, while still dropping the newline.
+        let link = "\x1b]8;;https://x\x07label\x1b]8;;\x07";
+        assert_eq!(sanitized(&format!("{link}\n")), link);
+    }
+
+    #[test]
+    fn sanitize_triggers_on_all_cursor_moving_controls() {
+        // The whole 0x08..=0x0d range engages the slow path on its own and
+        // the control is dropped.
+        assert_eq!(sanitized("a\x08b"), "ab"); // backspace
+        assert_eq!(sanitized("a\x0bb"), "ab"); // vertical tab
+        assert_eq!(sanitized("a\x0cb"), "ab"); // form feed
+        // A control outside that range, on its own, neither moves the cursor
+        // nor shifts columns, so it bails on the fast path and is left as-is.
+        assert_eq!(sanitized("a\x07b"), "a\x07b"); // BEL
+        assert_eq!(sanitized("a\x7fb"), "a\x7fb"); // DEL
+    }
+
+    #[test]
+    fn sanitize_drops_co_occurring_controls_and_stray_escape() {
+        // Once the slow path runs (a newline triggers it here), it also drops
+        // a co-occurring DEL and a stray ESC, and expands tabs.
+        assert_eq!(sanitized("a\x7f\nb"), "ab");
+        assert_eq!(sanitized("a\x1b\tb"), format!("a{TAB_AS_SPACES}b"));
+    }
+
+    #[test]
+    fn sanitize_preserves_csi_and_multibyte_on_the_slow_path() {
+        // A trailing newline forces the slow path. A CSI SGR sequence and
+        // multibyte text must survive it intact while the newline is dropped.
+        assert_eq!(sanitized("\x1b[1mbold\x1b[0m\n"), "\x1b[1mbold\x1b[0m");
+        assert_eq!(sanitized("café…\n"), "café…");
+    }
 
     // -- strip_ansi --
 

@@ -1,6 +1,6 @@
 //! Multi-line word-wrapping text display component.
 
-use crate::ansi::{TAB_AS_SPACES, apply_background_to_line, visible_width, wrap_text_with_ansi};
+use crate::ansi::{apply_background_to_line, expand_tabs, visible_width, wrap_text_with_ansi};
 use crate::component::Component;
 
 /// Default horizontal padding (left/right margin) applied to text content.
@@ -98,10 +98,10 @@ impl Component for Text {
             return Vec::new();
         }
 
-        // Replace tabs with three spaces before wrapping. This keeps
-        // tab-indented input from rendering as a single literal `\t`
-        // cell with the wrong visible width.
-        let normalized: String = self.text.replace('\t', TAB_AS_SPACES);
+        // Expand tabs before wrapping. This keeps tab-indented input from
+        // rendering as a single literal `\t` cell with the wrong visible
+        // width.
+        let normalized = expand_tabs(&self.text);
 
         // Clamp content width to at least 1 so a degenerate
         // `width <= 2 * padding_x` doesn't drop the row entirely.

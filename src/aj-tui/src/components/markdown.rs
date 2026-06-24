@@ -15,7 +15,7 @@ use syntect::highlighting::ScopeSelectors;
 use syntect::parsing::{MatchPower, ParseState, Scope, ScopeStack, SyntaxSet};
 
 use crate::ansi::{
-    TAB_AS_SPACES, apply_background_to_line, extract_ansi_code, visible_width, wrap_text_with_ansi,
+    apply_background_to_line, expand_tabs, extract_ansi_code, visible_width, wrap_text_with_ansi,
 };
 use crate::capabilities::get_capabilities;
 use crate::component::Component;
@@ -2032,15 +2032,15 @@ impl Component for Markdown {
             .default_text_style
             .as_ref()
             .and_then(|d| d.bg_color.as_ref());
-        // Normalize tabs to spaces before parsing, using the shared
-        // `TAB_AS_SPACES`. Three spaces (rather than CommonMark's four) is a
+        // Expand tabs to spaces before parsing, via the shared
+        // `expand_tabs` (three spaces, not CommonMark's four). This is a
         // UX call: a fenced code block with hard tabs would otherwise render
         // with a literal `\t` byte instead of the expected indent. The cache
         // key (`cached_text`) holds the *original* text so an unchanged input
         // still hits the cache. Normalization is idempotent and
         // deterministic, so a hit returns the same result we'd produce by
         // re-normalizing.
-        let normalized = self.text.replace('\t', TAB_AS_SPACES);
+        let normalized = expand_tabs(&self.text);
         let blocks = parse_markdown(&normalized);
 
         // Phase 1: collect block-rendered lines (no horizontal

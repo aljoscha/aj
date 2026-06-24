@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::ansi::{truncate_to_width, visible_width};
+use crate::ansi::{expand_tabs, truncate_to_width, visible_width};
 use crate::component::Component;
 use crate::keybindings;
 use crate::keys::InputEvent;
@@ -534,16 +534,21 @@ impl SelectList {
         max_width: usize,
         column_width: usize,
     ) -> String {
-        let display = item.display_value();
+        // Expand tabs for display only. This list renders inside an overlay,
+        // whose compositor measures a raw tab as zero width while the column
+        // math measures it as `TAB_WIDTH`, so a surviving tab would shift the
+        // row. The item's stored text stays raw, so filtering and the
+        // selection value are unaffected.
+        let display = expand_tabs(item.display_value());
         let candidate = match &self.layout.truncate_primary {
             Some(f) => f(TruncatePrimaryContext {
-                text: display,
+                text: &display,
                 max_width,
                 column_width,
                 item,
                 is_selected,
             }),
-            None => truncate_to_width(display, max_width, "", false),
+            None => truncate_to_width(&display, max_width, "", false),
         };
         // Guard against a bogus custom truncator that overshoots.
         truncate_to_width(&candidate, max_width, "", false)
@@ -560,8 +565,8 @@ impl SelectList {
         if prefix_column_width == 0 {
             return (String::new(), 0);
         }
-        let raw = item.prefix.as_deref().unwrap_or("");
-        let truncated = truncate_to_width(raw, prefix_column_width, "", false);
+        let raw = expand_tabs(item.prefix.as_deref().unwrap_or(""));
+        let truncated = truncate_to_width(&raw, prefix_column_width, "", false);
         let pad = prefix_column_width.saturating_sub(visible_width(&truncated));
         let padded = format!("{}{}", " ".repeat(pad), truncated);
         let styled = (self.theme.prefix)(&padded);
@@ -607,7 +612,10 @@ impl SelectList {
             Description(&'a str),
             None,
         }
-        let right = if let Some(sc) = item.shortcut.as_deref() {
+        // Expand tabs in the shortcut for display, same rationale as the
+        // primary column. Owned so the borrow below outlives the match.
+        let shortcut = item.shortcut.as_deref().map(expand_tabs);
+        let right = if let Some(sc) = shortcut.as_deref() {
             Right::Shortcut(sc)
         } else if let Some(desc) = description_single_line {
             Right::Description(desc)
@@ -707,7 +715,13 @@ impl Component for SelectList {
         for idx in start_index..end_index {
             let item = &self.items[self.filtered_indices[idx]];
             let is_selected = idx == self.selected;
-            let single_line = item.description.as_deref().map(normalize_to_single_line);
+            // Expand tabs before collapsing to a single line so the
+            // description column can't carry a raw tab into the overlay
+            // compositor (which would measure it as zero width).
+            let single_line = item
+                .description
+                .as_deref()
+                .map(|desc| normalize_to_single_line(&expand_tabs(desc)));
             lines.push(self.render_item(
                 item,
                 is_selected,
@@ -854,6 +868,30 @@ mod tests {
             .map(|&i| list.items[i].value.as_str())
             .collect();
         assert_eq!(visible, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn item_display_tabs_are_expanded() {
+        // Tabs in a label/description must not reach the overlay compositor,
+        // which would measure them as zero width and shift the row.
+        let items = vec![SelectItem::new("v", "a\tb").with_description("c\td")];
+        let mut list = SelectList::new(items, 5, identity_theme(), SelectListLayout::default());
+
+        // The model is untouched: filtering and the selection value keep the
+        // original text.
+        assert_eq!(list.items()[0].label, "a\tb");
+
+        // The rendered row carries no raw tab, and the label's tab shows as
+        // spaces.
+        let rendered = list.render(60).join("\n");
+        assert!(
+            !rendered.contains('\t'),
+            "rendered row has a raw tab: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("a   b"),
+            "label tab not expanded: {rendered:?}"
+        );
     }
 
     #[test]

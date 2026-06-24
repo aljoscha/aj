@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use aj_agent::TaskRegistry;
 use aj_agent::tool::{TaskId, TaskStatus};
-use aj_tui::ansi::{truncate_to_width, visible_width, wrap_text_with_ansi};
+use aj_tui::ansi::{expand_tabs, visible_width, wrap_text_with_ansi};
 use aj_tui::component::Component;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
@@ -43,9 +43,20 @@ pub enum TaskOutputOutcome {
 /// Cheap-to-clone handle pointing at the viewer's outcome slot.
 pub type TaskOutputOutcomeHandle = OutcomeSlot<TaskOutputOutcome>;
 
-/// Header rows the viewer renders above the scrollable body: the command
-/// line, the status line, and a blank separator.
-const HEADER_ROWS: usize = 3;
+/// Non-command header rows the viewer always renders above the scrollable
+/// body: the status line and a blank separator. The command preview adds a
+/// variable number of rows on top (see [`TaskOutputComponent::command_rows`]).
+const STATUS_AND_SEPARATOR_ROWS: usize = 2;
+
+/// Minimum body rows to keep visible below the header, so a long command
+/// preview never starves the output the viewer exists to show.
+const MIN_BODY_ROWS: usize = 4;
+
+/// Upper bound on how many rows the command preview may occupy, so a long
+/// multi-line script doesn't dominate the viewer even on a tall terminal.
+/// When the wrapped command exceeds this, the last shown row is replaced by
+/// a `… (+N more lines)` indicator.
+const MAX_COMMAND_PREVIEW_ROWS: usize = 8;
 
 /// Read-only, scrollable viewer that tails one background bash task.
 pub struct TaskOutputComponent {
@@ -86,8 +97,14 @@ pub struct TaskOutputComponent {
     /// Set on open and re-enabled by jump-to-bottom; any manual scroll
     /// up clears it.
     follow: bool,
-    /// Body rows available this frame, derived from the window's inner
-    /// height via [`Component::set_available_height`].
+    /// Inner content height the overlay grants this frame, set via
+    /// [`Component::set_available_height`]. The header (command preview +
+    /// status + separator) is carved out of this in `render`, and what
+    /// remains is the body viewport.
+    available_rows: usize,
+    /// Body rows available this frame, derived from `available_rows` minus
+    /// the header height. Recomputed in `render` (the header height depends
+    /// on the render width) and read back by the scroll input handlers.
     viewport: usize,
     outcome: TaskOutputOutcomeHandle,
     focused: bool,
@@ -112,6 +129,7 @@ impl TaskOutputComponent {
             total_bytes: 0,
             scroll: 0,
             follow: true,
+            available_rows: 10,
             viewport: 10,
             outcome: TaskOutputOutcomeHandle::new(),
             focused: true,
@@ -210,9 +228,33 @@ impl TaskOutputComponent {
         wrap_text_with_ansi(&line, width)
     }
 
-    /// The command line, dimmed and truncated to the box width.
-    fn command_line(&self, width: usize) -> String {
-        style::dim(&truncate_to_width(&self.command, width, "…", false))
+    /// The command preview, wrapped to the box width as one or more dim
+    /// rows. Embedded newlines split into separate rows and over-long lines
+    /// wrap, so a multi-line script reads as it was written. Capped at
+    /// `max_rows`: past that, the last row becomes a `… (+N more lines)`
+    /// indicator so a long command can't crowd out the body.
+    ///
+    /// Tabs are expanded before wrapping: this content is rendered inside an
+    /// overlay, and the compositor measures a raw tab as zero width, so a
+    /// surviving tab would shift the composited row.
+    fn command_rows(&self, width: usize, max_rows: usize) -> Vec<String> {
+        let max_rows = max_rows.max(1);
+        let mut rows = wrap_text_with_ansi(&expand_tabs(&self.command), width);
+        if rows.len() > max_rows {
+            let hidden = rows.len() - (max_rows - 1);
+            rows.truncate(max_rows - 1);
+            rows.push(format!("… (+{hidden} more lines)"));
+        }
+        rows.iter().map(|row| style::dim(row)).collect()
+    }
+
+    /// How many rows the command preview may occupy this frame: whatever is
+    /// left after reserving the status line, the separator, and a minimum
+    /// body, clamped to [`MAX_COMMAND_PREVIEW_ROWS`].
+    fn command_preview_cap(&self) -> usize {
+        self.available_rows
+            .saturating_sub(STATUS_AND_SEPARATOR_ROWS + MIN_BODY_ROWS)
+            .clamp(1, MAX_COMMAND_PREVIEW_ROWS)
     }
 
     /// The status line: glyph + status word + size on the left, scroll
@@ -280,11 +322,15 @@ fn status_glyph_word(status: TaskStatus) -> (&'static str, String) {
     }
 }
 
-/// Decode raw spill bytes into a display line: lossy UTF-8 plus a crude
-/// carriage-return collapse.
+/// Decode raw spill bytes into a display line: lossy UTF-8, a crude
+/// carriage-return collapse, and tab expansion.
+///
+/// Tabs are expanded here because the body is rendered inside an overlay,
+/// whose compositor measures a raw tab as zero width and would shift the
+/// row a surviving tab landed on.
 fn decode_line(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
-    render_carriage_returns(&text).to_string()
+    expand_tabs(render_carriage_returns(&text))
 }
 
 /// Approximate a terminal's handling of bare carriage returns: a `\r`
@@ -325,11 +371,20 @@ impl Component for TaskOutputComponent {
 
     fn render(&mut self, width: usize) -> Vec<String> {
         self.refresh();
+
+        // The command preview is variable-height, so the body viewport can
+        // only be sized here, where the render width (hence the wrapped
+        // command's row count) is known. Recompute it and stash it for the
+        // scroll input handlers.
+        let command_rows = self.command_rows(width, self.command_preview_cap());
+        let header_rows = command_rows.len() + STATUS_AND_SEPARATOR_ROWS;
+        let viewport = self.available_rows.saturating_sub(header_rows).max(1);
+        self.viewport = viewport;
+
         self.ensure_wrapped(width);
 
         let pending_rows = self.pending_rows(width);
         let total = self.visual.len() + pending_rows.len();
-        let viewport = self.viewport.max(1);
         let max_scroll = total.saturating_sub(viewport);
         // Follow pins to the bottom; otherwise keep the user's position
         // but never past the end as the buffer shrinks on a width change.
@@ -339,8 +394,8 @@ impl Component for TaskOutputComponent {
             self.scroll.min(max_scroll)
         };
 
-        let mut out = Vec::with_capacity(HEADER_ROWS + viewport);
-        out.push(self.command_line(width));
+        let mut out = Vec::with_capacity(header_rows + viewport);
+        out.extend(command_rows);
         out.push(self.status_line(width, total, viewport));
         out.push(String::new());
 
@@ -411,7 +466,9 @@ impl Component for TaskOutputComponent {
     }
 
     fn set_available_height(&mut self, rows: usize) {
-        self.viewport = rows.saturating_sub(HEADER_ROWS).max(1);
+        // Store the full budget. `render` carves out the header (whose
+        // height depends on the wrapped command) and sizes the viewport.
+        self.available_rows = rows;
     }
 
     fn set_focused(&mut self, focused: bool) {
@@ -481,8 +538,13 @@ mod tests {
         (v, registry, id, file)
     }
 
+    /// Header rows above the body for the single-line command (`echo hi`)
+    /// the test viewer is built with: one command row plus the status line
+    /// and blank separator.
+    const SINGLE_LINE_HEADER_ROWS: usize = 1 + STATUS_AND_SEPARATOR_ROWS;
+
     fn body(lines: &[String]) -> String {
-        lines[HEADER_ROWS..].join("\n")
+        lines[SINGLE_LINE_HEADER_ROWS..].join("\n")
     }
 
     #[test]
@@ -535,6 +597,109 @@ mod tests {
         let lines = v.render(40);
         assert!(lines[1].contains("exited 0"), "header: {:?}", lines[1]);
         assert!(lines[1].contains('✓'), "header glyph: {:?}", lines[1]);
+    }
+
+    /// Build a viewer with an explicit (possibly multi-line) command and
+    /// inner height, over a spill pre-filled with `contents`.
+    fn viewer_with_command(
+        command: &str,
+        contents: &str,
+        available_rows: usize,
+    ) -> (TaskOutputComponent, NamedTempFile) {
+        crate::config::keybindings::install_global_manager_defaults();
+        let mut file = NamedTempFile::new().expect("temp spill");
+        file.write_all(contents.as_bytes()).expect("write spill");
+        file.flush().expect("flush spill");
+        let read = TaskRead {
+            spill_path: Some(file.path().to_path_buf()),
+            stdout_total_bytes: u64::try_from(contents.len()).expect("spill length fits u64"),
+            ..TaskRead::default()
+        };
+        let registry = TaskRegistry::default();
+        let (id, _cancel) = registry.register(
+            AgentId::Main,
+            TaskKind::Bash {
+                command: command.to_string(),
+            },
+            command.to_string(),
+            Arc::new(FakeSource { read }),
+        );
+        let mut v = TaskOutputComponent::new(registry, id, command.to_string());
+        v.set_available_height(available_rows);
+        (v, file)
+    }
+
+    #[test]
+    fn multi_line_command_renders_one_row_per_line() {
+        let command = "cd /tmp\nset -u\nPR=37255";
+        let (mut v, _f) = viewer_with_command(command, "out\n", 20);
+        let lines = v.render(60);
+
+        // No rendered row carries an embedded newline: the multi-line
+        // command is split into separate rows, not crammed into one (the
+        // bug this guards against).
+        assert!(lines.iter().all(|l| !l.contains('\n')), "rows: {lines:#?}");
+        // Each command line lands on its own row.
+        assert!(lines[0].contains("cd /tmp"), "row 0: {:?}", lines[0]);
+        assert!(lines[1].contains("set -u"), "row 1: {:?}", lines[1]);
+        assert!(lines[2].contains("PR=37255"), "row 2: {:?}", lines[2]);
+        // The status line follows the three command rows.
+        assert!(lines[3].contains("running"), "status row: {:?}", lines[3]);
+        // The body still renders below the now-taller header.
+        assert!(lines.iter().any(|l| l.contains("out")), "body: {lines:#?}");
+    }
+
+    #[test]
+    fn long_command_is_capped_with_more_lines_indicator() {
+        let command: String = (1..=40).map(|n| format!("step{n}\n")).collect();
+        let (mut v, _f) = viewer_with_command(&command, "out\n", 24);
+        let lines = v.render(60);
+
+        let preview_rows = lines.iter().take_while(|l| !l.contains("running")).count();
+        assert_eq!(preview_rows, MAX_COMMAND_PREVIEW_ROWS, "rows: {lines:#?}");
+        assert!(
+            lines[MAX_COMMAND_PREVIEW_ROWS - 1].contains("more lines"),
+            "indicator row: {:?}",
+            lines[MAX_COMMAND_PREVIEW_ROWS - 1]
+        );
+    }
+
+    #[test]
+    fn command_tabs_expand_to_spaces() {
+        // A tab in the command must not survive into the rendered row: the
+        // overlay compositor measures raw tabs as zero width, so a survivor
+        // would shift the composited row. Expanded at the component instead.
+        let (mut v, _f) = viewer_with_command("\techo hi", "out\n", 20);
+        let lines = v.render(60);
+        assert!(
+            !lines[0].contains('\t'),
+            "row 0 has a raw tab: {:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("   echo hi"), "row 0: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn taller_command_header_shrinks_the_body_viewport() {
+        // A multi-line command grows the header, and the body viewport is
+        // whatever the budget leaves. The total never exceeds the budget.
+        let command = "one\ntwo\nthree";
+        let contents: String = (1..=50).map(|n| format!("out{n}\n")).collect();
+        let (mut v, _f) = viewer_with_command(command, &contents, 20);
+        let lines = v.render(60);
+
+        // 3 command rows + status + blank separator.
+        let header_rows = 3 + STATUS_AND_SEPARATOR_ROWS;
+        assert_eq!(
+            lines.len() - header_rows,
+            20 - header_rows,
+            "body should fill the remaining budget: {lines:#?}"
+        );
+        assert!(
+            lines.len() <= 20,
+            "rendered {} rows > budget 20",
+            lines.len()
+        );
     }
 
     #[test]

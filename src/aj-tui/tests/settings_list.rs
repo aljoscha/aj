@@ -338,6 +338,31 @@ fn render_shows_cursor_on_selected_item_and_description_below() {
 }
 
 #[test]
+fn render_expands_tabs_in_label_value_and_description() {
+    // The list renders inside an overlay, whose compositor measures a raw
+    // tab as zero width. A tab in any displayed field would shift the row,
+    // so they must be expanded to spaces before layout.
+    let items = vec![SettingItem {
+        id: "tabbed".into(),
+        label: "La\tbel".into(),
+        description: Some("de\tsc".into()),
+        current_value: "va\tlue".into(),
+        values: None,
+        submenu: None,
+    }];
+    let (mut list, _, _) = make_settings_list(items, SettingsListOptions::default());
+    let rendered = plain_lines_trim_end(&list.render(80));
+    assert!(
+        !rendered.iter().any(|line| line.contains('\t')),
+        "a rendered row has a raw tab: {rendered:?}",
+    );
+    assert!(
+        rendered.iter().any(|line| line.contains("La   bel")),
+        "label tab not expanded: {rendered:?}",
+    );
+}
+
+#[test]
 fn render_wraps_and_prefixes_selected_items_description() {
     let (mut list, _, _) = make_settings_list(sample_items(), SettingsListOptions::default());
     list.handle_input(&Key::down());

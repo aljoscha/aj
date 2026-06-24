@@ -42,8 +42,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant as TokioInstant, Interval, MissedTickBehavior, interval_at};
 
 use crate::ansi::{
-    SEGMENT_RESET, extract_segments, normalize_terminal_output, slice_by_column, slice_with_width,
-    visible_width,
+    SEGMENT_RESET, extract_segments, normalize_terminal_output, sanitize_render_line,
+    slice_by_column, slice_with_width, visible_width,
 };
 use crate::component::{CURSOR_MARKER, Component};
 use crate::container::Container;
@@ -1583,6 +1583,11 @@ impl Tui {
             if crate::image_protocol::is_image_line(line) {
                 continue;
             }
+            // Flatten any control characters a component left in the row
+            // (stray newlines, raw tabs, ...) before it reaches the
+            // terminal. Skipped for image rows above, whose self-contained
+            // escapes must pass through byte-for-byte.
+            sanitize_render_line(line);
             line.push_str(SEGMENT_RESET);
         }
 

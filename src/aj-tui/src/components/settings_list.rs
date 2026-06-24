@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::ansi::{truncate_to_width, visible_width, wrap_text_with_ansi};
+use crate::ansi::{expand_tabs, truncate_to_width, visible_width, wrap_text_with_ansi};
 use crate::component::Component;
 use crate::components::text_input::TextInput;
 use crate::fuzzy::fuzzy_filter;
@@ -466,15 +466,22 @@ impl Component for SettingsList {
                 "  ".to_string()
             };
             let prefix_width = visible_width(&prefix);
-            let label_w = visible_width(&item.label);
+            // Expand tabs before layout: this list is overlay content and
+            // the compositor measures a raw tab as zero width, so a tab in
+            // a label/value would shift the row. `visible_width` already
+            // counts a tab as `TAB_WIDTH`, so `compute_label_width` agrees
+            // with the expanded form.
+            let label = expand_tabs(&item.label);
+            let label_w = visible_width(&label);
             let pad = label_width.saturating_sub(label_w);
-            let label_padded = format!("{}{}", item.label, " ".repeat(pad));
+            let label_padded = format!("{}{}", label, " ".repeat(pad));
             let label_text = (self.theme.label)(&label_padded, is_selected);
 
             let separator = "  ";
             let used = prefix_width + label_width + visible_width(separator);
             let value_max = width.saturating_sub(used).saturating_sub(2);
-            let value_trunc = truncate_to_width(&item.current_value, value_max, "", false);
+            let value_trunc =
+                truncate_to_width(&expand_tabs(&item.current_value), value_max, "", false);
             let value_text = (self.theme.value)(&value_trunc, is_selected);
 
             lines.push(truncate_to_width(
@@ -504,7 +511,7 @@ impl Component for SettingsList {
         {
             if let Some(desc) = &item.description {
                 lines.push(String::new());
-                let wrapped = wrap_text_with_ansi(desc, width.saturating_sub(4));
+                let wrapped = wrap_text_with_ansi(&expand_tabs(desc), width.saturating_sub(4));
                 for row in wrapped {
                     lines.push((self.theme.description)(&format!("  {}", row)));
                 }
