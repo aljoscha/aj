@@ -90,7 +90,13 @@ pub fn transform_messages(messages: &[Message], target: &ModelInfo) -> Vec<Messa
 // Pass 1: assistant rewrites + tool-call ID normalization (rules 2–3)
 // ---------------------------------------------------------------------------
 
-/// True when `a` was produced by exactly the target model.
+/// True when `a` was produced by the target model.
+///
+/// All three of provider, api, and model id must match exactly. Providers
+/// record the requested catalog id (`ModelInfo::id`) on the assistant message
+/// rather than any resolved snapshot the wire echoes back, so a same-session
+/// continuation compares equal here and its signed reasoning is preserved
+/// rather than demoted.
 fn is_same_model(a: &AssistantMessage, target: &ModelInfo) -> bool {
     a.provider == target.provider && a.api == target.api && a.model == target.id
 }

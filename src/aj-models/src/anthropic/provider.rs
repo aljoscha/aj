@@ -999,14 +999,6 @@ impl StreamState {
         match event {
             ServerSentEvent::MessageStart { message } => {
                 self.partial.response_id = Some(message.id);
-                // The server may report a slightly different `model` than
-                // the registry id (e.g. version-pinned). Trust the wire
-                // value. Display-only: cost keys off the registry
-                // `ModelInfo`, not `partial.model`, so the override can't
-                // desync pricing.
-                if !message.model.is_empty() {
-                    self.partial.model = message.model;
-                }
                 self.partial.usage = into_unified_usage(&message.usage);
                 events.push(AssistantMessageEvent::Start {
                     partial: self.partial.clone(),
@@ -1944,6 +1936,25 @@ mod tests {
             container: None,
             context_management: None,
         }
+    }
+
+    #[test]
+    fn records_requested_model_id_not_wire_model() {
+        // `empty_a_message` carries a version-pinned wire id
+        // (`claude-sonnet-4-20250514`); the produced message must record the
+        // requested catalog id (`claude-sonnet-4`) so a same-session
+        // continuation stays same-model and session resume matches the
+        // catalog.
+        let result = replay_sse_events(
+            &fake_model(),
+            [
+                ServerSentEvent::MessageStart {
+                    message: empty_a_message(),
+                },
+                ServerSentEvent::MessageStop,
+            ],
+        );
+        assert_eq!(result.model, "claude-sonnet-4");
     }
 
     #[test]

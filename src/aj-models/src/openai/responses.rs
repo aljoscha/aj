@@ -1153,9 +1153,6 @@ impl StreamState {
         }
         self.started = true;
         self.partial.response_id = Some(response.id.clone());
-        if !response.model.is_empty() {
-            self.partial.model = response.model.clone();
-        }
         out.push(AssistantMessageEvent::Start {
             partial: self.partial.clone(),
         });
@@ -2082,6 +2079,37 @@ mod tests {
         };
         // 1.25 (input) + 10.0 (output) = 11.25 at full price; flex halves it.
         assert!((msg.usage.cost.total - 5.625).abs() < 1e-9);
+    }
+
+    #[test]
+    fn records_requested_model_id_not_wire_model() {
+        // The server echoes a dated snapshot id, but the produced message must
+        // record the requested catalog id so a same-session continuation stays
+        // same-model (`transform::is_same_model`) and session resume matches
+        // the catalog.
+        let created: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1", "object": "response", "created_at": 0,
+                "model": "gpt-5-2026-04-23", "output": [],
+                "parallel_tool_calls": true, "tools": [], "status": "in_progress"
+            }
+        }))
+        .expect("valid response.created event");
+        let completed: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1", "object": "response", "created_at": 0,
+                "model": "gpt-5-2026-04-23", "output": [],
+                "parallel_tool_calls": true, "tools": [], "status": "completed"
+            }
+        }))
+        .expect("valid response.completed event");
+
+        let msg = replay_sse_events(&fake_model(true), [created, completed], None);
+        assert_eq!(msg.model, "gpt-5");
     }
 
     #[test]

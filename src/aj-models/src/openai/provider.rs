@@ -830,14 +830,9 @@ impl StreamState {
         if !self.started {
             self.started = true;
             self.partial.response_id = Some(chunk.id.clone());
-            if !chunk.model.is_empty() {
-                self.partial.model = chunk.model.clone();
-            }
             events.push(AssistantMessageEvent::Start {
                 partial: self.partial.clone(),
             });
-        } else if !chunk.model.is_empty() && self.partial.model.is_empty() {
-            self.partial.model = chunk.model.clone();
         }
 
         if let Some(usage) = chunk.usage.as_ref() {
@@ -1552,6 +1547,19 @@ mod tests {
             logprobs: None,
         });
         chunk
+    }
+
+    #[test]
+    fn records_requested_model_id_not_wire_model() {
+        // The wire echoes a dated snapshot id; the produced message must
+        // record the requested catalog id so a same-session continuation
+        // stays same-model and session resume matches the catalog. Only the
+        // first chunk's id matters here; the terminal chunk's matching id is
+        // incidental.
+        let mut first = empty_chunk();
+        first.model = "gpt-5-2026-04-23".into();
+        let msg = replay_sse_events(&fake_model(), [first, finish_chunk(FinishReason::Stop)]);
+        assert_eq!(msg.model, "gpt-5");
     }
 
     fn text_delta(text: &str) -> ChatCompletionStreamResponseDelta {
