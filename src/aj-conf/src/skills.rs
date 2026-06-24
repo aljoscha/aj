@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::display_path;
+use crate::paths::display_path;
 
 /// Maximum length of a skill name, per the Agent Skills convention.
 const MAX_NAME_LENGTH: usize = 64;
@@ -97,8 +97,8 @@ struct SkillFrontmatter {
 /// are still returned but marked [`Skill::enabled`]` = false`.
 pub fn discover_skills(disabled: &[String]) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
     let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let git_root = crate::find_git_root(&working_directory);
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let git_root = crate::paths::find_git_root(&working_directory);
+    let home = crate::paths::home_dir();
     discover_skills_at(
         home.as_deref(),
         &working_directory,
@@ -154,7 +154,7 @@ fn skill_roots(
     git_root: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for dir in crate::project_dirs_upward(working_directory, git_root) {
+    for dir in crate::paths::project_dirs_upward(working_directory, git_root) {
         for sub in [".aj", ".agents", ".claude"] {
             roots.push(dir.join(sub).join("skills"));
         }
@@ -386,18 +386,6 @@ fn escape_xml(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Build a unique temp directory; mirrors the helper in the crate
-    /// root's tests.
-    fn make_temp_dir(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("aj-skills-test-{tag}-{}-{n}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     fn write_skill(dir: &Path, sub: &str, frontmatter: &str, body: &str) -> PathBuf {
         let skill_dir = dir.join(sub);
         fs::create_dir_all(&skill_dir).unwrap();
@@ -408,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_load_skill_with_full_frontmatter() {
-        let dir = make_temp_dir("full");
+        let dir = crate::test_temp_dir("full");
         let path = write_skill(
             &dir,
             "my-skill",
@@ -430,7 +418,7 @@ mod tests {
 
     #[test]
     fn test_load_skill_name_falls_back_to_directory() {
-        let dir = make_temp_dir("dir-name");
+        let dir = crate::test_temp_dir("dir-name");
         let path = write_skill(&dir, "from-dir", "description: Does things.\n", "");
 
         let mut diagnostics = Vec::new();
@@ -443,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_load_skill_without_description_is_rejected() {
-        let dir = make_temp_dir("no-desc");
+        let dir = crate::test_temp_dir("no-desc");
         let path = write_skill(&dir, "no-desc", "name: no-desc\n", "");
 
         let mut diagnostics = Vec::new();
@@ -456,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_load_skill_without_frontmatter_is_rejected() {
-        let dir = make_temp_dir("no-fm");
+        let dir = crate::test_temp_dir("no-fm");
         let skill_dir = dir.join("plain");
         fs::create_dir_all(&skill_dir).unwrap();
         let path = skill_dir.join("SKILL.md");
@@ -472,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_load_skill_bad_name_warns_but_loads() {
-        let dir = make_temp_dir("bad-name");
+        let dir = crate::test_temp_dir("bad-name");
         let path = write_skill(
             &dir,
             "bad",
@@ -491,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_load_skill_disable_model_invocation() {
-        let dir = make_temp_dir("dmi");
+        let dir = crate::test_temp_dir("dmi");
         let path = write_skill(
             &dir,
             "manual",
@@ -534,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_discovery_walks_project_dirs_up_to_git_root() {
-        let root = make_temp_dir("walk");
+        let root = crate::test_temp_dir("walk");
         let cwd = root.join("nested/inner");
         fs::create_dir_all(&cwd).unwrap();
         write_skill(
@@ -561,8 +549,8 @@ mod tests {
 
     #[test]
     fn test_discovery_includes_user_roots_and_marks_disabled() {
-        let home = make_temp_dir("home");
-        let cwd = make_temp_dir("cwd");
+        let home = crate::test_temp_dir("home");
+        let cwd = crate::test_temp_dir("cwd");
         write_skill(
             &home.join(".claude/skills"),
             "user-skill",
@@ -584,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_discovery_first_skill_wins_name_collision() {
-        let root = make_temp_dir("collision");
+        let root = crate::test_temp_dir("collision");
         let cwd = root.join("inner");
         fs::create_dir_all(&cwd).unwrap();
         let cwd_path = write_skill(
@@ -611,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_discovery_skips_hidden_and_node_modules() {
-        let cwd = make_temp_dir("skips");
+        let cwd = crate::test_temp_dir("skips");
         let skills_root = cwd.join(".agents/skills");
         write_skill(
             &skills_root.join("node_modules"),
@@ -642,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_skill_dir_is_not_recursed_into() {
-        let cwd = make_temp_dir("no-recurse");
+        let cwd = crate::test_temp_dir("no-recurse");
         let skills_root = cwd.join(".aj/skills");
         write_skill(&skills_root, "outer", "description: Outer skill.\n", "");
         // A SKILL.md nested inside a skill's own tree (e.g. a reference

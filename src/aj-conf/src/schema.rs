@@ -1,0 +1,2070 @@
+//! Config-file schema for `~/.aj/config.toml`: the option table that is
+//! the single source of truth, the lenient parser, the typed diagnostics,
+//! and the comment-preserving, lock-guarded writer.
+
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
+
+use serde::Deserialize;
+use thiserror::Error;
+
+use crate::paths::display_path;
+
+/// Thinking level that can be set in `config.toml` as a default baseline.
+///
+/// When set, this is used for every request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigThinkingLevel {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl fmt::Display for ConfigThinkingLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigThinkingLevel::Off => write!(f, "off"),
+            ConfigThinkingLevel::Minimal => write!(f, "minimal"),
+            ConfigThinkingLevel::Low => write!(f, "low"),
+            ConfigThinkingLevel::Medium => write!(f, "medium"),
+            ConfigThinkingLevel::High => write!(f, "high"),
+            ConfigThinkingLevel::XHigh => write!(f, "xhigh"),
+            ConfigThinkingLevel::Max => write!(f, "max"),
+        }
+    }
+}
+
+impl FromStr for ConfigThinkingLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "off" => Ok(ConfigThinkingLevel::Off),
+            "minimal" => Ok(ConfigThinkingLevel::Minimal),
+            "low" => Ok(ConfigThinkingLevel::Low),
+            "medium" => Ok(ConfigThinkingLevel::Medium),
+            "high" => Ok(ConfigThinkingLevel::High),
+            "xhigh" => Ok(ConfigThinkingLevel::XHigh),
+            "max" => Ok(ConfigThinkingLevel::Max),
+            _ => Err(format!(
+                "invalid thinking level '{s}': expected off, minimal, low, medium, high, xhigh, or max"
+            )),
+        }
+    }
+}
+
+/// How much of the assistant's reasoning channel to surface to the user.
+///
+/// A single knob that fans out to both provider-specific wire fields,
+/// mirroring [`aj_models::types::ThinkingDisplay`]. The config key name
+/// matches the Anthropic SDK's `display` knob so readers of the upstream
+/// docs find the same vocabulary here.
+///
+/// | Variant       | Anthropic `thinking.display` | OpenAI Responses `reasoning.summary` |
+/// |---------------|------------------------------|--------------------------------------|
+/// | `Summarized`  | `Summarized`                 | `Concise`                            |
+/// | `Detailed`    | `Summarized`*                | `Detailed`                           |
+/// | `Omitted`     | `Omitted`                    | (no summary requested)               |
+///
+/// *Anthropic has no "detailed" mode for adaptive thinking. It degrades
+/// to `Summarized`, so the user gets the verbose counterpart only on
+/// OpenAI Responses. Leaving the config key unset is the cross-provider
+/// default ("provider default behavior") and is generally what produces
+/// a `Thinking…` placeholder with no streamed body on adaptive Anthropic
+/// models, and no reasoning summary on OpenAI Responses.
+///
+/// Providers that don't have a reasoning channel knob at all (e.g.
+/// Chat Completions) see both wire fields populated by the mapping
+/// and ignore them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigThinkingDisplay {
+    /// Stream a terse model-generated summary of the reasoning.
+    /// Maps onto Anthropic `Summarized` and OpenAI `Concise`.
+    Summarized,
+    /// Stream a verbose model-generated summary of the reasoning.
+    /// Maps onto Anthropic `Summarized` (no Detailed variant) and
+    /// OpenAI `Detailed`.
+    Detailed,
+    /// Suppress the reasoning channel entirely. Maps onto
+    /// Anthropic `Omitted`; on OpenAI Responses this is achieved by
+    /// not requesting a summary (equivalent to leaving the key
+    /// unset on that provider).
+    Omitted,
+}
+
+impl fmt::Display for ConfigThinkingDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigThinkingDisplay::Summarized => write!(f, "summarized"),
+            ConfigThinkingDisplay::Detailed => write!(f, "detailed"),
+            ConfigThinkingDisplay::Omitted => write!(f, "omitted"),
+        }
+    }
+}
+
+impl FromStr for ConfigThinkingDisplay {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "summarized" => Ok(ConfigThinkingDisplay::Summarized),
+            "detailed" => Ok(ConfigThinkingDisplay::Detailed),
+            "omitted" => Ok(ConfigThinkingDisplay::Omitted),
+            _ => Err(format!(
+                "invalid thinking_display '{s}': expected summarized, detailed, or omitted"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("home directory not found")]
+    HomeNotFound,
+    /// The existing `config.toml` could not be parsed while preparing
+    /// to write an update, so [`Config::persist_changed`] refused to
+    /// clobber it. Carries the `toml_edit` parse error verbatim.
+    #[error("cannot update config.toml (existing file is not valid TOML): {0}")]
+    Update(String),
+    /// Timed out waiting for the `config.toml` write lock — another
+    /// process held it for longer than [`LOCK_ACQUIRE_TIMEOUT`].
+    #[error("timed out acquiring the config.toml lock (another process may be writing it)")]
+    LockTimeout,
+}
+
+/// Severity of a [`ConfigDiagnostic`]. Determines how the diagnostic
+/// should be surfaced to the user (e.g. yellow vs red in the TUI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// The config was loaded but something in it was ignored (e.g. an
+    /// unknown key). The user's other settings still took effect.
+    Warning,
+    /// The config could not be applied at all and built-in defaults
+    /// were used instead. The user almost certainly wants to fix this.
+    Error,
+}
+
+/// A non-fatal problem encountered while loading `~/.aj/config.toml`.
+///
+/// `Config::load` returns one of these per issue alongside the
+/// best-effort parsed config so the binary can surface them to the
+/// user (TUI chat scrollback, stderr in print mode) instead of
+/// silently falling back to defaults.
+#[derive(Debug, Clone)]
+pub enum ConfigDiagnostic {
+    /// `config.toml` exists but could not be read (e.g. permissions).
+    /// Built-in defaults were used.
+    Unreadable { path: PathBuf, error: String },
+    /// `config.toml` is not syntactically valid TOML. Built-in
+    /// defaults were used; the entire file is ignored.
+    ParseFailed { path: PathBuf, error: String },
+    /// A known key has a value that failed to deserialize (unknown
+    /// enum variant, wrong type, etc). Only this field was dropped —
+    /// the rest of the file still took effect.
+    InvalidValue {
+        path: PathBuf,
+        key: String,
+        error: String,
+    },
+    /// A top-level key in `config.toml` that [`Config`] doesn't
+    /// recognize. The rest of the file was parsed normally; this key
+    /// was dropped. `suggestion` carries the closest known key when
+    /// the typo is within edit-distance range, so the user gets a
+    /// "did you mean `theme`?" hint for `themee`.
+    UnknownKey {
+        path: PathBuf,
+        key: String,
+        suggestion: Option<&'static str>,
+    },
+}
+
+impl ConfigDiagnostic {
+    pub fn severity(&self) -> Severity {
+        match self {
+            ConfigDiagnostic::Unreadable { .. } | ConfigDiagnostic::ParseFailed { .. } => {
+                Severity::Error
+            }
+            ConfigDiagnostic::InvalidValue { .. } | ConfigDiagnostic::UnknownKey { .. } => {
+                Severity::Warning
+            }
+        }
+    }
+}
+
+impl fmt::Display for ConfigDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigDiagnostic::Unreadable { path, error } => {
+                write!(
+                    f,
+                    "failed to read {} (using built-in defaults): {error}",
+                    display_path(path)
+                )
+            }
+            ConfigDiagnostic::ParseFailed { path, error } => {
+                // The TOML crate's error already includes line/column
+                // and a caret-pointed snippet; pass it through verbatim
+                // so the user sees the same diagnostic they'd get from
+                // `taplo` or any other TOML tool.
+                write!(
+                    f,
+                    "failed to parse {} (using built-in defaults):\n{error}",
+                    display_path(path)
+                )
+            }
+            ConfigDiagnostic::InvalidValue { path, key, error } => {
+                // Per-field error: other keys still applied. We strip
+                // any trailing newline the toml error tacks on so the
+                // one-line warning format stays one line.
+                let error = error.trim_end();
+                write!(
+                    f,
+                    "{}: invalid value for `{key}` (ignored): {error}",
+                    display_path(path)
+                )
+            }
+            ConfigDiagnostic::UnknownKey {
+                path,
+                key,
+                suggestion,
+            } => match suggestion {
+                Some(s) => write!(
+                    f,
+                    "{}: unknown key `{key}` (did you mean `{s}`?)",
+                    display_path(path)
+                ),
+                None => write!(f, "{}: unknown key `{key}`", display_path(path)),
+            },
+        }
+    }
+}
+
+/// Kind of value a [`ConfigOption`] accepts. Drives help text and
+/// (eventually) tab completion in the settings command — the file
+/// parser uses the option's `apply_toml_fn` directly and doesn't
+/// need to branch on this.
+#[derive(Debug, Clone, Copy)]
+pub enum ValueKind {
+    /// A free-form string (stored as `Option<String>` on `Config`).
+    String,
+    /// A boolean.
+    Bool,
+    /// One of a fixed set of variants. The slice lists every
+    /// accepted value in its canonical (lowercase) form, in the
+    /// order they should be shown to the user.
+    Enum(&'static [&'static str]),
+    /// A list of strings.
+    StringList,
+    /// A floating-point number (stored as `f64` on `Config`).
+    Number,
+}
+
+impl fmt::Display for ValueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValueKind::String => write!(f, "string"),
+            ValueKind::Bool => write!(f, "bool"),
+            ValueKind::Enum(variants) => write!(f, "{}", variants.join(" | ")),
+            ValueKind::StringList => write!(f, "list of strings"),
+            ValueKind::Number => write!(f, "number"),
+        }
+    }
+}
+
+/// Schema entry for a single key in `~/.aj/config.toml`.
+///
+/// The full table is [`Config::OPTIONS`] — that's the single source
+/// of truth the file parser, the unknown-key suggester, and the
+/// settings command all walk. To add a new config option: add a
+/// field to [`Config`], then add a matching entry to
+/// [`Config::OPTIONS`]. The `test_options_table_matches_config_fields`
+/// test catches drift.
+///
+/// The two `fn` pointers are intentionally private — callers go
+/// through [`Self::apply_toml`] / [`Self::display`] so the schema
+/// stays the only place that touches `Config` fields by name.
+pub struct ConfigOption {
+    /// Key as it appears in `config.toml` and on the CLI.
+    pub name: &'static str,
+    /// One-line user-facing description, shown in the interactive
+    /// settings window.
+    pub description: &'static str,
+    /// What the option accepts. Used for help text and (future) tab
+    /// completion.
+    pub kind: ValueKind,
+    /// Parse `value` and write it into the matching field of `config`.
+    /// Returns the toml error verbatim on failure so the parser can
+    /// wrap it in [`ConfigDiagnostic::InvalidValue`].
+    apply_toml_fn: fn(toml::Value, &mut Config) -> Result<(), toml::de::Error>,
+    /// Render the field's current value, distinguishing unset
+    /// (`<unset>`) from set values.
+    display_fn: fn(&Config) -> String,
+    /// Serialize the field's current value into a `toml_edit::Item`
+    /// for [`Config::persist_changed`], or `None` when the field holds
+    /// its default/unset value. A `None` result tells the writer to
+    /// drop the key from `config.toml` rather than emit a redundant
+    /// at-default line — see [`Config::persist_changed`] for the full
+    /// contract.
+    to_toml_fn: fn(&Config) -> Option<toml_edit::Item>,
+}
+
+impl ConfigOption {
+    /// Apply a parsed TOML value to `config`.
+    pub fn apply_toml(
+        &self,
+        value: toml::Value,
+        config: &mut Config,
+    ) -> Result<(), toml::de::Error> {
+        (self.apply_toml_fn)(value, config)
+    }
+
+    /// Apply a value supplied as a user-entered string — the shape the
+    /// interactive settings window (and any string-based entry path)
+    /// delivers — by converting it to the [`toml::Value`] this option's
+    /// [`Self::apply_toml`] expects, then applying it.
+    ///
+    /// This is the single place that turns a UI string into the typed
+    /// value an option wants, keyed off [`Self::kind`], so adding an
+    /// option to [`Config::OPTIONS`] makes it editable from those paths
+    /// without a bespoke parser. Validation (range checks, enum
+    /// membership) still runs inside `apply_toml`.
+    pub fn apply_str(&self, value: &str, config: &mut Config) -> Result<(), toml::de::Error> {
+        let parsed = match self.kind {
+            ValueKind::Bool => toml::Value::Boolean(value.parse::<bool>().map_err(|_| {
+                <toml::de::Error as serde::de::Error>::custom(format!(
+                    "{}: expected `true` or `false`, got `{value}`",
+                    self.name
+                ))
+            })?),
+            // Prefer an integer so integer-backed options keep an exact
+            // value; fall back to a float for fractional input.
+            ValueKind::Number => {
+                if let Ok(i) = value.parse::<i64>() {
+                    toml::Value::Integer(i)
+                } else if let Ok(f) = value.parse::<f64>() {
+                    toml::Value::Float(f)
+                } else {
+                    return Err(<toml::de::Error as serde::de::Error>::custom(format!(
+                        "{}: expected a number, got `{value}`",
+                        self.name
+                    )));
+                }
+            }
+            // Comma-separated, trimmed, empty entries dropped.
+            ValueKind::StringList => toml::Value::Array(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| toml::Value::String(s.to_string()))
+                    .collect(),
+            ),
+            ValueKind::String | ValueKind::Enum(_) => toml::Value::String(value.to_string()),
+        };
+        self.apply_toml(parsed, config)
+    }
+
+    /// Render the field's current value for display.
+    pub fn display(&self, config: &Config) -> String {
+        (self.display_fn)(config)
+    }
+
+    /// Serialize the field's current value for
+    /// [`Config::persist_changed`]. `None` means the field is at its
+    /// default/unset value and the key should be removed from
+    /// `config.toml`.
+    pub fn to_toml(&self, config: &Config) -> Option<toml_edit::Item> {
+        (self.to_toml_fn)(config)
+    }
+}
+
+/// Display helper for `Option<T: Display>` fields. Returns the
+/// inner value's `Display` form when set, or the literal string
+/// `<unset>` otherwise.
+fn display_opt<T: fmt::Display>(value: &Option<T>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "<unset>".to_string(),
+    }
+}
+
+/// Display helper for `Vec<String>` list fields. Renders as
+/// `["a", "b"]`, or `<empty>` when the list has no entries.
+fn display_string_list(value: &[String]) -> String {
+    if value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        let items: Vec<String> = value.iter().map(|s| format!("\"{s}\"")).collect();
+        format!("[{}]", items.join(", "))
+    }
+}
+
+/// `to_toml` helper for `Option<T: Display>` fields: emit the value's
+/// canonical string form when set, or `None` (drop the key) when unset.
+/// Enum fields rely on their lowercase [`fmt::Display`] matching the
+/// parser's accepted spelling so the value round-trips.
+fn opt_value_item<T: fmt::Display>(value: &Option<T>) -> Option<toml_edit::Item> {
+    value.as_ref().map(|v| toml_edit::value(v.to_string()))
+}
+
+/// `to_toml` helper for `Vec<String>` list fields: emit a TOML array
+/// when non-empty, or `None` (drop the key) when empty.
+fn string_list_item(value: &[String]) -> Option<toml_edit::Item> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut array = toml_edit::Array::new();
+    for item in value {
+        array.push(item.as_str());
+    }
+    Some(toml_edit::value(array))
+}
+
+/// `to_toml` helper for `bool` fields: emit the value only when it
+/// differs from `default`, so a config left at its default doesn't
+/// accumulate redundant lines. When the value matches `default` the
+/// key is dropped from the file.
+fn bool_item(value: bool, default: bool) -> Option<toml_edit::Item> {
+    (value != default).then(|| toml_edit::value(value))
+}
+
+/// `to_toml` helper for `f64` fields: emit the value only when it
+/// differs from `default`, so a config left at its default doesn't
+/// accumulate a redundant line.
+fn number_item(value: f64, default: f64) -> Option<toml_edit::Item> {
+    (value != default).then(|| toml_edit::value(value))
+}
+
+/// Emit an integer config value only when it differs from `default`, so
+/// a pristine config never accumulates redundant lines.
+#[allow(clippy::as_conversions)]
+fn int_item(value: u64, default: u64) -> Option<toml_edit::Item> {
+    (value != default).then(|| toml_edit::value(value as i64))
+}
+
+/// Canonical string form of an option's serialized value, or `None`
+/// when the option is at its default/unset (its `to_toml` returns
+/// `None`). Used to detect whether an option changed between two
+/// configs without requiring `toml_edit::Item` to implement equality:
+/// both sides come from the same [`ConfigOption::to_toml`] path, so
+/// equal values render identically (decoration included).
+fn item_value_repr(item: &Option<toml_edit::Item>) -> Option<String> {
+    item.as_ref()
+        .and_then(|i| i.as_value())
+        .map(|v| v.to_string())
+}
+
+/// Application configuration loaded from `~/.aj/config.toml`.
+///
+/// All fields are optional. Missing fields use application defaults.
+///
+/// This struct is the config-file layer only. The binary overlays env
+/// vars and CLI flags on top of it (CLI flags > env vars > config file).
+/// That merge lives in `aj::model`, not here.
+///
+/// Example `config.toml`:
+///
+/// ```toml
+/// model_api = "anthropic"
+/// model_name = "claude-sonnet-4-20250514"
+/// model_url = "https://api.anthropic.com"
+/// thinking = "low"
+/// thinking_display = "summarized"
+/// verbosity = "low"
+/// theme = "dark"
+/// disabled_tools = ["todo_read", "todo_write"]
+/// disabled_skills = ["tmux-subagents"]
+/// hide_thinking_block = false
+/// ```
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Model API backend (e.g., "anthropic", "openai").
+    pub model_api: Option<String>,
+    /// Custom model endpoint URL.
+    pub model_url: Option<String>,
+    /// Model name override.
+    pub model_name: Option<String>,
+    /// Default thinking level applied to every request. Defaults to
+    /// `xhigh` when unset.
+    pub thinking: Option<ConfigThinkingLevel>,
+    /// How much of the assistant's reasoning channel to surface to
+    /// the user. Defaults to `summarized`, which streams a terse
+    /// model-generated summary of the reasoning (Anthropic
+    /// `Summarized`, OpenAI `Concise`). Set to `omitted` to suppress
+    /// the channel. See [`ConfigThinkingDisplay`] for the per-variant
+    /// mapping.
+    pub thinking_display: Option<ConfigThinkingDisplay>,
+    /// Inference speed mode (Anthropic only). `fast` enables higher
+    /// output-tokens-per-second at some quality cost.
+    pub speed: Option<ConfigSpeed>,
+    /// Output verbosity (`text.verbosity`): the visible answer-length
+    /// knob. Defaults to unset (the provider's server default). Only
+    /// takes effect for models that support it (the gpt-5 family on
+    /// the OpenAI Responses / Codex wire); ignored elsewhere. See
+    /// [`ConfigVerbosity`]. Distinct from `thinking_display`, which
+    /// controls the reasoning channel rather than the answer.
+    pub verbosity: Option<ConfigVerbosity>,
+    /// Interactive TUI theme name. Resolved against the bundled
+    /// catalog (`dark`, `light`) plus any `*.json` files in
+    /// `~/.aj/themes/`. Defaults to `light` when unset.
+    pub theme: Option<String>,
+    /// List of builtin tool names to disable. Tools in this list will not be
+    /// available to the agent.
+    pub disabled_tools: Vec<String>,
+    /// List of skill names to disable. Disabled skills are still discovered
+    /// (so the UI can show them) but excluded from the model-visible skill
+    /// listing in the system prompt.
+    pub disabled_skills: Vec<String>,
+    /// Replace expanded thinking blocks with a single italic
+    /// "Thinking…" placeholder line in the interactive TUI.
+    /// Defaults to `true` (collapsed). Toggled at runtime with
+    /// `Ctrl+T`.
+    pub hide_thinking_block: bool,
+    /// Whether `read_file` resizes images to fit within the inline
+    /// image budget before attaching them to tool results. Defaults
+    /// to `true`; setting to `false` attaches the raw bytes, which
+    /// is useful for full-quality images but may be rejected by the
+    /// wire layer when the source exceeds the provider's per-image
+    /// size limit.
+    pub image_auto_resize: bool,
+    /// Whether the interactive TUI renders tool-result image
+    /// attachments inline via Kitty graphics / iTerm2 OSC 1337.
+    /// Defaults to `true`. When `false`, the textual placeholder
+    /// (`[image: mime · WxH]`) is shown regardless of terminal
+    /// capability. Independent of `image_block`: this only affects
+    /// what the user sees, not what the model receives.
+    pub image_show_in_terminal: bool,
+    /// Defense-in-depth: when `true`, strip every
+    /// [`aj_models::types::UserContent::Image`] block from outgoing
+    /// wire messages (both user messages and tool result messages)
+    /// and replace each with a single text block noting the
+    /// omission. The model never sees the bytes regardless of its
+    /// declared vision capability. Defaults to `false`.
+    pub image_block: bool,
+    /// Whether the interactive TUI syntax-highlights fenced code
+    /// blocks when rendering markdown. Defaults to `false`, which
+    /// renders code-block bodies as plain text. Only affects
+    /// interactive rendering; print mode never highlights.
+    pub syntax_highlighting: bool,
+    /// Whether the agent automatically compacts context when occupancy
+    /// crosses `compact_threshold`. Defaults to `true`. Also gates the
+    /// reactive context-overflow recovery path.
+    pub auto_compact: bool,
+    /// Fraction of the model's context window at which auto-compaction
+    /// fires. Defaults to `0.85`. Must be in the half-open range
+    /// `(0.0, 1.0]`.
+    pub compact_threshold: f64,
+    /// Approximate tokens of recent conversation kept verbatim after a
+    /// compaction; everything older is summarized into the checkpoint.
+    /// A fixed budget rather than a fraction of the window, so the
+    /// summarized range depends only on how much recent context we want
+    /// to retain, not on the model. Defaults to `20_000`.
+    pub compact_keep_recent: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            model_api: None,
+            model_url: None,
+            model_name: None,
+            thinking: Some(ConfigThinkingLevel::XHigh),
+            thinking_display: Some(ConfigThinkingDisplay::Summarized),
+            speed: None,
+            verbosity: None,
+            theme: None,
+            disabled_tools: Vec::new(),
+            disabled_skills: Vec::new(),
+            hide_thinking_block: true,
+            // Image features: resize and inline-render by default;
+            // blocking is opt-in.
+            image_auto_resize: true,
+            image_show_in_terminal: true,
+            image_block: false,
+            syntax_highlighting: false,
+            auto_compact: true,
+            compact_threshold: 0.85,
+            compact_keep_recent: 20_000,
+        }
+    }
+}
+
+/// Inference speed mode set in `config.toml` (Anthropic only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigSpeed {
+    Standard,
+    Fast,
+}
+
+impl fmt::Display for ConfigSpeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigSpeed::Standard => write!(f, "standard"),
+            ConfigSpeed::Fast => write!(f, "fast"),
+        }
+    }
+}
+
+impl FromStr for ConfigSpeed {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "standard" => Ok(ConfigSpeed::Standard),
+            "fast" => Ok(ConfigSpeed::Fast),
+            _ => Err(format!("invalid speed '{s}': expected standard or fast")),
+        }
+    }
+}
+
+/// Output verbosity set in `config.toml`, mapping to OpenAI's
+/// `text.verbosity` (the answer-length knob). Leaving the key unset is
+/// the cross-provider default (server default applies). Only takes
+/// effect for models that support it (the gpt-5 family on the OpenAI
+/// Responses / Codex wire); other models and providers ignore it. This
+/// is distinct from `thinking_display`, which controls the reasoning
+/// channel, not the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigVerbosity {
+    Low,
+    Medium,
+    High,
+}
+
+impl fmt::Display for ConfigVerbosity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigVerbosity::Low => write!(f, "low"),
+            ConfigVerbosity::Medium => write!(f, "medium"),
+            ConfigVerbosity::High => write!(f, "high"),
+        }
+    }
+}
+
+impl FromStr for ConfigVerbosity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(ConfigVerbosity::Low),
+            "medium" => Ok(ConfigVerbosity::Medium),
+            "high" => Ok(ConfigVerbosity::High),
+            _ => Err(format!(
+                "invalid verbosity '{s}': expected low, medium, or high"
+            )),
+        }
+    }
+}
+
+impl Config {
+    /// Schema for every option this binary understands. The file
+    /// parser, the unknown-key suggester, and the interactive
+    /// settings window all walk this table — there is no other
+    /// source of truth for what `~/.aj/config.toml` accepts.
+    ///
+    /// Each entry's `description` is the user-facing one-liner shown
+    /// by the settings window; the field-level doc comments on
+    /// [`Config`] are the developer-facing reference. Keep them
+    /// roughly consistent but they don't need to match verbatim.
+    pub const OPTIONS: &'static [ConfigOption] = &[
+        ConfigOption {
+            name: "model_api",
+            description: "Model API backend (e.g. \"anthropic\", \"openai\").",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.model_api = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.model_api),
+            to_toml_fn: |c| opt_value_item(&c.model_api),
+        },
+        ConfigOption {
+            name: "model_url",
+            description: "Custom model endpoint URL.",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.model_url = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.model_url),
+            to_toml_fn: |c| opt_value_item(&c.model_url),
+        },
+        ConfigOption {
+            name: "model_name",
+            description: "Model name override.",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.model_name = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.model_name),
+            to_toml_fn: |c| opt_value_item(&c.model_name),
+        },
+        ConfigOption {
+            name: "thinking",
+            description: "Default thinking level.",
+            kind: ValueKind::Enum(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+            apply_toml_fn: |v, c| {
+                c.thinking = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.thinking),
+            to_toml_fn: |c| opt_value_item(&c.thinking),
+        },
+        ConfigOption {
+            name: "thinking_display",
+            description: "How much of the assistant's reasoning channel to surface to the user.",
+            kind: ValueKind::Enum(&["summarized", "detailed", "omitted"]),
+            apply_toml_fn: |v, c| {
+                c.thinking_display = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.thinking_display),
+            to_toml_fn: |c| opt_value_item(&c.thinking_display),
+        },
+        ConfigOption {
+            name: "speed",
+            description: "Inference speed mode (Anthropic only).",
+            kind: ValueKind::Enum(&["standard", "fast"]),
+            apply_toml_fn: |v, c| {
+                c.speed = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.speed),
+            to_toml_fn: |c| opt_value_item(&c.speed),
+        },
+        ConfigOption {
+            name: "verbosity",
+            description: "Output answer verbosity (only models that support it, e.g. OpenAI gpt-5).",
+            kind: ValueKind::Enum(&["low", "medium", "high"]),
+            apply_toml_fn: |v, c| {
+                c.verbosity = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.verbosity),
+            to_toml_fn: |c| opt_value_item(&c.verbosity),
+        },
+        ConfigOption {
+            name: "theme",
+            description: "Interactive TUI theme name (built-ins: dark, light).",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.theme = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.theme),
+            to_toml_fn: |c| opt_value_item(&c.theme),
+        },
+        ConfigOption {
+            name: "disabled_tools",
+            description: "Builtin tool names to hide from the agent.",
+            kind: ValueKind::StringList,
+            apply_toml_fn: |v, c| {
+                c.disabled_tools = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_string_list(&c.disabled_tools),
+            to_toml_fn: |c| string_list_item(&c.disabled_tools),
+        },
+        ConfigOption {
+            name: "disabled_skills",
+            description: "Skill names to hide from the model's skill listing.",
+            kind: ValueKind::StringList,
+            apply_toml_fn: |v, c| {
+                c.disabled_skills = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_string_list(&c.disabled_skills),
+            to_toml_fn: |c| string_list_item(&c.disabled_skills),
+        },
+        ConfigOption {
+            name: "hide_thinking_block",
+            description: "Collapse expanded thinking blocks to a placeholder in the TUI.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.hide_thinking_block = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.hide_thinking_block.to_string(),
+            to_toml_fn: |c| bool_item(c.hide_thinking_block, true),
+        },
+        ConfigOption {
+            name: "image_auto_resize",
+            description: "Resize images attached by tools (e.g. read_file) to fit the inline image budget.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.image_auto_resize = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.image_auto_resize.to_string(),
+            to_toml_fn: |c| bool_item(c.image_auto_resize, true),
+        },
+        ConfigOption {
+            name: "image_show_in_terminal",
+            description: "Render tool-result images inline in the TUI when the terminal supports it.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.image_show_in_terminal = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.image_show_in_terminal.to_string(),
+            to_toml_fn: |c| bool_item(c.image_show_in_terminal, true),
+        },
+        ConfigOption {
+            name: "image_block",
+            description: "Strip image attachments from outgoing wire messages (defense-in-depth).",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.image_block = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.image_block.to_string(),
+            to_toml_fn: |c| bool_item(c.image_block, false),
+        },
+        ConfigOption {
+            name: "syntax_highlighting",
+            description: "Syntax-highlight fenced code blocks in rendered markdown (interactive TUI).",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.syntax_highlighting = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.syntax_highlighting.to_string(),
+            to_toml_fn: |c| bool_item(c.syntax_highlighting, false),
+        },
+        ConfigOption {
+            name: "auto_compact",
+            description: "Automatically summarize earlier context when the window fills up.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.auto_compact = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.auto_compact.to_string(),
+            to_toml_fn: |c| bool_item(c.auto_compact, true),
+        },
+        ConfigOption {
+            name: "compact_threshold",
+            description: "Fraction of the context window (0.0–1.0) at which auto-compaction fires.",
+            kind: ValueKind::Number,
+            apply_toml_fn: |v, c| {
+                // Accept a TOML float or integer (so both `0.85` and `1`
+                // parse), reject any other type, then validate the
+                // (0.0, 1.0] range.
+                #[allow(clippy::as_conversions)]
+                let n: f64 = match v {
+                    toml::Value::Float(f) => f,
+                    toml::Value::Integer(i) => i as f64,
+                    _ => {
+                        return Err(<toml::de::Error as serde::de::Error>::custom(
+                            "compact_threshold must be a number",
+                        ));
+                    }
+                };
+                if !(n > 0.0 && n <= 1.0) {
+                    return Err(<toml::de::Error as serde::de::Error>::custom(
+                        "compact_threshold must be in the range (0.0, 1.0]",
+                    ));
+                }
+                c.compact_threshold = n;
+                Ok(())
+            },
+            display_fn: |c| c.compact_threshold.to_string(),
+            to_toml_fn: |c| number_item(c.compact_threshold, 0.85),
+        },
+        ConfigOption {
+            name: "compact_keep_recent",
+            description: "Approximate tokens of recent context kept verbatim after a compaction.",
+            kind: ValueKind::Number,
+            apply_toml_fn: |v, c| {
+                // Accept a TOML integer or float (so `20000` and
+                // `20000.0` both parse), reject any other type, then
+                // require a positive token count.
+                #[allow(clippy::as_conversions)]
+                let n: i64 = match v {
+                    toml::Value::Integer(i) => i,
+                    toml::Value::Float(f) => f as i64,
+                    _ => {
+                        return Err(<toml::de::Error as serde::de::Error>::custom(
+                            "compact_keep_recent must be a number",
+                        ));
+                    }
+                };
+                if n <= 0 {
+                    return Err(<toml::de::Error as serde::de::Error>::custom(
+                        "compact_keep_recent must be a positive number of tokens",
+                    ));
+                }
+                #[allow(clippy::as_conversions)]
+                {
+                    c.compact_keep_recent = n as u64;
+                }
+                Ok(())
+            },
+            display_fn: |c| c.compact_keep_recent.to_string(),
+            to_toml_fn: |c| int_item(c.compact_keep_recent, 20_000),
+        },
+    ];
+
+    /// Look up an option by its config key, if any. Returns `None`
+    /// for unknown keys.
+    pub fn option(name: &str) -> Option<&'static ConfigOption> {
+        Self::OPTIONS.iter().find(|o| o.name == name)
+    }
+
+    /// Load configuration from `~/.aj/config.toml`.
+    ///
+    /// Always returns a [`Config`]: a missing file yields defaults
+    /// with no diagnostics, while a malformed file yields defaults
+    /// plus a [`ConfigDiagnostic::ParseFailed`] so the caller can
+    /// surface the failure. Unknown top-level keys are reported as
+    /// [`ConfigDiagnostic::UnknownKey`] warnings while the rest of
+    /// the file is honored.
+    ///
+    /// Truly fatal conditions (no `$HOME`, can't `mkdir ~/.aj`)
+    /// degrade gracefully to defaults + no diagnostics — other code
+    /// paths that actually need those directories (sessions, dotenv)
+    /// will surface their own errors.
+    pub fn load() -> (Self, Vec<ConfigDiagnostic>) {
+        let Ok(config_path) = Self::config_file_path() else {
+            return (Config::default(), Vec::new());
+        };
+
+        if !config_path.exists() {
+            tracing::debug!(config_path = %config_path.display(), "no config file found, using defaults");
+            return (Config::default(), Vec::new());
+        }
+
+        match fs::read_to_string(&config_path) {
+            Ok(content) => {
+                tracing::debug!(config_path = %config_path.display(), "loaded config");
+                parse_config(&content, &config_path)
+            }
+            Err(e) => (
+                Config::default(),
+                vec![ConfigDiagnostic::Unreadable {
+                    path: config_path,
+                    error: e.to_string(),
+                }],
+            ),
+        }
+    }
+
+    /// Persist the options this process changed to
+    /// `~/.aj/config.toml`, merging them onto whatever is currently on
+    /// disk so a concurrent writer isn't clobbered.
+    ///
+    /// `baseline` is the configuration as it was before the caller's
+    /// in-memory mutation. Only the options whose value differs between
+    /// `self` and `baseline` are written; every other key is left
+    /// exactly as it appears in the file, so a second `aj` instance
+    /// that changed a *different* key keeps its write instead of the
+    /// last writer winning. The whole read-modify-write runs under a
+    /// cross-process lock ([`ConfigLock`]).
+    ///
+    /// The write round-trips through `toml_edit`, so existing comments,
+    /// key ordering, and surrounding whitespace are preserved. For a
+    /// changed option, a `Some` from [`ConfigOption::to_toml`] sets (or
+    /// updates in place, keeping its leading comment) the key, and a
+    /// `None` — the value is back at its default — removes it. An
+    /// existing file that isn't valid TOML is refused with
+    /// [`ConfigError::Update`] rather than overwritten; a missing file
+    /// is treated as empty and created on write.
+    pub fn persist_changed(&self, baseline: &Config) -> Result<(), ConfigError> {
+        let path = Self::config_file_path()?;
+        self.persist_changed_at(baseline, &path)
+    }
+
+    /// [`Self::persist_changed`] against an explicit path, so the lock
+    /// + merge can be exercised against a scratch file without touching
+    /// `~/.aj`.
+    fn persist_changed_at(&self, baseline: &Config, path: &Path) -> Result<(), ConfigError> {
+        let _lock = ConfigLock::acquire(path)?;
+
+        let existing = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(ConfigError::Io(e)),
+        };
+
+        let mut doc = existing
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| ConfigError::Update(e.to_string()))?;
+
+        self.apply_changed_into_document(baseline, &mut doc);
+
+        fs::write(path, doc.to_string())?;
+        Ok(())
+    }
+
+    /// Apply into `doc` only the options whose serialized value differs
+    /// between `self` and `baseline`, leaving every unchanged option's
+    /// key exactly as it appears in `doc`. This is the merge that keeps
+    /// a concurrent writer's edits: `doc` is parsed from the current
+    /// file, and we touch only what this process actually changed.
+    ///
+    /// For a changed option, a `Some` value sets the key (updating in
+    /// place to preserve a leading comment) and a `None` removes it —
+    /// the same set/remove rule [`ConfigOption::to_toml`] documents.
+    fn apply_changed_into_document(&self, baseline: &Config, doc: &mut toml_edit::DocumentMut) {
+        for option in Self::OPTIONS {
+            let new_item = option.to_toml(self);
+            if item_value_repr(&new_item) == item_value_repr(&option.to_toml(baseline)) {
+                continue;
+            }
+            match new_item {
+                Some(item) => doc[option.name] = item,
+                None => {
+                    doc.remove(option.name);
+                }
+            }
+        }
+    }
+}
+
+/// Parse a `config.toml` content string into a [`Config`] plus a list
+/// of [`ConfigDiagnostic`]s describing any non-fatal issues. The
+/// `path` is only used for diagnostic messages — it isn't read.
+///
+/// Per-field leniency: each top-level key is dispatched against
+/// [`Config::OPTIONS`] and applied independently. A bad value for
+/// `thinking` doesn't prevent `model_api` and friends from taking
+/// effect — only the offending field is dropped (and reported as
+/// [`ConfigDiagnostic::InvalidValue`]). Wholesale fallback to
+/// defaults only happens when the file isn't valid TOML at all
+/// ([`ConfigDiagnostic::ParseFailed`]).
+fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
+    let table = match content.parse::<toml::Table>() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                Config::default(),
+                vec![ConfigDiagnostic::ParseFailed {
+                    path: path.to_path_buf(),
+                    error: e.to_string(),
+                }],
+            );
+        }
+    };
+
+    let mut config = Config::default();
+    let mut diagnostics = Vec::new();
+
+    for (key, value) in table {
+        match Config::option(&key) {
+            Some(option) => {
+                if let Err(e) = option.apply_toml(value, &mut config) {
+                    diagnostics.push(ConfigDiagnostic::InvalidValue {
+                        path: path.to_path_buf(),
+                        key,
+                        error: e.to_string(),
+                    });
+                }
+            }
+            None => diagnostics.push(ConfigDiagnostic::UnknownKey {
+                path: path.to_path_buf(),
+                suggestion: suggest_key(&key),
+                key,
+            }),
+        }
+    }
+
+    (config, diagnostics)
+}
+
+/// Return the closest known key to `unknown` if it's within
+/// edit-distance range, or `None` if nothing is similar enough to be
+/// worth suggesting.
+///
+/// Threshold: distance strictly less than half the user's key length,
+/// capped at 3. That accepts `themee` → `theme` (dist 1) and
+/// `disabled_tool` → `disabled_tools` (dist 1) while rejecting
+/// `completely_unrelated` from matching anything.
+fn suggest_key(unknown: &str) -> Option<&'static str> {
+    let max_distance = (unknown.len() / 2).min(3).max(1);
+    Config::OPTIONS
+        .iter()
+        .map(|o| (o.name, strsim::levenshtein(unknown, o.name)))
+        .filter(|(_, d)| *d <= max_distance)
+        .min_by_key(|(_, d)| *d)
+        .map(|(k, _)| k)
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process config lock
+// ---------------------------------------------------------------------------
+
+/// Initial backoff between lock-acquisition retries; doubles each
+/// attempt up to [`LOCK_MAX_BACKOFF`].
+const LOCK_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
+const LOCK_MAX_BACKOFF: Duration = Duration::from_millis(250);
+/// Give up acquiring the lock after this long and report
+/// [`ConfigError::LockTimeout`]. A config write is a tiny
+/// read-modify-write, so genuine contention clears in milliseconds;
+/// this ceiling only bounds the pathological "another writer is
+/// wedged" case (a crashed holder is reclaimed sooner via
+/// [`LOCK_STALE_AGE`]). Kept short because the interactive loop calls
+/// the writer synchronously.
+const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+/// A lock directory whose mtime is older than this is assumed
+/// abandoned by a crashed writer and stolen.
+const LOCK_STALE_AGE: Duration = Duration::from_secs(60);
+
+/// Sidecar lock for `config.toml`: an empty directory next to the file
+/// (`config.toml.lock`). `create_dir` is atomic on every supported OS,
+/// so its `AlreadyExists` error is the natural "already locked" signal.
+/// Held across a read-modify-write so two processes editing the config
+/// can't interleave and clobber each other.
+///
+/// Released on `Drop`; a process that aborts before `Drop` runs leaves
+/// the directory behind, which the next acquirer reclaims once it's
+/// older than [`LOCK_STALE_AGE`].
+///
+/// The same sidecar-directory scheme guards `auth.json`; this is its
+/// synchronous twin, since the interactive loop persists config with no
+/// async runtime in scope.
+struct ConfigLock {
+    path: PathBuf,
+}
+
+impl ConfigLock {
+    /// Acquire the lock for `target_path`, retrying with exponential
+    /// backoff up to [`LOCK_ACQUIRE_TIMEOUT`]. Returns
+    /// [`ConfigError::LockTimeout`] if a live sibling holds it the whole
+    /// time.
+    fn acquire(target_path: &Path) -> Result<Self, ConfigError> {
+        let lock_path = lock_path_for(target_path);
+
+        // Make sure the parent exists so `create_dir(lock_path)` has
+        // somewhere to land.
+        if let Some(parent) = lock_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let mut backoff = LOCK_INITIAL_BACKOFF;
+        loop {
+            match fs::create_dir(&lock_path) {
+                Ok(()) => return Ok(Self { path: lock_path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if try_steal_stale_lock(&lock_path, LOCK_STALE_AGE) {
+                        // Stole an abandoned lock; retry immediately. A
+                        // racing acquirer that beat us just re-enters the
+                        // backoff path next iteration.
+                        continue;
+                    }
+                    if start.elapsed() > LOCK_ACQUIRE_TIMEOUT {
+                        return Err(ConfigError::LockTimeout);
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(LOCK_MAX_BACKOFF);
+                }
+                Err(e) => return Err(ConfigError::Io(e)),
+            }
+        }
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // Best-effort cleanup. The lock path is a directory we created,
+        // so `remove_dir` succeeds unless something already tore it down.
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+/// `config.toml` → `config.toml.lock` next to it.
+fn lock_path_for(file_path: &Path) -> PathBuf {
+    let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = match file_path.file_name() {
+        Some(n) => format!("{}.lock", n.to_string_lossy()),
+        None => "config.lock".to_string(),
+    };
+    parent.join(name)
+}
+
+/// Remove `lock_path` if it exists and its mtime is older than
+/// `max_age`, signalling the holder likely crashed. Returns `true` only
+/// when it actually removed the directory, so the caller can retry. Any
+/// I/O error is swallowed — worst case the caller backs off and times
+/// out. `max_age` is a parameter so tests can drive the steal path with
+/// a tiny threshold.
+fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
+    let Ok(meta) = fs::metadata(lock_path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = modified.elapsed() else {
+        return false;
+    };
+    if age <= max_age {
+        return false;
+    }
+    fs::remove_dir(lock_path).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert!(config.model_api.is_none());
+        assert!(config.model_url.is_none());
+        assert!(config.model_name.is_none());
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::XHigh));
+        assert_eq!(
+            config.thinking_display,
+            Some(ConfigThinkingDisplay::Summarized)
+        );
+        assert!(config.hide_thinking_block);
+    }
+
+    #[test]
+    fn test_config_deserialize_thinking_display() {
+        // Unset → the `summarized` default.
+        let (config, diag) = parse_config("", Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty());
+        assert_eq!(
+            config.thinking_display,
+            Some(ConfigThinkingDisplay::Summarized)
+        );
+
+        let cases = [
+            ("summarized", ConfigThinkingDisplay::Summarized),
+            ("detailed", ConfigThinkingDisplay::Detailed),
+            ("omitted", ConfigThinkingDisplay::Omitted),
+        ];
+        for (input, expected) in cases {
+            let toml_str = format!("thinking_display = \"{input}\"");
+            let (config, diag) = parse_config(&toml_str, Path::new("/tmp/config.toml"));
+            assert!(diag.is_empty(), "failed for {input}: {diag:?}");
+            assert_eq!(
+                config.thinking_display,
+                Some(expected),
+                "failed for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_thinking_display_from_str_round_trips() {
+        for variant in [
+            ConfigThinkingDisplay::Summarized,
+            ConfigThinkingDisplay::Detailed,
+            ConfigThinkingDisplay::Omitted,
+        ] {
+            let s = variant.to_string();
+            assert_eq!(s.parse::<ConfigThinkingDisplay>().unwrap(), variant);
+        }
+        // Case-insensitive parse, matching the
+        // `ConfigThinkingLevel` precedent.
+        assert_eq!(
+            "SUMMARIZED".parse::<ConfigThinkingDisplay>().unwrap(),
+            ConfigThinkingDisplay::Summarized,
+        );
+        assert!("nope".parse::<ConfigThinkingDisplay>().is_err());
+    }
+
+    #[test]
+    fn test_config_deserialize_thinking_levels() {
+        for (input, expected) in [
+            ("off", ConfigThinkingLevel::Off),
+            ("low", ConfigThinkingLevel::Low),
+            ("medium", ConfigThinkingLevel::Medium),
+            ("high", ConfigThinkingLevel::High),
+            ("xhigh", ConfigThinkingLevel::XHigh),
+            ("max", ConfigThinkingLevel::Max),
+        ] {
+            let toml_str = format!("thinking = \"{input}\"");
+            let (config, diag) = parse_config(&toml_str, Path::new("/tmp/config.toml"));
+            assert!(diag.is_empty(), "failed for {input}: {diag:?}");
+            assert_eq!(config.thinking, Some(expected), "failed for input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_config_thinking_level_from_str() {
+        assert_eq!(
+            "off".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::Off
+        );
+        assert_eq!(
+            "LOW".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::Low
+        );
+        assert_eq!(
+            "minimal".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::Minimal
+        );
+        assert_eq!(
+            "XHigh".parse::<ConfigThinkingLevel>().unwrap(),
+            ConfigThinkingLevel::XHigh
+        );
+        assert!("invalid".parse::<ConfigThinkingLevel>().is_err());
+    }
+
+    #[test]
+    fn test_config_thinking_level_display() {
+        assert_eq!(ConfigThinkingLevel::Off.to_string(), "off");
+        assert_eq!(ConfigThinkingLevel::Minimal.to_string(), "minimal");
+        assert_eq!(ConfigThinkingLevel::Low.to_string(), "low");
+        assert_eq!(ConfigThinkingLevel::Medium.to_string(), "medium");
+        assert_eq!(ConfigThinkingLevel::High.to_string(), "high");
+        assert_eq!(ConfigThinkingLevel::XHigh.to_string(), "xhigh");
+        assert_eq!(ConfigThinkingLevel::Max.to_string(), "max");
+    }
+
+    #[test]
+    fn test_config_load_missing_file() {
+        // Config::load() always succeeds — a missing file just yields
+        // defaults with no diagnostics. We don't assert specifics about
+        // the surrounding environment here; we just confirm the call
+        // doesn't panic and returns the expected tuple shape.
+        let (_config, _diagnostics) = Config::load();
+    }
+
+    #[test]
+    fn test_parse_config_empty_yields_no_diagnostics() {
+        let (config, diagnostics) = parse_config("", Path::new("/tmp/config.toml"));
+        assert!(diagnostics.is_empty());
+        assert!(config.model_api.is_none());
+    }
+
+    #[test]
+    fn test_parse_config_valid_yields_no_diagnostics() {
+        let toml_str = r#"
+model_api = "anthropic"
+thinking = "medium"
+theme = "dark"
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::Medium));
+        assert_eq!(config.theme.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn test_parse_config_unknown_key_reports_warning_with_suggestion() {
+        // `themee` is one edit away from `theme`; expect a hint.
+        let toml_str = r#"
+model_api = "anthropic"
+themee = "dark"
+"#;
+        let path = Path::new("/tmp/config.toml");
+        let (config, diagnostics) = parse_config(toml_str, path);
+
+        // The valid key still took effect.
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
+        assert!(config.theme.is_none());
+
+        assert_eq!(diagnostics.len(), 1);
+        match &diagnostics[0] {
+            ConfigDiagnostic::UnknownKey {
+                key, suggestion, ..
+            } => {
+                assert_eq!(key, "themee");
+                assert_eq!(*suggestion, Some("theme"));
+            }
+            other => panic!("expected UnknownKey, got {other:?}"),
+        }
+        assert_eq!(diagnostics[0].severity(), Severity::Warning);
+    }
+
+    #[test]
+    fn test_parse_config_unknown_key_no_suggestion_when_unrelated() {
+        let toml_str = r#"completely_unrelated_setting = 42"#;
+        let (_config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert_eq!(diagnostics.len(), 1);
+        match &diagnostics[0] {
+            ConfigDiagnostic::UnknownKey {
+                key, suggestion, ..
+            } => {
+                assert_eq!(key, "completely_unrelated_setting");
+                assert_eq!(*suggestion, None);
+            }
+            other => panic!("expected UnknownKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_config_reports_all_unknown_keys() {
+        let toml_str = r#"
+themee = "dark"
+disabled_tool = ["x"]
+"#;
+        let (_config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert_eq!(diagnostics.len(), 2);
+        let keys: Vec<&str> = diagnostics
+            .iter()
+            .map(|d| match d {
+                ConfigDiagnostic::UnknownKey { key, .. } => key.as_str(),
+                _ => panic!("expected UnknownKey"),
+            })
+            .collect();
+        assert!(keys.contains(&"themee"));
+        assert!(keys.contains(&"disabled_tool"));
+    }
+
+    #[test]
+    fn test_parse_config_invalid_value_keeps_other_fields() {
+        // `thinking = "meh"` is an unknown enum variant. Under the
+        // lenient parser, the bad field is dropped and the rest of
+        // the file still takes effect.
+        let toml_str = r#"
+model_api = "anthropic"
+model_name = "claude-sonnet-4-20250514"
+thinking = "meh"
+theme = "dark"
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+
+        // The valid keys took effect.
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(
+            config.model_name.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+        assert_eq!(config.theme.as_deref(), Some("dark"));
+        // The bad key was dropped to its default.
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::XHigh));
+
+        assert_eq!(diagnostics.len(), 1);
+        match &diagnostics[0] {
+            ConfigDiagnostic::InvalidValue { key, error, .. } => {
+                assert_eq!(key, "thinking");
+                assert!(error.contains("meh"), "got: {error}");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        assert_eq!(diagnostics[0].severity(), Severity::Warning);
+    }
+
+    #[test]
+    fn test_parse_config_invalid_value_alongside_unknown_key() {
+        let toml_str = r#"
+themee = "dark"
+thinking = "meh"
+model_api = "anthropic"
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(diagnostics.len(), 2);
+        // Both a typo warning and an invalid-value warning should
+        // appear; order matches the order of keys in the file (which
+        // toml::Table preserves as BTreeMap sort order — alphabetical).
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| matches!(d, ConfigDiagnostic::UnknownKey { key, .. } if key == "themee"))
+        );
+        assert!(
+            diagnostics.iter().any(
+                |d| matches!(d, ConfigDiagnostic::InvalidValue { key, .. } if key == "thinking")
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_config_syntax_failure_yields_defaults_and_error() {
+        // Genuine TOML syntax error: missing closing quote.
+        let toml_str = r#"model_api = "anthropic"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+
+        // Defaults: nothing from the file applied.
+        assert!(config.model_api.is_none());
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(matches!(
+            diagnostics[0],
+            ConfigDiagnostic::ParseFailed { .. }
+        ));
+        assert_eq!(diagnostics[0].severity(), Severity::Error);
+    }
+
+    #[test]
+    fn test_parse_config_invalid_value_wrong_type() {
+        // `disabled_tools` expects an array; a string should be
+        // reported as InvalidValue, not coerced.
+        let toml_str = r#"
+disabled_tools = "bash"
+theme = "dark"
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(config.disabled_tools.is_empty());
+        assert_eq!(config.theme.as_deref(), Some("dark"));
+        assert_eq!(diagnostics.len(), 1);
+        assert!(matches!(
+            &diagnostics[0],
+            ConfigDiagnostic::InvalidValue { key, .. } if key == "disabled_tools"
+        ));
+    }
+
+    #[test]
+    fn test_config_diagnostic_display_invalid_value() {
+        let d = ConfigDiagnostic::InvalidValue {
+            path: PathBuf::from("/tmp/config.toml"),
+            key: "thinking".to_string(),
+            error: "unknown variant `meh`\n".to_string(),
+        };
+        let s = d.to_string();
+        assert!(s.contains("invalid value for `thinking`"));
+        assert!(s.contains("ignored"));
+        assert!(s.contains("meh"));
+        // Trailing newline from the toml error should be trimmed so
+        // the message is single-line-friendly.
+        assert!(!s.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_suggest_key() {
+        assert_eq!(suggest_key("themee"), Some("theme"));
+        assert_eq!(suggest_key("theem"), Some("theme"));
+        assert_eq!(suggest_key("disabled_tool"), Some("disabled_tools"));
+        // `model` is too short and ambiguous between `model_api`,
+        // `model_url`, and `model_name` to suggest any one of them.
+        assert_eq!(suggest_key("model"), None);
+        // Far enough that no suggestion is more useful than a wrong one.
+        assert_eq!(suggest_key("completely_unrelated_setting"), None);
+    }
+
+    #[test]
+    fn test_options_table_matches_config_fields() {
+        // Spot-check that every entry in `Config::OPTIONS` accepts a
+        // sensible value for its kind and actually assigns it to the
+        // matching field. The values here cover every variant of
+        // `ValueKind` we use.
+        let toml_str = r#"
+model_api = "anthropic"
+model_url = "https://example.test"
+model_name = "x"
+thinking = "low"
+thinking_display = "summarized"
+speed = "fast"
+verbosity = "low"
+theme = "dark"
+disabled_tools = ["bash"]
+disabled_skills = ["scratch"]
+hide_thinking_block = true
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(diagnostics.is_empty(), "got drift: {diagnostics:?}");
+
+        // Every option's apply_toml_fn actually wrote to its field.
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(config.model_url.as_deref(), Some("https://example.test"));
+        assert_eq!(config.model_name.as_deref(), Some("x"));
+        assert_eq!(config.thinking, Some(ConfigThinkingLevel::Low));
+        assert_eq!(
+            config.thinking_display,
+            Some(ConfigThinkingDisplay::Summarized)
+        );
+        assert_eq!(config.speed, Some(ConfigSpeed::Fast));
+        assert_eq!(config.verbosity, Some(ConfigVerbosity::Low));
+        assert_eq!(config.theme.as_deref(), Some("dark"));
+        assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
+        assert_eq!(config.disabled_skills, vec!["scratch".to_string()]);
+        assert!(config.hide_thinking_block);
+    }
+
+    #[test]
+    fn compact_threshold_parses_and_validates_range() {
+        let opt = Config::option("compact_threshold").unwrap();
+
+        // TOML float in range is accepted and stored verbatim.
+        let mut config = Config::default();
+        assert!(opt.apply_toml(toml::Value::Float(0.5), &mut config).is_ok());
+        assert_eq!(config.compact_threshold, 0.5);
+
+        // TOML integer is accepted and widened to f64.
+        let mut config = Config::default();
+        assert!(opt.apply_toml(toml::Value::Integer(1), &mut config).is_ok());
+        assert_eq!(config.compact_threshold, 1.0);
+
+        // 0.0 is excluded by the open lower bound.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Float(0.0), &mut config)
+                .is_err()
+        );
+
+        // Anything above 1.0 is rejected.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Float(1.5), &mut config)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compact_keep_recent_parses_and_validates() {
+        let opt = Config::option("compact_keep_recent").unwrap();
+
+        // A positive integer is accepted and stored.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Integer(8000), &mut config)
+                .is_ok()
+        );
+        assert_eq!(config.compact_keep_recent, 8000);
+
+        // A float is floored to an integer token count.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Float(12000.0), &mut config)
+                .is_ok()
+        );
+        assert_eq!(config.compact_keep_recent, 12000);
+
+        // Zero and negatives are rejected.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Integer(0), &mut config)
+                .is_err()
+        );
+        assert!(
+            opt.apply_toml(toml::Value::Integer(-1), &mut config)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn number_item_emits_only_when_changed() {
+        // At default the key is dropped; off-default it round-trips.
+        assert!(number_item(0.85, 0.85).is_none());
+        assert!(number_item(0.5, 0.85).is_some());
+    }
+
+    #[test]
+    fn int_item_emits_only_when_changed() {
+        assert!(int_item(20_000, 20_000).is_none());
+        assert!(int_item(8_000, 20_000).is_some());
+    }
+
+    /// Guard for the settings-apply path: every schema option must
+    /// accept a representative string value through [`apply_str`]. The
+    /// interactive settings window feeds edits to `apply_str` as
+    /// strings, so an option whose `kind`/validation can't round-trip a
+    /// sane value would silently fail to apply from the window. Driven
+    /// with a per-kind literal rather than each field's default
+    /// `display()` because the latter is the `<unset>`/`<empty>`
+    /// sentinel for unset `Option`/empty-list fields.
+    #[test]
+    fn every_option_applies_its_string_value() {
+        for option in Config::OPTIONS {
+            let mut config = Config::default();
+            let value = match option.kind {
+                ValueKind::Bool => "true".to_string(),
+                ValueKind::Number => "1".to_string(),
+                ValueKind::StringList => "a, b".to_string(),
+                ValueKind::Enum(variants) => variants[0].to_string(),
+                ValueKind::String => "x".to_string(),
+            };
+            option.apply_str(&value, &mut config).unwrap_or_else(|e| {
+                panic!(
+                    "option {} rejected its apply_str value {value:?}: {e}",
+                    option.name
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn test_config_image_keys_default_and_parse() {
+        // Defaults: auto_resize=true, show_in_terminal=true, block=false.
+        let cfg = Config::default();
+        assert!(cfg.image_auto_resize);
+        assert!(cfg.image_show_in_terminal);
+        assert!(!cfg.image_block);
+
+        let toml_str = r#"
+image_auto_resize = false
+image_show_in_terminal = false
+image_block = true
+"#;
+        let (cfg, diag) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert!(!cfg.image_auto_resize);
+        assert!(!cfg.image_show_in_terminal);
+        assert!(cfg.image_block);
+    }
+
+    #[test]
+    fn test_options_table_has_no_duplicates() {
+        // Sanity-check that no two options share a name; the parser's
+        // `find` would silently prefer the first match.
+        let mut names: Vec<&str> = Config::OPTIONS.iter().map(|o| o.name).collect();
+        names.sort();
+        let original_len = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            original_len,
+            "duplicate option name(s) in Config::OPTIONS"
+        );
+    }
+
+    #[test]
+    fn test_config_option_lookup() {
+        assert!(Config::option("model_api").is_some());
+        assert_eq!(Config::option("model_api").unwrap().name, "model_api");
+        assert!(Config::option("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_config_option_display_unset_and_set() {
+        let mut config = Config::default();
+        let theme = Config::option("theme").unwrap();
+        assert_eq!(theme.display(&config), "<unset>");
+
+        config.theme = Some("dark".to_string());
+        assert_eq!(theme.display(&config), "dark");
+    }
+
+    #[test]
+    fn test_config_option_display_bool() {
+        let config = Config::default();
+        // Defaults exercise both literals: `hide_thinking_block` is
+        // on, `image_block` is off.
+        let hide = Config::option("hide_thinking_block").unwrap();
+        assert_eq!(hide.display(&config), "true");
+        let block = Config::option("image_block").unwrap();
+        assert_eq!(block.display(&config), "false");
+    }
+
+    #[test]
+    fn test_config_option_display_string_list() {
+        let mut config = Config::default();
+        let opt = Config::option("disabled_tools").unwrap();
+        assert_eq!(opt.display(&config), "<empty>");
+        config.disabled_tools = vec!["bash".into(), "grep".into()];
+        assert_eq!(opt.display(&config), r#"["bash", "grep"]"#);
+    }
+
+    #[test]
+    fn test_config_option_display_enum() {
+        let mut config = Config::default();
+        // `speed` is unset by default and renders the placeholder.
+        let speed = Config::option("speed").unwrap();
+        assert_eq!(speed.display(&config), "<unset>");
+        // `thinking` carries the `xhigh` default.
+        let thinking = Config::option("thinking").unwrap();
+        assert_eq!(thinking.display(&config), "xhigh");
+        config.thinking = Some(ConfigThinkingLevel::Medium);
+        assert_eq!(thinking.display(&config), "medium");
+    }
+
+    #[test]
+    fn test_value_kind_display() {
+        // Each option's kind renders sensibly for help text.
+        for option in Config::OPTIONS {
+            let rendered = option.kind.to_string();
+            assert!(!rendered.is_empty(), "empty kind for {}", option.name);
+        }
+        assert_eq!(ValueKind::String.to_string(), "string");
+        assert_eq!(ValueKind::Bool.to_string(), "bool");
+        assert_eq!(ValueKind::StringList.to_string(), "list of strings");
+        assert_eq!(ValueKind::Number.to_string(), "number");
+        assert_eq!(ValueKind::Enum(&["a", "b", "c"]).to_string(), "a | b | c");
+    }
+
+    #[test]
+    fn test_config_diagnostic_display_unknown_key() {
+        let d = ConfigDiagnostic::UnknownKey {
+            path: PathBuf::from("/tmp/config.toml"),
+            key: "themee".to_string(),
+            suggestion: Some("theme"),
+        };
+        let s = d.to_string();
+        assert!(s.contains("unknown key `themee`"));
+        assert!(s.contains("did you mean `theme`"));
+    }
+
+    #[test]
+    fn test_config_diagnostic_display_parse_failed() {
+        let d = ConfigDiagnostic::ParseFailed {
+            path: PathBuf::from("/tmp/config.toml"),
+            error: "bad variant".to_string(),
+        };
+        let s = d.to_string();
+        assert!(s.contains("failed to parse"));
+        assert!(s.contains("bad variant"));
+        assert!(s.contains("using built-in defaults"));
+    }
+
+    /// Apply the options that changed between `baseline` and `config`
+    /// onto `existing` config-file text via the same merge
+    /// [`Config::persist_changed`] uses, returning the rewritten text.
+    /// Lets the round-trip be asserted without touching `~/.aj`.
+    fn rewrite_changed(existing: &str, baseline: &Config, config: &Config) -> String {
+        let mut doc = existing.parse::<toml_edit::DocumentMut>().unwrap();
+        config.apply_changed_into_document(baseline, &mut doc);
+        doc.to_string()
+    }
+
+    #[test]
+    fn test_save_updates_value_and_preserves_comment() {
+        let existing = "\
+# Pick the reasoning effort.
+thinking = \"low\"
+";
+        let mut config = Config::default();
+        config.thinking = Some(ConfigThinkingLevel::High);
+
+        let rewritten = rewrite_changed(existing, &Config::default(), &config);
+        assert!(
+            rewritten.contains("# Pick the reasoning effort."),
+            "leading comment should survive: {rewritten:?}"
+        );
+        assert!(
+            rewritten.contains("thinking = \"high\""),
+            "got: {rewritten:?}"
+        );
+
+        // And it parses back to the value we wrote.
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(parsed.thinking, Some(ConfigThinkingLevel::High));
+    }
+
+    #[test]
+    fn test_save_adds_missing_keys() {
+        let mut config = Config::default();
+        config.model_api = Some("anthropic".to_string());
+        config.model_name = Some("claude-x".to_string());
+
+        let rewritten = rewrite_changed("", &Config::default(), &config);
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(parsed.model_api.as_deref(), Some("anthropic"));
+        assert_eq!(parsed.model_name.as_deref(), Some("claude-x"));
+    }
+
+    #[test]
+    fn test_save_removes_key_reverted_to_default() {
+        // Reverting an option to its default removes its key. The
+        // baseline carries the prior non-default values; `config` is
+        // back at defaults, so the merge drops each key it owns.
+        let existing = "\
+theme = \"dark\"
+disabled_tools = [\"bash\"]
+image_block = true
+";
+        let mut baseline = Config::default();
+        baseline.theme = Some("dark".to_string());
+        baseline.disabled_tools = vec!["bash".to_string()];
+        baseline.image_block = true;
+        let config = Config::default();
+        let rewritten = rewrite_changed(existing, &baseline, &config);
+
+        assert!(!rewritten.contains("theme"), "got: {rewritten:?}");
+        assert!(!rewritten.contains("disabled_tools"), "got: {rewritten:?}");
+        assert!(!rewritten.contains("image_block"), "got: {rewritten:?}");
+    }
+
+    #[test]
+    fn test_save_omits_default_bools() {
+        // A pristine default config writes nothing — defaults never
+        // accumulate redundant lines in a fresh file.
+        let rewritten = rewrite_changed("", &Config::default(), &Config::default());
+        assert_eq!(rewritten.trim(), "", "got: {rewritten:?}");
+    }
+
+    #[test]
+    fn test_save_writes_nondefault_bool() {
+        let mut config = Config::default();
+        // image_auto_resize defaults to true; flipping it off should persist.
+        config.image_auto_resize = false;
+        let rewritten = rewrite_changed("", &Config::default(), &config);
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert!(!parsed.image_auto_resize);
+    }
+
+    #[test]
+    fn test_save_full_round_trip() {
+        // Every option set to a non-default value must survive a
+        // serialize → parse cycle unchanged.
+        let mut config = Config::default();
+        config.model_api = Some("openai".to_string());
+        config.model_url = Some("https://example.test".to_string());
+        config.model_name = Some("gpt-x".to_string());
+        config.thinking = Some(ConfigThinkingLevel::Max);
+        config.thinking_display = Some(ConfigThinkingDisplay::Detailed);
+        config.speed = Some(ConfigSpeed::Fast);
+        config.theme = Some("light".to_string());
+        config.disabled_tools = vec!["bash".to_string(), "todo_read".to_string()];
+        config.hide_thinking_block = false;
+        config.image_auto_resize = false;
+        config.image_show_in_terminal = false;
+        config.image_block = true;
+
+        let rewritten = rewrite_changed("", &Config::default(), &config);
+        let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+
+        assert_eq!(parsed.model_api.as_deref(), Some("openai"));
+        assert_eq!(parsed.model_url.as_deref(), Some("https://example.test"));
+        assert_eq!(parsed.model_name.as_deref(), Some("gpt-x"));
+        assert_eq!(parsed.thinking, Some(ConfigThinkingLevel::Max));
+        assert_eq!(
+            parsed.thinking_display,
+            Some(ConfigThinkingDisplay::Detailed)
+        );
+        assert_eq!(parsed.speed, Some(ConfigSpeed::Fast));
+        assert_eq!(parsed.theme.as_deref(), Some("light"));
+        assert_eq!(parsed.disabled_tools, vec!["bash", "todo_read"]);
+        assert!(!parsed.hide_thinking_block);
+        assert!(!parsed.image_auto_resize);
+        assert!(!parsed.image_show_in_terminal);
+        assert!(parsed.image_block);
+    }
+
+    // ---- persist_changed (lock + merge) ----------------------------------
+
+    #[test]
+    fn persist_changed_does_not_clobber_a_concurrent_writers_key() {
+        // Simulate a second process having written `model_api`. This
+        // process only changed `theme`, so the merge must keep both.
+        let dir = crate::test_temp_dir("persist-no-clobber");
+        let path = dir.join("config.toml");
+        fs::write(&path, "model_api = \"anthropic\"\n").unwrap();
+
+        let baseline = Config::default();
+        let mut config = Config::default();
+        config.theme = Some("dark".to_string());
+        config
+            .persist_changed_at(&baseline, &path)
+            .expect("persist");
+
+        let written = fs::read_to_string(&path).unwrap();
+        let (parsed, diag) = parse_config(&written, &path);
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(
+            parsed.model_api.as_deref(),
+            Some("anthropic"),
+            "concurrent writer's key was clobbered: {written:?}"
+        );
+        assert_eq!(parsed.theme.as_deref(), Some("dark"), "got: {written:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_changed_refuses_to_clobber_invalid_toml() {
+        let dir = crate::test_temp_dir("persist-invalid");
+        let path = dir.join("config.toml");
+        let invalid = "this is = = not valid toml\n";
+        fs::write(&path, invalid).unwrap();
+
+        let mut config = Config::default();
+        config.theme = Some("dark".to_string());
+        let err = config
+            .persist_changed_at(&Config::default(), &path)
+            .expect_err("must refuse invalid TOML");
+        assert!(matches!(err, ConfigError::Update(_)), "got: {err:?}");
+
+        // The original file is left untouched.
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_changed_creates_a_missing_file() {
+        let dir = crate::test_temp_dir("persist-missing");
+        let path = dir.join("config.toml");
+        assert!(!path.exists());
+
+        let mut config = Config::default();
+        config.model_name = Some("gpt-x".to_string());
+        config
+            .persist_changed_at(&Config::default(), &path)
+            .expect("persist");
+
+        let (parsed, diag) = parse_config(&fs::read_to_string(&path).unwrap(), &path);
+        assert!(diag.is_empty(), "got: {diag:?}");
+        assert_eq!(parsed.model_name.as_deref(), Some("gpt-x"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_changed_preserves_comments_across_an_update() {
+        let dir = crate::test_temp_dir("persist-comments");
+        let path = dir.join("config.toml");
+        fs::write(&path, "# keep me\nthinking = \"low\"\n").unwrap();
+
+        let mut baseline = Config::default();
+        baseline.thinking = Some(ConfigThinkingLevel::Low);
+        let mut config = Config::default();
+        config.thinking = Some(ConfigThinkingLevel::High);
+        config
+            .persist_changed_at(&baseline, &path)
+            .expect("persist");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# keep me"), "got: {written:?}");
+        assert!(written.contains("thinking = \"high\""), "got: {written:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_lock_round_trips_and_releases_on_drop() {
+        let dir = crate::test_temp_dir("lock-roundtrip");
+        let target = dir.join("config.toml");
+        let lock_dir = lock_path_for(&target);
+
+        {
+            let _lock = ConfigLock::acquire(&target).expect("acquire");
+            assert!(lock_dir.exists(), "lock dir should exist while held");
+        }
+        assert!(!lock_dir.exists(), "lock dir should be gone after drop");
+
+        // A second acquisition succeeds now that the first released.
+        let _lock = ConfigLock::acquire(&target).expect("re-acquire");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn try_steal_stale_lock_reclaims_only_old_locks() {
+        let dir = crate::test_temp_dir("lock-steal");
+        let lock_dir = dir.join("config.toml.lock");
+        fs::create_dir(&lock_dir).unwrap();
+
+        // A just-created lock (younger than the threshold) is left alone.
+        assert!(!try_steal_stale_lock(&lock_dir, Duration::from_secs(3600)));
+        assert!(lock_dir.exists());
+
+        // A zero threshold treats any existing lock as stale and steals it.
+        assert!(try_steal_stale_lock(&lock_dir, Duration::from_secs(0)));
+        assert!(!lock_dir.exists());
+
+        // Nothing to steal once it's gone.
+        assert!(!try_steal_stale_lock(&lock_dir, Duration::from_secs(0)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}

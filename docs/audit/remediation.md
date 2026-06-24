@@ -328,6 +328,28 @@ Per-crate progress (work top-to-bottom):
   ACCEPTED-AS-IS the `find_env_keys` doc, already corrected to "four
   providers". Added the refresh-failure, unknown-provider, and
   manual-paste-race tests the report flagged as missing).
+- aj-conf — `DONE` (the two Majors were verify-only, retired by R5: the
+  non-atomic `Config::save` became the lock + read-merge-write
+  `persist_changed`, and the clobber-guard/missing-file tests exist. Cross-
+  checked the live items against the reference, which splits the same
+  concerns across `config.ts`/`settings-manager.ts`/`resource-loader.ts`,
+  funnels `$HOME` through one `homedir()`/`getAgentDir()`, stores sessions
+  flat instead of per-project, and injects `cwd`/`agentDir` into its
+  resource loader for hermetic tests. Acted on each: split the 2704-line
+  `lib.rs` into `schema`/`paths`/`env` modules (API-stable via crate-root
+  re-exports + a multi-file `impl Config`, so `Config::get_*` and friends
+  keep their paths); added an injectable `AgentEnv::discover` seam under the
+  real-host `new` wrapper (Minor Testing); centralized the six scattered
+  `$HOME` reads into one `paths::home_dir` (Minor Simplicity); documented
+  the `path_to_dir_name` collision on both it and `get_sessions_dir_path`
+  rather than changing the on-disk layout (Minor Contracts, reference
+  sidesteps it via flat storage); reworded the `Config` precedence doc to
+  say the merge lives in `aj::model` (Minor Contracts) and de-duplicated the
+  `ConfigThinkingDisplay` doc's doubled opening (Nit); fixed the `\u2014`
+  escape (Nit); dropped the unused chrono `serde` feature. ACCEPTED-AS-IS
+  the enum `Display`/`FromStr`/serde triple (now four enums): the TS idiom
+  doesn't transfer and the drift tests compensate. Three pre-existing
+  private-intra-doc-link warnings were left as-is (out of finding scope).)
 
 ---
 
@@ -1329,3 +1351,61 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   fixed. `cargo test -p aj-models --lib` (330, +1) and `-p aj --lib` (450)
   green, `clippy -p aj-models -p aj --all-targets` clean, `cargo check
   --workspace` clean.
+- 2026-06-24 · RESIDUAL(aj-conf) · DONE · 3babb6d · Eighth per-crate
+  residual sweep. Two findings verify-only, retired by R5: the Major
+  non-atomic `Config::save` (now the lock + read-merge-write
+  `persist_changed`, and the user-confirmed reframe that temp+rename/fsync
+  is over-engineering vs. the reference's plain-write-under-lock) and the
+  Minor "no clobber-guard test" (`persist_changed_refuses_to_clobber_
+  invalid_toml` + `_creates_a_missing_file` exist). The user asked to
+  cross-check the live items against the reference first, which confirmed
+  every call. The reference splits these exact concerns across separate
+  files (`config.ts` paths, `settings-manager.ts` schema+lock+merge,
+  `resolve-config-value.ts` resolution, `resource-loader.ts` context
+  loading), funnels `$HOME` through one `homedir()` + `getAgentDir()`,
+  injects `cwd`/`agentDir` into its loader for hermetic tests, and stores
+  sessions in one flat dir (sidestepping any path-derived name collision).
+  Acted on each live finding. **[Major][Boundaries] split the 2704-line
+  `lib.rs`** into `schema` (the `config.toml` schema, parser, typed
+  diagnostics, and lock-guarded writer), `paths` (`$HOME` resolution, the
+  `~/.aj/` resolvers, git-root + project-dir discovery, display
+  abbreviation), and `env` (`AgentEnv` + context-file loading), with a
+  re-export-only `lib.rs`. Public API is unchanged: types re-export from the
+  crate root and the path resolvers stay `impl Config` methods (Rust allows
+  a type's inherent impl to span files), so `Config::get_config_dir()` and
+  friends keep their paths and no consumer call site moved. The verbatim
+  move was done first and proven green before any semantic edit.
+  **[Minor][Testing] injectable `AgentEnv`:** added `AgentEnv::discover(
+  working_directory, home, today_date, ...)` as the hermetic core with
+  `new()` the thin real-host wrapper that reads cwd/`$HOME`/clock, matching
+  the reference's injected-`cwd`/`agentDir` loader; rewrote the two
+  `new()`-based smoke tests into a hermetic `discover_is_hermetic`, a
+  documented `new_reads_the_host_environment` smoke test, and a deterministic
+  `display_format_is_stable`. **[Minor][Simplicity] `$HOME`:** one
+  `paths::home_dir() -> Option<PathBuf>` now backs all six prior scattered
+  reads (config dir, display, dir-name, system prompt, user instructions,
+  skills), each adapting the `None` case to its own policy; the doc records
+  that contract. **[Minor][Contracts] `path_to_dir_name` collision:**
+  documented the lossy dash-join + outside-`$HOME` fallback on both
+  `path_to_dir_name` and `get_sessions_dir_path` rather than changing the
+  scheme (which would relocate every existing project's sessions dir); the
+  reference avoids it structurally with flat storage, out of scope for a
+  residual sweep. **[Minor][Contracts] precedence doc:** reworded the
+  `Config` doc to say the struct is the file layer only and the
+  CLI>env>config merge lives in `aj::model`. **[Nit] `ConfigThinkingDisplay`
+  doc:** collapsed the duplicated half-written opening into one summary +
+  the single-knob framing + table. **[Nit] `\u2014`:** the literal escape in
+  `get_sessions_base_dir_path`'s doc became two sentences (no em dash, per
+  our style). **Dependency hygiene:** dropped the unused chrono `serde`
+  feature (chrono is used only for `Utc::now().format`); other crates still
+  enable it where needed. **ACCEPTED-AS-IS** the enum
+  `Display`/`FromStr`/serde triple (now four enums: thinking level/display,
+  speed, verbosity): the reference's string-union/zod idiom doesn't carry to
+  Rust, a macro would add indirection for low payoff, and the
+  `test_options_table_*` drift tests compensate. Left three pre-existing
+  private-intra-doc-link warnings (`ConfigError::LockTimeout` →
+  `LOCK_ACQUIRE_TIMEOUT`, `persist_changed` → `ConfigLock`, `skills` →
+  `skill_roots`) as-is, outside the findings; introduced no new ones. No
+  public-API or on-disk/wire change. `cargo test -p aj-conf` green (74),
+  `fmt`/`clippy -p aj-conf --all-targets` clean, `cargo build --workspace`
+  confirms no consumer drift.

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-chrono = { workspace = true, features = ["serde"] }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }
 strsim = { workspace = true }
