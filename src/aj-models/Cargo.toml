@@ -41,6 +41,7 @@ anthropic-sdk = { path = "../anthropic-sdk" }
 # round-trip helpers to the `tests/roundtrip/` integration crate.
 aj-models = { path = ".", features = ["test-support"] }
 serde_json.workspace = true
+serial_test = { workspace = true }
 
 [lints]
 workspace = true

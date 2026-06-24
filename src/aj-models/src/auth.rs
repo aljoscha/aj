@@ -15,8 +15,11 @@
 //!   refresh is needed, so the storage layer can mint new access
 //!   tokens without the caller knowing about provider specifics.
 //! - **Resolution chain.** [`AuthStorage::get_api_key`] walks the
-//!   priority list — runtime override → env vars → stored
-//!   API key → stored OAuth (auto-refreshing if expired).
+//!   priority list: runtime override, then stored API key, then
+//!   stored OAuth (auto-refreshing if expired), then env vars. A
+//!   stored credential wins over the environment, so a deliberate
+//!   login stays authoritative and a stray exported key can't shadow
+//!   it. The explicit per-run override is the runtime `--api-key`.
 //!
 //! The on-disk shape is the same `{ "type": "...", ... }` discriminated
 //! union the rest of the project uses, so `auth.json` stays easy to
@@ -285,10 +288,17 @@ impl AuthStorage {
     /// priority chain:
     ///
     /// 1. Runtime override (CLI `--api-key` flag).
-    /// 2. Environment variables.
-    /// 3. Stored API key in `auth.json`.
-    /// 4. Stored OAuth tokens — auto-refreshed under the file lock if
+    /// 2. Stored API key in `auth.json`.
+    /// 3. Stored OAuth tokens, auto-refreshed under the file lock if
     ///    expired.
+    /// 4. Environment variables.
+    ///
+    /// A stored credential is checked before the environment so a
+    /// deliberate `aj login` or hand-edited `auth.json` entry stays
+    /// authoritative. A stray exported key (say an `ANTHROPIC_API_KEY`
+    /// left in a shell profile) must not silently shadow, and mis-bill
+    /// against, a configured subscription. The explicit per-run
+    /// override is the runtime `--api-key` in step 1, not ambient env.
     ///
     /// Returns `Ok(None)` when no source has a key. A stored OAuth
     /// credential whose provider id isn't in the registry (e.g. a
@@ -313,17 +323,12 @@ impl AuthStorage {
             return Ok(Some(key));
         }
 
-        // 2. Environment variables. Env wins over
-        //    `auth.json` so a developer can dev-override stored
-        //    credentials for a one-off run without editing the file.
-        if let Some(key) = get_env_api_key(provider_id) {
-            return Ok(Some(key));
-        }
-
-        // 3 & 4. Stored credential.
-        let cred = self.get(provider_id).await?;
-        match cred {
-            Some(AuthCredential::ApiKey { key }) => Ok(Some(key)),
+        // 2 & 3. Stored credential, checked before the environment so a
+        //        deliberate login stays authoritative (see the doc
+        //        comment). Each arm that yields a usable key returns
+        //        here. Otherwise we fall through to the env fallback.
+        match self.get(provider_id).await? {
+            Some(AuthCredential::ApiKey { key }) => return Ok(Some(key)),
             Some(AuthCredential::OAuth(creds)) => {
                 // A stored OAuth credential under a provider id we have
                 // no flow for (a hand-edited or renamed id) can be
@@ -337,10 +342,22 @@ impl AuthStorage {
                 if !creds.is_expired_at(now) {
                     return Ok(Some(provider.get_api_key(&creds)));
                 }
-                self.refresh_oauth_with_lock(provider_id, &*provider).await
+                // A refresh failure bubbles as `AuthError::OAuth`. An
+                // `Ok(None)` means a sibling process cleared or replaced
+                // the entry while we held the lock, so we fall through to
+                // env rather than inventing a credential.
+                if let Some(key) = self
+                    .refresh_oauth_with_lock(provider_id, &*provider)
+                    .await?
+                {
+                    return Ok(Some(key));
+                }
             }
-            None => Ok(None),
+            None => {}
         }
+
+        // 4. Environment variables, the lowest-priority fallback.
+        Ok(get_env_api_key(provider_id))
     }
 
     /// Run an OAuth login flow and persist the resulting credentials.
@@ -860,6 +877,74 @@ mod tests {
 
         let key = storage.get_api_key("custom-provider-xyz").await.unwrap();
         assert_eq!(key.as_deref(), Some("from-file"));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Restores an environment variable to its prior value on drop so an
+    /// env-mutating test can't leak state into sibling tests. The
+    /// `set_var`/`remove_var` calls are unsound if another thread reads
+    /// the environment concurrently, so a caller must (a) run under
+    /// `#[serial_test::serial]` and (b) pick a variable no parallel test
+    /// touches. `serial_test` only serializes against other `#[serial]`
+    /// tests, so (b) is what actually guards against the parallel
+    /// non-serial tests in this binary.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: see the type doc. No parallel test reads or writes
+            // this variable, so the set/remove can't race a `getenv`.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `EnvVarGuard::set`.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// Precedence: a stored `auth.json` credential wins over a set
+    /// environment variable, and the env var is consulted only as the
+    /// fallback when nothing is stored. Uses `openrouter`, whose single
+    /// env mapping (`OPENROUTER_API_KEY`) no other test reads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_api_key_stored_credential_beats_env_var() {
+        let _env = EnvVarGuard::set("OPENROUTER_API_KEY", "from-env");
+        let path = scratch_path("stored-beats-env");
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+        // Nothing stored yet, so the env var is the fallback.
+        assert_eq!(
+            storage.get_api_key("openrouter").await.unwrap().as_deref(),
+            Some("from-env"),
+        );
+
+        // A stored key now wins over the env var.
+        storage
+            .set(
+                "openrouter",
+                AuthCredential::ApiKey {
+                    key: "from-file".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_api_key("openrouter").await.unwrap().as_deref(),
+            Some("from-file"),
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

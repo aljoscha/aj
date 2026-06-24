@@ -16,7 +16,7 @@
 //! Key resolution is **lazy**: rather than reading a key up front and
 //! failing if none is set, the resolver is invoked by the provider
 //! before each inference and walks the [`AuthStorage`] chain (runtime
-//! `--api-key` override → env var → stored API key → stored OAuth,
+//! `--api-key` override → stored API key → stored OAuth → env var,
 //! auto-refreshing). This lets a session start without credentials
 //! (e.g. so the user can log in later) and lets a mid-session login
 //! take effect on the next turn without a restart.

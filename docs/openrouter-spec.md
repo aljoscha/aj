@@ -136,8 +136,8 @@ points the `openai-sdk` client at OpenRouter.
 
 `find_env_keys("openrouter")` returns `["OPENROUTER_API_KEY"]`
 (`aj-models/src/auth.rs`). OpenRouter uses a plain bearer API key, so the
-generic credential chain (runtime `--api-key` override, env var, stored
-`auth.json` key) works with no OAuth provider. There is no in-TUI flow
+generic credential chain (runtime `--api-key` override, stored
+`auth.json` key, env var) works with no OAuth provider. There is no in-TUI flow
 to store a plain API key today (the `/login` picker is OAuth-only), so
 OpenRouter credentials come from the env var or `--api-key`.
 

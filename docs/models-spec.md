@@ -1960,11 +1960,15 @@ struct AuthStorage {
 
 **API key resolution priority:**
 1. Runtime override (e.g. CLI `--api-key` flag)
-2. Environment variables — provider-specific (see §9.5). Env vars
-   win over `auth.json` so a developer can dev-override stored
-   credentials for a one-off run without editing the file.
-3. API key from `auth.json`
-4. OAuth token from `auth.json` (auto-refreshed if expired)
+2. API key from `auth.json`
+3. OAuth token from `auth.json` (auto-refreshed if expired)
+4. Environment variables, provider-specific (see §9.5)
+
+A stored credential wins over the environment, so a deliberate
+`aj login` or hand-edited `auth.json` entry stays authoritative and a
+stray exported key cannot silently shadow (and mis-bill against) it.
+The explicit per-run override is the runtime `--api-key` flag in step
+1, not ambient environment variables.
 
 ### 9.2 OAuth Provider Trait
 
@@ -2081,9 +2085,11 @@ used at request time.
 | anthropic | `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY` |
 | openai | `OPENAI_API_KEY` |
 | openai-codex | `OPENAI_CODEX_OAUTH_TOKEN` |
+| openrouter | `OPENROUTER_API_KEY` |
 
-Per §9.1, any of these env vars overrides credentials stored in
-`auth.json`.
+Per §9.1, these env vars are the lowest-priority source: a credential
+stored in `auth.json` (or a runtime `--api-key` flag) wins over them.
+They act as a fallback for when nothing is stored.
 
 `OPENAI_CODEX_OAUTH_TOKEN` is the JWT access token from the §9.4
 flow. It expires (typically within an hour) and cannot be

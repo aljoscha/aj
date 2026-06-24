@@ -1298,3 +1298,34 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   overstated cap claim) were fixed. `cargo test -p aj-models --lib` green
   (329, +4), `fmt`/`clippy -p aj-models --all-targets` clean, `cargo check
   --workspace` confirms no consumer drift.
+- 2026-06-24 · FOLLOWUP(aj-models-auth) · DONE · ae81600 · Actioned the
+  "possible future call" flagged in the entry above: flipped our API-key
+  resolution order from `runtime > env > stored` to `runtime > stored API
+  key > stored OAuth > env`, adopting the reference's model so a deliberate
+  `aj login` or hand-edited `auth.json` credential stays authoritative and
+  a stray exported key (e.g. an `ANTHROPIC_API_KEY` in a shell profile)
+  can't silently shadow and mis-bill against it. Env becomes the
+  lowest-priority fallback. The runtime `--api-key` flag (still rank 1)
+  remains the explicit per-run override, which is where the old
+  "env-as-quick-override" use case now lives. Matched the reference's
+  structure exactly except for our one deliberate divergence (a refresh
+  failure bubbles `AuthError::OAuth` instead of falling through to env). An
+  unknown-provider stored OAuth still short-circuits to `Ok(None)` with no
+  env fallback (faithful to the reference), and a sibling-cleared entry
+  under the lock now falls through to env. Reordered the binary's
+  `aj::auth::provider_status` overlay to mirror the chain (stored reported
+  before env). Updated every doc that stated the order: the `auth.rs`
+  module + `get_api_key` docs, `model.rs`'s `ApiKeyResolver` module doc,
+  `provider_status`/`ProviderAuthStatus` docs, `models-spec.md` §9.1 (list
+  + rationale) and §9.5 (env-mapping note, plus added the missing
+  `openrouter` row), and `openrouter-spec.md`. New `#[serial]` test
+  `get_api_key_stored_credential_beats_env_var` pins both directions (env
+  as fallback when nothing stored, stored wins when present) via an
+  `EnvVarGuard` RAII helper. Added `serial_test` as an `aj-models`
+  dev-dependency. The pre-existing `provider_status`-over-reports-typo'd-id
+  divergence noted above is unchanged. A fresh-agent review found no
+  correctness defects and flagged the two stale doc spots (`model.rs`,
+  `openrouter-spec.md`) and an overstated `EnvVarGuard` SAFETY comment, all
+  fixed. `cargo test -p aj-models --lib` (330, +1) and `-p aj --lib` (450)
+  green, `clippy -p aj-models -p aj --all-targets` clean, `cargo check
+  --workspace` clean.

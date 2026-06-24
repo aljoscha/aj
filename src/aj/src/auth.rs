@@ -30,9 +30,9 @@ const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openr
 /// A provider's resolved authentication status, ready to render.
 ///
 /// `summary` describes the *method and source* that would win the
-/// resolution chain (runtime override → env → stored key → stored
-/// OAuth); `detail` carries secondary info such as an OAuth token's
-/// remaining lifetime.
+/// resolution chain (runtime override, then stored key, then stored
+/// OAuth, then env). `detail` carries secondary info such as an OAuth
+/// token's remaining lifetime.
 #[derive(Debug, Clone)]
 pub struct ProviderAuthStatus {
     pub provider_id: String,
@@ -67,7 +67,43 @@ pub async fn provider_status(
         };
     }
 
-    // 2. Environment variable — report which one is set.
+    // 2 & 3. Stored credential, reported before the environment to
+    //        match the resolution order in `AuthStorage::get_api_key`.
+    match auth.get(provider_id).await {
+        Ok(Some(AuthCredential::ApiKey { .. })) => {
+            return ProviderAuthStatus {
+                provider_id: provider_id.to_string(),
+                configured: true,
+                summary: "API key (stored)".to_string(),
+                detail: None,
+            };
+        }
+        Ok(Some(AuthCredential::OAuth(creds))) => {
+            let summary = match oauth_name {
+                Some(name) => format!("subscription — {name}"),
+                None => "subscription".to_string(),
+            };
+            return ProviderAuthStatus {
+                provider_id: provider_id.to_string(),
+                configured: true,
+                summary,
+                detail: Some(format_remaining(creds.expires, now_unix_ms())),
+            };
+        }
+        Ok(None) => {}
+        // A corrupt/locked auth.json shouldn't take down the overlay;
+        // surface it as the status itself.
+        Err(err) => {
+            return ProviderAuthStatus {
+                provider_id: provider_id.to_string(),
+                configured: false,
+                summary: format!("error reading auth.json: {err}"),
+                detail: None,
+            };
+        }
+    }
+
+    // 4. Environment variable, reported by name when set.
     if let Some(var) = first_set_env_var(provider_id) {
         return ProviderAuthStatus {
             provider_id: provider_id.to_string(),
@@ -77,40 +113,12 @@ pub async fn provider_status(
         };
     }
 
-    // 3 & 4. Stored credential.
-    match auth.get(provider_id).await {
-        Ok(Some(AuthCredential::ApiKey { .. })) => ProviderAuthStatus {
-            provider_id: provider_id.to_string(),
-            configured: true,
-            summary: "API key (stored)".to_string(),
-            detail: None,
-        },
-        Ok(Some(AuthCredential::OAuth(creds))) => {
-            let summary = match oauth_name {
-                Some(name) => format!("subscription — {name}"),
-                None => "subscription".to_string(),
-            };
-            ProviderAuthStatus {
-                provider_id: provider_id.to_string(),
-                configured: true,
-                summary,
-                detail: Some(format_remaining(creds.expires, now_unix_ms())),
-            }
-        }
-        Ok(None) => ProviderAuthStatus {
-            provider_id: provider_id.to_string(),
-            configured: false,
-            summary: "not configured".to_string(),
-            detail: None,
-        },
-        // A corrupt/locked auth.json shouldn't take down the overlay;
-        // surface it as the status itself.
-        Err(err) => ProviderAuthStatus {
-            provider_id: provider_id.to_string(),
-            configured: false,
-            summary: format!("error reading auth.json: {err}"),
-            detail: None,
-        },
+    // 5. Nothing configured at any layer.
+    ProviderAuthStatus {
+        provider_id: provider_id.to_string(),
+        configured: false,
+        summary: "not configured".to_string(),
+        detail: None,
     }
 }
 
