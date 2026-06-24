@@ -1351,7 +1351,7 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   fixed. `cargo test -p aj-models --lib` (330, +1) and `-p aj --lib` (450)
   green, `clippy -p aj-models -p aj --all-targets` clean, `cargo check
   --workspace` clean.
-- 2026-06-24 · RESIDUAL(aj-conf) · DONE · 3babb6d · Eighth per-crate
+- 2026-06-24 · RESIDUAL(aj-conf) · DONE · a116f88 · Eighth per-crate
   residual sweep. Two findings verify-only, retired by R5: the Major
   non-atomic `Config::save` (now the lock + read-merge-write
   `persist_changed`, and the user-confirmed reframe that temp+rename/fsync
