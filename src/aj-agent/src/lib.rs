@@ -61,10 +61,10 @@ pub struct AgentSeed {
     pub transcript: Vec<AgentMessage>,
     /// The fully-assembled system prompt for the session: either
     /// reused verbatim from the log (cache-warm resume) or freshly
-    /// assembled by the host. Inference reads it directly, so it
-    /// must be seeded before any turn runs. `None` leaves the
-    /// agent's prompt unset (the seed targets a fresh agent, where
-    /// it is unset already).
+    /// assembled by the host. Inference reads it directly. `None`
+    /// leaves the agent's prompt at its default, the empty string.
+    /// The seed passes `None` only for a fresh agent that the host
+    /// will prompt later.
     pub assembled_system_prompt: Option<String>,
     /// Floor for sub-agent ids: subsequently minted ids are
     /// strictly greater than this value, so freshly spawned
@@ -76,8 +76,11 @@ pub struct AgentSeed {
 pub struct Agent {
     /// The fully-assembled system prompt for the current run.
     /// Populated by [`Agent::seed_session`] (resume path or fresh
-    /// assembly) before any turn runs; inference reads it directly.
-    assembled_system_prompt: Option<String>,
+    /// assembly) before any turn runs. Inference reads it directly.
+    /// Defaults to the empty string, which every provider tolerates
+    /// (none sends an empty system block or errors), so an unseeded
+    /// agent degrades to a promptless turn rather than panicking.
+    assembled_system_prompt: String,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<UnifiedToolDefinition>,
     /// Names of builtin tools to exclude when spawning subagents.
@@ -242,7 +245,7 @@ impl Agent {
         let session_state = SessionState::new(working_directory);
 
         Self {
-            assembled_system_prompt: None,
+            assembled_system_prompt: String::new(),
             tool_definitions,
             tools: api_tools,
             disabled_tools,
@@ -484,7 +487,7 @@ impl Agent {
     pub fn seed_session(&mut self, seed: AgentSeed) {
         self.transcript = seed.transcript;
         if let Some(prompt) = seed.assembled_system_prompt {
-            self.assembled_system_prompt = Some(prompt);
+            self.assembled_system_prompt = prompt;
         }
         self.session_state
             .seed_sub_agent_counter(seed.sub_agent_counter);
@@ -532,10 +535,10 @@ impl Agent {
         self.should_stop_after_turn = hook;
     }
 
-    /// Borrow the assembled system prompt. Returns `None` until
+    /// Borrow the assembled system prompt. Empty until
     /// [`Agent::seed_session`] supplies one.
-    pub fn assembled_system_prompt(&self) -> Option<&str> {
-        self.assembled_system_prompt.as_deref()
+    pub fn assembled_system_prompt(&self) -> &str {
+        &self.assembled_system_prompt
     }
 
     /// Run a single, bus-silent completion against the agent's provider
@@ -1657,10 +1660,7 @@ impl Agent {
 
         tracing::debug!(?thinking, "thinking effort");
 
-        let system_prompt = self
-            .assembled_system_prompt
-            .clone()
-            .expect("system prompt must be resolved before inference");
+        let system_prompt = self.assembled_system_prompt.clone();
 
         let messages = transcript_to_messages(&self.transcript);
         // Defense-in-depth `image_block` gate: scrub image bytes
@@ -1843,10 +1843,7 @@ impl Agent {
         // concurrently within one turn.
         let mut session_ctx_wrapper = SessionContextWrapper {
             session_state: self.session_state.clone(),
-            assembled_system_prompt: self
-                .assembled_system_prompt
-                .clone()
-                .expect("system prompt must be resolved before sub-agent spawn"),
+            assembled_system_prompt: self.assembled_system_prompt.clone(),
             disabled_tools: &self.disabled_tools,
             provider: Arc::clone(&self.provider),
             model_info: Arc::clone(&self.model_info),
@@ -4297,6 +4294,37 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
+    async fn prompt_on_unseeded_agent_runs_with_empty_system_prompt() {
+        // The assembled system prompt defaults to the empty string, so
+        // a host that drives a turn before calling `seed_session`
+        // degrades to a promptless turn instead of panicking. Every
+        // provider tolerates an empty system prompt (it sends none), so
+        // this is a clean fallback, not a misuse trap.
+        let provider: Arc<dyn Provider> = Arc::new(
+            ScriptedProvider::new(vec![ProviderScript::from_events(finalize_script(
+                finalize_text("ok"),
+            ))])
+            .on_exhausted(ExhaustedBehavior::Panic),
+        );
+        let mut agent = Agent::with_provider(
+            std::env::temp_dir(),
+            Vec::new(),
+            Vec::new(),
+            provider,
+            Arc::new(scripted_model_info()),
+            StreamOptions::default(),
+            None,
+        );
+        // Deliberately not seeded.
+        assert_eq!(agent.assembled_system_prompt(), "");
+
+        agent
+            .prompt("hello".to_string(), CancellationToken::new())
+            .await
+            .expect("an unseeded agent should run a turn, not panic");
+    }
+
+    #[tokio::test]
     async fn continue_run_drives_existing_transcript_without_appending() {
         // `continue_run` is the recovery / continuation entry point:
         // the binary uses it after a recoverable error to retry
@@ -4503,15 +4531,18 @@ mod event_protocol_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_mid_stream_pushes_aborted_partial_and_allows_followup() {
         // End-to-end smoke test for the cancellation invariant:
         // firing the token mid-stream should leave the transcript in
         // a shape that lets a second `prompt` call succeed without
         // any manual repair. We use a scripted provider whose first
-        // step is an immediate `Start` and whose second step is
-        // gated by a long delay, then cancel the token shortly after
-        // launching the prompt. The follow-up turn uses a normal
+        // step is an immediate `Start` and whose second step is gated
+        // by a long delay, and a canceller task on a much shorter
+        // timer. Under `start_paused` tokio advances the virtual clock
+        // to the nearest deadline only once every task is parked, so
+        // the 50ms cancel deterministically fires before the 60s Done
+        // (no wall-clock race). The follow-up turn uses a normal
         // scripted Done so we can verify the agent is still healthy.
         use aj_models::scripted::ProviderScript;
 
@@ -4527,7 +4558,8 @@ mod event_protocol_tests {
             .push_immediate(AssistantMessageEvent::Start {
                 partial: partial.clone(),
             })
-            // Long enough that the cancel races in before this lands.
+            // Far past the cancel's 50ms timer, so under paused time
+            // the cancel always fires first and this step never lands.
             .push(
                 std::time::Duration::from_secs(60),
                 AssistantMessageEvent::Done {
@@ -6064,6 +6096,12 @@ mod event_protocol_tests {
         name: &'static str,
         mode: ExecutionMode,
         state: Arc<ProbeState>,
+        /// When set, the probe fires this token at the very start of
+        /// `execute`, before it yields. Lets a test trigger
+        /// cancellation deterministically from inside the tool batch
+        /// (no wall-clock race): the agent's per-tool `select!` sees
+        /// the cancel the next time the probe's body suspends.
+        cancel_on_start: Option<CancellationToken>,
     }
 
     impl ToolDefinition for ProbeTool {
@@ -6086,6 +6124,13 @@ mod event_protocol_tests {
             _ctx: &mut dyn ToolContext,
             input: ProbeInput,
         ) -> Result<ToolOutcome, crate::BoxError> {
+            // Fire the cancel before any yield so the per-tool
+            // `select!` observes it the moment this body suspends at
+            // the sleep below, dropping the future before it can record
+            // a completion.
+            if let Some(token) = &self.cancel_on_start {
+                token.cancel();
+            }
             let now = {
                 let mut active = self.state.active.lock().unwrap();
                 *active += 1;
@@ -6126,6 +6171,7 @@ mod event_protocol_tests {
             name: "probe",
             mode: ExecutionMode::Parallel,
             state: Arc::clone(&state),
+            cancel_on_start: None,
         };
         let scripts = vec![
             finalize_script(finalize_tool_uses(&[
@@ -6163,6 +6209,7 @@ mod event_protocol_tests {
             name: "seq",
             mode: ExecutionMode::Sequential,
             state: Arc::clone(&state),
+            cancel_on_start: None,
         };
         let scripts = vec![
             finalize_script(finalize_tool_uses(&[
@@ -6195,6 +6242,7 @@ mod event_protocol_tests {
             name: "probe",
             mode: ExecutionMode::Parallel,
             state: Arc::clone(&state),
+            cancel_on_start: None,
         };
         let scripts = vec![
             finalize_script(finalize_tool_uses(&[
@@ -6237,18 +6285,30 @@ mod event_protocol_tests {
     /// call — the in-flight parallel group and the not-yet-started
     /// serial barrier after it — in original order, and the turn ends
     /// in `Aborted`. No `tool_use` is left dangling.
+    ///
+    /// The cancel is fired from inside the first probe's `execute`
+    /// (via `cancel_on_start`) rather than a background timer, so the
+    /// in-flight batch is provably cancelled while running, with no
+    /// wall-clock race.
     #[tokio::test]
     async fn cancellation_synthesizes_results_for_whole_batch() {
         let state = Arc::new(ProbeState::default());
+        let cancel = CancellationToken::new();
+        // The first parallel probe cancels the turn the moment it
+        // starts; both parallel calls then drop at their next suspend
+        // point and the serial barrier behind them is drained as
+        // cancelled.
         let par = ProbeTool {
             name: "probe",
             mode: ExecutionMode::Parallel,
             state: Arc::clone(&state),
+            cancel_on_start: Some(cancel.clone()),
         };
         let seq = ProbeTool {
             name: "seq",
             mode: ExecutionMode::Sequential,
             state: Arc::clone(&state),
+            cancel_on_start: None,
         };
         let scripts = vec![finalize_script(finalize_tool_uses(&[
             (
@@ -6264,13 +6324,6 @@ mod event_protocol_tests {
             ("c2", "seq", serde_json::json!({"id": "c2", "delay_ms": 0})),
         ]))];
         let mut agent = build_agent(scripts, vec![par.into(), seq.into()]);
-
-        let cancel = CancellationToken::new();
-        let canceller = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            canceller.cancel();
-        });
 
         let result = agent.prompt("go".to_string(), cancel).await;
         assert!(matches!(result, Err(crate::TurnError::Aborted)));

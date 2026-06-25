@@ -469,9 +469,7 @@ mod tests {
         let log = world.log.lock().await;
         let persisted = log.system_prompt().expect("system prompt frozen on create");
         let agent = world.agent.lock().await;
-        let held = agent
-            .assembled_system_prompt()
-            .expect("agent holds the assembled prompt");
+        let held = agent.assembled_system_prompt();
         assert_eq!(persisted, held);
     }
 
@@ -497,9 +495,7 @@ mod tests {
             let log = world.log.lock().await;
             assert_eq!(
                 log.system_prompt().expect("persisted prompt"),
-                agent
-                    .assembled_system_prompt()
-                    .expect("agent holds the persisted prompt"),
+                agent.assembled_system_prompt(),
                 "resume reuses the persisted prompt byte-for-byte"
             );
         }

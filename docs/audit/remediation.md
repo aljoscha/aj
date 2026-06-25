@@ -350,6 +350,48 @@ Per-crate progress (work top-to-bottom):
   the enum `Display`/`FromStr`/serde triple (now four enums): the TS idiom
   doesn't transfer and the drift tests compensate. Three pre-existing
   private-intra-doc-link warnings were left as-is (out of finding scope).)
+- aj-agent-runtime — `DONE` (nearly all findings retired by themed work:
+  the Critical `aj-conf` edge + edition pin by R7, the Major truncated-
+  `Done` by R1, the Major three-dead-event-variants by R13/R14, the Major
+  `tools::Tool` round-trip by the aj-models-core sweep, the Minor `anyhow`
+  by R11, the Minor vestigial `AgentEnd.messages` by R14, the Nit comment
+  chronology by R18; the Nit `determine_thinking` doc/ordering is moot
+  since the trigger-word mechanism was removed). Two live leftovers, both
+  cross-checked against the reference. (1) [Minor][Contracts] the two
+  reachable `expect`s on `assembled_system_prompt`: the reference makes
+  its `systemPrompt` a non-optional string defaulting to `""` and every
+  provider tolerates an empty system prompt, and our wire layer already
+  behaves identically (anthropic returns `None` on empty, the OpenAI
+  builders gate on `!is_empty`, codex substitutes its default), so rather
+  than the proposal's typed-error boundary guard we adopted the
+  reference's design: made `assembled_system_prompt` a plain `String`
+  (default `""`), dropped both `expect`s, and pass `Some(prompt)` to the
+  `Context`. An unseeded agent now degrades to a promptless turn instead
+  of panicking. Accessor returns `&str`; `seed_session` overwrites on
+  `Some`; the two test callers in `session.rs` lost their `.expect()`.
+  Net code reduction, no public-signature or on-disk change. (2)
+  [Nit][Testing] the cancellation tests raced wall-clock timers (the
+  multi-tool partial-cancel branch was already covered by a test added
+  since the audit, but it and the streaming-arm test both raced a
+  background `sleep`). The reference triggers aborts explicitly and lets
+  a signal-responsive stream react rather than racing a timer; mirrored
+  that: the batch test fires the cancel from inside the first probe's
+  `execute` (new `cancel_on_start` field) so the in-flight batch is
+  cancelled with no timer, and the streaming-arm test uses
+  `#[tokio::test(start_paused = true)]` so the 50ms cancel deterministically
+  precedes the 60s Done (also fixing a real, if rare, Start-vs-cancel
+  ordering race). New test pins the unseeded-agent no-panic behavior. A
+  fresh-agent review found no must-fix bugs and confirmed `Some("")` is
+  handled identically to absent across all four providers; its should-fix
+  doc-accuracy items (the codex "sends no system prompt" overstatement, a
+  pre-existing semicolon, an awkward `AgentSeed` doc) were folded in.
+  Flagged, not done: provider-level empty-prompt tests (anthropic/openai
+  lack an explicit `Some("") → no system block` test now that the path is
+  reachable) left for a possible aj-models follow-up to keep this change
+  aj-agent-scoped. The `SessionState`-publicness boundary note is punted
+  to the aj-agent-contracts (AG2) sweep. `cargo test -p aj-agent` (77) +
+  `-p aj` session tests green, `fmt`/`clippy -p aj-agent -p aj
+  --all-targets` clean, `cargo check --workspace` confirms no drift.
 
 ---
 
@@ -1409,3 +1451,64 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   public-API or on-disk/wire change. `cargo test -p aj-conf` green (74),
   `fmt`/`clippy -p aj-conf --all-targets` clean, `cargo build --workspace`
   confirms no consumer drift.
+- 2026-06-25 · RESIDUAL(aj-agent-runtime) · DONE · acf7a42 · Ninth
+  per-crate residual sweep. Of the AG1 report's 1 Critical / 3 Major / 4
+  Minor / 3 Nit, nearly all were verify-only, already retired by themed
+  work: the Critical `aj-agent → aj-conf` edge + the edition/version pin
+  (R7), the Major truncated-`Done`-trusted-blindly (R1), the Major three
+  never-emitted event variants (R13 wired `ToolExecutionUpdate`, R14
+  wired `TurnEnd` + found `QueueUpdate` live), the Major `tools::Tool ↔
+  ToolDefinition` round-trip (aj-models-core sweep deleted `tools.rs`),
+  the Minor `anyhow`-in-the-turn-API (R11's `BoxError`/`TurnError`), the
+  Minor always-empty `AgentEnd.messages` (R14 populated it), and the Nit
+  comment chronology (R18). The Nit `determine_thinking` doc/ordering is
+  moot: the thinking trigger-word mechanism was removed wholesale, so
+  thinking is now a fixed `ThinkingConfig` policy. Two live leftovers,
+  both cross-checked against the reference per the user. **(1)
+  [Minor][Contracts] reachable `expect`s on `assembled_system_prompt`:**
+  the public turn path could panic if a library consumer drove a turn
+  before `seed_session`. The reference sidesteps this entirely
+  (`agent.ts`: `systemPrompt: initialState?.systemPrompt ?? ""`, a
+  non-optional string, and every provider tolerates an empty system
+  prompt), and our wire layer already matches (anthropic `build_system`
+  returns `None` on empty, the OpenAI builders gate on `&& !is_empty`,
+  codex substitutes `"You are a helpful assistant."`). So instead of the
+  proposal's typed-error boundary guard, adopted the reference's design:
+  changed `assembled_system_prompt` from `Option<String>` to a plain
+  `String` (default `""`), dropped both `expect`s, and pass
+  `Some(prompt)` to the `Context`. An unseeded agent now degrades to a
+  promptless turn rather than panicking. The accessor returns `&str`,
+  `seed_session` overwrites on `Some`, and the two `#[cfg(test)]` callers
+  in `session.rs` lost their `.expect()`. Net code reduction, no
+  public-signature or on-disk/wire change; the behavior change is
+  strictly-better handling of a previously-panicking misuse. **(2)
+  [Nit][Testing] cancellation tests raced wall-clock timers:** the
+  multi-tool partial-cancel branch was already covered by
+  `cancellation_synthesizes_results_for_whole_batch` (added since the
+  audit), but it and `cancel_mid_stream_pushes_aborted_partial...` both
+  raced a background `sleep` against a long provider/tool delay. The
+  reference's abort tests trigger explicitly and let a signal-responsive
+  stream react, never racing a timer; mirrored that. The batch test now
+  fires the cancel from inside the first probe's `execute` (new
+  `cancel_on_start: Option<CancellationToken>` test field) so the
+  in-flight batch is provably cancelled with no timer at all; the
+  streaming-arm test (no tool to fire from) uses
+  `#[tokio::test(start_paused = true)]` so tokio's virtual clock advances
+  the 50ms cancel deterministically before the 60s `Done`, which also
+  fixes a real (if rare) `Start`-vs-cancel ordering race the old
+  wall-clock form could lose. Added `prompt_on_unseeded_agent_runs_with_
+  empty_system_prompt` pinning the no-panic fallback. A fresh-agent
+  review found no must-fix bugs, confirmed `Some("")` is handled
+  identically to absent across all four providers and that the only
+  production composition root always seeds non-empty; its should-fix
+  doc-accuracy items (the codex "sends no system prompt" overstatement, a
+  pre-existing structuring semicolon in the field doc, an awkward
+  `AgentSeed` doc rewrite) were folded into the amend. Flagged, not done:
+  the reviewer's note that anthropic/openai-completions/openai-responses
+  lack an explicit `Some("") → no system block` test now that the path is
+  reachable (codex has one), left for a possible aj-models follow-up to
+  keep this change aj-agent-scoped. The report's `SessionState`-publicness
+  boundary note is punted to the aj-agent-contracts (AG2) sweep, the next
+  RESIDUAL crate. `cargo test -p aj-agent` (77) + `-p aj` session tests
+  green, `fmt`/`clippy -p aj-agent -p aj --all-targets` clean, `cargo
+  check --workspace` confirms no consumer drift.
