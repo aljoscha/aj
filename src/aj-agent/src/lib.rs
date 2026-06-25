@@ -2220,8 +2220,13 @@ impl TaskRegistry {
 /// concurrent foreground tool calls can each hold a clone and mutate
 /// session state without contending on a `&mut` borrow of the agent —
 /// that borrow is what otherwise forces tool calls to run serially.
+///
+/// Crate-internal: the runtime owns this as a private [`Agent`] field
+/// and exposes only the read accessors the host needs
+/// (`turn_counter`, `accumulated_usage`, `sub_agent_usage` on
+/// [`Agent`]), so the state itself never appears in the public API.
 #[derive(Clone)]
-pub struct SessionState {
+pub(crate) struct SessionState {
     inner: Arc<StdMutex<SessionStateInner>>,
 }
 
@@ -2236,7 +2241,7 @@ struct SessionStateInner {
 }
 
 impl SessionState {
-    pub fn new(working_directory: PathBuf) -> Self {
+    pub(crate) fn new(working_directory: PathBuf) -> Self {
         Self {
             inner: Arc::new(StdMutex::new(SessionStateInner {
                 working_directory,
@@ -2265,7 +2270,7 @@ impl SessionState {
         self.lock().todo_list = todos;
     }
 
-    pub fn turn_counter(&self) -> usize {
+    pub(crate) fn turn_counter(&self) -> usize {
         self.lock().turn_counter
     }
 
@@ -2273,7 +2278,7 @@ impl SessionState {
         self.lock().turn_counter += 1;
     }
 
-    pub fn accumulated_usage(&self) -> Usage {
+    pub(crate) fn accumulated_usage(&self) -> Usage {
         self.lock().accumulated_usage.clone()
     }
 

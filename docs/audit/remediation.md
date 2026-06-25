@@ -392,6 +392,47 @@ Per-crate progress (work top-to-bottom):
   to the aj-agent-contracts (AG2) sweep. `cargo test -p aj-agent` (77) +
   `-p aj` session tests green, `fmt`/`clippy -p aj-agent -p aj
   --all-targets` clean, `cargo check --workspace` confirms no drift.
+- aj-agent-contracts — `DONE` (the Major `emit_update`-no-op retired by
+  R13, the Minor `anyhow`-in-the-tool-trait by R11, the §N comment refs by
+  R18, all verify-only). Cross-checked the live items against the
+  reference, which sharpened two calls. Live changes, all in
+  `aj-agent`'s contract files plus the `SessionState` narrowing. Added the
+  missing schema/back-compat tests (Minor Testing): `derive_schema` now has
+  a test pinning the wire-facing guarantees (strips the `title` schemars
+  emits, always injects `properties`/`required`, on both a struct and a
+  fieldless input), and a `ToolDetails::Bash` deser-from-legacy-payload
+  test pins the `#[serde(default)]` back-compat the variant doc promises.
+  The reference validated both: it dedicates a `convert-tools` test file to
+  its own schema post-processing, and its `details?` is optional with JS's
+  implicit missing-field tolerance, so our serde-default + test is the Rust
+  equivalent. Documented the `derive_schema` `expect` as a true
+  `schemars`-always-serializes invariant (Nit Contracts). Trimmed the
+  `ToolDetails::Bash` variant doc to the cross-field invariant, letting the
+  per-field docs carry per-field contract (Nit Comments). For the id-typing
+  fork (Minor Contracts, raw `usize` sub-agent ids tied to `AgentId::Sub`
+  only by prose), chose document-the-invariant over a `SubAgentId` newtype:
+  the reference uses plain primitive ids everywhere (`toolCallId: string`,
+  sub-agent `agent: string` + `step`), no id newtypes at all, and a real
+  newtype would ripple through `AgentId::Sub`/`SpawnedAgent`/`SpawnResult`/
+  `TaskKind::Agent`/the persisted `SubAgentReport` shape for a Low-priority
+  finding. Made `AgentId::Sub` the authoritative-id doc anchor and pointed
+  the four `usize` carriers at it ("the `n` from `Sub(n)`"). Restated the
+  `AgentMessage`/`AgentMessageKind` docs as steady-state forward-compat
+  rationale (Minor Comments): the reference's `AgentMessage = Message |
+  CustomAgentMessages[...]` is the same seam and is live in production (a
+  `bashExecution` custom message converted to a wire message before each
+  LLM call), confirming our single-variant-today design and the
+  role-discriminator contract are right, so the rationale was kept and only
+  the roadmap-y framing and stray em-dashes/semicolons were fixed. Also
+  reworded the stale "aj-session migration walker" test comment (no such
+  walker exists). Resolved the punted boundary note: `SessionState` was
+  dead public surface (nothing outside `aj-agent` names it; `Agent` holds
+  it privately and exposes its own accessors), narrowed to `pub(crate)`
+  along with its three `pub` inherent methods, matching the reference's
+  `private _state` + read-only getter. No on-disk/wire or public-signature
+  change beyond removing unused surface. `cargo test -p aj-agent` (78, +2) +
+  `-p aj` session tests green, `fmt`/`clippy -p aj-agent --all-targets`
+  clean, `cargo check --workspace` confirms no consumer drift.
 
 ---
 
@@ -1512,3 +1553,64 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   RESIDUAL crate. `cargo test -p aj-agent` (77) + `-p aj` session tests
   green, `fmt`/`clippy -p aj-agent -p aj --all-targets` clean, `cargo
   check --workspace` confirms no consumer drift.
+- 2026-06-25 · RESIDUAL(aj-agent-contracts) · DONE · 60d354f · Tenth
+  per-crate residual sweep (`tool.rs`/`message.rs`/`types.rs` + the
+  punted `SessionState` boundary note). Three findings verify-only,
+  already retired by themed work: the Major `ToolContext::emit_update`
+  documented-no-op (R13 wired the inline-await bus emit; the trait doc
+  now describes the live behavior), the Minor `anyhow`-in-the-public-tool-
+  trait (R11's `BoxError` on `execute`/`ErasedToolFn`/`spawn_agent`), and
+  the Minor `docs/aj-next-plan.md §N` comment refs (R18). The user asked
+  to cross-check the live items against the reference, which sharpened two
+  calls. **Live changes, all in `aj-agent`.** [Minor][Testing] added the
+  two missing boundary tests: `derive_schema_shapes_input_for_the_wire`
+  pins the wire-facing guarantees (strips the `title` `schemars` emits,
+  always injects `properties`/`required`) on both a struct and a fieldless
+  input, and `bash_details_deserialize_from_legacy_payload` pins the
+  `#[serde(default)]` back-compat the `ToolDetails::Bash` doc promises
+  (a payload with only command/stdout/stderr loads with the truncation
+  fields defaulting). The reference validated both: it dedicates a whole
+  `google-shared-convert-tools.test.ts` to its own schema post-processing,
+  and its `details?` is optional with JS's implicit missing-field
+  tolerance, so our serde-default + an explicit test is the Rust
+  equivalent (note: the reference doesn't strip `title` because TypeBox
+  emits none; ours is a `schemars`-specific necessity, making the test
+  more warranted). [Nit][Contracts] documented `derive_schema`'s `expect`
+  as a true `schemars`-always-serializes invariant. [Nit][Comments]
+  trimmed the `ToolDetails::Bash` variant doc to the cross-field invariant
+  (tail/cap/spill + legacy `[Output truncated]` fallback), letting the
+  per-field docs carry per-field contract. **[Minor][Contracts] id-typing
+  fork (the key cross-check call):** raw `usize` sub-agent ids on
+  `SpawnedAgent`/`SpawnResult::Started`/`ToolDetails::SubAgentReport`/
+  `TaskKind::Agent` are tied to `events::AgentId::Sub(usize)` only by
+  prose. Chose document-the-invariant over a `SubAgentId` newtype: the
+  reference uses plain primitive ids everywhere (`toolCallId: string`,
+  sub-agent `agent: string` + numeric `step`, no id newtype anywhere in
+  the codebase) and has no in-process `Sub(n)` concept, so a newtype would
+  diverge from it and ripple through the persisted `SubAgentReport`/
+  `TaskKind` on-disk shapes for a finding the report itself rates Low
+  priority. Made `AgentId::Sub`'s doc the authoritative-id anchor and
+  pointed the four `usize` carriers at it ("the `n` from this sub-agent's
+  `AgentId::Sub` id"), so the relationship reads from one place.
+  **[Minor][Comments] `AgentMessage` steady-state rationale:** the
+  reference's `AgentMessage = Message | CustomAgentMessages[...]` is the
+  same forward-compat seam and is live in production (a `bashExecution`
+  custom message, `role: "bashExecution"`, persisted in the transcript
+  and converted to a wire user-message before each LLM call by a filtering
+  transformer), confirming our single-variant-today enum, the
+  disambiguate-by-`role` contract, and `as_wire() -> Option` are all
+  right. So the rationale was kept and only the roadmap-y framing reworded
+  to steady-state, the stray em-dashes/semicolons fixed, and the stale
+  "aj-session migration walker" test comment reworded (no such walker
+  exists post-migration). **Boundary note (punted from the aj-agent-
+  runtime sweep): `SessionState` publicness.** The `sub_agent_usage` field
+  the runtime report flagged is already private inside a private
+  `SessionStateInner`; the type itself was dead public surface (nothing
+  outside `aj-agent` names it; `Agent` holds it as a private field and
+  exposes its own `pub` read accessors). Narrowed `SessionState` and its
+  three `pub` inherent methods (`new`/`turn_counter`/`accumulated_usage`)
+  to `pub(crate)`, matching the reference's `private _state` +
+  read-only-getter encapsulation. No on-disk/wire or public-signature
+  change beyond removing unused surface. `cargo test -p aj-agent` (78, +2)
+  + `-p aj` session tests green, `fmt`/`clippy -p aj-agent --all-targets`
+  clean, `cargo check --workspace` confirms no consumer drift.

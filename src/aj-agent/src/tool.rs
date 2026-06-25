@@ -96,16 +96,14 @@ pub enum ToolDetails {
         /// File content after the edit.
         after: String,
     },
-    /// Command-output rendering for `bash`. `stdout`/`stderr` carry a
-    /// bounded rolling tail; if either stream exceeded the cap the
-    /// implementation spills the full output to a temp file and
-    /// surfaces its path through `full_output_path`. The optional
-    /// `stdout_truncation` / `stderr_truncation` payloads carry
-    /// per-stream truncation summaries (total / output line and byte
-    /// counts, which budget fired, partial-trailing-line flag) that
-    /// renderers use to compose informative markers; absent fields on
-    /// older persisted sessions fall back to the legacy
-    /// `[Output truncated]` marker.
+    /// Command-output rendering for `bash`.
+    ///
+    /// Cross-field invariant: `stdout`/`stderr` carry a bounded rolling
+    /// tail. If either stream exceeded the cap the implementation
+    /// spills the full output to a temp file and surfaces its path
+    /// through `full_output_path`. Absent truncation fields on older
+    /// persisted sessions fall back to the legacy `[Output truncated]`
+    /// marker. The per-field docs carry each payload's contract.
     Bash {
         /// The exact command line executed.
         command: String,
@@ -145,7 +143,7 @@ pub enum ToolDetails {
     /// Sub-agent run report — emitted by the `agent` tool when it
     /// runs as a child agent and returns a final report.
     SubAgentReport {
-        /// Index of the sub-agent that produced this report.
+        /// The `n` from this sub-agent's [`AgentId::Sub`] id.
         agent_id: usize,
         /// Task description supplied by the parent.
         task: String,
@@ -303,12 +301,13 @@ pub struct ToolOutcome {
 /// Carries enough information for callers (currently the `agent`
 /// builtin) to construct a [`ToolDetails::SubAgentReport`] without
 /// looking up the freshly-allocated sub-agent id elsewhere. The
-/// `agent_id` matches the `Sub(_)` index surfaced on the bus through
+/// `agent_id` is the `n` from this child's [`AgentId::Sub`] id, also
+/// surfaced on the bus through
 /// [`crate::events::AgentEvent::SubAgentStart`] /
 /// [`crate::events::AgentEvent::SubAgentEnd`].
 #[derive(Clone, Debug)]
 pub struct SpawnedAgent {
-    /// The sub-agent's id within the current session.
+    /// The `n` from this sub-agent's [`AgentId::Sub`] id.
     pub agent_id: usize,
     /// Final assistant text returned by the sub-agent.
     pub report: String,
@@ -334,7 +333,7 @@ pub enum SpawnResult {
     /// driver; the report arrives later through the task's completion
     /// notice (and `task_output` once terminal).
     Started {
-        /// The sub-agent's id within the current session.
+        /// The `n` from this sub-agent's [`AgentId::Sub`] id.
         agent_id: usize,
         /// Id of the background task driving the run.
         task_id: TaskId,
@@ -381,7 +380,7 @@ pub enum TaskKind {
     },
     /// A background sub-agent run.
     Agent {
-        /// The sub-agent's `Sub(n)` index.
+        /// The `n` from this sub-agent's [`AgentId::Sub`] id.
         agent_id: usize,
         /// Task description supplied by the parent.
         task: String,
@@ -790,6 +789,9 @@ pub fn derive_schema<T: JsonSchema>() -> Value {
         schema.insert("required".to_string(), json!([]));
     }
 
+    // NOTE: The value comes from `schemars`, which always produces a
+    // serializable schema object, so this `expect` is a true invariant
+    // rather than an unchecked panic on a tool author's `Input` type.
     serde_json::to_value(&schema).expect("invalid schema object")
 }
 
@@ -800,9 +802,8 @@ mod tests {
     #[test]
     fn tool_details_round_trips_each_variant() {
         // The persistence listener writes ToolDetails alongside each
-        // tool_result message; this locks the {"kind": "..."} framing
-        // so the `aj-session` migration walker can rely on
-        // a stable shape.
+        // tool_result message. This locks the {"kind": "..."} framing
+        // that the session log and the TUI renderer both depend on.
         let cases = [
             ToolDetails::Text {
                 summary: "hi".into(),
@@ -848,5 +849,79 @@ mod tests {
     #[test]
     fn execution_mode_default_is_parallel() {
         assert_eq!(ExecutionMode::default(), ExecutionMode::Parallel);
+    }
+
+    #[test]
+    fn derive_schema_shapes_input_for_the_wire() {
+        // `derive_schema` faces the provider function-parameter format:
+        // it must drop the `title` schemars emits (noise to the model)
+        // and guarantee `properties`/`required` exist so the object
+        // validates for both Anthropic and OpenAI. A `schemars` upgrade
+        // reintroducing `title`, or a fieldless input producing neither
+        // key, would silently break tool calls.
+        #[derive(JsonSchema)]
+        #[allow(dead_code)]
+        struct WithFields {
+            command: String,
+            count: u32,
+        }
+
+        // A fieldless input is the corner case: schemars can emit an
+        // object schema with no `properties`/`required` at all.
+        #[derive(JsonSchema)]
+        struct Fieldless {}
+
+        for schema in [derive_schema::<WithFields>(), derive_schema::<Fieldless>()] {
+            assert!(
+                schema.get("title").is_none(),
+                "title not stripped: {schema}"
+            );
+            assert!(
+                schema.get("properties").is_some(),
+                "properties missing: {schema}"
+            );
+            assert!(
+                schema.get("required").is_some(),
+                "required missing: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_details_deserialize_from_legacy_payload() {
+        // Sessions captured before the truncation fields existed wrote
+        // a `Bash` payload with only command/stdout/stderr. The
+        // `#[serde(default)]` attributes must let such a line load with
+        // the new fields defaulting cleanly, so old logs keep rendering
+        // (falling back to the legacy `[Output truncated]` marker).
+        let legacy = json!({
+            "kind": "bash",
+            "command": "ls",
+            "stdout": "out",
+            "stderr": "",
+        });
+
+        let details: ToolDetails = serde_json::from_value(legacy).expect("legacy bash parses");
+        match details {
+            ToolDetails::Bash {
+                command,
+                exit_code,
+                truncated,
+                full_output_path,
+                stdout_truncation,
+                stderr_truncation,
+                task_id,
+                ..
+            } => {
+                assert_eq!(command, "ls");
+                assert_eq!(exit_code, None);
+                assert!(!truncated);
+                assert_eq!(full_output_path, None);
+                assert!(stdout_truncation.is_none());
+                assert!(stderr_truncation.is_none());
+                assert_eq!(task_id, None);
+            }
+            other => panic!("expected Bash, got {other:?}"),
+        }
     }
 }

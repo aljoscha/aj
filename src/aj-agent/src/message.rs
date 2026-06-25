@@ -1,17 +1,17 @@
 //! Agent-level transcript entries.
 //!
-//! `AgentMessage` is the unit of the agent's in-memory transcript and
-//! the input shape for `Agent::seed_session` / output shape for
-//! `Agent::messages()`. It wraps wire-level [`Message`]s so the
-//! transcript can later be extended with agent-only entries (e.g.
-//! UI-only annotations, tool batches, system prompt anchors) without
-//! breaking the event protocol.
+//! `AgentMessage` is the unit of the agent's in-memory transcript: the
+//! input shape for `Agent::seed_session` and the output shape for
+//! `Agent::messages()`. It wraps wire-level [`Message`]s behind an enum
+//! so the transcript can also hold agent-only entries (UI-only
+//! annotations, tool batches, system-prompt anchors) that are not valid
+//! wire messages, without those leaking into the event protocol.
 //!
-//! Today there is exactly one variant — [`AgentMessageKind::Wire`] —
-//! containing a `Message`. New variants land alongside their use
-//! sites; persistence and projection-to-LLM call sites match
-//! exhaustively on `AgentMessageKind` so any addition forces a
-//! conscious migration.
+//! The enum has a single variant, [`AgentMessageKind::Wire`]. That is
+//! the forward-compat seam: an agent-only entry becomes a new
+//! `AgentMessageKind` variant. Every persistence and projection-to-LLM
+//! call site matches exhaustively on the enum, so adding one forces
+//! each consumer to decide how to handle it.
 
 use aj_models::types::Message;
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// transcript content that isn't a wire message (e.g. compaction
 /// summaries, sub-agent result summaries, UI-only annotations), they
 /// land as additional [`AgentMessageKind`] variants. Disambiguation
-/// stays implicit in the payload shape — each new variant must be
+/// stays implicit in the payload shape. Each new variant must be
 /// distinguishable from `Message` by its own discriminator field
 /// (typically a distinct `role` value), so `untagged` deserialization
 /// can pick the right variant without an outer tag.
@@ -62,12 +62,12 @@ impl AgentMessage {
 /// Variants of an [`AgentMessage`].
 ///
 /// `#[serde(untagged)]` keeps the on-disk shape flat: each variant
-/// writes its own payload directly with no outer discriminator. Today
-/// the only variant is [`AgentMessageKind::Wire`], which serializes as
-/// a bare wire [`Message`] (`{"role": "user", ...}`). When a second
-/// variant is added it must carry its own discriminator inside the
-/// payload so `untagged` deserialization can disambiguate — typically
-/// a `role` value distinct from `user` / `assistant` / `tool_result`.
+/// writes its own payload directly with no outer discriminator. The
+/// only variant is [`AgentMessageKind::Wire`], which serializes as a
+/// bare wire [`Message`] (`{"role": "user", ...}`). A second variant
+/// must carry its own discriminator inside the payload so `untagged`
+/// deserialization can disambiguate, typically a `role` value distinct
+/// from `user` / `assistant` / `tool_result`.
 ///
 /// Backward compatibility: legacy lines written before this format
 /// change carry a stray `"kind": "wire"` field. `Message` has no

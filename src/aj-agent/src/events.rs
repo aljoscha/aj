@@ -82,6 +82,15 @@ pub enum AgentId {
     /// The top-level agent.
     Main,
     /// A sub-agent identified by its assignment index.
+    ///
+    /// This index is the authoritative sub-agent id. The raw `usize`
+    /// agent ids carried on [`crate::tool::SpawnedAgent`],
+    /// [`crate::tool::SpawnResult::Started`],
+    /// [`crate::tool::ToolDetails::SubAgentReport`], and
+    /// [`crate::tool::TaskKind::Agent`] are all "the `n` from a
+    /// `Sub(n)`". They carry the same value, kept as a bare `usize` on
+    /// those types so the persisted shapes stay plain integers. The
+    /// relationship is by convention, not a shared newtype.
     Sub(usize),
 }
 
