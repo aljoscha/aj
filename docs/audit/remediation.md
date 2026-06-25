@@ -1553,7 +1553,7 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   RESIDUAL crate. `cargo test -p aj-agent` (77) + `-p aj` session tests
   green, `fmt`/`clippy -p aj-agent -p aj --all-targets` clean, `cargo
   check --workspace` confirms no consumer drift.
-- 2026-06-25 · RESIDUAL(aj-agent-contracts) · DONE · 60d354f · Tenth
+- 2026-06-25 · RESIDUAL(aj-agent-contracts) · DONE · d60baa4 · Tenth
   per-crate residual sweep (`tool.rs`/`message.rs`/`types.rs` + the
   punted `SessionState` boundary note). Three findings verify-only,
   already retired by themed work: the Major `ToolContext::emit_update`
