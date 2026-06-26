@@ -19,8 +19,8 @@ pub use env::{
 };
 pub use paths::display_path;
 pub use schema::{
-    Config, ConfigDiagnostic, ConfigError, ConfigOption, ConfigSpeed, ConfigThinkingDisplay,
-    ConfigThinkingLevel, ConfigVerbosity, Severity, ValueKind,
+    Config, ConfigDiagnostic, ConfigError, ConfigLayer, ConfigOption, ConfigSpeed,
+    ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity, Severity, ValueKind,
 };
 
 /// Unique temp directory for tests that need real filesystem scratch

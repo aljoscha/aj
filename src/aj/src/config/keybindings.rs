@@ -118,6 +118,17 @@ pub const ACTION_SUBMIT_STEERING: &str = "aj.message.steer";
 /// chord yanks regardless of editor contents.
 pub const ACTION_DEQUEUE: &str = "aj.message.dequeue";
 
+/// Action ID for the "clear the selected project override" chord in
+/// the project settings window.
+///
+/// Bound by default to `ctrl+x`. The project settings window intercepts
+/// it on the main list: when the highlighted row is set by the project
+/// layer, the override is removed and the row reverts to the inherited
+/// user value. Handled inside that window only, so it never interferes
+/// with the row search box (which a plain key would feed). Inert on
+/// already-inherited rows and in the user settings window.
+pub const ACTION_SETTINGS_CLEAR: &str = "aj.settings.clear";
+
 /// Canonical display labels for keyboard chords that are deliberately
 /// fixed terminal conventions rather than rebindable actions.
 ///
@@ -191,6 +202,10 @@ pub fn aj_keybindings() -> KeybindingDefinitions {
         (
             ACTION_DEQUEUE.to_string(),
             K::new("alt+up", "Pull the queued message back into the editor"),
+        ),
+        (
+            ACTION_SETTINGS_CLEAR.to_string(),
+            K::new("ctrl+x", "Clear the selected project override"),
         ),
     ]
 }

@@ -130,6 +130,22 @@ impl Config {
         Ok(Self::get_config_dir()?.join("config.toml"))
     }
 
+    /// Path to the per-project config file `<git-root>/.aj/config.toml`
+    /// for the current working directory, or `None` when not inside a
+    /// git repository.
+    ///
+    /// The project layer is anchored at the git root (like the
+    /// per-project sessions bucket and skill discovery), so every
+    /// working directory within a repo sees the same project config.
+    /// Unlike [`Self::config_file_path`] this neither creates the `.aj`
+    /// directory nor the file. The writer creates the directory on the
+    /// first persist (the config lock's parent-dir bootstrap).
+    pub fn project_config_file_path() -> Option<PathBuf> {
+        let working_directory = env::current_dir().ok()?;
+        let git_root = find_git_root(&working_directory)?;
+        Some(git_root.join(".aj").join("config.toml"))
+    }
+
     pub fn get_dotenv_file_path() -> Result<PathBuf, ConfigError> {
         let aj_dir = Self::get_config_dir()?;
         Ok(aj_dir.join(".env"))

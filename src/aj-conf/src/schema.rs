@@ -2,6 +2,7 @@
 //! the single source of truth, the lenient parser, the typed diagnostics,
 //! and the comment-preserving, lock-guarded writer.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -340,6 +341,19 @@ impl ConfigOption {
     /// without a bespoke parser. Validation (range checks, enum
     /// membership) still runs inside `apply_toml`.
     pub fn apply_str(&self, value: &str, config: &mut Config) -> Result<(), toml::de::Error> {
+        let parsed = self.str_to_value(value)?;
+        self.apply_toml(parsed, config)
+    }
+
+    /// Convert a user-entered string into the [`toml::Value`] this
+    /// option accepts, keyed off [`Self::kind`], without applying it to
+    /// a [`Config`]. This is the shape conversion [`Self::apply_str`]
+    /// performs split out so a caller (e.g. a config layer that stores
+    /// raw values) can keep the parsed value. Shape errors (a
+    /// non-numeric `Number`, a non-bool `Bool`) are returned here;
+    /// semantic validation (range, enum membership) still runs in
+    /// [`Self::apply_toml`].
+    pub fn str_to_value(&self, value: &str) -> Result<toml::Value, toml::de::Error> {
         let parsed = match self.kind {
             ValueKind::Bool => toml::Value::Boolean(value.parse::<bool>().map_err(|_| {
                 <toml::de::Error as serde::de::Error>::custom(format!(
@@ -372,7 +386,7 @@ impl ConfigOption {
             ),
             ValueKind::String | ValueKind::Enum(_) => toml::Value::String(value.to_string()),
         };
-        self.apply_toml(parsed, config)
+        Ok(parsed)
     }
 
     /// Render the field's current value for display.
@@ -463,6 +477,45 @@ fn item_value_repr(item: &Option<toml_edit::Item>) -> Option<String> {
     item.as_ref()
         .and_then(|i| i.as_value())
         .map(|v| v.to_string())
+}
+
+/// Convert a parsed [`toml::Value`] into a `toml_edit::Item` for the
+/// writer. Covers exactly the value shapes [`Config::OPTIONS`] uses
+/// (scalars and string lists); the schema has no datetime- or
+/// table-valued options, so those arms are defensive fallbacks.
+///
+/// Used by the project-layer writer, which serializes the raw values a
+/// layer stores verbatim. Unlike the base-layer `to_toml` path it does
+/// not drop a value that equals the built-in default, because a project
+/// override must be written even when it matches the default (that's
+/// how it shadows a differing user value).
+fn toml_value_to_item(value: &toml::Value) -> toml_edit::Item {
+    use toml_edit::{Array, value as edit_value};
+    match value {
+        toml::Value::String(s) => edit_value(s.as_str()),
+        toml::Value::Integer(i) => edit_value(*i),
+        toml::Value::Float(f) => edit_value(*f),
+        toml::Value::Boolean(b) => edit_value(*b),
+        toml::Value::Datetime(d) => edit_value(d.to_string()),
+        toml::Value::Array(items) => {
+            let mut array = Array::new();
+            for item in items {
+                match item {
+                    toml::Value::String(s) => array.push(s.as_str()),
+                    toml::Value::Integer(i) => array.push(*i),
+                    toml::Value::Float(f) => array.push(*f),
+                    toml::Value::Boolean(b) => array.push(*b),
+                    // Nested arrays / tables / datetimes never appear in
+                    // a schema option's value.
+                    _ => {}
+                }
+            }
+            edit_value(array)
+        }
+        // No table-valued options exist; emit an empty string rather
+        // than panic if one is ever reached.
+        toml::Value::Table(_) => edit_value(""),
+    }
 }
 
 /// Application configuration loaded from `~/.aj/config.toml`.
@@ -963,6 +1016,34 @@ impl Config {
         }
     }
 
+    /// Load the per-project config overlay for the current working
+    /// directory's project: `<git-root>/.aj/config.toml`.
+    ///
+    /// Returns an empty [`ConfigLayer`] (with no diagnostics) when the
+    /// process is outside a git repository or the file is absent.
+    /// Otherwise the layer records exactly the keys the file set, so it
+    /// can be overlaid onto the user [`Config`] via
+    /// [`ConfigLayer::overlay_onto`]. Diagnostics follow the same
+    /// leniency as [`Self::load`].
+    pub fn load_project() -> (ConfigLayer, Vec<ConfigDiagnostic>) {
+        let Some(path) = Self::project_config_file_path() else {
+            return (ConfigLayer::default(), Vec::new());
+        };
+        if !path.exists() {
+            return (ConfigLayer::default(), Vec::new());
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => parse_layer(&content, &path),
+            Err(e) => (
+                ConfigLayer::default(),
+                vec![ConfigDiagnostic::Unreadable {
+                    path,
+                    error: e.to_string(),
+                }],
+            ),
+        }
+    }
+
     /// Persist the options this process changed to
     /// `~/.aj/config.toml`, merging them onto whatever is currently on
     /// disk so a concurrent writer isn't clobbered.
@@ -1101,6 +1182,198 @@ fn suggest_key(unknown: &str) -> Option<&'static str> {
         .filter(|(_, d)| *d <= max_distance)
         .min_by_key(|(_, d)| *d)
         .map(|(k, _)| k)
+}
+
+// ---------------------------------------------------------------------------
+// Config layering (per-project overlay)
+// ---------------------------------------------------------------------------
+
+/// A config-file overlay expressed as the raw, validated values for the
+/// keys its file set, keyed by [`ConfigOption::name`].
+///
+/// The base config layer (the user's `~/.aj/config.toml`) is a plain
+/// [`Config`]. A project's `<git-root>/.aj/config.toml` is loaded as one
+/// of these and overlaid on top via [`Self::overlay_onto`]. We track
+/// per-key presence (a key is set iff it's in `values`) rather than
+/// inferring it from the value, because a project must be able to
+/// override a user value even when the project's value equals the
+/// built-in default. The default-dropping base writer can't express
+/// that, but writing the stored value verbatim can.
+///
+/// Storing raw [`toml::Value`]s (rather than a parsed [`Config`] plus a
+/// presence set) keeps the writer trivial: each present value
+/// round-trips back to the file as-is, and overlaying reuses
+/// [`ConfigOption::apply_toml`].
+#[derive(Debug, Clone, Default)]
+pub struct ConfigLayer {
+    /// Validated values for the keys this layer sets, keyed by option
+    /// name. Membership is presence. A `BTreeMap` so the writer and
+    /// diagnostics iterate in a deterministic key order.
+    values: BTreeMap<&'static str, toml::Value>,
+}
+
+impl ConfigLayer {
+    /// Whether this layer sets `key`. Unknown keys are never set.
+    pub fn is_set(&self, key: &str) -> bool {
+        Config::option(key).is_some_and(|o| self.values.contains_key(o.name))
+    }
+
+    /// The option names this layer sets, in deterministic order.
+    pub fn set_keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.values.keys().copied()
+    }
+
+    /// Whether this layer sets no keys at all.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Overlay this layer's set keys onto `base`, producing the
+    /// effective [`Config`] a running session reads from. Keys this
+    /// layer doesn't set fall through to `base` unchanged.
+    pub fn overlay_onto(&self, base: &Config) -> Config {
+        let mut merged = base.clone();
+        for (name, value) in &self.values {
+            if let Some(option) = Config::option(name) {
+                // The value was validated when it entered the layer
+                // (parse time or `set_str`), so re-applying it can't
+                // fail. Ignore the result defensively rather than
+                // unwrap.
+                let _ = option.apply_toml(value.clone(), &mut merged);
+            }
+        }
+        merged
+    }
+
+    /// Set `key` to a value parsed from the user-entered string,
+    /// marking it present in this layer. Validates via the option's
+    /// [`ConfigOption::apply_toml`], so an out-of-range or unknown-enum
+    /// value is rejected and the layer is left unchanged.
+    pub fn set_str(&mut self, key: &str, value: &str) -> Result<(), toml::de::Error> {
+        let option = Config::option(key).ok_or_else(|| {
+            <toml::de::Error as serde::de::Error>::custom(format!("unknown config key `{key}`"))
+        })?;
+        let parsed = option.str_to_value(value)?;
+        // Validate against a scratch config so a bad value never lands
+        // in the layer.
+        option.apply_toml(parsed.clone(), &mut Config::default())?;
+        self.values.insert(option.name, parsed);
+        Ok(())
+    }
+
+    /// Remove `key` from this layer, so a read falls through to the
+    /// layer below it again. No-op for an unknown or unset key.
+    pub fn clear(&mut self, key: &str) {
+        if let Some(option) = Config::option(key) {
+            self.values.remove(option.name);
+        }
+    }
+
+    /// Persist this layer to `path`, writing the keys it sets and
+    /// removing the keys it no longer sets relative to `baseline`.
+    ///
+    /// `baseline` is this layer as it was before the caller's edit, so
+    /// (like [`Config::persist_changed`]) only the keys that actually
+    /// changed are touched and a concurrent writer's unrelated keys are
+    /// preserved. The whole read-modify-write runs under the same
+    /// cross-process [`ConfigLock`], round-trips through `toml_edit`
+    /// (preserving comments and key order), and refuses to clobber an
+    /// existing file that isn't valid TOML.
+    pub fn persist(&self, baseline: &ConfigLayer, path: &Path) -> Result<(), ConfigError> {
+        let _lock = ConfigLock::acquire(path)?;
+
+        let existing = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(ConfigError::Io(e)),
+        };
+
+        let mut doc = existing
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| ConfigError::Update(e.to_string()))?;
+
+        self.apply_changed_into_document(baseline, &mut doc);
+
+        fs::write(path, doc.to_string())?;
+        Ok(())
+    }
+
+    /// Apply into `doc` only the keys whose presence-or-value differs
+    /// between `self` and `baseline`. A now-set (or changed) key is
+    /// written verbatim via [`toml_value_to_item`]; a now-unset key is
+    /// removed. Every untouched key is left exactly as it appears in
+    /// `doc`, which is what keeps a concurrent writer's edits.
+    fn apply_changed_into_document(
+        &self,
+        baseline: &ConfigLayer,
+        doc: &mut toml_edit::DocumentMut,
+    ) {
+        for option in Config::OPTIONS {
+            let new_value = self.values.get(option.name);
+            if new_value == baseline.values.get(option.name) {
+                continue;
+            }
+            match new_value {
+                Some(value) => doc[option.name] = toml_value_to_item(value),
+                None => {
+                    doc.remove(option.name);
+                }
+            }
+        }
+    }
+}
+
+/// Parse a project `config.toml` content string into a [`ConfigLayer`]
+/// plus diagnostics, recording exactly the keys the file set. Shares
+/// the per-field leniency of [`parse_config`]: a key with an invalid
+/// value is dropped (and reported) without becoming present, and an
+/// unknown key is reported, while the rest of the file is honored. A
+/// whole-file TOML syntax error yields an empty layer plus
+/// [`ConfigDiagnostic::ParseFailed`].
+fn parse_layer(content: &str, path: &Path) -> (ConfigLayer, Vec<ConfigDiagnostic>) {
+    let table = match content.parse::<toml::Table>() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                ConfigLayer::default(),
+                vec![ConfigDiagnostic::ParseFailed {
+                    path: path.to_path_buf(),
+                    error: e.to_string(),
+                }],
+            );
+        }
+    };
+
+    let mut layer = ConfigLayer::default();
+    let mut diagnostics = Vec::new();
+    let mut scratch = Config::default();
+
+    for (key, value) in table {
+        match Config::option(&key) {
+            Some(option) => {
+                // Validate before recording so an invalid value is not
+                // marked present (it would otherwise shadow the user
+                // layer with a value we couldn't apply).
+                match option.apply_toml(value.clone(), &mut scratch) {
+                    Ok(()) => {
+                        layer.values.insert(option.name, value);
+                    }
+                    Err(e) => diagnostics.push(ConfigDiagnostic::InvalidValue {
+                        path: path.to_path_buf(),
+                        key,
+                        error: e.to_string(),
+                    }),
+                }
+            }
+            None => diagnostics.push(ConfigDiagnostic::UnknownKey {
+                path: path.to_path_buf(),
+                suggestion: suggest_key(&key),
+                key,
+            }),
+        }
+    }
+
+    (layer, diagnostics)
 }
 
 // ---------------------------------------------------------------------------
@@ -2064,6 +2337,107 @@ image_block = true
 
         // Nothing to steal once it's gone.
         assert!(!try_steal_stale_lock(&lock_dir, Duration::from_secs(0)));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn layer_overlay_overrides_base_per_key() {
+        let mut base = Config::default();
+        base.theme = Some("dark".to_string());
+        base.thinking = Some(ConfigThinkingLevel::Low);
+
+        let (layer, diag) = parse_layer("theme = \"light\"\n", Path::new("/p/.aj/config.toml"));
+        assert!(diag.is_empty(), "got: {diag:?}");
+
+        let effective = layer.overlay_onto(&base);
+        // The set key wins.
+        assert_eq!(effective.theme.as_deref(), Some("light"));
+        // The unset key falls through to the base.
+        assert_eq!(effective.thinking, Some(ConfigThinkingLevel::Low));
+    }
+
+    #[test]
+    fn layer_overrides_even_with_a_default_valued_value() {
+        // The user turned auto_compact off; the project forces it back
+        // on. `true` is the built-in default, so the default-dropping
+        // base writer couldn't express this, but a layer can.
+        let mut base = Config::default();
+        base.auto_compact = false;
+
+        let mut layer = ConfigLayer::default();
+        layer.set_str("auto_compact", "true").expect("set");
+        assert!(layer.is_set("auto_compact"));
+
+        let effective = layer.overlay_onto(&base);
+        assert!(effective.auto_compact);
+    }
+
+    #[test]
+    fn layer_set_str_rejects_invalid_value() {
+        let mut layer = ConfigLayer::default();
+        assert!(layer.set_str("compact_threshold", "2.0").is_err());
+        assert!(!layer.is_set("compact_threshold"));
+        assert!(layer.set_str("nonexistent", "x").is_err());
+    }
+
+    #[test]
+    fn layer_clear_falls_through_to_base() {
+        let mut base = Config::default();
+        base.theme = Some("dark".to_string());
+
+        let mut layer = ConfigLayer::default();
+        layer.set_str("theme", "light").expect("set");
+        assert_eq!(layer.overlay_onto(&base).theme.as_deref(), Some("light"));
+
+        layer.clear("theme");
+        assert!(!layer.is_set("theme"));
+        assert_eq!(layer.overlay_onto(&base).theme.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn layer_persist_round_trips_present_keys() {
+        let dir = crate::test_temp_dir("layer-persist");
+        let path = dir.join("config.toml");
+
+        let mut layer = ConfigLayer::default();
+        layer.set_str("auto_compact", "true").expect("set");
+        layer.set_str("theme", "light").expect("set");
+        layer
+            .persist(&ConfigLayer::default(), &path)
+            .expect("persist");
+
+        let (reloaded, diag) = parse_layer(&fs::read_to_string(&path).unwrap(), &path);
+        assert!(diag.is_empty(), "got: {diag:?}");
+        // A default-valued override is still written (and reloads as set).
+        assert!(reloaded.is_set("auto_compact"));
+        assert!(reloaded.is_set("theme"));
+        assert!(reloaded.overlay_onto(&Config::default()).auto_compact);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn layer_persist_removes_cleared_keys_and_keeps_comments() {
+        let dir = crate::test_temp_dir("layer-persist-clear");
+        let path = dir.join("config.toml");
+        // The comment decorates the key we keep, so removing the other
+        // key must not disturb it.
+        fs::write(
+            &path,
+            "theme = \"light\"\n# keep this\nauto_compact = false\n",
+        )
+        .unwrap();
+
+        let (baseline, _) = parse_layer(&fs::read_to_string(&path).unwrap(), &path);
+        let mut updated = baseline.clone();
+        updated.clear("theme");
+        updated.persist(&baseline, &path).expect("persist");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# keep this"), "got: {written:?}");
+        assert!(written.contains("auto_compact"), "got: {written:?}");
+        assert!(!written.contains("theme"), "got: {written:?}");
 
         fs::remove_dir_all(&dir).ok();
     }

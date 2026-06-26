@@ -159,6 +159,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenSettings,
     },
     Command {
+        name: "project-settings",
+        title: "project settings",
+        category: "aj",
+        description: "Open the per-project settings window (layered over user settings).",
+        action_id: None,
+        action: CommandAction::OpenProjectSettings,
+    },
+    Command {
         name: "skills",
         title: "skills",
         category: "aj",
@@ -268,6 +276,11 @@ pub enum CommandAction {
     /// Open the settings window overlay. Changes apply (and persist
     /// to `config.toml`) as the user makes them; `Esc` closes.
     OpenSettings,
+    /// Open the per-project settings window overlay. Edits the
+    /// project's `<git-root>/.aj/config.toml`, layered over the user
+    /// settings; rows the project doesn't set show the inherited user
+    /// value muted, and a key clears a project override. `Esc` closes.
+    OpenProjectSettings,
     /// Open the skills window overlay listing every discovered skill.
     /// Toggles persist to the `disabled_skills` config option as the
     /// user makes them; `Esc` closes.

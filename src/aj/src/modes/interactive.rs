@@ -26,6 +26,7 @@ pub mod shutdown;
 pub(crate) mod test_support;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,8 +35,8 @@ use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
 use aj_conf::{
-    AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity,
-    Severity, SystemPromptSource, display_path,
+    AgentEnv, Config, ConfigLayer, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel,
+    ConfigVerbosity, Severity, SystemPromptSource, display_path,
 };
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
@@ -88,9 +89,10 @@ use crate::modes::interactive::components::session_selector::{
     OutcomeHandle as SessionOutcomeHandle, SessionSelectorComponent, SessionSelectorOutcome,
 };
 use crate::modes::interactive::components::settings_window::{
-    ChangesHandle as SettingsChangesHandle, CorrectionsHandle as SettingsCorrectionsHandle,
-    MODEL_SETTING_ID, OutcomeHandle as SettingsOutcomeHandle, SettingsCurrentValues,
-    SettingsSubmenu, SettingsWindowComponent, SettingsWindowOutcome, UNSET_VALUE,
+    ChangesHandle as SettingsChangesHandle, ClearsHandle as SettingsClearsHandle,
+    CorrectionsHandle as SettingsCorrectionsHandle, MODEL_SETTING_ID,
+    OutcomeHandle as SettingsOutcomeHandle, SettingsCurrentValues, SettingsSubmenu,
+    SettingsWindowComponent, SettingsWindowOutcome, UNSET_VALUE,
 };
 use crate::modes::interactive::components::skills_window::{
     ChangesHandle as SkillsChangesHandle, OutcomeHandle as SkillsOutcomeHandle, SkillRow,
@@ -225,7 +227,18 @@ impl InteractiveMode {
         // and pumped onto the chat scrollback once the TUI is built;
         // we can't `eprintln!` them like print mode does because the
         // alternate screen will eat them.
-        let (config, config_diagnostics) = Config::load();
+        // Load the user config (`~/.aj/config.toml`), then the
+        // per-project overlay (`<git-root>/.aj/config.toml`). The
+        // running session reads `config`, the effective merge of the
+        // two; the settings windows edit one layer each. CLI flags and
+        // env vars still overlay on top of `config` downstream, so
+        // precedence stays CLI > env > project > user > defaults.
+        let (user_config, user_diagnostics) = Config::load();
+        let (project_layer, project_diagnostics) = Config::load_project();
+        let project_config_path = Config::project_config_file_path();
+        let mut config_diagnostics = user_diagnostics;
+        config_diagnostics.extend(project_diagnostics);
+        let config = project_layer.overlay_onto(&user_config);
 
         // Install the `tui.*` + `aj.*` keybindings registry before any
         // component looks up a key. Currently no user overrides are
@@ -536,12 +549,23 @@ impl InteractiveMode {
 
         // Shared, mutable view of the on-disk config. Selector
         // outcomes (model / thinking / the settings window) mutate
-        // this and persist it via `persist_config` so a choice made
+        // this and persist it via `persist_user` so a choice made
         // in the TUI survives a restart. Held behind a std mutex
         // because the write is a quick synchronous read-merge-write
         // (`Config::persist_changed`) done off the guard, never awaited
         // across.
         let config = Arc::new(std::sync::Mutex::new(config));
+
+        // The editable config layers behind the effective `config`
+        // above. The settings windows mutate one layer, recompute the
+        // effective config into `config`, and persist that layer's
+        // file. Held behind a std mutex like `config` (the write is a
+        // quick synchronous read-merge-write done off the guard).
+        let config_layers = Arc::new(std::sync::Mutex::new(ConfigLayers {
+            user: user_config,
+            project: project_layer,
+            project_path: project_config_path,
+        }));
 
         // Everything with process lifetime moves into the shell;
         // session worlds are rebuilt around it on every new-session /
@@ -550,6 +574,7 @@ impl InteractiveMode {
             tui,
             theme,
             config,
+            config_layers,
             auth,
             model_catalog,
             run_config,
@@ -709,6 +734,70 @@ impl InteractiveMode {
     }
 }
 
+/// The two config-file layers the interactive shell can edit.
+///
+/// The effective [`Config`] a running session reads is held separately
+/// in `Shell::config` (so the many readers stay unchanged); whenever a
+/// layer changes, [`Self::effective`] recomputes it. The user layer is
+/// the base; the project layer overlays it (see [`ConfigLayer`]).
+struct ConfigLayers {
+    /// `~/.aj/config.toml` (defaults plus the user's overrides).
+    user: Config,
+    /// `<git-root>/.aj/config.toml` overlay; empty outside a project.
+    project: ConfigLayer,
+    /// Where the project layer persists, or `None` when the process is
+    /// not inside a git repository (project editing is unavailable).
+    project_path: Option<PathBuf>,
+}
+
+impl ConfigLayers {
+    /// The effective config: the project layer overlaid on the user
+    /// layer. This is what `Shell::config` should be set to.
+    fn effective(&self) -> Config {
+        self.project.overlay_onto(&self.user)
+    }
+}
+
+/// Which configuration layer a settings edit persists to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigTarget {
+    /// The user's `~/.aj/config.toml`.
+    User,
+    /// The current project's `<git-root>/.aj/config.toml`.
+    Project,
+}
+
+/// How a confirmed setting change persists, beyond the effect it
+/// always has on the running session.
+///
+/// The `/thinking` and `/model` overlays are session-scoped
+/// ([`PersistAction::None`]); the settings windows persist to a config
+/// layer as the new default for future sessions. A project clear
+/// removes the key so the value falls back to the user (or built-in)
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistAction {
+    /// Session only: leave every config file untouched.
+    None,
+    /// Write the value to the user `config.toml`.
+    User,
+    /// Write the value to the project `config.toml` as an override.
+    ProjectSet,
+    /// Remove the key(s) from the project `config.toml`.
+    ProjectClear,
+}
+
+impl PersistAction {
+    /// The persist action for a value change (not a clear) made in a
+    /// settings window targeting `target`.
+    fn set_for(target: ConfigTarget) -> Self {
+        match target {
+            ConfigTarget::User => PersistAction::User,
+            ConfigTarget::Project => PersistAction::ProjectSet,
+        }
+    }
+}
+
 /// Process-lifetime state: everything that survives a session
 /// switch. Session worlds ([`SessionWorld`]) are rebuilt around the
 /// shell on every new-session or resume.
@@ -722,6 +811,10 @@ struct Shell {
     /// Shared, mutable view of the on-disk config; selector
     /// outcomes mutate and persist it.
     config: Arc<std::sync::Mutex<Config>>,
+    /// The editable config layers (user + project) behind the
+    /// effective [`Self::config`]. The settings windows edit one layer
+    /// and recompute `config`; persistence targets that layer's file.
+    config_layers: Arc<std::sync::Mutex<ConfigLayers>>,
     /// Credential store backing API-key resolution and login.
     auth: AuthStorage,
     /// Model catalog shared by the model selector and the
@@ -1517,6 +1610,7 @@ async fn run_session(
                                 Arc::clone(&shell.model_catalog),
                                 Arc::clone(&shell.run_config),
                                 &shell.config,
+                                &shell.config_layers,
                                 &shell.render_settings,
                                 world,
                                 &shell.conversation_persistence,
@@ -1558,6 +1652,7 @@ async fn run_session(
                                 Arc::clone(&shell.model_catalog),
                                 Arc::clone(&shell.run_config),
                                 &shell.config,
+                                &shell.config_layers,
                                 &shell.render_settings,
                                 world,
                                 &shell.conversation_persistence,
@@ -1599,6 +1694,7 @@ async fn run_session(
                                 Arc::clone(&shell.model_catalog),
                                 Arc::clone(&shell.run_config),
                                 &shell.config,
+                                &shell.config_layers,
                                 &shell.render_settings,
                                 world,
                                 &shell.conversation_persistence,
@@ -1634,6 +1730,7 @@ async fn run_session(
                                 &shell.auth,
                                 Arc::clone(&shell.run_config),
                                 Arc::clone(&shell.config),
+                                &shell.config_layers,
                                 &shell.model_catalog,
                                 world,
                                 &shell.theme,
@@ -1738,6 +1835,7 @@ async fn run_session(
                                             Arc::clone(&shell.model_catalog),
                                             Arc::clone(&shell.run_config),
                                             &shell.config,
+                                            &shell.config_layers,
                                             &shell.render_settings,
                                             world,
                                             &shell.conversation_persistence,
@@ -2321,16 +2419,20 @@ enum OpenSelector {
         handle: OverlayHandle,
         outcome: UsageStatusOutcomeHandle,
     },
-    /// Settings window. Stays open across changes: the
-    /// host drains `changes` after every input event, applying and
-    /// persisting each entry (and pushing a display fix through
-    /// `corrections` when an apply fails); `outcome` only ever
-    /// reports the close.
+    /// Settings window (user or project). Stays open across changes:
+    /// the host drains `changes` after every input event, applying and
+    /// persisting each entry to the layer named by `target` (and
+    /// pushing a display fix through `corrections` when an apply
+    /// fails). `clears` carries per-key clears from the project window
+    /// (the inherited value the live effect reverts to); empty for the
+    /// user window. `outcome` only ever reports the close.
     Settings {
         handle: OverlayHandle,
         outcome: SettingsOutcomeHandle,
         changes: SettingsChangesHandle,
         corrections: SettingsCorrectionsHandle,
+        clears: SettingsClearsHandle,
+        target: ConfigTarget,
     },
     /// Skills window. Stays open across changes: the host
     /// drains `changes` after every input event, persisting each
@@ -2561,6 +2663,66 @@ fn resolve_theme_name(configured: Option<&str>) -> &str {
     configured.unwrap_or("light")
 }
 
+/// Resolve the `(provider, id)` model key a config layer names,
+/// applying the same fallbacks startup uses when a field is unset:
+/// [`DEFAULT_PROVIDER_ID`] for the provider, and the first catalog
+/// entry for that provider as the model.
+///
+/// Used to fill the model row of the project settings window, where the
+/// value shown is a config-layer view rather than the live run config.
+///
+/// [`DEFAULT_PROVIDER_ID`]: crate::model::DEFAULT_PROVIDER_ID
+fn config_model_key(config: &Config, catalog: &[ModelInfo]) -> (String, String) {
+    let provider = config
+        .model_api
+        .clone()
+        .unwrap_or_else(|| crate::model::DEFAULT_PROVIDER_ID.to_string());
+    let id = config.model_name.clone().unwrap_or_else(|| {
+        catalog
+            .iter()
+            .find(|m| m.provider == provider)
+            .map(|m| m.id.clone())
+            .unwrap_or_default()
+    });
+    (provider, id)
+}
+
+/// Project a [`Config`] onto the [`SettingsCurrentValues`] the settings
+/// window renders, using the same canonical vocabulary the window's
+/// apply path parses.
+///
+/// This is the config-layer (not live run-config) view, used by the
+/// project settings window: `current` comes from the effective config
+/// and `inherited` from the user config, so a project-set row shows
+/// exactly what the file pins and a clear knows what to revert to.
+fn settings_values_from_config(config: &Config, catalog: &[ModelInfo]) -> SettingsCurrentValues {
+    SettingsCurrentValues {
+        model_key: config_model_key(config, catalog),
+        model_url: config.model_url.clone(),
+        thinking: config
+            .thinking
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "off".to_string()),
+        thinking_display: config.thinking_display.map(|d| d.to_string()),
+        speed: config
+            .speed
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "standard".to_string()),
+        verbosity: config.verbosity.map(|v| v.to_string()),
+        theme: resolve_theme_name(config.theme.as_deref()).to_string(),
+        disabled_tools: config.disabled_tools.clone(),
+        disabled_skills: config.disabled_skills.clone(),
+        hide_thinking_block: config.hide_thinking_block,
+        image_auto_resize: config.image_auto_resize,
+        image_show_in_terminal: config.image_show_in_terminal,
+        image_block: config.image_block,
+        syntax_highlighting: config.syntax_highlighting,
+        auto_compact: config.auto_compact,
+        compact_threshold: config.compact_threshold.to_string(),
+        compact_keep_recent: config.compact_keep_recent.to_string(),
+    }
+}
+
 /// The live theme file watcher: the notify guard plus the receiver
 /// the main loop's reload arm polls. Bundled to a single owner so a
 /// runtime theme switch (the settings window) can re-point the
@@ -2778,19 +2940,105 @@ fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> Config
 /// A save failure returns a user-facing notice (to append to the
 /// action's confirmation) rather than an error. Returns `None` on
 /// success.
-fn persist_config(
-    config: &Arc<std::sync::Mutex<Config>>,
+/// Apply `mutate` to the user config layer, refresh the effective
+/// config the running session reads, and persist the user
+/// `~/.aj/config.toml`.
+///
+/// Selector outcomes change live agent/TUI state for the running
+/// session; this mirrors the change into the user layer so it survives
+/// a restart. The in-memory mutation and the effective-config refresh
+/// happen first, under the layers lock, which is dropped before the
+/// file write so persistence never holds the lock across I/O. The
+/// write goes through [`Config::persist_changed`] (a comment-preserving
+/// per-key merge under a cross-process lock). A save failure returns a
+/// user-facing notice rather than an error.
+fn persist_user(
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
+    effective: &Arc<std::sync::Mutex<Config>>,
     mutate: impl FnOnce(&mut Config),
 ) -> Option<String> {
     let (baseline, updated) = {
-        let mut cfg = config.lock().expect("config mutex poisoned");
-        let baseline = cfg.clone();
-        mutate(&mut cfg);
-        (baseline, cfg.clone())
+        let mut l = layers.lock().expect("config layers mutex poisoned");
+        let baseline = l.user.clone();
+        mutate(&mut l.user);
+        let updated = l.user.clone();
+        *effective.lock().expect("config mutex poisoned") = l.effective();
+        (baseline, updated)
     };
     match updated.persist_changed(&baseline) {
         Ok(()) => None,
         Err(err) => Some(format!("(couldn't save to config.toml: {err})")),
+    }
+}
+
+/// Set or clear keys in the project config layer, refresh the effective
+/// config, and persist the project `<git-root>/.aj/config.toml`.
+///
+/// Each entry is `(option_name, Some(value) to set | None to remove)`.
+/// A set stores an explicit override (presence-tracked), so even a
+/// value equal to the built-in default is written and shadows the user
+/// layer. Mirrors [`persist_user`]'s discipline: the in-memory edit and
+/// effective-config refresh run under the layers lock, the file write
+/// off it. Reports the first set error (or a save failure) as a notice;
+/// returns a notice too when there is no project (not in a git repo).
+fn persist_project(
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
+    effective: &Arc<std::sync::Mutex<Config>>,
+    entries: &[(&str, Option<&str>)],
+) -> Option<String> {
+    let (baseline, updated, path, set_error) = {
+        let mut l = layers.lock().expect("config layers mutex poisoned");
+        let Some(path) = l.project_path.clone() else {
+            return Some("(no project config: not inside a git repository)".to_string());
+        };
+        let baseline = l.project.clone();
+        let mut set_error = None;
+        for (key, value) in entries {
+            match value {
+                Some(v) => {
+                    if let Err(e) = l.project.set_str(key, v) {
+                        set_error = Some(format!("(couldn't set {key}: {e})"));
+                        break;
+                    }
+                }
+                None => l.project.clear(key),
+            }
+        }
+        let updated = l.project.clone();
+        *effective.lock().expect("config mutex poisoned") = l.effective();
+        (baseline, updated, path, set_error)
+    };
+    if let Some(err) = set_error {
+        return Some(err);
+    }
+    match updated.persist(&baseline, &path) {
+        Ok(()) => None,
+        Err(err) => Some(format!("(couldn't save to project config.toml: {err})")),
+    }
+}
+
+/// Persist a single-key settings change to the layer named by
+/// `persist`, the common case for the settings-window arms.
+///
+/// `value` is the canonical string to write (`None` means "unset this
+/// key"). For the user layer the change is applied via `user_mutate`
+/// (which keeps the existing default-dropping semantics: a value equal
+/// to the default removes the key). For the project layer the value is
+/// stored verbatim as an override, or removed when `value` is `None`
+/// (an explicit "unset"/"default" choice) or `persist` is a clear.
+fn persist_setting(
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
+    effective: &Arc<std::sync::Mutex<Config>>,
+    persist: PersistAction,
+    key: &str,
+    value: Option<&str>,
+    user_mutate: impl FnOnce(&mut Config),
+) -> Option<String> {
+    match persist {
+        PersistAction::None => None,
+        PersistAction::User => persist_user(layers, effective, user_mutate),
+        PersistAction::ProjectSet => persist_project(layers, effective, &[(key, value)]),
+        PersistAction::ProjectClear => persist_project(layers, effective, &[(key, None)]),
     }
 }
 
@@ -2805,7 +3053,7 @@ fn persist_config(
 /// stay at least `COMMANDS.len() + 3`. The content-heavy overlays
 /// (session switcher, prompt history) size their rows dynamically
 /// instead. See [`large_overlay_inner_rows`].
-const PALETTE_OVERLAY_INNER_ROWS: usize = 20;
+const PALETTE_OVERLAY_INNER_ROWS: usize = 21;
 
 /// Sizing/anchor used by the command palette and the compact pickers
 /// (model / thinking / help). Centered, fills ~75% of the terminal
@@ -3045,6 +3293,31 @@ fn subtitle_settings_window(child: &dyn aj_tui::component::Component) -> String 
     }
 }
 
+/// Per-frame subtitle for the project settings window. Like
+/// [`subtitle_settings_window`], but the main-list hint also advertises
+/// the clear-override chord (project rows can revert to the user
+/// value).
+fn subtitle_project_settings_window(child: &dyn aj_tui::component::Component) -> String {
+    let submenu = child
+        .as_any()
+        .downcast_ref::<SettingsWindowComponent>()
+        .map(SettingsWindowComponent::active_submenu)
+        .unwrap_or(SettingsSubmenu::None);
+    if submenu != SettingsSubmenu::None {
+        // Inside a submenu the keys mean the same as the user window.
+        return subtitle_settings_window(child);
+    }
+    let confirm = aj_tui::keybindings::format_action_shortcut("tui.select.confirm")
+        .unwrap_or_else(|| "Enter".to_string());
+    let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
+        .unwrap_or_else(|| "Esc".to_string());
+    let clear = aj_tui::keybindings::format_action_shortcut(
+        crate::config::keybindings::ACTION_SETTINGS_CLEAR,
+    )
+    .unwrap_or_else(|| "Ctrl+X".to_string());
+    format!("{confirm} to change  \u{2022}  {clear} clear override  \u{2022}  {cancel} to close")
+}
+
 /// Subtitle for the OAuth login dialog overlay: how to submit a
 /// pasted code and how to cancel, with key labels resolved from the
 /// keybindings manager.
@@ -3141,6 +3414,7 @@ async fn handle_command(
     model_catalog: Arc<Vec<aj_models::registry::ModelInfo>>,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
+    config_layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     render_settings: &RenderSettings,
     world: &SessionWorld,
     conversation_persistence: &ConversationPersistence,
@@ -3631,6 +3905,7 @@ async fn handle_command(
             let outcome = inner.outcome_handle();
             let changes = inner.changes_handle();
             let corrections = inner.corrections_handle();
+            let clears = inner.clears_handle();
             let initial_inner_rows = large_overlay_inner_rows(usize::from(tui.terminal().rows()));
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Settings",
@@ -3647,6 +3922,83 @@ async fn handle_command(
                     outcome,
                     changes,
                     corrections,
+                    clears,
+                    target: ConfigTarget::User,
+                }),
+                notice: None,
+            }
+        }
+        CommandAction::OpenProjectSettings => {
+            // Per-project settings (`<git-root>/.aj/config.toml`),
+            // layered over the user config. Unavailable outside a git
+            // repository.
+            let (effective_config, user_config, set_keys) = {
+                let l = config_layers.lock().expect("config layers mutex poisoned");
+                if l.project_path.is_none() {
+                    return CommandOutcome::Continue {
+                        selector: None,
+                        notice: Some(
+                            "Project settings need a git repository (no .git found above the \
+                             working directory)."
+                                .to_string(),
+                        ),
+                    };
+                }
+                let effective = config.lock().expect("config mutex poisoned").clone();
+                let set_keys: std::collections::BTreeSet<String> =
+                    l.project.set_keys().map(String::from).collect();
+                (effective, l.user.clone(), set_keys)
+            };
+            // `current` shows the effective value per row (the project
+            // value where the project sets one, otherwise the inherited
+            // user value); `inherited` is the user-only value a clear
+            // reverts to. Both are config-layer views (not the live run
+            // config), so a project-set row reflects exactly what the
+            // file pins.
+            let current = settings_values_from_config(&effective_config, &model_catalog);
+            let inherited = settings_values_from_config(&user_config, &model_catalog);
+            let tool_names: Vec<String> = get_builtin_tools(&BuiltinToolOptions::default())
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            let skill_names: Vec<String> = aj_conf::skills::discover_skills(&[])
+                .0
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect();
+            let inner = SettingsWindowComponent::new_project(
+                settings_list_theme(theme),
+                select_list_theme(theme),
+                (*model_catalog).clone(),
+                Theme::available(),
+                tool_names,
+                skill_names,
+                current,
+                inherited,
+                set_keys,
+            );
+            let outcome = inner.outcome_handle();
+            let changes = inner.changes_handle();
+            let corrections = inner.corrections_handle();
+            let clears = inner.clears_handle();
+            let initial_inner_rows = large_overlay_inner_rows(usize::from(tui.terminal().rows()));
+            let window = aj_tui::components::overlay_window::OverlayWindow::new(
+                "Project Settings",
+                Box::new(inner),
+                crate::config::theme::overlay_window_theme(theme),
+                initial_inner_rows,
+            )
+            .with_dynamic_height(tui.handle(), large_overlay_inner_rows)
+            .with_dynamic_subtitle(subtitle_project_settings_window);
+            let handle = tui.show_overlay(Box::new(window), large_overlay_options());
+            CommandOutcome::Continue {
+                selector: Some(OpenSelector::Settings {
+                    handle,
+                    outcome,
+                    changes,
+                    corrections,
+                    clears,
+                    target: ConfigTarget::Project,
                 }),
                 notice: None,
             }
@@ -3729,33 +4081,18 @@ async fn handle_command(
 /// Whether a confirmed model or thinking pick should also become the
 /// default for new sessions.
 ///
-/// Both scopes change the running session: they stage into the
-/// loop-side run config and record on the session log, so the choice
-/// survives a resume of this same session. They differ only in
-/// whether the choice is also written to `config.toml`. The settings
-/// menu sets the default for new sessions, the `/model` and
-/// `/thinking` overlay commands change just the current session.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingScope {
-    /// Change only the running session. Leaves `config.toml` and the
-    /// in-memory default [`Config`] untouched.
-    SessionOnly,
-    /// Change the running session and persist the choice to
-    /// `config.toml` as the default for new sessions.
-    SessionAndDefault,
-}
-
 /// Apply a confirmed thinking pick to the main agent: stage into the
 /// run config, record on the session log's user thread, and refresh
-/// footer + border. With [`SettingScope::SessionAndDefault`] the
-/// choice is also persisted to `config.toml` as the default for new
+/// footer + border. The `persist` action additionally writes (or
+/// clears) the choice in a config layer as the default for new
 /// sessions. Returns the user-facing notice.
 async fn confirm_thinking_for_main(
     tui: &mut Tui,
     level: Option<ThinkingConfig>,
-    scope: SettingScope,
+    persist: PersistAction,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     world: &mut SessionWorld,
     theme: &ThemeHandle,
 ) -> String {
@@ -3799,15 +4136,17 @@ async fn confirm_thinking_for_main(
             .map(|err| format!("(couldn't record in session log: {err})"))
     };
     // Persist as the new default only when the change should outlive
-    // this session (the settings menu). The `/thinking` overlay
+    // this session (the settings windows). The `/thinking` overlay
     // command is session-scoped: it relies on the session-log record
     // above to survive a resume and leaves the default untouched.
-    let save_note = match scope {
-        SettingScope::SessionAndDefault => persist_config(config, |c| {
-            c.thinking = Some(config_thinking_level(level.as_ref()));
-        }),
-        SettingScope::SessionOnly => None,
-    };
+    let save_note = persist_setting(
+        layers,
+        config,
+        persist,
+        "thinking",
+        Some(thinking_level_name(&level)),
+        |c| c.thinking = Some(config_thinking_level(level.as_ref())),
+    );
     let mut notice = format!("Thinking effort set to {name}.");
     for note in [save_note, log_note].into_iter().flatten() {
         notice.push(' ');
@@ -3904,17 +4243,17 @@ async fn confirm_thinking_for_sub(
 
 /// Apply a confirmed model pick to the main agent: rebuild the
 /// bundle, stage into the run config, record on the session log's
-/// user thread, and refresh the footer. With
-/// [`SettingScope::SessionAndDefault`] the choice is also persisted to
-/// `config.toml` as the default for new sessions. Returns the
-/// user-facing notice.
+/// user thread, and refresh the footer. The `persist` action
+/// additionally writes (or clears) the choice in a config layer as the
+/// default for new sessions. Returns the user-facing notice.
 async fn confirm_model_for_main(
     tui: &mut Tui,
     info: ModelInfo,
-    scope: SettingScope,
+    persist: PersistAction,
     auth: &AuthStorage,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     world: &mut SessionWorld,
 ) -> String {
     // Construct a fresh provider handle from the picked catalog
@@ -3977,19 +4316,30 @@ async fn confirm_model_for_main(
             };
             // Persist the model choice (provider + id) as the new
             // default only when the change should outlive this session
-            // (the settings menu). The `/model` overlay command is
+            // (the settings windows). The `/model` overlay command is
             // session-scoped: it relies on the session-log record above
             // to survive a resume and leaves the default untouched.
             // `model_url` is intentionally left untouched: it's a
             // user-supplied endpoint override, not part of "which
             // model", and pinning the catalog's base URL into it would
             // freeze out future `models.json` updates.
-            let save_note = match scope {
-                SettingScope::SessionAndDefault => persist_config(config, |c| {
+            let save_note = match persist {
+                PersistAction::None => None,
+                PersistAction::User => persist_user(layers, config, |c| {
                     c.model_api = Some(info.provider.clone());
                     c.model_name = Some(info.id.clone());
                 }),
-                SettingScope::SessionOnly => None,
+                PersistAction::ProjectSet => persist_project(
+                    layers,
+                    config,
+                    &[
+                        ("model_api", Some(info.provider.as_str())),
+                        ("model_name", Some(info.id.as_str())),
+                    ],
+                ),
+                PersistAction::ProjectClear => {
+                    persist_project(layers, config, &[("model_api", None), ("model_name", None)])
+                }
             };
             let mut notice = format!(
                 "Model set to {} ({}/{}).",
@@ -4125,11 +4475,13 @@ async fn confirm_model_for_sub(
 #[allow(clippy::too_many_arguments)]
 async fn apply_setting_change(
     tui: &mut Tui,
+    persist: PersistAction,
     id: &str,
     value: &str,
     auth: &AuthStorage,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     model_catalog: &[ModelInfo],
     world: &mut SessionWorld,
     theme: &ThemeHandle,
@@ -4154,16 +4506,9 @@ async fn apply_setting_change(
                 push_correction(corrections, tui, MODEL_SETTING_ID, active);
                 return Some(format!("Unknown model {value}."));
             };
-            let notice = confirm_model_for_main(
-                tui,
-                info,
-                SettingScope::SessionAndDefault,
-                auth,
-                run_config,
-                config,
-                world,
-            )
-            .await;
+            let notice =
+                confirm_model_for_main(tui, info, persist, auth, run_config, config, layers, world)
+                    .await;
             // `confirm_model_for_main` reports a rebuild failure only
             // as notice text; compare the staged key instead so the
             // row reverts to the model that's actually active.
@@ -4179,13 +4524,7 @@ async fn apply_setting_change(
         "thinking" => match thinking_config_from_name(value) {
             Some(level) => Some(
                 confirm_thinking_for_main(
-                    tui,
-                    level,
-                    SettingScope::SessionAndDefault,
-                    run_config,
-                    config,
-                    world,
-                    theme,
+                    tui, level, persist, run_config, config, layers, world, theme,
                 )
                 .await,
             ),
@@ -4204,7 +4543,17 @@ async fn apply_setting_change(
                 let mut cfg = run_config.lock().expect("run config mutex poisoned");
                 crate::model::apply_thinking_display(&mut cfg.stream_options, display);
             }
-            let save_note = persist_config(config, |c| c.thinking_display = display);
+            // The "default" sentinel means "leave it unset", which for
+            // either layer is a key removal.
+            let value_opt = (value != UNSET_VALUE).then_some(value);
+            let save_note = persist_setting(
+                layers,
+                config,
+                persist,
+                "thinking_display",
+                value_opt,
+                |c| c.thinking_display = display,
+            );
             Some(join_notice(
                 format!("Thinking display set to {value}. Takes effect next turn."),
                 save_note,
@@ -4212,8 +4561,18 @@ async fn apply_setting_change(
         }
         "speed" => match speed_from_name(value) {
             Some(speed) => Some(
-                confirm_speed_for_main(tui, speed, auth, run_config, config, world, corrections)
-                    .await,
+                confirm_speed_for_main(
+                    tui,
+                    speed,
+                    persist,
+                    auth,
+                    run_config,
+                    config,
+                    layers,
+                    world,
+                    corrections,
+                )
+                .await,
             ),
             None => Some(format!("Unknown speed {value:?}.")),
         },
@@ -4226,7 +4585,10 @@ async fn apply_setting_change(
                     Err(err) => return Some(format!("Can't set verbosity: {err}")),
                 }
             };
-            Some(confirm_verbosity_for_main(verbosity, run_config, config, world).await)
+            Some(
+                confirm_verbosity_for_main(verbosity, persist, run_config, config, layers, world)
+                    .await,
+            )
         }
         "theme" => {
             // Strict load so a broken user theme surfaces instead of
@@ -4239,7 +4601,10 @@ async fn apply_setting_change(
                     // Re-point the hot-reload watcher at the newly
                     // configured theme's file.
                     *theme_watch = ThemeWatch::install(value);
-                    let save_note = persist_config(config, |c| c.theme = Some(value.to_string()));
+                    let save_note =
+                        persist_setting(layers, config, persist, "theme", Some(value), |c| {
+                            c.theme = Some(value.to_string())
+                        });
                     Some(join_notice(format!("Theme set to {value}."), save_note))
                 }
                 Err(err) => {
@@ -4256,7 +4621,14 @@ async fn apply_setting_change(
             let hide = value == "true";
             render_settings.set_hide_thinking_block(hide);
             tui.request_render();
-            let save_note = persist_config(config, |c| c.hide_thinking_block = hide);
+            let save_note = persist_setting(
+                layers,
+                config,
+                persist,
+                "hide_thinking_block",
+                Some(value),
+                |c| c.hide_thinking_block = hide,
+            );
             Some(join_notice(
                 format!(
                     "Thinking blocks {}.",
@@ -4269,7 +4641,14 @@ async fn apply_setting_change(
             let show = value == "true";
             render_settings.set_show_image_in_terminal(show);
             tui.request_render();
-            let save_note = persist_config(config, |c| c.image_show_in_terminal = show);
+            let save_note = persist_setting(
+                layers,
+                config,
+                persist,
+                "image_show_in_terminal",
+                Some(value),
+                |c| c.image_show_in_terminal = show,
+            );
             Some(join_notice(
                 format!("image_show_in_terminal set to {show}."),
                 save_note,
@@ -4277,7 +4656,14 @@ async fn apply_setting_change(
         }
         "image_auto_resize" => {
             let on = value == "true";
-            let save_note = persist_config(config, |c| c.image_auto_resize = on);
+            let save_note = persist_setting(
+                layers,
+                config,
+                persist,
+                "image_auto_resize",
+                Some(value),
+                |c| c.image_auto_resize = on,
+            );
             Some(join_notice(
                 format!("image_auto_resize set to {on}. Takes effect for new sessions."),
                 save_note,
@@ -4285,7 +4671,10 @@ async fn apply_setting_change(
         }
         "image_block" => {
             let on = value == "true";
-            let save_note = persist_config(config, |c| c.image_block = on);
+            let save_note =
+                persist_setting(layers, config, persist, "image_block", Some(value), |c| {
+                    c.image_block = on
+                });
             Some(join_notice(
                 format!("image_block set to {on}. Takes effect for new sessions."),
                 save_note,
@@ -4293,7 +4682,14 @@ async fn apply_setting_change(
         }
         "syntax_highlighting" => {
             let on = value == "true";
-            let save_note = persist_config(config, |c| c.syntax_highlighting = on);
+            let save_note = persist_setting(
+                layers,
+                config,
+                persist,
+                "syntax_highlighting",
+                Some(value),
+                |c| c.syntax_highlighting = on,
+            );
             Some(join_notice(
                 format!("syntax_highlighting set to {on}. Takes effect for new sessions."),
                 save_note,
@@ -4301,7 +4697,10 @@ async fn apply_setting_change(
         }
         "model_url" => {
             let url = (!value.is_empty()).then(|| value.to_string());
-            let save_note = persist_config(config, |c| c.model_url = url.clone());
+            let save_note =
+                persist_setting(layers, config, persist, "model_url", url.as_deref(), |c| {
+                    c.model_url = url.clone()
+                });
             let what = match &url {
                 Some(u) => format!("set to {u}"),
                 None => "unset".to_string(),
@@ -4318,7 +4717,14 @@ async fn apply_setting_change(
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect();
-            let save_note = persist_config(config, |c| c.disabled_tools = tools.clone());
+            let save_note = persist_setting(
+                layers,
+                config,
+                persist,
+                "disabled_tools",
+                Some(value),
+                |c| c.disabled_tools = tools.clone(),
+            );
             let what = if tools.is_empty() {
                 "cleared".to_string()
             } else {
@@ -4336,7 +4742,14 @@ async fn apply_setting_change(
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect();
-            let save_note = persist_config(config, |c| c.disabled_skills = skills.clone());
+            let save_note = persist_setting(
+                layers,
+                config,
+                persist,
+                "disabled_skills",
+                Some(value),
+                |c| c.disabled_skills = skills.clone(),
+            );
             let what = if skills.is_empty() {
                 "cleared".to_string()
             } else {
@@ -4349,32 +4762,27 @@ async fn apply_setting_change(
         }
         other => {
             // Any other key that's a real schema option is a plain
-            // config-backed value with no extra side effects: the
+            // config-backed value with no extra live side effects: the
             // options that need a provider rebuild, theme reload, or a
             // live render update are intercepted by the arms above.
             // Route the rest through the schema so a freshly-added
-            // option is editable from the settings window without a
-            // bespoke arm here. `apply_str` validates the value; the
-            // `every_option_applies_its_string_value` guard in `aj-conf`
-            // keeps every option round-trippable through this path.
+            // option is editable from the settings windows without a
+            // bespoke arm here.
             let Some(option) = Config::option(other) else {
                 return Some(format!("Unknown setting {other:?}."));
             };
-            let (baseline, updated) = {
-                let mut cfg = config.lock().expect("config mutex poisoned");
-                let baseline = cfg.clone();
-                if let Err(err) = option.apply_str(value, &mut cfg) {
-                    // Reject without half-applying: restore the pre-edit
-                    // config and report why.
-                    *cfg = baseline;
+            // Validate before touching any layer so a bad value is
+            // rejected with a clean message. A project clear carries an
+            // already-valid inherited value, so it needs no check.
+            if persist != PersistAction::ProjectClear {
+                if let Err(err) = option.apply_str(value, &mut Config::default()) {
                     return Some(format!("Can't set {other}: {err}"));
                 }
-                (baseline, cfg.clone())
-            };
-            let save_note = match updated.persist_changed(&baseline) {
-                Ok(()) => None,
-                Err(err) => Some(format!("(couldn't save to config.toml: {err})")),
-            };
+            }
+            let save_note = persist_setting(layers, config, persist, other, Some(value), |c| {
+                // Pre-validated above, so this can't fail.
+                let _ = option.apply_str(value, c);
+            });
             Some(join_notice(format!("{other} set to {value}."), save_note))
         }
     }
@@ -4390,8 +4798,10 @@ async fn apply_setting_change(
 /// without changing what's sent. Returns the user-facing notice.
 async fn confirm_verbosity_for_main(
     verbosity: Option<ConfigVerbosity>,
+    persist: PersistAction,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     world: &SessionWorld,
 ) -> String {
     let unified = verbosity.map(crate::model::config_verbosity_to_unified);
@@ -4407,7 +4817,17 @@ async fn confirm_verbosity_for_main(
             .err()
             .map(|err| format!("(couldn't record in session log: {err})"))
     };
-    let save_note = persist_config(config, |c| c.verbosity = verbosity);
+    // The verbosity name (`low`/`medium`/`high`) is the canonical
+    // config value; `None` means "unset" and removes the key.
+    let verbosity_str = verbosity.map(|v| v.to_string());
+    let save_note = persist_setting(
+        layers,
+        config,
+        persist,
+        "verbosity",
+        verbosity_str.as_deref(),
+        |c| c.verbosity = verbosity,
+    );
     let mut notice = format!("Output verbosity set to {name}. Takes effect next turn.");
     for note in [save_note, log_note].into_iter().flatten() {
         notice.push(' ');
@@ -4427,9 +4847,11 @@ async fn confirm_verbosity_for_main(
 async fn confirm_speed_for_main(
     tui: &mut Tui,
     speed: Option<Speed>,
+    persist: PersistAction,
     auth: &AuthStorage,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     world: &mut SessionWorld,
     corrections: &SettingsCorrectionsHandle,
 ) -> String {
@@ -4483,9 +4905,11 @@ async fn confirm_speed_for_main(
                     .err()
                     .map(|err| format!("(couldn't record in session log: {err})"))
             };
-            // "standard" persists as key removal: it's the default,
-            // and `speed_from_name` maps it to `None` on the wire.
-            let save_note = persist_config(config, |c| {
+            // "standard" persists to the user layer as key removal:
+            // it's the default, and `speed_from_name` maps it to `None`
+            // on the wire. The project layer stores it explicitly so it
+            // can override a user `fast`.
+            let save_note = persist_setting(layers, config, persist, "speed", Some(name), |c| {
                 c.speed = match speed {
                     None | Some(Speed::Standard) => None,
                     Some(Speed::Fast) => Some(ConfigSpeed::Fast),
@@ -4553,6 +4977,7 @@ async fn handle_selector_outcome(
     auth: &AuthStorage,
     run_config: Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: Arc<std::sync::Mutex<Config>>,
+    config_layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     model_catalog: &[ModelInfo],
     world: &mut SessionWorld,
     theme: &ThemeHandle,
@@ -4572,9 +4997,10 @@ async fn handle_selector_outcome(
                             confirm_thinking_for_main(
                                 tui,
                                 level,
-                                SettingScope::SessionOnly,
+                                PersistAction::None,
                                 &run_config,
                                 &config,
+                                config_layers,
                                 world,
                                 theme,
                             )
@@ -4602,10 +5028,11 @@ async fn handle_selector_outcome(
                             confirm_model_for_main(
                                 tui,
                                 info,
-                                SettingScope::SessionOnly,
+                                PersistAction::None,
                                 auth,
                                 &run_config,
                                 &config,
+                                config_layers,
                                 world,
                             )
                             .await
@@ -4759,21 +5186,52 @@ async fn handle_selector_outcome(
             outcome,
             changes,
             corrections,
+            clears,
+            target,
             ..
         } => {
             // Apply queued changes first. The window stays open while
-            // the user keeps editing, so changes and the eventual close
-            // arrive through separate channels.
+            // the user keeps editing, so changes, clears, and the
+            // eventual close arrive through separate channels.
             let drained: Vec<(String, String)> =
                 std::mem::take(&mut *changes.lock().expect("settings changes poisoned"));
             for (id, value) in drained {
                 let notice = apply_setting_change(
                     tui,
+                    PersistAction::set_for(*target),
                     &id,
                     &value,
                     auth,
                     &run_config,
                     &config,
+                    config_layers,
+                    model_catalog,
+                    world,
+                    theme,
+                    theme_watch,
+                    render_settings,
+                    corrections,
+                )
+                .await;
+                if let Some(text) = notice {
+                    world.pump.handle(tui, &notice_event(&text));
+                }
+            }
+            // Clears (project window only) carry the inherited value so
+            // the live effect reverts to it; persistence removes the
+            // project override.
+            let cleared: Vec<(String, String)> =
+                std::mem::take(&mut *clears.lock().expect("settings clears poisoned"));
+            for (id, inherited_value) in cleared {
+                let notice = apply_setting_change(
+                    tui,
+                    PersistAction::ProjectClear,
+                    &id,
+                    &inherited_value,
+                    auth,
+                    &run_config,
+                    &config,
+                    config_layers,
                     model_catalog,
                     world,
                     theme,
@@ -4802,7 +5260,7 @@ async fn handle_selector_outcome(
                 std::mem::take(&mut *changes.lock().expect("skills changes poisoned"));
             for (name, value) in drained {
                 let disable = value == "disabled";
-                let save_note = persist_config(&config, |c| {
+                let save_note = persist_user(config_layers, &config, |c| {
                     if disable {
                         if !c.disabled_skills.contains(&name) {
                             c.disabled_skills.push(name.clone());
@@ -5487,6 +5945,18 @@ mod tests {
         (world, run_config, tui)
     }
 
+    /// An empty config-layers handle for tests that drive
+    /// [`handle_selector_outcome`] for session-scoped overlays (which
+    /// never persist). The user layer is the default config, no project
+    /// layer, and no project path.
+    fn empty_layers() -> Arc<std::sync::Mutex<ConfigLayers>> {
+        Arc::new(std::sync::Mutex::new(ConfigLayers {
+            user: Config::default(),
+            project: ConfigLayer::default(),
+            project_path: None,
+        }))
+    }
+
     /// Mount a thinking selector with a pre-filled outcome and poll
     /// it through [`handle_selector_outcome`] for `target`, against
     /// the given default `config` so a test can assert whether the
@@ -5516,6 +5986,7 @@ mod tests {
             &auth,
             Arc::clone(run_config),
             Arc::clone(config),
+            &empty_layers(),
             &[],
             world,
             &theme,
@@ -5743,6 +6214,7 @@ mod tests {
             &auth,
             Arc::clone(&run_config),
             Arc::new(std::sync::Mutex::new(Config::default())),
+            &empty_layers(),
             &[],
             &mut world,
             &theme,
@@ -5840,6 +6312,7 @@ mod tests {
             &auth,
             Arc::clone(&run_config),
             Arc::clone(&config),
+            &empty_layers(),
             &[],
             &mut world,
             &theme,
@@ -5928,6 +6401,7 @@ mod tests {
             &auth,
             Arc::clone(&run_config),
             Arc::new(std::sync::Mutex::new(Config::default())),
+            &empty_layers(),
             &[],
             &mut world,
             &theme,
@@ -6053,6 +6527,7 @@ mod tests {
             &auth,
             Arc::clone(&run_config),
             Arc::new(std::sync::Mutex::new(Config::default())),
+            &empty_layers(),
             &[],
             &mut world,
             &theme,
@@ -6114,6 +6589,7 @@ mod tests {
             &auth,
             Arc::clone(&run_config),
             Arc::new(std::sync::Mutex::new(Config::default())),
+            &empty_layers(),
             &[],
             &mut world,
             &theme,
@@ -6615,6 +7091,11 @@ mod run_loop_tests {
         let shell = Shell {
             tui,
             theme,
+            config_layers: Arc::new(std::sync::Mutex::new(ConfigLayers {
+                user: config.clone(),
+                project: ConfigLayer::default(),
+                project_path: None,
+            })),
             config: Arc::new(std::sync::Mutex::new(config)),
             auth: AuthStorage::new(auth_dir.path().join("auth.json")),
             model_catalog: Arc::new(Vec::new()),

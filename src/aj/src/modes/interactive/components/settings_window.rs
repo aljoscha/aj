@@ -21,7 +21,7 @@
 //! and commits a `provider/id` string.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -87,6 +87,12 @@ pub type ChangesHandle = Arc<Mutex<Vec<(String, String)>>>;
 /// when an apply fails, drained by the component at render time.
 pub type CorrectionsHandle = Arc<Mutex<Vec<(String, String)>>>;
 
+/// Queue of `(row id, inherited value)` clears from the project
+/// settings window: the user asked to drop a project override, and the
+/// inherited value is what the live effect should revert to. Empty for
+/// the user settings window.
+pub type ClearsHandle = Arc<Mutex<Vec<(String, String)>>>;
+
 /// Live values the window opens with. Strings use the same canonical
 /// vocabulary the host's apply path parses (`thinking_level_name`,
 /// `speed_name`, theme names from the loader catalog).
@@ -124,14 +130,27 @@ pub struct SettingsCurrentValues {
 
 /// The overlay's top-level component. See the module docs for the
 /// changes/corrections flow.
+///
+/// In project mode (the per-project settings window) two extra
+/// behaviors apply: rows the project layer doesn't set are rendered as
+/// inherited (muted, with a ` (user)` marker), and the clear chord
+/// drops a project override via [`Self::clears`].
 pub struct SettingsWindowComponent {
     inner: SettingsList,
     outcome: OutcomeHandle,
     changes: ChangesHandle,
     corrections: CorrectionsHandle,
+    clears: ClearsHandle,
+    /// Whether this is the per-project window (enables the clear chord
+    /// and inherited-row rendering).
+    project_mode: bool,
+    /// Per-row value a clear reverts to (the inherited user value),
+    /// keyed by row id. Empty in the user window.
+    inherited: HashMap<String, String>,
 }
 
 impl SettingsWindowComponent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         settings_theme: SettingsListTheme,
         select_theme: SelectListTheme,
@@ -150,10 +169,72 @@ impl SettingsWindowComponent {
             skill_names,
             &current,
         );
+        Self::build(items, settings_theme, false, HashMap::new())
+    }
 
+    /// Build the per-project settings window.
+    ///
+    /// `current` is the effective (project-over-user) snapshot, so a
+    /// project-set row shows the project's value and an unset row shows
+    /// the inherited user value. `inherited` is the user-only snapshot,
+    /// the value a clear reverts to. `set_keys` are the option names the
+    /// project layer currently sets, used to mark the unset rows as
+    /// inherited (muted) and to gate the clear chord.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_project(
+        settings_theme: SettingsListTheme,
+        select_theme: SelectListTheme,
+        model_catalog: Vec<ModelInfo>,
+        theme_names: Vec<String>,
+        tool_names: Vec<String>,
+        skill_names: Vec<String>,
+        current: SettingsCurrentValues,
+        inherited: SettingsCurrentValues,
+        set_keys: BTreeSet<String>,
+    ) -> Self {
+        let mut items = build_items(
+            &settings_theme,
+            &select_theme,
+            model_catalog.clone(),
+            theme_names.clone(),
+            tool_names.clone(),
+            skill_names.clone(),
+            &current,
+        );
+        // Reuse the same row mapping to derive each row's inherited
+        // value, so the clear path commits exactly what the row would
+        // display once reverted.
+        let inherited_map: HashMap<String, String> = build_items(
+            &settings_theme,
+            &select_theme,
+            model_catalog,
+            theme_names,
+            tool_names,
+            skill_names,
+            &inherited,
+        )
+        .into_iter()
+        .map(|item| (item.id, item.current_value))
+        .collect();
+        // Rows the project doesn't set render as inherited.
+        for item in &mut items {
+            item.inherited = !row_is_project_set(&item.id, &set_keys);
+        }
+        Self::build(items, settings_theme, true, inherited_map)
+    }
+
+    /// Shared construction: wire the list's change/cancel callbacks to
+    /// the component's queues and stash the project-mode state.
+    fn build(
+        items: Vec<SettingItem>,
+        settings_theme: SettingsListTheme,
+        project_mode: bool,
+        inherited: HashMap<String, String>,
+    ) -> Self {
         let outcome: OutcomeHandle = Arc::new(Mutex::new(None));
         let changes: ChangesHandle = Arc::new(Mutex::new(Vec::new()));
         let corrections: CorrectionsHandle = Arc::new(Mutex::new(Vec::new()));
+        let clears: ClearsHandle = Arc::new(Mutex::new(Vec::new()));
 
         let changes_for_cb = Arc::clone(&changes);
         let outcome_for_cb = Arc::clone(&outcome);
@@ -183,6 +264,9 @@ impl SettingsWindowComponent {
             outcome,
             changes,
             corrections,
+            clears,
+            project_mode,
+            inherited,
         }
     }
 
@@ -202,6 +286,12 @@ impl SettingsWindowComponent {
     /// display fixes into.
     pub fn corrections_handle(&self) -> CorrectionsHandle {
         Arc::clone(&self.corrections)
+    }
+
+    /// Hand the host a clone of the clears queue to drain after each
+    /// input event. Only ever populated in project mode.
+    pub fn clears_handle(&self) -> ClearsHandle {
+        Arc::clone(&self.clears)
     }
 
     /// Which submenu kind is currently open, for border key-hints.
@@ -233,6 +323,32 @@ impl Component for SettingsWindowComponent {
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
+        // In project mode, the clear chord on the main list drops the
+        // selected row's project override. Intercepted before the list
+        // sees it (so it never reaches the row search box), and only
+        // when no submenu is open and the row is actually project-set.
+        if self.project_mode && !self.inner.has_active_submenu() {
+            let is_clear = {
+                let kb = keybindings::get();
+                kb.matches(event, crate::config::keybindings::ACTION_SETTINGS_CLEAR)
+            };
+            if is_clear {
+                if let Some(id) = self.inner.selected_id().map(str::to_string) {
+                    if !self.inner.is_inherited(&id) {
+                        let inherited_value = self.inherited.get(&id).cloned().unwrap_or_default();
+                        self.clears
+                            .lock()
+                            .expect("clears mutex poisoned")
+                            .push((id.clone(), inherited_value.clone()));
+                        // Optimistically revert the row to the inherited
+                        // value, shown muted, until the host confirms.
+                        self.inner.update_value(&id, inherited_value);
+                        self.inner.set_inherited(&id, true);
+                    }
+                }
+                return true;
+            }
+        }
         self.inner.handle_input(event)
     }
 
@@ -476,6 +592,17 @@ fn enum_values(option: &ConfigOption) -> Vec<String> {
     match option.kind {
         ValueKind::Enum(variants) => variants.iter().map(|v| v.to_string()).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Whether the project layer sets the option(s) a settings row stands
+/// for. The model row folds `model_api` + `model_name`, so it's set
+/// when either is.
+fn row_is_project_set(row_id: &str, set_keys: &BTreeSet<String>) -> bool {
+    if row_id == MODEL_SETTING_ID {
+        set_keys.contains("model_api") || set_keys.contains("model_name")
+    } else {
+        set_keys.contains(row_id)
     }
 }
 
@@ -1062,5 +1189,47 @@ mod tests {
             .push(("speed".to_string(), "fast".to_string()));
         component.render(80);
         assert_eq!(component.inner.value_of("speed"), Some("fast"));
+    }
+
+    /// A project-mode window with the given keys marked as project-set.
+    /// `current` shows the effective values; `inherited` carries the
+    /// user values a clear reverts to (here, distinct from `current`
+    /// for `theme` so the clear is observable).
+    fn project_test_component(set_keys: &[&str]) -> SettingsWindowComponent {
+        let mut current = current_values();
+        current.theme = "dark".to_string();
+        let mut inherited = current_values();
+        inherited.theme = "light".to_string();
+        let set: BTreeSet<String> = set_keys.iter().map(|s| s.to_string()).collect();
+        SettingsWindowComponent::new_project(
+            identity_settings_theme(),
+            identity_select_theme(),
+            vec![
+                make_model("anthropic", "claude-sonnet-4", "Claude Sonnet 4"),
+                make_model("openai", "gpt-5", "GPT-5"),
+            ],
+            vec!["dark".to_string(), "light".to_string()],
+            vec!["bash".to_string(), "read_file".to_string()],
+            vec!["tmux-subagents".to_string()],
+            current,
+            inherited,
+            set,
+        )
+    }
+
+    #[test]
+    fn project_rows_are_inherited_unless_the_project_sets_them() {
+        let component = project_test_component(&["theme"]);
+        // The project sets `theme`, so its row is not inherited.
+        assert!(!component.inner.is_inherited("theme"));
+        // Everything else falls through to the user layer.
+        assert!(component.inner.is_inherited("hide_thinking_block"));
+        assert!(component.inner.is_inherited("auto_compact"));
+    }
+
+    #[test]
+    fn project_model_row_set_when_either_model_key_is_set() {
+        let component = project_test_component(&["model_name"]);
+        assert!(!component.inner.is_inherited(MODEL_SETTING_ID));
     }
 }

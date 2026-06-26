@@ -89,7 +89,14 @@ pub async fn run(args: Args) -> Result<()> {
     // works in a freshly-cloned checkout without any setup; any
     // diagnostics (parse errors, unknown keys) are surfaced to
     // stderr so the user knows their file wasn't applied as-is.
-    let (config, config_diagnostics) = Config::load();
+    //
+    // The per-project overlay (`<git-root>/.aj/config.toml`) layers on
+    // top of the user config, matching interactive mode, so print mode
+    // honors project defaults too.
+    let (user_config, mut config_diagnostics) = Config::load();
+    let (project_layer, project_diagnostics) = Config::load_project();
+    config_diagnostics.extend(project_diagnostics);
+    let config = project_layer.overlay_onto(&user_config);
     for d in &config_diagnostics {
         let label = match d.severity() {
             Severity::Warning => "warning",

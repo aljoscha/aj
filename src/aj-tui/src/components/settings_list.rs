@@ -52,6 +52,12 @@ pub struct SettingItem {
     pub description: Option<String>,
     /// Current value shown on the right.
     pub current_value: String,
+    /// When true, the value is inherited from a lower configuration
+    /// layer rather than set on this one. The list renders it in the
+    /// muted hint style with a trailing ` (user)` marker. Editing the
+    /// row clears this flag (a value is now set at this layer). Always
+    /// false for lists that don't layer.
+    pub inherited: bool,
     /// If provided, Enter/Space cycles through these values.
     pub values: Option<Vec<String>>,
     /// If provided, Enter/Space opens a submenu built by this factory
@@ -73,6 +79,7 @@ impl SettingItem {
             label: label.into(),
             description: None,
             current_value: current_value.into(),
+            inherited: false,
             values: Some(values),
             submenu: None,
         }
@@ -90,6 +97,7 @@ impl SettingItem {
             label: label.into(),
             description: None,
             current_value: current_value.into(),
+            inherited: false,
             values: None,
             submenu: Some(submenu),
         }
@@ -214,6 +222,23 @@ impl SettingsList {
         }
     }
 
+    /// Set whether an item's value is inherited (see
+    /// [`SettingItem::inherited`]). No-op if the id is unknown.
+    pub fn set_inherited(&mut self, id: &str, inherited: bool) {
+        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
+            item.inherited = inherited;
+        }
+    }
+
+    /// Whether the item with the given id currently shows an inherited
+    /// value. False for an unknown id.
+    pub fn is_inherited(&self, id: &str) -> bool {
+        self.items
+            .iter()
+            .find(|i| i.id == id)
+            .is_some_and(|i| i.inherited)
+    }
+
     /// Index of the currently-selected visible item, or `None` if
     /// there are no visible items.
     pub fn selected_index(&self) -> Option<usize> {
@@ -268,6 +293,9 @@ impl SettingsList {
             None => 0,
         };
         item.current_value = values[next].clone();
+        // The user picked a value at this layer, so it's no longer
+        // inherited.
+        item.inherited = false;
         let id = item.id.clone();
         let new_value = item.current_value.clone();
         (self.on_change)(&id, &new_value);
@@ -320,6 +348,8 @@ impl SettingsList {
         if let SubmenuResult::Selected(new_value) = outcome {
             if let Some(item) = self.items.get_mut(active.parent_item_index) {
                 item.current_value = new_value.clone();
+                // A value was committed at this layer; no longer inherited.
+                item.inherited = false;
                 let id = item.id.clone();
                 (self.on_change)(&id, &new_value);
             }
@@ -480,9 +510,20 @@ impl Component for SettingsList {
             let separator = "  ";
             let used = prefix_width + label_width + visible_width(separator);
             let value_max = width.saturating_sub(used).saturating_sub(2);
-            let value_trunc =
-                truncate_to_width(&expand_tabs(&item.current_value), value_max, "", false);
-            let value_text = (self.theme.value)(&value_trunc, is_selected);
+            // An inherited value is shown muted with a ` (user)` marker
+            // so it reads as "falls through to the lower layer" rather
+            // than "set here".
+            let raw_value = if item.inherited {
+                format!("{} (user)", item.current_value)
+            } else {
+                item.current_value.clone()
+            };
+            let value_trunc = truncate_to_width(&expand_tabs(&raw_value), value_max, "", false);
+            let value_text = if item.inherited {
+                (self.theme.hint)(&value_trunc)
+            } else {
+                (self.theme.value)(&value_trunc, is_selected)
+            };
 
             lines.push(truncate_to_width(
                 &format!("{}{}{}{}", prefix, label_text, separator, value_text),

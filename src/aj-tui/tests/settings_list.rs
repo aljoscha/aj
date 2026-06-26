@@ -51,6 +51,7 @@ fn sample_items() -> Vec<SettingItem> {
             label: "Read Only".into(),
             description: Some("Some info".into()),
             current_value: "locked".into(),
+            inherited: false,
             values: None,
             submenu: None,
         },
@@ -166,6 +167,7 @@ fn enter_on_item_with_empty_values_list_is_a_noop() {
         label: "X".into(),
         description: None,
         current_value: "a".into(),
+        inherited: false,
         values: Some(Vec::new()),
         submenu: None,
     }];
@@ -347,6 +349,7 @@ fn render_expands_tabs_in_label_value_and_description() {
         label: "La\tbel".into(),
         description: Some("de\tsc".into()),
         current_value: "va\tlue".into(),
+        inherited: false,
         values: None,
         submenu: None,
     }];
@@ -955,4 +958,89 @@ fn available_height_reaches_submenus_on_open_and_on_later_pushes() {
     // A later push (e.g. terminal resize) reaches the open submenu.
     list.set_available_height(23);
     assert_eq!(*heights.borrow(), vec![17, 23]);
+}
+
+// ---------------------------------------------------------------------------
+// Inherited rows
+// ---------------------------------------------------------------------------
+
+/// Theme that tags the value and hint styles distinctly so a test can
+/// tell which one rendered a row's value.
+fn tagged_theme() -> SettingsListTheme {
+    SettingsListTheme {
+        label: Arc::new(|s, _| s.to_string()),
+        value: Arc::new(|s, _| format!("VAL[{s}]")),
+        description: Arc::new(|s| s.to_string()),
+        hint: Arc::new(|s| format!("HINT[{s}]")),
+        cursor: "> ".to_string(),
+    }
+}
+
+#[test]
+fn inherited_row_renders_muted_with_user_marker() {
+    let items = vec![
+        SettingItem {
+            id: "theme".into(),
+            label: "Theme".into(),
+            description: None,
+            current_value: "dark".into(),
+            inherited: false,
+            values: Some(vec!["dark".into(), "light".into()]),
+            submenu: None,
+        },
+        SettingItem {
+            id: "speed".into(),
+            label: "Speed".into(),
+            description: None,
+            current_value: "standard".into(),
+            inherited: true,
+            values: Some(vec!["standard".into(), "fast".into()]),
+            submenu: None,
+        },
+    ];
+    let mut list = SettingsList::new(
+        items,
+        5,
+        tagged_theme(),
+        |_, _| {},
+        || {},
+        SettingsListOptions::default(),
+    );
+    let body = plain_lines_trim_end(&list.render(60)).join("\n");
+    // The set row uses the value style with no marker.
+    assert!(body.contains("VAL[dark]"), "got: {body:?}");
+    // The inherited row uses the hint (muted) style and the marker.
+    assert!(body.contains("HINT[standard (user)]"), "got: {body:?}");
+}
+
+#[test]
+fn set_inherited_and_is_inherited_round_trip() {
+    let (mut list, _, _) = make_settings_list(sample_items(), SettingsListOptions::default());
+    assert!(!list.is_inherited("theme"));
+    list.set_inherited("theme", true);
+    assert!(list.is_inherited("theme"));
+    // An unknown id is reported as not inherited and ignored on set.
+    assert!(!list.is_inherited("nope"));
+    list.set_inherited("nope", true);
+    assert!(!list.is_inherited("nope"));
+}
+
+#[test]
+fn committing_a_value_clears_the_inherited_flag() {
+    let items = vec![SettingItem {
+        id: "speed".into(),
+        label: "Speed".into(),
+        description: None,
+        current_value: "standard".into(),
+        inherited: true,
+        values: Some(vec!["standard".into(), "fast".into()]),
+        submenu: None,
+    }];
+    let (mut list, _, _) = make_settings_list(items, SettingsListOptions::default());
+    assert!(list.is_inherited("speed"));
+    // Cycling the value (Enter) is an edit at this layer, so the row is
+    // no longer inherited.
+    list.handle_input(&Key::enter());
+    assert!(!list.is_inherited("speed"));
+    assert_eq!(list.value_of("speed"), Some("fast"));
 }
