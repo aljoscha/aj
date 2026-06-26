@@ -386,6 +386,42 @@ mod tests {
     }
 
     #[test]
+    fn truncate_head_counts_multibyte_bytes_without_truncating() {
+        // "aé🙂\nb" = 1 + 2 + 4 + 1 (newline) + 1 = 9 bytes, under
+        // both caps, so it passes through with an exact byte count.
+        let content = "aé🙂\nb";
+        let r = truncate_head(content, 10, 100);
+        assert!(!r.truncated);
+        assert_eq!(r.total_bytes, content.len());
+        assert_eq!(r.total_bytes, 9);
+        assert_eq!(r.output_bytes, 9);
+    }
+
+    #[test]
+    fn truncate_head_multibyte_byte_cap_keeps_whole_first_line() {
+        // "éé\nabc": the first line is 4 bytes; a 4-byte cap keeps it
+        // whole and drops the rest. Head joins whole lines, so a
+        // multibyte character is never split.
+        let r = truncate_head("éé\nabc", 10, 4);
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert_eq!(r.content, "éé");
+        assert_eq!(r.output_bytes, 4);
+        assert!(!r.first_line_exceeds_limit);
+    }
+
+    #[test]
+    fn truncate_head_multibyte_first_line_exceeds_limit() {
+        // "éé" is 4 bytes; a 3-byte cap can't keep even the first
+        // line, so head returns empty with the escape flag set.
+        let r = truncate_head("éé\nabc", 10, 3);
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(r.first_line_exceeds_limit);
+        assert_eq!(r.content, "");
+    }
+
+    #[test]
     fn truncate_tail_passes_through_when_under_caps() {
         let r = truncate_tail("a\nb\nc", 10, 1024);
         assert!(!r.truncated);
@@ -421,6 +457,21 @@ mod tests {
     }
 
     #[test]
+    fn truncate_tail_oversized_single_line_with_trailing_newline() {
+        // The trailing newline is dropped before tail truncation, so a
+        // huge single line still yields a one-line partial tail of
+        // exactly the byte budget.
+        let input = format!("{}\n", "X".repeat(300_000));
+        let r = truncate_tail(&input, 100, 1024);
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(r.last_line_partial);
+        assert_eq!(r.output_lines, 1);
+        assert_eq!(r.content, "X".repeat(1024));
+        assert_eq!(r.output_bytes, 1024);
+    }
+
+    #[test]
     fn truncate_tail_keeps_trailing_lines_under_byte_cap() {
         let lines = (1..=5)
             .map(|i| format!("{:04}", i)) // 4 bytes/line
@@ -453,6 +504,30 @@ mod tests {
     }
 
     #[test]
+    fn truncate_tail_keeps_partial_multibyte_tail() {
+        // "aé🙂b" is 8 bytes; a 5-byte tail snaps forward off the
+        // middle of 'é' to start at 🙂, yielding "🙂b" (5 bytes).
+        let r = truncate_tail("aé🙂b", 10, 5);
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(r.last_line_partial);
+        assert_eq!(r.content, "🙂b");
+        assert_eq!(r.output_bytes, 5);
+    }
+
+    #[test]
+    fn truncate_tail_drops_oversized_trailing_char() {
+        // The trailing 🙂 is 4 bytes and can't fit a 3-byte budget;
+        // snapping forward past all of its bytes leaves an empty tail.
+        let r = truncate_tail("abc🙂", 10, 3);
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(r.last_line_partial);
+        assert_eq!(r.content, "");
+        assert_eq!(r.output_bytes, 0);
+    }
+
+    #[test]
     fn take_last_bytes_utf8_respects_char_boundary() {
         // 'é' is 0xC3 0xA9 in UTF-8 (2 bytes). The string is 8 bytes
         // ("aaaaéé"); take last 3 — splitting in the middle of an 'é'
@@ -464,5 +539,106 @@ mod tests {
         // And the result must be valid UTF-8 by construction (Rust
         // would have panicked otherwise on `s[start..]`).
         let _ = kept.as_bytes();
+    }
+
+    /// Independent oracle for the tail byte-truncation contract: the
+    /// last `max_bytes` bytes of `content`, advanced forward to the next
+    /// UTF-8 code-point boundary so a multibyte character is never
+    /// split. Deliberately a separate implementation from
+    /// `take_last_bytes_utf8` so the fuzz test cross-checks the two.
+    fn buffer_tail(content: &str, max_bytes: usize) -> String {
+        let bytes = content.as_bytes();
+        if bytes.len() <= max_bytes {
+            return content.to_string();
+        }
+        let mut start = bytes.len() - max_bytes;
+        while start < bytes.len() && (bytes[start] & 0xc0) == 0x80 {
+            start += 1;
+        }
+        content[start..].to_string()
+    }
+
+    /// A spread of byte limits around the input's size: small absolute
+    /// values, the midpoint, and the boundaries near the total length.
+    fn sampled_byte_limits(input: &str) -> Vec<usize> {
+        let total = input.len();
+        let half = total / 2;
+        let mut limits = vec![0usize, 1, 2, 3, 4, 5, 8];
+        for base in [half, total] {
+            limits.push(base.saturating_sub(1));
+            limits.push(base);
+            limits.push(base + 1);
+        }
+        for sub in [8, 5, 4, 3, 2, 1] {
+            limits.push(total.saturating_sub(sub));
+        }
+        limits.push(total + 4);
+        limits.sort_unstable();
+        limits.dedup();
+        limits
+    }
+
+    /// For each byte limit, `truncate_tail` on a single-line input must
+    /// equal the byte-tail oracle and never exceed the limit.
+    fn assert_matches_buffer_tail(input: &str, byte_limits: &[usize]) {
+        for &max_bytes in byte_limits {
+            let result = truncate_tail(input, 10, max_bytes);
+            let expected = buffer_tail(input, max_bytes);
+            assert_eq!(
+                result.content, expected,
+                "tail mismatch input={input:?} max_bytes={max_bytes}"
+            );
+            assert!(
+                result.content.len() <= max_bytes,
+                "tail exceeded byte limit input={input:?} max_bytes={max_bytes} got={}",
+                result.content.len()
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_tail_matches_byte_tail_oracle_over_multibyte_fuzz() {
+        // UTF-8 boundary-class scalars: 1-byte (incl. the 0x7f edge),
+        // 2-byte start/mid/end, 3-byte start/mid, and 4-byte. The
+        // reference also fuzzes lone UTF-16 surrogates, which a Rust
+        // `&str` cannot hold (it is always valid UTF-8), so those are
+        // omitted. The alphabet has no newline, so every input is a
+        // single line and `truncate_tail` reduces to the byte-tail
+        // oracle.
+        let alphabet = [
+            'a', '\u{7f}', '\u{80}', 'é', '\u{7ff}', '\u{800}', '中', '\u{d7ff}', '🙂', '\u{e000}',
+            '\u{ffff}',
+        ];
+
+        fn check_exhaustive(prefix: &str, depth: u32, alphabet: &[char]) {
+            assert_matches_buffer_tail(prefix, &sampled_byte_limits(prefix));
+            if depth == 0 {
+                return;
+            }
+            for &c in alphabet {
+                let mut next = String::with_capacity(prefix.len() + 4);
+                next.push_str(prefix);
+                next.push(c);
+                check_exhaustive(&next, depth - 1, alphabet);
+            }
+        }
+        check_exhaustive("", 3, &alphabet);
+
+        // Deterministic LCG (the reference's constants) so the fuzz
+        // corpus is fixed across runs.
+        let mut seed: u32 = 0x1234_5678;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for _ in 0..1_000 {
+            let length = usize::try_from(next() % 80).expect("u32 fits usize");
+            let mut input = String::new();
+            for _ in 0..length {
+                let idx = usize::try_from(next()).expect("u32 fits usize") % alphabet.len();
+                input.push(alphabet[idx]);
+            }
+            assert_matches_buffer_tail(&input, &sampled_byte_limits(&input));
+        }
     }
 }
