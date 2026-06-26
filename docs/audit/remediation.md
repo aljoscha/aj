@@ -1706,7 +1706,7 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   change beyond removing unused surface. `cargo test -p aj-agent` (78, +2)
   + `-p aj` session tests green, `fmt`/`clippy -p aj-agent --all-targets`
   clean, `cargo check --workspace` confirms no consumer drift.
-- 2026-06-26 · RESIDUAL(aj-tools-framework) · DONE · 90209ac · Eleventh
+- 2026-06-26 · RESIDUAL(aj-tools-framework) · DONE · 935d505 · Eleventh
   per-crate residual sweep. Two findings verify-only, retired by themed
   work: the Major un-gated `testing.rs` `pub mod` (R12 gated it behind
   `cfg(test)` + the `testing` feature) and the Minor disabled-tools-filter
