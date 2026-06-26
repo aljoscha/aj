@@ -3273,7 +3273,6 @@ impl Component for Editor {
                         self.jump_mode = None;
                         return true;
                     }
-                    drop(kb);
                     // Printable (with only Shift) is the jump target.
                     if let KeyCode::Char(c) = key.code
                         && (mods - KeyModifiers::SHIFT).is_empty()
@@ -3296,21 +3295,18 @@ impl Component for Editor {
                 if self.autocomplete_state.is_some() {
                     let kb = keybindings::get();
                     if kb.matches(event, "tui.select.cancel") {
-                        drop(kb);
                         self.cancel_autocomplete();
                         return true;
                     }
                     if (kb.matches(event, "tui.select.up") || kb.matches(event, "tui.select.down"))
                         && self.autocomplete_list.is_some()
                     {
-                        drop(kb);
                         if let Some(list) = self.autocomplete_list.as_mut() {
                             list.handle_input(event);
                         }
                         return true;
                     }
                     if kb.matches(event, "tui.input.tab") {
-                        drop(kb);
                         // Tab with an open popup accepts the current
                         // selection (does not re-query as a force
                         // request). If no list, treat as cancel.
@@ -3330,7 +3326,6 @@ impl Component for Editor {
                         return true;
                     }
                     if kb.matches(event, "tui.select.confirm") {
-                        drop(kb);
                         let EnterOutcome::Consumed = self.accept_autocomplete_on_enter();
                         return true;
                     }
@@ -3354,7 +3349,6 @@ impl Component for Editor {
 
                 // Tab without an open popup: force-request autocomplete.
                 if kb.matches(event, "tui.input.tab") {
-                    drop(kb);
                     self.trigger_force_autocomplete();
                     return true;
                 }
@@ -3371,7 +3365,6 @@ impl Component for Editor {
 
                 // Undo.
                 if kb.matches(event, "tui.editor.undo") {
-                    drop(kb);
                     self.restore_undo();
                     return true;
                 }
@@ -3398,14 +3391,12 @@ impl Component for Editor {
                     // the backslash and submits, mirroring the standard
                     // workaround in the opposite direction.
                     if self.should_submit_on_backslash_enter(event, &kb) {
-                        drop(kb);
                         let line = &mut self.lines[self.cursor_line];
                         line.remove(self.cursor_col - 1);
                         self.cursor_col -= 1;
                         self.submit_value();
                         return true;
                     }
-                    drop(kb);
                     self.save_undo();
                     self.insert_newline_internal();
                     self.reset_sticky_state();
@@ -3424,7 +3415,6 @@ impl Component for Editor {
                     if self.disable_submit {
                         return true;
                     }
-                    drop(kb);
 
                     // Backslash+Enter newline workaround.
                     //
@@ -3455,7 +3445,6 @@ impl Component for Editor {
                 // Vertical movement: history-aware Up/Down off the
                 // visual-line map, not the logical one.
                 if kb.matches(event, "tui.editor.cursorUp") {
-                    drop(kb);
                     let width = self.layout_width.get();
                     let vls = self.build_visual_line_map(width);
                     let current_vl = self.find_current_visual_line(&vls);
@@ -3475,7 +3464,6 @@ impl Component for Editor {
                     return true;
                 }
                 if kb.matches(event, "tui.editor.cursorDown") {
-                    drop(kb);
                     let width = self.layout_width.get();
                     let vls = self.build_visual_line_map(width);
                     let current_vl = self.find_current_visual_line(&vls);
@@ -3496,12 +3484,10 @@ impl Component for Editor {
                 // Page up/down — scroll by max_visible_lines and move
                 // the cursor with the viewport.
                 if kb.matches(event, "tui.editor.pageUp") {
-                    drop(kb);
                     self.page_scroll(-1);
                     return true;
                 }
                 if kb.matches(event, "tui.editor.pageDown") {
-                    drop(kb);
                     self.page_scroll(1);
                     return true;
                 }
@@ -3552,57 +3538,43 @@ impl Component for Editor {
                 // Deletion. Word-level checked before char-level for
                 // the same reason as word-vs-char movement above.
                 if kb.matches(event, "tui.editor.deleteWordBackward") {
-                    drop(kb);
                     self.kill_word_backward();
                     return true;
                 }
                 if kb.matches(event, "tui.editor.deleteWordForward") {
-                    drop(kb);
                     self.kill_word_forward();
                     return true;
                 }
                 if kb.matches(event, "tui.editor.deleteCharBackward")
                     || key_id_matches(event, "shift+backspace")
                 {
-                    drop(kb);
                     self.backspace();
                     return true;
                 }
                 if kb.matches(event, "tui.editor.deleteCharForward")
                     || key_id_matches(event, "shift+delete")
                 {
-                    drop(kb);
                     self.delete_forward();
                     return true;
                 }
                 if kb.matches(event, "tui.editor.deleteToLineStart") {
-                    drop(kb);
                     self.kill_to_start();
                     return true;
                 }
                 if kb.matches(event, "tui.editor.deleteToLineEnd") {
-                    drop(kb);
                     self.kill_to_end();
                     return true;
                 }
 
                 // Yank.
                 if kb.matches(event, "tui.editor.yank") {
-                    drop(kb);
                     self.yank();
                     return true;
                 }
                 if kb.matches(event, "tui.editor.yankPop") {
-                    drop(kb);
                     self.yank_pop();
                     return true;
                 }
-
-                // Drop the read guard before falling through to
-                // character insertion: that path doesn't consult the
-                // registry, and holding the guard across the rest of
-                // the handler is unnecessary lock pressure.
-                drop(kb);
 
                 // Character insertion.
                 //

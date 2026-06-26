@@ -210,14 +210,12 @@ impl Component for FilterableSelect {
         // Cancel and confirm are intercepted here so exactly one outcome
         // fires regardless of which child the keys would otherwise reach.
         if kb.matches(event, "tui.select.cancel") {
-            drop(kb);
             if let Some(on_cancel) = self.on_cancel.as_mut() {
                 on_cancel();
             }
             return true;
         }
         if kb.matches(event, "tui.input.submit") {
-            drop(kb);
             self.fire_select();
             return true;
         }
@@ -228,13 +226,10 @@ impl Component for FilterableSelect {
             || kb.matches(event, "tui.select.pageUp")
             || kb.matches(event, "tui.select.pageDown")
         {
-            drop(kb);
             return self.list.handle_input(event);
         }
 
-        // Everything else edits the search box. Drop the registry guard
-        // so `apply_query` can re-acquire it without contention.
-        drop(kb);
+        // Everything else edits the search box.
         let before = self.search.value().to_string();
         let handled = self.search.handle_input(event);
         if handled && self.search.value() != before {

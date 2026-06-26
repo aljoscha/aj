@@ -345,11 +345,9 @@ impl Component for PromptHistorySearchComponent {
         // before the shared selector sees the key.
         let kb = keybindings::get();
         if kb.matches(event, ACTION_HISTORY_TOGGLE_SCOPE) {
-            drop(kb);
             self.toggle_scope();
             return true;
         }
-        drop(kb);
 
         self.inner.handle_input(event)
     }

@@ -349,7 +349,6 @@ impl aj_tui::component::Component for AgentPickerComponent {
     fn handle_input(&mut self, event: &InputEvent) -> bool {
         let kb = keybindings::get();
         if kb.matches(event, ACTION_AGENT_TOGGLE_SCOPE) {
-            drop(kb);
             self.scope = match self.scope {
                 Scope::Active => Scope::All,
                 Scope::All => Scope::Active,
@@ -358,7 +357,6 @@ impl aj_tui::component::Component for AgentPickerComponent {
             return true;
         }
         if kb.matches(event, ACTION_TASK_KILL) {
-            drop(kb);
             // Kill only acts on a selected, still-running task row;
             // on anything else the chord is consumed but inert (the
             // picker is a capturing overlay, so letting it fall
@@ -376,7 +374,6 @@ impl aj_tui::component::Component for AgentPickerComponent {
             }
             return true;
         }
-        drop(kb);
         self.inner.handle_input(event)
     }
 

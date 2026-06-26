@@ -790,7 +790,6 @@ impl Component for TextEditSubmenu {
             }
             return true;
         }
-        drop(kb);
         self.input.handle_input(event)
     }
 

@@ -256,7 +256,6 @@ impl Component for LoginDialogComponent {
         let kb = keybindings::get();
 
         if kb.matches(event, "tui.select.cancel") {
-            drop(kb);
             // Flip the shared flag; the host polls it and tears the
             // dialog down + aborts the login task.
             self.cancel.store(true, Ordering::Relaxed);
@@ -264,7 +263,6 @@ impl Component for LoginDialogComponent {
         }
 
         if kb.matches(event, "tui.input.submit") {
-            drop(kb);
             let value = self.input.value().trim().to_string();
             // Only deliver when a callback is actually awaiting input
             // and the field is non-empty; otherwise swallow the stray
@@ -291,7 +289,6 @@ impl Component for LoginDialogComponent {
             return true;
         }
 
-        drop(kb);
         self.input.handle_input(event)
     }
 

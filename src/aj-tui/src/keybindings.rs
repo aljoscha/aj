@@ -21,7 +21,7 @@
 //! ```
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{LazyLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::keys::{InputEvent, key_id_matches};
 
@@ -104,6 +104,11 @@ pub struct KeybindingConflict {
 
 /// Registry that resolves default definitions against optional user
 /// overrides and exposes the flattened key list per action.
+///
+/// `Clone` backs the copy-on-write swap in [`set_user_bindings`]: the
+/// global stores the manager behind an `Arc`, so mutating it clones the
+/// inner value when snapshots are still outstanding.
+#[derive(Clone)]
 pub struct KeybindingsManager {
     definitions: KeybindingDefinitions,
     user_bindings: Vec<(String, Vec<KeyId>)>,
@@ -489,18 +494,31 @@ pub fn tui_keybindings() -> KeybindingDefinitions {
 /// Components consult this singleton when handling input so that user
 /// rebindings (installed via [`set_user_bindings`] or [`set_manager`])
 /// take effect uniformly across the process.
-static GLOBAL_KEYBINDINGS: LazyLock<RwLock<KeybindingsManager>> = LazyLock::new(|| {
-    RwLock::new(KeybindingsManager::new(
+///
+/// The manager lives behind an `Arc` and [`get`] returns a clone of it
+/// rather than a read guard. We do this because a `std::sync::RwLock` is
+/// neither reentrant nor reader-preferring: a thread that held a read
+/// guard and then re-entered the lock (directly, or transitively through
+/// a child component's `handle_input`/`render`, or via
+/// [`format_action_shortcut`]) would block on its own second read as
+/// soon as another thread had a writer waiting. That writer in turn
+/// waits for the first read guard, closing a deadlock cycle. Handing
+/// back an `Arc` snapshot means no lock is ever held across caller code,
+/// so reentrant reads and the writer cycle are both impossible.
+static GLOBAL_KEYBINDINGS: LazyLock<RwLock<Arc<KeybindingsManager>>> = LazyLock::new(|| {
+    RwLock::new(Arc::new(KeybindingsManager::new(
         tui_keybindings(),
         Vec::<(String, Vec<KeyId>)>::new(),
-    ))
+    )))
 });
 
-/// Acquire a read-only handle to the process-wide [`KeybindingsManager`].
+/// Take a cheap snapshot of the process-wide [`KeybindingsManager`].
 ///
-/// The returned guard holds a shared lock for its lifetime, so callers
-/// typically bind it once at the top of an input handler and reuse it
-/// for every `kb.matches(event, "tui.xxx")` call inside that handler:
+/// The read lock is held only for the `Arc` clone inside this call, not
+/// for the lifetime of the returned value, so callers never block a
+/// writer and a writer never blocks them. Callers typically bind the
+/// snapshot once at the top of an input handler and reuse it for every
+/// `kb.matches(event, "tui.xxx")` call inside that handler:
 ///
 /// ```ignore
 /// let kb = aj_tui::keybindings::get();
@@ -508,13 +526,15 @@ static GLOBAL_KEYBINDINGS: LazyLock<RwLock<KeybindingsManager>> = LazyLock::new(
 /// if kb.matches(event, "tui.editor.cursorDown") { /* ... */ }
 /// ```
 ///
-/// Concurrent reads are allowed; concurrent calls to
-/// [`set_user_bindings`] or [`set_manager`] block until every read
-/// guard has been dropped.
-pub fn get() -> RwLockReadGuard<'static, KeybindingsManager> {
-    GLOBAL_KEYBINDINGS
-        .read()
-        .expect("aj-tui keybindings lock poisoned")
+/// A snapshot reflects the bindings as of the moment of the call. A
+/// concurrent [`set_user_bindings`] or [`set_manager`] swaps the global
+/// for later callers but leaves outstanding snapshots untouched.
+pub fn get() -> Arc<KeybindingsManager> {
+    Arc::clone(
+        &GLOBAL_KEYBINDINGS
+            .read()
+            .expect("aj-tui keybindings lock poisoned"),
+    )
 }
 
 /// Replace the user-supplied bindings on the process-wide manager.
@@ -525,8 +545,11 @@ pub fn get() -> RwLockReadGuard<'static, KeybindingsManager> {
 /// `&str`, or a `Vec`. Unknown action IDs are silently ignored,
 /// matching the manager's own contract.
 ///
-/// Replaces the previous user bindings wholesale — call with an empty
+/// Replaces the previous user bindings wholesale. Call with an empty
 /// iterator (or use [`reset`]) to drop user overrides entirely.
+///
+/// The new bindings apply to snapshots taken after this returns.
+/// Snapshots already handed out by [`get`] keep their previous bindings.
 pub fn set_user_bindings<U, S, K>(user_bindings: U)
 where
     U: IntoIterator<Item = (S, K)>,
@@ -536,7 +559,9 @@ where
     let mut lock = GLOBAL_KEYBINDINGS
         .write()
         .expect("aj-tui keybindings lock poisoned");
-    lock.set_user_bindings(user_bindings);
+    // Copy-on-write: clones the inner manager only when snapshots from
+    // `get` are still alive, leaving those outstanding snapshots intact.
+    Arc::make_mut(&mut lock).set_user_bindings(user_bindings);
 }
 
 /// Replace the entire process-wide manager.
@@ -544,11 +569,14 @@ where
 /// Use when an embedder wants to swap in a different definition set
 /// (e.g. an extension of [`tui_keybindings`] with downstream-specific
 /// actions).
+///
+/// The new manager becomes the next snapshot. Snapshots already handed
+/// out by [`get`] keep pointing at the previous manager.
 pub fn set_manager(manager: KeybindingsManager) {
     let mut lock = GLOBAL_KEYBINDINGS
         .write()
         .expect("aj-tui keybindings lock poisoned");
-    *lock = manager;
+    *lock = Arc::new(manager);
 }
 
 /// Restore the process-wide manager to a freshly-built default

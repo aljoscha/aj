@@ -591,12 +591,6 @@ impl Component for TextInput {
                     return true;
                 }
 
-                // Drop the read guard before falling through to
-                // character insertion: that path doesn't consult the
-                // registry, and holding the guard across the rest of
-                // the handler is unnecessary lock pressure.
-                drop(kb);
-
                 // Printable characters (no Ctrl/Alt; Shift folded
                 // into case by the terminal). Accept printable,
                 // reject control.

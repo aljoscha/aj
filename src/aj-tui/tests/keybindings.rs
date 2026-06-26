@@ -172,7 +172,6 @@ fn global_set_user_bindings_takes_effect_for_subsequent_get() {
     assert_eq!(kb.get_keys("tui.input.submit"), &["enter", "ctrl+enter"]);
     // Other actions still default.
     assert_eq!(kb.get_keys("tui.select.confirm"), &["enter"]);
-    drop(kb);
     keybindings::reset();
 }
 
@@ -204,7 +203,6 @@ fn global_set_manager_swaps_definitions_wholesale() {
     assert_eq!(kb.get_keys("tui.custom.action"), &["ctrl+x"]);
     // Defaults from `tui_keybindings()` are gone.
     assert!(kb.get_keys("tui.input.submit").is_empty());
-    drop(kb);
     keybindings::reset();
 }
 
@@ -224,6 +222,5 @@ fn global_matches_returns_true_for_a_user_bound_alternate() {
         crossterm::event::KeyModifiers::CONTROL,
     ));
     assert!(kb.matches(&ctrl_enter, "tui.input.submit"));
-    drop(kb);
     keybindings::reset();
 }

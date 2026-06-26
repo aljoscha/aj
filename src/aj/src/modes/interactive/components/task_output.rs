@@ -417,7 +417,6 @@ impl Component for TaskOutputComponent {
             return true;
         }
         if kb.matches(event, ACTION_TASK_KILL) {
-            drop(kb);
             // Kill in place; the status flip arrives via the event pump
             // and repaints the header. No-op once the task is terminal.
             if self.status == TaskStatus::Running {
@@ -426,26 +425,21 @@ impl Component for TaskOutputComponent {
             return true;
         }
         if kb.matches(event, "tui.select.up") {
-            drop(kb);
             self.scroll_up(1);
             return true;
         }
         if kb.matches(event, "tui.select.down") {
-            drop(kb);
             self.scroll_down(1);
             return true;
         }
         if kb.matches(event, "tui.select.pageUp") {
-            drop(kb);
             self.scroll_up(self.viewport);
             return true;
         }
         if kb.matches(event, "tui.select.pageDown") {
-            drop(kb);
             self.scroll_down(self.viewport);
             return true;
         }
-        drop(kb);
 
         // Vim-style extras the keybinding actions don't cover.
         match event.as_char() {

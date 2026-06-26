@@ -1303,7 +1303,6 @@ async fn run_session(
                                 &input,
                                 crate::config::keybindings::ACTION_THINKING_TOGGLE,
                             ) {
-                                drop(kb);
                                 let new_value = !world.pump.hide_thinking_block();
                                 world.pump.set_hide_thinking_block(&mut shell.tui, new_value);
                                 // Don't post a "hidden/visible"
@@ -1323,7 +1322,6 @@ async fn run_session(
                                 &input,
                                 crate::config::keybindings::ACTION_TOOLS_EXPAND,
                             ) {
-                                drop(kb);
                                 let new_value = !world.pump.tools_expanded();
                                 world.pump.set_tools_expanded(&mut shell.tui, new_value);
                                 continue;
@@ -1351,7 +1349,6 @@ async fn run_session(
                                 &input,
                                 crate::config::keybindings::ACTION_CLIPBOARD_PASTE_IMAGE,
                             ) {
-                                drop(kb);
                                 if let Some(path) =
                                     crate::clipboard::read_image_to_tempfile()
                                     && let Some(editor) = shell.tui.get_mut_as::<Editor>(
@@ -1381,7 +1378,6 @@ async fn run_session(
                                 &input,
                                 crate::config::keybindings::ACTION_SUBMIT_STEERING,
                             );
-                            drop(kb);
                             if matched && selectors.is_empty() && login_session.is_none() {
                                 let target = world.pump.active_view(&mut shell.tui);
                                 let text = shell
@@ -1436,7 +1432,6 @@ async fn run_session(
                             let kb = aj_tui::keybindings::get();
                             let matched =
                                 kb.matches(&input, crate::config::keybindings::ACTION_DEQUEUE);
-                            drop(kb);
                             if matched && selectors.is_empty() && login_session.is_none() {
                                 let target = world.pump.active_view(&mut shell.tui);
                                 yank_pending_into_editor(
@@ -1457,7 +1452,6 @@ async fn run_session(
                         {
                             let kb = aj_tui::keybindings::get();
                             let is_up = kb.matches(&input, "tui.editor.cursorUp");
-                            drop(kb);
                             if is_up && selectors.is_empty() && login_session.is_none() {
                                 let target = world.pump.active_view(&mut shell.tui);
                                 let editor_empty = shell
@@ -1503,7 +1497,6 @@ async fn run_session(
                                     crate::config::keybindings::ACTION_OVERLAY_CLOSE_ALL,
                                 )
                             {
-                                drop(kb);
                                 shell.close_all_request.store(true, Ordering::Relaxed);
                                 // Consume: skip `shell.tui.handle_input`
                                 // entirely so the selector doesn't
@@ -1519,7 +1512,6 @@ async fn run_session(
                                     crate::config::keybindings::ACTION_PALETTE_OPEN,
                                 )
                             {
-                                drop(kb);
                                 shell.palette_open_request.store(true, Ordering::Relaxed);
                                 // Fall through to the dispatcher
                                 // arm below by letting handle_input
@@ -1532,7 +1524,6 @@ async fn run_session(
                                     crate::config::keybindings::ACTION_HISTORY_OPEN,
                                 )
                             {
-                                drop(kb);
                                 shell.history_open_request.store(true, Ordering::Relaxed);
                                 // Consume: the editor binds no
                                 // ctrl+r, but skipping handle_input
@@ -1547,7 +1538,6 @@ async fn run_session(
                                     crate::config::keybindings::ACTION_AGENT_PICKER,
                                 )
                             {
-                                drop(kb);
                                 shell.agent_picker_open_request.store(true, Ordering::Relaxed);
                                 // Consume: the editor binds no alt+a;
                                 // skipping handle_input keeps the
