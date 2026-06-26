@@ -46,6 +46,9 @@ pub struct TruncationResult {
     /// Whether any source content was dropped.
     pub truncated: bool,
     /// Which budget triggered the truncation. `None` iff `!truncated`.
+    /// When both budgets are reached at once (the kept content hits the
+    /// line cap while its byte total is still within the byte cap),
+    /// `Lines` wins.
     pub truncated_by: Option<TruncatedBy>,
     /// Line count of the source content. Split on `\n` and drop a
     /// single trailing empty element introduced by a terminating
@@ -255,9 +258,11 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         running_bytes += extra;
     }
 
-    // Stop-condition disambiguation: when both budgets are equally
-    // tight, attribute the truncation to `Lines` if the line cap was
-    // hit and the byte total is still under the byte cap.
+    // Tie-break contract: when both budgets are hit at once (line cap
+    // reached, byte total still within the byte cap), `Lines` wins. The
+    // backward walk checks the line cap before the byte cap, so this
+    // makes the documented tie-break explicit rather than leaving it to
+    // loop ordering.
     if kept.len() >= max_lines && running_bytes <= max_bytes && partial_line.is_none() {
         truncated_by = TruncatedBy::Lines;
     }
@@ -303,7 +308,8 @@ fn take_last_bytes_utf8(s: &str, max_bytes: usize) -> String {
     while start < bytes.len() && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
         start += 1;
     }
-    // SAFETY: we positioned `start` on a UTF-8 boundary in valid UTF-8.
+    // `start` now sits on a code-point boundary, so this slice never
+    // splits a character (and never panics).
     s[start..].to_string()
 }
 
@@ -426,6 +432,23 @@ mod tests {
         assert!(r.truncated);
         assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
         assert_eq!(r.output_lines, 2);
+        assert_eq!(r.content, "0004\n0005");
+    }
+
+    #[test]
+    fn truncate_tail_lines_win_when_both_budgets_hit_at_once() {
+        // Five 4-byte lines. Keeping the last two yields "0004\n0005" =
+        // 9 bytes, exactly the byte cap, while the line cap (2) is also
+        // reached. The simultaneous tie must resolve to `Lines`.
+        let lines = (1..=5)
+            .map(|i| format!("{i:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = truncate_tail(&lines, 2, 9);
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Lines));
+        assert_eq!(r.output_lines, 2);
+        assert_eq!(r.output_bytes, 9);
         assert_eq!(r.content, "0004\n0005");
     }
 

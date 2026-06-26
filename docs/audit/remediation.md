@@ -492,6 +492,39 @@ Per-crate progress (work top-to-bottom):
   -p aj-session` (83, +3) + `-p aj --lib` (450) green, `fmt`/`clippy
   --workspace --all-targets` clean, `cargo check --workspace` confirms no
   consumer drift.)
+- aj-tools-framework — `DONE` (the Major un-gated `testing.rs` retired
+  by R12 and the Minor disabled-tools-filter duplication by R8, both
+  verify-only. Cross-checked the live items against the reference, which is
+  a near-direct ancestor: its `truncate.ts` carries the identical tie-break
+  post-pass and its `image-resize-core.ts`/test suite mirror our
+  `resize_image` (including the `maxBytes: 1 → null` bailout test). Five
+  live leftovers in one change. **[Minor][Contracts] `truncate_tail`
+  tie-break:** documented the lines-win-a-simultaneous-tie precedence on the
+  `truncated_by` field, reworded the post-pass comment to name it the
+  explicit attribution point (kept it for reference parity), and added
+  `truncate_tail_lines_win_when_both_budgets_hit_at_once` (line cap reached
+  with byte total == cap → `Lines`). **[Minor][Testing] image failure
+  paths:** added `resize_image` → `None` (1-byte budget), `resize_image`
+  undecodable → `None`, `passthrough_image` success (dimensions decoded,
+  source bytes verbatim), and `passthrough_image` undecodable → `None`.
+  **[Minor][Dependencies]:** dropped the redundant `tempfile`
+  `[dev-dependencies]` line (the hard dep, needed by `bash`'s spill path,
+  already covers tests). **[Nit][Comments]:** reworded the misplaced
+  `SAFETY:` on `take_last_bytes_utf8`'s panic-checked slice to a plain
+  nota bene. **[Nit][Comments]:** restated the `BuiltinToolOptions`
+  forward-looking doc as steady-state. On the `passthrough_image`
+  divergence (the reference has no analog: it skips resize at the caller and
+  recomputes dimensions at render time, carrying none in the tool result),
+  the user chose to keep our approach. Our `passthrough_image` fills the
+  persisted `ToolDetails::Image` dimensions on the auto-resize-off path and
+  gives a clean local error on undecodable bytes (vs the reference's
+  render-time decode + wire rejection); converging would be an M-sized
+  cross-crate change to the persisted detail schema, the producer, and the
+  TUI consumer, declined as out of scope for a residual sweep. No
+  public-API or on-disk/wire change. `cargo test -p aj-tools` green (127,
+  +5), `fmt`/`clippy -p aj-tools --all-targets` clean, `cargo check
+  --workspace` confirms no consumer drift, `cargo build -p aj-tools`
+  confirms `testing` stays gated out of prod.)
 
 ---
 
@@ -1673,3 +1706,44 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   change beyond removing unused surface. `cargo test -p aj-agent` (78, +2)
   + `-p aj` session tests green, `fmt`/`clippy -p aj-agent --all-targets`
   clean, `cargo check --workspace` confirms no consumer drift.
+- 2026-06-26 · RESIDUAL(aj-tools-framework) · DONE · 90209ac · Eleventh
+  per-crate residual sweep. Two findings verify-only, retired by themed
+  work: the Major un-gated `testing.rs` `pub mod` (R12 gated it behind
+  `cfg(test)` + the `testing` feature) and the Minor disabled-tools-filter
+  duplication (R8's `builtin_tools(options, disabled)` seam). Cross-checked
+  the live items against the reference, which is a near-direct ancestor:
+  its `truncate.ts` carries the identical tie-break post-pass, and its
+  `image-resize-core.ts` plus `image-processing.test.ts` mirror our
+  `resize_image` (the reference even has the same `maxBytes: 1 → null`
+  bailout test). Five live leftovers in one change. **[Minor][Contracts]
+  `truncate_tail` tie-break:** documented the lines-win-a-simultaneous-tie
+  precedence on the `truncated_by` field doc, reworded the post-pass
+  comment to name it the explicit attribution point (kept it for reference
+  parity rather than removing it as loop-ordering-redundant), and added
+  `truncate_tail_lines_win_when_both_budgets_hit_at_once` (line cap reached
+  with byte total == cap → `Lines`). **[Minor][Testing] image failure
+  paths:** added `resize_image` → `None` (1-byte budget no encoding meets),
+  `resize_image` undecodable → `None`, `passthrough_image` success
+  (dimensions decoded, source bytes forwarded verbatim), and
+  `passthrough_image` undecodable → `None`. **[Minor][Dependencies]:**
+  dropped the redundant `tempfile` `[dev-dependencies]` line; the hard dep
+  (needed by `bash`'s spill path) already covers tests. **[Nit][Comments]:**
+  reworded the misplaced `SAFETY:` on `take_last_bytes_utf8`'s
+  panic-checked slice to a plain nota bene (no `unsafe` there).
+  **[Nit][Comments]:** restated the `BuiltinToolOptions` forward-looking
+  "today/will" doc as steady-state. The `passthrough_image` divergence
+  (the reference has no analog: it skips resize at the caller and
+  recomputes dimensions at render time via `terminal-image.ts`, carrying
+  none in the tool result) was sketched in full with the user. Our helper
+  fills the persisted `ToolDetails::Image` dimensions on the
+  auto-resize-off path and gives a clean local error on undecodable bytes,
+  vs the reference's render-time decode + wire rejection. Converging to
+  parity would be an M-sized cross-crate change to the persisted detail
+  schema, the producer, and the TUI consumer (which reads
+  `displayed_dimensions` for the inline-render footprint and both tuples
+  for the `WxH → WxH` fallback line). The user chose to keep our approach,
+  so the divergence is recorded, not acted on. No public-API or
+  on-disk/wire change. `cargo test -p aj-tools` green (127, +5),
+  `fmt`/`clippy -p aj-tools --all-targets` clean, `cargo check --workspace`
+  confirms no consumer drift, `cargo build -p aj-tools` confirms `testing`
+  stays gated out of a prod build.

@@ -877,6 +877,43 @@ mod tests {
     }
 
     #[test]
+    fn resize_image_returns_none_when_no_encoding_fits_budget() {
+        // A real, decodable PNG against a 1-byte budget no encoding can
+        // meet at any dimension down to 1x1, so the shrink loop bails
+        // out with `None` (the caller then emits the omission note).
+        let bytes = make_png(64, 64);
+        let opts = ResizeOptions {
+            max_bytes: 1,
+            ..ResizeOptions::default()
+        };
+        assert!(resize_image(&bytes, "image/png", &opts).is_none());
+    }
+
+    #[test]
+    fn resize_image_returns_none_for_undecodable_bytes() {
+        assert!(resize_image(b"not an image", "image/png", &ResizeOptions::default()).is_none());
+    }
+
+    #[test]
+    fn passthrough_image_decodes_dimensions_and_keeps_source_bytes() {
+        let bytes = make_png(120, 80);
+        let result = passthrough_image(&bytes, "image/png").expect("passthrough result");
+        assert!(!result.was_resized);
+        assert_eq!(result.original_width, 120);
+        assert_eq!(result.original_height, 80);
+        assert_eq!(result.width, 120);
+        assert_eq!(result.height, 80);
+        assert_eq!(result.mime_type, "image/png");
+        // Passthrough forwards the source bytes verbatim, base64-encoded.
+        assert_eq!(result.data, BASE64.encode(&bytes));
+    }
+
+    #[test]
+    fn passthrough_image_returns_none_for_undecodable_bytes() {
+        assert!(passthrough_image(b"not an image", "image/png").is_none());
+    }
+
+    #[test]
     fn format_dimension_note_returns_none_when_not_resized() {
         let resized = ResizedImage {
             data: String::new(),

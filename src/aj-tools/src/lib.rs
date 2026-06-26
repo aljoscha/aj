@@ -35,9 +35,7 @@ pub use tools::todo::{TodoReadTool, TodoWriteTool};
 pub use tools::write_file::WriteFileTool;
 
 /// Cross-cutting settings the binary feeds into builtin tool
-/// construction. Today scopes only image-related flags; new fields
-/// will be `Default`-derived so callers can extend without churning
-/// every call site.
+/// construction. Currently image-related flags only.
 #[derive(Clone)]
 pub struct BuiltinToolOptions {
     /// Forwarded to [`ReadFileTool::with_auto_resize`]. Default
