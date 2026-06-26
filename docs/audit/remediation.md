@@ -1747,3 +1747,27 @@ One line per resolved item (most recent last): `<date> · <id> · <status> ·
   `fmt`/`clippy -p aj-tools --all-targets` clean, `cargo check --workspace`
   confirms no consumer drift, `cargo build -p aj-tools` confirms `testing`
   stays gated out of a prod build.
+- 2026-06-26 · FOLLOWUP(aj-tools-framework) · DONE · 3cdf906 · Actioned
+  the user's ask to add the one truncation-related thing the reference
+  has that we lacked: its `truncate.test.ts` property/fuzz test. Ported it
+  to `truncate.rs`, following the reference where it makes sense and
+  deviating only where Rust forces it. Added `buffer_tail` (an independent
+  oracle: the last `max_bytes` bytes snapped forward to a UTF-8 boundary,
+  written separately from `take_last_bytes_utf8` so the test cross-checks
+  the two) and `truncate_tail_matches_byte_tail_oracle_over_multibyte_fuzz`,
+  which asserts `truncate_tail` on single-line input equals the oracle and
+  never exceeds the limit across an exhaustive depth-3 small-string space
+  plus 1000 deterministic-LCG inputs (the reference's seed/constants) over
+  an 11-scalar boundary-class alphabet (1/2/3/4-byte UTF-8 classes). Also
+  added the explicit multibyte cases the reference pins: tail
+  (`aé🙂b`→`🙂b` at 5 bytes, `abc🙂`→`""` at 3 bytes, and an oversized
+  single line with a trailing newline) and head (byte-count sanity,
+  byte-cap keeps the whole first line, multibyte first-line-exceeds). So
+  every applicable it-block from `truncate.test.ts` is ported. Two things
+  intentionally left out: the lone-UTF-16-surrogate test (a Rust `&str`
+  cannot hold them, and our truncate inputs are always valid UTF-8 since
+  `bash` decodes via `from_utf8_lossy` and `read_file` via
+  `read_to_string`), and `truncateLine` (a grep-match per-line cap with no
+  consumer here, no search tool). Test-only, no production change.
+  `cargo test -p aj-tools --lib truncate` green (22, +7), `fmt`/`clippy
+  -p aj-tools --all-targets` clean.
