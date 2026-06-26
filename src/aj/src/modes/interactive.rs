@@ -3726,13 +3726,34 @@ async fn handle_command(
     }
 }
 
-/// Apply a confirmed thinking pick to the main agent: stage into
-/// the run config, persist to `config.toml`, record on the session
-/// log's user thread, and refresh footer + border. Returns the
-/// user-facing notice.
+/// Whether a confirmed model or thinking pick should also become the
+/// default for new sessions.
+///
+/// Both scopes change the running session: they stage into the
+/// loop-side run config and record on the session log, so the choice
+/// survives a resume of this same session. They differ only in
+/// whether the choice is also written to `config.toml`. The settings
+/// menu sets the default for new sessions, the `/model` and
+/// `/thinking` overlay commands change just the current session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingScope {
+    /// Change only the running session. Leaves `config.toml` and the
+    /// in-memory default [`Config`] untouched.
+    SessionOnly,
+    /// Change the running session and persist the choice to
+    /// `config.toml` as the default for new sessions.
+    SessionAndDefault,
+}
+
+/// Apply a confirmed thinking pick to the main agent: stage into the
+/// run config, record on the session log's user thread, and refresh
+/// footer + border. With [`SettingScope::SessionAndDefault`] the
+/// choice is also persisted to `config.toml` as the default for new
+/// sessions. Returns the user-facing notice.
 async fn confirm_thinking_for_main(
     tui: &mut Tui,
     level: Option<ThinkingConfig>,
+    scope: SettingScope,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
     world: &mut SessionWorld,
@@ -3777,10 +3798,16 @@ async fn confirm_thinking_for_main(
             .err()
             .map(|err| format!("(couldn't record in session log: {err})"))
     };
-    // Persist the choice so it survives a restart.
-    let save_note = persist_config(config, |c| {
-        c.thinking = Some(config_thinking_level(level.as_ref()));
-    });
+    // Persist as the new default only when the change should outlive
+    // this session (the settings menu). The `/thinking` overlay
+    // command is session-scoped: it relies on the session-log record
+    // above to survive a resume and leaves the default untouched.
+    let save_note = match scope {
+        SettingScope::SessionAndDefault => persist_config(config, |c| {
+            c.thinking = Some(config_thinking_level(level.as_ref()));
+        }),
+        SettingScope::SessionOnly => None,
+    };
     let mut notice = format!("Thinking effort set to {name}.");
     for note in [save_note, log_note].into_iter().flatten() {
         notice.push(' ');
@@ -3876,12 +3903,15 @@ async fn confirm_thinking_for_sub(
 }
 
 /// Apply a confirmed model pick to the main agent: rebuild the
-/// bundle, stage into the run config, persist to `config.toml`,
-/// record on the session log's user thread, and refresh the footer.
-/// Returns the user-facing notice.
+/// bundle, stage into the run config, record on the session log's
+/// user thread, and refresh the footer. With
+/// [`SettingScope::SessionAndDefault`] the choice is also persisted to
+/// `config.toml` as the default for new sessions. Returns the
+/// user-facing notice.
 async fn confirm_model_for_main(
     tui: &mut Tui,
     info: ModelInfo,
+    scope: SettingScope,
     auth: &AuthStorage,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     config: &Arc<std::sync::Mutex<Config>>,
@@ -3945,15 +3975,22 @@ async fn confirm_model_for_main(
                     .err()
                     .map(|err| format!("(couldn't record in session log: {err})"))
             };
-            // Persist the model choice (provider + id) so it survives
-            // a restart. `model_url` is intentionally left untouched:
-            // it's a user-supplied endpoint override, not part of
-            // "which model", and pinning the catalog's base URL into
-            // it would freeze out future `models.json` updates.
-            let save_note = persist_config(config, |c| {
-                c.model_api = Some(info.provider.clone());
-                c.model_name = Some(info.id.clone());
-            });
+            // Persist the model choice (provider + id) as the new
+            // default only when the change should outlive this session
+            // (the settings menu). The `/model` overlay command is
+            // session-scoped: it relies on the session-log record above
+            // to survive a resume and leaves the default untouched.
+            // `model_url` is intentionally left untouched: it's a
+            // user-supplied endpoint override, not part of "which
+            // model", and pinning the catalog's base URL into it would
+            // freeze out future `models.json` updates.
+            let save_note = match scope {
+                SettingScope::SessionAndDefault => persist_config(config, |c| {
+                    c.model_api = Some(info.provider.clone());
+                    c.model_name = Some(info.id.clone());
+                }),
+                SettingScope::SessionOnly => None,
+            };
             let mut notice = format!(
                 "Model set to {} ({}/{}).",
                 info.name, info.provider, info.id
@@ -4117,7 +4154,16 @@ async fn apply_setting_change(
                 push_correction(corrections, tui, MODEL_SETTING_ID, active);
                 return Some(format!("Unknown model {value}."));
             };
-            let notice = confirm_model_for_main(tui, info, auth, run_config, config, world).await;
+            let notice = confirm_model_for_main(
+                tui,
+                info,
+                SettingScope::SessionAndDefault,
+                auth,
+                run_config,
+                config,
+                world,
+            )
+            .await;
             // `confirm_model_for_main` reports a rebuild failure only
             // as notice text; compare the staged key instead so the
             // row reverts to the model that's actually active.
@@ -4131,9 +4177,18 @@ async fn apply_setting_change(
             Some(notice)
         }
         "thinking" => match thinking_config_from_name(value) {
-            Some(level) => {
-                Some(confirm_thinking_for_main(tui, level, run_config, config, world, theme).await)
-            }
+            Some(level) => Some(
+                confirm_thinking_for_main(
+                    tui,
+                    level,
+                    SettingScope::SessionAndDefault,
+                    run_config,
+                    config,
+                    world,
+                    theme,
+                )
+                .await,
+            ),
             None => Some(format!("Unknown thinking level {value:?}.")),
         },
         "thinking_display" => {
@@ -4517,6 +4572,7 @@ async fn handle_selector_outcome(
                             confirm_thinking_for_main(
                                 tui,
                                 level,
+                                SettingScope::SessionOnly,
                                 &run_config,
                                 &config,
                                 world,
@@ -4543,8 +4599,16 @@ async fn handle_selector_outcome(
                 Some(ModelSelectorOutcome::Confirmed(info)) => {
                     let notice = match *target {
                         AgentId::Main => {
-                            confirm_model_for_main(tui, info, auth, &run_config, &config, world)
-                                .await
+                            confirm_model_for_main(
+                                tui,
+                                info,
+                                SettingScope::SessionOnly,
+                                auth,
+                                &run_config,
+                                &config,
+                                world,
+                            )
+                            .await
                         }
                         AgentId::Sub(n) => confirm_model_for_sub(tui, info, n, auth, world).await,
                     };
@@ -5424,11 +5488,14 @@ mod tests {
     }
 
     /// Mount a thinking selector with a pre-filled outcome and poll
-    /// it through [`handle_selector_outcome`] for `target`.
+    /// it through [`handle_selector_outcome`] for `target`, against
+    /// the given default `config` so a test can assert whether the
+    /// persisted default was touched.
     async fn confirm_thinking(
         tui: &mut Tui,
         world: &mut SessionWorld,
         run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+        config: &Arc<std::sync::Mutex<Config>>,
         target: AgentId,
         level: Option<ThinkingConfig>,
     ) -> SelectorTransition {
@@ -5448,7 +5515,7 @@ mod tests {
             },
             &auth,
             Arc::clone(run_config),
-            Arc::new(std::sync::Mutex::new(Config::default())),
+            Arc::clone(config),
             &[],
             world,
             &theme,
@@ -5472,6 +5539,16 @@ mod tests {
         log.linearize(&head, filter).settings()
     }
 
+    /// Read the settings the main agent's user thread folds to.
+    async fn main_thread_settings(
+        log: &Arc<TokioMutex<ConversationLog>>,
+    ) -> aj_session::SessionSettings {
+        let log = log.lock().await;
+        let filter = ThreadFilter::USER;
+        let head = log.latest_leaf(filter).expect("user thread has a leaf");
+        log.linearize(&head, filter).settings()
+    }
+
     /// Confirming a thinking pick while targeting a live sub-agent
     /// stages an override, records the change on the sub's log
     /// thread, refreshes the sub's footer entry, and leaves the run
@@ -5481,11 +5558,13 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let (mut world, run_config, mut tui) = world_with_sub(&persistence).await;
+        let config = Arc::new(std::sync::Mutex::new(Config::default()));
 
         let outcome = confirm_thinking(
             &mut tui,
             &mut world,
             &run_config,
+            &config,
             AgentId::Sub(1),
             Some(ThinkingConfig::High),
         )
@@ -5530,11 +5609,13 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let (mut world, run_config, mut tui) = world_with_sub(&persistence).await;
+        let config = Arc::new(std::sync::Mutex::new(Config::default()));
 
         let outcome = confirm_thinking(
             &mut tui,
             &mut world,
             &run_config,
+            &config,
             AgentId::Sub(99),
             Some(ThinkingConfig::High),
         )
@@ -5559,6 +5640,65 @@ mod tests {
         );
         let cfg = run_config.lock().expect("run config mutex poisoned");
         assert_eq!(cfg.thinking, None, "run config untouched");
+    }
+
+    /// The `/thinking` overlay command for the main agent is
+    /// session-scoped: it stages into the run config and records on
+    /// the user thread (so a resume of this session restores it) but
+    /// leaves `config.toml`'s persisted default untouched.
+    #[tokio::test]
+    async fn thinking_confirm_for_main_is_session_scoped() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("unused")]);
+        let mut world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
+        while let Ok(event) = world.event_rx.try_recv() {
+            world.pump.handle(&mut tui, &event);
+        }
+
+        let config = Arc::new(std::sync::Mutex::new(Config::default()));
+        let baseline_thinking = config.lock().expect("config mutex poisoned").thinking;
+
+        let outcome = confirm_thinking(
+            &mut tui,
+            &mut world,
+            &run_config,
+            &config,
+            AgentId::Main,
+            Some(ThinkingConfig::High),
+        )
+        .await;
+
+        match outcome {
+            SelectorTransition::Close(effects) => {
+                assert_eq!(
+                    effects.notice.as_deref(),
+                    Some("Thinking effort set to high.")
+                )
+            }
+            _ => panic!("expected the selector to close"),
+        }
+        assert_eq!(
+            run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .thinking,
+            Some(ThinkingConfig::High),
+            "run config staged for this session"
+        );
+        assert_eq!(
+            main_thread_settings(&world.log).await.thinking.as_deref(),
+            Some("high"),
+            "change recorded on the user thread so a resume restores it"
+        );
+        assert_eq!(
+            config.lock().expect("config mutex poisoned").thinking,
+            baseline_thinking,
+            "config.toml default left unchanged"
+        );
     }
 
     /// Confirming a model pick while targeting a live sub-agent stages a
@@ -5647,6 +5787,93 @@ mod tests {
         );
         let cfg = run_config.lock().expect("run config mutex poisoned");
         assert_eq!(cfg.model_info.id, "scripted", "run config untouched");
+    }
+
+    /// The `/model` overlay command for the main agent is
+    /// session-scoped: it stages the swap into the run config and
+    /// records it on the user thread (so a resume of this session
+    /// restores it) but leaves `config.toml`'s persisted default
+    /// untouched.
+    #[tokio::test]
+    async fn model_confirm_for_main_is_session_scoped() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![finalized_text_message("unused")]);
+        let mut world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        let theme = ThemeHandle::new(Theme::bundled_dark());
+        let mut tui = Tui::new(Box::new(StubTerminal));
+        build_layout(&mut tui, &theme, true);
+        while let Ok(event) = world.event_rx.try_recv() {
+            world.pump.handle(&mut tui, &event);
+        }
+
+        // A pickable catalog entry whose api has a registered
+        // provider; key resolution is lazy, so no credentials are
+        // needed to build the bundle.
+        let info = ModelInfo {
+            id: "claude-x".to_string(),
+            name: "claude-x".to_string(),
+            api: "anthropic-messages".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            context_window: 1_000,
+            ..scripted_model_info()
+        };
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        use crate::modes::interactive::components::model_selector::ModelSelectorComponent;
+        let inner =
+            ModelSelectorComponent::new(select_list_theme(&theme), vec![info.clone()], None, None);
+        let outcome = inner.outcome_handle();
+        let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
+        outcome.set(ModelSelectorOutcome::Confirmed(info.clone()));
+
+        let config = Arc::new(std::sync::Mutex::new(Config::default()));
+
+        let result = handle_selector_outcome(
+            &mut tui,
+            &OpenSelector::Model {
+                handle,
+                outcome,
+                target: AgentId::Main,
+            },
+            &auth,
+            Arc::clone(&run_config),
+            Arc::clone(&config),
+            &[],
+            &mut world,
+            &theme,
+            &RenderSettings::new(false, false, true),
+            &mut ThemeWatch {
+                _guard: None,
+                rx: None,
+            },
+        )
+        .await;
+
+        match result {
+            SelectorTransition::Close(effects) => assert_eq!(
+                effects.notice.as_deref(),
+                Some("Model set to claude-x (anthropic/claude-x).")
+            ),
+            _ => panic!("expected the selector to close"),
+        }
+        assert_eq!(
+            run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .model_key,
+            ("anthropic".to_string(), "claude-x".to_string()),
+            "run config staged for this session"
+        );
+        assert_eq!(
+            main_thread_settings(&world.log).await.model,
+            Some(("anthropic".to_string(), "claude-x".to_string())),
+            "change recorded on the user thread so a resume restores it"
+        );
+        let cfg = config.lock().expect("config mutex poisoned");
+        assert_eq!(cfg.model_api, None, "config.toml default left unchanged");
+        assert_eq!(cfg.model_name, None, "config.toml default left unchanged");
     }
 
     // ---- Agent picker: background tasks ------------------------------------

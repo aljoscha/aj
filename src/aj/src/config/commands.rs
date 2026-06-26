@@ -58,7 +58,7 @@ pub const COMMANDS: &[Command] = &[
         name: "thinking",
         title: "thinking effort",
         category: "model",
-        description: "Set the reasoning effort for new turns.",
+        description: "Set the reasoning effort for this session.",
         action_id: None,
         action: CommandAction::OpenThinkingSelector,
     },
@@ -66,7 +66,7 @@ pub const COMMANDS: &[Command] = &[
         name: "model",
         title: "use",
         category: "model",
-        description: "Use a different model.",
+        description: "Use a different model for this session.",
         action_id: None,
         action: CommandAction::OpenModelSelector,
     },
@@ -222,11 +222,15 @@ pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
 pub enum CommandAction {
     /// Open the global command palette overlay.
     OpenCommandPalette,
-    /// Open the thinking-effort selector overlay. The current
-    /// level is highlighted; `Esc` cancels, `Enter` applies.
+    /// Open the thinking-effort selector overlay. The current level
+    /// is highlighted. `Esc` cancels, `Enter` applies. The choice
+    /// affects the current session only. Use the settings window to
+    /// change the default for new sessions.
     OpenThinkingSelector,
     /// Open the model selector overlay. The current model is
-    /// pre-selected; `Esc` cancels, `Enter` applies.
+    /// pre-selected. `Esc` cancels, `Enter` applies. The choice
+    /// affects the current session only. Use the settings window to
+    /// change the default for new sessions.
     OpenModelSelector,
     /// Open the OAuth login provider picker. On confirm the host
     /// starts the provider's browser login flow in a dialog overlay.
