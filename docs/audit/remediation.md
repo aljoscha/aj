@@ -433,6 +433,65 @@ Per-crate progress (work top-to-bottom):
   change beyond removing unused surface. `cargo test -p aj-agent` (78, +2) +
   `-p aj` session tests green, `fmt`/`clippy -p aj-agent --all-targets`
   clean, `cargo check --workspace` confirms no consumer drift.
+- aj-session — `DONE` (the three Majors + the `anyhow` Minor + the §N comment
+  Nit were verify-only, retired by themed work: per-line durability docs
+  softened by R5, the file-lock/colliding-id concern resolved by R6's random
+  `mint_id`, `repair`/listener `anyhow` by R11, and the `{:08}`
+  lexicographic-sort Nit made moot by R6's random ids. Cross-checked the live
+  items against the reference, which is structurally close and heavily used in
+  production. **#3 replay-drops-timestamp (Major): ACCEPTED-AS-IS + doc.** The
+  reference's authoritative activity time is read straight off disk during
+  session enumeration (`getMessageActivityTime`/`buildSessionInfo`), exactly
+  our `stats()`/`SessionPreview`. Its `AgentEvent` carries no timestamp slot
+  and the live TUI renders no per-message clock time or turn duration. Ours
+  matches (wire-message timestamps are `0` even live, the event pump never
+  reads one). Threading `entry.timestamp` into replay events would invent a
+  consumer neither codebase has, so documented the design on the `replay`
+  module instead. **#5 truncated-turn-replayed-as-complete (Minor): doc.** The
+  reference protects the model context with the same two layers we have:
+  synthesize results for orphaned tool_calls plus *skip* `error`/`aborted`
+  assistant turns (`transform-messages.ts`), the analog of our `repair.rs` +
+  `transform_messages` rule 5. So the hole is already closed for the context,
+  and we documented the two-layer protection and the narrow residual on
+  `append` and the `repair` module. **#6 preview double-open (Minor): fixed to
+  match the reference.** Its `buildSessionInfo` reads each file once, validating the
+  header inline in the same streaming pass and letting the progress total be
+  the raw file count. Made `read_session_preview_file` return
+  `Option<SessionPreview>` (`Ok(None)` when the first non-empty line isn't the
+  current shape), dropped the up-front `looks_like_new_format` filter from
+  `preview_candidates`, and have the walk apply the format gate inline so each
+  file opens once. A read error also drops the file (rather than the old
+  near-dead placeholder row), matching the reference's `buildSessionInfo` and
+  our own `list_sessions`, so the now-unused `SessionPreview::placeholder` was
+  removed. `list_sessions` keeps the standalone check. Folded in #11
+  (the `match { _ => {} }` became an `if let`). **#7 over-broad pub surface
+  (Minor): narrowed.** The reference's `SessionManager` keeps all index state
+  private and exposes no public mutation handle, so narrowed `ConversationView`
+  (the mutation handle, in no public signature) to `pub(crate)` (dropped from
+  the `lib.rs` re-export, reworded the `aj-agent` doc reference, gated the
+  test-only `head()` with `#[cfg(test)]`), demoted `Conversation::from_entries`
+  to `pub(crate)`, and removed the dead-everywhere `Conversation::conversation_id`,
+  `Conversation::{len,is_empty}` (2 test sites rewritten to `.entries().len()`),
+  and `ConversationView::as_conversation`. Kept the read accessors public
+  (the reference keeps its read API public) and `EntryId` a `pub` string alias
+  (the reference uses plain string ids, and the id-newtype idea was declined in
+  the aj-agent-contracts sweep). **#8 linearize-silently-truncates (Minor): warn +
+  doc.** The reference's production `getBranch` is also silently-stop and
+  documents orphan-as-root as intentional, so kept the non-erroring behavior
+  but added a `tracing::warn!` (consistent with the existing missing-`first_kept`
+  warn) and documented the partial-view contract. **#10 mint ceiling:
+  ACCEPTED-AS-IS** (the `{:08}` half moot post-R6, the `mint_unique_path`
+  ceiling already carries its justifying comment). Converted the touched
+  `ConversationView` intra-doc links to code spans to avoid new
+  private-intra-doc-link warnings. The pre-existing ones
+  (`projected_agent_messages`/`append_settings_entry`/`read_session_preview_file`)
+  are out of finding scope and left as-is. No on-disk/wire or public-signature change beyond
+  removing/narrowing unused surface. Tests:
+  pre-refactor-skip-keeps-valid-and-counts-all-files, torn-later-line
+  tolerance, and a linearize-broken-parent partial-chain. `cargo test
+  -p aj-session` (83, +3) + `-p aj --lib` (450) green, `fmt`/`clippy
+  --workspace --all-targets` clean, `cargo check --workspace` confirms no
+  consumer drift.)
 
 ---
 

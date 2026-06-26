@@ -6,13 +6,13 @@
 //! crashed process never leaves the two diverging beyond the last
 //! line (which [`ConversationLog::resume`] tolerates with a warning).
 //!
-//! [`ConversationView`] is a short-lived mutation handle that tracks
-//! a head pointer and routes appends to a specific thread (the
-//! user's main conversation, or one sub-agent subtree). It writes
+//! `ConversationView` is a short-lived, crate-internal mutation handle
+//! that tracks a head pointer and routes appends to a specific thread
+//! (the user's main conversation, or one sub-agent subtree). It writes
 //! one JSONL line per call; the write reaches the OS before the call
 //! returns, so the entry survives a crash of *this* process. It is
 //! deliberately not `fsync`'d, so a host crash or power loss can still
-//! lose the most recent line(s) — [`ConversationLog::resume`] tolerates
+//! lose the most recent line(s). [`ConversationLog::resume`] tolerates
 //! a torn final line with a warning.
 //!
 //! [`Conversation`] is the read-only linearized projection consumed
@@ -277,8 +277,7 @@ pub struct SessionSettings {
 }
 
 /// A linearized, read-only view of (a slice of) a conversation log. Produced
-/// by [ConversationLog::linearize] / [ConversationView::as_conversation] and
-/// passed to the model for inference.
+/// by [ConversationLog::linearize] and passed to the model for inference.
 ///
 /// The view carries both the underlying [`ConversationEntry`] sequence
 /// (for callers that need entry-level provenance, e.g. resume-time
@@ -293,32 +292,18 @@ pub struct Conversation {
 
 impl Conversation {
     /// Construct a read-only view from a conversation id and a linear list
-    /// of entries.
-    pub fn from_entries(conversation_id: String, entries: Vec<ConversationEntry>) -> Self {
+    /// of entries. Crate-internal: external callers obtain a `Conversation`
+    /// from [`ConversationLog::linearize`], never by hand.
+    pub(crate) fn from_entries(conversation_id: String, entries: Vec<ConversationEntry>) -> Self {
         Self {
             conversation_id,
             entries,
         }
     }
 
-    /// Get the conversation ID (the filename stem of the log).
-    pub fn conversation_id(&self) -> &str {
-        &self.conversation_id
-    }
-
     /// Get all entries in this linearized view.
     pub fn entries(&self) -> &[ConversationEntry] {
         &self.entries
-    }
-
-    /// Get the number of total entries in the view.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if the view is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Get the number of message entries only (excluding system prompt).
@@ -659,6 +644,20 @@ impl ConversationLog {
     /// for both paths, so all read-side queries (`latest_leaf`,
     /// `system_prompt_id`, `linearize`, …) behave the same way
     /// regardless of whether the entry has been flushed yet.
+    ///
+    /// NOTE: the crash-consistency unit is the finalized line. A turn
+    /// aborted before its assistant `MessageEnd` line is written is
+    /// simply absent on resume (good), but an assistant message whose
+    /// line *was* written with truncated content is replayed verbatim,
+    /// i.e. treated as authoritative. The log can't tell a complete
+    /// turn from a content-truncated one once both are well-formed JSON.
+    /// Two layers keep such a turn out of the model's context anyway:
+    /// `repair_interrupted_tool_uses` synthesizes results for dangling
+    /// tool_calls on resume, and `aj_models::transform::transform_messages`
+    /// drops assistant turns whose `stop_reason` is `Error`/`Aborted`
+    /// before each inference. The residual hole (a content-truncated turn
+    /// persisted with a clean `stop_reason`) is narrow, since a truncated
+    /// stream finalizes as a retryable error rather than a clean stop.
     pub fn append(
         &mut self,
         parent_id: Option<EntryId>,
@@ -782,11 +781,20 @@ impl ConversationLog {
     /// entries matching `filter`. Returns the entries in chronological
     /// (root-first) order, wrapped in a read-only [Conversation] view
     /// that can be handed to the model.
+    ///
+    /// A broken chain (a `parent_id` pointing at an entry not in the log)
+    /// yields a *partial* view rather than an error: the walk stops at the
+    /// break, so the root and everything above it are dropped. Append
+    /// validates that a parent exists, so this only arises on a corrupt or
+    /// hand-edited file (or the sibling-branch case two concurrent writers
+    /// produce). We warn so the truncation is observable but keep going,
+    /// matching the resume/compaction tolerance for damaged logs.
     pub fn linearize(&self, head: &EntryId, filter: ThreadFilter) -> Conversation {
         let mut out: Vec<ConversationEntry> = Vec::new();
         let mut cursor: Option<EntryId> = Some(head.clone());
         while let Some(id) = cursor {
             let Some(entry) = self.entries.get(&id) else {
+                tracing::warn!("linearize: entry {id} missing from log, returning a partial chain");
                 break;
             };
             if filter.matches(entry) {
@@ -1041,11 +1049,14 @@ impl ConversationLog {
 /// A mutation handle into a [ConversationLog] that tracks where the next
 /// append attaches (`head`) and which thread it belongs to.
 ///
-/// Each `add_*` method serializes and writes one line to disk before
-/// advancing the head, so every individual event reaches the OS as soon
-/// as the call returns (surviving a crash of this process; not
-/// `fsync`'d, so a power loss can lose the most recent line).
-pub struct ConversationView<'a> {
+/// Crate-internal: the append API is an implementation detail behind
+/// [`crate::persistence_listener`] and [`crate::repair_interrupted_tool_uses`],
+/// not a public surface. Each `add_*` method serializes and writes one
+/// line to disk before advancing the head, so every individual event
+/// reaches the OS as soon as the call returns (surviving a crash of this
+/// process, though not `fsync`'d, so a power loss can lose the most
+/// recent line).
+pub(crate) struct ConversationView<'a> {
     log: &'a mut ConversationLog,
     head: Option<EntryId>,
     thread: ThreadKind,
@@ -1056,7 +1067,7 @@ impl<'a> ConversationView<'a> {
     /// Build a new user-thread view attached to the given head. Pass
     /// `None` for a fresh log (the next append will create the root);
     /// pass the result of `latest_leaf(ThreadFilter::USER)` when resuming.
-    pub fn user(log: &'a mut ConversationLog, head: Option<EntryId>) -> Self {
+    pub(crate) fn user(log: &'a mut ConversationLog, head: Option<EntryId>) -> Self {
         Self {
             log,
             head,
@@ -1070,7 +1081,11 @@ impl<'a> ConversationView<'a> {
     /// user-thread assistant message carrying the spawning `tool_use`;
     /// once inside the subtree it's the latest entry of that subagent's
     /// own thread. `parent_head` must be an existing entry in the log.
-    pub fn subagent(log: &'a mut ConversationLog, parent_head: EntryId, agent_id: usize) -> Self {
+    pub(crate) fn subagent(
+        log: &'a mut ConversationLog,
+        parent_head: EntryId,
+        agent_id: usize,
+    ) -> Self {
         Self {
             log,
             head: Some(parent_head),
@@ -1081,28 +1096,17 @@ impl<'a> ConversationView<'a> {
 
     /// Current head -- the id that will become `parent_id` on the next
     /// append, or `None` if the log is still empty.
-    pub fn head(&self) -> Option<&EntryId> {
+    #[cfg(test)]
+    pub(crate) fn head(&self) -> Option<&EntryId> {
         self.head.as_ref()
-    }
-
-    /// Materialize a read-only linear [Conversation] for the model. Walks
-    /// parent pointers from `head` back, keeping only entries that
-    /// belong to this view's thread (so main-conversation inference
-    /// never sees subagent entries, and vice versa).
-    pub fn as_conversation(&self) -> Conversation {
-        let filter = ThreadFilter {
-            thread: self.thread,
-            agent_id: self.agent_id,
-        };
-        match &self.head {
-            Some(head) => self.log.linearize(head, filter),
-            None => Conversation::from_entries(self.log.session_id().to_string(), Vec::new()),
-        }
     }
 
     /// Append a wire-level message to this thread. Writes one JSONL
     /// line to disk before advancing the head.
-    pub fn add_message(&mut self, message: AgentMessage) -> Result<EntryId, ConversationError> {
+    pub(crate) fn add_message(
+        &mut self,
+        message: AgentMessage,
+    ) -> Result<EntryId, ConversationError> {
         let entry = ConversationEntryKind::Message { message };
         let parent = self.parent_for_next_append();
         let id = self.log.append(parent, self.thread, self.agent_id, entry)?;
@@ -1344,6 +1348,52 @@ mod tests {
         ));
         assert_eq!(convo.message_count(), 1);
         assert_eq!(convo.messages().len(), 1);
+    }
+
+    #[test]
+    fn linearize_returns_partial_chain_on_broken_parent() {
+        // A parent_id pointing at a missing entry (a corrupt or
+        // hand-edited file) truncates the walk at the break instead of
+        // panicking: we get only the entries below the break, and the
+        // root above it is dropped.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+
+        let (session_id, head_b) = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".to_string()).expect("set sp");
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("a")).expect("a");
+            let head_b = view.add_message(user_text("b")).expect("b");
+            (log.session_id().to_string(), head_b)
+        };
+
+        // Tamper: point entry `b`'s parent at a non-existent id.
+        let path = persistence.session_path(&session_id);
+        let tampered: Vec<String> = std::fs::read_to_string(&path)
+            .expect("read log")
+            .lines()
+            .map(|line| {
+                let mut v: serde_json::Value = serde_json::from_str(line).expect("line is json");
+                if v["id"] == serde_json::json!(head_b) {
+                    v["parent_id"] = serde_json::json!("deadbeef");
+                }
+                serde_json::to_string(&v).expect("reserialize")
+            })
+            .collect();
+        std::fs::write(&path, format!("{}\n", tampered.join("\n"))).expect("rewrite");
+
+        let log = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+        let convo = log.linearize(&head_b, ThreadFilter::USER);
+
+        // Only `b` survives. The broken parent drops `a` and the root.
+        assert_eq!(convo.entries().len(), 1);
+        match &convo.entries()[0].entry {
+            ConversationEntryKind::Message { message } => {
+                assert!(matches!(message.as_wire(), Some(Message::User(_))));
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
     }
 
     #[test]

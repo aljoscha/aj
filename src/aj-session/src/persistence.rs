@@ -158,7 +158,11 @@ impl ConversationPersistence {
         let total = candidates.len();
         let mut previews = Vec::with_capacity(total);
         for (i, (session_id, path)) in candidates.into_iter().enumerate() {
-            previews.push(read_preview_or_placeholder(session_id, &path));
+            if let Some(preview) = read_preview(session_id, &path) {
+                previews.push(preview);
+            }
+            // Tick progress for every file, including the pre-refactor
+            // ones that produced no row, so the counter reaches `total`.
             on_progress(i + 1, total);
         }
         Ok(previews)
@@ -172,9 +176,8 @@ impl ConversationPersistence {
     /// the whole walk.
     ///
     /// Mirrors the failure tolerance of [`Self::list_session_previews`]:
-    /// a per-file read error yields a placeholder preview (so the row
-    /// still appears), and a missing or unreadable sessions directory
-    /// emits nothing.
+    /// a pre-refactor or unreadable file is skipped (no row emitted),
+    /// and a missing or unreadable sessions directory emits nothing.
     pub fn list_session_previews_streaming(&self, emit: &mut dyn FnMut(Vec<SessionPreview>)) {
         let candidates = match self.preview_candidates() {
             Ok(c) => c,
@@ -187,16 +190,20 @@ impl ConversationPersistence {
             }
         };
         for (session_id, path) in candidates {
-            emit(vec![read_preview_or_placeholder(session_id, &path)]);
+            if let Some(preview) = read_preview(session_id, &path) {
+                emit(vec![preview]);
+            }
         }
     }
 
     /// Enumerate the session files worth previewing, newest-first.
     ///
-    /// Pre-refactor files (whose first line does not parse as the
-    /// current [`ConversationEntry`] shape) are filtered out up-front so
-    /// the count reflects only files we'll actually surface — otherwise
-    /// a progress bar driven off it would stall partway through.
+    /// Every `.jsonl` file is a candidate. The current-format check runs
+    /// inline in the per-file walk ([`read_session_preview_file`]), so
+    /// each file is opened once rather than once to check the format and
+    /// again to read the preview. A pre-refactor file is dropped during
+    /// that walk, so the progress total counts it but no row appears for
+    /// it, and the counter still reaches the total.
     fn preview_candidates(&self) -> Result<Vec<(String, PathBuf)>, ConversationError> {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
@@ -219,22 +226,33 @@ impl ConversationPersistence {
         Ok(session_files
             .into_iter()
             .map(|id| (id.clone(), self.session_path(&id)))
-            .filter(|(_, p)| Self::looks_like_new_format(p))
             .collect())
     }
 }
 
-/// Read a preview for `path`, falling back to a placeholder on error so
-/// a corrupt or unreadable session file still appears in the selector
-/// instead of dropping out of the listing.
-fn read_preview_or_placeholder(session_id: String, path: &std::path::Path) -> SessionPreview {
-    read_session_preview_file(&session_id, path).unwrap_or_else(|err| {
-        tracing::warn!(
-            "failed to read preview for session {}: {err}",
-            path.display()
-        );
-        SessionPreview::placeholder(session_id, path)
-    })
+/// Read a preview for `path`.
+///
+/// `Ok(None)` means a pre-refactor file (its first non-empty line is not
+/// the current [`ConversationEntry`] shape). It is dropped from the
+/// listing, matching the format gate [`ConversationPersistence::list_sessions`]
+/// applies. A read error (the file vanished or became unreadable between
+/// enumeration and the open) also drops it, the same way `list_sessions`
+/// does, so the two listings stay consistent.
+fn read_preview(session_id: String, path: &std::path::Path) -> Option<SessionPreview> {
+    match read_session_preview_file(&session_id, path) {
+        Ok(Some(preview)) => Some(preview),
+        Ok(None) => {
+            tracing::info!(
+                "skipping pre-refactor session file {} (old on-disk format)",
+                path.display()
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!("skipping unreadable session file {}: {err}", path.display());
+            None
+        }
+    }
 }
 
 /// Metadata about a conversation session.
@@ -267,10 +285,9 @@ pub struct SessionPreview {
     /// Session creation time. Parsed from `session_id` (which is
     /// minted as a millisecond-precision UTC timestamp on
     /// [`crate::log::ConversationLog::create`]). Falls back to
-    /// `modified` when the id doesn't parse — placeholder previews,
-    /// hand-renamed files, or a future filename format that this
-    /// build doesn't recognise still produce a structurally
-    /// complete row.
+    /// `modified` when the id doesn't parse, so hand-renamed files or a
+    /// future filename format this build doesn't recognise still
+    /// produce a structurally complete row.
     pub created_at: DateTime<Utc>,
     /// Time of the most recently appended message-kind entry.
     /// Captured during the JSONL walk in
@@ -299,52 +316,22 @@ pub struct SessionPreview {
     pub first_user_message: Option<String>,
 }
 
-impl SessionPreview {
-    /// Build a minimal preview for a file we could not parse — only
-    /// the id and file-system stat fields are populated. Used as a
-    /// fall-back so a corrupt session file still appears in the
-    /// selector instead of silently dropping out of the listing.
-    fn placeholder(session_id: String, path: &std::path::Path) -> Self {
-        let (modified, size_bytes) = match fs::metadata(path) {
-            Ok(md) => {
-                let modified = md
-                    .modified()
-                    .map(DateTime::<Utc>::from)
-                    .unwrap_or_else(|_| Utc::now());
-                (modified, md.len())
-            }
-            Err(_) => (Utc::now(), 0),
-        };
-        // Parse the creation time from the filename stem; fall back
-        // to `modified` so the row still has a complete metadata
-        // triple to render.
-        let created_at = parse_session_id_created_at(&session_id).unwrap_or(modified);
-        Self {
-            session_id,
-            modified,
-            created_at,
-            // No message-kind entries parsed: the cheap fallback is
-            // the file mtime, matching what `format_age` would have
-            // returned before this field existed.
-            last_message_at: modified,
-            size_bytes,
-            message_count: 0,
-            first_user_message: None,
-        }
-    }
-}
-
 /// Open `path`, walk every JSONL line, and assemble a
 /// [`SessionPreview`].
 ///
-/// Lines that fail to parse are skipped (matching the resume-time
-/// tolerance for truncated trailing lines). The walk is one-pass:
-/// we read every line so `message_count` is accurate, but we stop
-/// updating `first_user_message` once we have one.
+/// Returns `Ok(None)` when the first non-empty line does not parse as a
+/// [`ConversationEntry`], i.e. a pre-refactor file the listing should
+/// drop. This is the current-format gate applied inline so the file is
+/// opened once (the standalone [`ConversationPersistence::looks_like_new_format`]
+/// check stays for `list_sessions`, which doesn't otherwise read the
+/// file). A later line that fails to parse is skipped (matching the
+/// resume-time tolerance for truncated trailing lines). The walk is
+/// one-pass: we read every line so `message_count` is accurate, but we
+/// stop updating `first_user_message` once we have one.
 fn read_session_preview_file(
     session_id: &str,
     path: &std::path::Path,
-) -> Result<SessionPreview, ConversationError> {
+) -> Result<Option<SessionPreview>, ConversationError> {
     let metadata = fs::metadata(path)?;
     let modified = metadata
         .modified()
@@ -359,9 +346,10 @@ fn read_session_preview_file(
     let mut first_user_message: Option<String> = None;
     // Track the largest message-kind timestamp seen so far. Tracking
     // the max (not the last) lets the field tolerate out-of-order
-    // writes — a tool result that lands after a streaming assistant
+    // writes: a tool result that lands after a streaming assistant
     // message finalised, for example.
     let mut last_message_at: Option<DateTime<Utc>> = None;
+    let mut seen_first_entry = false;
 
     for line_res in reader.lines() {
         // A best-effort `Ok(_)`-only path: an IO error mid-file
@@ -374,27 +362,32 @@ fn read_session_preview_file(
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line) else {
-            continue;
+        let entry = match serde_json::from_str::<ConversationEntry>(&line) {
+            Ok(entry) => entry,
+            Err(_) if !seen_first_entry => {
+                // First non-empty line isn't the current entry shape: a
+                // pre-refactor file. Skip the whole file.
+                return Ok(None);
+            }
+            // A later torn/garbage line: skip it, keep what we have.
+            Err(_) => continue,
         };
-        match &entry.entry {
-            ConversationEntryKind::Message { message: msg } => {
-                message_count += 1;
+        seen_first_entry = true;
+        if let ConversationEntryKind::Message { message: msg } = &entry.entry {
+            message_count += 1;
+            if first_user_message.is_none() {
                 if let Some(Message::User(u)) = msg.as_wire() {
-                    if first_user_message.is_none() {
-                        if let Some(text) = first_user_text(&u.content) {
-                            first_user_message = Some(text);
-                        }
+                    if let Some(text) = first_user_text(&u.content) {
+                        first_user_message = Some(text);
                     }
                 }
-                if let Some(ts) = entry.timestamp {
-                    last_message_at = Some(match last_message_at {
-                        Some(prev) if prev >= ts => prev,
-                        _ => ts,
-                    });
-                }
             }
-            _ => {}
+            if let Some(ts) = entry.timestamp {
+                last_message_at = Some(match last_message_at {
+                    Some(prev) if prev >= ts => prev,
+                    _ => ts,
+                });
+            }
         }
     }
 
@@ -412,7 +405,7 @@ fn read_session_preview_file(
     // single-field design.
     let last_message_at = last_message_at.unwrap_or(modified);
 
-    Ok(SessionPreview {
+    Ok(Some(SessionPreview {
         session_id: session_id.to_string(),
         modified,
         created_at,
@@ -420,7 +413,7 @@ fn read_session_preview_file(
         size_bytes,
         message_count,
         first_user_message,
-    })
+    }))
 }
 
 /// Parse a session id minted by [`crate::log::ConversationLog::create`]
@@ -432,8 +425,8 @@ fn read_session_preview_file(
 /// stem against the same `chrono` format string the minter uses, so
 /// the round-trip is exact.
 ///
-/// Returns `None` for any stem that doesn't conform — placeholder
-/// ids, hand-renamed files, or future format changes. The caller
+/// Returns `None` for any stem that doesn't conform, such as
+/// hand-renamed files or future format changes. The caller
 /// falls back to file mtime in that case so the row still renders.
 pub(crate) fn parse_session_id_created_at(session_id: &str) -> Option<DateTime<Utc>> {
     // Strip a trailing `_<digits>` collision suffix. The mint side
@@ -635,6 +628,60 @@ mod tests {
 
         let previews = persistence.list_session_previews(|_, _| {}).expect("list");
         assert!(previews.is_empty(), "got {previews:?}");
+    }
+
+    #[test]
+    fn list_session_previews_keeps_valid_alongside_pre_refactor_and_counts_all_files() {
+        // A pre-refactor file is dropped from the rows but still counts
+        // toward the progress total (it's walked in the same single pass
+        // as the valid files), so the loaded counter reaches the total
+        // even though fewer rows appear.
+        let (_dir, persistence) = fixture();
+        let sessions_dir = persistence.sessions_dir().to_path_buf();
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        std::fs::write(sessions_dir.join("old.jsonl"), "not json at all\n").expect("write old");
+
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello", "hi");
+
+        let progress = RefCell::new(Vec::<(usize, usize)>::new());
+        let previews = persistence
+            .list_session_previews(|loaded, total| progress.borrow_mut().push((loaded, total)))
+            .expect("list");
+
+        assert_eq!(previews.len(), 1, "only the valid session yields a row");
+        assert_eq!(previews[0].session_id, log.session_id());
+        let progress = progress.into_inner();
+        assert_eq!(progress.last(), Some(&(2, 2)), "both files tick progress");
+    }
+
+    #[test]
+    fn read_session_preview_file_tolerates_a_torn_later_line() {
+        // The first line gates the format (a valid entry here), so a
+        // garbage line *after* it is skipped rather than dropping the
+        // whole file, matching the resume truncated-line tolerance.
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello", "hi");
+        let path = log.path().to_path_buf();
+        let session_id = log.session_id().to_string();
+        drop(log);
+
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .expect("read log")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Insert garbage after the first valid line.
+        lines.insert(1, "}{ this is not json".to_string());
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("rewrite");
+
+        let preview = read_session_preview_file(&session_id, &path)
+            .expect("read")
+            .expect("a valid first line keeps the file");
+        // The two messages survive. Only the torn line is skipped.
+        assert_eq!(preview.message_count, 2);
+        assert_eq!(preview.first_user_message.as_deref(), Some("hello"));
     }
 
     #[test]

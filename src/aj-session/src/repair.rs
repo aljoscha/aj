@@ -2,15 +2,25 @@
 //!
 //! A process killed between writing the assistant message and writing
 //! the matching tool_result message leaves the log in a state that
-//! both Anthropic and OpenAI APIs reject on resume — `tool_call`
-//! blocks must be answered by `tool_result` messages before the next
+//! both Anthropic and OpenAI APIs reject on resume. A `tool_call`
+//! block must be answered by a `tool_result` message before the next
 //! inference. [`repair_interrupted_tool_uses`] walks a linearized
 //! [`Conversation`], detects dangling `tool_call` ids, and synthesizes
 //! one error-flagged tool_result message per dangling id anchored at
 //! the conversation's current head.
 //!
+//! Scope: this heals exactly the dangling-`tool_call` shape, the one a
+//! crash mid-tool-use produces and the one the providers reject. It does
+//! not flag or trim an assistant turn whose content was truncated but
+//! whose line is well-formed. That turn is replayed as authoritative (see
+//! [`crate::log::ConversationLog::append`]). The in-memory context build
+//! (`aj_models::transform::transform_messages`) is the other half: it
+//! drops `Error`/`Aborted` assistant turns before each inference, so a
+//! truncated turn that finalized as an error never reaches the model even
+//! though it stays in the log and the scrollback.
+//!
 //! Owned by `aj-session` because it operates on log entries and
-//! writes through [`ConversationView`]. The binary calls it once on
+//! writes through `ConversationView`. The binary calls it once on
 //! startup, after resolving the system prompt and before seeding the
 //! agent's in-memory transcript.
 
@@ -187,7 +197,7 @@ mod tests {
             .latest_leaf(ThreadFilter::USER)
             .expect("user head exists");
         let convo = log.linearize(&head, ThreadFilter::USER);
-        let entry_count_before = convo.len();
+        let entry_count_before = convo.entries().len();
         let repaired = repair_interrupted_tool_uses(&mut log, &convo).expect("repair");
         assert!(!repaired, "should not have synthesized anything");
 
@@ -195,7 +205,7 @@ mod tests {
             .latest_leaf(ThreadFilter::USER)
             .expect("user head exists");
         let convo = log.linearize(&head, ThreadFilter::USER);
-        assert_eq!(convo.len(), entry_count_before);
+        assert_eq!(convo.entries().len(), entry_count_before);
     }
 
     #[test]

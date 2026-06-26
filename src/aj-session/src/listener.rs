@@ -7,7 +7,7 @@
 //! of every inference, and one tool_result message per tool call in
 //! a tool batch. A persistence listener subscribed to the agent's
 //! bus owns the [`ConversationLog`] handle and translates each
-//! [`MessageEnd`] event into one [`ConversationView::add_message`]
+//! [`MessageEnd`] event into one `ConversationView::add_message`
 //! call.
 //!
 //! Because the bus awaits each listener inline, the listener

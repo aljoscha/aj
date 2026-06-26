@@ -945,7 +945,7 @@ impl Agent {
     /// outputs, tool-result user message) flow out as
     /// [`AgentEvent::MessageEnd`] events. The persistence
     /// listener subscribed on the bus translates them into
-    /// `aj_session::ConversationView` appends, one JSONL line per
+    /// `aj-session` log appends, one JSONL line per
     /// event, so the on-disk state stays at-most one event behind
     /// reality.
     ///

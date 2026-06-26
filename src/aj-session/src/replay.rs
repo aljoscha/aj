@@ -73,6 +73,22 @@
 //! that first `Message` entry, with the task taken from its user
 //! text and default settings (empty provider/model, thinking "off",
 //! speed "standard").
+//!
+//! ## Timestamps
+//!
+//! Replay does not stamp the synthesized events with a wall-clock time,
+//! and intentionally so. [`AgentEvent`] carries no timestamp slot, and
+//! no frontend renders a per-message "sent at" or a turn duration off
+//! the event stream. The authoritative append time lives on
+//! [`ConversationEntry::timestamp`] and is read straight off the log by
+//! the session-listing surfaces ([`ConversationLog::stats`] and
+//! [`crate::persistence::SessionPreview`]), so a resumed session reports
+//! the same activity times as a live one without threading anything
+//! through replay. The projected wire messages keep their own
+//! `timestamp` field as persisted (today the live path leaves it `0`).
+//!
+//! [`ConversationEntry::timestamp`]: crate::log::ConversationEntry::timestamp
+//! [`ConversationLog::stats`]: crate::log::ConversationLog::stats
 
 use std::collections::{HashMap, HashSet};
 
