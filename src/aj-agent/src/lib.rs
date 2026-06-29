@@ -2309,7 +2309,7 @@ impl SessionState {
     }
 
     fn accumulate_usage(&self, delta: &Usage) {
-        accumulate_usage(&mut self.lock().accumulated_usage, delta);
+        self.lock().accumulated_usage.accumulate(delta);
     }
 
     fn next_sub_agent_id(&self) -> usize {
@@ -3187,23 +3187,6 @@ fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
         ThinkingConfig::XHigh => ThinkingLevel::XHigh,
         ThinkingConfig::Max => ThinkingLevel::Max,
     }
-}
-
-/// Sum `other` into `acc`. Counters are added; the cost subfield
-/// is summed dimension-by-dimension. `total_tokens` is recomputed
-/// off the per-dimension counters so it stays internally
-/// consistent with `input + output + cache_read + cache_write`.
-fn accumulate_usage(acc: &mut Usage, other: &Usage) {
-    acc.input += other.input;
-    acc.output += other.output;
-    acc.cache_read += other.cache_read;
-    acc.cache_write += other.cache_write;
-    acc.total_tokens += other.total_tokens;
-    acc.cost.input += other.cost.input;
-    acc.cost.output += other.cost.output;
-    acc.cost.cache_read += other.cost.cache_read;
-    acc.cost.cache_write += other.cost.cache_write;
-    acc.cost.total += other.cost.total;
 }
 
 /// Build the canonical `is_error: true` [`ToolOutcome`] used when a

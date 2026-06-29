@@ -189,6 +189,28 @@ pub struct Usage {
     pub cost: UsageCost,
 }
 
+impl Usage {
+    /// Add another response's usage into this running total.
+    ///
+    /// Every token category and every dollar figure is summed dimension
+    /// by dimension, including `total_tokens` and `cost.total`. A
+    /// per-response figure already satisfies `total_tokens == input +
+    /// output + cache_read + cache_write`, so summing keeps the aggregate
+    /// internally consistent.
+    pub fn accumulate(&mut self, other: &Usage) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.total_tokens += other.total_tokens;
+        self.cost.input += other.cost.input;
+        self.cost.output += other.cost.output;
+        self.cost.cache_read += other.cost.cache_read;
+        self.cost.cache_write += other.cost.cache_write;
+        self.cost.total += other.cost.total;
+    }
+}
+
 /// Dollar costs broken down by token category.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct UsageCost {
@@ -785,6 +807,51 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accumulate_sums_every_token_and_cost_dimension() {
+        let mut acc = Usage {
+            input: 100,
+            output: 50,
+            cache_read: 20,
+            cache_write: 10,
+            total_tokens: 180,
+            cost: UsageCost {
+                input: 0.10,
+                output: 0.20,
+                cache_read: 0.02,
+                cache_write: 0.01,
+                total: 0.33,
+            },
+        };
+        let other = Usage {
+            input: 200,
+            output: 80,
+            cache_read: 5,
+            cache_write: 15,
+            total_tokens: 300,
+            cost: UsageCost {
+                input: 0.25,
+                output: 0.40,
+                cache_read: 0.005,
+                cache_write: 0.015,
+                total: 0.67,
+            },
+        };
+
+        acc.accumulate(&other);
+
+        assert_eq!(acc.input, 300);
+        assert_eq!(acc.output, 130);
+        assert_eq!(acc.cache_read, 25);
+        assert_eq!(acc.cache_write, 25);
+        assert_eq!(acc.total_tokens, 480);
+        assert!((acc.cost.input - 0.35).abs() < 1e-9);
+        assert!((acc.cost.output - 0.60).abs() < 1e-9);
+        assert!((acc.cost.cache_read - 0.025).abs() < 1e-9);
+        assert!((acc.cost.cache_write - 0.025).abs() < 1e-9);
+        assert!((acc.cost.total - 1.00).abs() < 1e-9);
+    }
 
     #[test]
     fn test_message_roundtrip() {

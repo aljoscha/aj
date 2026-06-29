@@ -79,6 +79,14 @@ fn build_items(stats: &SessionStats) -> Vec<SelectItem> {
         kv("compactions", &stats.compactions.to_string()),
         kv("log entries", &stats.total_entries.to_string()),
         Row::Blank,
+        Row::Header("Usage".to_string()),
+        kv("input", &stats.usage.input.to_string()),
+        kv("output", &stats.usage.output.to_string()),
+        kv("cache read", &stats.usage.cache_read.to_string()),
+        kv("cache write", &stats.usage.cache_write.to_string()),
+        kv("total tokens", &stats.usage.total_tokens.to_string()),
+        kv("cost", &cost_label(stats.usage.cost.total)),
+        Row::Blank,
         Row::Header(format!("Tool calls ({})", stats.tool_calls)),
     ];
 
@@ -164,11 +172,19 @@ fn size_label(bytes: Option<u64>) -> String {
     }
 }
 
+/// Format the aggregate session cost as a dollar figure. Four decimal
+/// places so a sub-cent session still shows a non-zero amount, matching
+/// the HTML export's cost line.
+fn cost_label(total: f64) -> String {
+    format!("${total:.4}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use aj_models::types::{Usage, UsageCost};
     use aj_session::SessionSettings;
     use aj_tui::component::Component;
     use aj_tui::keys::Key;
@@ -202,6 +218,20 @@ mod tests {
             tool_call_counts: vec![("read_file".to_string(), 12), ("Bash".to_string(), 8)],
             subagents: 2,
             compactions: 1,
+            usage: Usage {
+                input: 1_000,
+                output: 2_000,
+                cache_read: 500,
+                cache_write: 250,
+                total_tokens: 3_750,
+                cost: UsageCost {
+                    input: 0.10,
+                    output: 0.20,
+                    cache_read: 0.01,
+                    cache_write: 0.02,
+                    total: 0.33,
+                },
+            },
             settings: SessionSettings {
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
                 thinking: Some("medium".to_string()),
@@ -223,6 +253,10 @@ mod tests {
         assert!(body.contains("48 KB"), "{body}");
         assert!(body.contains("read_file"), "{body}");
         assert!(body.contains("Tool calls (31)"), "{body}");
+        // The usage section reports aggregate tokens and the dollar cost.
+        assert!(body.contains("Usage"), "{body}");
+        assert!(body.contains("total tokens"), "{body}");
+        assert!(body.contains("$0.3300"), "{body}");
     }
 
     #[test]

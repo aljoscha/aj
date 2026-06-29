@@ -2,14 +2,15 @@
 //!
 //! [`SessionStats`] is the read-only digest behind a "session info" view:
 //! identity (id, on-disk path), timing, message counts broken out by kind,
-//! a per-tool call breakdown, and the settings the session is running with.
-//! It is computed in one pass over every entry across all threads, so the
-//! message and tool-call totals include sub-agent activity.
+//! a per-tool call breakdown, aggregate token usage and dollar cost, and
+//! the settings the session is running with. It is computed in one pass
+//! over every entry across all threads, so the message, tool-call, and
+//! usage totals include sub-agent activity.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use aj_models::types::{AssistantContent, Message};
+use aj_models::types::{AssistantContent, Message, Usage};
 use chrono::{DateTime, Utc};
 
 use crate::log::{ConversationEntryKind, ConversationLog, SessionSettings, ThreadFilter};
@@ -57,6 +58,14 @@ pub struct SessionStats {
     pub subagents: usize,
     /// Compaction checkpoints recorded in this session.
     pub compactions: usize,
+    /// Aggregate token usage and dollar cost, summed over every assistant
+    /// message in the file. Like the other counts this spans all threads
+    /// and branches, so it reflects total spend on the session rather than
+    /// the cost of the currently projected conversation. The cost figures
+    /// are the per-response amounts recorded when each response arrived, so
+    /// a model whose pricing was unknown contributes zero and a non-trivial
+    /// token count can still report a zero cost.
+    pub usage: Usage,
     /// Model / thinking / speed currently recorded on the user thread.
     pub settings: SessionSettings,
 }
@@ -77,6 +86,7 @@ impl ConversationLog {
         let mut subagents = 0;
         let mut compactions = 0;
         let mut total_entries = 0;
+        let mut usage = Usage::default();
         let mut last_activity: Option<DateTime<Utc>> = None;
         let mut per_tool: HashMap<String, usize> = HashMap::new();
 
@@ -91,6 +101,7 @@ impl ConversationLog {
                         Some(Message::User(_)) => user_messages += 1,
                         Some(Message::Assistant(a)) => {
                             assistant_messages += 1;
+                            usage.accumulate(&a.usage);
                             for content in &a.content {
                                 if let AssistantContent::ToolCall(call) = content {
                                     tool_calls += 1;
@@ -130,6 +141,7 @@ impl ConversationLog {
             tool_call_counts,
             subagents,
             compactions,
+            usage,
             settings,
         }
     }
@@ -247,5 +259,50 @@ mod tests {
         assert!(stats.tool_call_counts.is_empty());
         assert!(stats.last_activity.is_none());
         assert!(log.latest_leaf(ThreadFilter::USER).is_none());
+    }
+
+    /// Build an assistant message carrying explicit token usage and a
+    /// total dollar cost, used to exercise the per-session aggregation.
+    fn assistant_with_usage(input: u64, output: u64, cost_total: f64) -> Message {
+        let mut usage = Usage {
+            input,
+            output,
+            total_tokens: input + output,
+            ..Usage::default()
+        };
+        usage.cost.total = cost_total;
+        Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Text(text("ok"))],
+            api: "test".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            response_id: None,
+            usage,
+            stop_reason: StopReason::Stop,
+            error: None,
+            timestamp: 0,
+        })
+    }
+
+    /// The digest sums token usage and dollar cost across every assistant
+    /// message in the file.
+    #[test]
+    fn stats_aggregate_usage_across_assistant_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+
+        let mut head = ConversationView::user(&mut log, None);
+        head.add_message(AgentMessage::wire(user("hi"))).unwrap();
+        head.add_message(AgentMessage::wire(assistant_with_usage(100, 50, 0.10)))
+            .unwrap();
+        head.add_message(AgentMessage::wire(assistant_with_usage(200, 80, 0.25)))
+            .unwrap();
+
+        let stats = log.stats();
+        assert_eq!(stats.usage.input, 300);
+        assert_eq!(stats.usage.output, 130);
+        assert_eq!(stats.usage.total_tokens, 430);
+        assert!((stats.usage.cost.total - 0.35).abs() < 1e-9);
     }
 }
