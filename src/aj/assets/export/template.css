@@ -82,7 +82,7 @@ pre code { background: none; padding: 0; }
 .help-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .help-hint { color: var(--muted); font-size: 12px; }
 .help-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-.header-toggle-btn, .download-json-btn {
+.header-toggle-btn {
   cursor: pointer; border: 1px solid var(--border); background: var(--panel);
   color: var(--fg); border-radius: 6px; padding: 3px 9px; font-size: 12px;
 }
@@ -90,15 +90,15 @@ pre code { background: none; padding: 0; }
 .info-label { color: var(--muted); }
 .info-value { word-break: break-word; }
 
-.system-prompt, .tools-list {
+.system-prompt {
   margin-top: 14px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--panel); padding: 10px 14px; font-size: 13px;
 }
-.system-prompt-header, .tools-header {
+.system-prompt-header {
   text-transform: uppercase; font-size: 11px; letter-spacing: .05em;
   color: var(--muted); margin-bottom: 6px; cursor: pointer;
 }
-.system-prompt > summary::marker, .tools-list > summary::marker { color: var(--muted); }
+.system-prompt > summary::marker { color: var(--muted); }
 .system-prompt pre { margin: 0; }
 
 /* Messages */
@@ -110,7 +110,6 @@ pre code { background: none; padding: 0; }
 .msg.user .role { color: var(--user); }
 .msg.assistant .role { color: var(--assistant); }
 .role .model { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
-.msg.highlight { outline: 2px solid var(--link); outline-offset: 2px; transition: outline-color .4s; }
 
 /* Markdown content */
 .markdown-content > *:first-child { margin-top: 0; }
@@ -125,12 +124,7 @@ pre code { background: none; padding: 0; }
 .markdown-content img { max-width: 100%; }
 
 /* Tool calls and results */
-.toolcall {
-  margin: 10px 0 0; color: var(--tool); font-size: 13px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
 .tool-name { font-weight: 600; }
-.toolcall .args { margin-top: 6px; color: var(--fg); }
 .tool-execution {
   margin: 10px 0 0; padding: 8px 12px; border-left: 3px solid var(--tool);
   background: var(--panel2); border-radius: 0 6px 6px 0;
@@ -140,9 +134,7 @@ pre code { background: none; padding: 0; }
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .tool-execution.error .tool-header { color: var(--err); }
 .tool-command { color: var(--tool); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
-.tool-path { color: var(--fg); }
 .summary { color: var(--muted); font-size: 13px; margin: 4px 0; }
-.tool-error { color: var(--err); }
 
 /* Expandable tool output: preview collapsed, full text on expand. */
 .tool-output { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; margin: 4px 0; }

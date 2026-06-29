@@ -63,31 +63,12 @@
       .replace(/'/g, '&#39;');
   }
 
-  // Coerce to a string for display, or null when the value is the wrong
-  // type (a malformed tool argument). Callers show an "[invalid arg]".
-  function str(value) {
-    if (typeof value === 'string') return value;
-    if (value == null) return '';
-    return null;
-  }
-
   function replaceTabs(text) {
     return text.replace(/\t/g, '    ');
   }
 
-  function truncate(s, maxLen) {
-    maxLen = maxLen || 100;
-    return s.length <= maxLen ? s : s.slice(0, maxLen) + '\u2026';
-  }
-
   function normalize(s) {
     return s.replace(/[\n\t]/g, ' ').trim();
-  }
-
-  function shortenPath(p) {
-    if (typeof p !== 'string') return '';
-    const m = p.match(/^\/(?:Users|home)\/[^/]+(\/.*)?$/);
-    return m ? '~' + (m[1] || '') : p;
   }
 
   function formatTokens(count) {
@@ -101,19 +82,6 @@
     if (!ts) return 'unknown';
     const d = new Date(ts);
     return isNaN(d.getTime()) ? 'unknown' : d.toLocaleString();
-  }
-
-  function getLanguageFromPath(filePath) {
-    const ext = (filePath.split('.').pop() || '').toLowerCase();
-    const map = {
-      ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
-      py: 'python', rb: 'ruby', rs: 'rust', go: 'go', java: 'java',
-      c: 'c', cpp: 'cpp', h: 'c', hpp: 'cpp', cs: 'csharp', php: 'php',
-      sh: 'bash', bash: 'bash', zsh: 'bash', sql: 'sql', html: 'html',
-      css: 'css', scss: 'scss', json: 'json', yaml: 'yaml', yml: 'yaml',
-      xml: 'xml', md: 'markdown', toml: 'ini', dockerfile: 'dockerfile',
-    };
-    return map[ext];
   }
 
   // Restrict markdown link/image URLs to a scheme allow-list so a
@@ -182,7 +150,7 @@
   }
 
   function md(text) {
-    return marked.parse(text || '');
+    return marked.parse(text == null ? '' : String(text));
   }
 
   // ============================================================
@@ -395,7 +363,7 @@
       '<span class="sub-head">sub-agent #' + escapeHtml(String(spawn.agent_id)) + '</span> ' +
       '<span class="sub-task">' + escapeHtml(normalize(spawn.task || '')) + '</span></summary>';
     for (const e of subThread.get(spawn.agent_id) || []) {
-      html += renderEntry(e);
+      html += renderEntrySafe(e);
     }
     return html + '</details>';
   }
@@ -415,9 +383,10 @@
 
   function renderEntry(entry) {
     if (entry.type === 'message') {
-      const role = entry.message.role;
-      if (role === 'user') return renderUser(entry);
-      if (role === 'assistant') return renderAssistant(entry);
+      const msg = entry.message;
+      if (!msg) return '';
+      if (msg.role === 'user') return renderUser(entry);
+      if (msg.role === 'assistant') return renderAssistant(entry);
       // Tool results are shown inline under their call.
       return '';
     }
@@ -441,14 +410,28 @@
     return '';
   }
 
+  // Per-entry isolation: a single malformed record renders a placeholder
+  // instead of aborting the whole transcript.
+  function renderEntrySafe(entry) {
+    try {
+      return renderEntry(entry);
+    } catch (e) {
+      return '<div class="error-text">[failed to render entry ' + escapeHtml((entry && entry.id) || '?') + ']</div>';
+    }
+  }
+
   // ============================================================
   // PATH (root -> leaf over the user thread)
   // ============================================================
 
   function pathTo(targetId) {
     const path = [];
+    const seen = new Set();
     let cur = byId.get(targetId);
-    while (cur) {
+    // `seen` guards against a malformed log whose parent_id forms a
+    // cycle, which would otherwise hang the viewer.
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id);
       path.unshift(cur);
       if (!cur.parent_id || cur.parent_id === cur.id) break;
       cur = byId.get(cur.parent_id);
@@ -468,7 +451,7 @@
     };
     for (const e of entries) {
       if (e.type === 'compaction') s.compactions++;
-      if (e.type !== 'message') continue;
+      if (e.type !== 'message' || !e.message) continue;
       const m = e.message;
       if (m.role === 'user') s.user++;
       else if (m.role === 'tool_result') s.toolResults++;
@@ -527,7 +510,7 @@
   }
 
   function infoItem(label, value) {
-    return '<span class="info-label">' + label + ':</span><span class="info-value">' + escapeHtml(value) + '</span>';
+    return '<span class="info-label">' + escapeHtml(label) + ':</span><span class="info-value">' + escapeHtml(value) + '</span>';
   }
 
   // ============================================================
@@ -535,11 +518,15 @@
   // ============================================================
 
   function renderConversation() {
-    document.getElementById('header-container').innerHTML = renderHeader();
+    try {
+      document.getElementById('header-container').innerHTML = renderHeader();
+    } catch (e) {
+      document.getElementById('header-container').innerHTML = '<div class="error-text">[failed to render header]</div>';
+    }
     const messages = document.getElementById('messages');
     const path = leafId ? pathTo(leafId) : [];
     let html = '';
-    for (const entry of path) html += renderEntry(entry);
+    for (const entry of path) html += renderEntrySafe(entry);
     messages.innerHTML = html;
     attachHeaderHandlers();
   }

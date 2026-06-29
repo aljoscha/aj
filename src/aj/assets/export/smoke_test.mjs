@@ -64,8 +64,14 @@ const entries = [
   { id: 'a2', parent_id: 'r4', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:09Z',
     message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'Done. <script>alert(1)</script>' }],
       usage: { input: 1, output: 1, cache_read: 0, cache_write: 0, total_tokens: 2, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
+  // Adversarial prose: every vector here must render inert.
+  { id: 'a3', parent_id: 'a2', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:10Z',
+    message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text:
+      '[js](javascript:alert(1)) [html](data:text/html,<script>x</script>) ' +
+      '[breakout](https://e.com" onmouseover="alert(1)) raw <img src=x onerror=alert(1)> <svg onload=alert(2)>' }],
+      usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
 ];
-const sessionData = { session_id: 'smoke-session', leaf_id: 'a2', entries };
+const sessionData = { session_id: 'smoke-session', leaf_id: 'a3', entries };
 
 // ---- Minimal DOM shim. ----
 const elements = {
@@ -145,6 +151,11 @@ check('agent report not duplicated', rendered.split('sub-agent finding').length 
 console.log('security');
 hasnt('raw script not live', '<script>alert(1)');
 has('script escaped to text', '&lt;script&gt;');
+hasnt('javascript: link blocked', 'href="javascript');
+hasnt('data:text/html link blocked', 'href="data:text/html');
+hasnt('attribute breakout blocked', 'e.com" onmouseover');
+hasnt('raw img not live', '<img src=x onerror');
+hasnt('raw svg not live', '<svg onload');
 
 console.log('');
 if (failures) {

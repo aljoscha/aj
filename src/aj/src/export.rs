@@ -36,6 +36,12 @@ const APP_JS: &str = include_str!("../assets/export/template.js");
 const MARKED_JS: &str = include_str!("../assets/export/vendor/marked.min.js");
 const HIGHLIGHT_JS: &str = include_str!("../assets/export/vendor/highlight.min.js");
 
+/// Full license texts for the vendored libraries, embedded in the
+/// export so every shared copy carries the notices both licenses
+/// (MIT, BSD-3-Clause) require to travel with a redistribution.
+const MARKED_LICENSE: &str = include_str!("../assets/export/vendor/marked.LICENSE");
+const HIGHLIGHT_LICENSE: &str = include_str!("../assets/export/vendor/highlight.LICENSE");
+
 /// The embedded session envelope. Entries serialize verbatim (snake_case
 /// fields, `type`/`role`/`kind` tags as on disk); the renderer reads
 /// them directly.
@@ -64,6 +70,10 @@ pub(crate) fn render_session_html(log: &ConversationLog) -> String {
         entries: log.entries_in_order(),
     };
     let session_data = embed_json(&data);
+    let licenses = format!(
+        "marked (MIT) https://github.com/markedjs/marked\n\n{MARKED_LICENSE}\n\n\
+         highlight.js (BSD-3-Clause) https://github.com/highlightjs/highlight.js\n\n{HIGHLIGHT_LICENSE}"
+    );
 
     // The untrusted values (title, session JSON) are filled in the same
     // single pass as the trusted assets, and `fill_template` never
@@ -77,6 +87,7 @@ pub(crate) fn render_session_html(log: &ConversationLog) -> String {
             ("MARKED_JS", MARKED_JS),
             ("HIGHLIGHT_JS", HIGHLIGHT_JS),
             ("APP_JS", APP_JS),
+            ("LICENSES", &licenses),
             ("SESSION_DATA", &session_data),
         ],
     )
@@ -100,7 +111,9 @@ fn fill_template(template: &str, vars: &[(&str, &str)]) -> String {
                 match vars.iter().find(|(k, _)| *k == key) {
                     Some((_, value)) => out.push_str(value),
                     None => {
-                        let _ = (out.push_str("{{"), out.push_str(key), out.push_str("}}"));
+                        out.push_str("{{");
+                        out.push_str(key);
+                        out.push_str("}}");
                     }
                 }
                 rest = &after[end + 2..];
@@ -325,5 +338,49 @@ mod tests {
             4,
             "script element count drifted"
         );
+
+        // The license texts sit in an HTML comment, so they must not
+        // contain `-->` (which would end the comment early).
+        assert!(
+            !MARKED_LICENSE.contains("-->"),
+            "marked license ends the comment"
+        );
+        assert!(
+            !HIGHLIGHT_LICENSE.contains("-->"),
+            "highlight license ends the comment"
+        );
+    }
+
+    #[test]
+    fn embeds_license_texts() {
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER]);
+        let html = render_session_html(&log);
+        assert!(
+            html.contains("Permission is hereby granted"),
+            "MIT text missing"
+        );
+        assert!(html.contains("BSD 3-Clause License"), "BSD text missing");
+    }
+
+    /// Run the client-side renderer (`template.js`) against a fixture
+    /// under node, gating the escaping and sanitization that only the
+    /// JavaScript enforces. Skipped when node is not installed, so it
+    /// covers the renderer wherever node exists without forcing it.
+    #[test]
+    fn renderer_smoke_test_passes() {
+        use std::process::Command;
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/export/smoke_test.mjs");
+        match Command::new("node").arg(script).output() {
+            Ok(out) => assert!(
+                out.status.success(),
+                "renderer smoke test failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping renderer smoke test: node not found");
+            }
+            Err(e) => panic!("failed to run node: {e}"),
+        }
     }
 }
