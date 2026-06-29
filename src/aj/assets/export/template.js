@@ -12,10 +12,13 @@
   const data = JSON.parse(document.getElementById('session-data').textContent);
   const entries = data.entries || [];
   const byId = new Map(entries.map((e) => [e.id, e]));
+  // Append position, used as a stable tiebreaker when sibling branches
+  // share (or lack) a timestamp.
+  const orderIndex = new Map(entries.map((e, i) => [e.id, i]));
 
   // The active user-thread tip, computed by the exporter. Fall back to
   // the last user-thread entry in append order if it is missing.
-  const leafId = data.leaf_id || deriveLeaf();
+  const defaultLeaf = data.leaf_id || deriveLeaf();
   function deriveLeaf() {
     for (let i = entries.length - 1; i >= 0; i--) {
       if (entries[i].thread === 'user') return entries[i].id;
@@ -26,7 +29,8 @@
   // Sub-agent runs live on their own `subagent` thread, keyed by
   // `agent_id`. A `sub_agent_spawn` entry roots each run and is parented
   // at the assistant message that spawned it, so we index spawns by that
-  // parent to nest the run inline under that message.
+  // parent to nest the run inline under that message. Sub-agent entries
+  // are deliberately excluded from the navigation tree.
   const spawnsByParent = new Map();
   const subThread = new Map();
   for (const e of entries) {
@@ -41,12 +45,17 @@
   }
 
   // Tool-result lookup so an assistant's tool call can render its result
-  // inline (the standalone tool_result entry renders nothing).
+  // inline; tool-call lookup so a tree node can name a tool result.
   const resultByCallId = new Map();
+  const toolCallById = new Map();
   for (const e of entries) {
     const m = e.type === 'message' ? e.message : null;
-    if (m && m.role === 'tool_result' && m.tool_call_id) {
-      resultByCallId.set(m.tool_call_id, m);
+    if (!m) continue;
+    if (m.role === 'tool_result' && m.tool_call_id) resultByCallId.set(m.tool_call_id, m);
+    if (m.role === 'assistant') {
+      for (const b of m.content || []) {
+        if (b.type === 'tool_call') toolCallById.set(b.id, { name: b.name, arguments: b.arguments });
+      }
     }
   }
 
@@ -69,6 +78,17 @@
 
   function normalize(s) {
     return s.replace(/[\n\t]/g, ' ').trim();
+  }
+
+  function truncate(s, maxLen) {
+    maxLen = maxLen || 100;
+    return s.length <= maxLen ? s : s.slice(0, maxLen) + '\u2026';
+  }
+
+  function shortenPath(p) {
+    if (typeof p !== 'string') return '';
+    const m = p.match(/^\/(?:Users|home)\/[^/]+(\/.*)?$/);
+    return m ? '~' + (m[1] || '') : p;
   }
 
   function formatTokens(count) {
@@ -391,21 +411,21 @@
       return '';
     }
     if (entry.type === 'compaction') {
-      return '<div class="compaction"><div class="compaction-head">context compacted</div>' +
+      return '<div class="compaction" id="entry-' + escapeHtml(entry.id) + '"><div class="compaction-head">context compacted</div>' +
         md(entry.summary || '') + '</div>';
     }
     if (entry.type === 'model_change') {
-      return '<div class="model-change">switched model to <span class="model-name">' +
+      return '<div class="model-change" id="entry-' + escapeHtml(entry.id) + '">switched model to <span class="model-name">' +
         escapeHtml(entry.provider + '/' + entry.model_id) + '</span></div>';
     }
     if (entry.type === 'thinking_change') {
-      return '<div class="notice">thinking: ' + escapeHtml(entry.level) + '</div>';
+      return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">thinking: ' + escapeHtml(entry.level) + '</div>';
     }
     if (entry.type === 'speed_change') {
-      return '<div class="notice">speed: ' + escapeHtml(entry.speed) + '</div>';
+      return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">speed: ' + escapeHtml(entry.speed) + '</div>';
     }
     if (entry.type === 'verbosity_change') {
-      return '<div class="notice">verbosity: ' + escapeHtml(entry.verbosity) + '</div>';
+      return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">verbosity: ' + escapeHtml(entry.verbosity) + '</div>';
     }
     return '';
   }
@@ -418,25 +438,6 @@
     } catch (e) {
       return '<div class="error-text">[failed to render entry ' + escapeHtml((entry && entry.id) || '?') + ']</div>';
     }
-  }
-
-  // ============================================================
-  // PATH (root -> leaf over the user thread)
-  // ============================================================
-
-  function pathTo(targetId) {
-    const path = [];
-    const seen = new Set();
-    let cur = byId.get(targetId);
-    // `seen` guards against a malformed log whose parent_id forms a
-    // cycle, which would otherwise hang the viewer.
-    while (cur && !seen.has(cur.id)) {
-      seen.add(cur.id);
-      path.unshift(cur);
-      if (!cur.parent_id || cur.parent_id === cur.id) break;
-      cur = byId.get(cur.parent_id);
-    }
-    return path;
   }
 
   // ============================================================
@@ -514,22 +515,424 @@
   }
 
   // ============================================================
-  // INITIALIZATION
+  // TREE DATA (pure: flat entries -> nodes and layout)
+  // ============================================================
+  //
+  // The tree shows the user-thread conversation and its branches.
+  // Sub-agent entries are excluded; settings/system entries are kept but
+  // hidden by the default filter. The layout (indent, ASCII connectors,
+  // gutters) mirrors the TUI's branch selector so the two views agree.
+
+  const treeEntries = entries.filter((e) => e.thread !== 'subagent');
+
+  function buildTree() {
+    const nodeMap = new Map();
+    const roots = [];
+    for (const entry of treeEntries) nodeMap.set(entry.id, { entry, children: [] });
+    for (const entry of treeEntries) {
+      const node = nodeMap.get(entry.id);
+      const parent = entry.parent_id != null && entry.parent_id !== entry.id ? nodeMap.get(entry.parent_id) : null;
+      if (parent) parent.children.push(node);
+      else roots.push(node);
+    }
+    const ts = (e) => { const t = Date.parse(e.timestamp); return isNaN(t) ? 0 : t; };
+    function sortChildren(node) {
+      node.children.sort((a, b) => ts(a.entry) - ts(b.entry) || orderIndex.get(a.entry.id) - orderIndex.get(b.entry.id));
+      node.children.forEach(sortChildren);
+    }
+    roots.forEach(sortChildren);
+    return roots;
+  }
+
+  let treeNodeMap = null;
+  function findNewestLeaf(nodeId) {
+    if (!treeNodeMap) {
+      treeNodeMap = new Map();
+      const map = (node) => { treeNodeMap.set(node.entry.id, node); node.children.forEach(map); };
+      buildTree().forEach(map);
+    }
+    let cur = treeNodeMap.get(nodeId);
+    if (!cur) return nodeId;
+    while (cur.children.length > 0) cur = cur.children[cur.children.length - 1];
+    return cur.entry.id;
+  }
+
+  function pathTo(targetId) {
+    const path = [];
+    const seen = new Set();
+    let cur = byId.get(targetId);
+    // `seen` guards against a malformed log whose parent_id forms a
+    // cycle, which would otherwise hang the viewer.
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      path.unshift(cur);
+      if (!cur.parent_id || cur.parent_id === cur.id) break;
+      cur = byId.get(cur.parent_id);
+    }
+    return path;
+  }
+
+  function activePathIds(targetId) {
+    return new Set(pathTo(targetId).map((e) => e.id));
+  }
+
+  // Flatten the tree to a list with indent/connector info, prioritizing
+  // the branch that contains the active leaf. Ported from the TUI branch
+  // selector so the ASCII framing matches.
+  function flattenTree(roots, activeIds) {
+    const result = [];
+    const multipleRoots = roots.length > 1;
+    const containsActive = new Map();
+    function mark(node) {
+      let has = activeIds.has(node.entry.id);
+      for (const c of node.children) if (mark(c)) has = true;
+      containsActive.set(node, has);
+      return has;
+    }
+    roots.forEach(mark);
+
+    const orderedRoots = [...roots].sort((a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)));
+    const stack = [];
+    for (let i = orderedRoots.length - 1; i >= 0; i--) {
+      const isLast = i === orderedRoots.length - 1;
+      stack.push([orderedRoots[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, isLast, [], multipleRoots]);
+    }
+    while (stack.length > 0) {
+      const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop();
+      result.push({ node, indent, showConnector, isLast, gutters, isVirtualRootChild, multipleRoots });
+
+      const children = node.children;
+      const multipleChildren = children.length > 1;
+      const orderedChildren = [...children].sort((a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)));
+
+      let childIndent;
+      if (multipleChildren) childIndent = indent + 1;
+      else if (justBranched && indent > 0) childIndent = indent + 1;
+      else childIndent = indent;
+
+      const connectorDisplayed = showConnector && !isVirtualRootChild;
+      const currentDisplayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
+      const connectorPosition = Math.max(0, currentDisplayIndent - 1);
+      const childGutters = connectorDisplayed ? [...gutters, { position: connectorPosition, show: !isLast }] : gutters;
+
+      for (let i = orderedChildren.length - 1; i >= 0; i--) {
+        const childIsLast = i === orderedChildren.length - 1;
+        stack.push([orderedChildren[i], childIndent, multipleChildren, multipleChildren, childIsLast, childGutters, false]);
+      }
+    }
+    return result;
+  }
+
+  function buildTreePrefix(flatNode) {
+    const { indent, showConnector, isLast, gutters, isVirtualRootChild, multipleRoots } = flatNode;
+    const displayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
+    const connector = showConnector && !isVirtualRootChild ? (isLast ? '\u2514\u2500 ' : '\u251c\u2500 ') : '';
+    const connectorPosition = connector ? displayIndent - 1 : -1;
+    const totalChars = displayIndent * 3;
+    const chars = [];
+    for (let i = 0; i < totalChars; i++) {
+      const level = Math.floor(i / 3);
+      const posInLevel = i % 3;
+      const gutter = gutters.find((g) => g.position === level);
+      if (gutter) {
+        chars.push(posInLevel === 0 ? (gutter.show ? '\u2502' : ' ') : ' ');
+      } else if (connector && level === connectorPosition) {
+        if (posInLevel === 0) chars.push(isLast ? '\u2514' : '\u251c');
+        else if (posInLevel === 1) chars.push('\u2500');
+        else chars.push(' ');
+      } else {
+        chars.push(' ');
+      }
+    }
+    return chars.join('');
+  }
+
+  // Recompute indent/connectors over only the visible (filtered) nodes,
+  // reattaching each to its nearest visible ancestor so single-child
+  // chains do not drift right. Same rules as flattenTree.
+  function recalculateVisualStructure(filtered, allFlat) {
+    if (filtered.length === 0) return;
+    const visibleIds = new Set(filtered.map((n) => n.node.entry.id));
+    const flatById = new Map(allFlat.map((f) => [f.node.entry.id, f]));
+
+    function visibleAncestor(nodeId) {
+      let id = flatById.get(nodeId) && flatById.get(nodeId).node.entry.parent_id;
+      while (id != null) {
+        if (visibleIds.has(id)) return id;
+        id = flatById.get(id) && flatById.get(id).node.entry.parent_id;
+      }
+      return null;
+    }
+
+    const visibleChildren = new Map([[null, []]]);
+    for (const f of filtered) {
+      const id = f.node.entry.id;
+      const anc = visibleAncestor(id);
+      if (!visibleChildren.has(anc)) visibleChildren.set(anc, []);
+      visibleChildren.get(anc).push(id);
+    }
+    const rootIds = visibleChildren.get(null);
+    const multipleRoots = rootIds.length > 1;
+    const filteredById = new Map(filtered.map((f) => [f.node.entry.id, f]));
+
+    const stack = [];
+    for (let i = rootIds.length - 1; i >= 0; i--) {
+      const isLast = i === rootIds.length - 1;
+      stack.push([rootIds[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, isLast, [], multipleRoots]);
+    }
+    while (stack.length > 0) {
+      const [id, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop();
+      const f = filteredById.get(id);
+      if (!f) continue;
+      f.indent = indent; f.showConnector = showConnector; f.isLast = isLast;
+      f.gutters = gutters; f.isVirtualRootChild = isVirtualRootChild; f.multipleRoots = multipleRoots;
+
+      const children = visibleChildren.get(id) || [];
+      const multipleChildren = children.length > 1;
+      let childIndent;
+      if (multipleChildren) childIndent = indent + 1;
+      else if (justBranched && indent > 0) childIndent = indent + 1;
+      else childIndent = indent;
+
+      const connectorDisplayed = showConnector && !isVirtualRootChild;
+      const currentDisplayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
+      const connectorPosition = Math.max(0, currentDisplayIndent - 1);
+      const childGutters = connectorDisplayed ? [...gutters, { position: connectorPosition, show: !isLast }] : gutters;
+      for (let i = children.length - 1; i >= 0; i--) {
+        const childIsLast = i === children.length - 1;
+        stack.push([children[i], childIndent, multipleChildren, multipleChildren, childIsLast, childGutters, false]);
+      }
+    }
+  }
+
+  // ============================================================
+  // TREE DISPLAY TEXT
   // ============================================================
 
-  function renderConversation() {
+  function formatToolCall(name, args) {
+    args = args || {};
+    const path = (p) => shortenPath(String(p || ''));
+    switch (name) {
+      case 'read_file': case 'read': return '[read: ' + path(args.path || args.file_path) + ']';
+      case 'write_file': case 'write': return '[write: ' + path(args.path || args.file_path) + ']';
+      case 'edit_file': case 'edit': return '[edit: ' + path(args.path || args.file_path) + ']';
+      case 'bash': return '[bash: ' + truncate(normalize(String(args.command || '')), 50) + ']';
+      case 'agent': return '[agent: ' + truncate(normalize(String(args.task || '')), 50) + ']';
+      default: return '[' + name + ': ' + truncate(JSON.stringify(args), 40) + ']';
+    }
+  }
+
+  function role(cls, label) { return '<span class="' + cls + '">' + label + '</span>'; }
+  function treeMuted(s) { return '<span class="tree-muted">' + s + '</span>'; }
+
+  function treeNodeHtml(entry) {
+    switch (entry.type) {
+      case 'message': {
+        const m = entry.message;
+        if (!m) return treeMuted('[message]');
+        if (m.role === 'user') {
+          return role('tree-role-user', 'user:') + ' ' + escapeHtml(truncate(normalize(textOf(m.content))));
+        }
+        if (m.role === 'assistant') {
+          const t = normalize(textOf(m.content));
+          if (t) return role('tree-role-assistant', 'assistant:') + ' ' + escapeHtml(truncate(t));
+          if (m.stop_reason === 'Aborted') return role('tree-role-assistant', 'assistant:') + ' ' + treeMuted('(aborted)');
+          if (m.error) return role('tree-role-assistant', 'assistant:') + ' <span class="tree-error">' + escapeHtml(truncate(m.error.message || '')) + '</span>';
+          return role('tree-role-assistant', 'assistant:') + ' ' + treeMuted('(tool calls)');
+        }
+        if (m.role === 'tool_result') {
+          const call = m.tool_call_id ? toolCallById.get(m.tool_call_id) : null;
+          const label = call ? formatToolCall(call.name, call.arguments) : '[' + (m.tool_name || 'tool') + ']';
+          return '<span class="tree-role-tool">' + escapeHtml(label) + '</span>';
+        }
+        return treeMuted('[' + escapeHtml(m.role) + ']');
+      }
+      case 'compaction': return '<span class="tree-compaction">[compaction]</span>';
+      case 'system_prompt': return treeMuted('[system prompt]');
+      case 'model_change': return treeMuted('[model: ' + escapeHtml(entry.model_id) + ']');
+      case 'thinking_change': return treeMuted('[thinking: ' + escapeHtml(entry.level) + ']');
+      case 'speed_change': return treeMuted('[speed: ' + escapeHtml(entry.speed) + ']');
+      case 'verbosity_change': return treeMuted('[verbosity: ' + escapeHtml(entry.verbosity) + ']');
+      default: return treeMuted('[' + escapeHtml(entry.type) + ']');
+    }
+  }
+
+  function searchableText(entry) {
+    const parts = [entry.type];
+    if (entry.type === 'message' && entry.message) {
+      const m = entry.message;
+      parts.push(m.role, textOf(m.content));
+      if (m.role === 'tool_result') {
+        parts.push(m.tool_name || '');
+        const call = m.tool_call_id ? toolCallById.get(m.tool_call_id) : null;
+        if (call) parts.push(call.name, JSON.stringify(call.arguments || {}));
+      }
+    } else if (entry.type === 'compaction') {
+      parts.push(entry.summary || '');
+    } else if (entry.type === 'model_change') {
+      parts.push(entry.model_id || '');
+    }
+    return parts.join(' ').toLowerCase();
+  }
+
+  // ============================================================
+  // FILTERING
+  // ============================================================
+
+  let filterMode = 'default';
+  let searchQuery = '';
+  const SETTINGS_TYPES = ['system_prompt', 'model_change', 'thinking_change', 'speed_change', 'verbosity_change'];
+
+  function filterNodes(flatNodes, leafId) {
+    const tokens = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+    const filtered = flatNodes.filter((flat) => {
+      const entry = flat.node.entry;
+      if (entry.id === leafId) return true;
+
+      // Hide assistant messages that are only tool calls (no text)
+      // unless the turn errored or was aborted.
+      if (entry.type === 'message' && entry.message && entry.message.role === 'assistant') {
+        const hasText = textOf(entry.message.content).trim().length > 0;
+        const sr = entry.message.stop_reason;
+        const errored = sr && sr !== 'Stop' && sr !== 'ToolUse';
+        if (!hasText && !errored) return false;
+      }
+
+      const isSettings = SETTINGS_TYPES.includes(entry.type);
+      let pass;
+      switch (filterMode) {
+        case 'user-only': pass = entry.type === 'message' && entry.message && entry.message.role === 'user'; break;
+        case 'no-tools': pass = !isSettings && !(entry.type === 'message' && entry.message && entry.message.role === 'tool_result'); break;
+        case 'all': pass = true; break;
+        default: pass = !isSettings; break;
+      }
+      if (!pass) return false;
+
+      if (tokens.length > 0) {
+        const text = searchableText(entry);
+        if (!tokens.every((t) => text.includes(t))) return false;
+      }
+      return true;
+    });
+    recalculateVisualStructure(filtered, flatNodes);
+    return filtered;
+  }
+
+  // ============================================================
+  // TREE RENDER
+  // ============================================================
+
+  let currentLeafId = defaultLeaf;
+  let currentTargetId = defaultLeaf;
+  let treeRendered = false;
+
+  function renderTree() {
+    const roots = buildTree();
+    const activeIds = activePathIds(currentLeafId);
+    const flatNodes = flattenTree(roots, activeIds);
+    const filtered = filterNodes(flatNodes, currentLeafId);
+    const container = document.getElementById('tree-container');
+
+    if (!treeRendered) {
+      container.innerHTML = '';
+      for (const flat of filtered) {
+        const entry = flat.node.entry;
+        const div = document.createElement('div');
+        div.className = 'tree-node';
+        if (activeIds.has(entry.id)) div.classList.add('in-path');
+        if (entry.id === currentTargetId) div.classList.add('active');
+        div.dataset.id = entry.id;
+
+        const prefix = document.createElement('span');
+        prefix.className = 'tree-prefix';
+        prefix.textContent = buildTreePrefix(flat);
+        const marker = document.createElement('span');
+        marker.className = 'tree-marker';
+        marker.textContent = activeIds.has(entry.id) ? '\u2022 ' : '  ';
+        const content = document.createElement('span');
+        content.className = 'tree-content';
+        content.innerHTML = treeNodeHtml(entry);
+
+        div.append(prefix, marker, content);
+        div.addEventListener('click', () => {
+          if (window.getSelection().toString()) return;
+          navigateTo(findNewestLeaf(entry.id), 'target', entry.id);
+        });
+        container.appendChild(div);
+      }
+      treeRendered = true;
+    } else {
+      for (const node of container.querySelectorAll('.tree-node')) {
+        const id = node.dataset.id;
+        const onPath = activeIds.has(id);
+        node.classList.toggle('in-path', onPath);
+        node.classList.toggle('active', id === currentTargetId);
+        const marker = node.querySelector('.tree-marker');
+        if (marker) marker.textContent = onPath ? '\u2022 ' : '  ';
+      }
+    }
+
+    document.getElementById('tree-status').textContent = filtered.length + ' / ' + flatNodes.length + ' entries';
+    setTimeout(() => {
+      const active = container.querySelector('.tree-node.active');
+      if (active) active.scrollIntoView({ block: 'nearest' });
+    }, 0);
+  }
+
+  function forceTreeRerender() {
+    treeRendered = false;
+    renderTree();
+  }
+
+  // ============================================================
+  // NAVIGATION
+  // ============================================================
+
+  // Tool results render inside their assistant tool-call block, so route
+  // a scroll to that block; everything else scrolls to its own element.
+  function scrollTargetId(entryId) {
+    const entry = byId.get(entryId);
+    if (entry && entry.type === 'message' && entry.message && entry.message.role === 'tool_result' && entry.message.tool_call_id) {
+      return 'tool-call-' + entry.message.tool_call_id;
+    }
+    return 'entry-' + entryId;
+  }
+
+  function navigateTo(leafId, scrollMode, scrollToEntryId) {
+    currentLeafId = leafId;
+    currentTargetId = scrollToEntryId || leafId;
+
+    renderTree();
     try {
       document.getElementById('header-container').innerHTML = renderHeader();
     } catch (e) {
       document.getElementById('header-container').innerHTML = '<div class="error-text">[failed to render header]</div>';
     }
-    const messages = document.getElementById('messages');
-    const path = leafId ? pathTo(leafId) : [];
-    let html = '';
-    for (const entry of path) html += renderEntrySafe(entry);
-    messages.innerHTML = html;
     attachHeaderHandlers();
+
+    const messages = document.getElementById('messages');
+    let html = '';
+    for (const entry of pathTo(leafId)) html += renderEntrySafe(entry);
+    messages.innerHTML = html;
+
+    // Close the mobile sidebar after picking a node.
+    closeSidebar();
+
+    setTimeout(() => {
+      if (scrollMode === 'target' && scrollToEntryId) {
+        const el = document.getElementById(scrollTargetId(scrollToEntryId)) || document.getElementById('entry-' + scrollToEntryId);
+        if (el) {
+          el.scrollIntoView({ block: 'center' });
+          el.classList.add('highlight');
+          setTimeout(() => el.classList.remove('highlight'), 2000);
+        }
+      }
+    }, 0);
   }
+
+  // ============================================================
+  // INITIALIZATION
+  // ============================================================
 
   let thinkingExpanded = true;
   let toolsExpanded = false;
@@ -552,6 +955,27 @@
     if (o) o.addEventListener('click', toggleTools);
   }
 
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebar-overlay');
+  const hamburger = document.getElementById('hamburger');
+  function openSidebar() { sidebar.classList.add('open'); overlay.classList.add('open'); }
+  function closeSidebar() { sidebar.classList.remove('open'); overlay.classList.remove('open'); }
+  hamburger.addEventListener('click', openSidebar);
+  overlay.addEventListener('click', closeSidebar);
+  document.getElementById('sidebar-close').addEventListener('click', closeSidebar);
+
+  const searchInput = document.getElementById('tree-search');
+  searchInput.addEventListener('input', (e) => { searchQuery = e.target.value; forceTreeRerender(); });
+
+  document.querySelectorAll('.filter-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      filterMode = btn.dataset.filter;
+      forceTreeRerender();
+    });
+  });
+
   function isEditable(el) {
     if (!el) return false;
     const tag = el.tagName;
@@ -559,11 +983,12 @@
   }
 
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { searchInput.value = ''; searchQuery = ''; forceTreeRerender(); }
     if (isEditable(document.activeElement)) return;
     const key = e.key.toLowerCase();
     if (key === 't') { e.preventDefault(); toggleThinking(); }
     else if (key === 'o') { e.preventDefault(); toggleTools(); }
   });
 
-  renderConversation();
+  if (defaultLeaf) navigateTo(defaultLeaf, 'none');
 })();

@@ -70,18 +70,47 @@ const entries = [
       '[js](javascript:alert(1)) [html](data:text/html,<script>x</script>) ' +
       '[breakout](https://e.com" onmouseover="alert(1)) raw <img src=x onerror=alert(1)> <svg onload=alert(2)>' }],
       usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
+  // A sibling branch off u1 (an edited/retried prompt) to exercise the
+  // tree's branch connectors. It is off the active path to a3.
+  { id: 'u1b', parent_id: 'u1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:02Z',
+    message: { role: 'user', content: [{ type: 'text', text: 'alternative branch' }], timestamp: 0 } },
 ];
 const sessionData = { session_id: 'smoke-session', leaf_id: 'a3', entries };
 
-// ---- Minimal DOM shim. ----
-const elements = {
-  'session-data': { textContent: JSON.stringify(sessionData) },
-  'header-container': { innerHTML: '' },
-  'messages': { innerHTML: '' },
-};
-const noopEl = { addEventListener() {}, style: {}, classList: { toggle() {}, add() {}, remove() {} } };
+// ---- Minimal DOM shim (enough for the renderer's init + tree build). ----
+function makeEl(tag) {
+  const el = {
+    tagName: (tag || 'div').toUpperCase(),
+    _text: '', _html: '', children: [], dataset: {}, style: {},
+    classList: {
+      _s: new Set(),
+      add(c) { this._s.add(c); },
+      remove(c) { this._s.delete(c); },
+      toggle(c, f) { const on = f === undefined ? !this._s.has(c) : f; on ? this._s.add(c) : this._s.delete(c); return on; },
+      contains(c) { return this._s.has(c); },
+    },
+    appendChild(c) { this.children.push(c); return c; },
+    append(...cs) { for (const c of cs) this.children.push(c); },
+    addEventListener() {}, scrollIntoView() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  Object.defineProperty(el, 'textContent', { get() { return this._text; }, set(v) { this._text = String(v); } });
+  Object.defineProperty(el, 'innerHTML', { get() { return this._html; }, set(v) { this._html = String(v); this.children = []; } });
+  Object.defineProperty(el, 'className', { get() { return [...this.classList._s].join(' '); }, set(v) { this.classList._s = new Set(String(v).split(/\s+/).filter(Boolean)); } });
+  return el;
+}
+
+const elements = {};
+for (const id of ['session-data', 'header-container', 'messages', 'tree-container', 'tree-status',
+  'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search']) {
+  elements[id] = makeEl('div');
+}
+elements['session-data'].textContent = JSON.stringify(sessionData);
+
 const documentShim = {
   getElementById: (id) => elements[id] || null,
+  createElement: (tag) => makeEl(tag),
   querySelector: () => null,
   querySelectorAll: () => [],
   addEventListener: () => {},
@@ -91,6 +120,8 @@ const sandbox = { console, document: documentShim };
 sandbox.window = sandbox;
 sandbox.self = sandbox;
 sandbox.globalThis = sandbox;
+sandbox.getSelection = () => ({ toString: () => '' });
+sandbox.setTimeout = (fn) => fn();
 vm.createContext(sandbox);
 
 // Load the real libraries then the renderer, exactly as the page does.
@@ -99,6 +130,15 @@ vm.runInContext(read('vendor/highlight.min.js'), sandbox, { filename: 'highlight
 vm.runInContext(read('template.js'), sandbox, { filename: 'template.js' });
 
 const rendered = elements['header-container'].innerHTML + '\n' + elements['messages'].innerHTML;
+
+// The tree builds DOM nodes (not innerHTML), so flatten their text.
+function nodeText(el) {
+  let s = (el._text || '') + (el._html || '');
+  for (const c of el.children || []) s += nodeText(c);
+  return s;
+}
+const treeText = elements['tree-container'].children.map(nodeText).join('\n');
+const treeStatus = elements['tree-status'].textContent;
 
 // ---- Assertions. ----
 let failures = 0;
@@ -156,6 +196,16 @@ hasnt('data:text/html link blocked', 'href="data:text/html');
 hasnt('attribute breakout blocked', 'e.com" onmouseover');
 hasnt('raw img not live', '<img src=x onerror');
 hasnt('raw svg not live', '<svg onload');
+
+console.log('tree');
+check('tree has nodes', elements['tree-container'].children.length > 0);
+check('tree user node', treeText.includes('user:'));
+check('tree assistant node', treeText.includes('assistant:'));
+check('tree tool node', treeText.includes('[bash:') || treeText.includes('[read:'));
+check('tree status line', /\d+ \/ \d+ entries/.test(treeStatus));
+check('tree node text escaped', !treeText.includes('<script>alert'));
+check('tree shows branch sibling', treeText.includes('alternative branch'));
+check('tree draws branch connectors', treeText.includes('\u251c') || treeText.includes('\u2514'));
 
 console.log('');
 if (failures) {

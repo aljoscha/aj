@@ -11,11 +11,31 @@
 <body>
   <input type="checkbox" id="theme-toggle">
   <label for="theme-toggle" class="theme-toggle" title="Toggle light / dark" aria-label="Toggle light or dark theme">&#9680;</label>
+  <button id="hamburger" title="Open sidebar" aria-label="Open sidebar">&#9776;</button>
+  <div id="sidebar-overlay"></div>
 
-  <main id="content" class="container">
-    <div id="header-container"></div>
-    <div id="messages"></div>
-  </main>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-controls">
+          <input type="text" class="sidebar-search" id="tree-search" placeholder="Search...">
+        </div>
+        <div class="sidebar-filters">
+          <button class="filter-btn active" data-filter="default" title="Hide settings entries">Default</button>
+          <button class="filter-btn" data-filter="no-tools" title="Default minus tool results">No-tools</button>
+          <button class="filter-btn" data-filter="user-only" title="Only user messages">User</button>
+          <button class="filter-btn" data-filter="all" title="Show everything">All</button>
+          <button class="sidebar-close" id="sidebar-close" title="Close" aria-label="Close sidebar">&#10005;</button>
+        </div>
+      </div>
+      <div class="tree-container" id="tree-container"></div>
+      <div class="tree-status" id="tree-status"></div>
+    </aside>
+    <main id="content">
+      <div id="header-container"></div>
+      <div id="messages"></div>
+    </main>
+  </div>
 
   <!-- The complete session, embedded losslessly. Every `<` is written
        as its \u003c escape so the payload cannot break out of this
