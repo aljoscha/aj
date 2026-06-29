@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}}</title>
+  <style>
+{{CSS}}
+  </style>
+</head>
+<body>
+  <input type="checkbox" id="theme-toggle">
+  <label for="theme-toggle" class="theme-toggle" title="Toggle light / dark" aria-label="Toggle light or dark theme">&#9680;</label>
+
+  <main id="content" class="container">
+    <div id="header-container"></div>
+    <div id="messages"></div>
+  </main>
+
+  <!-- The complete session, embedded losslessly. Every `<` is written
+       as its \u003c escape so the payload cannot break out of this
+       script element; JSON.parse restores it. -->
+  <script type="application/json" id="session-data">{{SESSION_DATA}}</script>
+
+  <!-- Vendored libraries (see assets/export/vendor/PROVENANCE.md). -->
+  <script>{{MARKED_JS}}</script>
+  <script>{{HIGHLIGHT_JS}}</script>
+
+  <!-- Renderer. -->
+  <script>
+{{APP_JS}}
+  </script>
+</body>
+</html>
