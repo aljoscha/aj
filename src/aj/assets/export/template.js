@@ -1,16 +1,30 @@
-(function () {
+(async function () {
   'use strict';
 
   // ============================================================
   // DATA LOADING
   // ============================================================
   //
-  // The session is embedded as a JSON object in a <script> island:
+  // The session is embedded in a <script> island as gzip-compressed,
+  // base64-encoded JSON:
   //   { session_id, leaf_id, entries: [ConversationEntry, ...] }
   // Entries are the verbatim on-disk records (snake_case fields, the
   // `type`/`role`/`kind` tags exactly as serialized by aj-session).
-  const data = JSON.parse(document.getElementById('session-data').textContent);
+  const data = await loadSessionData();
   const entries = data.entries || [];
+
+  // Inflate and parse the data island. The exporter gzips the JSON and
+  // base64-encodes it to keep the file small. A raw JSON island (leading
+  // `{`) is also accepted, which keeps the renderer usable with
+  // uncompressed data such as the dev smoke test.
+  async function loadSessionData() {
+    const raw = document.getElementById('session-data').textContent.trim();
+    if (raw[0] === '{') return JSON.parse(raw);
+    const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return JSON.parse(await new Response(stream).text());
+  }
+
   const byId = new Map(entries.map((e) => [e.id, e]));
   // Append position, used as a stable tiebreaker when sibling branches
   // share (or lack) a timestamp.

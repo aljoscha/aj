@@ -35,6 +35,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenv",
+ "flate2",
  "iana-time-zone",
  "image",
  "notify",

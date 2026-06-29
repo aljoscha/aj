@@ -39,10 +39,11 @@
     <div id="image-modal" class="image-modal"><img id="modal-image" src="" alt=""></div>
   </div>
 
-  <!-- The complete session, embedded losslessly. Every `<` is written
-       as its \u003c escape so the payload cannot break out of this
-       script element; JSON.parse restores it. -->
-  <script type="application/json" id="session-data">{{SESSION_DATA}}</script>
+  <!-- The complete session, embedded losslessly as gzip-compressed,
+       base64-encoded JSON. The base64 alphabet has no `<`, so the payload
+       cannot break out of this script element. The renderer inflates it
+       with the browser's DecompressionStream, then JSON.parse. -->
+  <script type="application/octet-stream" id="session-data">{{SESSION_DATA}}</script>
 
   <!-- Vendored libraries, inlined for offline use. Full license texts:
 {{LICENSES}}

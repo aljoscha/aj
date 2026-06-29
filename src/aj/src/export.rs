@@ -15,17 +15,26 @@
 //! - `marked` (markdown) and `highlight.js` (syntax highlighting),
 //!   vendored under `assets/export/vendor` (see its `PROVENANCE.md`).
 //!
-//! Security: the JSON island lives in a `<script type="application/json">`
-//! block, and every `<` is rewritten to `\u003c` so the payload cannot
-//! open or close a tag (not just `</script>`, but also `<!--`/`<script`,
-//! which flip the HTML script-data tokenizer). `JSON.parse` restores it
-//! in the browser. The renderer treats raw HTML in prose as inert text
-//! and restricts link/image URLs to a scheme allow-list, so a shared
-//! transcript cannot inject markup or scripts.
+//! Security: the session rides in a `<script type="application/octet-stream">`
+//! block as gzip-compressed, base64-encoded bytes. The base64 alphabet
+//! has no `<`, so the payload cannot open or close a tag and needs no
+//! further escaping. The browser inflates it (via the native
+//! `DecompressionStream`) and `JSON.parse`s the result. Compression
+//! matters because the on-disk session stores full file contents for
+//! every edit, so a transcript with large or repeatedly edited files is
+//! many megabytes of highly redundant JSON. The renderer treats raw HTML
+//! in prose as inert text and restricts link/image URLs to a scheme
+//! allow-list, so a shared transcript cannot inject markup or scripts.
+
+use std::io::Write;
 
 use aj_agent::events::AgentEvent;
 use aj_models::types::{Message, UserContent};
 use aj_session::{ConversationEntry, ConversationLog, EntryId, ThreadFilter, replay};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde::Serialize;
 
 /// The HTML shell with `{{KEY}}` placeholders, filled by
@@ -69,7 +78,7 @@ pub(crate) fn render_session_html(log: &ConversationLog) -> String {
         leaf_id: log.latest_leaf(ThreadFilter::USER),
         entries: log.entries_in_order(),
     };
-    let session_data = embed_json(&data);
+    let session_data = embed_session(&data);
     let licenses = format!(
         "marked (MIT) https://github.com/markedjs/marked\n\n{MARKED_LICENSE}\n\n\
          highlight.js (BSD-3-Clause) https://github.com/highlightjs/highlight.js\n\n{HIGHLIGHT_LICENSE}"
@@ -128,14 +137,24 @@ fn fill_template(template: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
-/// Serialize the export envelope and neutralize every `<` so the JSON is
-/// inert inside its surrounding `<script>` element. In JSON `<` only
-/// appears in string values, where `\u003c` is an equivalent escape, so
-/// the payload stays valid and parses back unchanged.
-fn embed_json(data: &ExportData) -> String {
-    serde_json::to_string(data)
-        .unwrap_or_default()
-        .replace('<', "\\u003c")
+/// Serialize the export envelope, gzip-compress it, and base64-encode
+/// the result for embedding in a `<script>` element.
+///
+/// Compression is the point: the session JSON is large and highly
+/// redundant (full file contents per edit), and gzip shrinks it several
+/// fold. The base64 alphabet contains no `<`, so the payload is inert
+/// inside its surrounding element without any further escaping. The
+/// browser reverses both steps (`DecompressionStream` then `JSON.parse`).
+fn embed_session(data: &ExportData) -> String {
+    let json = serde_json::to_vec(data).unwrap_or_default();
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    // Writing to an in-memory buffer cannot fail, so the gzip output is
+    // always available once we finish the encoder.
+    let gzipped = encoder
+        .write_all(&json)
+        .and_then(|()| encoder.finish())
+        .unwrap_or_default();
+    BASE64.encode(gzipped)
 }
 
 /// The first user prompt's text, used for the page `<title>`. Derived
@@ -192,8 +211,10 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Read;
 
     use aj_session::{ConversationLog, ConversationPersistence};
+    use flate2::read::GzDecoder;
     use tempfile::tempdir;
 
     use super::*;
@@ -209,12 +230,24 @@ mod tests {
         (dir, log)
     }
 
-    /// The neutralized JSON payload from the embedded data island.
+    /// The raw (base64) payload from the embedded data island.
     fn data_island(html: &str) -> &str {
         html.split_once("id=\"session-data\">")
             .and_then(|(_, rest)| rest.split_once("</script>"))
             .map(|(payload, _)| payload)
             .expect("data island present")
+    }
+
+    /// Decode the data island back to its JSON text (reverse of
+    /// [`embed_session`]: base64-decode then gunzip), so tests can assert
+    /// on the embedded session content.
+    fn decoded_island(html: &str) -> String {
+        let gzipped = BASE64.decode(data_island(html)).expect("island is base64");
+        let mut json = String::new();
+        GzDecoder::new(&gzipped[..])
+            .read_to_string(&mut json)
+            .expect("island gunzips to utf-8");
+        json
     }
 
     const SYSTEM: &str = r#"{"id":"root0001","timestamp":"2024-01-01T00:00:00Z","thread":"meta","type":"system_prompt","text":"You are aj."}"#;
@@ -271,7 +304,7 @@ mod tests {
     fn embeds_entries_and_leaf() {
         let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, TOOL_RESULT]);
         let html = render_session_html(&log);
-        let data = data_island(html.as_str());
+        let data = decoded_island(html.as_str());
         // The session id, the derived leaf, and the entries all ride in
         // the island (the renderer needs them all).
         assert!(data.contains("\"session_id\":\"test-session\""));
@@ -290,15 +323,22 @@ mod tests {
     }
 
     #[test]
-    fn data_island_neutralizes_angle_brackets() {
-        // Tag-like sequences in a prompt must not be able to open or
-        // close a tag inside the embedded JSON island.
+    fn data_island_is_inert_base64() {
+        // The base64 payload contains no `<`, so it cannot open or close a
+        // tag inside its surrounding script element, no matter what a
+        // prompt contains. The original tag-like text round-trips once
+        // decoded.
         let user = r#"{"id":"u0000001","parent_id":"root0001","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"</script><!--<script>x"}],"timestamp":1704067201000}}"#;
         let (_dir, log) = log_from_jsonl(&[SYSTEM, user]);
         let html = render_session_html(&log);
-        let data = data_island(html.as_str());
-        assert!(!data.contains('<'), "raw '<' leaked into the JSON island");
-        assert!(data.contains("\\u003c"), "angle bracket not neutralized");
+        assert!(
+            !data_island(html.as_str()).contains('<'),
+            "raw '<' leaked into the data island"
+        );
+        assert!(
+            decoded_island(html.as_str()).contains("</script><!--<script>x"),
+            "prompt text did not round-trip through the island"
+        );
     }
 
     #[test]
@@ -349,6 +389,22 @@ mod tests {
             !HIGHLIGHT_LICENSE.contains("-->"),
             "highlight license ends the comment"
         );
+    }
+
+    #[test]
+    fn island_round_trips_losslessly() {
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, TOOL_RESULT]);
+        let html = render_session_html(&log);
+        // Decoding the island yields exactly the JSON the exporter
+        // serialized, so the gzip+base64 step is lossless and the
+        // download-JSONL feature reconstructs the session faithfully.
+        let data = ExportData {
+            session_id: log.session_id(),
+            leaf_id: log.latest_leaf(ThreadFilter::USER),
+            entries: log.entries_in_order(),
+        };
+        let expected = serde_json::to_string(&data).expect("serialize envelope");
+        assert_eq!(decoded_island(html.as_str()), expected);
     }
 
     #[test]

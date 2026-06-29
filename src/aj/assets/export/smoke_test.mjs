@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import vm from 'node:vm';
+import zlib from 'node:zlib';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(join(here, p), 'utf8');
@@ -107,7 +108,9 @@ for (const id of ['session-data', 'header-container', 'messages', 'tree-containe
   'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search']) {
   elements[id] = makeEl('div');
 }
-elements['session-data'].textContent = JSON.stringify(sessionData);
+// Feed the island exactly as the exporter does: gzip-compressed,
+// base64-encoded. This exercises the renderer's real inflate path.
+elements['session-data'].textContent = zlib.gzipSync(JSON.stringify(sessionData)).toString('base64');
 
 const documentShim = {
   getElementById: (id) => elements[id] || null,
@@ -123,12 +126,30 @@ sandbox.self = sandbox;
 sandbox.globalThis = sandbox;
 sandbox.getSelection = () => ({ toString: () => '' });
 sandbox.setTimeout = (fn) => fn();
+// Web APIs the data loader needs to inflate the gzip+base64 island. A
+// fresh vm context has the ECMAScript intrinsics (Uint8Array, Promise)
+// but none of these, so hand them in from the host.
+sandbox.atob = atob;
+sandbox.Blob = Blob;
+sandbox.Response = Response;
+sandbox.DecompressionStream = DecompressionStream;
 vm.createContext(sandbox);
 
 // Load the real libraries then the renderer, exactly as the page does.
 vm.runInContext(read('vendor/marked.min.js'), sandbox, { filename: 'marked.min.js' });
 vm.runInContext(read('vendor/highlight.min.js'), sandbox, { filename: 'highlight.min.js' });
 vm.runInContext(read('template.js'), sandbox, { filename: 'template.js' });
+
+// The renderer loads its data asynchronously (inflate is async), so wait
+// for the first render to land before asserting.
+const deadline = Date.now() + 3000;
+while (!elements['messages'].innerHTML && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 10));
+}
+if (!elements['messages'].innerHTML) {
+  console.error('renderer did not produce output (data load failed?)');
+  process.exit(1);
+}
 
 const rendered = elements['header-container'].innerHTML + '\n' + elements['messages'].innerHTML;
 
