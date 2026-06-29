@@ -162,6 +162,8 @@ has('session id', 'smoke-session');
 has('token totals', '\u2191101');
 has('cost', '$0.0100');
 has('system prompt', 'You are aj.');
+has('download JSONL button', 'download-json-btn');
+has('copy-link button', 'class="copy-link-btn"');
 
 console.log('messages');
 has('user markdown bold', '<strong>bug</strong>');

@@ -64,6 +64,11 @@ a { color: var(--link); }
   position: sticky; top: 0; height: 100vh; background: var(--panel);
   border-right: 1px solid var(--border);
 }
+#sidebar-resizer {
+  width: 6px; flex-shrink: 0; position: sticky; top: 0; height: 100vh;
+  cursor: col-resize; touch-action: none; background: transparent;
+}
+#sidebar-resizer:hover, body.sidebar-resizing #sidebar-resizer { background: var(--panel2); }
 .sidebar-header { padding: 8px 8px 0; flex-shrink: 0; }
 .sidebar-search {
   width: 100%; padding: 5px 8px; font-size: 12px; font-family: inherit;
@@ -157,6 +162,10 @@ pre code { background: none; padding: 0; }
   cursor: pointer; border: 1px solid var(--border); background: var(--panel);
   color: var(--fg); border-radius: 6px; padding: 3px 9px; font-size: 12px;
 }
+.download-json-btn {
+  cursor: pointer; border: 1px solid var(--border); background: var(--panel);
+  color: var(--fg); border-radius: 6px; padding: 3px 9px; font-size: 12px;
+}
 .header-info { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
 .info-label { color: var(--muted); }
 .info-value { word-break: break-word; }
@@ -182,6 +191,13 @@ pre code { background: none; padding: 0; }
 .msg.assistant .role { color: var(--assistant); }
 .role .model { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
 .msg.highlight { outline: 2px solid var(--link); outline-offset: 2px; }
+.copy-link-btn {
+  position: absolute; top: 8px; right: 8px; opacity: 0; cursor: pointer; padding: 2px 5px;
+  background: var(--panel2); color: var(--muted); border: 1px solid var(--border); border-radius: 5px;
+  line-height: 0; transition: opacity .15s;
+}
+.msg:hover .copy-link-btn { opacity: .7; }
+.copy-link-btn:hover, .copy-link-btn.copied { opacity: 1; color: var(--link); }
 
 /* Markdown content */
 .markdown-content > *:first-child { margin-top: 0; }
@@ -247,7 +263,13 @@ pre code { background: none; padding: 0; }
   color: var(--muted); font-size: 13px; }
 .compaction-head { text-transform: uppercase; font-size: 11px; letter-spacing: .05em; margin-bottom: 6px; }
 .error-text { color: var(--err); font-size: 13px; margin-top: 8px; }
-.message-image, .tool-image { max-width: 100%; border-radius: 6px; margin: 8px 0; }
+.message-image, .tool-image { max-width: 100%; border-radius: 6px; margin: 8px 0; cursor: zoom-in; }
+
+/* Click an image to view it full-size. */
+.image-modal { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(0, 0, 0, .85);
+  cursor: zoom-out; align-items: center; justify-content: center; padding: 24px; }
+.image-modal.open { display: flex; }
+#modal-image { max-width: 100%; max-height: 100%; border-radius: 6px; }
 
 /* Sub-agent runs render inline as a collapsible nested transcript. */
 .subagent {

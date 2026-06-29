@@ -26,6 +26,20 @@
     return entries.length ? entries[entries.length - 1].id : null;
   }
 
+  // Deep-link parameters: open on a specific branch/message when the URL
+  // carries them (set by a copy-link button on a prior visit).
+  function urlParam(name) {
+    try {
+      const q = (window.location && window.location.search) || '';
+      const m = q.match(new RegExp('[?&]' + name + '=([^&]*)'));
+      return m ? decodeURIComponent(m[1]) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  const urlLeafId = urlParam('leafId');
+  const urlTargetId = urlParam('targetId');
+
   // Sub-agent runs live on their own `subagent` thread, keyed by
   // `agent_id`. A `sub_agent_spawn` entry roots each run and is parented
   // at the assistant message that spawned it, so we index spawns by that
@@ -346,9 +360,19 @@
     return renderToolExecution(call, result);
   }
 
+  // A small button that copies a deep link to its message. The handler
+  // is delegated from #messages (see init).
+  function copyLinkButton(id) {
+    return '<button class="copy-link-btn" data-entry-id="' + escapeHtml(id) +
+      '" title="Copy link to this message" aria-label="Copy link to this message">' +
+      '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>' +
+      '<path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>';
+  }
+
   function renderAssistant(entry) {
     const msg = entry.message;
-    let html = '<div class="msg assistant" id="entry-' + escapeHtml(entry.id) + '">';
+    let html = '<div class="msg assistant" id="entry-' + escapeHtml(entry.id) + '">' + copyLinkButton(entry.id);
     html += '<div class="role">Assistant <span class="model">' + escapeHtml(msg.model || '') + '</span></div>';
 
     for (const block of msg.content || []) {
@@ -390,7 +414,7 @@
 
   function renderUser(entry) {
     const content = entry.message.content;
-    let html = '<div class="msg user" id="entry-' + escapeHtml(entry.id) + '"><div class="role">User</div>';
+    let html = '<div class="msg user" id="entry-' + escapeHtml(entry.id) + '">' + copyLinkButton(entry.id) + '<div class="role">User</div>';
     if (Array.isArray(content)) {
       for (const c of content) {
         if (c.type === 'image') html += imageTag(c, 'message-image');
@@ -492,6 +516,7 @@
       '<div class="help-actions">' +
       '<button type="button" class="header-toggle-btn" data-action="toggle-thinking">Toggle thinking</button>' +
       '<button type="button" class="header-toggle-btn" data-action="toggle-tools">Toggle tools</button>' +
+      '<button type="button" class="download-json-btn" data-action="download-json" title="Download session as JSONL">\u2193 JSONL</button>' +
       '</div></div>' +
       '<div class="header-info">' +
       infoItem('Date', formatDate(firstTs)) +
@@ -951,8 +976,66 @@
   function attachHeaderHandlers() {
     const t = document.querySelector('[data-action="toggle-thinking"]');
     const o = document.querySelector('[data-action="toggle-tools"]');
+    const d = document.querySelector('[data-action="download-json"]');
     if (t) t.addEventListener('click', toggleThinking);
     if (o) o.addEventListener('click', toggleTools);
+    if (d) d.addEventListener('click', downloadSessionJson);
+  }
+
+  // ----- share / download -----
+
+  // A deep link to one message: the current branch leaf plus the target
+  // entry, as query params this page reads on load.
+  function buildShareUrl(entryId) {
+    try {
+      const base = ((window.location && window.location.href) || '').split('?')[0];
+      return base + '?leafId=' + encodeURIComponent(currentLeafId) + '&targetId=' + encodeURIComponent(entryId);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  async function copyToClipboard(text, button) {
+    let ok = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch (e) { /* fall through to the execCommand path */ }
+    if (!ok) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch (e) { /* clipboard unavailable */ }
+    }
+    if (ok && button) {
+      const original = button.innerHTML;
+      button.innerHTML = '\u2713';
+      button.classList.add('copied');
+      setTimeout(() => { button.innerHTML = original; button.classList.remove('copied'); }, 1500);
+    }
+  }
+
+  // Reconstruct the session as JSONL (one entry per line). There is no
+  // header line in the aj format, so the entries alone round-trip.
+  function downloadSessionJson() {
+    const jsonl = entries.map((e) => JSON.stringify(e)).join('\n');
+    const blob = new Blob([jsonl], { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (data.session_id || 'session') + '.jsonl';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   const sidebar = document.getElementById('sidebar');
@@ -966,6 +1049,61 @@
 
   const searchInput = document.getElementById('tree-search');
   searchInput.addEventListener('input', (e) => { searchQuery = e.target.value; forceTreeRerender(); });
+
+  // Copy-link buttons are delegated from #messages, which survives the
+  // innerHTML rewrites that each navigation does.
+  document.getElementById('messages').addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('.copy-link-btn');
+    if (!btn) return;
+    e.stopPropagation();
+    copyToClipboard(buildShareUrl(btn.dataset.entryId), btn);
+  });
+
+  // Drag the divider to resize the sidebar; width persists per browser.
+  // No-ops where the resizer is absent (e.g. a non-DOM test harness).
+  function setupSidebarResize() {
+    const resizer = document.getElementById('sidebar-resizer');
+    if (!resizer) return;
+    const KEY = 'aj-export:sidebar-width';
+    const root = document.documentElement;
+    const isMobile = () => window.matchMedia && window.matchMedia('(max-width: 900px)').matches;
+    const clamp = (w) => Math.max(220, Math.min(640, w));
+    const apply = (w) => root.style.setProperty('--sidebar-width', Math.round(clamp(w)) + 'px');
+    const save = (w) => { try { localStorage.setItem(KEY, String(Math.round(clamp(w)))); } catch (e) {} };
+    try { const saved = Number(localStorage.getItem(KEY)); if (saved) apply(saved); } catch (e) {}
+
+    resizer.addEventListener('pointerdown', (e) => {
+      if (isMobile()) return;
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = sidebar.getBoundingClientRect().width;
+      document.body.classList.add('sidebar-resizing');
+      const onMove = (ev) => apply(startW + (ev.clientX - startX));
+      const onUp = () => {
+        document.body.classList.remove('sidebar-resizing');
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        save(sidebar.getBoundingClientRect().width);
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    });
+    resizer.addEventListener('dblclick', () => { if (!isMobile()) { apply(340); save(340); } });
+  }
+
+  // Click any image to view it full-size; click the backdrop to close.
+  function setupImageModal() {
+    const modal = document.getElementById('image-modal');
+    const modalImg = document.getElementById('modal-image');
+    if (!modal || !modalImg) return;
+    document.getElementById('content').addEventListener('click', (e) => {
+      const img = e.target.closest && e.target.closest('.message-image, .tool-image');
+      if (!img) return;
+      modalImg.src = img.src;
+      modal.classList.add('open');
+    });
+    modal.addEventListener('click', () => modal.classList.remove('open'));
+  }
 
   document.querySelectorAll('.filter-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -990,5 +1128,14 @@
     else if (key === 'o') { e.preventDefault(); toggleTools(); }
   });
 
-  if (defaultLeaf) navigateTo(defaultLeaf, 'none');
+  setupSidebarResize();
+  setupImageModal();
+
+  // Open on the deep-linked branch/message when the URL carries valid
+  // params, otherwise on the default leaf.
+  const startLeaf = urlLeafId && byId.has(urlLeafId) ? urlLeafId : defaultLeaf;
+  if (startLeaf) {
+    if (urlTargetId && byId.has(urlTargetId)) navigateTo(startLeaf, 'target', urlTargetId);
+    else navigateTo(startLeaf, 'none');
+  }
 })();
