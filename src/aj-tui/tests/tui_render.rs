@@ -1068,19 +1068,19 @@ fn full_clear_mode_below_cursor_opt_in_preserves_scrollback_wipe_absent() {
 }
 
 #[test]
-fn diff_falls_back_to_full_redraw_when_first_change_is_above_viewport() {
-    // Regression guard for the `first_changed < viewport_top` full-
-    // redraw fallback. Scenario:
+fn diff_skips_paint_when_change_is_entirely_above_viewport() {
+    // A change whose rows are all above the viewport top is invisible
+    // (scrolled off into scrollback) and unreachable by relative cursor
+    // moves. The engine skips the paint entirely rather than falling
+    // back to a whole-screen redraw. Scenario:
     //
     //   1. First render fills the terminal exactly (no scroll).
-    //   2. Second render grows past the bottom, scrolling the top
-    //      row into scrollback. `previous_viewport_top` advances to
-    //      track where logical row 0 now lives relative to the
-    //      visible viewport.
-    //   3. Third render changes logical row 0 again. Diff says
-    //      `firstChanged = 0`, but row 0 is off-screen in scrollback
-    //      — diff path physically can't touch it. Engine must fall
-    //      back to a full redraw (which resets the whole viewport).
+    //   2. Second render grows past the bottom, scrolling the top rows
+    //      into scrollback. `previous_viewport_top` advances to track
+    //      where logical row 0 now lives relative to the viewport.
+    //   3. Third render changes logical row 0 (still off-screen, same
+    //      line count). The whole change is above the viewport top, so
+    //      the engine skips: no full redraw, no diff, nothing written.
     let terminal = VirtualTerminal::new(40, 6);
     let mut tui = Tui::new(Box::new(terminal.clone()));
     let component = MutableLines::new();
@@ -1089,19 +1089,21 @@ fn diff_falls_back_to_full_redraw_when_first_change_is_above_viewport() {
     component.set(["row 0", "row 1", "row 2", "row 3", "row 4", "row 5"]);
     render_now(&mut tui);
 
-    // Grow past the bottom — the \r\n fix makes the terminal scroll
-    // and `previous_viewport_top` must advance so the engine knows
-    // where "logical row 0" sits relative to the visible area.
+    // Grow past the bottom — the terminal scrolls and
+    // `previous_viewport_top` advances.
     component.set([
         "row 0", "row 1", "row 2", "row 3", "row 4", "row 5", "row 6", "row 7", "row 8",
     ]);
     tui.request_render();
     render_now(&mut tui);
 
-    let redraws_before = tui.full_redraws();
+    let full_redraws_before = tui.full_redraws();
+    let skipped_before = tui.skipped_renders();
+    let viewport_before = terminal.viewport();
+    terminal.clear_writes();
 
-    // Change row 0 (logically) — off-screen, must trigger full
-    // redraw fallback.
+    // Change row 0 (logically) — off-screen, equal line count. Must be
+    // skipped, not full-redrawn.
     component.set([
         "ROW 0 CHANGED",
         "row 1",
@@ -1116,22 +1118,71 @@ fn diff_falls_back_to_full_redraw_when_first_change_is_above_viewport() {
     tui.request_render();
     render_now(&mut tui);
 
-    assert!(
-        tui.full_redraws() > redraws_before,
-        "changing a row that's scrolled into scrollback should force full redraw \
-         (before: {redraws_before}, after: {})",
+    assert_eq!(
         tui.full_redraws(),
+        full_redraws_before,
+        "an off-screen change must not trigger a full redraw",
     );
-    // And the visible viewport shows the tail rows including the now-
-    // updated row 0 wait — with WholeScreen full-redraw the scrolled
-    // content is wiped, so the final viewport is the bottom `height`
-    // logical rows (rows 3..=8, starting with the updated row 0 at
-    // the top of the paint but scrolled to show only the tail).
-    let v = terminal.viewport();
-    assert_eq!(v.len(), 6);
+    assert_eq!(
+        tui.skipped_renders(),
+        skipped_before + 1,
+        "an off-screen change should take the skip path",
+    );
     assert!(
-        v.iter().any(|r| r.contains("row 8")),
-        "viewport should show latest row; got {v:?}",
+        !terminal.writes_joined().contains("ROW 0 CHANGED"),
+        "the off-screen change must not be written to the terminal; writes: {:?}",
+        terminal.writes_joined(),
+    );
+    assert_eq!(
+        terminal.viewport(),
+        viewport_before,
+        "the visible viewport must be unchanged by an off-screen edit",
+    );
+}
+
+#[test]
+fn skipped_off_screen_change_repaints_when_scrolled_back_into_view() {
+    // Companion to the skip test: once a skipped off-screen change
+    // scrolls back into the viewport (here by shrinking the content
+    // below it so the frame fits again), the engine must repaint it
+    // with the *current* content. This works because the skip left
+    // `previous_lines` honest (still showing the pre-edit content), so
+    // the re-entry diff sees the difference and repaints it.
+    let terminal = VirtualTerminal::new(40, 6);
+    let mut tui = Tui::new(Box::new(terminal.clone()));
+    let component = MutableLines::new();
+    tui.add_child(Box::new(component.clone()));
+
+    // Eight rows on a 6-row terminal: rows 0..=1 scroll off.
+    component.set((0..8).map(|i| format!("row {i}")));
+    render_now(&mut tui);
+
+    // Edit off-screen row 0 — skipped.
+    let mut edited: Vec<String> = (0..8).map(|i| format!("row {i}")).collect();
+    edited[0] = "row 0 EDITED".to_string();
+    component.set(edited);
+    tui.request_render();
+    render_now(&mut tui);
+    assert!(
+        !terminal.viewport().iter().any(|r| r.contains("EDITED")),
+        "edit was off-screen, should not be visible yet; got {:?}",
+        terminal.viewport(),
+    );
+
+    // Shrink to three rows so row 0 is back in view. The current
+    // (edited) content for row 0 must now appear.
+    component.set(["row 0 EDITED", "row 1", "row 2"]);
+    tui.request_render();
+    render_now(&mut tui);
+
+    assert!(
+        terminal
+            .viewport()
+            .iter()
+            .any(|r| r.contains("row 0 EDITED")),
+        "after scrolling back into view the edited row must repaint with \
+         current content; got {:?}",
+        terminal.viewport(),
     );
 }
 
@@ -1553,8 +1604,9 @@ fn composite_drops_wide_char_that_would_straddle_overlay_boundary() {
 
 #[test]
 #[serial_test::serial]
-fn termux_height_shrink_reaches_full_redraw_when_old_top_would_have_hidden_it() {
-    // Regression guard for the Termux-path viewport-top recompute.
+fn termux_height_shrink_recompute_lets_off_screen_change_skip() {
+    // Regression guard for the Termux-path viewport-top recompute,
+    // now observed through the off-screen skip path.
     //
     // Scenario that distinguishes old-vs-new behavior:
     //
@@ -1564,12 +1616,12 @@ fn termux_height_shrink_reaches_full_redraw_when_old_top_would_have_hidden_it() 
     //     5..=9; logical rows 0..=4 have fallen above it into what
     //     the tracker should start treating as scrollback.
     //   - Change logical row 0. This row is above the (recomputed)
-    //     viewport top, so the engine must fall back to a full
-    //     redraw to reach it.
+    //     viewport top, so the change is invisible and the engine
+    //     skips the paint.
     //
     // Without the recompute, `previous_viewport_top` stays 0 — the
-    // `diff_above_viewport` check is `0 < 0 => false`, the diff path
-    // runs, and the repaint lands on the wrong physical row.
+    // `last < viewport_top` check is `0 < 0 => false`, the skip is not
+    // taken, and the diff path repaints the (wrong) physical row.
     let _guard = support::with_env(&[("TERMUX_VERSION", Some("1"))]);
 
     let terminal = VirtualTerminal::new(40, 10);
@@ -1585,11 +1637,12 @@ fn termux_height_shrink_reaches_full_redraw_when_old_top_would_have_hidden_it() 
     tui.request_render();
     render_now(&mut tui);
 
-    let redraws_before = tui.full_redraws();
+    let full_redraws_before = tui.full_redraws();
+    let skipped_before = tui.skipped_renders();
 
-    // Change logical row 0. With the recompute, diff_above_viewport
-    // fires (0 < 5 => true) and the engine full-redraws. Without it,
-    // the check is 0 < 0 => false and the diff path runs.
+    // Change logical row 0. With the recompute it sits above the
+    // viewport top (0 < 5), so the engine skips the paint. Without it,
+    // the skip is not taken.
     component.set((0..10).map(|i| {
         if i == 0 {
             "row-0-NEW".to_string()
@@ -1600,11 +1653,15 @@ fn termux_height_shrink_reaches_full_redraw_when_old_top_would_have_hidden_it() 
     tui.request_render();
     render_now(&mut tui);
 
-    assert!(
-        tui.full_redraws() > redraws_before,
-        "change above (recomputed) viewport top must force a full redraw \
-         (before: {redraws_before}, after: {})",
+    assert_eq!(
+        tui.skipped_renders(),
+        skipped_before + 1,
+        "a change above the recomputed viewport top should be skipped",
+    );
+    assert_eq!(
         tui.full_redraws(),
+        full_redraws_before,
+        "the off-screen change must not trigger a full redraw",
     );
 }
 

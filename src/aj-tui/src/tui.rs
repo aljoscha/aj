@@ -1019,6 +1019,12 @@ pub struct Tui {
     /// coalescing tests that want to assert "exactly one render ran"
     /// without depending on throttle timing.
     total_renders: u64,
+    /// Number of `render()` calls that classified the frame's change as
+    /// entirely above the viewport and skipped the paint (see
+    /// `docs/offscreen-render-skip-spec.md`). Counted separately from
+    /// `full_redraws` and the diff strategies so tests can assert the
+    /// skip path was taken.
+    skipped_renders: u64,
 
     // Behavior flags.
     clear_on_shrink: bool,
@@ -1142,6 +1148,7 @@ impl Tui {
             scorched_earth_pending: false,
             full_redraws: 0,
             total_renders: 0,
+            skipped_renders: 0,
             clear_on_shrink: false,
             strict_line_widths: true,
             full_clear_mode: FullClearMode::WholeScreen,
@@ -1733,6 +1740,60 @@ impl Tui {
             })
             .unwrap_or(false);
 
+        // A change whose rows all sit above the viewport top is
+        // invisible: the user only sees the bottom `height` rows, and
+        // these have scrolled off into the terminal's scrollback. We
+        // can't reach them with relative cursor moves, and repainting
+        // the whole screen (the `diff_above_viewport` full-redraw
+        // fallback) to reflect rows nobody can see is the dominant
+        // source of flicker while a background sub-agent box streams
+        // off-screen.
+        //
+        // Skip the paint and leave `previous_lines` and all
+        // viewport/cursor/image tracking untouched, so the engine keeps
+        // believing the terminal shows the old, scrolled-off content,
+        // which it does. When these rows scroll back into view (content
+        // below shrinks, or the terminal grows) the next diff compares
+        // the current frame against this stale record and repaints them.
+        // See `docs/offscreen-render-skip-spec.md`.
+        //
+        // `last < effective_viewport_top` implies the line count is
+        // unchanged: a net insert or delete above the fold would shift
+        // the tail and surface as changes at indices at or below the
+        // viewport, contradicting `last < vt`. So there is no length
+        // delta to reconcile and nothing visible to clear. The
+        // pure-deletion-above-viewport and forced-full-clear cases still
+        // need their full redraw, so they are excluded here.
+        let change_entirely_above_viewport = peeked_range
+            .map(|(_, last)| last < effective_viewport_top)
+            .unwrap_or(false);
+        if change_entirely_above_viewport && !deletion_only_needs_full && !self.pending_full_clear {
+            self.skipped_renders += 1;
+            self.render_requested = false;
+            if let Some(path) = debug_log_path.as_ref() {
+                RenderDebugRecord {
+                    strategy: "skip(above_viewport)",
+                    cursor_at_before,
+                    cursor_at_after: self.hardware_cursor_row,
+                    first_changed: peeked_range.map(|(f, _)| f),
+                    last_changed: peeked_range.map(|(_, l)| l),
+                    prev_len: self.previous_lines.len(),
+                    new_len: lines.len(),
+                    max_lines_rendered_before,
+                    max_lines_rendered_after: self.max_lines_rendered,
+                    width: current_width,
+                    height: current_height,
+                    width_changed,
+                    height_changed,
+                    cursor_pos: cursor_pos.as_ref().map(|p| (p.row, p.col)),
+                    prev_lines_snapshot,
+                    new_lines_snapshot,
+                }
+                .append_to(path);
+            }
+            return;
+        }
+
         let strategy: &'static str;
         let mut diff_range: Option<(usize, usize)> = None;
         // `pending_full_clear` distinguishes a post-`force_full_render`
@@ -1923,6 +1984,14 @@ impl Tui {
     /// CI machines.
     pub fn total_renders(&self) -> u64 {
         self.total_renders
+    }
+
+    /// Number of renders that skipped the paint because every changed
+    /// row was above the viewport top (scrolled off into scrollback).
+    /// Exposed for tests that assert the off-screen-skip path was taken
+    /// rather than a full redraw or a diff.
+    pub fn skipped_renders(&self) -> u64 {
+        self.skipped_renders
     }
 
     /// The historical high-water mark of the number of lines that have been
