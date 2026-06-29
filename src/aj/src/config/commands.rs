@@ -127,6 +127,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenSessionInfo,
     },
     Command {
+        name: "export",
+        title: "export",
+        category: "session",
+        description: "Export this session to a shareable HTML file.",
+        action_id: None,
+        action: CommandAction::ExportHtml,
+    },
+    Command {
         name: "compact",
         title: "compact",
         category: "session",
@@ -285,6 +293,10 @@ pub enum CommandAction {
     /// Toggles persist to the `disabled_skills` config option as the
     /// user makes them; `Esc` closes.
     OpenSkills,
+    /// Render the current session to a self-contained HTML file under
+    /// `~/.aj/exports/` and surface the path as a notice. Read-only, so
+    /// it's safe mid-turn.
+    ExportHtml,
     /// Start a fresh session. The current session is preserved on
     /// disk; the host creates a new [`ConversationLog`], swaps it
     /// in, seeds the agent's transcript empty, and clears the

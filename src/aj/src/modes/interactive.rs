@@ -3062,7 +3062,7 @@ fn persist_setting(
 /// stay at least `COMMANDS.len() + 3`. The content-heavy overlays
 /// (session switcher, prompt history) size their rows dynamically
 /// instead. See [`large_overlay_inner_rows`].
-const PALETTE_OVERLAY_INNER_ROWS: usize = 21;
+const PALETTE_OVERLAY_INNER_ROWS: usize = 22;
 
 /// Sizing/anchor used by the command palette and the compact pickers
 /// (model / thinking / help). Centered, fills ~75% of the terminal
@@ -3416,6 +3416,23 @@ async fn start_login_session(
     ))
 }
 
+/// Write the rendered session HTML to `~/.aj/exports/aj-session-<id>.html`,
+/// creating the directory if needed. Returns the path written.
+///
+/// We keep exports under the managed config dir rather than the
+/// working directory so a `export` from inside a git repo doesn't drop
+/// an untracked file into the user's tree. The notice reports the full
+/// path, so it stays discoverable.
+fn write_session_export(session_id: &str, html: &str) -> Result<PathBuf> {
+    let dir = Config::get_config_dir()
+        .context("failed to resolve ~/.aj")?
+        .join("exports");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!("aj-session-{session_id}.html"));
+    std::fs::write(&path, html).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 /// Apply a [`CommandAction`] chosen from the palette, a keyboard
 /// shortcut, or a palette follow-up.
 #[allow(clippy::too_many_arguments)]
@@ -3657,6 +3674,22 @@ async fn handle_command(
             CommandOutcome::Continue {
                 selector: Some(OpenSelector::SessionInfo { handle, outcome }),
                 notice: None,
+            }
+        }
+        CommandAction::ExportHtml => {
+            // Render under the lock (read-only, so it can't deadlock a
+            // turn) as a string, then write the file with the guard
+            // already dropped at the end of the statement. Mirrors
+            // `OpenSessionInfo`, which also reads the log under the
+            // lock. Both success and failure surface as a notice.
+            let html = crate::export::render_session_html(&*world.log.lock().await);
+            let notice = match write_session_export(&world.session_id, &html) {
+                Ok(path) => format!("Exported session to {}", display_path(&path)),
+                Err(e) => format!("Export failed: {e}"),
+            };
+            CommandOutcome::Continue {
+                selector: None,
+                notice: Some(notice),
             }
         }
         CommandAction::OpenUsageStatus => {

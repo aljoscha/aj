@@ -27,6 +27,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod compaction;
 pub mod config;
+pub mod export;
 pub mod model;
 pub mod modes;
 pub mod scripted;
