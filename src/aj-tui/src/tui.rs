@@ -1740,60 +1740,6 @@ impl Tui {
             })
             .unwrap_or(false);
 
-        // A change whose rows all sit above the viewport top is
-        // invisible: the user only sees the bottom `height` rows, and
-        // these have scrolled off into the terminal's scrollback. We
-        // can't reach them with relative cursor moves, and repainting
-        // the whole screen (the `diff_above_viewport` full-redraw
-        // fallback) to reflect rows nobody can see is the dominant
-        // source of flicker while a background sub-agent box streams
-        // off-screen.
-        //
-        // Skip the paint and leave `previous_lines` and all
-        // viewport/cursor/image tracking untouched, so the engine keeps
-        // believing the terminal shows the old, scrolled-off content,
-        // which it does. When these rows scroll back into view (content
-        // below shrinks, or the terminal grows) the next diff compares
-        // the current frame against this stale record and repaints them.
-        // See `docs/offscreen-render-skip-spec.md`.
-        //
-        // `last < effective_viewport_top` implies the line count is
-        // unchanged: a net insert or delete above the fold would shift
-        // the tail and surface as changes at indices at or below the
-        // viewport, contradicting `last < vt`. So there is no length
-        // delta to reconcile and nothing visible to clear. The
-        // pure-deletion-above-viewport and forced-full-clear cases still
-        // need their full redraw, so they are excluded here.
-        let change_entirely_above_viewport = peeked_range
-            .map(|(_, last)| last < effective_viewport_top)
-            .unwrap_or(false);
-        if change_entirely_above_viewport && !deletion_only_needs_full && !self.pending_full_clear {
-            self.skipped_renders += 1;
-            self.render_requested = false;
-            if let Some(path) = debug_log_path.as_ref() {
-                RenderDebugRecord {
-                    strategy: "skip(above_viewport)",
-                    cursor_at_before,
-                    cursor_at_after: self.hardware_cursor_row,
-                    first_changed: peeked_range.map(|(f, _)| f),
-                    last_changed: peeked_range.map(|(_, l)| l),
-                    prev_len: self.previous_lines.len(),
-                    new_len: lines.len(),
-                    max_lines_rendered_before,
-                    max_lines_rendered_after: self.max_lines_rendered,
-                    width: current_width,
-                    height: current_height,
-                    width_changed,
-                    height_changed,
-                    cursor_pos: cursor_pos.as_ref().map(|p| (p.row, p.col)),
-                    prev_lines_snapshot,
-                    new_lines_snapshot,
-                }
-                .append_to(path);
-            }
-            return;
-        }
-
         let strategy: &'static str;
         let mut diff_range: Option<(usize, usize)> = None;
         // `pending_full_clear` distinguishes a post-`force_full_render`
@@ -1802,20 +1748,53 @@ impl Tui {
         // field doc for the rationale.
         let recover_full_clear = self.pending_full_clear;
 
-        // After the skip early-return above, `diff_above_viewport`
-        // (first changed row above the viewport top) means exactly "the
-        // change straddles the viewport top": part is in scrollback,
-        // part is visible. When the line count is unchanged nothing
-        // scrolled, so the visible rows kept their screen positions and
-        // we can repaint just the visible suffix, clamped to the
-        // viewport top, leaving the unreachable scrollback rows alone. A
-        // straddle that changed the line count still needs a full redraw,
-        // because the net insert or delete above the fold forces a
-        // scroll we can't drive from the visible region.
+        // Classify the change relative to the viewport top so we can
+        // skip or clamp work the user can't see. `peeked_range` is
+        // `None` (so both flags below are false) whenever a hard
+        // full-redraw trigger already fired (`first_render`,
+        // `width_changed`, `height_forces_full_redraw`, `shrunk`), so
+        // those take precedence here without an explicit check.
+        //
+        // Both optimizations require an unchanged line count. The
+        // clamped repaint needs it because a net insert or delete above
+        // the fold would scroll the bottom-anchored frame, which a
+        // clamped repaint can't reproduce. For the skip it is implied
+        // (`compute_diff_range` pads missing rows with "", and Phase 4
+        // appends `SEGMENT_RESET` to every rendered row, so an added or
+        // removed row always differs from the padding and surfaces as a
+        // tail change at or below the viewport, ruling out `last < vt`),
+        // but we require it explicitly so the soundness is self-contained
+        // rather than resting on that non-local fact.
         let equal_line_count = lines.len() == self.previous_lines.len();
-        let straddle_clamped = diff_above_viewport && equal_line_count;
-        // Set by the clamped-straddle path to the viewport top, so the
-        // state update below preserves the off-screen prefix of
+
+        // Entirely above the viewport: invisible (scrolled into
+        // scrollback, unreachable by relative cursor moves). We paint no
+        // content and leave `previous_lines` and the Kitty registry
+        // untouched, so the engine keeps believing the terminal shows the
+        // old, scrolled-off content, which it does. When these rows
+        // scroll back into view the next diff repaints them. The cursor
+        // phase still runs below: a caret move in the visible editor
+        // produces no line diff (the marker is stripped before the diff),
+        // so skipping it would freeze the cursor while a background box
+        // streams off-screen. The pure-deletion-above-viewport and
+        // forced-full-clear cases need their full redraw, so they are
+        // excluded. See `docs/offscreen-render-skip-spec.md`.
+        let skip_content = equal_line_count
+            && peeked_range
+                .map(|(_, last)| last < effective_viewport_top)
+                .unwrap_or(false)
+            && !deletion_only_needs_full
+            && !recover_full_clear;
+
+        // Straddles the viewport top (first row above it, last row
+        // visible) with an unchanged line count: repaint only the
+        // visible suffix, clamped to the viewport top, instead of a full
+        // redraw. A straddle that changed the line count still
+        // full-redraws (the scroll can't be driven from the visible
+        // region).
+        let straddle_clamped = !skip_content && diff_above_viewport && equal_line_count;
+        // Set by the clamped-straddle path to the viewport top so the
+        // state update preserves the off-screen prefix of
         // `previous_lines` instead of overwriting it with the (unpainted)
         // current content.
         let mut preserve_prefix: Option<usize> = None;
@@ -1867,6 +1846,17 @@ impl Tui {
             self.full_render(&mut frame, &lines, clear);
             self.full_redraws += 1;
             self.pending_full_clear = false;
+        } else if skip_content {
+            // Paint nothing: the change is entirely above the viewport.
+            // `previous_lines` and the Kitty registry stay untouched (the
+            // honest-buffer invariant, applied in the state update
+            // below); only the viewport-top tracker advances, which
+            // matters when a Termux height change reached this path. The
+            // cursor phase below still runs.
+            self.previous_viewport_top = effective_viewport_top;
+            self.skipped_renders += 1;
+            diff_range = peeked_range;
+            strategy = "skip(above_viewport)";
         } else if straddle_clamped {
             // Repaint only the visible suffix `[viewport_top, last]` and
             // leave the off-screen prefix untouched. The state update
@@ -1911,34 +1901,42 @@ impl Tui {
         self.terminal.write(&frame);
         self.terminal.flush();
 
-        // Update state.
-        match preserve_prefix {
-            Some(floor) => {
-                // Clamped straddle: rows above `floor` are in scrollback
-                // and were intentionally not repainted, so keep their
-                // last-painted content (the honest record of what the
-                // terminal shows) and adopt only the repainted visible
-                // suffix. Equal line count guarantees `floor <=
-                // lines.len()` and that the two halves line up.
-                self.previous_lines.truncate(floor);
-                self.previous_lines.extend(lines.drain(floor..));
-            }
-            None => {
-                self.previous_lines = lines;
-            }
-        }
+        // Update state. Width, height, and the render-requested flag
+        // always settle to the current frame. The content buffer and the
+        // Kitty registry are left untouched on the skip path so they keep
+        // reflecting what is physically on the terminal (the
+        // honest-buffer invariant).
         self.previous_width = current_width;
         self.previous_height = current_height;
         self.render_requested = false;
+        if !skip_content {
+            match preserve_prefix {
+                Some(floor) => {
+                    // Clamped straddle: rows above `floor` are in
+                    // scrollback and were intentionally not repainted, so
+                    // keep their last-painted content (the honest record
+                    // of what the terminal shows) and adopt only the
+                    // repainted visible suffix. `floor <= last < len` (the
+                    // skip already consumed the `last < floor` case) keeps
+                    // `truncate`/`drain` in range, and the equal line
+                    // count keeps the two halves aligned.
+                    self.previous_lines.truncate(floor);
+                    self.previous_lines.extend(lines.drain(floor..));
+                }
+                None => {
+                    self.previous_lines = lines;
+                }
+            }
 
-        // Refresh the Kitty placement registry from the frame
-        // we just committed. The next render's diff path uses
-        // this set to decide which delete-by-id escapes to emit
-        // before redrawing any image-bearing row.
-        self.previous_kitty_image_ids.clear();
-        for line in &self.previous_lines {
-            for id in crate::image_protocol::extract_kitty_image_ids(line) {
-                self.previous_kitty_image_ids.insert(id);
+            // Refresh the Kitty placement registry from the frame we just
+            // committed. The next render's diff path uses this set to
+            // decide which delete-by-id escapes to emit before redrawing
+            // any image-bearing row.
+            self.previous_kitty_image_ids.clear();
+            for line in &self.previous_lines {
+                for id in crate::image_protocol::extract_kitty_image_ids(line) {
+                    self.previous_kitty_image_ids.insert(id);
+                }
             }
         }
 
@@ -3098,7 +3096,7 @@ impl Tui {
         let (first, mut last) = Self::compute_diff_range(&self.previous_lines, lines)?;
         // Clamp the repaint floor to the visible region. With `min_row >
         // 0` the first row of the range may now be byte-identical to the
-        // previous frame (the genuine change was above the floor); the
+        // previous frame (the genuine change was above the floor). The
         // main loop's per-row skip handles that and leaves it untouched.
         let first = first.max(min_row);
 

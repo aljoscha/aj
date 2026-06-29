@@ -1089,7 +1089,7 @@ fn diff_skips_paint_when_change_is_entirely_above_viewport() {
     component.set(["row 0", "row 1", "row 2", "row 3", "row 4", "row 5"]);
     render_now(&mut tui);
 
-    // Grow past the bottom — the terminal scrolls and
+    // Grow past the bottom. The terminal scrolls and
     // `previous_viewport_top` advances.
     component.set([
         "row 0", "row 1", "row 2", "row 3", "row 4", "row 5", "row 6", "row 7", "row 8",
@@ -1102,7 +1102,7 @@ fn diff_skips_paint_when_change_is_entirely_above_viewport() {
     let viewport_before = terminal.viewport();
     terminal.clear_writes();
 
-    // Change row 0 (logically) — off-screen, equal line count. Must be
+    // Change row 0 (logically), off-screen, equal line count. Must be
     // skipped, not full-redrawn.
     component.set([
         "ROW 0 CHANGED",
@@ -1143,11 +1143,12 @@ fn diff_skips_paint_when_change_is_entirely_above_viewport() {
 #[test]
 fn skipped_off_screen_change_repaints_when_scrolled_back_into_view() {
     // Companion to the skip test: once a skipped off-screen change
-    // scrolls back into the viewport (here by shrinking the content
-    // below it so the frame fits again), the engine must repaint it
-    // with the *current* content. This works because the skip left
-    // `previous_lines` honest (still showing the pre-edit content), so
-    // the re-entry diff sees the difference and repaints it.
+    // scrolls back into the viewport, its current content must appear.
+    // Here re-entry is via a content shrink, which the engine handles
+    // with a full redraw, so this covers the end-to-end resume contract.
+    // The honest-buffer-via-diff path (where re-entry repaints through a
+    // diff against the stale `previous_lines`) is covered separately by
+    // `skipped_off_screen_change_repaints_via_diff_on_termux_grow`.
     let terminal = VirtualTerminal::new(40, 6);
     let mut tui = Tui::new(Box::new(terminal.clone()));
     let component = MutableLines::new();
@@ -1156,13 +1157,19 @@ fn skipped_off_screen_change_repaints_when_scrolled_back_into_view() {
     // Eight rows on a 6-row terminal: rows 0..=1 scroll off.
     component.set((0..8).map(|i| format!("row {i}")));
     render_now(&mut tui);
+    let skipped_before = tui.skipped_renders();
 
-    // Edit off-screen row 0 — skipped.
+    // Edit off-screen row 0, which is skipped.
     let mut edited: Vec<String> = (0..8).map(|i| format!("row {i}")).collect();
     edited[0] = "row 0 EDITED".to_string();
     component.set(edited);
     tui.request_render();
     render_now(&mut tui);
+    assert_eq!(
+        tui.skipped_renders(),
+        skipped_before + 1,
+        "the off-screen edit must take the skip path",
+    );
     assert!(
         !terminal.viewport().iter().any(|r| r.contains("EDITED")),
         "edit was off-screen, should not be visible yet; got {:?}",
@@ -1191,7 +1198,7 @@ fn straddle_with_equal_line_count_repaints_only_visible_portion() {
     // A change that straddles the viewport top (one row above it, one
     // row visible) with an unchanged line count repaints only the
     // visible suffix, clamped to the viewport top. No full redraw, no
-    // skip — the off-screen row is left alone and the visible row
+    // skip. The off-screen row is left alone and the visible row
     // updates.
     let terminal = VirtualTerminal::new(40, 6);
     let mut tui = Tui::new(Box::new(terminal.clone()));
@@ -1207,10 +1214,11 @@ fn straddle_with_equal_line_count_repaints_only_visible_portion() {
     let skipped_before = tui.skipped_renders();
 
     // Change off-screen row 1 and visible row 5 in one frame, same line
-    // count. first=1 (above the fold), last=5 (visible) — a straddle.
+    // count. first=1 (above the fold), last=5 (visible), a straddle.
     let mut next: Vec<String> = (0..9).map(|i| format!("row {i}")).collect();
     next[1] = "row 1 OFFSCREEN".to_string();
     next[5] = "row 5 VISIBLE".to_string();
+    terminal.clear_writes();
     component.set(next);
     tui.request_render();
     render_now(&mut tui);
@@ -1231,14 +1239,27 @@ fn straddle_with_equal_line_count_repaints_only_visible_portion() {
         viewport.iter().any(|r| r.contains("row 5 VISIBLE")),
         "the visible portion of the straddle should repaint; got {viewport:?}",
     );
-    // ...while the off-screen edit stays out of view.
+    // ...while the off-screen edit is neither visible nor written. The
+    // write-level check is what distinguishes a clamped repaint from a
+    // (whole-screen) full redraw, which the viewport alone cannot: a
+    // full redraw of these 9 rows produces the same visible bottom six.
     assert!(
         !viewport.iter().any(|r| r.contains("OFFSCREEN")),
-        "the off-screen portion must not be painted; got {viewport:?}",
+        "the off-screen portion must not be visible; got {viewport:?}",
+    );
+    let writes = terminal.writes_joined();
+    assert!(
+        !writes.contains("row 1 OFFSCREEN"),
+        "the off-screen row must not be written; writes: {writes:?}",
+    );
+    assert!(
+        !writes.contains("\x1b[2J"),
+        "a clamped repaint must not clear the screen; writes: {writes:?}",
     );
 
-    // Resume: shrink so row 1 comes back into view; its current content
-    // must appear, proving the clamped repaint left the buffer honest.
+    // Resume: shrink so row 1 comes back into view and its current
+    // content appears (end-to-end resume; this re-entry is a full
+    // redraw, see the Termux-grow test for the diff-path variant).
     component.set(["row 0", "row 1 OFFSCREEN", "row 2"]);
     tui.request_render();
     render_now(&mut tui);
@@ -1289,6 +1310,124 @@ fn straddle_with_line_count_change_falls_back_to_full_redraw() {
         tui.skipped_renders(),
         skipped_before,
         "a length-changing straddle is a full redraw, not a skip",
+    );
+}
+
+#[test]
+fn off_screen_skip_still_repositions_a_moved_cursor() {
+    // A caret move in the visible editor produces no line diff (the
+    // cursor marker is stripped before the diff runs), so when it
+    // coincides with an off-screen change in the same coalesced frame
+    // the frame still classifies as a skip. The skip must nonetheless
+    // run the cursor phase, or the caret would freeze while a background
+    // box streams off-screen.
+    use aj_tui::component::CURSOR_MARKER;
+
+    let terminal = VirtualTerminal::new(40, 6);
+    let mut tui = Tui::new(Box::new(terminal.clone()));
+    let component = MutableLines::new();
+    tui.add_child(Box::new(component.clone()));
+
+    // Eight rows on a 6-row terminal: rows 0..=1 scroll off. The last
+    // (visible) row carries the cursor marker inside "abcd".
+    let rows = |marker_after: usize| {
+        let mut v: Vec<String> = (0..7).map(|i| format!("row {i}")).collect();
+        let cell = "abcd";
+        v.push(format!(
+            "{}{}{}",
+            &cell[..marker_after],
+            CURSOR_MARKER,
+            &cell[marker_after..]
+        ));
+        v
+    };
+    component.set(rows(2));
+    render_now(&mut tui);
+    let col_before = terminal.cursor().1;
+    let full_redraws_before = tui.full_redraws();
+    let skipped_before = tui.skipped_renders();
+
+    // Move the marker one column right (2 -> 3) AND edit off-screen row
+    // 0. The stripped last row is unchanged ("abcd"), so the only line
+    // diff is off-screen (a skip), but the caret must still advance.
+    let mut next = rows(3);
+    next[0] = "row 0 CHANGED".to_string();
+    component.set(next);
+    tui.request_render();
+    render_now(&mut tui);
+
+    assert_eq!(
+        tui.skipped_renders(),
+        skipped_before + 1,
+        "off-screen change with an unchanged visible line is a skip",
+    );
+    assert_eq!(
+        tui.full_redraws(),
+        full_redraws_before,
+        "the skip must not full-redraw",
+    );
+    assert_eq!(
+        terminal.cursor().1,
+        col_before + 1,
+        "the skip must still reposition the moved cursor (was col {col_before})",
+    );
+    assert!(
+        !terminal.viewport().iter().any(|r| r.contains("CHANGED")),
+        "the off-screen edit must stay invisible; got {:?}",
+        terminal.viewport(),
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn skipped_off_screen_change_repaints_via_diff_on_termux_grow() {
+    // The strong honest-buffer test: re-entry through the diff path, not
+    // a full redraw. On Termux a height change stays on the diff path
+    // and recomputes the viewport top, so growing the terminal brings
+    // off-screen rows back into view via a diff against `previous_lines`.
+    // If the skip had advanced `previous_lines`, the diff would see no
+    // change and leave the stale pre-edit row on screen.
+    let _guard = support::with_env(&[("TERMUX_VERSION", Some("1"))]);
+
+    let terminal = VirtualTerminal::new(40, 6);
+    let mut tui = Tui::new(Box::new(terminal.clone()));
+    let component = MutableLines::new();
+    tui.add_child(Box::new(component.clone()));
+
+    // Eight rows on a 6-row terminal: rows 0..=1 scroll off.
+    component.set((0..8).map(|i| format!("row {i}")));
+    render_now(&mut tui);
+
+    // Edit off-screen row 0, which is skipped, leaving `previous_lines`
+    // honest.
+    let mut edited: Vec<String> = (0..8).map(|i| format!("row {i}")).collect();
+    edited[0] = "row 0 EDITED".to_string();
+    component.set(edited);
+    tui.request_render();
+    render_now(&mut tui);
+    assert_eq!(tui.skipped_renders(), 1, "the off-screen edit must skip");
+    let full_redraws_before = tui.full_redraws();
+
+    // Grow the terminal so all eight rows fit. On Termux this stays on
+    // the diff path (no full redraw) and the recomputed viewport top
+    // brings row 0 into view; the diff against the honest buffer
+    // repaints the edit.
+    terminal.resize(40, 10);
+    tui.request_render();
+    render_now(&mut tui);
+
+    assert_eq!(
+        tui.full_redraws(),
+        full_redraws_before,
+        "Termux grow must re-enter via the diff path, not a full redraw",
+    );
+    assert!(
+        terminal
+            .viewport()
+            .iter()
+            .any(|r| r.contains("row 0 EDITED")),
+        "the diff must surface the edited row from the honest buffer; got {:?}",
+        terminal.viewport(),
     );
 }
 

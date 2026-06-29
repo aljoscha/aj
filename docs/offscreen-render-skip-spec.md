@@ -1,4 +1,4 @@
-# Off-screen render skip & clamped straddle repaint — spec
+# Off-screen render skip and clamped straddle repaint
 
 Status: implemented.
 
@@ -53,9 +53,10 @@ Let `(first, last)` be the changed row range from `compute_diff_range`
 and `vt` the effective viewport top (logical row currently at physical
 row 0). The engine classifies a change relative to the viewport:
 
-1. **Entirely above the viewport** (`last < vt`): invisible. Paint
-   nothing. This is the dominant steady-state case for a saturated,
-   off-screen sub-agent box.
+1. **Entirely above the viewport** (`last < vt`, unchanged line count):
+   invisible. Paint no content (the cursor phase still runs, see below).
+   This is the dominant steady-state case for a saturated, off-screen
+   sub-agent box.
 2. **Straddles the viewport top** (`first < vt <= last`): part is in
    scrollback (unreachable), part is visible.
    - If the line count is unchanged (`lines.len() ==
@@ -69,15 +70,22 @@ row 0). The engine classifies a change relative to the viewport:
 3. **In or below the viewport** (`first >= vt`): the existing
    differential path, unchanged.
 
-`last < vt` (entirely above) implies the line count is unchanged: a net
-insert or delete shifts the tail rows, which would surface as changes at
-high indices (at or below the viewport, well past `vt`), contradicting
-`last < vt`. So the skip case is always a pure in-place change and never
-needs to reconcile a length delta.
+Both the skip and the clamped repaint require an unchanged line count.
+The clamped repaint needs it because a net insert or delete above the
+fold would scroll the bottom-anchored frame, which a clamped repaint
+cannot reproduce. For the skip it is already implied: `compute_diff_range`
+pads missing rows with `""`, and Phase 4 appends `SEGMENT_RESET` to
+every rendered row, so an added or removed row always differs from the
+padding and surfaces as a tail change at or below the viewport, which
+rules out `last < vt`. We still require it explicitly so the skip's
+soundness is self-contained rather than resting on that non-local fact.
 
-The other hard full-redraw triggers (first render, width change, height
-change, clear-on-shrink, pure-deletion-above-viewport, forced full
-clear) take precedence over the skip and the clamped repaint.
+The other hard full-redraw triggers take precedence over the skip and
+the clamped repaint. First render, width change, height change (off
+Termux), and clear-on-shrink make `compute_diff_range`'s peek `None`, so
+both flags are false without an explicit check. Pure-deletion-above-
+viewport and forced-full-clear are excluded explicitly in the skip
+guard.
 
 ## The honest-buffer invariant
 
@@ -85,21 +93,31 @@ clear) take precedence over the skip and the clamped repaint.
 including the rows frozen in scrollback. This is what makes "resume when
 scrolled back into view" work without any extra machinery:
 
-- On a **skip**, leave `previous_lines` (and the viewport tracker,
-  hardware cursor, and Kitty image registry) completely untouched. The
-  engine keeps believing the terminal shows the old, scrolled-off
-  content, which is true.
+- On a **skip**, leave the content buffer `previous_lines` and the Kitty
+  image registry untouched, so the engine keeps believing the terminal
+  shows the old, scrolled-off content, which is true. The viewport-top
+  tracker and width/height still settle to the current frame, and the
+  cursor phase still runs. A caret move in the visible editor produces
+  no line diff (the marker is stripped before diffing), so a frame that
+  skips its content paint must still emit the cursor move, or the caret
+  freezes while a background box streams.
 - On a **clamped straddle repaint**, advance only the rows that were
   actually painted. Keep the off-screen prefix `[0, vt)` as its
   last-painted content and adopt the repainted visible suffix `[vt, ..)`.
 
-When those rows later re-enter the viewport (the content below shrinks,
-or the terminal grows), the next diff compares the current frame against
-the stale `previous_lines`, sees the difference at the now-visible rows,
-and repaints them. If `previous_lines` had instead been advanced while
-the rows were off-screen, the engine would believe they were already up
-to date and would leave stale content on screen at re-entry. That is the
-trap the invariant avoids.
+When those rows later re-enter the viewport, the next diff compares the
+current frame against the stale `previous_lines`, sees the difference at
+the now-visible rows, and repaints them. If `previous_lines` had instead
+been advanced while the rows were off-screen, the engine would believe
+they were already up to date and would leave stale content on screen at
+re-entry. That is the trap the invariant avoids.
+
+The common re-entry paths repaint via a full redraw rather than a diff:
+shrinking the content below an off-screen row, and a non-Termux terminal
+grow, both take a full-redraw branch that paints current content
+regardless of `previous_lines`. The honest buffer matters specifically
+when re-entry stays on the diff path, which is the height-change-on-diff
+case (Termux, with the viewport-top recompute).
 
 A skipped, still-dirty off-screen row keeps the computed diff range
 starting above the viewport on subsequent frames. As long as only
@@ -117,10 +135,20 @@ old full clear-and-repaint and produces no flicker (no `\x1b[2J`).
   it matches how the engine already treats scrollback. The live box is a
   progress affordance. The final result still reaches the main thread as
   a normal message or tool result.
-- **Transient straddle redraws.** A box growing toward its compact cap,
-  or the brief moment a box scrolls across the top edge, changes the
-  line count above the fold and takes a full redraw. Short-lived and
-  acceptable.
+- **Length changes during streaming take a full redraw.** Any frame
+  whose total line count changes while an off-screen row is also dirty
+  has its first changed row above the fold and a changed line count, so
+  it full-redraws. This covers a box growing toward its compact cap, a
+  box crossing the top edge, and typing that grows the editor while a
+  sub-agent streams. The clamp only applies to equal-length frames.
+  Short-lived, and far cheaper than the old per-token full redraw.
+- **Kitty image retention.** A skip never issues delete-by-id for
+  off-screen placements, so an image that scrolls off and is then
+  replaced off-screen keeps its old placement resident in the terminal's
+  graphics store until the next full redraw drains the registry.
+  Correctness is unaffected (the resume diff deletes the stale id before
+  repainting), but graphics memory for off-screen boxes is reclaimed
+  lazily.
 - **Residual scheduling cost.** The event pump still requests a render
   per sub-agent event, so the engine still walks the component tree
   (with leaf caches) and then skips. That removes the flicker and the
@@ -136,10 +164,13 @@ viewport the user sees and the engine's strategy counters
 
 - An off-screen, equal-length change takes the skip path: no full
   redraw, no content bytes written, viewport unchanged.
-- A skipped off-screen change becomes visible again (content below
-  shrinks) and the current content appears: resume works.
+- A skip whose frame also moves the visible caret still repositions the
+  cursor (the regression guard for running the cursor phase on a skip).
+- A skipped change resumes when scrolled back into view, both via a
+  content shrink (full redraw) and via a Termux grow (a diff against the
+  honest buffer, the regression guard for not advancing `previous_lines`
+  on the skip).
 - A straddling, equal-length change takes the clamped repaint: no full
-  redraw, the visible portion updates, off-screen rows are left
-  untouched.
+  redraw, the visible portion repaints, off-screen rows are not written.
 - A straddling change that alters the line count above the fold still
   takes a full redraw.
