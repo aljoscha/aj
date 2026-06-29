@@ -565,13 +565,15 @@
   // TREE DATA (pure: flat entries -> nodes and layout)
   // ============================================================
   //
-  // The tree shows the user-thread conversation and its branches.
-  // Sub-agent entries are excluded. Settings and system entries are kept
+  // The tree shows the conversation, its branches, and (toggleable)
+  // sub-agent runs. A sub-agent run hangs off the assistant that spawned
+  // it: its `sub_agent_spawn` entry is parented at that assistant, so the
+  // run appears as a branch there. Settings and system entries are kept
   // but hidden by the default filter. The layout (indent, ASCII
   // connectors, gutters) mirrors the TUI's branch selector so the two
   // views agree.
 
-  const treeEntries = entries.filter((e) => e.thread !== 'subagent');
+  const treeEntries = entries;
 
   function buildTree() {
     const nodeMap = new Map();
@@ -610,7 +612,14 @@
     }
     let cur = treeNodeMap.get(nodeId);
     if (!cur) return nodeId;
-    while (cur.children.length > 0) cur = cur.children[cur.children.length - 1];
+    // Follow the newest child to a leaf, but stay on the conversation:
+    // never descend into a sub-agent run. Those are reached by clicking
+    // the sub-agent node itself, not by walking a conversation branch.
+    while (cur.children.length > 0) {
+      const onThread = cur.children.filter((c) => c.entry.thread !== 'subagent');
+      if (onThread.length === 0) break;
+      cur = onThread[onThread.length - 1];
+    }
     return cur.entry.id;
   }
 
@@ -828,6 +837,9 @@
         }
         return treeMuted('[' + escapeHtml(m.role) + ']');
       }
+      case 'sub_agent_spawn':
+        return '<span class="tree-sub-label">\u21b3 sub-agent #' + escapeHtml(String(entry.agent_id)) + '</span> ' +
+          escapeHtml(truncate(normalize(entry.task || '')));
       case 'compaction': return '<span class="tree-compaction">[compaction]</span>';
       case 'system_prompt': return treeMuted('[system prompt]');
       case 'model_change': return treeMuted('[model: ' + escapeHtml(entry.model_id) + ']');
@@ -848,6 +860,8 @@
         const call = m.tool_call_id ? toolCallById.get(m.tool_call_id) : null;
         if (call) parts.push(call.name, JSON.stringify(call.arguments || {}));
       }
+    } else if (entry.type === 'sub_agent_spawn') {
+      parts.push('sub-agent', entry.task || '');
     } else if (entry.type === 'compaction') {
       parts.push(entry.summary || '');
     } else if (entry.type === 'model_change') {
@@ -862,12 +876,17 @@
 
   let filterMode = 'default';
   let searchQuery = '';
+  // Sub-agent runs are shown by default; the sidebar toggle hides them.
+  let showSubAgents = true;
   const SETTINGS_TYPES = ['system_prompt', 'model_change', 'thinking_change', 'speed_change', 'verbosity_change'];
 
   function filterNodes(flatNodes, leafId) {
     const tokens = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
     const filtered = flatNodes.filter((flat) => {
       const entry = flat.node.entry;
+      // Sub-agent rows appear only when the toggle is on. Checked before
+      // the leaf rule so hiding wins even if the leaf is a sub-agent.
+      if (entry.thread === 'subagent' && !showSubAgents) return false;
       // The current leaf is always shown so the active branch never
       // vanishes, even under a filter or search that would exclude it.
       if (entry.id === leafId) return true;
@@ -926,6 +945,7 @@
       div.className = 'tree-node';
       if (activeIds.has(entry.id)) div.classList.add('in-path');
       if (entry.id === currentTargetId) div.classList.add('active');
+      if (entry.thread === 'subagent') div.classList.add('tree-subagent');
       div.dataset.id = entry.id;
 
       const prefix = document.createElement('span');
@@ -941,7 +961,11 @@
       div.append(prefix, marker, content);
       div.addEventListener('click', () => {
         if (window.getSelection().toString()) return;
-        navigateTo(findNewestLeaf(entry.id), 'target', entry.id);
+        // A sub-agent row navigates to itself: its run shows inline under
+        // the spawning assistant, so we open that box and scroll there. A
+        // conversation row goes to its branch leaf as usual.
+        if (entry.thread === 'subagent') navigateTo(entry.id, 'target', entry.id);
+        else navigateTo(findNewestLeaf(entry.id), 'target', entry.id);
       });
       container.appendChild(div);
     }
@@ -984,7 +1008,11 @@
 
     const messages = document.getElementById('messages');
     let html = '';
-    for (const entry of pathTo(leafId)) html += renderEntrySafe(entry);
+    // Sub-agent entries are not rendered in the main flow; they appear in
+    // the collapsible box under the assistant that spawned them.
+    for (const entry of pathTo(leafId)) {
+      if (entry.thread !== 'subagent') html += renderEntrySafe(entry);
+    }
     messages.innerHTML = html;
 
     // Render the tree last and in isolation: it already rendered the
@@ -1000,6 +1028,12 @@
 
     setTimeout(() => {
       if (scrollMode === 'target' && scrollToEntryId) {
+        // A sub-agent target lives inside a collapsed box; open it first.
+        const tgt = byId.get(scrollToEntryId);
+        if (tgt && tgt.thread === 'subagent' && tgt.agent_id != null) {
+          const box = document.getElementById('subagent-' + tgt.agent_id);
+          if (box) box.open = true;
+        }
         const el = document.getElementById(scrollTargetId(scrollToEntryId)) || document.getElementById('entry-' + scrollToEntryId);
         if (el) {
           el.scrollIntoView({ block: 'center' });
@@ -1178,6 +1212,22 @@
       renderTree();
     });
   });
+
+  // Sub-agent visibility is an independent toggle, not one of the radio
+  // filter modes. Hidden entirely when the session spawned no sub-agents.
+  const subToggle = document.getElementById('toggle-subagents');
+  if (subToggle) {
+    if (subThread.size === 0) {
+      subToggle.style.display = 'none';
+    } else {
+      subToggle.classList.toggle('active', showSubAgents);
+      subToggle.addEventListener('click', () => {
+        showSubAgents = !showSubAgents;
+        subToggle.classList.toggle('active', showSubAgents);
+        renderTree();
+      });
+    }
+  }
 
   function isEditable(el) {
     if (!el) return false;

@@ -73,6 +73,14 @@ a { color: var(--link); }
 }
 .filter-btn:hover { color: var(--fg); border-color: var(--fg); }
 .filter-btn.active { background: var(--link); color: var(--bg); border-color: var(--link); }
+/* The sub-agent toggle is independent of the radio filters, so it uses
+ * the tool accent (amber) when active to read as a separate control. */
+.toggle-btn {
+  padding: 3px 8px; font-size: 10px; font-family: inherit; background: transparent;
+  color: var(--muted); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+}
+.toggle-btn:hover { color: var(--fg); border-color: var(--fg); }
+.toggle-btn.active { background: var(--tool); color: var(--bg); border-color: var(--tool); }
 .sidebar-close {
   display: none; padding: 3px 8px; font-size: 12px; font-family: inherit; background: transparent;
   color: var(--muted); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; margin-left: auto;
@@ -95,6 +103,8 @@ a { color: var(--link); }
 .tree-muted { color: var(--muted); }
 .tree-error { color: var(--err); }
 .tree-compaction { color: var(--tool); }
+.tree-sub-label { color: var(--tool); }
+.tree-node.tree-subagent .tree-marker { color: var(--tool); }
 .tree-status { padding: 4px 12px; font-size: 10px; color: var(--muted); flex-shrink: 0; }
 
 #content { flex: 1; min-width: 0; padding: 24px 20px 80px; }

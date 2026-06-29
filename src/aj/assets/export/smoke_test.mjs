@@ -105,7 +105,7 @@ function makeEl(tag) {
 
 const elements = {};
 for (const id of ['session-data', 'header-container', 'messages', 'tree-container', 'tree-status',
-  'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search']) {
+  'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search', 'toggle-subagents']) {
   elements[id] = makeEl('div');
 }
 // Feed the island exactly as the exporter does: gzip-compressed,
@@ -235,6 +235,24 @@ check('tree status line', /\d+ \/ \d+ entries/.test(treeStatus));
 check('tree node text escaped', !treeText.includes('<script>alert'));
 check('tree shows branch sibling', treeText.includes('alternative branch'));
 check('tree draws branch connectors', treeText.includes('\u251c') || treeText.includes('\u2514'));
+
+// Sub-agent runs appear in the tree by default and the toggle hides them.
+console.log('sub-agents');
+check('sub-agent run shown in tree by default', treeText.includes('sub-agent #1'));
+check('sub-agent task in tree', treeText.includes('investigate the bug'));
+check('sub-agent message in tree', treeText.includes('sub-agent finding'));
+const subToggle = elements['toggle-subagents'];
+check('sub-agent toggle present', !!subToggle);
+if (subToggle) {
+  check('sub-agent toggle active by default', subToggle.classList.contains('active'));
+  fire(subToggle, 'click');
+  const hidden = elements['tree-container'].children.map(nodeText).join('\n');
+  check('sub-agent hidden after toggle', !hidden.includes('sub-agent #1'));
+  check('conversation still present when hidden', hidden.includes('user:'));
+  fire(subToggle, 'click');
+  const reshown = elements['tree-container'].children.map(nodeText).join('\n');
+  check('sub-agent shown again after toggling back', reshown.includes('sub-agent #1'));
+}
 
 // Navigating to a sibling branch must rebuild the tree (not just update
 // markers), so the node set and the status line stay in sync. This
