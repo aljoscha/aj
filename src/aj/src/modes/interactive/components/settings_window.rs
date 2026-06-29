@@ -132,9 +132,9 @@ pub struct SettingsCurrentValues {
 /// changes/corrections flow.
 ///
 /// In project mode (the per-project settings window) two extra
-/// behaviors apply: rows the project layer doesn't set are rendered as
-/// inherited (muted, with a ` (user)` marker), and the clear chord
-/// drops a project override via [`Self::clears`].
+/// behaviors apply: the list renders layered (rows the project sets
+/// carry an override marker, the rest show the inherited user value),
+/// and the clear chord drops a project override via [`Self::clears`].
 pub struct SettingsWindowComponent {
     inner: SettingsList,
     outcome: OutcomeHandle,
@@ -238,7 +238,7 @@ impl SettingsWindowComponent {
 
         let changes_for_cb = Arc::clone(&changes);
         let outcome_for_cb = Arc::clone(&outcome);
-        let inner = SettingsList::new(
+        let mut inner = SettingsList::new(
             items,
             // Pre-push default; the surrounding overlay window pushes
             // its real budget via `set_available_height`.
@@ -258,6 +258,9 @@ impl SettingsWindowComponent {
                 enable_search: true,
             },
         );
+        // The project window renders layered: set rows get the override
+        // marker, inherited rows render plain.
+        inner.set_layered(project_mode);
 
         Self {
             inner,
@@ -409,6 +412,8 @@ fn build_items(
                     current.model_url.clone().unwrap_or_default(),
                     text_submenu_factory(),
                 );
+                // Empty means "use the provider's default endpoint".
+                item.empty_placeholder = Some("(default)".to_string());
                 item.description = Some(describe(
                     option,
                     "Takes effect on restart. Submit an empty value to unset.",
@@ -901,6 +906,7 @@ mod tests {
             value: Arc::new(|s, _| s.to_string()),
             description: Arc::new(|s| s.to_string()),
             hint: Arc::new(|s| s.to_string()),
+            marker: Arc::new(|s| s.to_string()),
             cursor: "→ ".to_string(),
         }
     }
@@ -1230,5 +1236,60 @@ mod tests {
     fn project_model_row_set_when_either_model_key_is_set() {
         let component = project_test_component(&["model_name"]);
         assert!(!component.inner.is_inherited(MODEL_SETTING_ID));
+    }
+
+    #[test]
+    fn model_url_renders_default_placeholder_when_empty() {
+        let mut component = test_component();
+        // `current_values()` leaves `model_url` unset, so the row is
+        // empty and must show its "(default)" placeholder.
+        search_for(&mut component, "model_url");
+        let body = component.render(80).join("\n");
+        assert!(body.contains("(default)"), "got: {body:?}");
+    }
+
+    #[test]
+    fn clearing_a_project_row_queues_the_inherited_value_and_reverts_it() {
+        // The clear chord is an `aj.*` action, so the aj-level
+        // keybindings must be installed for `matches` to resolve it.
+        crate::config::keybindings::install_global_manager_defaults();
+        let mut component = project_test_component(&["theme"]);
+        let clears = component.clears_handle();
+        search_for(&mut component, "theme");
+        component.handle_input(&Key::ctrl('x'));
+
+        let queued = std::mem::take(&mut *clears.lock().unwrap());
+        assert_eq!(
+            queued,
+            vec![("theme".to_string(), "light".to_string())],
+            "clear should carry the inherited user value"
+        );
+        // The row optimistically reverts to the inherited value and is
+        // no longer an override.
+        assert_eq!(component.inner.value_of("theme"), Some("light"));
+        assert!(component.inner.is_inherited("theme"));
+    }
+
+    #[test]
+    fn clearing_an_inherited_row_is_a_noop() {
+        crate::config::keybindings::install_global_manager_defaults();
+        let mut component = project_test_component(&["theme"]);
+        let clears = component.clears_handle();
+        // `auto_compact` is inherited (the project doesn't set it).
+        search_for(&mut component, "auto_compact");
+        component.handle_input(&Key::ctrl('x'));
+        assert!(clears.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_window_ignores_the_clear_chord() {
+        crate::config::keybindings::install_global_manager_defaults();
+        let mut component = test_component();
+        let clears = component.clears_handle();
+        search_for(&mut component, "theme");
+        // Not project mode: the chord falls through to the list and
+        // queues no clear.
+        component.handle_input(&Key::ctrl('x'));
+        assert!(clears.lock().unwrap().is_empty());
     }
 }

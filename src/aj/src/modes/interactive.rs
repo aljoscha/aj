@@ -3303,9 +3303,9 @@ fn subtitle_settings_window(child: &dyn aj_tui::component::Component) -> String 
 }
 
 /// Per-frame subtitle for the project settings window. Like
-/// [`subtitle_settings_window`], but the main-list hint also advertises
-/// the clear-override chord (project rows can revert to the user
-/// value).
+/// [`subtitle_settings_window`], but the main-list hint also explains
+/// the override marker and advertises the clear-override chord (project
+/// rows can revert to the inherited user value).
 fn subtitle_project_settings_window(child: &dyn aj_tui::component::Component) -> String {
     let submenu = child
         .as_any()
@@ -3324,7 +3324,9 @@ fn subtitle_project_settings_window(child: &dyn aj_tui::component::Component) ->
         crate::config::keybindings::ACTION_SETTINGS_CLEAR,
     )
     .unwrap_or_else(|| "Ctrl+X".to_string());
-    format!("{confirm} to change  \u{2022}  {clear} clear override  \u{2022}  {cancel} to close")
+    format!(
+        "\u{25cf} set here  \u{2022}  {confirm} change  \u{2022}  {clear} clear  \u{2022}  {cancel} close"
+    )
 }
 
 /// Subtitle for the OAuth login dialog overlay: how to submit a

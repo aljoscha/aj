@@ -167,6 +167,7 @@ mod tests {
             value: Arc::new(|s, _| s.to_string()),
             description: Arc::new(|s| s.to_string()),
             hint: Arc::new(|s| s.to_string()),
+            marker: Arc::new(|s| s.to_string()),
             cursor: "→ ".to_string(),
         }
     }

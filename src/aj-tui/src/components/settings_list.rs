@@ -29,6 +29,14 @@ use crate::fuzzy::fuzzy_filter;
 use crate::keybindings;
 use crate::keys::InputEvent;
 
+/// Glyph marking a row whose value is set on the current layer (rather
+/// than inherited), shown only in a layered list.
+const OVERRIDE_MARKER: &str = "\u{25cf}";
+
+/// Fallback shown for an empty value when the item supplies no
+/// [`SettingItem::empty_placeholder`].
+const EMPTY_PLACEHOLDER: &str = "(none)";
+
 /// Callback passed to a [`SettingItem::submenu`] factory. The submenu
 /// calls this with `Some(value)` to commit a selection (which updates
 /// the parent item's current value and fires the parent's on-change
@@ -52,11 +60,15 @@ pub struct SettingItem {
     pub description: Option<String>,
     /// Current value shown on the right.
     pub current_value: String,
+    /// Text shown in place of an empty `current_value`, rendered muted
+    /// so the row reads as "no value set" instead of going blank.
+    /// `None` falls back to a generic placeholder.
+    pub empty_placeholder: Option<String>,
     /// When true, the value is inherited from a lower configuration
-    /// layer rather than set on this one. The list renders it in the
-    /// muted hint style with a trailing ` (user)` marker. Editing the
-    /// row clears this flag (a value is now set at this layer). Always
-    /// false for lists that don't layer.
+    /// layer rather than set on this one. In a layered list (see
+    /// [`SettingsList::set_layered`]) inherited rows render plainly
+    /// while rows set on this layer get an override marker. Editing a
+    /// row clears this flag. Always false for lists that don't layer.
     pub inherited: bool,
     /// If provided, Enter/Space cycles through these values.
     pub values: Option<Vec<String>>,
@@ -79,6 +91,7 @@ impl SettingItem {
             label: label.into(),
             description: None,
             current_value: current_value.into(),
+            empty_placeholder: None,
             inherited: false,
             values: Some(values),
             submenu: None,
@@ -97,6 +110,7 @@ impl SettingItem {
             label: label.into(),
             description: None,
             current_value: current_value.into(),
+            empty_placeholder: None,
             inherited: false,
             values: None,
             submenu: Some(submenu),
@@ -122,6 +136,10 @@ pub struct SettingsListTheme {
     pub value: Arc<dyn Fn(&str, bool) -> String>,
     pub description: Arc<dyn Fn(&str) -> String>,
     pub hint: Arc<dyn Fn(&str) -> String>,
+    /// Styles the override marker shown next to rows set on the current
+    /// layer in a layered list (see [`SettingsList::set_layered`]).
+    /// Unused by non-layered lists.
+    pub marker: Arc<dyn Fn(&str) -> String>,
     pub cursor: String,
 }
 
@@ -176,6 +194,10 @@ pub struct SettingsList {
     on_cancel: CancelCallback,
     focused: bool,
     active_submenu: Option<ActiveSubmenu>,
+    /// When true, the list distinguishes rows set on the current layer
+    /// (an override marker, prominent value) from inherited rows (plain,
+    /// muted). Set by the host for the per-project settings window.
+    layered: bool,
     /// Height budget pushed by the host via
     /// [`Component::set_available_height`]. Remembered so a submenu
     /// opened later starts with the same budget. `None` until the
@@ -209,6 +231,7 @@ impl SettingsList {
             on_cancel: Box::new(on_cancel),
             focused: false,
             active_submenu: None,
+            layered: false,
             available_height: None,
         }
     }
@@ -237,6 +260,14 @@ impl SettingsList {
             .iter()
             .find(|i| i.id == id)
             .is_some_and(|i| i.inherited)
+    }
+
+    /// Enable layered rendering: rows set on the current layer get an
+    /// override marker and a prominent value, inherited rows render
+    /// plain and muted. Off by default (a non-layered list shows no
+    /// markers regardless of any item's `inherited` flag).
+    pub fn set_layered(&mut self, layered: bool) {
+        self.layered = layered;
     }
 
     /// Index of the currently-selected visible item, or `None` if
@@ -508,25 +539,50 @@ impl Component for SettingsList {
             let label_text = (self.theme.label)(&label_padded, is_selected);
 
             let separator = "  ";
-            let used = prefix_width + label_width + visible_width(separator);
+            // A layered list reserves a 2-column marker cell on every
+            // row so values stay aligned whether or not the row carries
+            // the override glyph.
+            let marker_width = if self.layered { 2 } else { 0 };
+            let used = prefix_width + label_width + visible_width(separator) + marker_width;
             let value_max = width.saturating_sub(used).saturating_sub(2);
-            // An inherited value is shown muted with a ` (user)` marker
-            // so it reads as "falls through to the lower layer" rather
-            // than "set here".
-            let raw_value = if item.inherited {
-                format!("{} (user)", item.current_value)
+
+            // A row is an override when it's set on the current layer:
+            // only meaningful in a layered list, where the rest are
+            // inherited.
+            let is_override = self.layered && !item.inherited;
+            let marker_cell = if !self.layered {
+                String::new()
+            } else if is_override {
+                format!("{} ", (self.theme.marker)(OVERRIDE_MARKER))
             } else {
-                item.current_value.clone()
+                "  ".to_string()
             };
-            let value_trunc = truncate_to_width(&expand_tabs(&raw_value), value_max, "", false);
-            let value_text = if item.inherited {
-                (self.theme.hint)(&value_trunc)
+
+            let value_text = if item.current_value.is_empty() {
+                // Never render a blank value cell: show a muted
+                // placeholder so the row reads as "no value set".
+                let placeholder = item
+                    .empty_placeholder
+                    .as_deref()
+                    .unwrap_or(EMPTY_PLACEHOLDER);
+                (self.theme.hint)(&truncate_to_width(placeholder, value_max, "", false))
             } else {
-                (self.theme.value)(&value_trunc, is_selected)
+                let value_trunc =
+                    truncate_to_width(&expand_tabs(&item.current_value), value_max, "", false);
+                if is_selected {
+                    (self.theme.value)(&value_trunc, true)
+                } else if is_override {
+                    // Set on this layer: render as prominently as a
+                    // label so it stands out from the muted inherited
+                    // rows around it.
+                    (self.theme.label)(&value_trunc, false)
+                } else {
+                    (self.theme.value)(&value_trunc, false)
+                }
             };
 
             lines.push(truncate_to_width(
-                &format!("{}{}{}{}", prefix, label_text, separator, value_text),
+                &format!("{prefix}{label_text}{separator}{marker_cell}{value_text}"),
                 width,
                 "",
                 false,

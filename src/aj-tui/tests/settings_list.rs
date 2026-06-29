@@ -28,6 +28,7 @@ fn identity_theme() -> SettingsListTheme {
         value: Arc::new(|s, _| s.to_string()),
         description: Arc::new(|s| s.to_string()),
         hint: Arc::new(|s| s.to_string()),
+        marker: Arc::new(|s| s.to_string()),
         cursor: "> ".to_string(),
     }
 }
@@ -51,6 +52,7 @@ fn sample_items() -> Vec<SettingItem> {
             label: "Read Only".into(),
             description: Some("Some info".into()),
             current_value: "locked".into(),
+            empty_placeholder: None,
             inherited: false,
             values: None,
             submenu: None,
@@ -167,6 +169,7 @@ fn enter_on_item_with_empty_values_list_is_a_noop() {
         label: "X".into(),
         description: None,
         current_value: "a".into(),
+        empty_placeholder: None,
         inherited: false,
         values: Some(Vec::new()),
         submenu: None,
@@ -349,6 +352,7 @@ fn render_expands_tabs_in_label_value_and_description() {
         label: "La\tbel".into(),
         description: Some("de\tsc".into()),
         current_value: "va\tlue".into(),
+        empty_placeholder: None,
         inherited: false,
         values: None,
         submenu: None,
@@ -961,43 +965,42 @@ fn available_height_reaches_submenus_on_open_and_on_later_pushes() {
 }
 
 // ---------------------------------------------------------------------------
-// Inherited rows
+// Layered rows (override marker, inherited, empty placeholder)
 // ---------------------------------------------------------------------------
 
-/// Theme that tags the value and hint styles distinctly so a test can
-/// tell which one rendered a row's value.
+/// Theme that tags each style distinctly so a test can tell which one
+/// rendered a row's value (and whether the override marker fired).
 fn tagged_theme() -> SettingsListTheme {
     SettingsListTheme {
-        label: Arc::new(|s, _| s.to_string()),
-        value: Arc::new(|s, _| format!("VAL[{s}]")),
+        label: Arc::new(|s, _| format!("LBL[{s}]")),
+        value: Arc::new(|s, selected| {
+            if selected {
+                format!("SEL[{s}]")
+            } else {
+                format!("MUT[{s}]")
+            }
+        }),
         description: Arc::new(|s| s.to_string()),
         hint: Arc::new(|s| format!("HINT[{s}]")),
+        marker: Arc::new(|s| format!("MARK[{s}]")),
         cursor: "> ".to_string(),
     }
 }
 
-#[test]
-fn inherited_row_renders_muted_with_user_marker() {
-    let items = vec![
-        SettingItem {
-            id: "theme".into(),
-            label: "Theme".into(),
-            description: None,
-            current_value: "dark".into(),
-            inherited: false,
-            values: Some(vec!["dark".into(), "light".into()]),
-            submenu: None,
-        },
-        SettingItem {
-            id: "speed".into(),
-            label: "Speed".into(),
-            description: None,
-            current_value: "standard".into(),
-            inherited: true,
-            values: Some(vec!["standard".into(), "fast".into()]),
-            submenu: None,
-        },
-    ];
+fn layered_item(id: &str, value: &str, inherited: bool) -> SettingItem {
+    SettingItem {
+        id: id.into(),
+        label: id.into(),
+        description: None,
+        current_value: value.into(),
+        empty_placeholder: None,
+        inherited,
+        values: Some(vec![value.into(), "other".into()]),
+        submenu: None,
+    }
+}
+
+fn layered_list(items: Vec<SettingItem>) -> SettingsList {
     let mut list = SettingsList::new(
         items,
         5,
@@ -1006,11 +1009,67 @@ fn inherited_row_renders_muted_with_user_marker() {
         || {},
         SettingsListOptions::default(),
     );
+    list.set_layered(true);
+    list
+}
+
+#[test]
+fn layered_marks_overrides_and_leaves_inherited_plain() {
+    // Row 0 ("focus") stays selected so both `theme` (override) and
+    // `speed` (inherited) render in their unselected styling, which is
+    // where the override/inherited distinction lives.
+    let mut list = layered_list(vec![
+        layered_item("focus", "x", true),
+        layered_item("theme", "dark", false),
+        layered_item("speed", "standard", true),
+    ]);
     let body = plain_lines_trim_end(&list.render(60)).join("\n");
-    // The set row uses the value style with no marker.
-    assert!(body.contains("VAL[dark]"), "got: {body:?}");
-    // The inherited row uses the hint (muted) style and the marker.
-    assert!(body.contains("HINT[standard (user)]"), "got: {body:?}");
+    // Exactly one row is an override, so the marker appears once, and
+    // that row renders its value as prominently as a label.
+    assert_eq!(body.matches("MARK[\u{25cf}]").count(), 1, "got: {body:?}");
+    assert!(body.contains("LBL[dark]"), "got: {body:?}");
+    // The inherited row has no marker and renders muted.
+    assert!(body.contains("MUT[standard]"), "got: {body:?}");
+    // The `(user)` affix is gone.
+    assert!(!body.contains("(user)"), "got: {body:?}");
+}
+
+#[test]
+fn non_layered_list_shows_no_override_marker() {
+    // The same items in a non-layered list: no marker column at all,
+    // even though `inherited` flags are present.
+    let mut list = SettingsList::new(
+        vec![layered_item("theme", "dark", false)],
+        5,
+        tagged_theme(),
+        |_, _| {},
+        || {},
+        SettingsListOptions::default(),
+    );
+    let body = plain_lines_trim_end(&list.render(60)).join("\n");
+    assert!(!body.contains("MARK["), "got: {body:?}");
+}
+
+#[test]
+fn empty_value_renders_a_muted_placeholder() {
+    let mut generic = layered_item("model_url", "", true);
+    generic.values = None;
+    let mut with_custom = layered_item("custom", "", true);
+    with_custom.values = None;
+    with_custom.empty_placeholder = Some("(default)".into());
+    let mut list = SettingsList::new(
+        vec![generic, with_custom],
+        5,
+        tagged_theme(),
+        |_, _| {},
+        || {},
+        SettingsListOptions::default(),
+    );
+    let body = plain_lines_trim_end(&list.render(60)).join("\n");
+    // Generic empty falls back to "(none)"; a custom placeholder wins.
+    // Both render muted (the hint style).
+    assert!(body.contains("HINT[(none)]"), "got: {body:?}");
+    assert!(body.contains("HINT[(default)]"), "got: {body:?}");
 }
 
 #[test]
@@ -1027,20 +1086,12 @@ fn set_inherited_and_is_inherited_round_trip() {
 
 #[test]
 fn committing_a_value_clears_the_inherited_flag() {
-    let items = vec![SettingItem {
-        id: "speed".into(),
-        label: "Speed".into(),
-        description: None,
-        current_value: "standard".into(),
-        inherited: true,
-        values: Some(vec!["standard".into(), "fast".into()]),
-        submenu: None,
-    }];
+    let items = vec![layered_item("speed", "standard", true)];
     let (mut list, _, _) = make_settings_list(items, SettingsListOptions::default());
     assert!(list.is_inherited("speed"));
     // Cycling the value (Enter) is an edit at this layer, so the row is
     // no longer inherited.
     list.handle_input(&Key::enter());
     assert!(!list.is_inherited("speed"));
-    assert_eq!(list.value_of("speed"), Some("fast"));
+    assert_eq!(list.value_of("speed"), Some("other"));
 }

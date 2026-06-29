@@ -174,6 +174,7 @@ pub fn default_settings_list_theme() -> SettingsListTheme {
         value: Arc::new(|s, _selected| style::dim(s)),
         description: Arc::new(style::dim),
         hint: Arc::new(style::dim),
+        marker: Arc::new(style::bold),
         cursor: "→ ".to_string(),
     }
 }
@@ -187,6 +188,7 @@ pub fn identity_settings_list_theme() -> SettingsListTheme {
         value: Arc::new(|s, _selected| s.to_string()),
         description: Arc::new(|s| s.to_string()),
         hint: Arc::new(|s| s.to_string()),
+        marker: Arc::new(|s| s.to_string()),
         cursor: "→ ".to_string(),
     }
 }

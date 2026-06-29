@@ -124,6 +124,7 @@ async fn main() {
         value: Arc::new(|s, _| style::cyan(s)),
         description: Arc::new(style::dim),
         hint: Arc::new(style::dim),
+        marker: Arc::new(style::bold),
         cursor: "→ ".to_string(),
     };
 
@@ -133,6 +134,7 @@ async fn main() {
             label: "Theme".into(),
             description: Some("Editor background color scheme.".into()),
             current_value: "dark".into(),
+            empty_placeholder: None,
             inherited: false,
             values: Some(vec!["dark".into(), "light".into()]),
             submenu: None,
@@ -146,6 +148,7 @@ async fn main() {
                     .into(),
             ),
             current_value: "info".into(),
+            empty_placeholder: None,
             inherited: false,
             values: Some(vec![
                 "off".into(),
@@ -161,6 +164,7 @@ async fn main() {
             label: "Confirm Exit".into(),
             description: Some("Prompt before quitting.".into()),
             current_value: "yes".into(),
+            empty_placeholder: None,
             inherited: false,
             values: Some(vec!["yes".into(), "no".into()]),
             submenu: None,
@@ -173,6 +177,7 @@ async fn main() {
                     .into(),
             ),
             current_value: "helix".into(),
+            empty_placeholder: None,
             inherited: false,
             values: None,
             submenu: Some(editor_submenu_factory()),

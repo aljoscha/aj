@@ -1152,6 +1152,7 @@ pub fn settings_list_theme(
 ) -> aj_tui::components::settings_list::SettingsListTheme {
     let accent = theme.fg_closure(ThemeColor::Accent);
     let accent_for_label = Arc::clone(&accent);
+    let accent_for_marker = Arc::clone(&accent);
     let muted = theme.fg_closure(ThemeColor::Muted);
     // The `aj-tui` theme structs hold `Arc<dyn Fn(&str) -> String>`
     // without `Send + Sync` bounds; match the surrounding API by
@@ -1176,6 +1177,9 @@ pub fn settings_list_theme(
         value,
         description: theme.fg_closure(ThemeColor::Muted),
         hint: theme.fg_closure(ThemeColor::Dim),
+        // The override marker (project window) reuses the accent so a
+        // set row's glyph matches the selected-row accent palette.
+        marker: accent_for_marker,
         // Two columns wide so unselected rows' two-space gutter
         // lines up; matches the component's own row layout.
         cursor: "→ ".to_string(),
