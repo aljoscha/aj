@@ -12,8 +12,8 @@
 //! - the verbatim on-disk entries (`ConversationEntry`), under a small
 //!   envelope carrying the session id and the active user-thread leaf,
 //! - the page renderer (`template.js`),
-//! - `marked` (markdown) and `highlight.js` (syntax highlighting),
-//!   vendored under `assets/export/vendor` (see its `PROVENANCE.md`).
+//! - `marked` (markdown), vendored under `assets/export/vendor` (see its
+//!   `PROVENANCE.md`).
 //!
 //! Security: the session rides in a `<script type="application/octet-stream">`
 //! block as gzip-compressed, base64-encoded bytes. The base64 alphabet
@@ -43,13 +43,11 @@ const TEMPLATE: &str = include_str!("../assets/export/template.html");
 const CSS: &str = include_str!("../assets/export/template.css");
 const APP_JS: &str = include_str!("../assets/export/template.js");
 const MARKED_JS: &str = include_str!("../assets/export/vendor/marked.min.js");
-const HIGHLIGHT_JS: &str = include_str!("../assets/export/vendor/highlight.min.js");
 
-/// Full license texts for the vendored libraries, embedded in the
-/// export so every shared copy carries the notices both licenses
-/// (MIT, BSD-3-Clause) require to travel with a redistribution.
+/// Full license text for the vendored library, embedded in the export so
+/// every shared copy carries the notice the MIT license requires to
+/// travel with a redistribution.
 const MARKED_LICENSE: &str = include_str!("../assets/export/vendor/marked.LICENSE");
-const HIGHLIGHT_LICENSE: &str = include_str!("../assets/export/vendor/highlight.LICENSE");
 
 /// The embedded session envelope. Entries serialize verbatim (snake_case
 /// fields, `type`/`role`/`kind` tags as on disk); the renderer reads
@@ -79,10 +77,7 @@ pub(crate) fn render_session_html(log: &ConversationLog) -> String {
         entries: log.entries_in_order(),
     };
     let session_data = embed_session(&data);
-    let licenses = format!(
-        "marked (MIT) https://github.com/markedjs/marked\n\n{MARKED_LICENSE}\n\n\
-         highlight.js (BSD-3-Clause) https://github.com/highlightjs/highlight.js\n\n{HIGHLIGHT_LICENSE}"
-    );
+    let licenses = format!("marked (MIT) https://github.com/markedjs/marked\n\n{MARKED_LICENSE}");
 
     // The untrusted values (title, session JSON) are filled in the same
     // single pass as the trusted assets, and `fill_template` never
@@ -94,7 +89,6 @@ pub(crate) fn render_session_html(log: &ConversationLog) -> String {
             ("TITLE", &escape(&title)),
             ("CSS", CSS),
             ("MARKED_JS", MARKED_JS),
-            ("HIGHLIGHT_JS", HIGHLIGHT_JS),
             ("APP_JS", APP_JS),
             ("LICENSES", &licenses),
             ("SESSION_DATA", &session_data),
@@ -279,9 +273,8 @@ mod tests {
         assert!(html.starts_with("<!DOCTYPE html>"));
         // Every placeholder is filled.
         assert!(!html.contains("{{"), "unfilled placeholder remains");
-        // Renderer and vendored libraries are inlined.
+        // Renderer and vendored library are inlined.
         assert!(html.contains("marked"), "marked not embedded");
-        assert!(html.contains("hljs"), "highlight.js not embedded");
         assert!(html.contains("id=\"session-data\""), "data island missing");
         // No external assets are referenced.
         assert!(!html.contains("src=\"http"), "external script referenced");
@@ -352,43 +345,35 @@ mod tests {
 
     #[test]
     fn embedded_scripts_cannot_break_out() {
-        // The vendored libraries and the renderer are inlined raw into
+        // The vendored library and the renderer are inlined raw into
         // `<script>` elements. A literal `</script` is the one sequence
         // that would terminate the element early and break the page, so
         // no embedded asset may contain it (case-insensitive). The
         // `<!--`/`<script` script-data escape only bites when a
         // `</script` follows, so guarding this sequence is sufficient.
-        for (name, js) in [
-            ("marked", MARKED_JS),
-            ("highlight", HIGHLIGHT_JS),
-            ("app", APP_JS),
-        ] {
+        for (name, js) in [("marked", MARKED_JS), ("app", APP_JS)] {
             assert!(
                 !js.to_ascii_lowercase().contains("</script"),
                 "{name} contains a script-closing sequence"
             );
         }
 
-        // The document has exactly four script elements (data island,
-        // marked, highlight.js, renderer). A drift here means an asset
-        // leaked an extra terminator.
+        // The document has exactly three script elements (data island,
+        // marked, renderer). A drift here means an asset leaked an extra
+        // terminator.
         let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, TOOL_RESULT]);
         let html = render_session_html(&log);
         assert_eq!(
             html.matches("</script>").count(),
-            4,
+            3,
             "script element count drifted"
         );
 
-        // The license texts sit in an HTML comment, so they must not
+        // The license text sits in an HTML comment, so it must not
         // contain `-->` (which would end the comment early).
         assert!(
             !MARKED_LICENSE.contains("-->"),
             "marked license ends the comment"
-        );
-        assert!(
-            !HIGHLIGHT_LICENSE.contains("-->"),
-            "highlight license ends the comment"
         );
     }
 
@@ -409,14 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn embeds_license_texts() {
+    fn embeds_license_text() {
         let (_dir, log) = log_from_jsonl(&[SYSTEM, USER]);
         let html = render_session_html(&log);
         assert!(
             html.contains("Permission is hereby granted"),
             "MIT text missing"
         );
-        assert!(html.contains("BSD 3-Clause License"), "BSD text missing");
     }
 
     /// Run the client-side renderer (`template.js`) against a fixture

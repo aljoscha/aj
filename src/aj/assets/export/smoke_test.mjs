@@ -135,9 +135,8 @@ sandbox.Response = Response;
 sandbox.DecompressionStream = DecompressionStream;
 vm.createContext(sandbox);
 
-// Load the real libraries then the renderer, exactly as the page does.
+// Load the real library then the renderer, exactly as the page does.
 vm.runInContext(read('vendor/marked.min.js'), sandbox, { filename: 'marked.min.js' });
-vm.runInContext(read('vendor/highlight.min.js'), sandbox, { filename: 'highlight.min.js' });
 vm.runInContext(read('template.js'), sandbox, { filename: 'template.js' });
 
 // The renderer loads its data asynchronously (inflate is async), so wait
@@ -194,7 +193,8 @@ has('copy-link button', 'class="copy-link-btn"');
 
 console.log('messages');
 has('user markdown bold', '<strong>bug</strong>');
-has('code fence highlighted', 'hljs');
+has('code fence rendered as block', '<pre><code>');
+has('code fence content escaped', 'fn main(){}');
 has('assistant model label', 'claude-test');
 has('thinking block', 'thinking-block');
 

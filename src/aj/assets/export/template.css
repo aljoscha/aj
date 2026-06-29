@@ -6,16 +6,13 @@
  * and a #theme-toggle checkbox inverts whichever default is active via
  * :root:has(#theme-toggle:checked). The two palettes are duplicated
  * across the cascade because plain CSS cannot alias a whole variable
- * set. Syntax-highlight colors ride the same palette as --syn-* vars so
- * code blocks follow the theme. */
+ * set. */
 
 :root {
   --bg: #fbfbfd; --panel: #ffffff; --panel2: #f0f1f4; --fg: #1f2328;
   --muted: #656d76; --border: #d6d9df; --user: #0969da; --assistant: #1a7f37;
   --tool: #8a5d00; --add: #1a7f37; --del: #cf222e; --err: #cf222e;
   --link: #0969da; --sub-bg: #f3f6fd;
-  --syn-kw: #cf222e; --syn-str: #0a3069; --syn-num: #0550ae; --syn-com: #6e7781;
-  --syn-fn: #8250df; --syn-type: #953800; --syn-attr: #0550ae; --syn-meta: #116329;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -23,16 +20,12 @@
     --muted: #9aa0aa; --border: #3a3a44; --user: #7aa2f7; --assistant: #9ece6a;
     --tool: #e0af68; --add: #9ece6a; --del: #f7768e; --err: #f7768e;
     --link: #7dcfff; --sub-bg: rgba(122, 162, 247, .06);
-    --syn-kw: #bb9af7; --syn-str: #9ece6a; --syn-num: #ff9e64; --syn-com: #565f89;
-    --syn-fn: #7aa2f7; --syn-type: #2ac3de; --syn-attr: #7dcfff; --syn-meta: #73daca;
   }
   :root:has(#theme-toggle:checked) {
     --bg: #fbfbfd; --panel: #ffffff; --panel2: #f0f1f4; --fg: #1f2328;
     --muted: #656d76; --border: #d6d9df; --user: #0969da; --assistant: #1a7f37;
     --tool: #8a5d00; --add: #1a7f37; --del: #cf222e; --err: #cf222e;
     --link: #0969da; --sub-bg: #f3f6fd;
-    --syn-kw: #cf222e; --syn-str: #0a3069; --syn-num: #0550ae; --syn-com: #6e7781;
-    --syn-fn: #8250df; --syn-type: #953800; --syn-attr: #0550ae; --syn-meta: #116329;
   }
 }
 @media (prefers-color-scheme: light) {
@@ -41,8 +34,6 @@
     --muted: #9aa0aa; --border: #3a3a44; --user: #7aa2f7; --assistant: #9ece6a;
     --tool: #e0af68; --add: #9ece6a; --del: #f7768e; --err: #f7768e;
     --link: #7dcfff; --sub-bg: rgba(122, 162, 247, .06);
-    --syn-kw: #bb9af7; --syn-str: #9ece6a; --syn-num: #ff9e64; --syn-com: #565f89;
-    --syn-fn: #7aa2f7; --syn-type: #2ac3de; --syn-attr: #7dcfff; --syn-meta: #73daca;
   }
 }
 
@@ -281,16 +272,3 @@ pre code { background: none; padding: 0; }
 .subagent[open] > summary { margin-bottom: 10px; }
 .sub-head { color: var(--user); text-transform: uppercase; letter-spacing: .05em; }
 .sub-task { color: var(--muted); font-weight: 400; font-size: 13px; }
-
-/* highlight.js token colors mapped onto the theme palette. */
-.hljs { color: var(--fg); background: transparent; }
-.hljs-comment, .hljs-quote { color: var(--syn-com); font-style: italic; }
-.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-doctag { color: var(--syn-kw); }
-.hljs-string, .hljs-regexp, .hljs-addition { color: var(--syn-str); }
-.hljs-number, .hljs-meta .hljs-string { color: var(--syn-num); }
-.hljs-title, .hljs-title.function_, .hljs-built_in, .hljs-name { color: var(--syn-fn); }
-.hljs-type, .hljs-class .hljs-title, .hljs-title.class_ { color: var(--syn-type); }
-.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-selector-attr { color: var(--syn-attr); }
-.hljs-meta, .hljs-symbol, .hljs-bullet, .hljs-link { color: var(--syn-meta); }
-.hljs-emphasis { font-style: italic; }
-.hljs-strong { font-weight: bold; }

@@ -174,8 +174,8 @@
   // Configure marked to render authored prose only. Raw HTML in the
   // source is shown as literal text (the html/tag tokenizers return
   // undefined), matching the TUI and keeping a shared transcript from
-  // injecting markup. Code blocks are syntax-highlighted; inline code is
-  // escaped.
+  // injecting markup. Code blocks and inline code are escaped and shown
+  // in a monospace block. We do not syntax-highlight.
   marked.use({
     breaks: true,
     gfm: true,
@@ -197,22 +197,13 @@
         return '<img src="' + escapeHtml(href) + '" alt="' + escapeHtml(token.text || '') + '"' + title + '>';
       },
       code(token) {
-        return '<pre><code class="hljs">' + highlight(token.text, token.lang) + '</code></pre>';
+        return '<pre><code>' + escapeHtml(token.text) + '</code></pre>';
       },
       codespan(token) {
         return '<code>' + escapeHtml(token.text) + '</code>';
       },
     },
   });
-
-  function highlight(code, lang) {
-    try {
-      if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
-      return hljs.highlightAuto(code).value;
-    } catch (e) {
-      return escapeHtml(code);
-    }
-  }
 
   function md(text) {
     return marked.parse(text == null ? '' : String(text));
