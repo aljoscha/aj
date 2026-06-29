@@ -403,7 +403,7 @@
   }
 
   function renderSubAgent(spawn) {
-    let html = '<details class="subagent"><summary>' +
+    let html = '<details class="subagent" id="subagent-' + escapeHtml(String(spawn.agent_id)) + '"><summary>' +
       '<span class="sub-head">sub-agent #' + escapeHtml(String(spawn.agent_id)) + '</span> ' +
       '<span class="sub-task">' + escapeHtml(normalize(spawn.task || '')) + '</span></summary>';
     for (const e of subThread.get(spawn.agent_id) || []) {
@@ -544,9 +544,10 @@
   // ============================================================
   //
   // The tree shows the user-thread conversation and its branches.
-  // Sub-agent entries are excluded; settings/system entries are kept but
-  // hidden by the default filter. The layout (indent, ASCII connectors,
-  // gutters) mirrors the TUI's branch selector so the two views agree.
+  // Sub-agent entries are excluded. Settings and system entries are kept
+  // but hidden by the default filter. The layout (indent, ASCII
+  // connectors, gutters) mirrors the TUI's branch selector so the two
+  // views agree.
 
   const treeEntries = entries.filter((e) => e.thread !== 'subagent');
 
@@ -561,11 +562,16 @@
       else roots.push(node);
     }
     const ts = (e) => { const t = Date.parse(e.timestamp); return isNaN(t) ? 0 : t; };
-    function sortChildren(node) {
-      node.children.sort((a, b) => ts(a.entry) - ts(b.entry) || orderIndex.get(a.entry.id) - orderIndex.get(b.entry.id));
-      node.children.forEach(sortChildren);
+    const cmp = (a, b) => ts(a.entry) - ts(b.entry) || orderIndex.get(a.entry.id) - orderIndex.get(b.entry.id);
+    // Sort siblings iteratively (an explicit stack) rather than
+    // recursing on tree depth, so a long linear session cannot overflow
+    // the call stack.
+    const stack = [...roots];
+    while (stack.length) {
+      const node = stack.pop();
+      node.children.sort(cmp);
+      for (const c of node.children) stack.push(c);
     }
-    roots.forEach(sortChildren);
     return roots;
   }
 
@@ -573,8 +579,12 @@
   function findNewestLeaf(nodeId) {
     if (!treeNodeMap) {
       treeNodeMap = new Map();
-      const map = (node) => { treeNodeMap.set(node.entry.id, node); node.children.forEach(map); };
-      buildTree().forEach(map);
+      const stack = buildTree();
+      while (stack.length) {
+        const n = stack.pop();
+        treeNodeMap.set(n.entry.id, n);
+        for (const c of n.children) stack.push(c);
+      }
     }
     let cur = treeNodeMap.get(nodeId);
     if (!cur) return nodeId;
@@ -601,20 +611,34 @@
     return new Set(pathTo(targetId).map((e) => e.id));
   }
 
-  // Flatten the tree to a list with indent/connector info, prioritizing
-  // the branch that contains the active leaf. Ported from the TUI branch
-  // selector so the ASCII framing matches.
+  // Flatten the tree to a list with indent and connector info,
+  // prioritizing the branch that contains the active leaf. Each stack
+  // tuple is [node, indent, justBranched, showConnector, isLast,
+  // gutters, isVirtualRootChild]: `justBranched` means the parent had
+  // multiple children (so this generation indents one more for visual
+  // grouping), `gutters` are the vertical bars to continue for unfinished
+  // ancestor branches, and `isVirtualRootChild` suppresses a connector
+  // for the synthetic level we add when there is more than one root.
   function flattenTree(roots, activeIds) {
     const result = [];
     const multipleRoots = roots.length > 1;
+    // Mark which subtrees contain the active leaf, bottom-up. Computed
+    // iteratively over reverse pre-order (children before parents) so
+    // depth does not bound the call stack.
     const containsActive = new Map();
-    function mark(node) {
-      let has = activeIds.has(node.entry.id);
-      for (const c of node.children) if (mark(c)) has = true;
-      containsActive.set(node, has);
-      return has;
+    const preorder = [];
+    const markStack = [...roots];
+    while (markStack.length) {
+      const n = markStack.pop();
+      preorder.push(n);
+      for (const c of n.children) markStack.push(c);
     }
-    roots.forEach(mark);
+    for (let i = preorder.length - 1; i >= 0; i--) {
+      const n = preorder[i];
+      let has = activeIds.has(n.entry.id);
+      for (const c of n.children) if (containsActive.get(c)) has = true;
+      containsActive.set(n, has);
+    }
 
     const orderedRoots = [...roots].sort((a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)));
     const stack = [];
@@ -650,6 +674,9 @@
 
   function buildTreePrefix(flatNode) {
     const { indent, showConnector, isLast, gutters, isVirtualRootChild, multipleRoots } = flatNode;
+    // With multiple roots we add one synthetic indent level for the
+    // virtual root, so subtract it back out for display. The connector
+    // (the corner glyph) sits one level shallower than the node itself.
     const displayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
     const connector = showConnector && !isVirtualRootChild ? (isLast ? '\u2514\u2500 ' : '\u251c\u2500 ') : '';
     const connectorPosition = connector ? displayIndent - 1 : -1;
@@ -680,9 +707,13 @@
     const visibleIds = new Set(filtered.map((n) => n.node.entry.id));
     const flatById = new Map(allFlat.map((f) => [f.node.entry.id, f]));
 
+    // Climb parent_id to the nearest ancestor that survived the filter.
+    // `seen` guards a malformed parent_id cycle (pathTo guards the same).
     function visibleAncestor(nodeId) {
+      const seen = new Set();
       let id = flatById.get(nodeId) && flatById.get(nodeId).node.entry.parent_id;
-      while (id != null) {
+      while (id != null && !seen.has(id)) {
+        seen.add(id);
         if (visibleIds.has(id)) return id;
         id = flatById.get(id) && flatById.get(id).node.entry.parent_id;
       }
@@ -734,6 +765,9 @@
   // TREE DISPLAY TEXT
   // ============================================================
 
+  // Build a short tree label for a tool call. The result is plain text
+  // and MUST be escaped before it reaches innerHTML (the sole caller in
+  // `treeNodeHtml` does this).
   function formatToolCall(name, args) {
     args = args || {};
     const path = (p) => shortenPath(String(p || ''));
@@ -812,6 +846,8 @@
     const tokens = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
     const filtered = flatNodes.filter((flat) => {
       const entry = flat.node.entry;
+      // The current leaf is always shown so the active branch never
+      // vanishes, even under a filter or search that would exclude it.
       if (entry.id === leafId) return true;
 
       // Hide assistant messages that are only tool calls (no text)
@@ -849,8 +885,11 @@
 
   let currentLeafId = defaultLeaf;
   let currentTargetId = defaultLeaf;
-  let treeRendered = false;
 
+  // Rebuild the whole node list every time. The visible set, sibling
+  // order, and connector glyphs all depend on the active leaf, so an
+  // in-place marker update would leave the tree out of sync after a
+  // navigation. The trees are small enough that a full rebuild is cheap.
   function renderTree() {
     const roots = buildTree();
     const activeIds = activePathIds(currentLeafId);
@@ -858,43 +897,31 @@
     const filtered = filterNodes(flatNodes, currentLeafId);
     const container = document.getElementById('tree-container');
 
-    if (!treeRendered) {
-      container.innerHTML = '';
-      for (const flat of filtered) {
-        const entry = flat.node.entry;
-        const div = document.createElement('div');
-        div.className = 'tree-node';
-        if (activeIds.has(entry.id)) div.classList.add('in-path');
-        if (entry.id === currentTargetId) div.classList.add('active');
-        div.dataset.id = entry.id;
+    container.innerHTML = '';
+    for (const flat of filtered) {
+      const entry = flat.node.entry;
+      const div = document.createElement('div');
+      div.className = 'tree-node';
+      if (activeIds.has(entry.id)) div.classList.add('in-path');
+      if (entry.id === currentTargetId) div.classList.add('active');
+      div.dataset.id = entry.id;
 
-        const prefix = document.createElement('span');
-        prefix.className = 'tree-prefix';
-        prefix.textContent = buildTreePrefix(flat);
-        const marker = document.createElement('span');
-        marker.className = 'tree-marker';
-        marker.textContent = activeIds.has(entry.id) ? '\u2022 ' : '  ';
-        const content = document.createElement('span');
-        content.className = 'tree-content';
-        content.innerHTML = treeNodeHtml(entry);
+      const prefix = document.createElement('span');
+      prefix.className = 'tree-prefix';
+      prefix.textContent = buildTreePrefix(flat);
+      const marker = document.createElement('span');
+      marker.className = 'tree-marker';
+      marker.textContent = activeIds.has(entry.id) ? '\u2022 ' : '  ';
+      const content = document.createElement('span');
+      content.className = 'tree-content';
+      content.innerHTML = treeNodeHtml(entry);
 
-        div.append(prefix, marker, content);
-        div.addEventListener('click', () => {
-          if (window.getSelection().toString()) return;
-          navigateTo(findNewestLeaf(entry.id), 'target', entry.id);
-        });
-        container.appendChild(div);
-      }
-      treeRendered = true;
-    } else {
-      for (const node of container.querySelectorAll('.tree-node')) {
-        const id = node.dataset.id;
-        const onPath = activeIds.has(id);
-        node.classList.toggle('in-path', onPath);
-        node.classList.toggle('active', id === currentTargetId);
-        const marker = node.querySelector('.tree-marker');
-        if (marker) marker.textContent = onPath ? '\u2022 ' : '  ';
-      }
+      div.append(prefix, marker, content);
+      div.addEventListener('click', () => {
+        if (window.getSelection().toString()) return;
+        navigateTo(findNewestLeaf(entry.id), 'target', entry.id);
+      });
+      container.appendChild(div);
     }
 
     document.getElementById('tree-status').textContent = filtered.length + ' / ' + flatNodes.length + ' entries';
@@ -904,21 +931,20 @@
     }, 0);
   }
 
-  function forceTreeRerender() {
-    treeRendered = false;
-    renderTree();
-  }
-
   // ============================================================
   // NAVIGATION
   // ============================================================
 
   // Tool results render inside their assistant tool-call block, so route
-  // a scroll to that block; everything else scrolls to its own element.
+  // a scroll there. A successful `agent` result has no tool block (the
+  // sub-agent box shows it instead), so route those to the box. Anything
+  // else scrolls to its own element.
   function scrollTargetId(entryId) {
     const entry = byId.get(entryId);
-    if (entry && entry.type === 'message' && entry.message && entry.message.role === 'tool_result' && entry.message.tool_call_id) {
-      return 'tool-call-' + entry.message.tool_call_id;
+    if (entry && entry.type === 'message' && entry.message && entry.message.role === 'tool_result') {
+      const det = entry.message.details;
+      if (det && det.kind === 'sub_agent_report') return 'subagent-' + det.agent_id;
+      if (entry.message.tool_call_id) return 'tool-call-' + entry.message.tool_call_id;
     }
     return 'entry-' + entryId;
   }
@@ -927,7 +953,6 @@
     currentLeafId = leafId;
     currentTargetId = scrollToEntryId || leafId;
 
-    renderTree();
     try {
       document.getElementById('header-container').innerHTML = renderHeader();
     } catch (e) {
@@ -939,6 +964,14 @@
     let html = '';
     for (const entry of pathTo(leafId)) html += renderEntrySafe(entry);
     messages.innerHTML = html;
+
+    // Render the tree last and in isolation: it already rendered the
+    // transcript, so a tree failure leaves the content intact.
+    try {
+      renderTree();
+    } catch (e) {
+      document.getElementById('tree-status').textContent = 'tree failed to render';
+    }
 
     // Close the mobile sidebar after picking a node.
     closeSidebar();
@@ -986,6 +1019,10 @@
 
   // A deep link to one message: the current branch leaf plus the target
   // entry, as query params this page reads on load.
+  //
+  // NOTE: for a `file://` export the base is the absolute local path, so
+  // the link only resolves on the same machine. It comes into its own
+  // for a hosted copy, where the same params address the same message.
   function buildShareUrl(entryId) {
     try {
       const base = ((window.location && window.location.href) || '').split('?')[0];
@@ -1048,7 +1085,7 @@
   document.getElementById('sidebar-close').addEventListener('click', closeSidebar);
 
   const searchInput = document.getElementById('tree-search');
-  searchInput.addEventListener('input', (e) => { searchQuery = e.target.value; forceTreeRerender(); });
+  searchInput.addEventListener('input', (e) => { searchQuery = e.target.value; renderTree(); });
 
   // Copy-link buttons are delegated from #messages, which survives the
   // innerHTML rewrites that each navigation does.
@@ -1059,8 +1096,9 @@
     copyToClipboard(buildShareUrl(btn.dataset.entryId), btn);
   });
 
-  // Drag the divider to resize the sidebar; width persists per browser.
-  // No-ops where the resizer is absent (e.g. a non-DOM test harness).
+  // Drag the divider to resize the sidebar, with the width persisted per
+  // browser. No-ops where the resizer is absent (e.g. a non-DOM test
+  // harness).
   function setupSidebarResize() {
     const resizer = document.getElementById('sidebar-resizer');
     if (!resizer) return;
@@ -1083,26 +1121,31 @@
         document.body.classList.remove('sidebar-resizing');
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
         save(sidebar.getBoundingClientRect().width);
       };
       window.addEventListener('pointermove', onMove);
       window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
     });
     resizer.addEventListener('dblclick', () => { if (!isMobile()) { apply(340); save(340); } });
   }
 
-  // Click any image to view it full-size; click the backdrop to close.
+  // Click any image to view it full-size. Click the backdrop or press
+  // Escape to close.
   function setupImageModal() {
     const modal = document.getElementById('image-modal');
     const modalImg = document.getElementById('modal-image');
     if (!modal || !modalImg) return;
+    const close = () => modal.classList.remove('open');
     document.getElementById('content').addEventListener('click', (e) => {
       const img = e.target.closest && e.target.closest('.message-image, .tool-image');
       if (!img) return;
       modalImg.src = img.src;
       modal.classList.add('open');
     });
-    modal.addEventListener('click', () => modal.classList.remove('open'));
+    modal.addEventListener('click', close);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
   }
 
   document.querySelectorAll('.filter-btn').forEach((btn) => {
@@ -1110,7 +1153,7 @@
       document.querySelectorAll('.filter-btn').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       filterMode = btn.dataset.filter;
-      forceTreeRerender();
+      renderTree();
     });
   });
 
@@ -1121,7 +1164,7 @@
   }
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { searchInput.value = ''; searchQuery = ''; forceTreeRerender(); }
+    if (e.key === 'Escape') { searchInput.value = ''; searchQuery = ''; renderTree(); }
     if (isEditable(document.activeElement)) return;
     const key = e.key.toLowerCase();
     if (key === 't') { e.preventDefault(); toggleThinking(); }
@@ -1131,11 +1174,13 @@
   setupSidebarResize();
   setupImageModal();
 
-  // Open on the deep-linked branch/message when the URL carries valid
-  // params, otherwise on the default leaf.
-  const startLeaf = urlLeafId && byId.has(urlLeafId) ? urlLeafId : defaultLeaf;
-  if (startLeaf) {
-    if (urlTargetId && byId.has(urlTargetId)) navigateTo(startLeaf, 'target', urlTargetId);
-    else navigateTo(startLeaf, 'none');
+  // Open on the deep-linked message when present. If the URL's leaf and
+  // target disagree (a hand-edited or cross-branch link), fall back to
+  // the target's own branch so the scroll target always exists.
+  if (urlTargetId && byId.has(urlTargetId)) {
+    const onLeaf = urlLeafId && byId.has(urlLeafId) && activePathIds(urlLeafId).has(urlTargetId);
+    navigateTo(onLeaf ? urlLeafId : findNewestLeaf(urlTargetId), 'target', urlTargetId);
+  } else if (defaultLeaf) {
+    navigateTo(urlLeafId && byId.has(urlLeafId) ? urlLeafId : defaultLeaf, 'none');
   }
 })();

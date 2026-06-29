@@ -91,7 +91,8 @@ function makeEl(tag) {
     },
     appendChild(c) { this.children.push(c); return c; },
     append(...cs) { for (const c of cs) this.children.push(c); },
-    addEventListener() {}, scrollIntoView() {},
+    addEventListener(type, fn) { (this._on || (this._on = {}))[type] = ((this._on && this._on[type]) || []).concat(fn); },
+    scrollIntoView() {},
     querySelector() { return null; },
     querySelectorAll() { return []; },
   };
@@ -139,6 +140,11 @@ function nodeText(el) {
 }
 const treeText = elements['tree-container'].children.map(nodeText).join('\n');
 const treeStatus = elements['tree-status'].textContent;
+
+// Fire a stored listener with a minimal event (for the navigation test).
+function fire(el, type) {
+  ((el._on && el._on[type]) || []).forEach((fn) => fn({ stopPropagation() {}, preventDefault() {}, target: el }));
+}
 
 // ---- Assertions. ----
 let failures = 0;
@@ -208,6 +214,21 @@ check('tree status line', /\d+ \/ \d+ entries/.test(treeStatus));
 check('tree node text escaped', !treeText.includes('<script>alert'));
 check('tree shows branch sibling', treeText.includes('alternative branch'));
 check('tree draws branch connectors', treeText.includes('\u251c') || treeText.includes('\u2514'));
+
+// Navigating to a sibling branch must rebuild the tree (not just update
+// markers), so the node set and the status line stay in sync. This
+// guards the stale-tree regression.
+console.log('navigation');
+const branchNode = elements['tree-container'].children.find((n) => n.dataset.id === 'u1b');
+check('sibling branch node present', !!branchNode);
+if (branchNode) {
+  fire(branchNode, 'click');
+  check('navigation switched branch', elements['messages'].innerHTML.includes('alternative branch'));
+  const m = elements['tree-status'].textContent.match(/(\d+) \/ \d+/);
+  check('tree rebuilt: node count matches status', !!m && Number(m[1]) === elements['tree-container'].children.length);
+  const active = elements['tree-container'].children.find((n) => n.classList.contains('active'));
+  check('active node moved to clicked branch', !!active && active.dataset.id === 'u1b');
+}
 
 console.log('');
 if (failures) {
