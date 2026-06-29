@@ -74,8 +74,9 @@
   // Sub-agent runs live on their own `subagent` thread, keyed by
   // `agent_id`. A `sub_agent_spawn` entry roots each run and is parented
   // at the assistant message that spawned it, so we index spawns by that
-  // parent to nest the run inline under that message. Sub-agent entries
-  // are deliberately excluded from the navigation tree.
+  // parent to nest the run inline under that message. These spawns also
+  // appear in the navigation tree as a branch off that message, shown by
+  // default and hidden via the sidebar toggle.
   const spawnsByParent = new Map();
   const subThread = new Map();
   for (const e of entries) {
@@ -642,6 +643,29 @@
     return new Set(pathTo(targetId).map((e) => e.id));
   }
 
+  // The conversation entry a sub-agent run belongs to: walk up out of the
+  // sub-agent thread to the assistant that spawned it. For a conversation
+  // entry this returns the entry itself. `seen` guards a malformed cycle.
+  function conversationHost(entryId) {
+    let cur = byId.get(entryId);
+    const seen = new Set();
+    while (cur && cur.thread === 'subagent' && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      cur = cur.parent_id != null ? byId.get(cur.parent_id) : null;
+    }
+    return cur ? cur.id : entryId;
+  }
+
+  // The conversation leaf to open when navigating to `targetId`. A
+  // sub-agent target resolves to its host's branch leaf, so the full
+  // conversation stays visible and the run shows in its inline box. A
+  // conversation target resolves to its own branch leaf.
+  function leafForTarget(targetId) {
+    const e = byId.get(targetId);
+    if (e && e.thread === 'subagent') return findNewestLeaf(conversationHost(targetId));
+    return findNewestLeaf(targetId);
+  }
+
   // Flatten the tree to a list with indent and connector info,
   // prioritizing the branch that contains the active leaf. Each stack
   // tuple is [node, indent, justBranched, showConnector, isLast,
@@ -961,11 +985,10 @@
       div.append(prefix, marker, content);
       div.addEventListener('click', () => {
         if (window.getSelection().toString()) return;
-        // A sub-agent row navigates to itself: its run shows inline under
-        // the spawning assistant, so we open that box and scroll there. A
-        // conversation row goes to its branch leaf as usual.
-        if (entry.thread === 'subagent') navigateTo(entry.id, 'target', entry.id);
-        else navigateTo(findNewestLeaf(entry.id), 'target', entry.id);
+        // Open the entry's conversation branch and scroll to it. A
+        // sub-agent row routes to its host branch (its run shows inline
+        // there), so the full conversation stays visible.
+        navigateTo(leafForTarget(entry.id), 'target', entry.id);
       });
       container.appendChild(div);
     }
@@ -991,6 +1014,10 @@
       const det = entry.message.details;
       if (det && det.kind === 'sub_agent_report') return 'subagent-' + det.agent_id;
       if (entry.message.tool_call_id) return 'tool-call-' + entry.message.tool_call_id;
+    }
+    // The spawn node has no element of its own; scroll to its run's box.
+    if (entry && entry.type === 'sub_agent_spawn' && entry.agent_id != null) {
+      return 'subagent-' + entry.agent_id;
     }
     return 'entry-' + entryId;
   }
@@ -1028,11 +1055,17 @@
 
     setTimeout(() => {
       if (scrollMode === 'target' && scrollToEntryId) {
-        // A sub-agent target lives inside a collapsed box; open it first.
-        const tgt = byId.get(scrollToEntryId);
-        if (tgt && tgt.thread === 'subagent' && tgt.agent_id != null) {
-          const box = document.getElementById('subagent-' + tgt.agent_id);
-          if (box) box.open = true;
+        // A sub-agent target lives inside a collapsed box (possibly
+        // nested), so open it and any ancestor sub-agent boxes first.
+        let cur = byId.get(scrollToEntryId);
+        const opened = new Set();
+        while (cur && cur.thread === 'subagent' && !opened.has(cur.id)) {
+          opened.add(cur.id);
+          if (cur.agent_id != null) {
+            const box = document.getElementById('subagent-' + cur.agent_id);
+            if (box) box.open = true;
+          }
+          cur = cur.parent_id != null ? byId.get(cur.parent_id) : null;
         }
         const el = document.getElementById(scrollTargetId(scrollToEntryId)) || document.getElementById('entry-' + scrollToEntryId);
         if (el) {
@@ -1224,6 +1257,14 @@
       subToggle.addEventListener('click', () => {
         showSubAgents = !showSubAgents;
         subToggle.classList.toggle('active', showSubAgents);
+        // If we hide while the active leaf is a sub-agent (e.g. a
+        // hand-crafted deep link), re-home onto its host conversation so
+        // the active node does not vanish from the tree.
+        const leaf = byId.get(currentLeafId);
+        if (!showSubAgents && leaf && leaf.thread === 'subagent') {
+          navigateTo(leafForTarget(currentLeafId), 'none');
+          return;
+        }
         renderTree();
       });
     }
@@ -1251,7 +1292,7 @@
   // the target's own branch so the scroll target always exists.
   if (urlTargetId && byId.has(urlTargetId)) {
     const onLeaf = urlLeafId && byId.has(urlLeafId) && activePathIds(urlLeafId).has(urlTargetId);
-    navigateTo(onLeaf ? urlLeafId : findNewestLeaf(urlTargetId), 'target', urlTargetId);
+    navigateTo(onLeaf ? urlLeafId : leafForTarget(urlTargetId), 'target', urlTargetId);
   } else if (defaultLeaf) {
     navigateTo(urlLeafId && byId.has(urlLeafId) ? urlLeafId : defaultLeaf, 'none');
   }

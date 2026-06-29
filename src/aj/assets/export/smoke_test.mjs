@@ -254,6 +254,16 @@ if (subToggle) {
   check('sub-agent shown again after toggling back', reshown.includes('sub-agent #1'));
 }
 
+// Clicking a sub-agent row opens its inline box and keeps the full
+// conversation visible (it routes to the host assistant's branch).
+const spawnNode = elements['tree-container'].children.find((n) => n.dataset.id === 'sp');
+check('sub-agent spawn node present', !!spawnNode);
+if (spawnNode) {
+  fire(spawnNode, 'click');
+  check('clicking sub-agent renders its inline box', elements['messages'].innerHTML.includes('id="subagent-1"'));
+  check('clicking sub-agent keeps full conversation', elements['messages'].innerHTML.includes('Done.'));
+}
+
 // Navigating to a sibling branch must rebuild the tree (not just update
 // markers), so the node set and the status line stay in sync. This
 // guards the stale-tree regression.

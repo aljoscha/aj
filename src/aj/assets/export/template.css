@@ -47,8 +47,9 @@ body {
 a { color: var(--link); }
 
 /* Layout: a fixed-width navigation sidebar beside a scrolling content
- * pane. The sidebar lists the conversation tree (user-thread branches);
- * sub-agent runs are not tree nodes, they render inline in the content. */
+ * pane. The sidebar lists the conversation tree (branches plus, by
+ * default, sub-agent runs hanging off the message that spawned them). A
+ * sub-agent run also renders inline as a collapsible box in the content. */
 #app { display: flex; min-height: 100vh; }
 #sidebar {
   width: var(--sidebar-width); flex-shrink: 0; display: flex; flex-direction: column;
@@ -94,6 +95,9 @@ a { color: var(--link); }
 .tree-node.active .tree-content { font-weight: 700; }
 .tree-node:not(.in-path) { opacity: .5; }
 .tree-node:not(.in-path):hover { opacity: 1; }
+/* The selected node stays legible even on an off-path (dimmed) branch,
+ * such as a sub-agent run viewed from the conversation. */
+.tree-node.active { opacity: 1; }
 .tree-prefix { color: var(--muted); flex-shrink: 0; font-family: ui-monospace, monospace; white-space: pre; }
 .tree-marker { color: var(--link); flex-shrink: 0; white-space: pre; }
 .tree-content { color: var(--fg); overflow: hidden; text-overflow: ellipsis; }
