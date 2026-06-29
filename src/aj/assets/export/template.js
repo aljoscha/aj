@@ -10,19 +10,36 @@
   //   { session_id, leaf_id, entries: [ConversationEntry, ...] }
   // Entries are the verbatim on-disk records (snake_case fields, the
   // `type`/`role`/`kind` tags exactly as serialized by aj-session).
-  const data = await loadSessionData();
+  //
+  // The load is async (inflate is stream-based) and fails on a browser
+  // without DecompressionStream, so we bail with a visible message
+  // rather than leave a blank page.
+  let data;
+  try {
+    data = await loadSessionData();
+  } catch (e) {
+    showLoadError();
+    console.error('aj export: could not load the session data', e);
+    return;
+  }
   const entries = data.entries || [];
 
   // Inflate and parse the data island. The exporter gzips the JSON and
-  // base64-encodes it to keep the file small. A raw JSON island (leading
-  // `{`) is also accepted, which keeps the renderer usable with
-  // uncompressed data such as the dev smoke test.
+  // base64-encodes it; the base64 alphabet has no `<`, so the payload is
+  // inert in its script element. We reverse both steps here.
   async function loadSessionData() {
     const raw = document.getElementById('session-data').textContent.trim();
-    if (raw[0] === '{') return JSON.parse(raw);
     const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
     const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
     return JSON.parse(await new Response(stream).text());
+  }
+
+  function showLoadError() {
+    const msg = document.getElementById('messages');
+    if (msg) {
+      msg.innerHTML = '<div class="error-text">This session export could not be loaded. ' +
+        'It needs a browser with gzip DecompressionStream support (2023 or newer).</div>';
+    }
   }
 
   const byId = new Map(entries.map((e) => [e.id, e]));
@@ -1197,4 +1214,4 @@
   } else if (defaultLeaf) {
     navigateTo(urlLeafId && byId.has(urlLeafId) ? urlLeafId : defaultLeaf, 'none');
   }
-})();
+})().catch((e) => console.error('aj export: renderer error', e));

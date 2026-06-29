@@ -146,14 +146,15 @@ fn fill_template(template: &str, vars: &[(&str, &str)]) -> String {
 /// inside its surrounding element without any further escaping. The
 /// browser reverses both steps (`DecompressionStream` then `JSON.parse`).
 fn embed_session(data: &ExportData) -> String {
-    let json = serde_json::to_vec(data).unwrap_or_default();
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    // Writing to an in-memory buffer cannot fail, so the gzip output is
-    // always available once we finish the encoder.
+    let json = serde_json::to_vec(data).expect("ExportData always serializes");
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    // Gzipping to an in-memory buffer is infallible, so a failure here is
+    // a bug rather than something to paper over with empty output (which
+    // would inflate to "" and leave the page unable to parse its data).
     let gzipped = encoder
         .write_all(&json)
         .and_then(|()| encoder.finish())
-        .unwrap_or_default();
+        .expect("gzip to a Vec cannot fail");
     BASE64.encode(gzipped)
 }
 
