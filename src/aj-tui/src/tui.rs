@@ -1802,6 +1802,24 @@ impl Tui {
         // field doc for the rationale.
         let recover_full_clear = self.pending_full_clear;
 
+        // After the skip early-return above, `diff_above_viewport`
+        // (first changed row above the viewport top) means exactly "the
+        // change straddles the viewport top": part is in scrollback,
+        // part is visible. When the line count is unchanged nothing
+        // scrolled, so the visible rows kept their screen positions and
+        // we can repaint just the visible suffix, clamped to the
+        // viewport top, leaving the unreachable scrollback rows alone. A
+        // straddle that changed the line count still needs a full redraw,
+        // because the net insert or delete above the fold forces a
+        // scroll we can't drive from the visible region.
+        let equal_line_count = lines.len() == self.previous_lines.len();
+        let straddle_clamped = diff_above_viewport && equal_line_count;
+        // Set by the clamped-straddle path to the viewport top, so the
+        // state update below preserves the off-screen prefix of
+        // `previous_lines` instead of overwriting it with the (unpainted)
+        // current content.
+        let mut preserve_prefix: Option<usize> = None;
+
         // Assemble the entire frame — clear/paint, cursor positioning,
         // and cursor visibility toggle — into a single buffer, then
         // wrap it in [`SYNC_BEGIN`] / [`SYNC_END`] and commit with a
@@ -1820,7 +1838,7 @@ impl Tui {
             || width_changed
             || height_forces_full_redraw
             || shrunk
-            || diff_above_viewport
+            || (diff_above_viewport && !equal_line_count)
             || deletion_only_needs_full
             || recover_full_clear
         {
@@ -1837,7 +1855,7 @@ impl Tui {
             } else if deletion_only_needs_full {
                 "full(deletion_only_unreachable)"
             } else {
-                "full(diff_above_viewport)"
+                "full(straddle_resize)"
             };
             // Clear-on-paint is required for every full-render strategy
             // *except* a genuine first render on a freshly-started Tui,
@@ -1849,6 +1867,15 @@ impl Tui {
             self.full_render(&mut frame, &lines, clear);
             self.full_redraws += 1;
             self.pending_full_clear = false;
+        } else if straddle_clamped {
+            // Repaint only the visible suffix `[viewport_top, last]` and
+            // leave the off-screen prefix untouched. The state update
+            // below keeps that prefix's `previous_lines` entries so a
+            // later diff repaints the rows when they scroll into view.
+            self.previous_viewport_top = effective_viewport_top;
+            diff_range = self.differential_render(&mut frame, &lines, effective_viewport_top);
+            preserve_prefix = Some(effective_viewport_top);
+            strategy = "diff(clamped)";
         } else {
             // Sync the recomputed viewport top into `self` before
             // `differential_render` reads it. Its end-of-run update
@@ -1856,7 +1883,7 @@ impl Tui {
             // height + 1)`, so starting from the stale value would
             // bias the tracker upward when the height shrinks.
             self.previous_viewport_top = effective_viewport_top;
-            diff_range = self.differential_render(&mut frame, &lines);
+            diff_range = self.differential_render(&mut frame, &lines, 0);
             strategy = if diff_range.is_some() {
                 "diff"
             } else {
@@ -1885,7 +1912,21 @@ impl Tui {
         self.terminal.flush();
 
         // Update state.
-        self.previous_lines = lines;
+        match preserve_prefix {
+            Some(floor) => {
+                // Clamped straddle: rows above `floor` are in scrollback
+                // and were intentionally not repainted, so keep their
+                // last-painted content (the honest record of what the
+                // terminal shows) and adopt only the repainted visible
+                // suffix. Equal line count guarantees `floor <=
+                // lines.len()` and that the two halves line up.
+                self.previous_lines.truncate(floor);
+                self.previous_lines.extend(lines.drain(floor..));
+            }
+            None => {
+                self.previous_lines = lines;
+            }
+        }
         self.previous_width = current_width;
         self.previous_height = current_height;
         self.render_requested = false;
@@ -3040,12 +3081,26 @@ impl Tui {
     /// As with [`Self::full_render`], this method does not write to or
     /// flush the terminal — the caller assembles the full sync-wrapped
     /// frame buffer and issues a single `write` + `flush`.
+    ///
+    /// `min_row` clamps the repaint to start no earlier than that row.
+    /// The normal path passes 0. The clamped-straddle path passes the
+    /// viewport top so a change that starts above the fold repaints only
+    /// its visible portion, leaving the unreachable scrollback rows
+    /// alone (their `previous_lines` entries are preserved by the
+    /// caller). The clamp is only sound when the line count is unchanged
+    /// (no scroll), which is the caller's contract.
     fn differential_render(
         &mut self,
         buf: &mut String,
         lines: &[String],
+        min_row: usize,
     ) -> Option<(usize, usize)> {
         let (first, mut last) = Self::compute_diff_range(&self.previous_lines, lines)?;
+        // Clamp the repaint floor to the visible region. With `min_row >
+        // 0` the first row of the range may now be byte-identical to the
+        // previous frame (the genuine change was above the floor); the
+        // main loop's per-row skip handles that and leaves it untouched.
+        let first = first.max(min_row);
 
         // Expand `last` to cover every previous row inside
         // `[first..]` that held a Kitty image placement. Those
@@ -3187,11 +3242,13 @@ impl Tui {
             let old_line = prev.get(i).map(String::as_str).unwrap_or("");
             if new_line == old_line {
                 // Unchanged middle row: the `\r\n` above already
-                // advanced the cursor past it, so there is nothing
-                // more to emit. The very first row of the range
-                // (`i == first`) is guaranteed to differ, so this
-                // branch never trips on a row that would need its
-                // `\x1b[2K`-clear skipped.
+                // advanced the cursor past it, so there is nothing more
+                // to emit. With `min_row == 0` the first row of the
+                // range always differs, so on the unclamped path this
+                // branch only trips on interior rows. On the clamped
+                // path (`min_row > 0`) the first row may be unchanged,
+                // and skipping it here is exactly right: the cursor is
+                // already parked on it at column 0 and we leave it as-is.
                 continue;
             }
             buf.push_str("\x1b[2K");

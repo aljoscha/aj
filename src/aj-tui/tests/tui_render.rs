@@ -1187,6 +1187,112 @@ fn skipped_off_screen_change_repaints_when_scrolled_back_into_view() {
 }
 
 #[test]
+fn straddle_with_equal_line_count_repaints_only_visible_portion() {
+    // A change that straddles the viewport top (one row above it, one
+    // row visible) with an unchanged line count repaints only the
+    // visible suffix, clamped to the viewport top. No full redraw, no
+    // skip — the off-screen row is left alone and the visible row
+    // updates.
+    let terminal = VirtualTerminal::new(40, 6);
+    let mut tui = Tui::new(Box::new(terminal.clone()));
+    let component = MutableLines::new();
+    tui.add_child(Box::new(component.clone()));
+
+    // Nine rows on a 6-row terminal: viewport top is logical row 3, so
+    // rows 0..=2 are in scrollback and rows 3..=8 are visible.
+    component.set((0..9).map(|i| format!("row {i}")));
+    render_now(&mut tui);
+
+    let full_redraws_before = tui.full_redraws();
+    let skipped_before = tui.skipped_renders();
+
+    // Change off-screen row 1 and visible row 5 in one frame, same line
+    // count. first=1 (above the fold), last=5 (visible) — a straddle.
+    let mut next: Vec<String> = (0..9).map(|i| format!("row {i}")).collect();
+    next[1] = "row 1 OFFSCREEN".to_string();
+    next[5] = "row 5 VISIBLE".to_string();
+    component.set(next);
+    tui.request_render();
+    render_now(&mut tui);
+
+    assert_eq!(
+        tui.full_redraws(),
+        full_redraws_before,
+        "an equal-length straddle must not trigger a full redraw",
+    );
+    assert_eq!(
+        tui.skipped_renders(),
+        skipped_before,
+        "a straddle has a visible portion, so it is not a skip",
+    );
+    // Visible row 5 updated...
+    let viewport = terminal.viewport();
+    assert!(
+        viewport.iter().any(|r| r.contains("row 5 VISIBLE")),
+        "the visible portion of the straddle should repaint; got {viewport:?}",
+    );
+    // ...while the off-screen edit stays out of view.
+    assert!(
+        !viewport.iter().any(|r| r.contains("OFFSCREEN")),
+        "the off-screen portion must not be painted; got {viewport:?}",
+    );
+
+    // Resume: shrink so row 1 comes back into view; its current content
+    // must appear, proving the clamped repaint left the buffer honest.
+    component.set(["row 0", "row 1 OFFSCREEN", "row 2"]);
+    tui.request_render();
+    render_now(&mut tui);
+    assert!(
+        terminal
+            .viewport()
+            .iter()
+            .any(|r| r.contains("row 1 OFFSCREEN")),
+        "the off-screen edit must surface once scrolled back into view; got {:?}",
+        terminal.viewport(),
+    );
+}
+
+#[test]
+fn straddle_with_line_count_change_falls_back_to_full_redraw() {
+    // A change that straddles the viewport top *and* changes the line
+    // count can't be clamped: the net insert/delete above the fold
+    // forces a scroll the diff path can't drive from the visible
+    // region, so the engine full-redraws.
+    let terminal = VirtualTerminal::new(40, 6);
+    let mut tui = Tui::new(Box::new(terminal.clone()));
+    let component = MutableLines::new();
+    tui.add_child(Box::new(component.clone()));
+
+    // Nine rows: viewport top is logical row 3.
+    component.set((0..9).map(|i| format!("row {i}")));
+    render_now(&mut tui);
+
+    let full_redraws_before = tui.full_redraws();
+    let skipped_before = tui.skipped_renders();
+
+    // Insert a row at the top (shifts every row down) and keep the rest.
+    // The line count grows from 9 to 10, so this is a straddle with a
+    // length change.
+    let mut next: Vec<String> = vec!["row NEW TOP".to_string()];
+    next.extend((0..9).map(|i| format!("row {i}")));
+    component.set(next);
+    tui.request_render();
+    render_now(&mut tui);
+
+    assert!(
+        tui.full_redraws() > full_redraws_before,
+        "a straddle that changes the line count must full-redraw \
+         (before: {full_redraws_before}, after: {})",
+        tui.full_redraws(),
+    );
+    assert_eq!(
+        tui.skipped_renders(),
+        skipped_before,
+        "a length-changing straddle is a full redraw, not a skip",
+    );
+}
+
+#[test]
 fn line_reset_closes_open_hyperlink_on_each_row() {
     // Regression guard for apply_line_resets: every rendered non-empty
     // line must be terminated with `\x1b[0m\x1b]8;;\x07` (SGR reset +
