@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
-use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError};
+use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError, sub_agent_session_id};
 use aj_conf::{
     AgentEnv, Config, ConfigLayer, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel,
     ConfigVerbosity, Severity, SystemPromptSource, display_path,
@@ -2067,25 +2067,44 @@ fn apply_turn_config(
     match target {
         AgentId::Main => {
             let cfg = run_config.lock().expect("run config mutex poisoned");
+            // Re-stamp the session's prompt-cache key every turn: a
+            // mid-session model swap rebuilds `stream_options` from
+            // registry defaults, which carry none, so we restore it
+            // from the durable `session_id`.
+            let mut stream_options = cfg.stream_options.clone();
+            stream_options.session_id = cfg.session_id.clone();
             agent.set_provider(
                 Arc::clone(&cfg.provider),
                 Arc::clone(&cfg.model_info),
-                cfg.stream_options.clone(),
+                stream_options,
             );
             agent.set_default_thinking(cfg.thinking.clone());
             agent.set_speed(cfg.speed);
         }
         AgentId::Sub(n) => {
+            // Base session key used to scope the sub-agent's bundle
+            // below. Cloned out so we don't hold the run-config lock
+            // while taking the sub-overrides lock.
+            let base_session_id = run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .session_id
+                .clone();
             let overrides = sub_overrides.lock().expect("sub overrides mutex poisoned");
             let Some(entry) = overrides.get(&n) else {
                 return;
             };
             if let Some((provider, model_info, stream_options, _)) = &entry.bundle {
-                agent.set_provider(
-                    Arc::clone(provider),
-                    Arc::clone(model_info),
-                    stream_options.clone(),
-                );
+                // The override bundle came from `from_model_info`
+                // (registry defaults, no cache key), so re-scope it to
+                // this sub-agent's id, matching what the spawn path
+                // stamps. A sub-agent with no bundle override keeps the
+                // scoped key it was spawned with.
+                let mut stream_options = stream_options.clone();
+                if let Some(base) = &base_session_id {
+                    stream_options.session_id = Some(sub_agent_session_id(base, n));
+                }
+                agent.set_provider(Arc::clone(provider), Arc::clone(model_info), stream_options);
             }
             if let Some(thinking) = &entry.thinking {
                 agent.set_default_thinking(thinking.clone());
@@ -5800,6 +5819,11 @@ mod tests {
             let s = sub.lock().await;
             assert_eq!(s.model_info().id, "scripted", "spawn-time model inherited");
             assert_eq!(s.default_thinking(), None, "spawn-time thinking inherited");
+            assert_eq!(
+                s.session_id(),
+                Some(format!("{}:sub:1", world.session_id).as_str()),
+                "sub-agent cache key scoped to its id at spawn"
+            );
         }
 
         // The user changes the global run config after the spawn.
@@ -5819,6 +5843,11 @@ mod tests {
             apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &no_overrides);
             assert_eq!(s.model_info().id, "scripted", "sub keeps its model");
             assert_eq!(s.default_thinking(), None, "sub keeps its thinking");
+            assert_eq!(
+                s.session_id(),
+                Some(format!("{}:sub:1", world.session_id).as_str()),
+                "no override: sub keeps its scoped cache key"
+            );
         }
 
         // A main turn picks up the new config.
@@ -5827,6 +5856,11 @@ mod tests {
             apply_turn_config(AgentId::Main, &mut m, &run_config, &no_overrides);
             assert_eq!(m.model_info().id, "changed");
             assert_eq!(m.default_thinking(), Some(ThinkingConfig::High));
+            assert_eq!(
+                m.session_id(),
+                Some(world.session_id.as_str()),
+                "main agent carries the bare session id as its cache key"
+            );
         }
     }
 
@@ -5899,6 +5933,11 @@ mod tests {
             apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &world.sub_overrides);
             assert_eq!(s.model_info().id, "override-model");
             assert_eq!(s.default_thinking(), Some(ThinkingConfig::High));
+            assert_eq!(
+                s.session_id(),
+                Some(format!("{}:sub:1", world.session_id).as_str()),
+                "bundle override re-scopes the cache key to the sub's id"
+            );
         }
 
         // The global run config never moved.
@@ -7031,6 +7070,7 @@ mod run_loop_tests {
             thinking: None,
             speed: None,
             model_key: ("scripted".to_string(), "scripted".to_string()),
+            session_id: None,
         }))
     }
 

@@ -48,6 +48,23 @@ use std::sync::Arc;
 use tokio_retry2::strategy::{ExponentialBackoff, jitter};
 use tokio_util::sync::CancellationToken;
 
+/// Derive a sub-agent's prompt-cache key from the parent session's
+/// base key and the sub-agent's id.
+///
+/// A sub-agent carries a different prefix than the main thread (its
+/// own task framing and transcript), so it must cache under a distinct
+/// key to avoid colliding with the main thread's cached prefix and
+/// each sibling's. We derive it from the base key rather than mint a
+/// fresh one so the key stays stable across the sub-agent's own turns,
+/// which is what lets its prefix cache hit.
+///
+/// NOTE: OpenAI's Responses API caps `prompt_cache_key` at 64 chars.
+/// Session ids are short and sub-agents don't nest, so `<base>:sub:<id>`
+/// stays well under the limit.
+pub fn sub_agent_session_id(base: &str, agent_id: usize) -> String {
+    format!("{base}:sub:{agent_id}")
+}
+
 /// One-shot session seed applied at construction time: the resumed
 /// transcript, the fully-assembled system prompt, and the sub-agent
 /// counter floor derived from sub-agent subtrees already persisted
@@ -616,6 +633,15 @@ impl Agent {
     /// [`ModelRegistry`]: aj_models::registry::ModelRegistry
     pub fn model_info(&self) -> Arc<ModelInfo> {
         Arc::clone(&self.model_info)
+    }
+
+    /// The prompt-cache key on the agent's current [`StreamOptions`],
+    /// if any. Providers that key prompt caching on a session id stamp
+    /// it onto each request from here. The main agent carries the bare
+    /// session id; a sub-agent carries an id scoped to it (see
+    /// [`sub_agent_session_id`]).
+    pub fn session_id(&self) -> Option<&str> {
+        self.stream_options.session_id.as_deref()
     }
 
     /// Replace the provider handle, model metadata, and per-call
@@ -2328,6 +2354,25 @@ mod session_state_tests {
 }
 
 #[cfg(test)]
+mod sub_agent_session_id_tests {
+    use super::sub_agent_session_id;
+
+    #[test]
+    fn scopes_base_key_to_agent_id() {
+        let base = "2026-06-29-09-00-15-098";
+        assert_eq!(
+            sub_agent_session_id(base, 1),
+            "2026-06-29-09-00-15-098:sub:1"
+        );
+        // Distinct ids yield distinct keys so siblings don't share a
+        // cached prefix.
+        assert_ne!(sub_agent_session_id(base, 1), sub_agent_session_id(base, 2));
+        // Stays under the Responses API's 64-char prompt_cache_key cap.
+        assert!(sub_agent_session_id(base, 9999).len() <= 64);
+    }
+}
+
+#[cfg(test)]
 mod task_registry_tests {
     use std::sync::Arc;
 
@@ -2693,18 +2738,28 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // directory and tools. Its transcript starts empty; the
             // prompt the tool invoked us with is appended as the first
             // user message inside `run_single_turn`. Sub-agents share
-            // the parent's provider / model_info / stream_options
-            // triple so the whole hierarchy talks to the same backend.
-            // The thinking level
-            // is applied separately below via `set_default_thinking`
-            // so the child inherits the parent's resolved value.
+            // the parent's provider and model_info so the whole
+            // hierarchy talks to the same backend, and inherit its
+            // stream_options except for the prompt-cache key, which we
+            // scope to the child's id below. The thinking level is
+            // applied separately below via `set_default_thinking` so
+            // the child inherits the parent's resolved value.
+            //
+            // Scoping the cache key keeps the child's distinct prefix
+            // from colliding with the main thread's or a sibling's. A
+            // parent without a key (provider that doesn't key caching
+            // on it) leaves the child without one too.
+            let mut sub_stream_options = self.stream_options.clone();
+            if let Some(base) = self.stream_options.session_id.as_deref() {
+                sub_stream_options.session_id = Some(sub_agent_session_id(base, agent_id));
+            }
             let mut sub_agent = Agent::with_provider(
                 self.session_state.working_directory(),
                 sub_agent_tools,
                 disabled_tools,
                 Arc::clone(&self.provider),
                 Arc::clone(&self.model_info),
-                self.stream_options.clone(),
+                sub_stream_options,
                 None,
             );
             sub_agent.set_agent_id(child_id);

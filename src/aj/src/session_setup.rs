@@ -74,6 +74,14 @@ pub(crate) struct RunConfigSnapshot {
     /// the scripted path's provider id (from `--model-api`) differs
     /// from `model_info.provider`, which is always `"scripted"`.
     pub(crate) model_key: (String, String),
+    /// Stable per-session prompt-cache key (the conversation/session
+    /// id). Providers that key prompt caching on it (OpenAI Responses,
+    /// Codex) reuse the cached prefix across this session's turns when
+    /// it's set. Stamped onto `stream_options.session_id` before each
+    /// turn, but held here separately because a model swap rebuilds
+    /// `stream_options` from registry defaults, which would otherwise
+    /// drop it. `None` until the log is opened in [`prepare_log`].
+    pub(crate) session_id: Option<String>,
 }
 
 /// Dependencies for resume-time settings restoration: the model
@@ -106,6 +114,9 @@ fn build_run_config(
         thinking: crate::model::default_thinking_from_config(config.thinking),
         speed,
         model_key,
+        // Filled in by `prepare_log` once the log (and thus the session
+        // id) exists; the initial resolve runs before then.
+        session_id: None,
     }
 }
 
@@ -442,6 +453,21 @@ pub(crate) fn prepare_log(
         Vec::new()
     };
 
+    // Stamp the session's stable prompt-cache key onto the run config
+    // now that the log exists. We do it after the restore block above:
+    // a resume rebuilds `stream_options` from registry defaults (which
+    // carry no cache key), so stamping earlier would be undone here.
+    // `session_id` is the durable source the per-turn apply re-stamps
+    // from after a mid-session model swap; the direct `stream_options`
+    // stamp covers print mode and the initial agent build, which read
+    // these options without going through the per-turn apply.
+    {
+        let mut cfg = run_config.lock().expect("run config mutex poisoned");
+        let session_id = log.session_id().to_string();
+        cfg.stream_options.session_id = Some(session_id.clone());
+        cfg.session_id = Some(session_id);
+    }
+
     Ok(PreparedLog {
         log,
         transcript,
@@ -532,5 +558,41 @@ mod tests {
             build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None)
                 .expect("scripted run config");
         assert_eq!(run_config.model_key.0, crate::model::DEFAULT_PROVIDER_ID);
+    }
+
+    /// `prepare_log` stamps the opened log's id onto the run config as
+    /// the session's prompt-cache key. The initial resolve runs before
+    /// a log exists, so the field starts empty and is filled here; the
+    /// stamp lands on both the durable `session_id` and the
+    /// `stream_options` the agent build reads directly.
+    #[test]
+    fn prepare_log_stamps_session_id_onto_run_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
+        let config = Config::default();
+        let (run_config, _restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), None)
+                .expect("scripted run config");
+        assert!(run_config.session_id.is_none());
+        assert!(run_config.stream_options.session_id.is_none());
+
+        let run_config = Arc::new(StdMutex::new(run_config));
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let prepared = prepare_log(
+            &persistence,
+            &SessionSource::Create,
+            &config,
+            &run_config,
+            None,
+        )
+        .expect("prepare log");
+
+        let session_id = prepared.log.session_id().to_string();
+        let cfg = run_config.lock().expect("run config mutex poisoned");
+        assert_eq!(cfg.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            cfg.stream_options.session_id.as_deref(),
+            Some(session_id.as_str())
+        );
     }
 }

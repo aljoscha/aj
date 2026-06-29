@@ -105,6 +105,7 @@ pub(crate) fn scripted_run_config(
         thinking: None,
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
+        session_id: None,
     }))
 }
 
@@ -127,6 +128,7 @@ pub(crate) fn scripted_run_config_with_window(
         thinking: None,
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
+        session_id: None,
     }))
 }
 

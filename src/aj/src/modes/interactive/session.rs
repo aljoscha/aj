@@ -986,6 +986,7 @@ mod tests {
                 thinking: None,
                 speed: None,
                 model_key: ("anthropic".to_string(), "claude-x".to_string()),
+                session_id: None,
             }))
         };
 
