@@ -12,6 +12,10 @@
 //! compaction checkpoints. Tool results render from their structured
 //! [`ToolDetails`] payload (diffs, command output, todo lists, images)
 //! rather than the raw model-facing text, matching what the TUI shows.
+//! Long tool output is truncated to a preview, with the remainder
+//! behind a `<details>` toggle, mirroring the TUI's collapsed default.
+//! The `agent` tool's result is omitted, since the sub-agent box
+//! already shows that same final message.
 //!
 //! The document carries a light and a dark palette inlined as CSS. It
 //! follows the OS `prefers-color-scheme` (defaulting to light when none
@@ -76,6 +80,25 @@ pub(crate) fn render_session_html(log: &ConversationLog) -> String {
     )
 }
 
+/// Default line budget for collapsed text-style tool output, matching
+/// the TUI's `TEXT_COLLAPSED_LINES`. The first lines stay visible and
+/// the remainder folds into a `<details>`.
+const TEXT_COLLAPSED_LINES: usize = 10;
+
+/// Default line budget per command stream (stdout, stderr) for
+/// collapsed `bash` output, matching the TUI's `BASH_COLLAPSED_LINES`.
+/// The last lines stay visible, since a stream's tail is what usually
+/// matters, and the earlier lines fold into a `<details>`.
+const BASH_COLLAPSED_LINES: usize = 5;
+
+/// Which end of a long tool-output block stays visible when collapsed.
+/// Mirrors the TUI: text bodies keep their head, streamed command
+/// output keeps its tail.
+enum Truncate {
+    Head(usize),
+    Tail(usize),
+}
+
 /// Accumulates the transcript body while walking the replayed event
 /// stream. Sub-agent runs are bracketed by
 /// [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`], which
@@ -112,7 +135,18 @@ impl Renderer {
                 content,
                 is_error,
                 ..
-            } => self.tool_result(tool, result, content, *is_error),
+            } => {
+                // A successful `agent` result is the sub-agent's last
+                // assistant message verbatim, which already shows as the
+                // closing message inside the sub-agent box, so we skip
+                // it to avoid repeating the report. A failed run is
+                // different: the failure rides an `is_error` result here
+                // and the sub-agent box may be empty, so we keep those.
+                // Otherwise the failure would render nowhere.
+                if tool != "agent" || *is_error {
+                    self.tool_result(tool, result, content, *is_error);
+                }
+            }
             AgentEvent::SubAgentStart { child, task, .. } => {
                 let id = match child {
                     aj_agent::events::AgentId::Sub(n) => *n,
@@ -230,6 +264,57 @@ impl Renderer {
         );
     }
 
+    /// Emit a `<pre>` block, optionally classed. `class` is written
+    /// into the attribute unescaped, so it must be a trusted literal,
+    /// never caller-derived text.
+    fn pre(&mut self, text: &str, class: Option<&str>) {
+        match class {
+            Some(c) => {
+                let _ = write!(self.body, "<pre class=\"{c}\">{}</pre>", escape(text));
+            }
+            None => {
+                let _ = write!(self.body, "<pre>{}</pre>", escape(text));
+            }
+        }
+    }
+
+    /// Tool output collapsed to a preview, with the hidden remainder
+    /// behind a scriptless `<details>` toggle, mirroring the TUI's
+    /// default truncation. `Head` keeps the first lines and folds the
+    /// rest below. `Tail` keeps the last lines and folds the earlier
+    /// ones above. We split on `\n` and drop one trailing empty line so
+    /// the line count matches the TUI's.
+    fn output_block(&mut self, text: &str, class: Option<&str>, mode: Truncate) {
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        if lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        match mode {
+            Truncate::Head(limit) if lines.len() > limit => {
+                let hidden = lines.len() - limit;
+                self.pre(&lines[..limit].join("\n"), class);
+                self.fold(&lines[limit..].join("\n"), class, hidden, "more");
+            }
+            Truncate::Tail(limit) if lines.len() > limit => {
+                let split = lines.len() - limit;
+                self.fold(&lines[..split].join("\n"), class, split, "earlier");
+                self.pre(&lines[split..].join("\n"), class);
+            }
+            _ => self.pre(&lines.join("\n"), class),
+        }
+    }
+
+    /// A collapsed `<details>` holding the folded-away lines, labeled
+    /// "{count} {word} lines" (e.g. "12 more lines").
+    fn fold(&mut self, text: &str, class: Option<&str>, count: usize, word: &str) {
+        let _ = write!(
+            self.body,
+            "<details class=\"more\"><summary>{count} {word} lines</summary>"
+        );
+        self.pre(text, class);
+        self.body.push_str("</details>");
+    }
+
     fn tool_result(
         &mut self,
         tool: &str,
@@ -258,7 +343,7 @@ impl Renderer {
                     );
                 }
                 if !body.is_empty() {
-                    let _ = write!(self.body, "<pre>{}</pre>", escape(body));
+                    self.output_block(body, None, Truncate::Head(TEXT_COLLAPSED_LINES));
                 }
             }
             ToolDetails::Diff {
@@ -279,10 +364,10 @@ impl Renderer {
             } => {
                 let _ = write!(self.body, "<pre class=\"cmd\">$ {}</pre>", escape(command));
                 if !stdout.is_empty() {
-                    let _ = write!(self.body, "<pre>{}</pre>", escape(stdout));
+                    self.output_block(stdout, None, Truncate::Tail(BASH_COLLAPSED_LINES));
                 }
                 if !stderr.is_empty() {
-                    let _ = write!(self.body, "<pre class=\"stderr\">{}</pre>", escape(stderr));
+                    self.output_block(stderr, Some("stderr"), Truncate::Tail(BASH_COLLAPSED_LINES));
                 }
                 if *truncated {
                     self.body
@@ -294,6 +379,11 @@ impl Renderer {
                     let _ = write!(self.body, "<div class=\"summary\">exit code {code}</div>");
                 }
             }
+            // Unreachable on the production path: the only producer is
+            // the `agent` tool, whose successful result is skipped in
+            // `handle` because the sub-agent box already shows the
+            // report. We keep a faithful rendering for exhaustiveness
+            // and in case a future caller routes a report here directly.
             ToolDetails::SubAgentReport { task, report, .. } => {
                 let _ = write!(self.body, "<div class=\"summary\">{}</div>", escape(task));
                 self.body.push_str(&markdown(report));
@@ -558,6 +648,9 @@ border-radius:0 6px 6px 0}\
 font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .tool.error .tool-head{color:var(--err)}\
 .summary{color:var(--muted);font-size:13px;margin:4px 0}\
+details.more{margin:4px 0}\
+details.more>summary{cursor:pointer;color:var(--muted);font-size:12px;font-style:italic}\
+details.more>summary::marker{font-style:normal}\
 pre.cmd{color:var(--tool)}\
 pre.stderr{color:var(--del)}\
 pre.diff .add{color:var(--add)}\
@@ -616,6 +709,7 @@ mod tests {
     const SUB_SPAWN: &str = r#"{"id":"ss000001","parent_id":"as000001","thread":"subagent","agent_id":1,"type":"sub_agent_spawn","task":"investigate the bug","settings":{"provider":"anthropic","model_id":"claude-test","thinking":"off","speed":"standard","verbosity":""}}"#;
     const SUB_MSG: &str = r#"{"id":"sm000001","parent_id":"ss000001","thread":"subagent","agent_id":1,"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"sub agent finding"}],"api":"x","provider":"anthropic","model":"claude-test","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"Stop","timestamp":1704067203000}}"#;
     const SUB_RESULT: &str = r#"{"id":"ts000001","parent_id":"as000001","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-agent","tool_name":"agent","content":[{"type":"text","text":"report"}],"details":{"kind":"sub_agent_report","agent_id":1,"task":"investigate the bug","report":"final report text"},"is_error":false,"timestamp":1704067204000}}"#;
+    const SUB_FAIL_RESULT: &str = r#"{"id":"ts000002","parent_id":"as000001","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-agent","tool_name":"agent","content":[{"type":"text","text":"sub-agent failed: boom"}],"details":{"kind":"text","summary":"agent: error","body":"sub-agent failed: boom"},"is_error":true,"timestamp":1704067204000}}"#;
 
     #[test]
     fn escapes_html_special_chars() {
@@ -750,6 +844,167 @@ mod tests {
             html.matches("<details").count(),
             html.matches("</details>").count(),
             "unbalanced details boxes"
+        );
+
+        // The `agent` tool result repeats the sub-agent's last message,
+        // so the transcript body must not render it a second time. (It
+        // still lives in the embedded JSON island, hence the body-only
+        // check.)
+        let body = html
+            .split_once("<main")
+            .and_then(|(_, rest)| rest.split_once("</main>"))
+            .map(|(body, _)| body)
+            .expect("body present");
+        assert!(
+            !body.contains("final report text"),
+            "agent report rendered twice"
+        );
+    }
+
+    #[test]
+    fn failed_agent_run_surfaces_the_error() {
+        // A failed sub-agent run carries the failure on an `is_error`
+        // result for the `agent` tool, and the sub-agent box may be
+        // empty, so the exporter must keep that result rather than skip
+        // it the way it skips a successful (duplicate) report.
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, SUB_CALL, SUB_SPAWN, SUB_FAIL_RESULT]);
+        let html = render_session_html(&log);
+        let body = html
+            .split_once("<main")
+            .and_then(|(_, rest)| rest.split_once("</main>"))
+            .map(|(body, _)| body)
+            .expect("body present");
+        assert!(
+            body.contains("class=\"tool error\""),
+            "failure not rendered"
+        );
+        assert!(
+            body.contains("sub-agent failed: boom"),
+            "error message missing"
+        );
+    }
+
+    #[test]
+    fn head_truncation_folds_remainder() {
+        let mut r = Renderer::default();
+        let body = (1..=12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.output_block(&body, None, Truncate::Head(TEXT_COLLAPSED_LINES));
+
+        let (preview, folded) = r.body.split_once("<details").expect("fold present");
+        assert!(preview.contains("line10"), "10th line should stay visible");
+        assert!(!preview.contains("line11"), "11th line should be folded");
+        assert!(
+            folded.contains("<summary>2 more lines</summary>"),
+            "fold label wrong: {folded}"
+        );
+        assert!(
+            folded.contains("line11") && folded.contains("line12"),
+            "folded lines missing"
+        );
+    }
+
+    #[test]
+    fn tail_truncation_folds_earlier_lines() {
+        let mut r = Renderer::default();
+        let out = (1..=8)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.output_block(&out, None, Truncate::Tail(BASH_COLLAPSED_LINES));
+
+        let (fold, tail) = r.body.split_once("</details>").expect("fold present");
+        assert!(
+            fold.contains("<summary>3 earlier lines</summary>"),
+            "fold label wrong: {fold}"
+        );
+        assert!(
+            fold.contains("line3") && !fold.contains("line4"),
+            "earlier lines mis-split"
+        );
+        assert!(
+            tail.contains("line4") && tail.contains("line8"),
+            "tail lines should stay visible"
+        );
+    }
+
+    #[test]
+    fn short_output_is_not_folded() {
+        let mut r = Renderer::default();
+        r.output_block("only\ntwo\n", None, Truncate::Head(TEXT_COLLAPSED_LINES));
+        assert!(!r.body.contains("<details"), "short output should not fold");
+        assert!(r.body.contains("<pre>only\ntwo</pre>"), "plain pre missing");
+    }
+
+    #[test]
+    fn exactly_at_limit_does_not_fold() {
+        // The fold triggers on `len > limit`, so output of exactly the
+        // limit stays whole, matching the TUI.
+        let mut r = Renderer::default();
+        let ten = (1..=10)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.output_block(&ten, None, Truncate::Head(TEXT_COLLAPSED_LINES));
+        assert!(!r.body.contains("<details"), "head at limit must not fold");
+
+        let mut r = Renderer::default();
+        let five = (1..=5)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.output_block(&five, None, Truncate::Tail(BASH_COLLAPSED_LINES));
+        assert!(!r.body.contains("<details"), "tail at limit must not fold");
+    }
+
+    #[test]
+    fn trailing_newline_is_not_counted() {
+        // 11 content lines plus a trailing newline. The empty trailing
+        // line is dropped before counting, so exactly one line folds.
+        // If the pop were missing we'd see "2 more lines".
+        let mut r = Renderer::default();
+        let lines = (1..=11)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.output_block(
+            &format!("{lines}\n"),
+            None,
+            Truncate::Head(TEXT_COLLAPSED_LINES),
+        );
+        assert!(
+            r.body.contains("<summary>1 more lines</summary>"),
+            "trailing newline mis-counted: {}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn folded_content_is_escaped() {
+        // The hidden remainder must be escaped like the preview, so a
+        // tool that echoes markup cannot inject it through the fold. The
+        // folded `<pre>` must also keep its stream class.
+        let mut r = Renderer::default();
+        let rest = (1..=10)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Tail folds the earlier lines, so put the markup up front.
+        r.output_block(
+            &format!("<script>x</script>\n{rest}"),
+            Some("stderr"),
+            Truncate::Tail(BASH_COLLAPSED_LINES),
+        );
+        assert!(!r.body.contains("<script>x"), "raw markup survived in fold");
+        assert!(
+            r.body.contains("&lt;script&gt;x"),
+            "fold content not escaped"
+        );
+        assert!(
+            r.body.contains("<pre class=\"stderr\">"),
+            "stream class lost in fold"
         );
     }
 
