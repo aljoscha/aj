@@ -14,6 +14,7 @@
 
 pub mod cell;
 pub mod ctlseqs;
+pub mod error;
 pub mod event;
 pub mod event_loop;
 pub mod grapheme_cache;
@@ -31,6 +32,8 @@ pub mod vaxis;
 pub mod vxfw;
 pub mod widgets;
 pub mod window;
+
+pub use crate::error::Error;
 
 /// Terminal window size in character cells and pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -41,6 +41,7 @@ use base64::Engine as _;
 use crate::Winsize;
 use crate::cell::{Color, CursorShape, Hyperlink, Kind, Scale, Style, Underline};
 use crate::ctlseqs;
+use crate::error::Error;
 use crate::gwidth;
 use crate::internal_screen::InternalScreen;
 use crate::key::KittyFlags;
@@ -237,7 +238,7 @@ impl Vaxis {
 
     /// Reallocates both buffers for `winsize`, sends the cursor home, and emits
     /// a hardware clear-below-cursor. Every cell is redrawn on the next render.
-    pub fn resize<W: Write>(&mut self, w: &mut W, winsize: Winsize) -> io::Result<()> {
+    pub fn resize<W: Write>(&mut self, w: &mut W, winsize: Winsize) -> Result<(), Error> {
         {
             let mut screen = self.screen.borrow_mut();
             *screen = Screen::new(winsize);
@@ -259,7 +260,8 @@ impl Vaxis {
         self.state.cursor.col = 0;
         w.write_all(ctlseqs::SGR_RESET.as_bytes())?;
         w.write_all(ctlseqs::ERASE_BELOW_CURSOR.as_bytes())?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Resets enabled features, returns the cursor home, and clears below it.
@@ -271,7 +273,7 @@ impl Vaxis {
     /// resize, and default-color changes. Each step is gated on its `state` bit
     /// so we only undo what we turned on. Showing the cursor and resetting SGR
     /// are best-effort (errors ignored), the rest propagate.
-    pub fn reset_state<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn reset_state<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         let _ = w.write_all(ctlseqs::SHOW_CURSOR.as_bytes());
         let _ = w.write_all(ctlseqs::SGR_RESET.as_bytes());
         if self.screen.borrow().cursor_shape != CursorShape::Default {
@@ -320,7 +322,8 @@ impl Vaxis {
             w.write_all(ctlseqs::OSC12_RESET.as_bytes())?;
             self.state.changed_cursor_color = false;
         }
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Draws the screen to the terminal, emitting only what changed since the
@@ -328,7 +331,7 @@ impl Vaxis {
     ///
     /// The early return when nothing started is observable: a clean render of an
     /// unchanged screen emits zero bytes.
-    pub fn render<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn render<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         let mut sync_active = false;
         let result = self.render_inner(w, &mut sync_active);
         // On a mid-render error we still leave synchronized output if we opened
@@ -340,7 +343,7 @@ impl Vaxis {
         result
     }
 
-    fn render_inner<W: Write>(&mut self, w: &mut W, sync_active: &mut bool) -> io::Result<()> {
+    fn render_inner<W: Write>(&mut self, w: &mut W, sync_active: &mut bool) -> Result<(), Error> {
         let screen = self.screen.borrow();
         debug_assert_eq!(
             screen.buf.len(),
@@ -596,7 +599,8 @@ impl Vaxis {
         }
 
         w.write_all(ctlseqs::SYNC_RESET.as_bytes())?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Emits the per-cell SGR delta between the last-emitted style and `next`.
@@ -605,7 +609,12 @@ impl Vaxis {
     /// and the conpty underline workaround), the underline style, and the seven
     /// attributes. Bold and dim share a reset (`SGR 22`), so flipping one off
     /// re-emits the other if it is still set.
-    fn emit_style_diff<W: Write>(&self, w: &mut W, last: &Style, next: &Style) -> io::Result<()> {
+    fn emit_style_diff<W: Write>(
+        &self,
+        w: &mut W,
+        last: &Style,
+        next: &Style,
+    ) -> Result<(), Error> {
         if !last.fg.eql(&next.fg) {
             match next.fg {
                 Color::Default => w.write_all(ctlseqs::FG_RESET.as_bytes())?,
@@ -740,9 +749,9 @@ impl Vaxis {
     /// leaving the cursor on the line after the last printed line. Useful for
     /// dumping styled output to stdout. Errors if in the alt screen. The cursor
     /// is hidden and mouse shapes are not emitted.
-    pub fn pretty_print<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn pretty_print<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         if self.state.alt_screen {
-            return Err(io::Error::other("prettyPrint requires the primary screen"));
+            return Err(Error::NotInPrimaryScreen);
         }
         w.write_all(ctlseqs::HIDE_CURSOR.as_bytes())?;
         w.write_all(ctlseqs::SYNC_SET.as_bytes())?;
@@ -754,7 +763,7 @@ impl Vaxis {
         result
     }
 
-    fn pretty_print_body<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    fn pretty_print_body<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         let screen = self.screen.borrow();
         let buf_len = screen.buf.len();
         let mut reposition = false;
@@ -830,7 +839,8 @@ impl Vaxis {
             advance_cell(&mut self.screen_last, &mut i, &mut col, cw);
         }
         w.write_all(b"\r\n")?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     // --- Capability detection ----------------------------------------------
@@ -839,7 +849,7 @@ impl Vaxis {
     /// handshake (via [`Vaxis::notify_queries_done`]) or `timeout` elapses, then
     /// enables detected features. For a custom main loop, use
     /// [`Vaxis::query_terminal_send`] and [`Vaxis::enable_detected_features`].
-    pub fn query_terminal<W: Write>(&mut self, w: &mut W, timeout: Duration) -> io::Result<()> {
+    pub fn query_terminal<W: Write>(&mut self, w: &mut W, timeout: Duration) -> Result<(), Error> {
         self.query_terminal_send(w)?;
         {
             let received = self.da1_received.lock().expect("da1 mutex poisoned");
@@ -857,7 +867,7 @@ impl Vaxis {
     /// The two cursor-position requests bracket the explicit-width and
     /// scaled-text probes: the terminal's reply reports the column the cursor
     /// landed on, which tells us whether those OSC 66 forms moved the cursor.
-    pub fn query_terminal_send<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn query_terminal_send<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         // Exclusive access (&mut self) means no reader thread can observe this
         // write, so the non-atomic set is sound and uses the &mut.
         *self.queries_done.get_mut() = false;
@@ -880,7 +890,8 @@ impl Vaxis {
         ] {
             w.write_all(seq.as_bytes())?;
         }
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Applies environment overrides, then enables the features that capability
@@ -889,7 +900,7 @@ impl Vaxis {
     /// NOTE: Upstream reads a captured environment map; we read [`std::env`]
     /// directly. We do not reproduce upstream's Windows path (unconditional
     /// legacy SGR), since the port is Linux-first.
-    pub fn enable_detected_features<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn enable_detected_features<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         if env::var_os("TERMUX_VERSION").is_some() {
             self.sgr = Sgr::Legacy;
         }
@@ -918,7 +929,8 @@ impl Vaxis {
         if self.caps.unicode == gwidth::Method::Unicode && !self.caps.explicit_width {
             w.write_all(ctlseqs::UNICODE_SET.as_bytes())?;
         }
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Wakes the DA1 handshake. The loop calls this when the DA1 response is
@@ -936,7 +948,7 @@ impl Vaxis {
     // --- Per-feature emit methods ------------------------------------------
 
     /// Enters the alternate screen.
-    pub fn enter_alt_screen<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn enter_alt_screen<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         w.write_all(ctlseqs::SMCUP.as_bytes())?;
         w.flush()?;
         self.state.alt_screen = true;
@@ -944,7 +956,7 @@ impl Vaxis {
     }
 
     /// Exits the alternate screen.
-    pub fn exit_alt_screen<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn exit_alt_screen<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         w.write_all(ctlseqs::RMCUP.as_bytes())?;
         w.flush()?;
         self.state.alt_screen = false;
@@ -956,7 +968,7 @@ impl Vaxis {
         &mut self,
         w: &mut W,
         flags: KittyFlags,
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         ctlseqs::csi_u_push(w, flags.bits())?;
         w.flush()?;
         self.state.kitty_keyboard = true;
@@ -964,23 +976,30 @@ impl Vaxis {
     }
 
     /// Sends a desktop notification, with an optional title.
-    pub fn notify<W: Write>(&self, w: &mut W, title: Option<&str>, body: &str) -> io::Result<()> {
+    pub fn notify<W: Write>(
+        &self,
+        w: &mut W,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), Error> {
         match title {
             Some(t) => ctlseqs::osc777_notify(w, t, body)?,
             None => ctlseqs::osc9_notify(w, body)?,
         }
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Sets the window title.
-    pub fn set_title<W: Write>(&self, w: &mut W, title: &str) -> io::Result<()> {
+    pub fn set_title<W: Write>(&self, w: &mut W, title: &str) -> Result<(), Error> {
         ctlseqs::osc2_set_title(w, title)?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Turns bracketed paste on or off. While on, paste start/end events bracket
     /// the pasted keystrokes.
-    pub fn set_bracketed_paste<W: Write>(&mut self, w: &mut W, enable: bool) -> io::Result<()> {
+    pub fn set_bracketed_paste<W: Write>(&mut self, w: &mut W, enable: bool) -> Result<(), Error> {
         let seq = if enable {
             ctlseqs::BP_SET
         } else {
@@ -999,7 +1018,7 @@ impl Vaxis {
 
     /// Turns mouse reporting on or off. When on and the terminal reports pixel
     /// coordinates (sgr_pixels), the pixel mode is used.
-    pub fn set_mouse_mode<W: Write>(&mut self, w: &mut W, enable: bool) -> io::Result<()> {
+    pub fn set_mouse_mode<W: Write>(&mut self, w: &mut W, enable: bool) -> Result<(), Error> {
         if enable {
             self.state.mouse = true;
             if self.caps.sgr_pixels {
@@ -1011,7 +1030,8 @@ impl Vaxis {
         } else {
             w.write_all(ctlseqs::MOUSE_RESET.as_bytes())?;
         }
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Translates pixel mouse coordinates into a cell position plus sub-cell
@@ -1043,23 +1063,22 @@ impl Vaxis {
     }
 
     /// Copies `text` to the system clipboard via OSC 52.
-    pub fn copy_to_system_clipboard<W: Write>(&self, w: &mut W, text: &str) -> io::Result<()> {
+    pub fn copy_to_system_clipboard<W: Write>(&self, w: &mut W, text: &str) -> Result<(), Error> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(text);
         ctlseqs::osc52_clipboard_copy(w, &b64)?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Requests the system clipboard contents via OSC 52. Errors when clipboard
     /// access is not enabled in [`Options`].
-    pub fn request_system_clipboard<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    pub fn request_system_clipboard<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         if !self.opts.system_clipboard_enabled {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "system clipboard access is not enabled",
-            ));
+            return Err(Error::ClipboardDisabled);
         }
         w.write_all(ctlseqs::OSC52_CLIPBOARD_REQUEST.as_bytes())?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Sets the terminal's default foreground color.
@@ -1067,7 +1086,7 @@ impl Vaxis {
         &mut self,
         w: &mut W,
         rgb: [u8; 3],
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         ctlseqs::osc10_set(w, rgb[0], rgb[1], rgb[2])?;
         w.flush()?;
         self.state.changed_default_fg = true;
@@ -1079,7 +1098,7 @@ impl Vaxis {
         &mut self,
         w: &mut W,
         rgb: [u8; 3],
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         ctlseqs::osc11_set(w, rgb[0], rgb[1], rgb[2])?;
         w.flush()?;
         self.state.changed_default_bg = true;
@@ -1091,7 +1110,7 @@ impl Vaxis {
         &mut self,
         w: &mut W,
         rgb: [u8; 3],
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         ctlseqs::osc12_set(w, rgb[0], rgb[1], rgb[2])?;
         w.flush()?;
         self.state.changed_cursor_color = true;
@@ -1104,7 +1123,7 @@ impl Vaxis {
         &mut self,
         w: &mut W,
         rgb: [u8; 3],
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         if self.caps.multi_cursor {
             ctlseqs::secondary_cursors_rgb(w, rgb[0], rgb[1], rgb[2])?;
             w.flush()?;
@@ -1133,19 +1152,20 @@ impl Vaxis {
     }
 
     /// Requests a color report for `kind`. Not all terminals respond.
-    pub fn query_color<W: Write>(&self, w: &mut W, kind: Kind) -> io::Result<()> {
+    pub fn query_color<W: Write>(&self, w: &mut W, kind: Kind) -> Result<(), Error> {
         match kind {
             Kind::Fg => w.write_all(ctlseqs::OSC10_QUERY.as_bytes())?,
             Kind::Bg => w.write_all(ctlseqs::OSC11_QUERY.as_bytes())?,
             Kind::Cursor => w.write_all(ctlseqs::OSC12_QUERY.as_bytes())?,
             Kind::Index(idx) => ctlseqs::osc4_query(w, idx)?,
         }
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Subscribes to color-scheme update events. The terminal reports the
     /// current scheme immediately. Support is `caps.color_scheme_updates`.
-    pub fn subscribe_to_color_scheme_updates<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
+    pub fn subscribe_to_color_scheme_updates<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         w.write_all(ctlseqs::COLOR_SCHEME_REQUEST.as_bytes())?;
         w.write_all(ctlseqs::COLOR_SCHEME_SET.as_bytes())?;
         w.flush()?;
@@ -1154,9 +1174,10 @@ impl Vaxis {
     }
 
     /// Sends a device status report request.
-    pub fn device_status_report<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    pub fn device_status_report<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         w.write_all(ctlseqs::DEVICE_STATUS_REPORT.as_bytes())?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 
     /// Reports the terminal's working directory via OSC 7. `path` must be
@@ -1165,12 +1186,9 @@ impl Vaxis {
         &self,
         w: &mut W,
         path: &str,
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         if path.is_empty() || !path.starts_with('/') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "working directory must be an absolute path",
-            ));
+            return Err(Error::NotAbsolutePath(path.to_string()));
         }
         let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
         let host = percent_encode(&hostname, |b| is_uri_unreserved(b) || is_uri_sub_delim(b));
@@ -1178,7 +1196,8 @@ impl Vaxis {
             is_uri_unreserved(b) || is_uri_sub_delim(b) || matches!(b, b'/' | b':' | b'@')
         });
         ctlseqs::osc7(w, format_args!("file://{host}{encoded_path}"))?;
-        w.flush()
+        w.flush()?;
+        Ok(())
     }
 }
 
