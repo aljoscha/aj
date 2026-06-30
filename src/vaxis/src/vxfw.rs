@@ -48,18 +48,28 @@ use crate::window::{ChildOptions, Window};
 
 mod app;
 mod border;
+mod button;
 mod center;
+mod flex_column;
+mod flex_row;
 mod padding;
+mod rich_text;
 mod sized_box;
 mod spinner;
+mod split_view;
 mod text;
 
 pub use crate::vxfw::app::{App, Options};
 pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
+pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
+pub use crate::vxfw::flex_column::FlexColumn;
+pub use crate::vxfw::flex_row::FlexRow;
 pub use crate::vxfw::padding::{PadValues, Padding};
+pub use crate::vxfw::rich_text::{RichText, TextSpan};
 pub use crate::vxfw::sized_box::SizedBox;
 pub use crate::vxfw::spinner::Spinner;
+pub use crate::vxfw::split_view::{Constrain, SplitView};
 pub use crate::vxfw::text::{Overflow, Text, TextAlign, WidthBasis};
 
 /// A reference-counted, interior-mutable handle to a widget.
