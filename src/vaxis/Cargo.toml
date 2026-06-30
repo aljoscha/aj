@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 vaxis-ucd = { path = "../vaxis-ucd" }
+bitflags = { workspace = true }
 compact_str = { workspace = true }
+phf = { workspace = true }
 thiserror = { workspace = true }
 unicode-segmentation = { workspace = true }
 
