@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 vaxis-ucd = { path = "../vaxis-ucd" }
+base64 = { workspace = true }
 bitflags = { workspace = true }
 compact_str = { workspace = true }
 phf = { workspace = true }
