@@ -11,6 +11,7 @@ compact_str = { workspace = true }
 image = { workspace = true }
 phf = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

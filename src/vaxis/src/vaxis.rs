@@ -33,7 +33,7 @@ use std::cell::RefCell;
 use std::env;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -84,6 +84,178 @@ impl Default for Capabilities {
     }
 }
 
+/// Screen geometry the reader needs to translate pixel mouse coordinates.
+///
+/// The reader cannot reach the `Vaxis` screen (it is `!Sync`), so `Vaxis`
+/// mirrors the geometry and the pixel-mouse flag into [`Shared`] on resize and
+/// mouse-mode changes. All zero means "not resized yet", which makes
+/// [`translate_mouse_with`] a no-op.
+#[derive(Debug, Clone, Copy, Default)]
+struct MouseTranslate {
+    pixel_mouse: bool,
+    width: u16,
+    height: u16,
+    width_pix: u16,
+    height_pix: u16,
+}
+
+/// Translates pixel mouse coordinates into a cell position plus a sub-cell
+/// offset. A no-op unless pixel mouse mode is active and the screen has a
+/// non-zero size.
+fn translate_mouse_with(params: MouseTranslate, mouse: Mouse) -> Mouse {
+    if params.width == 0 || params.height == 0 {
+        return mouse;
+    }
+    let mut result = mouse;
+    if params.pixel_mouse {
+        debug_assert_eq!(mouse.xoffset, 0);
+        debug_assert_eq!(mouse.yoffset, 0);
+        let xpos = mouse.col;
+        let ypos = mouse.row;
+        let xextra = params.width_pix % params.width;
+        let yextra = params.height_pix % params.height;
+        let xcell = i16::try_from((params.width_pix - xextra) / params.width).unwrap_or(0);
+        let ycell = i16::try_from((params.height_pix - yextra) / params.height).unwrap_or(0);
+        if xcell == 0 || ycell == 0 {
+            return mouse;
+        }
+        result.col = xpos.div_euclid(xcell);
+        result.row = ypos.div_euclid(ycell);
+        result.xoffset = u16::try_from(xpos.rem_euclid(xcell)).unwrap_or(0);
+        result.yoffset = u16::try_from(ypos.rem_euclid(ycell)).unwrap_or(0);
+    }
+    result
+}
+
+/// Capability-detection and resize state shared between [`Vaxis`] and the input
+/// reader (the threaded [`Loop`](crate::event_loop::Loop) or the async
+/// front-end).
+///
+/// We share only this much, rather than wrapping the whole `Vaxis` in a lock, so
+/// the renderer's hot path stays lock-free. The contract has three parts.
+///
+/// Capability detection: while a query batch is outstanding the reader folds
+/// `cap_*` responses and the F3 explicit-width/scaled-text probes into
+/// `detected`, and on the DA1 response calls [`Shared::notify_da1`].
+/// [`Vaxis::query_terminal`] blocks on the condvar until then (or a timeout),
+/// then snapshots `detected` into its own `caps`. After that snapshot `Vaxis`
+/// owns `caps` and the renderer reads it with no synchronization.
+///
+/// In-band resize: the reader calls [`Shared::set_in_band_resize`] when a
+/// DEC 2048 winsize report arrives. [`Vaxis::reset_state`] reads and clears the
+/// flag so the mode teardown is emitted only when the terminal proved support,
+/// and the SIGWINCH callback reads it to suppress the out-of-band resize once
+/// in-band reports take over.
+///
+/// Mouse translation: pixel-to-cell translation needs the screen geometry, so
+/// `Vaxis` mirrors it here (see [`MouseTranslate`]) and the reader translates
+/// before posting.
+pub struct Shared {
+    da1_received: Mutex<bool>,
+    da1_condvar: Condvar,
+    /// False while a query batch is outstanding, so the reader treats an F3
+    /// cursor-position report as a capability probe rather than a real key.
+    queries_done: AtomicBool,
+    detected: Mutex<Capabilities>,
+    in_band_resize: AtomicBool,
+    mouse: Mutex<MouseTranslate>,
+}
+
+impl Shared {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            da1_received: Mutex::new(false),
+            da1_condvar: Condvar::new(),
+            queries_done: AtomicBool::new(true),
+            detected: Mutex::new(Capabilities::default()),
+            in_band_resize: AtomicBool::new(false),
+            mouse: Mutex::new(MouseTranslate::default()),
+        })
+    }
+
+    /// True once detection has finished. The reader gates F3 probe detection on
+    /// `!queries_done`.
+    pub(crate) fn queries_done(&self) -> bool {
+        self.queries_done.load(Ordering::Relaxed)
+    }
+
+    fn set_queries_done(&self, value: bool) {
+        self.queries_done.store(value, Ordering::Relaxed);
+    }
+
+    /// Folds detected capabilities. Called by the reader for each `cap_*`
+    /// response and each F3 probe.
+    pub(crate) fn update_detected(&self, f: impl FnOnce(&mut Capabilities)) {
+        let mut detected = self.detected.lock().expect("detected caps poisoned");
+        f(&mut detected);
+    }
+
+    /// A snapshot of the capabilities detected so far.
+    pub(crate) fn detected(&self) -> Capabilities {
+        *self.detected.lock().expect("detected caps poisoned")
+    }
+
+    /// DA1 arrival hook: marks queries done and wakes [`Vaxis::query_terminal`].
+    /// Mirrors upstream's `cap_da1` handler, which both wakes the futex and sets
+    /// `queries_done`.
+    pub(crate) fn notify_da1(&self) {
+        self.set_queries_done(true);
+        let mut received = self.da1_received.lock().expect("da1 mutex poisoned");
+        *received = true;
+        self.da1_condvar.notify_all();
+    }
+
+    /// Blocks until DA1 arrives or `timeout` elapses.
+    fn wait_for_da1(&self, timeout: Duration) {
+        let received = self.da1_received.lock().expect("da1 mutex poisoned");
+        let _unused = self
+            .da1_condvar
+            .wait_timeout_while(received, timeout, |r| !*r)
+            .expect("da1 mutex poisoned");
+    }
+
+    /// Whether DA1 has been observed. Used by tests asserting the handshake
+    /// fired.
+    #[cfg(test)]
+    pub(crate) fn da1_fired(&self) -> bool {
+        *self.da1_received.lock().expect("da1 mutex poisoned")
+    }
+
+    /// Begins a query batch: marks queries outstanding and seeds `detected` from
+    /// the runtime's current `caps` so detection accumulates onto them, never
+    /// resetting a capability the caller set by hand.
+    pub(crate) fn begin_query(&self, caps: Capabilities) {
+        self.set_queries_done(false);
+        *self.detected.lock().expect("detected caps poisoned") = caps;
+    }
+
+    /// Records that an in-band (DEC 2048) resize report arrived.
+    pub(crate) fn set_in_band_resize(&self) {
+        self.in_band_resize.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether in-band resize reports are in effect. The SIGWINCH callback reads
+    /// this to avoid posting a duplicate out-of-band resize.
+    pub(crate) fn in_band_resize(&self) -> bool {
+        self.in_band_resize.load(Ordering::Relaxed)
+    }
+
+    fn take_in_band_resize(&self) -> bool {
+        self.in_band_resize.swap(false, Ordering::Relaxed)
+    }
+
+    fn update_mouse(&self, f: impl FnOnce(&mut MouseTranslate)) {
+        let mut mouse = self.mouse.lock().expect("mouse translate poisoned");
+        f(&mut mouse);
+    }
+
+    /// Translates a mouse report using the geometry mirrored from `Vaxis`.
+    pub(crate) fn translate_mouse(&self, mouse: Mouse) -> Mouse {
+        let params = *self.mouse.lock().expect("mouse translate poisoned");
+        translate_mouse_with(params, mouse)
+    }
+}
+
 /// Runtime options supplied to [`Vaxis::new`].
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -127,9 +299,7 @@ struct State {
     kitty_keyboard: bool,
     bracketed_paste: bool,
     mouse: bool,
-    pixel_mouse: bool,
     color_scheme_updates: bool,
-    in_band_resize: bool,
     changed_default_fg: bool,
     changed_default_bg: bool,
     changed_cursor_color: bool,
@@ -171,20 +341,12 @@ pub struct Vaxis {
 
     sgr: Sgr,
 
-    /// DA1 capability handshake. [`Vaxis::query_terminal`] blocks on the condvar
-    /// until the loop calls [`Vaxis::notify_queries_done`] (woken when the
-    /// `cap_da1` response is parsed), or the timeout elapses.
-    ///
-    /// NOTE: One-shot per runtime, like upstream's futex: the flag is set when
-    /// DA1 arrives and never cleared. A second `query_terminal` returns at once.
-    da1_received: Mutex<bool>,
-    da1_condvar: Condvar,
-
-    /// False while a query batch is outstanding. The input layer reads this to
-    /// disambiguate the explicit cursor-position reports (which collide with F3
-    /// key encoding) from a real F3 keypress. Atomic because the reader thread
-    /// reads it while the main thread writes it.
-    queries_done: AtomicBool,
+    /// Capability-detection and resize state shared with the input reader. See
+    /// [`Shared`] for the lock-free-renderer contract. Held behind an `Arc` so
+    /// the reader (a separate thread or async task) can fold detected
+    /// capabilities, wake the DA1 handshake, and flag in-band resizes while the
+    /// runtime stays `!Sync` (its screen is a `RefCell`).
+    shared: Arc<Shared>,
 
     state: State,
 }
@@ -207,11 +369,17 @@ impl Vaxis {
             next_img_id: 1,
             enable_workarounds: true,
             sgr: Sgr::Standard,
-            da1_received: Mutex::new(false),
-            da1_condvar: Condvar::new(),
-            queries_done: AtomicBool::new(true),
+            shared: Shared::new(),
             state: State::default(),
         }
+    }
+
+    /// A clonable handle to the capability-detection and resize state shared
+    /// with the input reader. Pass it to the threaded
+    /// [`Loop`](crate::event_loop::Loop) or the async front-end so the reader
+    /// and this runtime agree on the DA1 handshake and detected capabilities.
+    pub fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
     }
 
     /// Returns a [`Window`] over the entire screen.
@@ -250,6 +418,14 @@ impl Vaxis {
         // Only the front screen is sized to the new geometry; reinitializing the
         // back buffer to defaults forces every cell to redraw next render.
         self.screen_last = InternalScreen::new(winsize.cols, winsize.rows);
+
+        // Mirror the geometry so the reader can translate pixel mouse reports.
+        self.shared.update_mouse(|m| {
+            m.width = winsize.cols;
+            m.height = winsize.rows;
+            m.width_pix = winsize.x_pixel;
+            m.height_pix = winsize.y_pixel;
+        });
 
         if self.state.alt_screen {
             w.write_all(ctlseqs::HOME.as_bytes())?;
@@ -309,9 +485,8 @@ impl Vaxis {
             w.write_all(ctlseqs::COLOR_SCHEME_RESET.as_bytes())?;
             self.state.color_scheme_updates = false;
         }
-        if self.state.in_band_resize {
+        if self.shared.take_in_band_resize() {
             w.write_all(ctlseqs::IN_BAND_RESIZE_RESET.as_bytes())?;
-            self.state.in_band_resize = false;
         }
         if self.state.changed_default_fg {
             w.write_all(ctlseqs::OSC10_RESET.as_bytes())?;
@@ -854,14 +1029,14 @@ impl Vaxis {
     /// [`Vaxis::query_terminal_send`] and [`Vaxis::enable_detected_features`].
     pub fn query_terminal<W: Write>(&mut self, w: &mut W, timeout: Duration) -> Result<(), Error> {
         self.query_terminal_send(w)?;
-        {
-            let received = self.da1_received.lock().expect("da1 mutex poisoned");
-            let _unused = self
-                .da1_condvar
-                .wait_timeout_while(received, timeout, |r| !*r)
-                .expect("da1 mutex poisoned");
-        }
-        self.queries_done.store(true, Ordering::Relaxed);
+        self.shared.wait_for_da1(timeout);
+        self.shared.set_queries_done(true);
+        // Snapshot the capabilities the reader detected during the query window
+        // into our own `caps`. From here the renderer reads `caps` lock-free.
+        self.caps = self.shared.detected();
+        // Keep the print engine's width method in step with the detected unicode
+        // mode (the reader cannot touch our screen).
+        self.screen.borrow_mut().width_method = self.caps.unicode;
         self.enable_detected_features(w)
     }
 
@@ -871,9 +1046,9 @@ impl Vaxis {
     /// scaled-text probes: the terminal's reply reports the column the cursor
     /// landed on, which tells us whether those OSC 66 forms moved the cursor.
     pub fn query_terminal_send<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
-        // Exclusive access (&mut self) means no reader thread can observe this
-        // write, so the non-atomic set is sound and uses the &mut.
-        *self.queries_done.get_mut() = false;
+        // Mark queries outstanding and seed the shared detection state from our
+        // current caps so the reader accumulates onto them.
+        self.shared.begin_query(self.caps);
         for seq in [
             ctlseqs::DECRQM_SGR_PIXELS,
             ctlseqs::DECRQM_UNICODE,
@@ -939,13 +1114,11 @@ impl Vaxis {
     /// Wakes the DA1 handshake. The loop calls this when the DA1 response is
     /// parsed, unblocking [`Vaxis::query_terminal`].
     ///
-    /// NOTE: Takes `&self` so the loop can call it through a shared reference.
-    /// Cross-thread waking in phase 7 shares the handshake separately, since
-    /// `Vaxis` is `!Sync` (the screen `RefCell`).
+    /// NOTE: Takes `&self` and delegates to the shared [`Shared`] handshake, so
+    /// a reader on another thread can wake the runtime even though `Vaxis`
+    /// itself is `!Sync`.
     pub fn notify_queries_done(&self) {
-        let mut received = self.da1_received.lock().expect("da1 mutex poisoned");
-        *received = true;
-        self.da1_condvar.notify_all();
+        self.shared.notify_da1();
     }
 
     // --- Per-feature emit methods ------------------------------------------
@@ -1025,7 +1198,7 @@ impl Vaxis {
         if enable {
             self.state.mouse = true;
             if self.caps.sgr_pixels {
-                self.state.pixel_mouse = true;
+                self.shared.update_mouse(|m| m.pixel_mouse = true);
                 w.write_all(ctlseqs::MOUSE_SET_PIXELS.as_bytes())?;
             } else {
                 w.write_all(ctlseqs::MOUSE_SET.as_bytes())?;
@@ -1039,30 +1212,11 @@ impl Vaxis {
 
     /// Translates pixel mouse coordinates into a cell position plus sub-cell
     /// offset. A no-op unless pixel mouse mode is active.
+    ///
+    /// Delegates to the shared geometry mirror so a synchronous caller and the
+    /// input reader translate identically.
     pub fn translate_mouse(&self, mouse: Mouse) -> Mouse {
-        let screen = self.screen.borrow();
-        if screen.width == 0 || screen.height == 0 {
-            return mouse;
-        }
-        let mut result = mouse;
-        if self.state.pixel_mouse {
-            debug_assert_eq!(mouse.xoffset, 0);
-            debug_assert_eq!(mouse.yoffset, 0);
-            let xpos = mouse.col;
-            let ypos = mouse.row;
-            let xextra = screen.width_pix % screen.width;
-            let yextra = screen.height_pix % screen.height;
-            let xcell = i16::try_from((screen.width_pix - xextra) / screen.width).unwrap_or(0);
-            let ycell = i16::try_from((screen.height_pix - yextra) / screen.height).unwrap_or(0);
-            if xcell == 0 || ycell == 0 {
-                return mouse;
-            }
-            result.col = xpos.div_euclid(xcell);
-            result.row = ypos.div_euclid(ycell);
-            result.xoffset = u16::try_from(xpos.rem_euclid(xcell)).unwrap_or(0);
-            result.yoffset = u16::try_from(ypos.rem_euclid(ycell)).unwrap_or(0);
-        }
-        result
+        self.shared.translate_mouse(mouse)
     }
 
     /// Copies `text` to the system clipboard via OSC 52.
@@ -1638,7 +1792,7 @@ mod tests {
         }
         assert_eq!(out, expected);
         // Sending a batch marks queries as outstanding.
-        assert!(!vx.queries_done.load(Ordering::Relaxed));
+        assert!(!vx.shared.queries_done());
     }
 
     #[test]
@@ -1669,7 +1823,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         vx.query_terminal(&mut out, Duration::from_secs(5))
             .expect("query");
-        assert!(vx.queries_done.load(Ordering::Relaxed));
+        assert!(vx.shared.queries_done());
         // The batch was still sent.
         assert!(out.starts_with(ctlseqs::DECRQM_SGR_PIXELS.as_bytes()));
     }

@@ -3336,6 +3336,7 @@ dependencies = [
  "serial_test",
  "signal-hook",
  "thiserror",
+ "tokio",
  "unicode-segmentation",
  "vaxis-ucd",
 ]
