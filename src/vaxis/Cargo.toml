@@ -8,6 +8,7 @@ vaxis-ucd = { path = "../vaxis-ucd" }
 base64 = { workspace = true }
 bitflags = { workspace = true }
 compact_str = { workspace = true }
+image = { workspace = true }
 phf = { workspace = true }
 thiserror = { workspace = true }
 unicode-segmentation = { workspace = true }

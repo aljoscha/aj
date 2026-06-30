@@ -37,12 +37,15 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
+use image::DynamicImage;
+use image::codecs::png::PngEncoder;
 
 use crate::Winsize;
 use crate::cell::{Color, CursorShape, Hyperlink, Kind, Scale, Style, Underline};
 use crate::ctlseqs;
 use crate::error::Error;
 use crate::gwidth;
+use crate::image::{Image, Source, TransmitFormat, TransmitMedium};
 use crate::internal_screen::InternalScreen;
 use crate::key::KittyFlags;
 use crate::mouse::{Mouse, Shape as MouseShape};
@@ -1199,6 +1202,168 @@ impl Vaxis {
         w.flush()?;
         Ok(())
     }
+
+    // --- Image transmission (kitty graphics) -------------------------------
+
+    /// Transmits an image whose bytes the terminal reads from the local
+    /// filesystem (or temp/shared-memory medium), base64-encoding `payload`.
+    ///
+    /// `payload` is the raw bytes for the chosen medium (typically a path).
+    /// Errors with [`Error::PathTooLong`] when the encoded payload would not
+    /// fit a single 4096-byte chunk, and with [`Error::NoGraphicsCapability`]
+    /// when the terminal lacks kitty graphics. The image id is allocated even
+    /// on the `PathTooLong` path, matching upstream.
+    pub fn transmit_local_image_path<W: Write>(
+        &mut self,
+        w: &mut W,
+        payload: &[u8],
+        width: u16,
+        height: u16,
+        medium: TransmitMedium,
+        format: TransmitFormat,
+    ) -> Result<Image, Error> {
+        if !self.caps.kitty_graphics {
+            return Err(Error::NoGraphicsCapability);
+        }
+        // The id is consumed even when we bail with PathTooLong below: upstream
+        // increments it in a `defer` placed after the capability check.
+        let id = self.next_img_id;
+        self.next_img_id += 1;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        if encoded.len() >= 4096 {
+            return Err(Error::PathTooLong);
+        }
+
+        let medium_char = match medium {
+            TransmitMedium::File => 'f',
+            TransmitMedium::TempFile => 't',
+            TransmitMedium::SharedMem => 's',
+        };
+        match format {
+            TransmitFormat::Rgb => {
+                write!(w, "\x1b_Gf=24,s={width},v={height},i={id},t={medium_char};")?;
+            }
+            TransmitFormat::Rgba => {
+                write!(w, "\x1b_Gf=32,s={width},v={height},i={id},t={medium_char};")?;
+            }
+            TransmitFormat::Png => {
+                write!(w, "\x1b_Gf=100,i={id},t={medium_char};")?;
+            }
+        }
+        w.write_all(encoded.as_bytes())?;
+        w.write_all(b"\x1b\\")?;
+        w.flush()?;
+        Ok(Image::new(id, width, height))
+    }
+
+    /// Transmits an already-base64-encoded image, chunking the payload at 4096
+    /// bytes.
+    ///
+    /// A payload under 4096 bytes is sent as one APC. Larger payloads are split
+    /// into 4096-byte chunks with the kitty continuation flag set (`m=1`) on
+    /// every chunk but the last (`m=0`). Errors with
+    /// [`Error::NoGraphicsCapability`] when the terminal lacks kitty graphics.
+    pub fn transmit_pre_encoded_image<W: Write>(
+        &mut self,
+        w: &mut W,
+        bytes: &[u8],
+        width: u16,
+        height: u16,
+        format: TransmitFormat,
+    ) -> Result<Image, Error> {
+        if !self.caps.kitty_graphics {
+            return Err(Error::NoGraphicsCapability);
+        }
+        let id = self.next_img_id;
+        self.next_img_id += 1;
+
+        let fmt: u8 = match format {
+            TransmitFormat::Rgb => 24,
+            TransmitFormat::Rgba => 32,
+            TransmitFormat::Png => 100,
+        };
+
+        if bytes.len() < 4096 {
+            write!(w, "\x1b_Gf={fmt},s={width},v={height},i={id};")?;
+            w.write_all(bytes)?;
+            w.write_all(b"\x1b\\")?;
+        } else {
+            write!(w, "\x1b_Gf={fmt},s={width},v={height},i={id},m=1;")?;
+            w.write_all(&bytes[0..4096])?;
+            w.write_all(b"\x1b\\")?;
+            let mut n = 4096;
+            while n < bytes.len() {
+                let end = (n + 4096).min(bytes.len());
+                let m = if end == bytes.len() { 0 } else { 1 };
+                write!(w, "\x1b_Gm={m};")?;
+                w.write_all(&bytes[n..end])?;
+                w.write_all(b"\x1b\\")?;
+                n += 4096;
+            }
+        }
+        w.flush()?;
+        Ok(Image::new(id, width, height))
+    }
+
+    /// Encodes a decoded image in `format` and transmits it.
+    ///
+    /// PNG goes through [`PngEncoder`], RGB through `to_rgb8`, RGBA through
+    /// `to_rgba8`. The encoded bytes are base64-ed and handed to
+    /// [`Vaxis::transmit_pre_encoded_image`]. Errors with
+    /// [`Error::NoGraphicsCapability`] when the terminal lacks kitty graphics
+    /// and [`Error::Image`] on an encode failure.
+    pub fn transmit_image<W: Write>(
+        &mut self,
+        w: &mut W,
+        img: &DynamicImage,
+        format: TransmitFormat,
+    ) -> Result<Image, Error> {
+        if !self.caps.kitty_graphics {
+            return Err(Error::NoGraphicsCapability);
+        }
+        let width = u16::try_from(img.width()).unwrap_or(u16::MAX);
+        let height = u16::try_from(img.height()).unwrap_or(u16::MAX);
+
+        let raw = match format {
+            TransmitFormat::Png => {
+                let mut png = Vec::new();
+                img.write_with_encoder(PngEncoder::new(&mut png))?;
+                png
+            }
+            TransmitFormat::Rgb => img.to_rgb8().into_raw(),
+            TransmitFormat::Rgba => img.to_rgba8().into_raw(),
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        self.transmit_pre_encoded_image(w, encoded.as_bytes(), width, height, format)
+    }
+
+    /// Decodes an image from a path or from memory and transmits it as PNG.
+    ///
+    /// Errors with [`Error::NoGraphicsCapability`] when the terminal lacks
+    /// kitty graphics and [`Error::Image`] on a decode failure.
+    pub fn load_image<W: Write>(&mut self, w: &mut W, src: Source) -> Result<Image, Error> {
+        if !self.caps.kitty_graphics {
+            return Err(Error::NoGraphicsCapability);
+        }
+        let img = match src {
+            Source::Path(path) => image::open(path)?,
+            Source::Mem(bytes) => image::load_from_memory(&bytes)?,
+        };
+        self.transmit_image(w, &img, TransmitFormat::Png)
+    }
+
+    /// Deletes an image from the terminal's graphics memory by id.
+    ///
+    /// Best-effort: write and flush errors are swallowed, mirroring upstream
+    /// (which logs and returns). Takes `&self` since it touches no runtime
+    /// state.
+    pub fn free_image<W: Write>(&self, w: &mut W, id: u32) {
+        if write!(w, "\x1b_Ga=d,d=I,i={id};\x1b\\").is_err() {
+            return;
+        }
+        let _ = w.flush();
+    }
 }
 
 /// Begins a render: opens synchronized output, hides the cursor, sends the
@@ -1544,5 +1709,201 @@ mod tests {
         assert!(text.contains("\x1b_Ga=p,i=7"), "preamble missing: {text:?}");
         assert!(text.contains(",z=-1"), "z-index missing: {text:?}");
         assert!(text.contains(",C=1\x1b\\"), "closing missing: {text:?}");
+    }
+
+    /// Enables kitty graphics and returns a fresh runtime ready to transmit.
+    fn vx_with_graphics() -> Vaxis {
+        let mut vx = Vaxis::new(Options::default());
+        vx.caps.kitty_graphics = true;
+        vx
+    }
+
+    /// A 2x2 RGBA image wrapped as a `DynamicImage`.
+    fn tiny_rgba() -> DynamicImage {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        DynamicImage::ImageRgba8(img)
+    }
+
+    #[test]
+    fn transmit_pre_encoded_short_payload_single_apc() {
+        let mut vx = vx_with_graphics();
+        let mut out: Vec<u8> = Vec::new();
+        let payload = vec![b'A'; 100];
+
+        let img = vx
+            .transmit_pre_encoded_image(&mut out, &payload, 4, 2, TransmitFormat::Png)
+            .expect("transmit");
+        assert_eq!((img.id(), img.width(), img.height()), (1, 4, 2));
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"\x1b_Gf=100,s=4,v=2,i=1;");
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(b"\x1b\\");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn transmit_pre_encoded_large_payload_chunks() {
+        let mut vx = vx_with_graphics();
+        let mut out: Vec<u8> = Vec::new();
+        // 9000 bytes spans three chunks: 4096 (m=1), 4096 (m=1), 808 (m=0).
+        let payload = vec![b'A'; 9000];
+
+        vx.transmit_pre_encoded_image(&mut out, &payload, 1, 1, TransmitFormat::Rgba)
+            .expect("transmit");
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"\x1b_Gf=32,s=1,v=1,i=1,m=1;");
+        expected.extend_from_slice(&payload[0..4096]);
+        expected.extend_from_slice(b"\x1b\\");
+        expected.extend_from_slice(b"\x1b_Gm=1;");
+        expected.extend_from_slice(&payload[4096..8192]);
+        expected.extend_from_slice(b"\x1b\\");
+        expected.extend_from_slice(b"\x1b_Gm=0;");
+        expected.extend_from_slice(&payload[8192..9000]);
+        expected.extend_from_slice(b"\x1b\\");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn transmit_image_rgba_and_png_emit_fresh_ids() {
+        let mut vx = vx_with_graphics();
+        let img = tiny_rgba();
+
+        let mut out: Vec<u8> = Vec::new();
+        let rgba = vx
+            .transmit_image(&mut out, &img, TransmitFormat::Rgba)
+            .expect("rgba");
+        assert_eq!((rgba.id(), rgba.width(), rgba.height()), (1, 2, 2));
+        assert!(out.starts_with(b"\x1b_Gf=32,s=2,v=2,i=1;"), "rgba header");
+        assert!(out.ends_with(b"\x1b\\"));
+
+        let mut out: Vec<u8> = Vec::new();
+        let png = vx
+            .transmit_image(&mut out, &img, TransmitFormat::Png)
+            .expect("png");
+        assert_eq!(png.id(), 2);
+        assert!(out.starts_with(b"\x1b_Gf=100,s=2,v=2,i=2;"), "png header");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn transmit_local_image_path_emits_header_and_payload() {
+        let mut vx = vx_with_graphics();
+        let mut out: Vec<u8> = Vec::new();
+        let payload = vec![1u8, 2, 3, 4, 5];
+
+        let img = vx
+            .transmit_local_image_path(
+                &mut out,
+                &payload,
+                4,
+                2,
+                TransmitMedium::File,
+                TransmitFormat::Rgb,
+            )
+            .expect("transmit");
+        assert_eq!((img.id(), img.width(), img.height()), (1, 4, 2));
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"\x1b_Gf=24,s=4,v=2,i=1,t=f;");
+        expected.extend_from_slice(encoded.as_bytes());
+        expected.extend_from_slice(b"\x1b\\");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn transmit_local_image_path_too_long_consumes_id() {
+        let mut vx = vx_with_graphics();
+        let mut out: Vec<u8> = Vec::new();
+        // 3072 raw bytes base64-encode to exactly 4096 chars, hitting the cap.
+        let payload = vec![0u8; 3072];
+
+        let err = vx
+            .transmit_local_image_path(
+                &mut out,
+                &payload,
+                1,
+                1,
+                TransmitMedium::File,
+                TransmitFormat::Png,
+            )
+            .expect_err("should be too long");
+        assert!(matches!(err, Error::PathTooLong));
+        // Nothing was written, but the id was still consumed.
+        assert!(out.is_empty());
+        assert_eq!(vx.next_img_id, 2);
+    }
+
+    #[test]
+    fn load_image_decodes_png_from_memory() {
+        let mut vx = vx_with_graphics();
+
+        // Encode a tiny PNG with the image crate, then decode + transmit it.
+        let mut png = Vec::new();
+        tiny_rgba()
+            .write_with_encoder(PngEncoder::new(&mut png))
+            .expect("encode png");
+
+        let mut out: Vec<u8> = Vec::new();
+        let img = vx
+            .load_image(&mut out, Source::Mem(png))
+            .expect("load image");
+        assert_eq!((img.id(), img.width(), img.height()), (1, 2, 2));
+        // load_image transmits as PNG.
+        assert!(out.starts_with(b"\x1b_Gf=100,s=2,v=2,i=1;"), "png header");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn free_image_emits_delete_by_id() {
+        let vx = vx_with_graphics();
+        let mut out: Vec<u8> = Vec::new();
+        vx.free_image(&mut out, 7);
+        assert_eq!(out, b"\x1b_Ga=d,d=I,i=7;\x1b\\");
+    }
+
+    #[test]
+    fn transmits_gated_on_kitty_graphics() {
+        // Default caps have kitty_graphics off: every transmit refuses and
+        // emits nothing.
+        let mut vx = Vaxis::new(Options::default());
+        let img = tiny_rgba();
+
+        let mut out: Vec<u8> = Vec::new();
+        assert!(matches!(
+            vx.transmit_pre_encoded_image(&mut out, b"x", 1, 1, TransmitFormat::Png),
+            Err(Error::NoGraphicsCapability)
+        ));
+        assert!(out.is_empty());
+
+        assert!(matches!(
+            vx.transmit_image(&mut out, &img, TransmitFormat::Rgba),
+            Err(Error::NoGraphicsCapability)
+        ));
+        assert!(out.is_empty());
+
+        assert!(matches!(
+            vx.transmit_local_image_path(
+                &mut out,
+                b"x",
+                1,
+                1,
+                TransmitMedium::File,
+                TransmitFormat::Png
+            ),
+            Err(Error::NoGraphicsCapability)
+        ));
+        assert!(out.is_empty());
+
+        assert!(matches!(
+            vx.load_image(&mut out, Source::Mem(vec![0u8])),
+            Err(Error::NoGraphicsCapability)
+        ));
+        assert!(out.is_empty());
+
+        // The id counter is untouched when every transmit refuses.
+        assert_eq!(vx.next_img_id, 1);
     }
 }

@@ -3330,6 +3330,7 @@ dependencies = [
  "base64",
  "bitflags",
  "compact_str 0.8.1",
+ "image",
  "nix",
  "phf",
  "serial_test",

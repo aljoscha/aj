@@ -315,6 +315,26 @@ impl<'s> Window<'s> {
         crate::gwidth::gwidth(s, self.screen.borrow().width_method)
     }
 
+    /// Pixel width of the underlying screen.
+    pub fn screen_width_pix(&self) -> u16 {
+        self.screen.borrow().width_pix
+    }
+
+    /// Pixel height of the underlying screen.
+    pub fn screen_height_pix(&self) -> u16 {
+        self.screen.borrow().height_pix
+    }
+
+    /// Cell width of the underlying screen.
+    pub fn screen_width(&self) -> u16 {
+        self.screen.borrow().width
+    }
+
+    /// Cell height of the underlying screen.
+    pub fn screen_height(&self) -> u16 {
+        self.screen.borrow().height
+    }
+
     /// Fills the window with `cell`.
     pub fn fill(&self, cell: Cell) {
         let mut screen = self.screen.borrow_mut();
