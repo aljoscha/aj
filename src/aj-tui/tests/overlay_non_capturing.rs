@@ -50,7 +50,7 @@ impl FocusableRecorder {
 impl Component for FocusableRecorder {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
         Vec::new()
     }
 
@@ -308,8 +308,8 @@ fn non_capturing_overlay_renders_even_though_it_does_not_capture_input() {
     struct Overlay;
     impl Component for Overlay {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec!["VISIBLE".to_string()]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec!["VISIBLE".into()]
         }
     }
 
@@ -997,8 +997,8 @@ fn microtask_deferred_sub_overlay_pattern_restores_focus_on_teardown() {
 struct SingleChar(&'static str);
 impl Component for SingleChar {
     impl_component_any!();
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        vec![self.0.to_string()]
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+        vec![self.0.to_string().into()]
     }
 }
 

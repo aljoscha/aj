@@ -62,7 +62,7 @@ impl Default for Header {
 impl Component for Header {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         let mut parts = Vec::new();
         if let Some(id) = &self.session_id {
             parts.push(format!("session {id}"));
@@ -92,11 +92,14 @@ impl Component for Header {
         // in `Tui::render` panics on terminals narrower than the
         // banner content.
         if width == 0 {
-            return vec![String::new(), String::new()];
+            return vec![aj_tui::Line::default(), aj_tui::Line::default()];
         }
         let content = parts.join("  ·  ");
         let truncated = truncate_to_width(&content, width - 1, "…", false);
-        vec![format!(" {}", style::dim(&truncated)), String::new()]
+        vec![
+            format!(" {}", style::dim(&truncated)).into(),
+            aj_tui::Line::default(),
+        ]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {

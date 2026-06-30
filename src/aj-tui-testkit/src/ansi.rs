@@ -66,18 +66,21 @@ pub fn strip_ansi(s: &str) -> String {
 }
 
 /// Apply [`strip_ansi`] to every line.
-pub fn plain_lines(lines: &[String]) -> Vec<String> {
-    lines.iter().map(|l| strip_ansi(l)).collect()
+///
+/// Generic over the row type so it accepts both `&[String]` and the
+/// `&[Line]` that component renders now hand back.
+pub fn plain_lines<S: AsRef<str>>(lines: &[S]) -> Vec<String> {
+    lines.iter().map(|l| strip_ansi(l.as_ref())).collect()
 }
 
 /// [`plain_lines`], with trailing whitespace removed from each line.
 ///
 /// Useful when a component pads rendered lines with trailing spaces and the
 /// test only cares about the structural content.
-pub fn plain_lines_trim_end(lines: &[String]) -> Vec<String> {
+pub fn plain_lines_trim_end<S: AsRef<str>>(lines: &[S]) -> Vec<String> {
     lines
         .iter()
-        .map(|l| strip_ansi(l).trim_end().to_string())
+        .map(|l| strip_ansi(l.as_ref()).trim_end().to_string())
         .collect()
 }
 

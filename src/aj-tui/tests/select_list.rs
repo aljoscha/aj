@@ -181,7 +181,11 @@ fn filter_restricts_visible_items_and_resets_selection() {
     list.set_filter("ap");
     let rendered = list.render(80);
 
-    let joined = rendered.join("\n");
+    let joined = rendered
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("apple"));
     assert!(joined.contains("apricot"));
     assert!(!joined.contains("banana"));
@@ -315,7 +319,11 @@ fn sequential_down_navigation_centers_selection_in_window() {
     );
 
     let rendered = list.render(80);
-    let joined = rendered.join("\n");
+    let joined = rendered
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("item3"), "rendered:\n{}", joined);
     assert!(joined.contains("item4"), "rendered:\n{}", joined);
     assert!(joined.contains("item5"), "rendered:\n{}", joined);
@@ -338,7 +346,11 @@ fn up_wrap_at_top_clamps_window_to_show_selection_at_bottom_edge() {
     );
 
     let rendered = list.render(80);
-    let joined = rendered.join("\n");
+    let joined = rendered
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("item7"), "rendered:\n{}", joined);
     assert!(joined.contains("item8"), "rendered:\n{}", joined);
     assert!(joined.contains("item9"), "rendered:\n{}", joined);
@@ -364,7 +376,11 @@ fn down_wrap_at_bottom_clamps_window_to_show_selection_at_top_edge() {
     );
 
     let rendered = list.render(80);
-    let joined = rendered.join("\n");
+    let joined = rendered
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("item0"), "rendered:\n{}", joined);
     assert!(joined.contains("item1"), "rendered:\n{}", joined);
     assert!(joined.contains("item2"), "rendered:\n{}", joined);
@@ -399,7 +415,11 @@ fn set_filter_resets_selection_to_top_and_window_follows() {
     );
 
     let rendered = list.render(80);
-    let joined = rendered.join("\n");
+    let joined = rendered
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("item0"), "rendered:\n{}", joined);
     assert!(joined.contains("item1"), "rendered:\n{}", joined);
     assert!(joined.contains("item2"), "rendered:\n{}", joined);

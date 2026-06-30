@@ -35,9 +35,9 @@ impl CountingLines {
 impl Component for CountingLines {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
         self.renders.set(self.renders.get() + 1);
-        self.lines.clone()
+        self.lines.iter().cloned().map(aj_tui::Line::from).collect()
     }
 }
 
@@ -183,8 +183,8 @@ fn cache_invalidates_when_child_output_changes() {
     impl Component for Mutable {
         impl_component_any!();
 
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec![self.value.borrow().clone()]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec![self.value.borrow().clone().into()]
         }
     }
 

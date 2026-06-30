@@ -333,7 +333,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 impl Component for PromptHistorySearchComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.drain();
         self.inner.render(width)
     }
@@ -564,7 +564,12 @@ mod tests {
             vec![entry("fix the bug", None), entry("add a test", None)],
             vec![],
         );
-        let body = c.render(80).join("\n");
+        let body = c
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("fix the bug"), "got: {body}");
         assert!(body.contains("add a test"), "got: {body}");
     }
@@ -578,7 +583,12 @@ mod tests {
         for ch in "test".chars() {
             c.handle_input(&Key::char(ch));
         }
-        let body = c.render(80).join("\n");
+        let body = c
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("add a test"), "got: {body}");
         assert!(!body.contains("fix the bug"), "got: {body}");
     }
@@ -619,7 +629,12 @@ mod tests {
             },
             |_emit| {},
         );
-        let body = c.render(80).join("\n");
+        let body = c
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let newest = body.find("newest").expect("newest shown");
         let older = body.find("older").expect("older shown");
         assert!(newest < older, "expected newest before older, got: {body}");
@@ -642,12 +657,31 @@ mod tests {
         );
 
         // Workspace scope only shows the workspace prompt.
-        assert!(c.render(80).join("\n").contains("workspace prompt"));
-        assert!(!c.render(80).join("\n").contains("other workspace prompt"));
+        assert!(
+            c.render(80)
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .contains("workspace prompt")
+        );
+        assert!(
+            !c.render(80)
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .contains("other workspace prompt")
+        );
 
         // Toggle to all: loader runs, the all set shows.
         c.handle_input(&Key::ctrl('t'));
-        let body = c.render(80).join("\n");
+        let body = c
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("other workspace prompt"), "got: {body}");
         assert!(body.contains("other-proj"), "project label shown: {body}");
         assert_eq!(calls.load(Ordering::Relaxed), 1);

@@ -44,8 +44,13 @@ impl ScriptedLines {
 impl Component for ScriptedLines {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        self.lines.borrow().clone()
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+        self.lines
+            .borrow()
+            .iter()
+            .cloned()
+            .map(aj_tui::Line::from)
+            .collect()
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {

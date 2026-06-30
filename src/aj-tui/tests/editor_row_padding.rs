@@ -39,7 +39,7 @@ fn editor(padding_x: usize) -> Editor {
 
 /// Return only the visible content rows (drop the top/bottom border
 /// and any trailing autocomplete-popup rows).
-fn content_rows(rendered: &[String]) -> Vec<&str> {
+fn content_rows(rendered: &[aj_tui::Line]) -> Vec<&str> {
     // Editor renders: [top_border, ...content_rows..., bottom_border, popup?]
     // The borders are the rows that stripped to a run of `─`.
     let mut out = Vec::new();

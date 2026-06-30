@@ -594,7 +594,7 @@ impl ToolExecutionComponent {
 impl Component for ToolExecutionComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         // Pull in any session-wide settings change (tool expansion
         // or inline-image toggle) before painting. Gated on the
         // generation so steady-state renders skip the work. Done
@@ -613,7 +613,10 @@ impl Component for ToolExecutionComponent {
         // or background, so the tool composes inside the sub-agent
         // box's own painted background.
         if self.header_only {
-            return wrap_text_with_ansi(&self.header_line(), width.max(1));
+            return wrap_text_with_ansi(&self.header_line(), width.max(1))
+                .into_iter()
+                .map(aj_tui::Line::from)
+                .collect();
         }
 
         // Tiny widths drop into a degraded "render plain" path so
@@ -624,10 +627,14 @@ impl Component for ToolExecutionComponent {
         // so anything below [`MIN_BUBBLE_WIDTH`] skips the box and
         // falls back to the original wrap-per-line path.
         if width < MIN_BUBBLE_WIDTH {
-            let mut out = Vec::with_capacity(self.body.len() + 1);
-            out.push(self.header_line());
+            let mut out: Vec<aj_tui::Line> = Vec::with_capacity(self.body.len() + 1);
+            out.push(self.header_line().into());
             for line in &self.body {
-                out.extend(wrap_text_with_ansi(line, width.max(1)));
+                out.extend(
+                    wrap_text_with_ansi(line, width.max(1))
+                        .into_iter()
+                        .map(aj_tui::Line::from),
+                );
             }
             return out;
         }

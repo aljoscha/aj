@@ -45,8 +45,8 @@ struct FillToWidth;
 impl Component for FillToWidth {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
-        vec!["x".repeat(width)]
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
+        vec!["x".repeat(width).into()]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {

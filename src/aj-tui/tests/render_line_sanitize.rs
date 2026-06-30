@@ -21,8 +21,8 @@ struct DirtyLines(Vec<String>);
 impl Component for DirtyLines {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        self.0.clone()
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+        self.0.iter().cloned().map(aj_tui::Line::from).collect()
     }
 }
 

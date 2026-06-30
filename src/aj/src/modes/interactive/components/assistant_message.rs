@@ -396,14 +396,14 @@ impl AssistantMessageComponent {
 impl Component for AssistantMessageComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         // Pull in any session-wide settings change (the user toggled
         // `aj.thinking.toggle`) before painting. Gated on the
         // generation so steady-state renders skip the work.
         if self.settings.generation() != self.last_generation {
             self.reconcile_settings();
         }
-        let mut lines = Vec::new();
+        let mut lines: Vec<aj_tui::Line> = Vec::new();
         // Pre-compute both placeholder variants once so we don't
         // need to re-borrow `self` while iterating `self.blocks`
         // mutably below. The `with_hint` variant is used when the
@@ -429,7 +429,7 @@ impl Component for AssistantMessageComponent {
             // intra-message break between thinking and text
             // sections.
             if !lines.is_empty() {
-                lines.push(String::new());
+                lines.push(aj_tui::Line::default());
             }
             if render_placeholder {
                 // Body-less thinking blocks (signed-but-empty, or
@@ -442,7 +442,7 @@ impl Component for AssistantMessageComponent {
                 } else {
                     &collapsed_with_hint
                 };
-                lines.extend(placeholder.iter().cloned());
+                lines.extend(placeholder.iter().cloned().map(aj_tui::Line::from));
             } else if let Some(w) = block.widget.as_mut() {
                 lines.extend(w.render(width));
             }
@@ -654,7 +654,11 @@ mod tests {
             "the model's reasoning here".to_string(),
         );
         let lines = c.render(80);
-        let joined = lines.join("\n");
+        let joined = lines
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains("Thinking: "),
             "expected 'Thinking: ' prefix in expanded thinking render; got {lines:?}"
@@ -676,7 +680,11 @@ mod tests {
         let mut c = AssistantMessageComponent::new(&theme(), settings(false));
         c.open_block(BlockKind::Thinking, " leading space".to_string());
         let lines = c.render(80);
-        let joined = lines.join("\n");
+        let joined = lines
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains("Thinking: leading space"),
             "expected single space between prefix and body; got {lines:?}"
@@ -715,7 +723,12 @@ mod tests {
         c.open_block(BlockKind::Text, "reply TWO".to_string());
         c.close_block(BlockKind::Text, Some("reply TWO".to_string()));
 
-        let rendered = c.render(120).join("\n");
+        let rendered = c
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         for needle in ["thought ONE", "reply ONE", "thought TWO", "reply TWO"] {
             assert!(
                 rendered.contains(needle),

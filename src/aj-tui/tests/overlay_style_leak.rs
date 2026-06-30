@@ -25,8 +25,8 @@ struct SingleLineOverlay(&'static str);
 impl Component for SingleLineOverlay {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        vec![self.0.to_string()]
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+        vec![self.0.to_string().into()]
     }
 }
 

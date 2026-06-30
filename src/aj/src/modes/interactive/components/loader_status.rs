@@ -107,7 +107,7 @@ impl LoaderStatus {
 impl Component for LoaderStatus {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         if !self.active {
             // Idle agent → no rendered rows. The `status` slot
             // collapses to zero height between turns so the chat

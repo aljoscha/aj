@@ -143,17 +143,20 @@ impl CompactionSummaryComponent {
 impl Component for CompactionSummaryComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         if self.settings.generation() != self.last_generation {
             self.reconcile_settings();
         }
         let gutter = " ".repeat(PADDING_X.min(width));
         let header = format!("{gutter}{}", self.styled_header());
-        let mut lines = wrap_text_with_ansi(&header, width.max(1));
+        let mut lines: Vec<aj_tui::Line> = wrap_text_with_ansi(&header, width.max(1))
+            .into_iter()
+            .map(aj_tui::Line::from)
+            .collect();
         if let Some(w) = self.widget.as_mut() {
             // One blank row between the header and the expanded summary,
             // matching the assistant message's intra-block spacing.
-            lines.push(String::new());
+            lines.push(aj_tui::Line::default());
             lines.extend(w.render(width));
         }
         lines

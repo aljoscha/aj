@@ -45,7 +45,7 @@ use crate::ansi::{
     SEGMENT_RESET, extract_segments, normalize_terminal_output, sanitize_render_line,
     slice_by_column, slice_with_width, visible_width,
 };
-use crate::component::{CURSOR_MARKER, Component};
+use crate::component::{CURSOR_MARKER, Component, Line};
 use crate::container::Container;
 use crate::keys::{InputEvent, key_id_matches};
 use crate::terminal::{InputStream, Terminal};
@@ -414,7 +414,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Atomically (ish) dump a crash report to the resolved crash-log path.
 /// Errors are swallowed: the caller is about to panic anyway and the
 /// panic message is the backstop.
-fn write_crash_log(header: &str, lines: &[String], width: usize) {
+fn write_crash_log(header: &str, lines: &[Line], width: usize) {
     let Some(path) = resolve_crash_log_path() else {
         return;
     };
@@ -484,8 +484,8 @@ struct RenderDebugRecord {
     width_changed: bool,
     height_changed: bool,
     cursor_pos: Option<(usize, usize)>,
-    prev_lines_snapshot: Vec<String>,
-    new_lines_snapshot: Vec<String>,
+    prev_lines_snapshot: Vec<Line>,
+    new_lines_snapshot: Vec<Line>,
 }
 
 impl RenderDebugRecord {
@@ -565,7 +565,7 @@ impl RenderDebugRecord {
 /// line with multiple markers is itself a component bug; surfacing
 /// the stray in the rendered frame keeps diagnostics honest rather
 /// than silently scrubbing it.
-fn extract_cursor_position(lines: &mut [String], viewport_height: usize) -> Option<CursorPosition> {
+fn extract_cursor_position(lines: &mut [Line], viewport_height: usize) -> Option<CursorPosition> {
     // Only search the visible viewport (bottom `viewport_height` lines).
     let viewport_top = lines.len().saturating_sub(viewport_height);
     // Iterate row indices from `lines.len() - 1` down to `viewport_top`
@@ -573,22 +573,59 @@ fn extract_cursor_position(lines: &mut [String], viewport_height: usize) -> Opti
     // spelling: empty when `lines` is empty (no underflow), otherwise
     // yields the bottom row first.
     for row in (viewport_top..lines.len()).rev() {
-        let line = &mut lines[row];
-        if let Some(marker_pos) = line.find(CURSOR_MARKER) {
-            let before_marker = &line[..marker_pos];
-            let col = visible_width(before_marker);
-            // Strip exactly the marker we located. Using `replace` here
-            // would scrub every occurrence on the line — we deliberately
-            // splice out just the one at `marker_pos` so a stray second
-            // marker stays visible in the frame for diagnosis.
-            let mut spliced = String::with_capacity(line.len() - CURSOR_MARKER.len());
-            spliced.push_str(&line[..marker_pos]);
-            spliced.push_str(&line[marker_pos + CURSOR_MARKER.len()..]);
-            *line = spliced;
-            return Some(CursorPosition { row, col });
-        }
+        let Some(marker_pos) = lines[row].find(CURSOR_MARKER) else {
+            continue;
+        };
+        let line = lines[row].as_str();
+        let col = visible_width(&line[..marker_pos]);
+        // Strip exactly the marker we located. Using `replace` here
+        // would scrub every occurrence on the line — we deliberately
+        // splice out just the one at `marker_pos` so a stray second
+        // marker stays visible in the frame for diagnosis. Only this one
+        // row gets a fresh allocation; every other row keeps its `Rc`.
+        let mut spliced = String::with_capacity(line.len() - CURSOR_MARKER.len());
+        spliced.push_str(&line[..marker_pos]);
+        spliced.push_str(&line[marker_pos + CURSOR_MARKER.len()..]);
+        lines[row] = spliced.into();
+        return Some(CursorPosition { row, col });
     }
     None
+}
+
+/// Turn one composed row into its terminal-ready form.
+///
+/// First normalize precomposed Thai/Lao SARA AM vowels (`U+0E33`,
+/// `U+0EB3`) to their compatibility decompositions: some terminals leave
+/// stale-cell glyphs when a row holding the precomposed form is partially
+/// overwritten, and the decomposed pair has the same visible width.
+/// Components keep the precomposed form internally so cursor and width math
+/// don't shift; only the bytes handed to the terminal are rewritten.
+///
+/// Then, for non-image rows, flatten stray control characters
+/// ([`sanitize_render_line`]) and append [`SEGMENT_RESET`] (SGR reset + an
+/// empty OSC 8). The full reset, not a bare SGR reset, also closes any
+/// dangling hyperlink: a component that emits `\x1b]8;;URL\x1b\label`
+/// without the matching `\x1b]8;;\x1b\` closer would otherwise bleed the
+/// URL attribute into every following row. Empty rows get it too, as a
+/// two-byte guard against a terminal-side style bleeding into their cells
+/// on setups that don't honor synchronized output end-to-end.
+///
+/// Image-protocol rows (Kitty `\x1b_G…\x1b\`, iTerm2 OSC 1337) pass through
+/// with only normalization: appending `SEGMENT_RESET` would land inside the
+/// payload or terminate an SGR/OSC-8 state they never opened, and the
+/// multi-row image contract already keeps the surrounding rows blank.
+///
+/// NOTE: this allocates, so the engine runs it only on rows that changed
+/// since the previous frame (see [`Tui::apply_line_resets`]).
+fn process_render_line(line: &str) -> Line {
+    let mut s = String::with_capacity(line.len() + SEGMENT_RESET.len());
+    s.push_str(line);
+    normalize_terminal_output(&mut s);
+    if !crate::image_protocol::is_image_line(&s) {
+        sanitize_render_line(&mut s);
+        s.push_str(SEGMENT_RESET);
+    }
+    s.into()
 }
 
 // ---------------------------------------------------------------------------
@@ -936,7 +973,18 @@ pub struct Tui {
     terminal: Box<dyn Terminal>,
 
     // Render state.
-    previous_lines: Vec<String>,
+    //
+    // `previous_lines` is the previous frame's *processed* rows (post
+    // normalize/sanitize/`SEGMENT_RESET`), the baseline the diff engine
+    // paints against. `previous_composed` is the previous frame's rows
+    // *before* that processing (post overlay/cursor-extraction). The two
+    // are kept index-aligned and updated together, so for any committed
+    // row `previous_lines[i]` is exactly the processed form of
+    // `previous_composed[i]`. `apply_line_resets` uses that invariant:
+    // when a new composed row is the same `Rc` as `previous_composed[i]`
+    // it reuses `previous_lines[i]` instead of re-processing.
+    previous_lines: Vec<Line>,
+    previous_composed: Vec<Line>,
     previous_width: u16,
     previous_height: u16,
     hardware_cursor_row: usize,
@@ -1137,6 +1185,7 @@ impl Tui {
             root,
             terminal,
             previous_lines: Vec::new(),
+            previous_composed: Vec::new(),
             previous_width: 0,
             previous_height: 0,
             hardware_cursor_row: 0,
@@ -1540,63 +1589,21 @@ impl Tui {
         // state (most notably the editor's autocomplete pipeline)
         // drain their result channels at the top of their own
         // `render(&mut self, …)` — no framework-wide tick hook needed.
-        let mut lines = self.root.render(width);
+        let mut composed = self.root.render(width);
 
         // Phase 2: Composite overlays.
-        self.composite_overlays(&mut lines, width, height);
+        self.composite_overlays(&mut composed, width, height);
 
         // Phase 3: Extract cursor position.
-        let cursor_pos = extract_cursor_position(&mut lines, height);
+        let cursor_pos = extract_cursor_position(&mut composed, height);
 
-        // Phase 4: Apply line resets and terminal-output normalization.
-        // Every line gets the full `SEGMENT_RESET` terminator (SGR
-        // reset + OSC 8 empty URL), not just `SGR_RESET`. A plain SGR
-        // reset closes colors and attributes but leaves any open
-        // hyperlink dangling — if a component emits
-        // `\x1b]8;;https://x\x1b\\label` without a matching
-        // `\x1b]8;;\x1b\\` closer, the URL attribute bleeds into every
-        // subsequent row until something else happens to terminate it.
-        // Appending `SEGMENT_RESET` lets component authors omit the
-        // hyperlink close sequence without contaminating the rest of
-        // the frame.
-        //
-        // Empty lines get the reset too. A row produced as `""` by a
-        // component sits below a styled row whose terminator just closed
-        // its own SGR state — but on a degraded sync-mode setup (BSU not
-        // honored end-to-end), an in-progress style on the *terminal*
-        // (not in our line buffer) can bleed into the empty row's cells
-        // until something resets. The reset on an otherwise-empty line
-        // is a two-byte safety net against that bleed-through.
-        //
-        // Normalization rewrites precomposed Thai/Lao SARA AM vowels
-        // (`U+0E33`, `U+0EB3`) to their compatibility decompositions
-        // before the bytes reach the terminal; some terminals leave
-        // stale-cell glyphs when a row containing the precomposed form
-        // is partially overwritten. The decomposed pair has the same
-        // visible width but avoids the artifact in practice. The
-        // editor and other components keep using the precomposed form
-        // internally so cursor positions and width math don't shift.
-        for line in &mut lines {
-            normalize_terminal_output(line);
-            // Image-protocol rows carry their own self-contained
-            // escape (Kitty `\x1b_G…\x1b\\` or iTerm2 OSC 1337);
-            // appending `SEGMENT_RESET` would either land inside
-            // the payload (corrupting the protocol) or terminate
-            // an SGR/OSC-8 state these rows never opened. The
-            // multi-row image contract in [`crate::image_protocol`]
-            // already keeps the surrounding rows blank, so the
-            // bleed-through that `SEGMENT_RESET` defends against
-            // can't reach them.
-            if crate::image_protocol::is_image_line(line) {
-                continue;
-            }
-            // Flatten any control characters a component left in the row
-            // (stray newlines, raw tabs, ...) before it reaches the
-            // terminal. Skipped for image rows above, whose self-contained
-            // escapes must pass through byte-for-byte.
-            sanitize_render_line(line);
-            line.push_str(SEGMENT_RESET);
-        }
+        // Phase 4: Turn each composed row into its terminal-ready form
+        // (normalize, sanitize, append `SEGMENT_RESET`; see
+        // [`process_render_line`]). We reuse the previous frame's processed
+        // row for every composed row that is the same `Rc` as last frame's,
+        // so a spinner tick over a long scrollback re-processes only the
+        // handful of rows that actually changed. See [`Self::apply_line_resets`].
+        let mut lines = self.apply_line_resets(&composed, width);
 
         // Phase 4.5: Sanity-check line widths. A component that emits a
         // line wider than the terminal throws off every downstream width
@@ -1690,12 +1697,12 @@ impl Tui {
         let debug_log_path = resolve_debug_log_path();
         let cursor_at_before = self.hardware_cursor_row;
         let max_lines_rendered_before = self.max_lines_rendered;
-        let prev_lines_snapshot: Vec<String> = if debug_log_path.is_some() {
+        let prev_lines_snapshot: Vec<Line> = if debug_log_path.is_some() {
             self.previous_lines.clone()
         } else {
             Vec::new()
         };
-        let new_lines_snapshot: Vec<String> = if debug_log_path.is_some() {
+        let new_lines_snapshot: Vec<Line> = if debug_log_path.is_some() {
             lines.clone()
         } else {
             Vec::new()
@@ -1919,12 +1926,18 @@ impl Tui {
                     // repainted visible suffix. `floor <= last < len` (the
                     // skip already consumed the `last < floor` case) keeps
                     // `truncate`/`drain` in range, and the equal line
-                    // count keeps the two halves aligned.
+                    // count keeps the two halves aligned. `previous_composed`
+                    // is spliced the same way so it stays index-aligned with
+                    // `previous_lines` (the reuse invariant in
+                    // [`Self::apply_line_resets`]).
                     self.previous_lines.truncate(floor);
                     self.previous_lines.extend(lines.drain(floor..));
+                    self.previous_composed.truncate(floor);
+                    self.previous_composed.extend(composed.drain(floor..));
                 }
                 None => {
                     self.previous_lines = lines;
+                    self.previous_composed = composed;
                 }
             }
 
@@ -2856,6 +2869,41 @@ impl Tui {
 
     // -- Private rendering methods --
 
+    /// Produce the processed frame from `composed`, reusing the previous
+    /// frame's processed row wherever a composed row is unchanged.
+    ///
+    /// A row counts as unchanged when it is the same `Rc` allocation as the
+    /// previous frame's composed row at that index (see [`Line::same_alloc`]).
+    /// Components return their cached rows by `Rc` clone, so an untouched
+    /// subtree (e.g. the entire scrollback above a streaming message) hands
+    /// back the same allocations and skips re-processing for free. Only
+    /// changed rows run [`process_render_line`], which allocates.
+    ///
+    /// Reuse is gated on an unchanged width. A width change re-wraps every
+    /// component so no composed `Rc` would survive anyway, but we check it
+    /// explicitly so the soundness is self-contained rather than resting on
+    /// that non-local fact. `previous_composed` and `previous_lines` are
+    /// kept index-aligned (updated together in the same render), so reusing
+    /// `previous_lines[i]` for a matching `previous_composed[i]` is correct.
+    fn apply_line_resets(&self, composed: &[Line], width: usize) -> Vec<Line> {
+        let reuse = usize::from(self.previous_width) == width;
+        let mut out = Vec::with_capacity(composed.len());
+        for (i, line) in composed.iter().enumerate() {
+            let reused = reuse
+                && i < self.previous_lines.len()
+                && self
+                    .previous_composed
+                    .get(i)
+                    .is_some_and(|prev| prev.same_alloc(line));
+            if reused {
+                out.push(self.previous_lines[i].clone());
+            } else {
+                out.push(process_render_line(line));
+            }
+        }
+        out
+    }
+
     /// Panic cleanly if any rendered line would overflow the
     /// terminal width that the frame was *laid out for*. See the
     /// phase-4.5 block in [`Tui::render`] for the motivation. The
@@ -2873,7 +2921,7 @@ impl Tui {
     /// width would be measured against the new (smaller) width and
     /// trip a spurious panic on a frame whose lines were valid for
     /// the width they were actually rendered at.
-    fn validate_line_widths(&mut self, lines: &[String], width: usize) {
+    fn validate_line_widths(&mut self, lines: &[Line], width: usize) {
         if !self.strict_line_widths {
             return;
         }
@@ -2904,7 +2952,9 @@ impl Tui {
         // - `previous_lines[i] == *line`: any byte difference might
         //   change the visible width (e.g. a CJK glyph swapped in
         //   for an ASCII one, an ANSI sequence dropped so previously
-        //   zero-width bytes start counting).
+        //   zero-width bytes start counting). A row reused verbatim is
+        //   the same `Rc`, so `same_alloc` skips it in O(1) before the
+        //   byte compare even runs.
         //
         // `force_full_render` clears `previous_lines` and resets
         // `previous_width` to 0, which falls through to the full walk
@@ -2912,7 +2962,12 @@ impl Tui {
         // forced repaint expect.
         let skip_unchanged = usize::from(self.previous_width) == width;
         for (i, line) in lines.iter().enumerate() {
-            if skip_unchanged && self.previous_lines.get(i).is_some_and(|prev| prev == line) {
+            if skip_unchanged
+                && self
+                    .previous_lines
+                    .get(i)
+                    .is_some_and(|prev| prev.same_alloc(line) || prev == line)
+            {
                 continue;
             }
             // Image-protocol rows carry long byte payloads with
@@ -2958,7 +3013,7 @@ impl Tui {
     /// for wrapping the buffer in [`SYNC_BEGIN`] / [`SYNC_END`] and issuing
     /// the actual `terminal.write` + `flush`; this method does not touch
     /// the terminal directly. See [`Self::render`] for the assembly path.
-    fn full_render(&mut self, buf: &mut String, lines: &[String], clear: bool) {
+    fn full_render(&mut self, buf: &mut String, lines: &[Line], clear: bool) {
         if clear {
             // Kitty placements survive `\x1b[2J` — the graphics
             // layer is independent of the cell grid. Delete every
@@ -3056,11 +3111,21 @@ impl Tui {
     /// byte-identical. Rows past the end of either side are treated
     /// as empty strings so shrinks and grows both surface as
     /// changes to the "missing" slot.
-    fn compute_diff_range(prev: &[String], new: &[String]) -> Option<(usize, usize)> {
+    fn compute_diff_range(prev: &[Line], new: &[Line]) -> Option<(usize, usize)> {
         let max_len = new.len().max(prev.len());
         let mut first_changed = None;
         let mut last_changed = None;
         for i in 0..max_len {
+            // Fast path: a row reused verbatim from the previous frame is
+            // the same `Rc`, so pointer identity settles it in O(1)
+            // without a byte compare. This is what keeps the diff scan
+            // proportional to the changed rows rather than the whole
+            // (potentially huge) frame.
+            if let (Some(a), Some(b)) = (prev.get(i), new.get(i)) {
+                if a.same_alloc(b) {
+                    continue;
+                }
+            }
             let new_line = new.get(i).map(|s| s.as_str()).unwrap_or("");
             let old_line = prev.get(i).map(|s| s.as_str()).unwrap_or("");
             if new_line != old_line {
@@ -3090,7 +3155,7 @@ impl Tui {
     fn differential_render(
         &mut self,
         buf: &mut String,
-        lines: &[String],
+        lines: &[Line],
         min_row: usize,
     ) -> Option<(usize, usize)> {
         let (first, mut last) = Self::compute_diff_range(&self.previous_lines, lines)?;
@@ -3236,8 +3301,8 @@ impl Tui {
                 buf.push_str("\r\n");
                 cursor_row = i;
             }
-            let new_line = lines.get(i).map(String::as_str).unwrap_or("");
-            let old_line = prev.get(i).map(String::as_str).unwrap_or("");
+            let new_line = lines.get(i).map(Line::as_str).unwrap_or("");
+            let old_line = prev.get(i).map(Line::as_str).unwrap_or("");
             if new_line == old_line {
                 // Unchanged middle row: the `\r\n` above already
                 // advanced the cursor past it, so there is nothing more
@@ -3307,7 +3372,7 @@ impl Tui {
     /// As with [`Self::full_render`] and [`Self::differential_render`],
     /// this method appends to `buf` and updates internal state but does
     /// not touch the terminal directly.
-    fn differential_render_deletion_only(&mut self, buf: &mut String, lines: &[String]) {
+    fn differential_render_deletion_only(&mut self, buf: &mut String, lines: &[Line]) {
         let prev_len = self.previous_lines.len();
         let new_len = lines.len();
         debug_assert!(prev_len > new_len, "deletion-only path requires shrink");
@@ -3375,7 +3440,7 @@ impl Tui {
         buf: &mut String,
         row: usize,
         col: usize,
-        lines: &[String],
+        lines: &[Line],
     ) {
         // Defensive clamp on row. The caller (typically `render` after
         // `extract_cursor_position` returned a position) has already
@@ -3443,7 +3508,7 @@ impl Tui {
         self.hardware_cursor_row = row;
     }
 
-    fn composite_overlays(&mut self, lines: &mut Vec<String>, width: usize, height: usize) {
+    fn composite_overlays(&mut self, lines: &mut Vec<Line>, width: usize, height: usize) {
         // Short-circuit when the overlay stack is empty. Beyond the obvious
         // performance win, this is load-bearing for the strategy-selector:
         // the second pass below pads the line buffer up to terminal height
@@ -3490,7 +3555,7 @@ impl Tui {
         // First pass: render each overlay and resolve its layout, tracking
         // the minimum working-buffer height the composition requires.
         struct RenderedOverlay {
-            lines: Vec<String>,
+            lines: Vec<Line>,
             row: usize,
             col: usize,
             width: usize,
@@ -3506,7 +3571,7 @@ impl Tui {
             let overlay_lines = entry.component.render(layout.width);
             // Apply max-height clamp (if any).
             let max_h = layout.max_height.unwrap_or(overlay_lines.len());
-            let overlay_lines: Vec<String> = overlay_lines.into_iter().take(max_h).collect();
+            let overlay_lines: Vec<Line> = overlay_lines.into_iter().take(max_h).collect();
             // Re-resolve with the actual content height for final row / col.
             let layout = resolve_overlay_layout(&entry.options, overlay_lines.len(), width, height);
             min_lines_needed = min_lines_needed.max(layout.row + overlay_lines.len());
@@ -3548,7 +3613,7 @@ impl Tui {
         // content into scrollback on terminal widen.
         let working_height = lines.len().max(height).max(min_lines_needed);
         while lines.len() < working_height {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
         let viewport_start = working_height.saturating_sub(height);
 
@@ -3562,7 +3627,8 @@ impl Tui {
                         overlay.col,
                         overlay.width,
                         width,
-                    );
+                    )
+                    .into();
                 }
             }
         }
@@ -3592,9 +3658,9 @@ mod tests {
 
     #[test]
     fn test_cursor_marker_extraction() {
-        let mut lines = vec![
-            "first line".to_string(),
-            format!("cursor{}here", CURSOR_MARKER),
+        let mut lines: Vec<Line> = vec![
+            "first line".into(),
+            format!("cursor{}here", CURSOR_MARKER).into(),
         ];
         let pos = extract_cursor_position(&mut lines, 10);
         assert!(pos.is_some());
@@ -3612,7 +3678,7 @@ mod tests {
     /// scrubbed.
     #[test]
     fn extract_cursor_position_strips_only_the_first_marker_on_a_line() {
-        let mut lines = vec![format!("left{m}middle{m}right", m = CURSOR_MARKER)];
+        let mut lines: Vec<Line> = vec![format!("left{m}middle{m}right", m = CURSOR_MARKER).into()];
         let pos = extract_cursor_position(&mut lines, 10);
         assert!(pos.is_some());
         let pos = pos.unwrap();

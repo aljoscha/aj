@@ -18,7 +18,7 @@ use crate::ansi::{
     apply_background_to_line, expand_tabs, extract_ansi_code, visible_width, wrap_text_with_ansi,
 };
 use crate::capabilities::get_capabilities;
-use crate::component::Component;
+use crate::component::{Component, Line};
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -1212,7 +1212,7 @@ pub struct Markdown {
     // Cache.
     cached_text: Option<String>,
     cached_width: Option<usize>,
-    cached_lines: Option<Vec<String>>,
+    cached_lines: Option<Vec<Line>>,
 }
 
 impl Markdown {
@@ -1987,7 +1987,7 @@ impl Markdown {
 impl Component for Markdown {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         // The cache check runs *before* the empty-text guard so that
         // a repeat render of a whitespace-only input (whose first call
         // wrote the empty-vec cache below) returns the cached result
@@ -2153,6 +2153,10 @@ impl Component for Markdown {
         // fallback below: a cache-hit returns whatever was computed
         // verbatim (potentially the empty vec), only the first-call
         // return path runs through the fallback.
+        // Convert to `Line` once here, on the cache-miss path. Cache
+        // hits above return `Rc` clones, so an unchanged message costs a
+        // refcount bump rather than a re-parse and re-wrap.
+        let result: Vec<Line> = result.into_iter().map(Line::from).collect();
         self.cached_text = Some(self.text.clone());
         self.cached_width = Some(width);
         self.cached_lines = Some(result.clone());
@@ -2165,7 +2169,7 @@ impl Component for Markdown {
         // line plus a separator, so this branch is unreachable for
         // real inputs.
         if result.is_empty() {
-            vec![String::new()]
+            vec![Line::default()]
         } else {
             result
         }

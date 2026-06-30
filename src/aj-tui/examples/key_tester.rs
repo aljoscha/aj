@@ -58,7 +58,7 @@ impl KeyLogger {
 impl Component for KeyLogger {
     impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         let sep = "=".repeat(width);
         let mut out = Vec::new();
 
@@ -105,7 +105,7 @@ impl Component for KeyLogger {
         }
         out.push(sep);
 
-        out
+        out.into_iter().map(aj_tui::Line::from).collect()
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {

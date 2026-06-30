@@ -100,7 +100,7 @@ impl ThinkingSelectorComponent {
 impl aj_tui::component::Component for ThinkingSelectorComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         let mut lines = Vec::with_capacity(THINKING_LEVELS.len() + 1);
         lines.extend(self.inner.render(width));
         lines
@@ -161,7 +161,11 @@ mod tests {
         let lines = sel.render(60);
         // The first list row should be the medium row, marked
         // "(current)" so the user sees what's currently active.
-        let body = lines.join("\n");
+        let body = lines
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("medium (current)"), "got: {body}");
     }
 

@@ -91,7 +91,12 @@ mod tests {
     #[test]
     fn renders_every_provider() {
         let mut c = sample();
-        let body = c.render(120).join("\n");
+        let body = c
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("anthropic"), "{body}");
         assert!(body.contains("subscription"), "{body}");
         assert!(body.contains("expires in 1h 47m"), "{body}");

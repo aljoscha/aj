@@ -130,7 +130,7 @@ impl SkillsWindowComponent {
 impl Component for SkillsWindowComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.inner.render(width)
     }
 
@@ -215,13 +215,23 @@ mod tests {
     #[test]
     fn rows_render_with_status_and_marker() {
         let mut component = SkillsWindowComponent::new(identity_theme(), rows());
-        let rendered = component.render(100).join("\n");
+        let rendered = component
+            .render(100)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("alpha"));
         assert!(rendered.contains("enabled"));
         // The model-invocation marker shows in the focused row's
         // description; move to beta to surface it.
         component.handle_input(&Key::down());
-        let rendered = component.render(100).join("\n");
+        let rendered = component
+            .render(100)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("beta"));
     }
 }

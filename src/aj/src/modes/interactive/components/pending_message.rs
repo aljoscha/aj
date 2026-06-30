@@ -102,7 +102,7 @@ fn header(kind: PendingKind) -> String {
 impl Component for PendingMessage {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         let Some(kind) = self.snapshot.kind else {
             // Nothing pending → no rows; the slot collapses to zero
             // height so the editor sits flush under the chat.
@@ -154,7 +154,7 @@ impl Component for PendingMessage {
         for _ in 0..PADDING_Y {
             out.push(blank.clone());
         }
-        out
+        out.into_iter().map(aj_tui::Line::from).collect()
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {
@@ -185,8 +185,8 @@ mod tests {
     }
 
     /// Index of the first rendered row whose text contains `needle`.
-    fn line_with(lines: &[String], needle: &str) -> Option<usize> {
-        lines.iter().position(|l| l.contains(needle))
+    fn line_with<S: AsRef<str>>(lines: &[S], needle: &str) -> Option<usize> {
+        lines.iter().position(|l| l.as_ref().contains(needle))
     }
 
     #[test]

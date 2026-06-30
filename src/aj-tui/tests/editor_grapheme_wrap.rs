@@ -41,21 +41,21 @@ fn editor_with_text(text: &str) -> Editor {
     e
 }
 
-fn content_rows(lines: &[String]) -> Vec<String> {
+fn content_rows(lines: &[aj_tui::Line]) -> Vec<aj_tui::Line> {
     if lines.len() <= 2 {
         return Vec::new();
     }
     lines[1..lines.len() - 1].to_vec()
 }
 
-fn plain_content_rows_trimmed(lines: &[String]) -> Vec<String> {
+fn plain_content_rows_trimmed(lines: &[aj_tui::Line]) -> Vec<String> {
     plain_lines(&content_rows(lines))
         .into_iter()
         .map(|l| l.trim().to_string())
         .collect()
 }
 
-fn assert_no_row_exceeds_width(lines: &[String], width: usize) {
+fn assert_no_row_exceeds_width(lines: &[aj_tui::Line], width: usize) {
     for (i, line) in content_rows(lines).iter().enumerate() {
         let w = visible_width(line);
         assert!(

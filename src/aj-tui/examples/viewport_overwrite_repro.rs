@@ -71,7 +71,7 @@ impl Lines {
 impl Component for Lines {
     impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.lines
             .borrow()
             .iter()
@@ -82,6 +82,7 @@ impl Component for Lines {
                     format!("{:<width$}", line, width = width)
                 }
             })
+            .map(aj_tui::Line::from)
             .collect()
     }
 }

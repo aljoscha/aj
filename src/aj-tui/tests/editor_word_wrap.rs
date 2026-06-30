@@ -43,7 +43,7 @@ fn editor_with_text(text: &str) -> Editor {
 
 /// Trim the render output to just the content rows, dropping the top
 /// and bottom border lines.
-fn content_rows(lines: &[String]) -> Vec<String> {
+fn content_rows(lines: &[aj_tui::Line]) -> Vec<aj_tui::Line> {
     if lines.len() <= 2 {
         return Vec::new();
     }
@@ -52,7 +52,7 @@ fn content_rows(lines: &[String]) -> Vec<String> {
 
 /// Plain-text (ANSI-stripped) content rows, with leading and trailing
 /// whitespace removed so assertions can focus on visible structure.
-fn plain_content_rows_trimmed(lines: &[String]) -> Vec<String> {
+fn plain_content_rows_trimmed(lines: &[aj_tui::Line]) -> Vec<String> {
     plain_lines(&content_rows(lines))
         .into_iter()
         .map(|l| l.trim().to_string())

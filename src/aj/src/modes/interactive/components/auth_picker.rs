@@ -80,7 +80,7 @@ impl AuthPickerComponent {
 impl aj_tui::component::Component for AuthPickerComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.inner.render(width)
     }
 

@@ -322,7 +322,11 @@ fn parses_inline_markup_on_list_item_continuation_lines() {
 
     // Inline code renders yellow in the default test theme; every span
     // (marker line and continuation) must be styled, not just the first.
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let styled = joined.matches("\x1b[33m").count();
     assert!(
         styled >= 3,
@@ -581,7 +585,11 @@ fn wraps_styled_inline_code_inside_table_cells_without_breaking_borders() {
     let mut m = md("| Code |\n| --- |\n| `averyveryveryverylongidentifier` |");
     let width = 20;
     let lines = m.render(width);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("\x1b[33m"),
         "inline code should be styled (yellow)",
@@ -719,7 +727,11 @@ fn preserves_gray_italic_styling_after_inline_code() {
     // an inline-code span retains gray + italic styling.
     let mut m = md_with_gray_italic("This is thinking with `inline code` and more text after");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(joined.contains("inline code"));
     // Should have gray (90) and italic (3) codes from the pre-style.
@@ -732,7 +744,11 @@ fn preserves_gray_italic_styling_after_inline_code() {
 fn preserves_gray_italic_styling_after_bold_text() {
     let mut m = md_with_gray_italic("This is thinking with **bold text** and more after");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(joined.contains("bold text"));
     assert!(joined.contains("\x1b[90m"), "expected gray color code");
@@ -1212,7 +1228,11 @@ fn indents_wrapped_blockquote_lines_with_styling() {
         );
     }
 
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("\x1b[3m"), "should have italic");
 }
 
@@ -1232,7 +1252,11 @@ fn renders_inline_formatting_inside_blockquotes_and_reapplies_quote_styling() {
     assert!(all.contains("bold"));
     assert!(all.contains("code"));
 
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("\x1b[1m"), "should have bold styling");
     assert!(
         joined.contains("\x1b[33m"),
@@ -1277,7 +1301,11 @@ fn renders_fenced_code_block_inside_blockquote() {
 
     // The quote's italic styling is still present — recursion didn't
     // strip it.
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("\x1b[3m"),
         "should still have italic from quote",
@@ -1320,7 +1348,11 @@ fn fenced_code_block_inside_blockquote_does_not_collapse_surrounding_paragraphs(
 fn preserves_heading_styling_after_inline_code_h3() {
     let mut m = md("### Why `sourceInfo` should not be optional");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[33m"),
@@ -1357,7 +1389,11 @@ fn preserves_heading_styling_after_inline_code_h3() {
 fn preserves_heading_styling_after_inline_code_h1() {
     let mut m = md("# Title with `code` inside");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let code_end = joined
         .find("code")
@@ -1394,7 +1430,11 @@ fn preserves_heading_color_on_trailing_text_after_inline_code() {
     // trailing text, `baz` ends up bold-only with the cyan stripped.
     let mut m = md("# foo `bar` baz");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let baz_pos = joined
         .find(" baz")
@@ -1452,7 +1492,11 @@ fn does_not_leak_h1_underline_into_padding_when_inline_code_is_the_last_token() 
 fn preserves_heading_styling_after_bold_text() {
     let mut m = md("## Heading with **bold** and more");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let bold_end = joined
         .find("bold")
@@ -1505,7 +1549,11 @@ fn theme_with_color_only_heading() -> MarkdownTheme {
 fn h1_renders_as_bold_even_when_theme_heading_is_only_a_color() {
     let mut m = Markdown::new("# Heading", 0, 0, theme_with_color_only_heading(), None);
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[1m"),
@@ -1528,7 +1576,11 @@ fn h1_renders_as_bold_even_when_theme_heading_is_only_a_color() {
 fn h2_renders_as_bold_even_when_theme_heading_is_only_a_color() {
     let mut m = Markdown::new("## Heading", 0, 0, theme_with_color_only_heading(), None);
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[1m"),
@@ -1552,7 +1604,11 @@ fn h2_renders_as_bold_even_when_theme_heading_is_only_a_color() {
 fn h3_renders_as_bold_even_when_theme_heading_is_only_a_color() {
     let mut m = Markdown::new("### Heading", 0, 0, theme_with_color_only_heading(), None);
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[1m"),
@@ -1586,7 +1642,11 @@ fn h1_inline_code_still_reopens_bold_underline_and_color_after_reset() {
         None,
     );
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let code_end = joined
         .find("code")
@@ -1622,7 +1682,11 @@ fn h1_inline_code_still_reopens_bold_underline_and_color_after_reset() {
 fn renders_double_tilde_as_strikethrough() {
     let mut m = md("Use ~~strikethrough~~ here");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join(" ");
 
     assert!(
@@ -1644,7 +1708,11 @@ fn single_tilde_strikes_through_per_gfm() {
     // literal; see `single_tilde_in_paths_and_approximations_stays_literal`.
     let mut m = md("Use ~struck~ here");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join(" ");
 
     assert!(plain.contains("struck"));
@@ -1662,7 +1730,11 @@ fn single_tilde_strikes_through_per_gfm() {
 fn single_tilde_in_paths_and_approximations_stays_literal() {
     let mut m = md("run ~/home/user and ~5 to ~10 things");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join(" ");
 
     assert!(
@@ -1687,7 +1759,11 @@ fn rejects_strikethrough_when_open_is_followed_by_whitespace() {
     // whitespace-padded openings" half of the strict rule.
     let mut m = md("Use ~~ foo ~~ here");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join(" ");
 
     assert!(
@@ -1710,7 +1786,11 @@ fn rejects_strikethrough_when_close_is_preceded_by_whitespace() {
     // half of the strict rule.
     let mut m = md("Use ~~foo ~~ here");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join(" ");
 
     assert!(
@@ -1734,7 +1814,11 @@ fn rejects_strikethrough_when_close_run_exceeds_two_tildes() {
     for source in ["before ~~foo~~~ after", "a ~~~~~~~~ b"] {
         let mut m = md(source);
         let lines = m.render(80);
-        let joined = lines.join("\n");
+        let joined = lines
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let plain = plain_lines(&lines).join(" ");
 
         assert!(
@@ -1803,7 +1887,11 @@ fn link_with_bold_text_renders_bold_inside_link_styling() {
     let mut m = md("[**important**](https://example.com)");
     let lines = m.render(80);
     let plain = plain_lines(&lines).join(" ");
-    let joined = lines.join("");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("");
 
     assert!(
         plain.contains("important"),
@@ -1854,7 +1942,11 @@ fn link_inside_heading_inherits_heading_style_via_context() {
         None,
     );
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join(" ");
 
     assert!(
@@ -2185,7 +2277,11 @@ fn multi_line_paragraph_with_inline_styling_preserves_each_row_with_styling() {
 
     // Bold open (\x1b[1m) for `bold` and yellow code (\x1b[33m) for
     // `code` should both still appear in the rendered output.
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("\x1b[1m"),
         "expected bold styling to survive soft-break split: {:?}",
@@ -2232,7 +2328,11 @@ fn paragraph_with_break_at_last_line_strips_marker_without_emitting_blank_row() 
 fn intraword_asterisks_italicize_per_commonmark() {
     let mut m = md("5*4*3");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join("\n");
 
     assert!(
@@ -2251,7 +2351,11 @@ fn intraword_asterisks_italicize_per_commonmark() {
 fn intraword_double_asterisks_bold_per_commonmark() {
     let mut m = md("5**4**3");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join("\n");
 
     assert!(
@@ -2270,7 +2374,11 @@ fn intraword_double_asterisks_bold_per_commonmark() {
 fn intraword_underscores_do_not_italicize() {
     let mut m = md("foo_bar_baz");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join("\n");
 
     assert!(
@@ -2289,7 +2397,11 @@ fn intraword_underscores_do_not_italicize() {
 fn intraword_double_underscores_do_not_bold() {
     let mut m = md("foo__bar__baz");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let plain = plain_lines(&lines).join("\n");
 
     assert!(
@@ -2311,7 +2423,11 @@ fn well_formed_italic_at_a_word_boundary_still_renders() {
     // `foo`.
     let mut m = md("text *foo* bar");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[3m"),
@@ -2324,7 +2440,11 @@ fn well_formed_italic_at_a_word_boundary_still_renders() {
 fn well_formed_bold_at_a_word_boundary_still_renders() {
     let mut m = md("text **foo** bar");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[1m"),
@@ -2339,7 +2459,11 @@ fn italic_at_start_of_text_still_opens() {
     // the very beginning of a paragraph still italicizes.
     let mut m = md("*foo* bar");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[3m"),
@@ -2354,7 +2478,11 @@ fn italic_at_end_of_text_still_closes() {
     // the very end of a paragraph still italicizes.
     let mut m = md("bar *foo*");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[3m"),
@@ -2962,7 +3090,11 @@ fn pre_styled_paragraph_reopens_gray_italic_after_inline_code() {
     // paragraph.
     let mut m = md_with_gray_italic("This is thinking with `inline code` and more text after");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let inline_code_end = joined
         .find("inline code")
@@ -3009,7 +3141,11 @@ fn pre_styled_paragraph_reopens_gray_italic_after_bold_span() {
     // text gets a fresh gray + italic open.
     let mut m = md_with_gray_italic("This is thinking with **bold text** and more after");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let bold_end = joined
         .find("bold text")
@@ -3055,7 +3191,11 @@ fn pre_styled_paragraph_with_no_inlines_still_wraps_text_in_gray_italic() {
     // text run (e.g. an over-eager trim).
     let mut m = md_with_gray_italic("This is plain thinking text");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[90m"),
@@ -3080,7 +3220,11 @@ fn pre_styled_paragraph_ending_with_inline_code_trims_dangling_prefix() {
     // default-style prefix.
     let mut m = md_with_gray_italic("This is thinking with `inline code`");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // The default-style prefix is `\x1b[3m\x1b[90m` (italic-open
     // then gray-open: italic-outer / color-innermost). After the
@@ -3126,7 +3270,11 @@ fn h1_inline_code_keeps_its_own_styling_only_not_double_wrapped_with_heading() {
         None,
     );
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Find the inline code's content close: `bar\x1b[39m` is the
     // theme.code's closing. Walk past it and inspect what follows.
@@ -3170,7 +3318,11 @@ fn h1_inline_code_at_end_of_heading_trims_dangling_heading_prefix() {
         None,
     );
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // The H1 style_prefix with the color-only-heading theme is
     // `\x1b[36m\x1b[1m\x1b[4m` (cyan + bold + underline). After
@@ -3208,7 +3360,11 @@ fn apply_default_style_open_order_is_italic_outer_color_inner() {
     // so its open comes first in the byte stream.
     let mut m = md_with_gray_italic("plain thinking text");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let italic_open = joined
         .find("\x1b[3m")
@@ -3248,7 +3404,11 @@ fn pre_styled_text_does_not_wrap_headings() {
     // appear on the heading line.
     let mut m = md_with_gray_italic("# My Heading");
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         !joined.contains("\x1b[90m"),
@@ -3361,7 +3521,11 @@ fn custom_non_italic_quote_theme_still_underwraps_with_italic() {
     let theme = theme_with_cyan_quote();
     let mut m = Markdown::new("> hello", 0, 0, theme, None);
     let lines = m.render(80);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[3m"),
@@ -3431,7 +3595,12 @@ fn code_block_colors_tokens_with_palette_syntax_styles() {
     // palette-category classification is wired up.
     let code = "```rust\n// note\nlet y = 2;\n```";
     let mut m = Markdown::new(code, 0, 0, default_markdown_theme(), None);
-    let joined = m.render(80).join("\n");
+    let joined = m
+        .render(80)
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         joined.contains("\x1b[31m"),
@@ -3690,7 +3859,7 @@ fn long_code_block_line_inside_blockquote_wraps_with_quote_state_propagation() {
     // Every quoted row (those starting with the border) should fit
     // within the rendered width. A row that overflows past 24 cells
     // would mean wrap didn't happen.
-    let bordered: Vec<&String> = lines
+    let bordered: Vec<&aj_tui::Line> = lines
         .iter()
         .filter(|l| l.starts_with("\x1b[2m│ "))
         .collect();
@@ -3710,7 +3879,7 @@ fn long_code_block_line_inside_blockquote_wraps_with_quote_state_propagation() {
     // least two body rows (excluding the ``` border rows). Body rows
     // are bordered rows whose plain content doesn't start with `│ ```
     // (they're indented code).
-    let body_rows: Vec<&&String> = bordered
+    let body_rows: Vec<&&aj_tui::Line> = bordered
         .iter()
         .filter(|l| {
             let p = strip_ansi(l);

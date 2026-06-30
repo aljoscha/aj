@@ -598,8 +598,8 @@ impl StubSubmenu {
 impl Component for StubSubmenu {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        vec![format!("submenu open, current={}", self.current)]
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+        vec![format!("submenu open, current={}", self.current).into()]
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
@@ -826,8 +826,8 @@ fn invalidate_forwards_to_the_active_submenu() {
 
     impl Component for CountingSubmenu {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec!["counting submenu".to_string()]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec!["counting submenu".into()]
         }
         fn invalidate(&mut self) {
             *self.invalidate_count.borrow_mut() += 1;
@@ -917,8 +917,8 @@ struct HeightRecordingSubmenu {
 impl Component for HeightRecordingSubmenu {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        vec!["height submenu".to_string()]
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+        vec!["height submenu".into()]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {

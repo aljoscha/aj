@@ -154,7 +154,7 @@ impl ChatView {
 impl Component for ChatView {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         match self.active {
             AgentId::Main => self.main.render(width),
             AgentId::Sub(n) => {
@@ -215,8 +215,8 @@ mod tests {
         String::from_utf8(out).expect("strip_ansi: surviving bytes remain valid UTF-8")
     }
 
-    fn joined(lines: &[String]) -> String {
-        lines.iter().map(|l| strip_ansi(l)).collect()
+    fn joined<S: AsRef<str>>(lines: &[S]) -> String {
+        lines.iter().map(|l| strip_ansi(l.as_ref())).collect()
     }
 
     #[test]

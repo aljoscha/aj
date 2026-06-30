@@ -177,6 +177,9 @@ fn render_chat(tui: &mut Tui) -> Vec<String> {
         .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
         .expect("chat slot present");
     chat.render(usize::from(SCREEN_WIDTH))
+        .into_iter()
+        .map(|l| l.to_string())
+        .collect()
 }
 
 /// Build a kill-switch [`Listener`] that returns `Err` the first

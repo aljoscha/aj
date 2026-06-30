@@ -7083,7 +7083,14 @@ mod run_loop_tests {
                 .tui
                 .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
                 .expect("chat slot present");
-            strip_ansi(&chat.render(usize::from(COLS)).join("\n"))
+            strip_ansi(
+                &chat
+                    .render(usize::from(COLS))
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         }
     }
 

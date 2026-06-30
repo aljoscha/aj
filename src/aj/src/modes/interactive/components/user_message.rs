@@ -153,7 +153,7 @@ fn fold_source(text: &str, expanded: bool) -> String {
 impl Component for UserMessageComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         // Pull in an `aj.tools.expand` toggle before painting, gated on
         // the generation so steady-state renders skip the rebuild. Only
         // an actual mode change rebuilds the widget; an unrelated toggle

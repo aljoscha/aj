@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::components::text::Text;
 use crate::tui::RenderHandle;
 
@@ -370,7 +370,7 @@ impl Drop for Loader {
 impl Component for Loader {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         // Take an owned copy of the frame so the immutable borrow of
         // `self` ends before we mutably borrow `self.body`.
         let frame = self.current_frame().to_string();
@@ -396,8 +396,8 @@ impl Component for Loader {
         // visible line at `width - 2` content width. Prepend a
         // leading blank row.
         self.body.set_text(&text);
-        let mut result = Vec::with_capacity(2);
-        result.push(String::new());
+        let mut result: Vec<Line> = Vec::with_capacity(2);
+        result.push(Line::default());
         result.extend(self.body.render(width));
         result
     }

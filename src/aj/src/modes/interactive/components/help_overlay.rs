@@ -83,7 +83,12 @@ mod tests {
         crate::config::keybindings::install_global_manager_defaults();
         let mut h = build_overlay(identity_theme());
         // Render wide so descriptions aren't column-truncated.
-        let body = h.render(200).join("\n");
+        let body = h
+            .render(200)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         for cmd in COMMANDS {
             assert!(
                 body.contains(cmd.title),
@@ -111,7 +116,12 @@ mod tests {
     #[test]
     fn no_selection_indicator_in_read_only_view() {
         let mut h = build_overlay(identity_theme());
-        let body = h.render(200).join("\n");
+        let body = h
+            .render(200)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             !body.contains('→'),
             "read-only help should not show an arrow: {body}"

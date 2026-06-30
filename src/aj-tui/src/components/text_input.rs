@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ansi::visible_width;
-use crate::component::{CURSOR_MARKER, Component};
+use crate::component::{CURSOR_MARKER, Component, Line};
 use crate::keybindings;
 use crate::keys::{InputEvent, is_newline_event};
 use crate::kill_ring::KillRing;
@@ -373,11 +373,11 @@ impl Component for TextInput {
         self.focused
     }
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         let prompt_width = visible_width(&self.prompt);
         let available = width.saturating_sub(prompt_width);
         if available == 0 {
-            return vec![self.prompt.clone()];
+            return vec![self.prompt.clone().into()];
         }
 
         // Calculate visible portion of the value with horizontal scrolling.
@@ -471,7 +471,7 @@ impl Component for TextInput {
             line.push_str(&visible);
         }
 
-        vec![line]
+        vec![line.into()]
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {

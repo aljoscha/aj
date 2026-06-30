@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ansi::{expand_tabs, truncate_to_width, visible_width, wrap_text_with_ansi};
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::components::text_input::TextInput;
 use crate::fuzzy::fuzzy_filter;
 use crate::keybindings;
@@ -479,7 +479,7 @@ impl SettingsList {
 impl Component for SettingsList {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         // While a submenu is open, it owns the entire frame. Keeps the
         // parent list from bleeding render state into the submenu's
         // layout.
@@ -487,25 +487,28 @@ impl Component for SettingsList {
             return active.component.render(width);
         }
 
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<Line> = Vec::new();
 
         if let Some(search) = self.search.as_mut() {
             lines.extend(search.render(width));
-            lines.push(String::new());
+            lines.push(Line::default());
         }
 
         if self.items.is_empty() {
-            lines.push((self.theme.hint)("  No settings available"));
+            lines.push((self.theme.hint)("  No settings available").into());
             return lines;
         }
 
         if self.filtered.is_empty() {
-            lines.push(truncate_to_width(
-                &(self.theme.hint)("  No matching settings"),
-                width,
-                "",
-                false,
-            ));
+            lines.push(
+                truncate_to_width(
+                    &(self.theme.hint)("  No matching settings"),
+                    width,
+                    "",
+                    false,
+                )
+                .into(),
+            );
             return lines;
         }
 
@@ -581,23 +584,29 @@ impl Component for SettingsList {
                 }
             };
 
-            lines.push(truncate_to_width(
-                &format!("{prefix}{label_text}{separator}{marker_cell}{value_text}"),
-                width,
-                "",
-                false,
-            ));
+            lines.push(
+                truncate_to_width(
+                    &format!("{prefix}{label_text}{separator}{marker_cell}{value_text}"),
+                    width,
+                    "",
+                    false,
+                )
+                .into(),
+            );
         }
 
         // Scroll indicator when truncated.
         if start > 0 || end < self.filtered.len() {
             let scroll_text = format!("  ({}/{})", self.selected + 1, self.filtered.len());
-            lines.push((self.theme.hint)(&truncate_to_width(
-                &scroll_text,
-                width.saturating_sub(2),
-                "",
-                false,
-            )));
+            lines.push(
+                (self.theme.hint)(&truncate_to_width(
+                    &scroll_text,
+                    width.saturating_sub(2),
+                    "",
+                    false,
+                ))
+                .into(),
+            );
         }
 
         // Description for the selected item.
@@ -607,10 +616,10 @@ impl Component for SettingsList {
             .and_then(|idx| self.items.get(*idx))
         {
             if let Some(desc) = &item.description {
-                lines.push(String::new());
+                lines.push(Line::default());
                 let wrapped = wrap_text_with_ansi(&expand_tabs(desc), width.saturating_sub(4));
                 for row in wrapped {
-                    lines.push((self.theme.description)(&format!("  {}", row)));
+                    lines.push((self.theme.description)(&format!("  {}", row)).into());
                 }
             }
         }

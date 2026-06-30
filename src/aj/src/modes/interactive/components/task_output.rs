@@ -369,7 +369,7 @@ fn human_bytes(n: u64) -> String {
 impl Component for TaskOutputComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.refresh();
 
         // The command preview is variable-height, so the body viewport can
@@ -407,7 +407,7 @@ impl Component for TaskOutputComponent {
                 out.push(pending_rows[i - self.visual.len()].clone());
             }
         }
-        out
+        out.into_iter().map(aj_tui::Line::from).collect()
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {
@@ -537,8 +537,12 @@ mod tests {
     /// and blank separator.
     const SINGLE_LINE_HEADER_ROWS: usize = 1 + STATUS_AND_SEPARATOR_ROWS;
 
-    fn body(lines: &[String]) -> String {
-        lines[SINGLE_LINE_HEADER_ROWS..].join("\n")
+    fn body<S: AsRef<str>>(lines: &[S]) -> String {
+        lines[SINGLE_LINE_HEADER_ROWS..]
+            .iter()
+            .map(|l| l.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]

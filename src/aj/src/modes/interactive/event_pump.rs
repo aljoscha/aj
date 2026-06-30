@@ -1710,7 +1710,7 @@ mod tests {
         assert!(!terminal.is_progress_active(), "cleared when main idles");
     }
 
-    fn render_pending(tui: &mut aj_tui::tui::Tui) -> Vec<String> {
+    fn render_pending(tui: &mut aj_tui::tui::Tui) -> Vec<aj_tui::Line> {
         tui.get_mut_as::<PendingMessage>(SlotIndex::Pending.idx())
             .map(|p| p.render(80))
             .unwrap_or_default()
@@ -1827,7 +1827,11 @@ mod tests {
             .get_mut_as::<Footer>(SlotIndex::Footer.idx())
             .expect("footer slot");
         let lines = footer.render(120);
-        let joined = lines.join("\n");
+        let joined = lines
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // Strip the SGR escape sequences so tests assert against
         // visible content only. Matches the pattern used elsewhere
         // in this module ("\x1b[2m" + "\x1b[22m" dim wrap).
@@ -2372,7 +2376,12 @@ mod tests {
         let assistant = chat
             .get_mut_as::<AssistantMessageComponent>(last)
             .expect("assistant message at chat tail after thinking stream");
-        let rendered = assistant.render(80).join("\n");
+        let rendered = assistant
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             rendered.contains("first let me reason about the inputs carefully"),
             "expected accumulated thinking text to survive the empty-snapshot \
@@ -2418,7 +2427,11 @@ mod tests {
         // brackets the body, so a `contains` check on the visible
         // payload is robust to trailing/leading ANSI bytes.
         let lines = row.render(120);
-        let joined = lines.join("\n");
+        let joined = lines
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains(
                 "Token Usage - Input: 0+42 | Output: 0+17 | Cache Creation: 0 | Cache Read: 0+3"
@@ -2485,7 +2498,12 @@ mod tests {
         let row = chat
             .get_mut_as::<aj_tui::components::text::Text>(before)
             .expect("appended row should be a Text component");
-        let joined = row.render(120).join("\n");
+        let joined = row
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains("Error: anthropic provider: no credentials"),
             "row should carry the in-band error, got: {joined:?}",
@@ -2549,7 +2567,12 @@ mod tests {
         let last = chat
             .get_mut_as::<aj_tui::components::text::Text>(total - 1)
             .expect("last child should be the error Text row");
-        let joined = last.render(120).join("\n");
+        let joined = last
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains("Error: no credentials"),
             "error row should land last, after the usage row, got: {joined:?}",
@@ -2581,7 +2604,12 @@ mod tests {
             .get_mut_as::<aj_tui::components::text::Text>(before)
             .expect("appended row should be a Text component");
         assert!(
-            row.render(120).join("\n").contains("Error: stream ended"),
+            row.render(120)
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .contains("Error: stream ended"),
             "retryable terminal error should render in-band",
         );
     }
@@ -2613,6 +2641,9 @@ mod tests {
             .expect("appended row should be a Text component");
         assert!(
             row.render(120)
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>()
                 .join("\n")
                 .contains("Error: the model stream failed"),
         );
@@ -3581,6 +3612,9 @@ mod tests {
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
             .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
             .join("\n");
         assert!(
             full.contains("BODYMARKER"),
@@ -3593,6 +3627,9 @@ mod tests {
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
             .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
             .join("\n");
         assert!(
             !main.contains("BODYMARKER"),
@@ -3656,6 +3693,9 @@ mod tests {
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
             .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
             .join("\n");
         assert!(
             !main.contains("BODYMARKER"),
@@ -3669,6 +3709,9 @@ mod tests {
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
             .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
             .join("\n");
         assert!(
             full.contains("BODYMARKER"),
@@ -3681,6 +3724,9 @@ mod tests {
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
             .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
             .join("\n");
         assert!(
             !main_again.contains("BODYMARKER"),

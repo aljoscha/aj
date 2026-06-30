@@ -239,7 +239,7 @@ impl ModelIdentity for ModelIdentityRef<'_> {
 impl Component for ModelSelectorComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.inner.render(width)
     }
 
@@ -333,7 +333,12 @@ mod tests {
             id: "claude-opus-4-20250514",
         };
         let mut sel = ModelSelectorComponent::new(identity_theme(), catalog, Some(&current), None);
-        let body = sel.render(60).join("\n");
+        let body = sel
+            .render(60)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // The opus row should be marked "(current)" since it's the
         // active model on open.
         assert!(body.contains("Claude Opus 4 (current)"), "got: {body}");
@@ -403,7 +408,12 @@ mod tests {
         for c in "opus".chars() {
             sel.handle_input(&Key::char(c));
         }
-        let body = sel.render(60).join("\n");
+        let body = sel
+            .render(60)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("Claude Opus 4"), "got: {body}");
         assert!(!body.contains("GPT-5"), "got: {body}");
         sel.handle_input(&enter_event());
@@ -421,7 +431,12 @@ mod tests {
         let catalog = sample_catalog();
         let mut sel =
             ModelSelectorComponent::new(identity_theme(), catalog, None, Some("gpt".to_string()));
-        let body = sel.render(60).join("\n");
+        let body = sel
+            .render(60)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // Only the two GPT-5 rows should appear.
         assert!(body.contains("GPT-5"), "got: {body}");
         assert!(!body.contains("Claude"), "got: {body}");
@@ -430,7 +445,12 @@ mod tests {
     #[test]
     fn empty_catalog_renders_no_match_placeholder() {
         let mut sel = ModelSelectorComponent::new(identity_theme(), vec![], None, None);
-        let body = sel.render(60).join("\n");
+        let body = sel
+            .render(60)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // SelectList renders "No matching commands" when filtered
         // indices is empty; the selector inherits that placeholder
         // verbatim.
@@ -457,7 +477,12 @@ mod tests {
             None,
             Some("gpt-5.5".to_string()),
         );
-        let body = sel.render(60).join("\n");
+        let body = sel
+            .render(60)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("GPT-5.5"), "got: {body}");
         assert!(body.contains("GPT-5.5 Pro"), "got: {body}");
         assert!(!body.contains("GPT-5.1"), "got: {body}");

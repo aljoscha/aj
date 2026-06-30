@@ -12,7 +12,7 @@ use nu_ansi_term::Color;
 
 use support::strip_ansi;
 
-fn render(text: &str, padding_x: usize, padding_y: usize, width: usize) -> Vec<String> {
+fn render(text: &str, padding_x: usize, padding_y: usize, width: usize) -> Vec<aj_tui::Line> {
     // Padding is supplied at construction; there are no setters.
     let mut t = TruncatedText::new(text, padding_x, padding_y);
     t.render(width)

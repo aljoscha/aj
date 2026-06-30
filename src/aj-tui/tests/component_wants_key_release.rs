@@ -54,7 +54,7 @@ impl Recorder {
 impl Component for Recorder {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
         Vec::new()
     }
 

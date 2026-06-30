@@ -193,18 +193,19 @@ impl SubAgentBox {
 impl Component for SubAgentBox {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         // Degenerate width: plain fallback so the bg-padding pipeline
         // never paints a too-narrow row. Mirrors the tool bubble's
         // degraded path.
         if width < MIN_BOX_WIDTH {
-            let mut out = Vec::new();
-            out.extend(wrap_text_with_ansi(
-                &self.compact_title(width.max(1)),
-                width.max(1),
-            ));
+            let mut out: Vec<aj_tui::Line> = Vec::new();
+            out.extend(
+                wrap_text_with_ansi(&self.compact_title(width.max(1)), width.max(1))
+                    .into_iter()
+                    .map(aj_tui::Line::from),
+            );
             let inner_lines = self.inner.render(width.max(1));
-            let body: Vec<String> = match self.mode {
+            let body: Vec<aj_tui::Line> = match self.mode {
                 SubAgentBoxMode::Compact => {
                     let start = inner_lines.len().saturating_sub(self.compact_rows);
                     inner_lines[start..].to_vec()
@@ -212,7 +213,11 @@ impl Component for SubAgentBox {
                 SubAgentBoxMode::Full => inner_lines,
             };
             for line in &body {
-                out.extend(wrap_text_with_ansi(line, width.max(1)));
+                out.extend(
+                    wrap_text_with_ansi(line, width.max(1))
+                        .into_iter()
+                        .map(aj_tui::Line::from),
+                );
             }
             return out;
         }
@@ -230,7 +235,7 @@ impl Component for SubAgentBox {
                 "…",
                 false,
             ));
-            let mut out = vec![header];
+            let mut out = vec![aj_tui::Line::from(header)];
             out.extend(self.inner.render(width));
             return out;
         }
@@ -241,32 +246,32 @@ impl Component for SubAgentBox {
 
         // Window to the tail, reserving one row for the dropped-lines
         // hint so the total body never exceeds `compact_rows`.
-        let body: Vec<String> = if inner_lines.len() > self.compact_rows {
+        let body: Vec<aj_tui::Line> = if inner_lines.len() > self.compact_rows {
             let keep = self.compact_rows.saturating_sub(1).max(1);
             let earlier = inner_lines.len() - keep;
             let mut windowed = Vec::with_capacity(keep + 1);
-            windowed.push(style::dim(&format!("… ({earlier} earlier lines)")));
+            windowed.push(style::dim(&format!("… ({earlier} earlier lines)")).into());
             windowed.extend_from_slice(&inner_lines[inner_lines.len() - keep..]);
             windowed
         } else {
             inner_lines
         };
 
-        let mut content_lines = Vec::with_capacity(body.len() + 1);
-        content_lines.push(self.compact_title(content_width));
+        let mut content_lines: Vec<aj_tui::Line> = Vec::with_capacity(body.len() + 1);
+        content_lines.push(self.compact_title(content_width).into());
         content_lines.extend(body);
 
         let padding = " ".repeat(PADDING_X);
-        let mut out = Vec::with_capacity(content_lines.len() + 2 * PADDING_Y);
+        let mut out: Vec<aj_tui::Line> = Vec::with_capacity(content_lines.len() + 2 * PADDING_Y);
         for _ in 0..PADDING_Y {
-            out.push(apply_background_to_line("", width, self.bg.as_ref()));
+            out.push(apply_background_to_line("", width, self.bg.as_ref()).into());
         }
         for line in &content_lines {
             let padded = format!("{padding}{line}");
-            out.push(apply_background_to_line(&padded, width, self.bg.as_ref()));
+            out.push(apply_background_to_line(&padded, width, self.bg.as_ref()).into());
         }
         for _ in 0..PADDING_Y {
-            out.push(apply_background_to_line("", width, self.bg.as_ref()));
+            out.push(apply_background_to_line("", width, self.bg.as_ref()).into());
         }
         out
     }

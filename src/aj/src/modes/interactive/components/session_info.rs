@@ -244,7 +244,12 @@ mod tests {
     #[test]
     fn renders_identity_counts_and_tool_breakdown() {
         let mut c = build_overlay(identity_theme(), sample_stats());
-        let body = c.render(120).join("\n");
+        let body = c
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("2026-06-19-14-22-03-512"), "{body}");
         assert!(body.contains("home-u-proj"), "{body}");
         assert!(body.contains("anthropic / claude-sonnet-4-5"), "{body}");

@@ -313,7 +313,7 @@ impl SettingsWindowComponent {
 impl Component for SettingsWindowComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         // Apply queued display corrections before painting so a
         // failed apply never leaves a stale value on screen longer
         // than one host round-trip.
@@ -719,7 +719,7 @@ struct ModelPickerSubmenu {
 impl Component for ModelPickerSubmenu {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.inner.render(width)
     }
 
@@ -777,7 +777,7 @@ struct TextEditSubmenu {
 impl Component for TextEditSubmenu {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.input.render(width)
     }
 
@@ -1244,7 +1244,12 @@ mod tests {
         // `current_values()` leaves `model_url` unset, so the row is
         // empty and must show its "(default)" placeholder.
         search_for(&mut component, "model_url");
-        let body = component.render(80).join("\n");
+        let body = component
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("(default)"), "got: {body:?}");
     }
 

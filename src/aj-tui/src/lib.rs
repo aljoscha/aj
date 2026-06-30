@@ -76,4 +76,5 @@ pub mod undo_stack;
 pub mod word_boundary;
 pub mod word_wrap;
 
+pub use component::Line;
 pub use editor_component::EditorComponent;

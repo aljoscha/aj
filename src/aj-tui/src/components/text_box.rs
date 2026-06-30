@@ -8,7 +8,7 @@
 //! strings on every render.
 
 use crate::ansi::{apply_background_to_line, visible_width};
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::keys::InputEvent;
 
 /// Rendered state cached between frames when the inputs haven't changed.
@@ -24,9 +24,9 @@ use crate::keys::InputEvent;
 ///   misses the cache.
 struct RenderCache {
     width: usize,
-    child_lines: Vec<String>,
+    child_lines: Vec<Line>,
     bg_sample: Option<String>,
-    lines: Vec<String>,
+    lines: Vec<Line>,
 }
 
 /// A box container that renders children with padding and an optional background.
@@ -145,7 +145,7 @@ impl TextBox {
 impl Component for TextBox {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         if self.children.is_empty() {
             // Empty-children returns `[]` without touching the cache.
             // `add_child` / `remove_child_by_ref` / `clear` already
@@ -193,13 +193,13 @@ impl Component for TextBox {
             return cache.lines.clone();
         }
 
-        let mut lines = Vec::with_capacity(child_lines.len() + 2 * self.padding_y);
+        let mut lines: Vec<Line> = Vec::with_capacity(child_lines.len() + 2 * self.padding_y);
 
         // Top padding. Routes through `apply_bg_row` so the padding
         // cells go through the same pad-then-bg pipeline as the
         // content rows.
         for _ in 0..self.padding_y {
-            lines.push(self.apply_bg_row("", width));
+            lines.push(self.apply_bg_row("", width).into());
         }
 
         // Content. Same `apply_bg_row` path; the helper right-pads
@@ -207,12 +207,12 @@ impl Component for TextBox {
         // rectangle even when no `bg_fn` is set.
         for child_line in &child_lines {
             let padded = format!("{}{}", padding, child_line);
-            lines.push(self.apply_bg_row(&padded, width));
+            lines.push(self.apply_bg_row(&padded, width).into());
         }
 
         // Bottom padding.
         for _ in 0..self.padding_y {
-            lines.push(self.apply_bg_row("", width));
+            lines.push(self.apply_bg_row("", width).into());
         }
 
         self.cache = Some(RenderCache {

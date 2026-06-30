@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::components::select_list::{SelectItem, SelectList};
 use crate::components::text_input::TextInput;
 use crate::keybindings;
@@ -189,15 +189,15 @@ impl FilterableSelect {
 impl Component for FilterableSelect {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         let mut lines = self.search.render(width);
         if self.has_status_line {
             let text = self.status_line.clone().unwrap_or_default();
-            lines.push((self.status_style)(&text));
+            lines.push((self.status_style)(&text).into());
         }
-        lines.push(String::new());
+        lines.push(Line::default());
         if self.loading && self.list.items().is_empty() {
-            lines.push((self.status_style)(&self.loading_message));
+            lines.push((self.status_style)(&self.loading_message).into());
         } else {
             lines.extend(self.list.render(width));
         }
@@ -322,7 +322,12 @@ mod tests {
         for c in "alp".chars() {
             fs.handle_input(&Key::char(c));
         }
-        let body = fs.render(40).join("\n");
+        let body = fs
+            .render(40)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("alpha"), "got: {body}");
         assert!(!body.contains("bravo"), "got: {body}");
     }
@@ -336,7 +341,12 @@ mod tests {
             list.set_items(vec![SelectItem::new("q", &format!("query:{query}"))]);
         }));
         fs.handle_input(&Key::char('z'));
-        let body = fs.render(40).join("\n");
+        let body = fs
+            .render(40)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("query:z"), "got: {body}");
     }
 
@@ -345,11 +355,23 @@ mod tests {
         let mut fs = FilterableSelect::new("search: ", list_with(&[]), Arc::new(|s| s.to_string()));
         fs.set_loading_message("Loading…");
         fs.set_loading(true);
-        assert!(fs.render(40).join("\n").contains("Loading…"));
+        assert!(
+            fs.render(40)
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .contains("Loading…")
+        );
 
         fs.list_mut()
             .extend_items(vec![SelectItem::new("a", "alpha")]);
-        let body = fs.render(40).join("\n");
+        let body = fs
+            .render(40)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("alpha"), "got: {body}");
         assert!(!body.contains("Loading…"), "got: {body}");
     }

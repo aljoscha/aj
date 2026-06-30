@@ -27,7 +27,7 @@ use crate::autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteSession, AutocompleteSuggestions,
     SessionInvalid, SuggestOpts,
 };
-use crate::component::{CURSOR_MARKER, Component};
+use crate::component::{CURSOR_MARKER, Component, Line};
 use crate::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
 use crate::keybindings;
 use crate::keys::{InputEvent, is_newline_event, key_id_matches};
@@ -2960,7 +2960,7 @@ impl Component for Editor {
         self.focused
     }
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         // Drain any autocomplete deliveries that arrived since the
         // previous frame. The async worker's send resumes us here, on
         // the editor's turn to read its state; apply the latest
@@ -3231,7 +3231,7 @@ impl Component for Editor {
             }
         }
 
-        result
+        result.into_iter().map(Line::from).collect()
     }
 
     fn handle_input(&mut self, event: &InputEvent) -> bool {

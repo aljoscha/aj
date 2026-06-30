@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::ansi::{truncate_to_width, visible_width};
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::impl_component_any;
 use crate::keys::InputEvent;
 use crate::tui::RenderHandle;
@@ -250,10 +250,10 @@ impl OverlayWindow {
 impl Component for OverlayWindow {
     impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         // Degenerate widths: hand back something minimal but valid.
         if width < 4 {
-            return vec!["".to_string()];
+            return vec![Line::default()];
         }
         let inner_width = width - 4;
         let inner_rows = self.inner_rows();
@@ -270,18 +270,18 @@ impl Component for OverlayWindow {
         }
 
         let blank = " ".repeat(inner_width);
-        let mut out = Vec::with_capacity(inner_rows + 4);
-        out.push(self.render_top(width));
-        out.push(self.wrap_inner(&blank, inner_width));
+        let mut out: Vec<Line> = Vec::with_capacity(inner_rows + 4);
+        out.push(self.render_top(width).into());
+        out.push(self.wrap_inner(&blank, inner_width).into());
         let rendered = child_lines.len();
         for line in &child_lines {
-            out.push(self.wrap_inner(line, inner_width));
+            out.push(self.wrap_inner(line, inner_width).into());
         }
         for _ in rendered..inner_rows {
-            out.push(self.wrap_inner(&blank, inner_width));
+            out.push(self.wrap_inner(&blank, inner_width).into());
         }
-        out.push(self.wrap_inner(&blank, inner_width));
-        out.push(self.render_bottom(width));
+        out.push(self.wrap_inner(&blank, inner_width).into());
+        out.push(self.render_bottom(width).into());
         out
     }
 
@@ -342,9 +342,9 @@ mod tests {
     }
 
     impl Component for MockChild {
-        fn render(&mut self, width: usize) -> Vec<String> {
+        fn render(&mut self, width: usize) -> Vec<Line> {
             self.last_width = width;
-            self.lines.clone()
+            self.lines.iter().cloned().map(Line::from).collect()
         }
         fn handle_input(&mut self, _event: &InputEvent) -> bool {
             self.input_count += 1;

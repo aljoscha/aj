@@ -16,11 +16,11 @@ struct SimpleOverlay;
 impl Component for SimpleOverlay {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
         vec![
-            "OVERLAY_TOP".to_string(),
-            "OVERLAY_MID".to_string(),
-            "OVERLAY_BOT".to_string(),
+            "OVERLAY_TOP".into(),
+            "OVERLAY_MID".into(),
+            "OVERLAY_BOT".into(),
         ]
     }
 }

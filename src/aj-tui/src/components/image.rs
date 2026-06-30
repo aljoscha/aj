@@ -17,7 +17,7 @@
 use std::any::Any;
 
 use crate::capabilities::{ImageProtocol, get_capabilities};
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::image_protocol::{
     DEFAULT_CELL_PIXEL_SIZE, image_cell_footprint, iterm2_sequence, kitty_sequence,
     next_kitty_image_id,
@@ -62,7 +62,7 @@ pub struct Image {
 struct CachedRender {
     width: usize,
     protocol: Option<ImageProtocol>,
-    lines: Vec<String>,
+    lines: Vec<Line>,
 }
 
 impl Image {
@@ -120,7 +120,7 @@ impl Image {
 impl Component for Image {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         let caps = get_capabilities();
         if let Some(cached) = &self.cached_render
             && cached.width == width
@@ -128,7 +128,11 @@ impl Component for Image {
         {
             return cached.lines.clone();
         }
-        let lines = self.render_uncached(width, caps.images);
+        let lines: Vec<Line> = self
+            .render_uncached(width, caps.images)
+            .into_iter()
+            .map(Line::from)
+            .collect();
         self.cached_render = Some(CachedRender {
             width,
             protocol: caps.images,
@@ -357,7 +361,11 @@ mod tests {
         });
         let mut img = make("image/png").with_filename("hello.png");
         let lines = img.render(80);
-        let joined = lines.join("\n");
+        let joined = lines
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // base64("hello.png") = "aGVsbG8ucG5n"
         assert!(
             joined.contains("name=aGVsbG8ucG5n"),

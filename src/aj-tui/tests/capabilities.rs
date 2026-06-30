@@ -345,7 +345,11 @@ fn emits_osc_8_hyperlink_sequence_when_terminal_supports_hyperlinks() {
         None,
     );
     let lines = md.render(80);
-    let joined = lines.join("");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("");
 
     assert!(
         joined.contains("\x1b]8;;https://example.com\x1b\\"),
@@ -391,7 +395,11 @@ fn uses_osc_8_for_mailto_links_when_terminal_supports_hyperlinks() {
         None,
     );
     let lines = md.render(80);
-    let joined = lines.join("");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("");
 
     assert!(
         joined.contains("\x1b]8;;mailto:test@example.com\x1b\\"),
@@ -423,7 +431,11 @@ fn uses_osc_8_for_bare_urls_when_terminal_supports_hyperlinks() {
         None,
     );
     let lines = md.render(80);
-    let joined = lines.join("");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("");
 
     assert!(
         joined.contains("\x1b]8;;https://example.com\x1b\\"),

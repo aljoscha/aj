@@ -1,7 +1,7 @@
 //! Multi-line word-wrapping text display component.
 
 use crate::ansi::{apply_background_to_line, expand_tabs, visible_width, wrap_text_with_ansi};
-use crate::component::Component;
+use crate::component::{Component, Line};
 
 /// Default horizontal padding (left/right margin) applied to text content.
 const DEFAULT_PADDING_X: usize = 1;
@@ -21,7 +21,7 @@ pub struct Text {
     // Cache.
     cached_text: Option<String>,
     cached_width: Option<usize>,
-    cached_lines: Option<Vec<String>>,
+    cached_lines: Option<Vec<Line>>,
 }
 
 impl Text {
@@ -78,7 +78,7 @@ impl Default for Text {
 impl Component for Text {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         // Check cache.
         if let (Some(ct), Some(cw), Some(cl)) =
             (&self.cached_text, self.cached_width, &self.cached_lines)
@@ -157,6 +157,10 @@ impl Component for Text {
         // `wrap_text_with_ansi` always returns at least one line for
         // any input that passed the early empty/whitespace check, so
         // this branch is unreachable for real inputs.
+        // Convert the assembled rows to `Line` once, on this cache-miss
+        // path. Cache hits above return `Rc` clones, so the per-frame
+        // cost of an unchanged `Text` is a refcount bump, not a rebuild.
+        let result: Vec<Line> = result.into_iter().map(Line::from).collect();
         self.cached_text = Some(self.text.clone());
         self.cached_width = Some(width);
         self.cached_lines = Some(result.clone());
@@ -166,7 +170,7 @@ impl Component for Text {
         // cache-hits return the (empty) cached vec — first-call vs.
         // cached-call asymmetry is intentional.
         if result.is_empty() {
-            return vec![String::new()];
+            return vec![Line::default()];
         }
 
         result

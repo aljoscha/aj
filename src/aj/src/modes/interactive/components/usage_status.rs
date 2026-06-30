@@ -140,7 +140,7 @@ fn build_items(statuses: &[ProviderUsageStatus]) -> Vec<SelectItem> {
 impl Component for UsageStatusComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.poll_statuses();
         self.list.render(width)
     }
@@ -216,11 +216,21 @@ mod tests {
     fn shows_loading_until_statuses_arrive() {
         let (tx, rx) = oneshot::channel();
         let mut c = UsageStatusComponent::new(identity_theme(), rx);
-        let body = c.render(120).join("\n");
+        let body = c
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("Loading usage…"), "{body}");
 
         tx.send(sample_statuses()).unwrap();
-        let body = c.render(120).join("\n");
+        let body = c
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!body.contains("Loading"), "{body}");
         assert!(body.contains("anthropic"), "{body}");
         assert!(body.contains("5h limit"), "{body}");
@@ -244,7 +254,12 @@ mod tests {
         let (tx, rx) = oneshot::channel::<Vec<ProviderUsageStatus>>();
         drop(tx);
         let mut c = UsageStatusComponent::new(identity_theme(), rx);
-        let body = c.render(120).join("\n");
+        let body = c
+            .render(120)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("Usage fetch failed."), "{body}");
     }
 

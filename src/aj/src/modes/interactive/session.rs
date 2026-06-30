@@ -507,7 +507,12 @@ mod tests {
         let chat = tui
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot present");
-        let rendered = chat.render(100).join("\n");
+        let rendered = chat
+            .render(100)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rendered.contains("hello there"), "prompt rendered");
         assert!(rendered.contains("scripted reply"), "reply rendered");
     }

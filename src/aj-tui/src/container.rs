@@ -2,7 +2,7 @@
 //!
 //! Renders children sequentially, concatenating their output lines.
 
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::keys::InputEvent;
 
 /// A container that stacks child components vertically.
@@ -135,7 +135,7 @@ impl Default for Container {
 impl Component for Container {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         let mut lines = Vec::new();
         for child in &mut self.children {
             lines.extend(child.render(width));
@@ -166,8 +166,8 @@ mod tests {
     impl Component for Lines {
         impl_component_any!();
 
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            self.0.clone()
+        fn render(&mut self, _width: usize) -> Vec<Line> {
+            self.0.iter().cloned().map(Line::from).collect()
         }
     }
 
@@ -176,7 +176,7 @@ mod tests {
     impl Component for Empty {
         impl_component_any!();
 
-        fn render(&mut self, _width: usize) -> Vec<String> {
+        fn render(&mut self, _width: usize) -> Vec<Line> {
             Vec::new()
         }
     }

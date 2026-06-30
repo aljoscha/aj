@@ -334,14 +334,14 @@ fn format_runtime(d: Duration) -> String {
 impl aj_tui::component::Component for AgentPickerComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         let header = match self.scope {
             Scope::Active => "Showing: running agents",
             Scope::All => "Showing: all agents",
         };
-        let mut lines = Vec::new();
-        lines.push(style::dim(header));
-        lines.push(String::new());
+        let mut lines: Vec<aj_tui::Line> = Vec::new();
+        lines.push(style::dim(header).into());
+        lines.push(aj_tui::Line::default());
         lines.extend(self.inner.render(width));
         lines
     }
@@ -455,7 +455,12 @@ mod tests {
     #[test]
     fn active_scope_lists_main_and_running_only() {
         let mut picker = picker(fixture(), Vec::new(), AgentId::Main);
-        let body = picker.render(80).join("\n");
+        let body = picker
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("Showing: running agents"), "got: {body}");
         assert!(body.contains("main agent"), "got: {body}");
         assert!(body.contains("agent 1"), "got: {body}");
@@ -467,7 +472,12 @@ mod tests {
         crate::config::keybindings::install_global_manager_defaults();
         let mut picker = picker(fixture(), Vec::new(), AgentId::Main);
         assert!(picker.handle_input(&Key::ctrl('t')));
-        let body = picker.render(80).join("\n");
+        let body = picker
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("Showing: all agents"), "got: {body}");
         assert!(body.contains("agent 2"), "got: {body}");
         // The finished sub surfaces its status in the shortcut column.
@@ -513,7 +523,12 @@ mod tests {
             sub_entry(2, SubAgentStatus::Failed),
         ];
         let mut picker = picker(agents, Vec::new(), AgentId::Main);
-        let body = picker.render(80).join("\n");
+        let body = picker
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("main agent"), "got: {body}");
         // No running subs, so none of them appear in Active scope.
         assert!(!body.contains("agent 1"), "got: {body}");
@@ -527,7 +542,12 @@ mod tests {
             task_entry(2, TaskStatus::Exited(Some(0)), 5),
         ];
         let mut picker = picker(fixture(), tasks, AgentId::Main);
-        let body = picker.render(100).join("\n");
+        let body = picker
+            .render(100)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // Active scope: only the running task is listed, with its
         // glyph, command, and runtime.
         assert!(body.contains("… task #1"), "got: {body}");
@@ -551,7 +571,12 @@ mod tests {
         ];
         let mut picker = picker(fixture(), tasks, AgentId::Main);
         assert!(picker.handle_input(&Key::ctrl('t')));
-        let body = picker.render(100).join("\n");
+        let body = picker
+            .render(100)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("✓ task #1"), "got: {body}");
         assert!(body.contains("exited 0 · 5s"), "got: {body}");
         assert!(body.contains("✗ task #2"), "got: {body}");

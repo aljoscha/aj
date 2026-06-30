@@ -121,7 +121,7 @@ fn build_items() -> Vec<SelectItem> {
 impl Component for CommandPaletteComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.inner.render(width)
     }
 
@@ -171,7 +171,12 @@ mod tests {
         // unlike the host, which gives the list a fixed height and
         // lets it scroll.
         let mut p = CommandPaletteComponent::new(identity_theme(), COMMANDS.len());
-        let body = p.render(80).join("\n");
+        let body = p
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         for cmd in COMMANDS {
             assert!(
                 body.contains(cmd.title),
@@ -215,7 +220,12 @@ mod tests {
         // `PALETTE_OVERLAY_INNER_ROWS` needs a bump.
         let mut p = CommandPaletteComponent::new(identity_theme(), 1);
         p.set_available_height(crate::modes::interactive::PALETTE_OVERLAY_INNER_ROWS);
-        let body = p.render(80).join("\n");
+        let body = p
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         for cmd in COMMANDS {
             assert!(
                 body.contains(cmd.title),
@@ -234,7 +244,12 @@ mod tests {
         crate::config::keybindings::install_global_manager_defaults();
         let mut p = CommandPaletteComponent::new(identity_theme(), 14);
         p.set_available_height(crate::modes::interactive::PALETTE_OVERLAY_INNER_ROWS);
-        let body = p.render(80).join("\n");
+        let body = p
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("Ctrl+O"), "expected Ctrl+O in: {body}");
     }
 
@@ -244,7 +259,12 @@ mod tests {
         for c in "mod".chars() {
             p.handle_input(&Key::char(c));
         }
-        let body = p.render(80).join("\n");
+        let body = p
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // The `model` category rows survive.
         assert!(body.contains("model"), "got: {body}");
         // Rows in other categories don't fuzzy-match "mod".
@@ -258,7 +278,12 @@ mod tests {
         for c in "mod".chars() {
             p.handle_input(&Key::char(c));
         }
-        let body = p.render(80).join("\n");
+        let body = p
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // Both `model` rows (`thinking` and `use`) should be on
         // screen — querying the category surfaces every entry in that
         // group via the `"<category> <title>"` filter key.
@@ -329,12 +354,12 @@ mod tests {
     /// `[search-input, blank, ...list rows]`; this helper skips the
     /// search input (which echoes the user's query and would otherwise
     /// match the needle when the query itself is the command name).
-    fn list_row_containing(lines: &[String], needle: &str) -> Option<String> {
+    fn list_row_containing<S: AsRef<str>>(lines: &[S], needle: &str) -> Option<String> {
         lines
             .iter()
             .skip(1)
-            .find(|line| line.contains(needle))
-            .cloned()
+            .find(|line| line.as_ref().contains(needle))
+            .map(|l| l.as_ref().to_string())
     }
 
     /// Strip the 2-cell `SelectList` selection-arrow gutter (`"→ "`

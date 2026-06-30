@@ -334,7 +334,7 @@ fn format_created(now: DateTime<Utc>, created: DateTime<Utc>) -> String {
 impl Component for SessionSelectorComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         self.drain();
         self.inner.render(width)
     }
@@ -477,7 +477,12 @@ mod tests {
         let mut sel = selector(sample_catalog(), Some("2025-05-09"), None);
         // Render wide enough that SelectList's primary column
         // doesn't truncate the `(current)` suffix off the label.
-        let body = sel.render(200).join("\n");
+        let body = sel
+            .render(200)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // The middle row should be marked "(current)".
         assert!(
             body.contains("debug the streaming protocol (current)"),
@@ -535,7 +540,12 @@ mod tests {
         for c in "stream".chars() {
             sel.handle_input(&Key::char(c));
         }
-        let body = sel.render(80).join("\n");
+        let body = sel
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("debug the streaming protocol"), "got: {body}");
         assert!(!body.contains("refactor"), "got: {body}");
         sel.handle_input(&enter_event());
@@ -548,7 +558,12 @@ mod tests {
     #[test]
     fn initial_query_pre_fills_search_and_filters_immediately() {
         let mut sel = selector(sample_catalog(), None, Some("refactor"));
-        let body = sel.render(80).join("\n");
+        let body = sel
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("refactor the agent loop"), "got: {body}");
         assert!(!body.contains("debug"), "got: {body}");
     }
@@ -561,7 +576,12 @@ mod tests {
         for c in "dbg".chars() {
             sel.handle_input(&Key::char(c));
         }
-        let body = sel.render(80).join("\n");
+        let body = sel
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             !body.contains("debug the streaming protocol"),
             "got: {body}"
@@ -572,7 +592,12 @@ mod tests {
     #[test]
     fn empty_catalog_renders_no_match_placeholder() {
         let mut sel = selector(vec![], None, None);
-        let body = sel.render(80).join("\n");
+        let body = sel
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         // With no sessions the list renders its configured empty
         // message once the scan completes.
         assert!(body.contains("No sessions in this project"), "got: {body}");
@@ -582,7 +607,12 @@ mod tests {
     fn session_with_no_user_message_shows_placeholder_in_primary() {
         let catalog = vec![make_preview("2025-05-11", None, 0, Duration::seconds(10))];
         let mut sel = selector(catalog, None, None);
-        let body = sel.render(80).join("\n");
+        let body = sel
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("(no user message yet)"), "got: {body}");
     }
 
@@ -777,7 +807,12 @@ mod tests {
         let current = catalog[6].session_id.clone();
         let mut sel = selector(catalog, Some(&current), None);
         // Render wide so column truncation can't strip "(current)".
-        let body = sel.render(200).join("\n");
+        let body = sel
+            .render(200)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             body.contains("session 6 (current)"),
             "expected the current row to be visible: {body}"
@@ -809,7 +844,12 @@ mod tests {
                 )]);
             },
         );
-        let body = sel.render(200).join("\n");
+        let body = sel
+            .render(200)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let newest = body.find("newest session").expect("newest shown");
         let older = body.find("older session").expect("older shown");
         assert!(newest < older, "expected newest before older, got: {body}");

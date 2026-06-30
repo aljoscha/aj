@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use aj_tui::component::Component;
+use aj_tui::component::{Component, Line};
 use aj_tui::impl_component_any;
 use aj_tui::keys::InputEvent;
 
@@ -37,8 +37,8 @@ impl StaticLines {
 impl Component for StaticLines {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        self.lines.clone()
+    fn render(&mut self, _width: usize) -> Vec<Line> {
+        self.lines.iter().cloned().map(Line::from).collect()
     }
 }
 
@@ -139,8 +139,13 @@ impl MutableLines {
 impl Component for MutableLines {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
-        self.lines.borrow().clone()
+    fn render(&mut self, _width: usize) -> Vec<Line> {
+        self.lines
+            .borrow()
+            .iter()
+            .cloned()
+            .map(Line::from)
+            .collect()
     }
 }
 
@@ -175,7 +180,7 @@ impl InputRecorder {
 impl Component for InputRecorder {
     impl_component_any!();
 
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, _width: usize) -> Vec<Line> {
         Vec::new()
     }
 
@@ -228,8 +233,8 @@ impl StaticOverlay {
 impl Component for StaticOverlay {
     impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         *self.rendered_width.borrow_mut() = Some(width);
-        self.lines.clone()
+        self.lines.iter().cloned().map(Line::from).collect()
     }
 }

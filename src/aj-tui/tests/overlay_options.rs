@@ -17,7 +17,7 @@ use support::{StaticLines, StaticOverlay, VirtualTerminal, render_now};
 struct EmptyContent;
 impl Component for EmptyContent {
     impl_component_any!();
-    fn render(&mut self, _width: usize) -> Vec<String> {
+    fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
         Vec::new()
     }
 }
@@ -610,11 +610,11 @@ fn overlay_on_base_content_with_osc_hyperlinks_does_not_crash() {
     struct HyperlinkContent;
     impl Component for HyperlinkContent {
         impl_component_any!();
-        fn render(&mut self, width: usize) -> Vec<String> {
+        fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
             let link = "\x1b]8;;file:///path/to/file.ts\x07file.ts\x1b]8;;\x07";
             let padding = "X".repeat(width.saturating_sub(30));
             let line = format!("See {} for details {}", link, padding);
-            vec![line.clone(), line.clone(), line]
+            vec![line.clone().into(), line.clone().into(), line.into()]
         }
     }
 
@@ -795,9 +795,9 @@ fn explicit_row_pins_the_overlay_top_across_content_height_changes() {
     }
     impl Component for FlexOverlay {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
             (0..*self.count.borrow())
-                .map(|i| format!("row{}", i))
+                .map(|i| format!("row{}", i).into())
                 .collect()
         }
     }
@@ -865,9 +865,9 @@ fn center_anchor_shifts_top_row_as_content_height_changes() {
     }
     impl Component for FlexOverlay {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
             (0..*self.count.borrow())
-                .map(|i| format!("row{}", i))
+                .map(|i| format!("row{}", i).into())
                 .collect()
         }
     }
@@ -1095,8 +1095,8 @@ fn showing_an_overlay_hides_hardware_cursor_synchronously() {
     struct MarkerEmitter;
     impl Component for MarkerEmitter {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec![format!("hello{CURSOR_MARKER}")]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec![format!("hello{CURSOR_MARKER}").into()]
         }
     }
 
@@ -1149,8 +1149,8 @@ fn draining_overlay_stack_hides_hardware_cursor_synchronously() {
     struct MarkerEmitter;
     impl Component for MarkerEmitter {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec![format!("hello{CURSOR_MARKER}")]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec![format!("hello{CURSOR_MARKER}").into()]
         }
     }
 
@@ -1229,8 +1229,8 @@ fn popping_a_non_draining_overlay_does_not_emit_cursor_hide() {
     struct MarkerEmitter;
     impl Component for MarkerEmitter {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec![format!("hello{CURSOR_MARKER}")]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec![format!("hello{CURSOR_MARKER}").into()]
         }
     }
 

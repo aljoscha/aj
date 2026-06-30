@@ -55,7 +55,11 @@ fn cursor_cell_at_end_of_line_terminates_with_full_sgr_reset() {
     // emits a highlighted-space cell (`\x1b[7m \x1b[0m`).
     let mut e = editor_with_text("hello");
     let lines = e.render(20);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let closer = next_sgr_after_reverse_open(&joined)
         .expect("expected a cursor cell with an SGR closer in the rendered output");
@@ -78,7 +82,11 @@ fn cursor_cell_on_a_grapheme_terminates_with_full_sgr_reset() {
     let mut e = editor_with_text("ab");
     e.handle_input(&Key::left());
     let lines = e.render(20);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let closer = next_sgr_after_reverse_open(&joined)
         .expect("expected a cursor cell with an SGR closer in the rendered output");
@@ -111,7 +119,11 @@ fn styling_open_before_cursor_does_not_bleed_past_the_cursor_cell() {
     let mut e = editor_with_text("\x1b[31mab");
     e.handle_input(&Key::left());
     let lines = e.render(20);
-    let joined = lines.join("\n");
+    let joined = lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let closer = next_sgr_after_reverse_open(&joined)
         .expect("expected a cursor cell with an SGR closer in the rendered output");

@@ -31,7 +31,7 @@
 
 use tokio_util::sync::CancellationToken;
 
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::components::loader::Loader;
 use crate::keybindings;
 use crate::keys::InputEvent;
@@ -122,7 +122,7 @@ impl CancellableLoader {
 impl Component for CancellableLoader {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         self.inner.render(width)
     }
 

@@ -170,7 +170,7 @@ fn hyperlink(uri: &str, text: &str) -> String {
 impl Component for LoginDialogComponent {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         let (lines, prompt, url) = {
             let st = self.state.lock().expect("login dialog state poisoned");
             (st.lines.clone(), st.input_prompt.clone(), st.url.clone())
@@ -192,11 +192,11 @@ impl Component for LoginDialogComponent {
             ));
         }
 
-        let mut out = Vec::new();
+        let mut out: Vec<aj_tui::Line> = Vec::new();
         for line in &lines {
             match line {
-                LoginLine::Info(t) => out.push((self.style.info)(t)),
-                LoginLine::Progress(t) => out.push((self.style.progress)(t)),
+                LoginLine::Info(t) => out.push((self.style.info)(t).into()),
+                LoginLine::Progress(t) => out.push((self.style.progress)(t).into()),
                 LoginLine::Url(u) => {
                     // Each wrapped chunk is its own hyperlink to the
                     // full URL, so clicking any visible part opens it —
@@ -208,25 +208,28 @@ impl Component for LoginDialogComponent {
                     let hyperlinks = aj_tui::capabilities::get_capabilities().hyperlinks;
                     for chunk in wrap_chars(u, width) {
                         let styled = (self.style.url)(&chunk);
-                        out.push(if hyperlinks {
-                            hyperlink(u, &styled)
-                        } else {
-                            styled
-                        });
+                        out.push(
+                            if hyperlinks {
+                                hyperlink(u, &styled)
+                            } else {
+                                styled
+                            }
+                            .into(),
+                        );
                     }
                 }
             }
         }
 
         if let Some(prompt) = prompt {
-            out.push(String::new());
-            out.push((self.style.hint)(&prompt));
+            out.push(aj_tui::Line::default());
+            out.push((self.style.hint)(&prompt).into());
             out.extend(self.input.render(width));
         }
 
         if let Some(notice) = &self.notice {
-            out.push(String::new());
-            out.push((self.style.hint)(notice));
+            out.push(aj_tui::Line::default());
+            out.push((self.style.hint)(notice).into());
         }
         out
     }
@@ -522,7 +525,12 @@ mod tests {
         // clipboard / stdout, which a unit test shouldn't do.)
         let (mut dialog, _state, _pending, _cancel) = make();
         assert!(dialog.handle_input(&Key::ctrl('y')));
-        let body = dialog.render(80).join("\n");
+        let body = dialog
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("No authorization URL to copy yet"), "{body}");
     }
 
@@ -589,7 +597,12 @@ mod tests {
             .unwrap()
             .lines
             .push(LoginLine::Url(url.to_string()));
-        let body = dialog.render(80).join("\n");
+        let body = dialog
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             body.contains(&format!("\x1b]8;id=aj-oauth;{url}\x1b\\")),
             "expected OSC 8 open for {url} in {body:?}"
@@ -609,7 +622,12 @@ mod tests {
             .unwrap()
             .lines
             .push(LoginLine::Url(url.to_string()));
-        let body = dialog.render(80).join("\n");
+        let body = dialog
+            .render(80)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             !body.contains("\x1b]8;"),
             "must not emit OSC 8 when hyperlinks are unsupported; got {body:?}"

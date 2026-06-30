@@ -1,7 +1,7 @@
 //! Single-line truncating text component.
 
 use crate::ansi::truncate_to_width;
-use crate::component::Component;
+use crate::component::{Component, Line};
 
 /// Default horizontal padding (left/right margin) applied to text content.
 const DEFAULT_PADDING_X: usize = 0;
@@ -50,7 +50,7 @@ impl Default for TruncatedText {
 impl Component for TruncatedText {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<Line> {
         let empty_line = " ".repeat(width);
 
         let mut result = Vec::new();
@@ -83,6 +83,6 @@ impl Component for TruncatedText {
             result.push(empty_line.clone());
         }
 
-        result
+        result.into_iter().map(Line::from).collect()
     }
 }

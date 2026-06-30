@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::ansi::{expand_tabs, truncate_to_width, visible_width};
-use crate::component::Component;
+use crate::component::{Component, Line};
 use crate::keybindings;
 use crate::keys::InputEvent;
 
@@ -692,14 +692,11 @@ fn normalize_to_single_line(text: &str) -> String {
 impl Component for SelectList {
     crate::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
-        let mut lines = Vec::new();
+    fn render(&mut self, width: usize) -> Vec<Line> {
+        let mut lines: Vec<Line> = Vec::new();
 
         if self.filtered_indices.is_empty() {
-            lines.push((self.theme.no_match)(&format!(
-                "  {}",
-                self.layout.empty_message
-            )));
+            lines.push((self.theme.no_match)(&format!("  {}", self.layout.empty_message)).into());
             return lines;
         }
 
@@ -722,14 +719,17 @@ impl Component for SelectList {
                 .description
                 .as_deref()
                 .map(|desc| normalize_to_single_line(&expand_tabs(desc)));
-            lines.push(self.render_item(
-                item,
-                is_selected,
-                width,
-                single_line.as_deref(),
-                primary_column_width,
-                prefix_column_width,
-            ));
+            lines.push(
+                self.render_item(
+                    item,
+                    is_selected,
+                    width,
+                    single_line.as_deref(),
+                    primary_column_width,
+                    prefix_column_width,
+                )
+                .into(),
+            );
         }
 
         // Scroll indicator. `(N/TOTAL)` shows the 1-based index of the
@@ -739,7 +739,7 @@ impl Component for SelectList {
         if start_index > 0 || end_index < len {
             let info = format!("  ({}/{})", self.selected + 1, len);
             let clamped = truncate_to_width(&info, width.saturating_sub(2), "", false);
-            lines.push((self.theme.scroll_info)(&clamped));
+            lines.push((self.theme.scroll_info)(&clamped).into());
         }
 
         lines
@@ -883,7 +883,12 @@ mod tests {
 
         // The rendered row carries no raw tab, and the label's tab shows as
         // spaces.
-        let rendered = list.render(60).join("\n");
+        let rendered = list
+            .render(60)
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             !rendered.contains('\t'),
             "rendered row has a raw tab: {rendered:?}"

@@ -107,7 +107,7 @@ impl ReadOnlyListOverlay {
 impl Component for ReadOnlyListOverlay {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         // The wrapped list renders every row, so we window the result here.
         let all = self.list.render(width);
         self.content_rows = all.len();
@@ -119,7 +119,7 @@ impl Component for ReadOnlyListOverlay {
         }
 
         self.scroll = self.scroll.min(max_scroll);
-        let mut out: Vec<String> = all[self.scroll..self.scroll + shown].to_vec();
+        let mut out: Vec<aj_tui::Line> = all[self.scroll..self.scroll + shown].to_vec();
 
         // Position indicator on the reserved last row: `(first-last/total)`,
         // clamped like the list's own indicator so narrow frames stay tidy.
@@ -130,7 +130,7 @@ impl Component for ReadOnlyListOverlay {
             self.content_rows
         );
         let clamped = truncate_to_width(&text, width.saturating_sub(2), "", false);
-        out.push((self.scroll_info_style)(&clamped));
+        out.push((self.scroll_info_style)(&clamped).into());
         out
     }
 
@@ -205,7 +205,7 @@ mod tests {
         ReadOnlyListOverlay::new(list, scroll_info)
     }
 
-    fn body(overlay: &mut ReadOnlyListOverlay) -> Vec<String> {
+    fn body(overlay: &mut ReadOnlyListOverlay) -> Vec<aj_tui::Line> {
         overlay.render(80)
     }
 

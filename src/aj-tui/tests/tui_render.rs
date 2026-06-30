@@ -658,10 +658,10 @@ fn diff_path_keeps_cursor_tracking_when_overlay_content_shrinks_then_grows() {
     }
     impl Component for FlipOverlay {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
             match *self.shape.borrow() {
-                "tall" => (0..10).map(|i| format!("T{}", i)).collect(),
-                _ => vec!["S0".to_string(), "S1".to_string()],
+                "tall" => (0..10).map(|i| format!("T{}", i).into()).collect(),
+                _ => vec!["S0".into(), "S1".into()],
             }
         }
     }
@@ -1806,9 +1806,9 @@ fn composite_drops_wide_char_that_would_straddle_overlay_boundary() {
     struct BoundaryOverlay;
     impl aj_tui::component::Component for BoundaryOverlay {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
             // Four cells + one 2-wide CJK: width 6, overlay claims 4.
-            vec!["abcあ".to_string()]
+            vec!["abcあ".into()]
         }
     }
 
@@ -1923,8 +1923,8 @@ fn hardware_cursor_enabled_preference_suppresses_cursor_even_with_marker() {
     struct MarkerEmitter;
     impl Component for MarkerEmitter {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec![format!("before{CURSOR_MARKER}after")]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec![format!("before{CURSOR_MARKER}after").into()]
         }
     }
 
@@ -2088,19 +2088,19 @@ fn overlay_composite_pads_right_to_terminal_width() {
     struct Short;
     impl aj_tui::component::Component for Short {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
             // Only 5 visible columns on a 20-column terminal; the
             // after segment is empty so `afterPad` is the only
             // thing keeping the composited row at full width.
-            vec!["AAAAA".to_string()]
+            vec!["AAAAA".into()]
         }
     }
 
     struct Five;
     impl aj_tui::component::Component for Five {
         impl_component_any!();
-        fn render(&mut self, _width: usize) -> Vec<String> {
-            vec!["OOOOO".to_string()]
+        fn render(&mut self, _width: usize) -> Vec<aj_tui::Line> {
+            vec!["OOOOO".into()]
         }
     }
 

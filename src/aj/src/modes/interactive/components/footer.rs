@@ -105,7 +105,7 @@ impl Default for Footer {
 impl Component for Footer {
     aj_tui::impl_component_any!();
 
-    fn render(&mut self, width: usize) -> Vec<String> {
+    fn render(&mut self, width: usize) -> Vec<aj_tui::Line> {
         let mut parts: Vec<String> = Vec::new();
         if let Some(m) = &self.model {
             parts.push(m.clone());
@@ -135,11 +135,11 @@ impl Component for Footer {
         // hardware cursor away from where the diff engine expects
         // it; a single truncated row keeps the layout stable.
         if width == 0 {
-            return vec![String::new()];
+            return vec![aj_tui::Line::default()];
         }
         let content = parts.join("  ·  ");
         let truncated = truncate_to_width(&content, width - 1, "…", false);
-        vec![format!(" {}", style::dim(&truncated))]
+        vec![format!(" {}", style::dim(&truncated)).into()]
     }
 
     fn handle_input(&mut self, _event: &InputEvent) -> bool {
