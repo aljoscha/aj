@@ -47,8 +47,20 @@ use crate::unicode::{self, GraphemeIterator};
 use crate::window::{ChildOptions, Window};
 
 mod app;
+mod border;
+mod center;
+mod padding;
+mod sized_box;
+mod spinner;
+mod text;
 
 pub use crate::vxfw::app::{App, Options};
+pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
+pub use crate::vxfw::center::Center;
+pub use crate::vxfw::padding::{PadValues, Padding};
+pub use crate::vxfw::sized_box::SizedBox;
+pub use crate::vxfw::spinner::Spinner;
+pub use crate::vxfw::text::{Overflow, Text, TextAlign, WidthBasis};
 
 /// A reference-counted, interior-mutable handle to a widget.
 ///
