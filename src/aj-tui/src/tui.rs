@@ -2850,6 +2850,10 @@ impl Tui {
     /// shell output above the TUI.
     pub fn force_full_render(&mut self) {
         self.previous_lines.clear();
+        // Kept index-aligned with `previous_lines` (see the field doc);
+        // clearing it here preserves that invariant so the next render's
+        // row reuse can't pair fresh rows against a stale composed frame.
+        self.previous_composed.clear();
         self.previous_width = 0;
         self.previous_height = 0;
         self.hardware_cursor_row = 0;
