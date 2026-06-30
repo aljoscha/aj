@@ -40,3 +40,8 @@ pub struct Winsize {
     pub x_pixel: u16,
     pub y_pixel: u16,
 }
+
+/// Resets terminal state using the global tty. Use only to recover during a
+/// panic. See [`tty::recover`].
+#[cfg(unix)]
+pub use crate::tty::recover;
