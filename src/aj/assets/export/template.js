@@ -828,6 +828,17 @@
       const lastConnectorId = connectorKids.length ? connectorKids[connectorKids.length - 1] : null;
       const ordered = [...spawns, ...lines];
 
+      // A lone conversation continuation that stays on this node's spine
+      // (not bumped one level in by `justBranched`) and follows one or
+      // more sub-agent runs. When present, the runs' connector column
+      // threads down to it: the last run draws `├─` (not `└─`) and its
+      // body keeps the `│`, so the spine reads as one line from the
+      // spawning message, past the runs, to the continuation, whose
+      // marker sits on the same column. When the continuation is bumped
+      // (inside a fork) the columns no longer line up, so we don't extend.
+      const continuation = !branched && lines.length === 1 ? lines[0] : null;
+      const continuationOnSpine = continuation != null && !(justBranched && indent > 0);
+
       const connectorDisplayed = showConnector && !isVirtualRootChild;
       const currentDisplayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
       const connectorPosition = Math.max(0, currentDisplayIndent - 1);
@@ -840,7 +851,7 @@
           childIndent = indent + 1;
           childShowConnector = true;
           childJustBranched = true;
-          childIsLast = childId === lastConnectorId;
+          childIsLast = childId === lastConnectorId && !continuationOnSpine;
         } else {
           // Spine continuation: no connector. It still indents one more
           // when it directly follows a hang-in (so a fork or run body

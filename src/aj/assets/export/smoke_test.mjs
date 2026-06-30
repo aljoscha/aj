@@ -175,6 +175,7 @@ const treeStatus = elements['tree-status'].textContent;
 // assertions check indentation relationships directly.
 function treeRows() {
   return elements['tree-container'].children.map((n) => ({
+    prefix: (n.children[0] && n.children[0]._text) || '',
     indent: Math.floor(((n.children[0] && n.children[0]._text) || '').length / 3),
     content: nodeText(n.children[2] || makeEl('div')),
     id: n.dataset.id,
@@ -291,6 +292,13 @@ console.log('layout');
   check('sub-agent run hangs one level in off its spawning message', !!(a2 && sp2) && sp2.indent === a2.indent + 1);
   check('main thread is not indented by a sub-agent run', !!(a2 && a3) && a3.indent === a2.indent);
   check('sub-agent run renders before the conversation continues', !!(sp2 && a3) && rows.indexOf(sp2) < rows.indexOf(a3));
+  // A run followed by a spine continuation keeps the connector open (├)
+  // so the spine threads down to the continuation; a run inside a fork
+  // (sub-agent #1, off a1) closes with └ because its continuation is
+  // bumped one level in and the columns no longer line up.
+  const sp1 = has2('sub-agent #1');
+  check('run before a spine continuation keeps the connector open', !!sp2 && sp2.prefix.includes('\u251c') && !sp2.prefix.includes('\u2514'));
+  check('run inside a fork closes its connector', !!sp1 && sp1.prefix.includes('\u2514'));
 }
 
 // Sub-agent runs appear in the tree by default and the toggle hides them.
