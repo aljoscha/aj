@@ -395,28 +395,38 @@
 
   function renderAssistant(entry) {
     const msg = entry.message;
-    let html = '<div class="msg assistant" id="entry-' + escapeHtml(entry.id) + '">' + copyLinkButton(entry.id);
-    html += '<div class="role">Assistant <span class="model">' + escapeHtml(msg.model || '') + '</span></div>';
 
+    // Build the message body (text, thinking, error) first. Tool calls
+    // are not part of the body: they render as sibling blocks after the
+    // bubble, matching the TUI where each tool execution is its own block
+    // beneath the assistant turn rather than nested inside it.
+    let body = '';
     for (const block of msg.content || []) {
       if (block.type === 'text' && block.text && block.text.trim()) {
-        html += '<div class="markdown-content">' + md(block.text) + '</div>';
+        body += '<div class="markdown-content">' + md(block.text) + '</div>';
       } else if (block.type === 'thinking' && block.thinking && block.thinking.trim()) {
-        html += '<div class="thinking-block">' +
+        body += '<div class="thinking-block">' +
           '<div class="thinking-text" onclick="' + TOGGLE + '">' + escapeHtml(block.thinking) + '</div>' +
           '<div class="thinking-collapsed">Thinking \u2026</div></div>';
       }
     }
+    // A failed turn records its cause on the message, not in a block.
+    if ((msg.stop_reason === 'Error' || msg.stop_reason === 'Aborted') && msg.error) {
+      body += '<div class="error-text">' + escapeHtml(msg.error.category) + ': ' + escapeHtml(msg.error.message) + '</div>';
+    }
+
+    // Skip the bubble entirely for a tool-only turn so we don't leave an
+    // empty "Assistant" box hanging above its tool executions.
+    let html = '';
+    if (body) {
+      html += '<div class="msg assistant" id="entry-' + escapeHtml(entry.id) + '">' + copyLinkButton(entry.id) +
+        '<div class="role">Assistant <span class="model">' + escapeHtml(msg.model || '') + '</span></div>' +
+        body + '</div>';
+    }
+
     for (const block of msg.content || []) {
       if (block.type === 'tool_call') html += renderToolCall(block);
     }
-
-    // A failed turn records its cause on the message, not in a block.
-    if ((msg.stop_reason === 'Error' || msg.stop_reason === 'Aborted') && msg.error) {
-      html += '<div class="error-text">' + escapeHtml(msg.error.category) + ': ' + escapeHtml(msg.error.message) + '</div>';
-    }
-
-    html += '</div>';
 
     // Sub-agent runs spawned by this message render inline beneath it.
     for (const spawn of spawnsByParent.get(entry.id) || []) {
@@ -571,8 +581,8 @@
   // it: its `sub_agent_spawn` entry is parented at that assistant, so the
   // run appears as a branch there. Settings and system entries are kept
   // but hidden by the default filter. The layout (indent, ASCII
-  // connectors, gutters) mirrors the TUI's branch selector so the two
-  // views agree.
+  // connectors, gutters) draws each branch point one level deeper, so the
+  // conversation's branch structure reads at a glance.
 
   const treeEntries = entries;
 
@@ -666,65 +676,19 @@
     return findNewestLeaf(targetId);
   }
 
-  // Flatten the tree to a list with indent and connector info,
-  // prioritizing the branch that contains the active leaf. Each stack
-  // tuple is [node, indent, justBranched, showConnector, isLast,
-  // gutters, isVirtualRootChild]: `justBranched` means the parent had
-  // multiple children (so this generation indents one more for visual
-  // grouping), `gutters` are the vertical bars to continue for unfinished
-  // ancestor branches, and `isVirtualRootChild` suppresses a connector
-  // for the synthetic level we add when there is more than one root.
-  function flattenTree(roots, activeIds) {
-    const result = [];
-    const multipleRoots = roots.length > 1;
-    // Mark which subtrees contain the active leaf, bottom-up. Computed
-    // iteratively over reverse pre-order (children before parents) so
-    // depth does not bound the call stack.
-    const containsActive = new Map();
-    const preorder = [];
-    const markStack = [...roots];
-    while (markStack.length) {
-      const n = markStack.pop();
-      preorder.push(n);
-      for (const c of n.children) markStack.push(c);
+  // Collect every node into a flat list (no layout). Order here is
+  // irrelevant: the filter runs over this list, and the visible layout
+  // (order, indent, connectors) is computed afterwards in `layoutVisible`.
+  // Iterative so a deep linear session can't overflow the call stack.
+  function collectNodes(roots) {
+    const out = [];
+    const stack = [...roots];
+    while (stack.length) {
+      const node = stack.pop();
+      out.push({ node });
+      for (const c of node.children) stack.push(c);
     }
-    for (let i = preorder.length - 1; i >= 0; i--) {
-      const n = preorder[i];
-      let has = activeIds.has(n.entry.id);
-      for (const c of n.children) if (containsActive.get(c)) has = true;
-      containsActive.set(n, has);
-    }
-
-    const orderedRoots = [...roots].sort((a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)));
-    const stack = [];
-    for (let i = orderedRoots.length - 1; i >= 0; i--) {
-      const isLast = i === orderedRoots.length - 1;
-      stack.push([orderedRoots[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, isLast, [], multipleRoots]);
-    }
-    while (stack.length > 0) {
-      const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop();
-      result.push({ node, indent, showConnector, isLast, gutters, isVirtualRootChild, multipleRoots });
-
-      const children = node.children;
-      const multipleChildren = children.length > 1;
-      const orderedChildren = [...children].sort((a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)));
-
-      let childIndent;
-      if (multipleChildren) childIndent = indent + 1;
-      else if (justBranched && indent > 0) childIndent = indent + 1;
-      else childIndent = indent;
-
-      const connectorDisplayed = showConnector && !isVirtualRootChild;
-      const currentDisplayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
-      const connectorPosition = Math.max(0, currentDisplayIndent - 1);
-      const childGutters = connectorDisplayed ? [...gutters, { position: connectorPosition, show: !isLast }] : gutters;
-
-      for (let i = orderedChildren.length - 1; i >= 0; i--) {
-        const childIsLast = i === orderedChildren.length - 1;
-        stack.push([orderedChildren[i], childIndent, multipleChildren, multipleChildren, childIsLast, childGutters, false]);
-      }
-    }
-    return result;
+    return out;
   }
 
   function buildTreePrefix(flatNode) {
@@ -754,66 +718,142 @@
     return chars.join('');
   }
 
-  // Recompute indent/connectors over only the visible (filtered) nodes,
-  // reattaching each to its nearest visible ancestor so single-child
-  // chains do not drift right. Same rules as flattenTree.
-  function recalculateVisualStructure(filtered, allFlat) {
-    if (filtered.length === 0) return;
-    const visibleIds = new Set(filtered.map((n) => n.node.entry.id));
+  // Lay out the visible nodes as a branch tree and return them in display
+  // order with indent / connector / gutter fields set.
+  //
+  // The conversation runs down a spine at the base indent. Two things
+  // hang one level in off a spine node and draw a connector: a sub-agent
+  // run (its `sub_agent_spawn`, rendered before the conversation
+  // continues) and a genuine conversation fork (an edited/retried prompt,
+  // i.e. more than one conversation child). A lone continuation stays on
+  // the spine, so spawning a sub-agent does not indent the rest of the
+  // main thread. Each node reattaches to its nearest visible ancestor, so
+  // a filter that hides intermediate entries doesn't break the structure.
+  //
+  // `justBranched` marks a node its parent hung in with a connector, so
+  // the node's own subtree indents one further to stay grouped under it.
+  // `gutters` are the vertical bars to continue for unfinished ancestor
+  // branches, and `isVirtualRootChild` suppresses a connector for the
+  // synthetic level added when there is more than one visible root.
+  function layoutVisible(visible, allFlat, activeIds) {
+    if (visible.length === 0) return [];
     const flatById = new Map(allFlat.map((f) => [f.node.entry.id, f]));
+    const visById = new Map(visible.map((f) => [f.node.entry.id, f]));
+    const visibleIds = new Set(visById.keys());
 
-    // Climb parent_id to the nearest ancestor that survived the filter.
-    // `seen` guards a malformed parent_id cycle (pathTo guards the same).
-    function visibleAncestor(nodeId) {
+    // Nearest ancestor that survived the filter (null if none). `seen`
+    // guards a malformed parent_id cycle (pathTo guards the same).
+    function visibleAncestor(id) {
       const seen = new Set();
-      let id = flatById.get(nodeId) && flatById.get(nodeId).node.entry.parent_id;
-      while (id != null && !seen.has(id)) {
-        seen.add(id);
-        if (visibleIds.has(id)) return id;
-        id = flatById.get(id) && flatById.get(id).node.entry.parent_id;
+      let pid = flatById.get(id) && flatById.get(id).node.entry.parent_id;
+      while (pid != null && !seen.has(pid)) {
+        seen.add(pid);
+        if (visibleIds.has(pid)) return pid;
+        pid = flatById.get(pid) && flatById.get(pid).node.entry.parent_id;
       }
       return null;
     }
 
-    const visibleChildren = new Map([[null, []]]);
-    for (const f of filtered) {
+    const childrenOf = new Map([[null, []]]);
+    for (const f of visible) {
       const id = f.node.entry.id;
       const anc = visibleAncestor(id);
-      if (!visibleChildren.has(anc)) visibleChildren.set(anc, []);
-      visibleChildren.get(anc).push(id);
+      if (!childrenOf.has(anc)) childrenOf.set(anc, []);
+      childrenOf.get(anc).push(id);
     }
-    const rootIds = visibleChildren.get(null);
-    const multipleRoots = rootIds.length > 1;
-    const filteredById = new Map(filtered.map((f) => [f.node.entry.id, f]));
+    const isSpawn = (id) => visById.get(id).node.entry.type === 'sub_agent_spawn';
 
+    // Which subtrees contain the active leaf (post-order, iterative), so a
+    // forked conversation shows its active branch first.
+    const containsActive = new Map();
+    const order = [];
+    const markStack = [...childrenOf.get(null)];
+    while (markStack.length) {
+      const id = markStack.pop();
+      order.push(id);
+      for (const c of childrenOf.get(id) || []) markStack.push(c);
+    }
+    for (let i = order.length - 1; i >= 0; i--) {
+      const id = order[i];
+      let has = activeIds.has(id);
+      for (const c of childrenOf.get(id) || []) if (containsActive.get(c)) has = true;
+      containsActive.set(id, has);
+    }
+
+    // A node's children in display order: sub-agent runs first (in spawn
+    // order), then the conversation (active branch first). `orderIndex`
+    // breaks ties by append position so the order is stable.
+    function split(ids) {
+      const oi = (id) => orderIndex.get(id) || 0;
+      const spawns = ids.filter(isSpawn).sort((a, b) => oi(a) - oi(b));
+      const lines = ids
+        .filter((id) => !isSpawn(id))
+        .sort((a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)) || oi(a) - oi(b));
+      return { spawns, lines };
+    }
+
+    const rootIds = childrenOf.get(null);
+    const multipleRoots = rootIds.length > 1;
+    const result = [];
+
+    // Stack frame: [id, indent, justBranched, showConnector, isLast,
+    // gutters, isVirtualRootChild].
     const stack = [];
-    for (let i = rootIds.length - 1; i >= 0; i--) {
-      const isLast = i === rootIds.length - 1;
-      stack.push([rootIds[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, isLast, [], multipleRoots]);
+    {
+      const { spawns, lines } = split(rootIds);
+      const ordered = [...spawns, ...lines];
+      for (let i = ordered.length - 1; i >= 0; i--) {
+        const isLast = i === ordered.length - 1;
+        stack.push([ordered[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, isLast, [], multipleRoots]);
+      }
     }
     while (stack.length > 0) {
       const [id, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop();
-      const f = filteredById.get(id);
-      if (!f) continue;
-      f.indent = indent; f.showConnector = showConnector; f.isLast = isLast;
-      f.gutters = gutters; f.isVirtualRootChild = isVirtualRootChild; f.multipleRoots = multipleRoots;
+      const f = visById.get(id);
+      f.indent = indent;
+      f.showConnector = showConnector;
+      f.isLast = isLast;
+      f.gutters = gutters;
+      f.isVirtualRootChild = isVirtualRootChild;
+      f.multipleRoots = multipleRoots;
+      result.push(f);
 
-      const children = visibleChildren.get(id) || [];
-      const multipleChildren = children.length > 1;
-      let childIndent;
-      if (multipleChildren) childIndent = indent + 1;
-      else if (justBranched && indent > 0) childIndent = indent + 1;
-      else childIndent = indent;
+      const { spawns, lines } = split(childrenOf.get(id) || []);
+      const branched = lines.length > 1;
+      // Children that hang one level in and draw a connector: every
+      // sub-agent run, plus the conversation children when the thread
+      // forks. A lone continuation stays on the spine.
+      const connectorKids = branched ? [...spawns, ...lines] : spawns;
+      const connectorSet = new Set(connectorKids);
+      const lastConnectorId = connectorKids.length ? connectorKids[connectorKids.length - 1] : null;
+      const ordered = [...spawns, ...lines];
 
       const connectorDisplayed = showConnector && !isVirtualRootChild;
       const currentDisplayIndent = multipleRoots ? Math.max(0, indent - 1) : indent;
       const connectorPosition = Math.max(0, currentDisplayIndent - 1);
       const childGutters = connectorDisplayed ? [...gutters, { position: connectorPosition, show: !isLast }] : gutters;
-      for (let i = children.length - 1; i >= 0; i--) {
-        const childIsLast = i === children.length - 1;
-        stack.push([children[i], childIndent, multipleChildren, multipleChildren, childIsLast, childGutters, false]);
+
+      for (let i = ordered.length - 1; i >= 0; i--) {
+        const childId = ordered[i];
+        let childIndent, childShowConnector, childJustBranched, childIsLast;
+        if (connectorSet.has(childId)) {
+          childIndent = indent + 1;
+          childShowConnector = true;
+          childJustBranched = true;
+          childIsLast = childId === lastConnectorId;
+        } else {
+          // Spine continuation: no connector. It still indents one more
+          // when it directly follows a hang-in (so a fork or run body
+          // stays grouped), otherwise it stays on the spine.
+          childIndent = justBranched && indent > 0 ? indent + 1 : indent;
+          childShowConnector = false;
+          childJustBranched = false;
+          childIsLast = true;
+        }
+        stack.push([childId, childIndent, childJustBranched, childShowConnector, childIsLast, childGutters, false]);
       }
     }
+    return result;
   }
 
   // ============================================================
@@ -904,9 +944,9 @@
   let showSubAgents = true;
   const SETTINGS_TYPES = ['system_prompt', 'model_change', 'thinking_change', 'speed_change', 'verbosity_change'];
 
-  function filterNodes(flatNodes, leafId) {
+  function filterNodes(flatNodes, leafId, activeIds) {
     const tokens = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
-    const filtered = flatNodes.filter((flat) => {
+    const visible = flatNodes.filter((flat) => {
       const entry = flat.node.entry;
       // Sub-agent rows appear only when the toggle is on. Checked before
       // the leaf rule so hiding wins even if the leaf is a sub-agent.
@@ -914,6 +954,20 @@
       // The current leaf is always shown so the active branch never
       // vanishes, even under a filter or search that would exclude it.
       if (entry.id === leafId) return true;
+
+      // A successful `agent` tool result duplicates its sub-agent run:
+      // when sub-agent rows are shown, the run's spawn node already names
+      // the same task (and its report shows in the inline box), so drop
+      // the tool result to avoid listing the task twice. With sub-agent
+      // rows hidden there is no spawn node, so we keep it as the
+      // conversation-thread trace of the call. A failed run is always
+      // kept so the failure is not lost, matching renderToolCall.
+      if (showSubAgents && entry.type === 'message' && entry.message && entry.message.role === 'tool_result') {
+        const tr = entry.message;
+        const call = tr.tool_call_id ? toolCallById.get(tr.tool_call_id) : null;
+        const isAgent = call ? call.name === 'agent' : tr.tool_name === 'agent';
+        if (isAgent && !tr.is_error) return false;
+      }
 
       // Hide assistant messages that are only tool calls (no text)
       // unless the turn errored or was aborted.
@@ -940,8 +994,7 @@
       }
       return true;
     });
-    recalculateVisualStructure(filtered, flatNodes);
-    return filtered;
+    return layoutVisible(visible, flatNodes, activeIds);
   }
 
   // ============================================================
@@ -958,8 +1011,8 @@
   function renderTree() {
     const roots = buildTree();
     const activeIds = activePathIds(currentLeafId);
-    const flatNodes = flattenTree(roots, activeIds);
-    const filtered = filterNodes(flatNodes, currentLeafId);
+    const flatNodes = collectNodes(roots);
+    const filtered = filterNodes(flatNodes, currentLeafId, activeIds);
     const container = document.getElementById('tree-container');
 
     container.innerHTML = '';

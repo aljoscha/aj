@@ -63,8 +63,17 @@ const entries = [
       details: { kind: 'sub_agent_report', agent_id: 1, task: 'investigate the bug', report: 'sub-agent finding' },
       is_error: false, timestamp: 0 } },
   { id: 'a2', parent_id: 'r4', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:09Z',
-    message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'Done. <script>alert(1)</script>' }],
-      usage: { input: 1, output: 1, cache_read: 0, cache_write: 0, total_tokens: 2, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
+    message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'Done. <script>alert(1)</script>' },
+      { type: 'tool_call', id: 'c5', name: 'agent', arguments: { task: 'double-check' } }],
+      usage: { input: 1, output: 1, cache_read: 0, cache_write: 0, total_tokens: 2, cost: { total: 0 } }, stop_reason: 'ToolUse', timestamp: 0 } },
+  // A second sub-agent, spawned by a2 (a spine continuation, not a fork
+  // child). It must hang one level in off a2 while a2's own continuation
+  // (a3) stays on the spine at a2's indent. Exercises the spine layout.
+  { id: 'sp2', parent_id: 'a2', thread: 'subagent', agent_id: 2, type: 'sub_agent_spawn', task: 'double-check the work',
+    settings: { provider: 'anthropic', model_id: 'claude-test', thinking: 'off', speed: 'standard', verbosity: '' }, timestamp: '2024-01-01T00:00:09Z' },
+  { id: 'sm2', parent_id: 'sp2', thread: 'subagent', agent_id: 2, type: 'message', timestamp: '2024-01-01T00:00:09Z',
+    message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'checked, looks good' }],
+      usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
   // Adversarial prose: every vector here must render inert.
   { id: 'a3', parent_id: 'a2', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:10Z',
     message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text:
@@ -161,6 +170,17 @@ function nodeText(el) {
 const treeText = elements['tree-container'].children.map(nodeText).join('\n');
 const treeStatus = elements['tree-status'].textContent;
 
+// Per-tree-node depth, read from the prefix span (3 glyph columns per
+// indent level), plus its content and entry id. Lets the layout
+// assertions check indentation relationships directly.
+function treeRows() {
+  return elements['tree-container'].children.map((n) => ({
+    indent: Math.floor(((n.children[0] && n.children[0]._text) || '').length / 3),
+    content: nodeText(n.children[2] || makeEl('div')),
+    id: n.dataset.id,
+  }));
+}
+
 // Fire a stored listener with a minimal event (for the navigation test).
 function fire(el, type) {
   ((el._on && el._on[type]) || []).forEach((fn) => fn({ stopPropagation() {}, preventDefault() {}, target: el }));
@@ -181,6 +201,23 @@ function has(label, needle) {
 }
 function hasnt(label, needle) {
   check(label + ' (absent)', !rendered.includes(needle));
+}
+
+// Extract the balanced <div>...</div> that opens at the element whose tag
+// carries `marker` (e.g. an `id="..."` attribute), so we can assert on
+// what is and isn't nested inside that element.
+function divRegion(html, marker) {
+  const at = html.indexOf(marker);
+  if (at < 0) return '';
+  const open = html.lastIndexOf('<div', at);
+  const tag = /<\/?div\b/g;
+  tag.lastIndex = open;
+  let depth = 0, m;
+  while ((m = tag.exec(html))) {
+    depth += m[0] === '</div' ? -1 : 1;
+    if (depth === 0) return html.slice(open, html.indexOf('>', m.index) + 1);
+  }
+  return html.slice(open);
 }
 
 console.log('header / stats');
@@ -209,6 +246,11 @@ has('bash exit code', 'exit code 1');
 has('stderr class', 'tool-output expandable stderr');
 has('edit diff added', 'diff-added');
 has('edit diff removed', 'diff-removed');
+// Tool executions are siblings of the assistant bubble, not nested inside
+// it (matching the TUI). The bubble for a1 must close before its tools.
+const a1box = divRegion(elements['messages'].innerHTML, 'id="entry-a1"');
+check('assistant bubble present for a turn with text', a1box.includes('Reading the file'));
+check('tool execution is a sibling, not nested in the assistant bubble', !!a1box && !a1box.includes('tool-execution'));
 
 console.log('sub-agent');
 has('sub-agent box', 'class="subagent"');
@@ -236,11 +278,29 @@ check('tree node text escaped', !treeText.includes('<script>alert'));
 check('tree shows branch sibling', treeText.includes('alternative branch'));
 check('tree draws branch connectors', treeText.includes('\u251c') || treeText.includes('\u2514'));
 
+// Spine layout: a sub-agent run hangs one level in off the message that
+// spawned it and renders before the conversation continues, while the
+// main thread stays on its spine (not indented by the run). sp2 is
+// spawned by a2; a3 is a2's conversation continuation.
+console.log('layout');
+{
+  const rows = treeRows();
+  const at = (id) => rows.find((r) => r.id === id);
+  const has2 = (s) => rows.find((r) => r.content.includes(s));
+  const a2 = at('a2'), a3 = at('a3'), sp2 = has2('sub-agent #2');
+  check('sub-agent run hangs one level in off its spawning message', !!(a2 && sp2) && sp2.indent === a2.indent + 1);
+  check('main thread is not indented by a sub-agent run', !!(a2 && a3) && a3.indent === a2.indent);
+  check('sub-agent run renders before the conversation continues', !!(sp2 && a3) && rows.indexOf(sp2) < rows.indexOf(a3));
+}
+
 // Sub-agent runs appear in the tree by default and the toggle hides them.
 console.log('sub-agents');
 check('sub-agent run shown in tree by default', treeText.includes('sub-agent #1'));
 check('sub-agent task in tree', treeText.includes('investigate the bug'));
 check('sub-agent message in tree', treeText.includes('sub-agent finding'));
+// The successful `agent` tool result is not listed as its own tree node
+// while sub-agent rows are shown: the spawn node already names the task.
+check('agent tool result not duplicated in tree', !treeText.includes('[agent:'));
 const subToggle = elements['toggle-subagents'];
 check('sub-agent toggle present', !!subToggle);
 if (subToggle) {
@@ -249,6 +309,9 @@ if (subToggle) {
   const hidden = elements['tree-container'].children.map(nodeText).join('\n');
   check('sub-agent hidden after toggle', !hidden.includes('sub-agent #1'));
   check('conversation still present when hidden', hidden.includes('user:'));
+  // With the spawn rows gone, the agent result is the only trace of the
+  // run left on the conversation thread, so it reappears.
+  check('agent tool result shown in tree when sub-agents hidden', hidden.includes('[agent:'));
   fire(subToggle, 'click');
   const reshown = elements['tree-container'].children.map(nodeText).join('\n');
   check('sub-agent shown again after toggling back', reshown.includes('sub-agent #1'));
