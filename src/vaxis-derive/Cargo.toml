@@ -1,0 +1,12 @@
+[package]
+name = "vaxis-derive"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+
+[lints]
+workspace = true

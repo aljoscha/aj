@@ -10,6 +10,9 @@ members = [
     "src/anthropic-sdk",
     "src/openai-sdk",
     "src/aj-tui",
+    "src/vaxis",
+    "src/vaxis-ucd",
+    "src/vaxis-derive",
 ]
 resolver = "2"
 
