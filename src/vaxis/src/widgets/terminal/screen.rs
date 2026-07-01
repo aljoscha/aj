@@ -543,19 +543,26 @@ impl Screen {
 
         // Shift rows down, from the bottom of the region upward.
         //
-        // NOTE: when the cursor is on the region's bottom row `adjusted_n` is
-        // 0 and this degenerates: cells self-copy (blanking their char), and if
-        // `top` is also 0 the saturating decrement never falls below the loop
-        // bound and it spins forever. This mirrors an upstream latent bug.
-        // Normal callers (`scroll_down`) position the cursor at the top first,
-        // so `adjusted_n >= 1` and the loop terminates.
+        // NOTE: when the cursor is on the region's bottom row `adjusted_n` is 0,
+        // so the shift is a no-op (stride 0) that self-copies each cell (which
+        // blanks its char). The bottom-up walk with a saturating decrement spins
+        // forever when `top` is also 0: the bound `row >= top + adjusted_n`
+        // becomes `row >= 0`, always true for usize, and the decrement floors at
+        // 0. Because this processes UNTRUSTED child output, an abnormal cursor
+        // position must not hang the reader thread, so we break once row 0 has
+        // been handled. The normal path (`scroll_down` positions the cursor at
+        // the top, `adjusted_n >= 1`) exits before ever reaching row 0 and is
+        // unaffected.
         let mut row = bottom;
         while row >= top + adjusted_n {
             for col in left..=right {
                 let i = row * width + col;
                 self.copy_cell(i, i - stride);
             }
-            row = row.saturating_sub(1);
+            if row == 0 {
+                break;
+            }
+            row -= 1;
         }
 
         // Blank the rows opened at the top.
@@ -791,6 +798,21 @@ mod tests {
         assert_eq!(grapheme_at(&s, 0, 0), " ");
         assert_eq!(grapheme_at(&s, 0, 1), "c");
         assert_eq!(grapheme_at(&s, 0, 2), "e");
+    }
+
+    #[test]
+    fn insert_line_terminates_on_bottom_row_cursor() {
+        // Untrusted child output can place the cursor on the region's bottom
+        // row, where `adjusted_n` is 0. With `top == 0` the bottom-up shift used
+        // to spin forever (see the NOTE in `insert_line`). The defensive break
+        // guarantees it returns, so reaching the assert at all proves
+        // termination. `scroll_down` on a 1-row top region reaches the same
+        // degenerate path, so this covers it too.
+        let mut s = Screen::new(2, 3);
+        s.cursor.col = 0;
+        s.cursor.row = 2; // region bottom, with region top == 0
+        s.insert_line(1);
+        assert_eq!(s.buf.len(), 6);
     }
 
     #[test]

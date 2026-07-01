@@ -145,6 +145,15 @@ impl App {
         if use_signal_resize {
             input_loop.uninstall_resize_handler(self.tty.as_ref());
         }
+        // Signal the reader to quit, then provoke a byte so its blocking read
+        // wakes. The reader parks in a blocking `read` on the tty and only
+        // re-checks the quit flag once a byte arrives, so without the wake the
+        // `stop` join below would block until the user's next keypress. A
+        // device-status report round-trips through the terminal to deliver that
+        // byte. Signalling before writing keeps this race-free (see
+        // `Loop::signal_stop`), and we own the writer here so we can drive it.
+        input_loop.signal_stop();
+        let _ = self.vx.device_status_report(&mut self.tty.writer());
         input_loop.stop();
 
         // Restore the terminal on the way out: show the cursor, leave the alt

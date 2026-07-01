@@ -102,21 +102,23 @@ impl InputCore {
         S: FnMut(E),
     {
         match event {
-            // The explicit-width and scaled-text probes encode as an F3 cursor
-            // report. They are only probes while a query batch is outstanding;
-            // once `queries_done`, an F3 is a real key and falls through below.
-            Event::KeyPress(ref key)
-                if !self.shared.queries_done() && is_explicit_width_probe(key) =>
-            {
-                self.shared.update_detected(|caps| {
-                    caps.explicit_width = true;
-                    caps.unicode = gwidth::Method::Unicode;
-                });
-            }
-            Event::KeyPress(ref key)
-                if !self.shared.queries_done() && is_scaled_text_probe(key) =>
-            {
-                self.shared.update_detected(|caps| caps.scaled_text = true);
+            // The explicit-width and scaled-text queries each pair a cursor
+            // home with a cursor-position request, so their reply is an F3
+            // cursor report whose modifier bits encode the column the cursor
+            // landed on. While a query batch is outstanding every F3 is such a
+            // reply, so we fold whatever capability bits it carries and swallow
+            // it. A col-1 reply (the terminal ignored the query) carries no bits
+            // but is still a probe reply, so we must not leak it as a real key.
+            // Once `queries_done`, an F3 is a real key and falls through below.
+            Event::KeyPress(ref key) if !self.shared.queries_done() && key.codepoint == Key::F3 => {
+                if is_explicit_width_probe(key) {
+                    self.shared.update_detected(|caps| {
+                        caps.explicit_width = true;
+                        caps.unicode = gwidth::Method::Unicode;
+                    });
+                } else if is_scaled_text_probe(key) {
+                    self.shared.update_detected(|caps| caps.scaled_text = true);
+                }
             }
 
             Event::CapKittyKeyboard => {
@@ -376,5 +378,24 @@ mod tests {
             })]
         );
         assert!(!shared.detected().explicit_width);
+    }
+
+    #[test]
+    fn plain_f3_probe_reply_is_swallowed_during_queries() {
+        // A terminal that ignores the explicit-width/scaled-text queries leaves
+        // the cursor at home, so its cursor-position reply is a col-1 F3 with no
+        // modifier bits. While queries are outstanding this is still a probe
+        // reply and must not leak as a real key press into the sink.
+        let shared = Shared::new();
+        let mut core = InputCore::new(Arc::clone(&shared));
+        let mut events: Vec<Event> = Vec::new();
+        let mut sink = |event: Event| events.push(event);
+
+        shared.begin_query(Capabilities::default());
+        core.feed(b"\x1b[1;1R", &mut sink).expect("feed");
+
+        assert!(events.is_empty(), "a col-1 F3 probe reply is swallowed");
+        assert!(!shared.detected().explicit_width);
+        assert!(!shared.detected().scaled_text);
     }
 }
