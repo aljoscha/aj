@@ -227,6 +227,13 @@ impl Widget for ScrollBars {
             (sv.scroll.top, sv.scroll.has_more_vertical)
         };
         if self.draw_vertical_scrollbar && !(scroll_top == 0 && !has_more_vertical) {
+            // The bar spans the scroll view, which is one row shorter than the
+            // widget when the horizontal bar is drawn. The thumb must be placed
+            // within this height, not the full `max.height`, or its bottom row
+            // is clipped away when pinned to the end.
+            let bar_height = max
+                .height
+                .saturating_sub(u16::from(self.draw_horizontal_scrollbar));
             let widget_height_f = f32::from(scroll_view_height);
             let total_num_children_f =
                 num::usize_to_f32(total_item_count(&self.scroll_view.borrow()));
@@ -249,14 +256,12 @@ impl Widget for ScrollBars {
                 let thumb_top_f = widget_height_f * top_child_idx_f / total_num_children_f;
                 num::f32_to_u32(thumb_top_f)
             } else {
-                u32::from(max.height.saturating_sub(thumb_height))
+                u32::from(bar_height.saturating_sub(thumb_height))
             };
 
             let mut scroll_bar = Surface::with_size(Size {
                 width: 1,
-                height: max
-                    .height
-                    .saturating_sub(u16::from(self.draw_horizontal_scrollbar)),
+                height: bar_height,
             });
             let cell = if self.is_dragging_vertical_thumb {
                 self.vertical_scrollbar_drag_thumb.clone()
@@ -579,6 +584,87 @@ mod tests {
         scroll_bars.estimated_content_width = None;
         let surface = scroll_bars.draw(&ctx);
         assert_eq!(surface.children.len(), 3);
+    }
+
+    #[test]
+    fn vertical_thumb_pinned_to_bottom_is_not_clipped() {
+        // The vertical bar surface is one row shorter than the widget when the
+        // horizontal bar is enabled. When the view is scrolled to the bottom the
+        // thumb is pinned to the bar's end; it must sit flush inside that
+        // shorter surface, not one row lower where its bottom cell is clipped
+        // away. A clipped thumb loses a row (appears smaller) or, at a one-row
+        // thumb, vanishes entirely.
+        let items: Vec<WidgetRef> = (0..40).map(|i| text(&i.to_string())).collect();
+        let mut sv = ScrollView::new(Source::Slice(items));
+        sv.wheel_scroll = 3;
+
+        let mut sb = ScrollBars::new(sv);
+        // bar_height^2 / estimate = 25 / 12 rounds to a two-row thumb, so a
+        // clip would shrink it to one row and the assertions would catch it.
+        sb.estimated_content_height = Some(12);
+        let inner = Rc::clone(&sb.scroll_view);
+        let scroll_bars: WidgetRef = Rc::new(RefCell::new(sb));
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(8),
+                height: Some(6),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+        let bar_height: u16 = 5; // max.height - horizontal bar row.
+
+        // Drive the inner view to the very bottom, redrawing to reconcile each
+        // wheel step into a concrete scroll position.
+        let _ = draw_widget(&scroll_bars, &ctx);
+        for _ in 0..100 {
+            if !inner.borrow().scroll.has_more_vertical {
+                break;
+            }
+            let mut ec = EventContext::new();
+            let wheel = Event::Mouse(mouse::Mouse {
+                col: 0,
+                row: 0,
+                xoffset: 0,
+                yoffset: 0,
+                button: mouse::Button::WheelDown,
+                mods: mouse::Modifiers::empty(),
+                kind: mouse::Type::Press,
+            });
+            inner.borrow_mut().handle_event(&mut ec, &wheel);
+            let _ = draw_widget(&scroll_bars, &ctx);
+        }
+        assert!(
+            !inner.borrow().scroll.has_more_vertical,
+            "the view should be at the bottom"
+        );
+
+        let surface = draw_widget(&scroll_bars, &ctx);
+
+        // The vertical bar is the width-1 child at the last column.
+        let bar = surface
+            .children
+            .iter()
+            .find(|child| child.surface.size.width == 1 && child.origin.col == 7)
+            .expect("the vertical scroll bar was drawn");
+        assert_eq!(bar.surface.size.height, bar_height);
+
+        let thumb_glyph = "▐";
+        let thumb_rows: Vec<u16> = (0..bar_height)
+            .filter(|&row| bar.surface.read_cell(0, row).char.grapheme() == thumb_glyph)
+            .collect();
+
+        // Two rows tall (the intended height, no row clipped) and flush against
+        // the bar's bottom edge.
+        assert_eq!(thumb_rows, vec![bar_height - 2, bar_height - 1]);
     }
 
     #[test]
