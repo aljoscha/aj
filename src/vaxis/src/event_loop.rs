@@ -172,6 +172,20 @@ impl<E: FromEvent> Loop<E> {
         self.thread = Some(handle);
     }
 
+    /// Signals the reader thread to quit without joining.
+    ///
+    /// A reader parked in a blocking [`ByteSource::read`] only observes the
+    /// quit flag after the next byte arrives, so pair this with a write that
+    /// provokes one (a device-status report is the usual trick) and then call
+    /// [`stop`](Self::stop) to join. Setting the flag *before* the unblocking
+    /// byte is sent is what makes the shutdown race-free: the reader wakes,
+    /// sees the flag, and exits. Because our read/write split keeps the tty
+    /// writer with the app, this two-step dance is how an app reproduces
+    /// upstream's race-free stop, which sent the report from inside `stop`.
+    pub fn signal_stop(&self) {
+        self.should_quit.store(true, Ordering::Relaxed);
+    }
+
     /// Signals the reader to quit and joins it. A no-op if not running.
     ///
     /// NOTE: A reader blocked in a real (blocking) `ByteSource::read` does not
@@ -262,6 +276,28 @@ impl<E: FromEvent> Loop<E> {
     /// Posts an event without blocking. Returns `false` if the queue is full.
     pub fn try_post_event(&self, event: E) -> bool {
         self.queue.try_push(event)
+    }
+}
+
+/// The `PosixTty`-wired constructor, unix only. Mirrors upstream's
+/// `Loop.init(io, &tty, &vx)`, which our read/write split otherwise forces each
+/// app to assemble by hand.
+#[cfg(unix)]
+impl<E: FromEvent> Loop<E> {
+    /// Builds a threaded loop wired to a [`PosixTty`](crate::tty::PosixTty).
+    ///
+    /// The byte source is an independent read handle over the same terminal
+    /// (via [`PosixTty::dup_reader`](crate::tty::PosixTty::dup_reader)) so the
+    /// reader thread can read while the app writes through `tty`. The tty's
+    /// window size is installed as the [`WinsizeSource`], which the reader uses
+    /// for the initial winsize event and which
+    /// [`install_resize_handler`](Self::install_resize_handler) needs.
+    pub fn init(tty: &crate::tty::PosixTty, vx: &crate::vaxis::Vaxis) -> io::Result<Self> {
+        let source = tty.dup_reader()?;
+        let winsize_reader = tty.dup_reader()?;
+        let mut input_loop = Loop::new(Box::new(source), vx.shared());
+        input_loop.set_winsize_source(Arc::new(move || winsize_reader.winsize()));
+        Ok(input_loop)
     }
 }
 

@@ -44,6 +44,17 @@ pub use vaxis_derive::TableRow;
 /// macro. Trait and macro share a name but live in different namespaces.
 pub use crate::widgets::table::TableRow;
 
+/// The vaxis logo, in PixelCode block glyphs. Four lines joined by `\n`, 28
+/// columns wide, with no trailing newline.
+///
+/// Named `LOGO` (upstream `logo`) to satisfy the const-naming lint.
+pub const LOGO: &str = concat!(
+    "▄   ▄  ▄▄▄  ▄   ▄ ▄▄▄  ▄▄▄\n",
+    "█   █ █▄▄▄█ ▀▄ ▄▀  █  █   ▀\n",
+    "▀▄ ▄▀ █   █  ▄▀▄   █   ▀▀▀▄\n",
+    " ▀▄▀  █   █ █   █ ▄█▄ ▀▄▄▄▀",
+);
+
 /// Terminal window size in character cells and pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Winsize {

@@ -80,6 +80,59 @@ impl PosixTty {
             fd: raw_fd,
         })
     }
+
+    /// Duplicates the terminal fd for independent reading on another thread.
+    ///
+    /// The returned [`TtyReader`] refers to the same terminal as `self` (and so
+    /// shares its raw mode) through a duplicated fd. That lets a threaded
+    /// [`Loop`](crate::event_loop::Loop) read input on its own thread while the
+    /// app writes through this `PosixTty`. Reads and writes on a tty are
+    /// independent, so the split is sound.
+    pub(crate) fn dup_reader(&self) -> io::Result<TtyReader> {
+        // SAFETY: `self.fd` is open for the lifetime of `self`; we only borrow
+        // it long enough to dup a fresh owned fd.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        Ok(TtyReader {
+            fd: borrowed.try_clone_to_owned()?,
+        })
+    }
+}
+
+/// An independent blocking read handle over the terminal a [`PosixTty`] owns.
+///
+/// Produced by [`PosixTty::dup_reader`]. Reads block until at least one byte is
+/// available (VMIN=1), matching the tty's raw-mode setup. Implements
+/// [`std::io::Read`] so it is a [`ByteSource`](crate::event_loop::ByteSource)
+/// for the threaded loop, and exposes the window size for the loop's
+/// [`WinsizeSource`](crate::event_loop::WinsizeSource).
+pub(crate) struct TtyReader {
+    fd: OwnedFd,
+}
+
+impl TtyReader {
+    /// The terminal's current window size, via `TIOCGWINSZ`.
+    pub(crate) fn winsize(&self) -> io::Result<Winsize> {
+        let mut ws = nix::libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `self.fd` is an open tty and `ws` is a valid out parameter.
+        unsafe { tiocgwinsz(self.fd.as_raw_fd(), &mut ws)? };
+        Ok(Winsize {
+            rows: ws.ws_row,
+            cols: ws.ws_col,
+            x_pixel: ws.ws_xpixel,
+            y_pixel: ws.ws_ypixel,
+        })
+    }
+}
+
+impl io::Read for TtyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Ok(nix::unistd::read(self.fd.as_raw_fd(), buf)?)
+    }
 }
 
 impl Tty for PosixTty {
