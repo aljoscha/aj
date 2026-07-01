@@ -12,12 +12,18 @@
 //! one immediate-mode and one retained-mode.
 
 pub mod alignment;
+pub mod code_view;
 pub mod line_numbers;
 pub mod scroll_view;
 pub mod scrollbar;
 pub mod text_input;
+pub mod text_view;
+pub mod view;
 
+pub use crate::widgets::code_view::CodeView;
 pub use crate::widgets::line_numbers::LineNumbers;
 pub use crate::widgets::scroll_view::ScrollView;
 pub use crate::widgets::scrollbar::Scrollbar;
 pub use crate::widgets::text_input::TextInput;
+pub use crate::widgets::text_view::{Buffer, BufferWriter, TextView};
+pub use crate::widgets::view::View;
