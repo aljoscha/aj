@@ -125,10 +125,9 @@ The split:
   (`from_json`/`from_json_with_mode`/`load`), and the file watcher
   (`watch_user_theme`, `ThemeWatcherGuard`). `Theme` changes to store a
   **structured color value** per token instead of an ANSI string. Concretely,
-  `fg: HashMap<ThemeColor, ThemeRgb>` where `ThemeRgb` is the resolved color
-  (RGB triple, with the `ColorMode` retained on the `Theme` for backends that
-  downsample). The parse step stores the resolved RGB rather than calling
-  `fg_ansi`.
+  `fg: HashMap<ThemeColor, ThemeRgb>` where `ThemeRgb` is the resolved color,
+  with the `ColorMode` retained on the `Theme` for backends that downsample. The
+  parse step stores the resolved color rather than calling `fg_ansi`.
 - **`ThemeHandle` moves to `aj-app` as a generic holder:** `Arc<RwLock<Theme>>`
   with `read()`, `replace()`, `name()`, `color_mode()`. The hot-reload
   mechanism (RwLock + watcher-fed `replace`) is backend-neutral. What does *not*
@@ -143,11 +142,16 @@ The split:
 - **`aj-next` writes its own** builders that read structured colors from the
   shared `Theme` and produce `vaxis::cell::Style`/`Color` values.
 
-Open point (small): the exact shape of `ThemeRgb`. Recommendation: store the
-resolved RGB triple plus keep `ColorMode` on `Theme`, and let each backend
-downsample (`aj` via the existing `fg_ansi` path, `aj-next` by handing
-`Color::Rgb` to vaxis, which already renders per terminal capability). We do not
-pre-downsample in `aj-app`, so no color fidelity is lost at the boundary.
+`ThemeRgb` is the resolved-color type, promoted from the loader's existing
+internal `ResolvedColor` to a public three-variant enum: `Rgb(u8, u8, u8)`,
+`Ansi256(u8)` (an explicit palette index, e.g. a JSON integer color value), and
+`Default` (the terminal default, the empty JSON value used by most text tokens).
+A bare RGB triple would be wrong: it would lose the palette-index and
+terminal-default cases the JSON schema already supports. `ColorMode` stays on
+`Theme`, and each backend downsamples (`aj` via the existing `fg_ansi` path,
+`aj-next` by handing the variant to vaxis, which renders per terminal
+capability). We do not pre-downsample in `aj-app`, so no color fidelity is lost
+at the boundary.
 
 #### 2c. Footer data (`modes/interactive/footer_data.rs`)
 
@@ -309,10 +313,11 @@ switching/new/resume and turn cancellation behave identically.
 
 - **D-1. Crate name. Resolved: `aj-app`.**
 - **D-2. Theme storage. Resolved: change it.** `aj-app`'s `Theme` stores a
-  structured color per token (`ThemeRgb` = resolved RGB, with `ColorMode`
-  retained on `Theme`); each backend downsamples. No fidelity loss at the
-  boundary. This changes `aj`'s theme storage from pre-baked ANSI strings to
-  structured colors, which is well-tested and low risk.
+  structured color per token (`ThemeRgb`, a three-variant enum of
+  `Rgb`/`Ansi256`/`Default`, with `ColorMode` retained on `Theme`); each backend
+  downsamples. No fidelity loss at the boundary. This changes `aj`'s theme
+  storage from pre-baked ANSI strings to structured colors, which is well-tested
+  and low risk.
 - **D-3. Turn seam. Resolved: split, do not move `spawn_turn`.** `spawn_turn`
   today mixes pure decision logic (which agent, what config to apply, what turn
   policy) with run-loop mechanics (a `JoinSet` of in-flight turns and a per-turn
