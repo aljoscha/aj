@@ -53,6 +53,35 @@ pub enum SessionEntry {
     Switch,
 }
 
+/// Why a session's run loop returned.
+pub enum SessionExit {
+    /// The user quit (Ctrl+C / the quit command, or the terminal
+    /// stream ended); the process shuts down.
+    Quit,
+    /// A resume pick: rebuild onto the identified session.
+    Switch(String),
+    /// New session: rebuild onto a freshly minted session.
+    New,
+}
+
+/// A session change requested by a command or selector. The session's
+/// run loop maps it onto a [`SessionExit`] so the host can tear down
+/// the current session and build the next one. Only emitted with no
+/// turn in flight.
+pub enum SessionRequest {
+    New,
+    Resume(String),
+}
+
+impl SessionRequest {
+    pub fn into_exit(self) -> SessionExit {
+        match self {
+            SessionRequest::New => SessionExit::New,
+            SessionRequest::Resume(id) => SessionExit::Switch(id),
+        }
+    }
+}
+
 /// Loop-side staged settings for one sub-agent. Each axis is
 /// `Some(..)` only if the user changed it for this agent; axes left
 /// `None` keep whatever the agent itself holds (its spawn-time

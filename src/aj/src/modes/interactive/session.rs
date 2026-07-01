@@ -29,7 +29,8 @@ use crate::modes::interactive::render_settings::RenderSettings;
 use crate::session_setup::{RestoreContext, RunConfigSnapshot};
 
 pub use aj_app::session::{
-    AgentLifecycle, SessionCore, SessionEntry, SessionSpec, SubAgentOverrides,
+    AgentLifecycle, SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec,
+    SubAgentOverrides,
 };
 
 /// The application name shown in the header notice and the terminal

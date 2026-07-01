@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
-use aj_agent::{Agent, TurnError, sub_agent_session_id};
+use aj_agent::{Agent, TurnError};
 use aj_conf::{
     AgentEnv, Config, ConfigLayer, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel,
     ConfigVerbosity, Severity, SystemPromptSource, display_path,
@@ -112,7 +112,7 @@ use crate::modes::interactive::event_pump::{
 use crate::modes::interactive::layout::{SlotIndex, build_layout};
 use crate::modes::interactive::render_settings::RenderSettings;
 use crate::modes::interactive::session::{
-    SessionCore, SessionEntry, SessionSpec, SessionWorld, SubAgentOverrides,
+    SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec, SessionWorld,
 };
 use crate::modes::interactive::shutdown::{
     print_resume_hint, print_session_usage, print_usage_summary,
@@ -941,35 +941,6 @@ fn build_next_world(
     }
 }
 
-/// Why [`run_session`]'s per-session loop returned.
-enum SessionExit {
-    /// The user quit (Ctrl+C / the quit command, or the terminal
-    /// stream ended); the process shuts down.
-    Quit,
-    /// A resume pick: rebuild onto the identified session.
-    Switch(String),
-    /// New session: rebuild onto a freshly minted session.
-    New,
-}
-
-/// A session change requested by a command or selector. The
-/// per-session loop maps it onto a [`SessionExit`] so the outer
-/// loop in [`InteractiveMode::run`] can tear down the current world
-/// and build the next one. Only emitted with no turn in flight.
-enum SessionRequest {
-    New,
-    Resume(String),
-}
-
-impl SessionRequest {
-    fn into_exit(self) -> SessionExit {
-        match self {
-            SessionRequest::New => SessionExit::New,
-            SessionRequest::Resume(id) => SessionExit::Switch(id),
-        }
-    }
-}
-
 /// Drive one session world until the user quits, a session change
 /// is requested, or a fatal error occurs.
 ///
@@ -1026,7 +997,7 @@ async fn run_session(
             &shell.run_config,
             AgentId::Main,
             TurnStart::Content(launch_content),
-            turn_policy(AgentId::Main, &shell.config),
+            crate::turn::turn_policy(AgentId::Main, &shell.config),
             &mut turns,
             &mut turn_cancels,
         );
@@ -1076,7 +1047,7 @@ async fn run_session(
                                 id,
                                 &world.core,
                                 &shell.run_config,
-                                turn_policy(id, &shell.config),
+                                crate::turn::turn_policy(id, &shell.config),
                                 &mut turns,
                                 &mut turn_cancels,
                             );
@@ -1405,7 +1376,7 @@ async fn run_session(
                                         &shell.run_config,
                                         target,
                                         text,
-                                        turn_policy(target, &shell.config),
+                                        crate::turn::turn_policy(target, &shell.config),
                                         &mut turns,
                                         &mut turn_cancels,
                                     ) {
@@ -1809,7 +1780,7 @@ async fn run_session(
                                                         aj_agent::events::CompactionReason::Manual,
                                                     instructions: None,
                                                 },
-                                                turn_policy(AgentId::Main, &shell.config),
+                                                crate::turn::turn_policy(AgentId::Main, &shell.config),
                                                 &mut turns,
                                                 &mut turn_cancels,
                                             );
@@ -1913,7 +1884,7 @@ async fn run_session(
                                 &shell.run_config,
                                 target,
                                 trimmed,
-                                turn_policy(target, &shell.config),
+                                crate::turn::turn_policy(target, &shell.config),
                                 &mut turns,
                                 &mut turn_cancels,
                             ) {
@@ -1942,7 +1913,7 @@ async fn run_session(
                         *agent_id,
                         &world.core,
                         &shell.run_config,
-                        turn_policy(*agent_id, &shell.config),
+                        crate::turn::turn_policy(*agent_id, &shell.config),
                         &mut turns,
                         &mut turn_cancels,
                     );
@@ -1963,7 +1934,7 @@ async fn run_session(
                         *agent_id,
                         &world.core,
                         &shell.run_config,
-                        turn_policy(*agent_id, &shell.config),
+                        crate::turn::turn_policy(*agent_id, &shell.config),
                         &mut turns,
                         &mut turn_cancels,
                     );
@@ -2041,93 +2012,6 @@ async fn recv_event(rx: &mut UnboundedReceiver<AgentEvent>) -> Option<AgentEvent
     rx.recv().await
 }
 
-/// Apply the loop-side staged settings to the agent about to run a
-/// turn.
-///
-/// **Main** stamps the full [`RunConfigSnapshot`]: the run config is
-/// the main agent's configuration — the selectors stage into it and
-/// it persists to `config.toml` — so a main turn picks up any model /
-/// thinking change made since the last turn.
-///
-/// **Sub-agents** own their settings (inherited from the parent at
-/// spawn); only the axes the user explicitly staged in
-/// `sub_overrides` are applied. Entries are kept (not drained) and
-/// re-applied idempotently each turn — an entry is the user's
-/// standing choice for that agent. A sub-agent with no entry stamps
-/// nothing and runs with whatever it already holds.
-fn apply_turn_config(
-    target: AgentId,
-    agent: &mut Agent,
-    run_config: &std::sync::Mutex<RunConfigSnapshot>,
-    sub_overrides: &std::sync::Mutex<HashMap<usize, SubAgentOverrides>>,
-) {
-    match target {
-        AgentId::Main => {
-            let cfg = run_config.lock().expect("run config mutex poisoned");
-            // Re-stamp the session's prompt-cache key every turn: a
-            // mid-session model swap rebuilds `stream_options` from
-            // registry defaults, which carry none, so we restore it
-            // from the durable `session_id`.
-            let mut stream_options = cfg.stream_options.clone();
-            stream_options.session_id = cfg.session_id.clone();
-            agent.set_provider(
-                Arc::clone(&cfg.provider),
-                Arc::clone(&cfg.model_info),
-                stream_options,
-            );
-            agent.set_default_thinking(cfg.thinking.clone());
-            agent.set_speed(cfg.speed);
-        }
-        AgentId::Sub(n) => {
-            // Base session key used to scope the sub-agent's bundle
-            // below. Cloned out so we don't hold the run-config lock
-            // while taking the sub-overrides lock.
-            let base_session_id = run_config
-                .lock()
-                .expect("run config mutex poisoned")
-                .session_id
-                .clone();
-            let overrides = sub_overrides.lock().expect("sub overrides mutex poisoned");
-            let Some(entry) = overrides.get(&n) else {
-                return;
-            };
-            if let Some((provider, model_info, stream_options, _)) = &entry.bundle {
-                // The override bundle came from `from_model_info`
-                // (registry defaults, no cache key), so re-scope it to
-                // this sub-agent's id, matching what the spawn path
-                // stamps. A sub-agent with no bundle override keeps the
-                // scoped key it was spawned with.
-                let mut stream_options = stream_options.clone();
-                if let Some(base) = &base_session_id {
-                    stream_options.session_id = Some(sub_agent_session_id(base, n));
-                }
-                agent.set_provider(Arc::clone(provider), Arc::clone(model_info), stream_options);
-            }
-            if let Some(thinking) = &entry.thinking {
-                agent.set_default_thinking(thinking.clone());
-            }
-            if let Some(speed) = entry.speed {
-                agent.set_speed(speed);
-            }
-        }
-    }
-}
-
-/// Build the per-agent [`TurnPolicy`]. The Main agent gets reactive
-/// overflow recovery and threshold compaction (both gated on
-/// `auto_compact`); a sub-agent continuation gets neither, since
-/// compaction operates on the log's USER (Main) thread. Queued-work
-/// delivery is not a policy knob — the loop wakes idle agents directly.
-fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnPolicy {
-    let c = config.lock().expect("config mutex poisoned");
-    let main = target == AgentId::Main;
-    TurnPolicy {
-        recover_overflow: main && c.auto_compact,
-        auto_threshold: (main && c.auto_compact).then_some(c.compact_threshold),
-        keep_recent: c.compact_keep_recent,
-    }
-}
-
 /// Spawn a turn sequence for `target` onto `turns`: resolve the agent
 /// handle, mint the per-sequence cancel token (into `turn_cancels`,
 /// which Ctrl+C fires), and drive `start` plus its automatic
@@ -2160,7 +2044,12 @@ fn spawn_turn(
             &policy,
             start,
             |agent: &mut Agent| {
-                apply_turn_config(target, agent, &run_config_for_turn, &sub_overrides_for_turn);
+                crate::turn::apply_turn_config(
+                    target,
+                    agent,
+                    &run_config_for_turn,
+                    &sub_overrides_for_turn,
+                );
             },
             turn_cancel,
         )
@@ -5371,6 +5260,7 @@ mod tests {
         build_test_world, create_spec, drive_turn, finalized_text_message, one_turn_session,
         resume_spec, scripted_model_info, scripted_run_config,
     };
+    use crate::turn::apply_turn_config;
 
     /// Build an [`AgentEnv`] for use in the helper tests below.
     /// Working directory / OS / date / git root are all stubbed —

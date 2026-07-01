@@ -14,10 +14,12 @@
 //! driven here. Mid-turn steering is drained inside the agent's own
 //! turn loop, a layer below this.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use aj_agent::events::{AgentEvent, CompactionReason};
-use aj_agent::{Agent, TurnError};
+use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
+use aj_agent::{Agent, TurnError, sub_agent_session_id};
+use aj_conf::Config;
 use aj_models::errors::is_context_overflow;
 use aj_models::types::UserContent;
 use aj_session::ConversationLog;
@@ -26,6 +28,8 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::run_compaction;
+use crate::session::SubAgentOverrides;
+use crate::session_setup::RunConfigSnapshot;
 
 /// How a turn sequence begins.
 pub enum TurnStart {
@@ -61,6 +65,93 @@ pub struct TurnPolicy {
     pub auto_threshold: Option<f64>,
     /// Recent-tail budget kept verbatim across a compaction.
     pub keep_recent: u64,
+}
+
+/// Build the per-agent [`TurnPolicy`]. The Main agent gets reactive
+/// overflow recovery and threshold compaction (both gated on
+/// `auto_compact`); a sub-agent continuation gets neither, since
+/// compaction operates on the log's USER (Main) thread. Queued-work
+/// delivery is not a policy knob — the loop wakes idle agents directly.
+pub fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnPolicy {
+    let c = config.lock().expect("config mutex poisoned");
+    let main = target == AgentId::Main;
+    TurnPolicy {
+        recover_overflow: main && c.auto_compact,
+        auto_threshold: (main && c.auto_compact).then_some(c.compact_threshold),
+        keep_recent: c.compact_keep_recent,
+    }
+}
+
+/// Apply the loop-side staged settings to the agent about to run a
+/// turn.
+///
+/// **Main** stamps the full [`RunConfigSnapshot`]: the run config is
+/// the main agent's configuration — the selectors stage into it and
+/// it persists to `config.toml` — so a main turn picks up any model /
+/// thinking change made since the last turn.
+///
+/// **Sub-agents** own their settings (inherited from the parent at
+/// spawn); only the axes the user explicitly staged in
+/// `sub_overrides` are applied. Entries are kept (not drained) and
+/// re-applied idempotently each turn — an entry is the user's
+/// standing choice for that agent. A sub-agent with no entry stamps
+/// nothing and runs with whatever it already holds.
+pub fn apply_turn_config(
+    target: AgentId,
+    agent: &mut Agent,
+    run_config: &std::sync::Mutex<RunConfigSnapshot>,
+    sub_overrides: &std::sync::Mutex<HashMap<usize, SubAgentOverrides>>,
+) {
+    match target {
+        AgentId::Main => {
+            let cfg = run_config.lock().expect("run config mutex poisoned");
+            // Re-stamp the session's prompt-cache key every turn: a
+            // mid-session model swap rebuilds `stream_options` from
+            // registry defaults, which carry none, so we restore it
+            // from the durable `session_id`.
+            let mut stream_options = cfg.stream_options.clone();
+            stream_options.session_id = cfg.session_id.clone();
+            agent.set_provider(
+                Arc::clone(&cfg.provider),
+                Arc::clone(&cfg.model_info),
+                stream_options,
+            );
+            agent.set_default_thinking(cfg.thinking.clone());
+            agent.set_speed(cfg.speed);
+        }
+        AgentId::Sub(n) => {
+            // Base session key used to scope the sub-agent's bundle
+            // below. Cloned out so we don't hold the run-config lock
+            // while taking the sub-overrides lock.
+            let base_session_id = run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .session_id
+                .clone();
+            let overrides = sub_overrides.lock().expect("sub overrides mutex poisoned");
+            let Some(entry) = overrides.get(&n) else {
+                return;
+            };
+            if let Some((provider, model_info, stream_options, _)) = &entry.bundle {
+                // The override bundle came from `from_model_info`
+                // (registry defaults, no cache key), so re-scope it to
+                // this sub-agent's id, matching what the spawn path
+                // stamps. A sub-agent with no bundle override keeps the
+                // scoped key it was spawned with.
+                let mut stream_options = stream_options.clone();
+                if let Some(base) = &base_session_id {
+                    stream_options.session_id = Some(sub_agent_session_id(base, n));
+                }
+                agent.set_provider(Arc::clone(provider), Arc::clone(model_info), stream_options);
+            }
+            if let Some(thinking) = &entry.thinking {
+                agent.set_default_thinking(thinking.clone());
+            }
+            if let Some(speed) = entry.speed {
+                agent.set_speed(speed);
+            }
+        }
+    }
 }
 
 /// Message appended to the error chain when overflow recovery's retry
