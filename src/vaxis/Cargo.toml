@@ -21,6 +21,7 @@ signal-hook = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }
+ignore = { workspace = true }
 
 [lints]
 workspace = true

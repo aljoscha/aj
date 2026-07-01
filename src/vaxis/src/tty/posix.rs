@@ -88,7 +88,11 @@ impl PosixTty {
     /// [`Loop`](crate::event_loop::Loop) read input on its own thread while the
     /// app writes through this `PosixTty`. Reads and writes on a tty are
     /// independent, so the split is sound.
-    pub(crate) fn dup_reader(&self) -> io::Result<TtyReader> {
+    ///
+    /// This is also the read side an [`App`](crate::vxfw::App) needs: pass the
+    /// returned reader as the `source` to [`App::new`](crate::vxfw::App::new)
+    /// while the `PosixTty` itself is the writer-side `tty`.
+    pub fn dup_reader(&self) -> io::Result<TtyReader> {
         // SAFETY: `self.fd` is open for the lifetime of `self`; we only borrow
         // it long enough to dup a fresh owned fd.
         let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
@@ -105,7 +109,7 @@ impl PosixTty {
 /// [`std::io::Read`] so it is a [`ByteSource`](crate::event_loop::ByteSource)
 /// for the threaded loop, and exposes the window size for the loop's
 /// [`WinsizeSource`](crate::event_loop::WinsizeSource).
-pub(crate) struct TtyReader {
+pub struct TtyReader {
     fd: OwnedFd,
 }
 

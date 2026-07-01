@@ -28,7 +28,7 @@ mod test_backend;
 mod windows;
 
 #[cfg(unix)]
-pub use crate::tty::posix::{PosixTty, recover};
+pub use crate::tty::posix::{PosixTty, TtyReader, recover};
 pub use crate::tty::test_backend::TestTty;
 #[cfg(windows)]
 pub use crate::tty::windows::WindowsTty;

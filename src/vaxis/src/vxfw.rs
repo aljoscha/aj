@@ -138,6 +138,18 @@ pub fn draw_widget(w: &WidgetRef, ctx: &DrawContext) -> Surface {
     surface
 }
 
+/// Type-erases a concrete widget handle into a [`WidgetRef`].
+///
+/// A composite widget often holds its children as typed `Rc<RefCell<W>>`
+/// handles so it can reach their concrete API (a `Button`'s label, a
+/// `ListView`'s cursor), yet must also hand them to [`draw_widget`], focus
+/// requests, or a list [`Source`] as a `WidgetRef`. This performs the unsized
+/// coercion, which is otherwise awkward to spell on a cloned `Rc`: the coercion
+/// only applies to an owned value, not through the reference `Rc::clone` takes.
+pub fn to_widget_ref<W: Widget + 'static>(widget: Rc<RefCell<W>>) -> WidgetRef {
+    widget
+}
+
 /// The user-facing event delivered to widgets.
 ///
 /// NOTE: This is distinct from the internal [`crate::event::Event`] superset

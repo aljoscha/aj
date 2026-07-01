@@ -146,6 +146,16 @@ impl App {
             input_loop.uninstall_resize_handler(self.tty.as_ref());
         }
         input_loop.stop();
+
+        // Restore the terminal on the way out: show the cursor, leave the alt
+        // screen, and disable mouse and bracketed paste. Upstream does this in
+        // `app.deinit()`. Best-effort so we do not mask the loop's result, and
+        // we flush because the writer is buffered and the reset bytes must reach
+        // the terminal before the app returns (e.g. before a caller prints to
+        // stdout).
+        let _ = self.vx.reset_state(&mut self.tty.writer());
+        let _ = self.tty.writer().flush();
+
         result
     }
 
