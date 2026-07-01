@@ -3338,12 +3338,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "unicode-segmentation",
+ "vaxis-derive",
  "vaxis-ucd",
 ]
 
 [[package]]
 name = "vaxis-derive"
 version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "vaxis-ucd"

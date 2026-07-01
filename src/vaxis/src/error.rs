@@ -52,4 +52,9 @@ pub enum Error {
     /// Decoding or encoding an image failed.
     #[error(transparent)]
     Image(#[from] image::ImageError),
+
+    /// A [`Table`](crate::widgets::table) draw failed, e.g. a width style did
+    /// not provide enough static column widths.
+    #[error(transparent)]
+    Table(#[from] crate::widgets::table::TableError),
 }

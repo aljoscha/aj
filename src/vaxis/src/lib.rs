@@ -35,6 +35,15 @@ pub mod window;
 
 pub use crate::error::Error;
 
+/// The `#[derive(TableRow)]` macro. Lives in the macro namespace, so importing
+/// it alongside the [`TableRow`](crate::widgets::table::TableRow) trait via a
+/// single `use vaxis::TableRow` brings both into scope.
+pub use vaxis_derive::TableRow;
+
+/// The `TableRow` trait, re-exported at the crate root next to its derive
+/// macro. Trait and macro share a name but live in different namespaces.
+pub use crate::widgets::table::TableRow;
+
 /// Terminal window size in character cells and pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Winsize {
