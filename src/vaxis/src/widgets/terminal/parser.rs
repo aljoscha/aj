@@ -7,13 +7,18 @@
 //!
 //! ## Input model
 //!
-//! [`Parser::parse_reader`] pulls one [`Event`] per call from any
-//! [`std::io::BufRead`]. Tests feed a byte slice through a
-//! [`std::io::Cursor`], whose `BufRead` returns all remaining bytes at once,
-//! and pull events until [`ParseError::Eof`]. This reproduces upstream's
-//! "flush the accumulated print run when the reader's buffer drains or a
-//! control byte is hit" rule: a print event ends as soon as no more bytes are
-//! immediately available (`fill_buf` empty) or a control byte appears.
+//! [`Parser::parse_reader`] pulls one [`Event`] per call from a reader that is
+//! both [`std::io::BufRead`] and [`BufferedLen`], and callers pull events until
+//! [`ParseError::Eof`]. A print run ends when a control byte appears or when the
+//! bytes already available drain, reproducing upstream's "flush the accumulated
+//! print run when the reader's buffer drains or a control byte is hit" rule.
+//!
+//! The drain check must not itself block. On a live (blocking) stream, asking
+//! "is there more right now?" via `fill_buf` would park until the next byte, so
+//! a trailing all-printable run (a shell prompt, an echoed keystroke) would
+//! stall until a control byte finally arrived. [`BufferedLen`] answers from the
+//! bytes already buffered, without a refill, mirroring upstream's
+//! `Reader.bufferedLen()`.
 //!
 //! ## Pending byte
 //!
@@ -21,7 +26,32 @@
 //! of the run. That byte is stashed in [`Parser::pending_byte`] and consumed
 //! first on the next call, so the control sequence it begins is parsed intact.
 
-use std::io::BufRead;
+use std::io::{BufRead, BufReader, Cursor, Read};
+
+/// Count of bytes a reader can yield without a blocking refill.
+///
+/// [`Parser::parse_ground`] ends a print run the instant these drain, so the
+/// answer must never trigger a read. `BufRead` alone cannot express this
+/// (`fill_buf` refills when its buffer is empty), so the parser requires this
+/// alongside it.
+pub trait BufferedLen {
+    /// Bytes currently available without reading from the underlying source.
+    fn buffered_len(&self) -> usize;
+}
+
+impl<R: Read> BufferedLen for BufReader<R> {
+    fn buffered_len(&self) -> usize {
+        self.buffer().len()
+    }
+}
+
+impl<T: AsRef<[u8]>> BufferedLen for Cursor<T> {
+    fn buffered_len(&self) -> usize {
+        let inner = self.get_ref().as_ref();
+        let pos = usize::try_from(self.position()).unwrap_or(inner.len());
+        inner.len().saturating_sub(pos)
+    }
+}
 
 use thiserror::Error;
 
@@ -80,7 +110,10 @@ impl Parser {
     ///
     /// Returns [`ParseError::Eof`] when the reader is exhausted, which for a
     /// finite input marks the end of the event stream.
-    pub fn parse_reader<R: BufRead>(&mut self, reader: &mut R) -> Result<Event, ParseError> {
+    pub fn parse_reader<R: BufRead + BufferedLen>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Event, ParseError> {
         self.buf.clear();
         loop {
             let b = match self.pending_byte.take() {
@@ -136,7 +169,10 @@ impl Parser {
     /// Reads whole UTF-8 sequences (length taken from the leading byte) and
     /// stops when the reader's buffer drains or a control byte is hit, stashing
     /// that control byte in [`Parser::pending_byte`].
-    fn parse_ground<R: BufRead>(&mut self, reader: &mut R) -> Result<Event, ParseError> {
+    fn parse_ground<R: BufRead + BufferedLen>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Event, ParseError> {
         debug_assert!(!self.buf.is_empty());
 
         // Finish the first codepoint's continuation bytes.
@@ -146,7 +182,7 @@ impl Parser {
         }
 
         loop {
-            if buffered_len(reader)? == 0 {
+            if reader.buffered_len() == 0 {
                 return Ok(Event::Print(self.buf.clone()));
             }
             let b = take_byte(reader)?;
@@ -264,11 +300,6 @@ fn discard_one<R: BufRead>(reader: &mut R) -> Result<(), ParseError> {
     }
     reader.consume(1);
     Ok(())
-}
-
-/// Returns the number of bytes immediately available without a further read.
-fn buffered_len<R: BufRead>(reader: &mut R) -> Result<usize, ParseError> {
-    Ok(reader.fill_buf()?.len())
 }
 
 /// Skips bytes until an ST (`ESC \`).
@@ -478,5 +509,57 @@ mod tests {
         // A DCS is skipped; the ST's trailing '\' is parsed as a print. This
         // pins the documented skip_until_st behavior.
         assert_eq!(parse_all(b"\x1bPq;data\x1b\\X"), vec![print("\\X")]);
+    }
+
+    /// A reader that yields its bytes but treats reading past them as a block:
+    /// any `fill_buf` with nothing available panics. It stands in for a live
+    /// PTY that is waiting on the child, so a test can assert the parser never
+    /// blocks to end a print run.
+    struct BlockingAfterAvailable<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl Read for BlockingAfterAvailable<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let src = self.fill_buf()?;
+            let n = src.len().min(out.len());
+            out[..n].copy_from_slice(&src[..n]);
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for BlockingAfterAvailable<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            assert!(
+                self.pos < self.data.len(),
+                "parser read past the available bytes: on a live stream this would block"
+            );
+            Ok(&self.data[self.pos..])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.pos += amt;
+        }
+    }
+
+    impl BufferedLen for BlockingAfterAvailable<'_> {
+        fn buffered_len(&self) -> usize {
+            self.data.len() - self.pos
+        }
+    }
+
+    #[test]
+    fn trailing_print_run_flushes_without_blocking() {
+        // A shell prompt tail: all printable, no trailing control byte. The
+        // parser must emit it once the available bytes drain, not park waiting
+        // for a byte that (on a live stream) only arrives after the next key.
+        let mut parser = Parser::new();
+        let mut reader = BlockingAfterAvailable {
+            data: b"$ ",
+            pos: 0,
+        };
+        assert_eq!(parser.parse_reader(&mut reader).unwrap(), print("$ "));
     }
 }
