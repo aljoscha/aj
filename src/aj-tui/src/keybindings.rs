@@ -480,6 +480,11 @@ pub fn tui_keybindings() -> KeybindingDefinitions {
             "tui.select.cancel".to_string(),
             K::new(["escape", "ctrl+c"], "Cancel selection"),
         ),
+        // Usage overlay actions
+        (
+            "tui.usage.reset".to_string(),
+            K::new("r", "Use a rate-limit reset"),
+        ),
     ]
 }
 

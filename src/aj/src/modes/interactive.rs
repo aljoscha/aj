@@ -105,7 +105,7 @@ use crate::modes::interactive::components::thinking_selector::{
     OutcomeHandle as ThinkingOutcomeHandle, ThinkingSelectorComponent, ThinkingSelectorOutcome,
 };
 use crate::modes::interactive::components::usage_status::{
-    UsageStatusComponent, UsageStatusOutcomeHandle,
+    UsageActionDeps, UsageStatusComponent, UsageStatusOutcomeHandle,
 };
 use crate::modes::interactive::editor_ext::{DEFAULT_MAX_ENTRIES, PromptHistory};
 use crate::modes::interactive::event_pump::{
@@ -3708,7 +3708,15 @@ async fn handle_command(
                 }
             });
 
-            let inner = UsageStatusComponent::new(select_list_theme(theme), rx);
+            // Dependencies for the in-overlay reset-credit action: it
+            // spends a credit and refetches without leaving the overlay.
+            let deps = UsageActionDeps {
+                auth: auth.clone(),
+                reset_sources: aj_models::usage::default_reset_sources(),
+                runtime: tokio::runtime::Handle::current(),
+                render: tui.handle(),
+            };
+            let inner = UsageStatusComponent::new(select_list_theme(theme), rx, deps);
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Usage",
@@ -3716,7 +3724,15 @@ async fn handle_command(
                 crate::config::theme::overlay_window_theme(theme),
                 PALETTE_OVERLAY_INNER_ROWS,
             )
-            .with_subtitle(&subtitle_close());
+            // The hint tracks the reset-credit state machine, so resolve
+            // it from the component each frame.
+            .with_dynamic_subtitle(|child| {
+                child
+                    .as_any()
+                    .downcast_ref::<UsageStatusComponent>()
+                    .map(UsageStatusComponent::footer_hint)
+                    .unwrap_or_default()
+            });
             let handle = tui.show_overlay(Box::new(window), palette_overlay_options());
             CommandOutcome::Continue {
                 selector: Some(OpenSelector::UsageStatus { handle, outcome }),
