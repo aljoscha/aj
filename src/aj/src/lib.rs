@@ -15,7 +15,7 @@
 //!
 //! [`AgentEvent`]: aj_agent::events::AgentEvent
 
-pub use aj_app::{auth, cli, clipboard, export, model, session_setup, turn, usage};
+pub use aj_app::{auth, cli, clipboard, export, model, session, session_setup, turn, usage};
 
 pub mod config;
 pub mod modes;

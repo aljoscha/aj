@@ -73,6 +73,7 @@ pub(crate) fn build_test_world(
 /// persistence listener writes real entries into the log.
 pub(crate) async fn drive_turn(world: &SessionWorld, prompt: &str) {
     world
+        .core
         .agent
         .lock()
         .await
@@ -105,5 +106,5 @@ pub(crate) async fn one_turn_session(
     let run_config = scripted_run_config(vec![finalized_text_message(reply)]);
     let world = build_test_world(persistence, &run_config, &create_spec()).expect("create world");
     drive_turn(&world, prompt).await;
-    world.session_id.clone()
+    world.core.session_id.clone()
 }

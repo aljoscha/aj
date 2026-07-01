@@ -20,7 +20,7 @@
 //!
 //! [`SubAgentBox`]: crate::modes::interactive::components::subagent_box::SubAgentBox
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -54,6 +54,7 @@ use crate::modes::interactive::components::user_message::UserMessageComponent;
 use crate::modes::interactive::footer_data::AgentFooters;
 use crate::modes::interactive::layout::SlotIndex;
 use crate::modes::interactive::render_settings::RenderSettings;
+use crate::modes::interactive::session::AgentLifecycle;
 
 /// Per-agent streaming bookkeeping. The pump keeps one of these for
 /// the main agent and one per sub-agent so streaming events route to
@@ -110,50 +111,14 @@ struct TaskInfo {
 /// The pump owns no view state of its own — every component lives
 /// inside the `Tui`'s slot tree. It tracks per-agent streaming
 /// metadata ([`AgentRender`]) so streaming events reach the right
-/// widget, and the in-flight-agent set that the per-view spinner,
-/// the footer indicator, and per-box status all derive from.
+/// widget. The agent-lifecycle truth that the per-view spinner, the
+/// footer indicator, and per-box status derive from lives outside the
+/// pump in an [`AgentLifecycle`]. The event-processing methods take it
+/// by reference so the pump reads and updates it without owning it.
 pub struct EventPump {
     theme: ChatTheme,
     /// Per-agent streaming bookkeeping, keyed by [`AgentId`].
     agents: HashMap<AgentId, AgentRender>,
-    /// The literal set of agents that have emitted
-    /// [`AgentEvent::AgentStart`] without a matching
-    /// [`AgentEvent::AgentEnd`] yet — the single source of truth
-    /// for "what is running".
-    ///
-    /// `AgentStart` inserts; `AgentEnd` removes; the pump never
-    /// special-cases [`AgentId::Main`]. Under concurrency a main
-    /// turn can legitimately start or end while a sub-agent turn
-    /// runs, so no agent's lifecycle may touch another's entry.
-    ///
-    /// Three things derive from this set:
-    /// - the per-view spinner ([`Self::sync_loader`]) — active iff
-    ///   the *viewed* agent is in the set, so a leaked entry can
-    ///   never pin the spinner of an idle view;
-    /// - the aggregate footer indicator
-    ///   ([`Self::sync_agent_indicator`]) — the count of running
-    ///   `Sub(_)` ids, so background activity stays visible while
-    ///   viewing an idle agent;
-    /// - per-box status (`Running` on `AgentStart(Sub n)`, `Done`
-    ///   on `AgentEnd(Sub n)`), which is what flips a re-prompted
-    ///   box back through `Running`→`Done`.
-    ///
-    /// Leak draining (a dropped `AgentEnd(Sub n)` from a cancelled
-    /// initial spawn) is the *binary's* responsibility on
-    /// main-turn completion via [`Self::mark_idle`]: only the
-    /// binary knows which running subs are independent
-    /// continuations versus nested initial spawns. The pump keeps
-    /// this set as literal truth.
-    running_agents: HashSet<AgentId>,
-    /// Agents with an in-flight host-driven compaction — inserted on
-    /// [`AgentEvent::CompactionStart`], removed on
-    /// [`AgentEvent::CompactionEnd`]. Compaction runs outside the
-    /// `AgentStart`/`AgentEnd` bracket (it is host-orchestrated, not a
-    /// model turn), so it never touches `running_agents`; the
-    /// per-view spinner ([`Self::sync_loader`]) treats an agent as busy
-    /// when it is in *either* set, which is how the spinner animates
-    /// during the multi-second summarizer call.
-    compacting: HashSet<AgentId>,
     /// Background tasks observed via [`AgentEvent::TaskStart`],
     /// keyed by task id. Entries are kept (with their terminal
     /// status) after `TaskEnd` so the picker's "all" scope can list
@@ -185,12 +150,11 @@ pub struct EventPump {
     /// [`Self::sync_pending`].
     message_queues: MessageQueues,
     /// Whether the OS progress indicator (taskbar / window badge) is
-    /// currently lit. Tracks the main agent's busy state
-    /// (`running_agents.contains(&AgentId::Main)`). Kept here so
-    /// [`Self::sync_progress`] only emits an escape on the
-    /// idle<->busy edge. `set_progress(false)` re-emits its clear
-    /// sequence on every call, so without this gate every sub-agent
-    /// end would needlessly clear an already-off indicator.
+    /// currently lit. Tracks the main agent's busy state. Kept here so
+    /// [`Self::sync_progress`] only emits an escape on the idle<->busy
+    /// edge. `set_progress(false)` re-emits its clear sequence on every
+    /// call, so without this gate every sub-agent end would needlessly
+    /// clear an already-off indicator.
     progress_active: bool,
 }
 
@@ -220,8 +184,6 @@ impl EventPump {
         Self {
             theme,
             agents: HashMap::new(),
-            running_agents: HashSet::new(),
-            compacting: HashSet::new(),
             tasks: BTreeMap::new(),
             render_settings,
             footer_data: AgentFooters::new(main_settings, main_context_window),
@@ -263,14 +225,14 @@ impl EventPump {
     /// Shows `N agents, M tasks (key)` while at least one sub-agent
     /// or background bash task runs, where `key` is the resolved
     /// `aj.agent.open` shortcut; clears the indicator when neither.
-    /// The agent count is derived from `running_agents` (every
-    /// running `Sub(_)` id) and the task count from the running
-    /// [`TaskKind::Bash`] entries — agent-backed tasks are excluded
-    /// because their sub-agent is already in the agent count.
-    fn sync_agent_indicator(&self, tui: &mut Tui) {
-        let agents = self
-            .running_agents
-            .iter()
+    /// The agent count is the number of running `Sub(_)` ids and the
+    /// task count the running [`TaskKind::Bash`] entries — agent-backed
+    /// tasks are excluded because their sub-agent is already in the
+    /// agent count.
+    fn sync_agent_indicator(&self, life: &AgentLifecycle, tui: &mut Tui) {
+        let agents = life
+            .running_agents()
+            .into_iter()
             .filter(|a| matches!(a, AgentId::Sub(_)))
             .count();
         let tasks = self
@@ -295,8 +257,8 @@ impl EventPump {
     /// (unlike the view-scoped spinner and the sub-aggregate footer
     /// indicator), so background sub-agents don't drive it. Emits an
     /// escape only on the busy<->idle edge.
-    fn sync_progress(&mut self, tui: &mut Tui) {
-        let active = self.running_agents.contains(&AgentId::Main);
+    fn sync_progress(&mut self, life: &AgentLifecycle, tui: &mut Tui) {
+        let active = life.is_running(AgentId::Main);
         if active != self.progress_active {
             self.progress_active = active;
             tui.terminal_mut().set_progress(active);
@@ -475,7 +437,7 @@ impl EventPump {
     /// Switch the chat view to `id`'s transcript. Invalidates and
     /// requests a render because the visible chat region changes
     /// wholesale (the diff engine needs a full repaint).
-    pub fn set_active_view(&mut self, tui: &mut Tui, id: AgentId) {
+    pub fn set_active_view(&mut self, life: &AgentLifecycle, tui: &mut Tui, id: AgentId) {
         if let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx()) {
             chat.set_active(id);
         }
@@ -483,24 +445,11 @@ impl EventPump {
         // switch must immediately reflect the new agent's running
         // state. The footer is view-scoped too: repaint it with the
         // new view's model line and context usage.
-        self.sync_loader(tui);
+        self.sync_loader(life, tui);
         self.sync_footer(tui);
         self.sync_pending(tui);
         tui.invalidate();
         tui.request_render();
-    }
-
-    /// Whether `id` is currently running (membership in the
-    /// authoritative `running_agents` set).
-    pub fn is_running(&self, id: AgentId) -> bool {
-        self.running_agents.contains(&id)
-    }
-
-    /// Snapshot of every agent currently in the running set. The
-    /// binary iterates this to reconcile leaked nested sub-agents
-    /// on main-turn completion; order is unspecified.
-    pub fn running_agents(&self) -> Vec<AgentId> {
-        self.running_agents.iter().copied().collect()
     }
 
     /// Force `id` out of the running set, reconciling everything
@@ -508,17 +457,17 @@ impl EventPump {
     /// status). Idempotent w.r.t. an `AgentEnd` the pump already
     /// processed. The binary calls this on main-turn completion to
     /// drain a leaked sub-agent whose `AgentEnd` never arrived.
-    pub fn mark_idle(&mut self, tui: &mut Tui, id: AgentId) {
-        self.running_agents.remove(&id);
+    pub fn mark_idle(&mut self, life: &mut AgentLifecycle, tui: &mut Tui, id: AgentId) {
+        life.mark_idle(id);
         if let AgentId::Sub(n) = id
             && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             && let Some(b) = chat.sub_box_mut(n)
         {
             b.set_status(SubAgentStatus::Done);
         }
-        self.sync_loader(tui);
-        self.sync_agent_indicator(tui);
-        self.sync_progress(tui);
+        self.sync_loader(life, tui);
+        self.sync_agent_indicator(life, tui);
+        self.sync_progress(life, tui);
     }
 
     /// Dispatch one [`AgentEvent`] onto `tui`'s slot tree. Returns
@@ -526,18 +475,22 @@ impl EventPump {
     /// Callers that want a render afterwards should call
     /// [`Tui::request_render`] (the pump itself does so for the
     /// events that mutate visible state).
-    pub fn handle(&mut self, tui: &mut Tui, event: &AgentEvent) {
+    ///
+    /// `life` is the agent-lifecycle truth: this method updates it on
+    /// `AgentStart`/`AgentEnd` and compaction events and reads it to
+    /// drive the spinner, footer count, and OS progress indicator.
+    pub fn handle(&mut self, life: &mut AgentLifecycle, tui: &mut Tui, event: &AgentEvent) {
         match event {
             // ---- Lifecycle: drive the per-view spinner. ----
             //
-            // `running_agents` is the literal set of in-flight
-            // agents: `AgentStart` inserts, `AgentEnd` removes, no
+            // `life` is the literal set of in-flight agents:
+            // `AgentStart` marks running, `AgentEnd` marks idle, no
             // agent's lifecycle touches another's entry. The single
             // status-slot spinner is scoped to the *viewed* agent
             // ([`Self::sync_loader`]), so a sub-agent's lifecycle
             // can't toggle the spinner of an unrelated view.
             AgentEvent::AgentStart { agent_id } => {
-                self.running_agents.insert(*agent_id);
+                life.mark_running(*agent_id);
                 // A continuation re-prompt emits no `SubAgentStart`,
                 // so `AgentStart(Sub n)` is what flips a re-prompted
                 // box back to `Running`. Defensive: skip when the
@@ -548,12 +501,12 @@ impl EventPump {
                 {
                     b.set_status(SubAgentStatus::Running);
                 }
-                self.sync_loader(tui);
-                self.sync_agent_indicator(tui);
-                self.sync_progress(tui);
+                self.sync_loader(life, tui);
+                self.sync_agent_indicator(life, tui);
+                self.sync_progress(life, tui);
             }
             AgentEvent::AgentEnd { agent_id, .. } => {
-                self.running_agents.remove(agent_id);
+                life.mark_idle(*agent_id);
                 // Each agent owns its streaming bookkeeping, so an
                 // agent's end clears only its own entry; the main
                 // agent's pending `agent` tool call (whose body is a
@@ -568,9 +521,9 @@ impl EventPump {
                 {
                     b.set_status(SubAgentStatus::Done);
                 }
-                self.sync_loader(tui);
-                self.sync_agent_indicator(tui);
-                self.sync_progress(tui);
+                self.sync_loader(life, tui);
+                self.sync_agent_indicator(life, tui);
+                self.sync_progress(life, tui);
             }
             AgentEvent::TurnStart { agent_id } => {
                 // Each new turn starts with a fresh assistant
@@ -693,9 +646,9 @@ impl EventPump {
             // multi-second network call, so this animated label is the
             // primary "still working" affordance.
             AgentEvent::CompactionStart { agent_id, .. } => {
-                self.compacting.insert(*agent_id);
+                life.mark_compacting(*agent_id);
                 self.set_loader_message_for(tui, *agent_id, "Compacting context…");
-                self.sync_loader(tui);
+                self.sync_loader(life, tui);
                 tui.request_render();
             }
             AgentEvent::CompactionProgress {
@@ -717,7 +670,7 @@ impl EventPump {
                 error,
                 ..
             } => {
-                self.compacting.remove(agent_id);
+                life.clear_compacting(*agent_id);
                 // The `summary`/`error` pair encodes the terminal
                 // outcome (see `AgentEvent::CompactionEnd`): an error
                 // is a failure, a summary is a success, neither is a
@@ -750,7 +703,7 @@ impl EventPump {
                     self.append_notice(tui, *agent_id, "Compaction canceled.");
                 }
                 self.reset_loader_message(tui, *agent_id);
-                self.sync_loader(tui);
+                self.sync_loader(life, tui);
                 tui.request_render();
             }
 
@@ -823,7 +776,7 @@ impl EventPump {
                         cell,
                     },
                 );
-                self.sync_agent_indicator(tui);
+                self.sync_agent_indicator(life, tui);
             }
             AgentEvent::TaskOutput {
                 task_id, partial, ..
@@ -842,7 +795,7 @@ impl EventPump {
                 if let Some((owner, cell)) = self.task_cell(*task_id) {
                     self.update_task_cell(tui, owner, cell, |c| c.finish_task(*status));
                 }
-                self.sync_agent_indicator(tui);
+                self.sync_agent_indicator(life, tui);
             }
 
             // ---- Placeholders: events whose UI work isn't yet wired. ----
@@ -873,13 +826,13 @@ impl EventPump {
     // ---- Helpers ---------------------------------------------------------
 
     /// Drive the status-slot loader to reflect the *viewed* agent's
-    /// activity: active iff the active view's agent is in
-    /// `running_agents`. Only toggles on a genuine edge —
-    /// `Loader::start` resets the frame clock, so calling it on
-    /// every event would jitter the animation.
-    fn sync_loader(&self, tui: &mut Tui) {
+    /// activity: active iff the active view's agent is running or
+    /// compacting. Only toggles on a genuine edge — `Loader::start`
+    /// resets the frame clock, so calling it on every event would
+    /// jitter the animation.
+    fn sync_loader(&self, life: &AgentLifecycle, tui: &mut Tui) {
         let active = self.active_view(tui);
-        let should_run = self.running_agents.contains(&active) || self.compacting.contains(&active);
+        let should_run = life.is_running(active) || life.is_compacting(active);
         self.with_loader(tui, |l| match (should_run, l.is_active()) {
             (true, false) => l.start(),
             (false, true) => l.stop(),
@@ -1673,9 +1626,11 @@ mod tests {
     #[test]
     fn progress_indicator_tracks_main_agent_busy_state() {
         let (mut tui, mut pump, terminal) = fresh_tui_with_virtual_terminal();
+        let mut life = AgentLifecycle::default();
         assert!(!terminal.is_progress_active(), "starts cleared");
 
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
@@ -1686,12 +1641,14 @@ mod tests {
         // A sub-agent starting and finishing must not move it while
         // the main agent is still busy.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
@@ -1701,6 +1658,7 @@ mod tests {
         assert!(terminal.is_progress_active(), "still lit: main runs");
 
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
@@ -1722,6 +1680,7 @@ mod tests {
     fn queue_update_paints_pending_box_for_active_view() {
         let queues = MessageQueues::default();
         let (mut tui, mut pump) = fresh_tui_with_queues(queues.clone());
+        let mut life = AgentLifecycle::default();
 
         pump.sync_pending(&mut tui);
         assert!(
@@ -1731,6 +1690,7 @@ mod tests {
 
         queues.append_follow_up(AgentId::Main, "clean up later");
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::QueueUpdate {
                 agent_id: AgentId::Main,
@@ -1749,10 +1709,12 @@ mod tests {
     fn pending_box_is_view_scoped() {
         let queues = MessageQueues::default();
         let (mut tui, mut pump) = fresh_tui_with_queues(queues.clone());
+        let mut life = AgentLifecycle::default();
 
         // Queue for Sub(1) while viewing Main.
         queues.append_steering(AgentId::Sub(1), "do this now");
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::QueueUpdate {
                 agent_id: AgentId::Sub(1),
@@ -1765,12 +1727,12 @@ mod tests {
             "Sub(1)'s pending message must not show while viewing Main"
         );
 
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         let lines = render_pending(&mut tui);
         assert!(lines.iter().any(|l| l.contains("do this now")));
         assert!(lines.iter().any(|l| l.contains("steering")));
 
-        pump.set_active_view(&mut tui, AgentId::Main);
+        pump.set_active_view(&life, &mut tui, AgentId::Main);
         assert!(
             render_pending(&mut tui).is_empty(),
             "switching back to Main hides Sub(1)'s pending message"
@@ -1849,11 +1811,13 @@ mod tests {
         // Sum of the prompt-side fields is the numerator:
         // 1_000 + 200 + 50 = 1_250 tokens; window is 200k -> 0.6%.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.sync_footer(&mut tui);
         // Before any turn lands the indicator is "?/200k".
         assert!(rendered_footer(&mut tui).contains("?/200k"));
 
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
@@ -1878,10 +1842,12 @@ mod tests {
         // here, so a sub-agent's usage folds into the sub's own
         // entry without moving the rendered footer.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.sync_footer(&mut tui);
         let before = rendered_footer(&mut tui);
 
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Sub(1),
@@ -1902,7 +1868,9 @@ mod tests {
         // model line and the indicator's denominator immediately
         // rather than waiting for the next turn.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
@@ -1944,16 +1912,22 @@ mod tests {
         // main's line and usage.
         let (mut tui, mut pump, _theme) =
             fresh_tui_with_catalog(vec![catalog_model("openai", "gpt-sub", 400_000)]);
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
                 usage: token_usage([10_000, 0, 0, 0], [0, 0, 0, 0]),
             },
         );
-        pump.handle(&mut tui, &sub_agent_start(1, "openai", "gpt-sub"));
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &sub_agent_start(1, "openai", "gpt-sub"),
+        );
 
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         let line = rendered_footer(&mut tui);
         assert!(
             line.contains("gpt-sub off") && line.contains("?/400k"),
@@ -1962,6 +1936,7 @@ mod tests {
 
         // A sub turn updates the viewed footer live.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Sub(1),
@@ -1975,7 +1950,7 @@ mod tests {
         );
 
         // Switching back restores main's line and usage.
-        pump.set_active_view(&mut tui, AgentId::Main);
+        pump.set_active_view(&life, &mut tui, AgentId::Main);
         let line = rendered_footer(&mut tui);
         assert!(
             line.contains("claude-main off") && line.contains("10k/200k"),
@@ -1987,21 +1962,34 @@ mod tests {
     fn window_resolution_catalog_hit_identity_match_and_full_miss() {
         let (mut tui, mut pump, _theme) =
             fresh_tui_with_catalog(vec![catalog_model("openai", "gpt-sub", 400_000)]);
+        let mut life = AgentLifecycle::default();
 
         // Catalog hit.
-        pump.handle(&mut tui, &sub_agent_start(1, "openai", "gpt-sub"));
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &sub_agent_start(1, "openai", "gpt-sub"),
+        );
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         assert!(rendered_footer(&mut tui).contains("?/400k"));
 
         // Catalog miss, identity equals Main's settings: Main's
         // window.
-        pump.handle(&mut tui, &sub_agent_start(2, "anthropic", "claude-main"));
-        pump.set_active_view(&mut tui, AgentId::Sub(2));
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &sub_agent_start(2, "anthropic", "claude-main"),
+        );
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(2));
         assert!(rendered_footer(&mut tui).contains("?/200k"));
 
         // Full miss: window 0 suppresses the indicator.
-        pump.handle(&mut tui, &sub_agent_start(3, "mystery", "unknown-model"));
-        pump.set_active_view(&mut tui, AgentId::Sub(3));
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &sub_agent_start(3, "mystery", "unknown-model"),
+        );
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(3));
         let line = rendered_footer(&mut tui);
         assert!(
             !line.contains('/'),
@@ -2013,8 +2001,13 @@ mod tests {
     #[test]
     fn note_main_settings_while_viewing_a_sub_does_not_repaint() {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
-        pump.handle(&mut tui, &sub_agent_start(1, "anthropic", "claude-main"));
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        let mut life = AgentLifecycle::default();
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &sub_agent_start(1, "anthropic", "claude-main"),
+        );
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         let before = rendered_footer(&mut tui);
 
         pump.note_agent_settings(
@@ -2036,7 +2029,7 @@ mod tests {
         );
 
         // The new line shows after switching back to main.
-        pump.set_active_view(&mut tui, AgentId::Main);
+        pump.set_active_view(&life, &mut tui, AgentId::Main);
         let line = rendered_footer(&mut tui);
         assert!(
             line.contains("claude-next max"),
@@ -2052,8 +2045,14 @@ mod tests {
         // like a live run.
         let (mut tui, mut pump, _theme) =
             fresh_tui_with_catalog(vec![catalog_model("openai", "gpt-sub", 400_000)]);
-        pump.handle(&mut tui, &sub_agent_start(1, "openai", "gpt-sub"));
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
+            &mut tui,
+            &sub_agent_start(1, "openai", "gpt-sub"),
+        );
+        pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Sub(1),
@@ -2061,7 +2060,7 @@ mod tests {
             },
         );
 
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         let line = rendered_footer(&mut tui);
         assert!(
             line.contains("gpt-sub off") && line.contains("4.0k/400k"),
@@ -2088,6 +2087,7 @@ mod tests {
         // the tool execution. Pin the correct order with a
         // canonical replay event sequence.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         let chat_len = |tui: &mut Tui| -> usize {
             tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
@@ -2098,13 +2098,18 @@ mod tests {
         let chat_baseline = chat_len(&mut tui);
 
         // User prompt → user message component.
-        pump.handle(&mut tui, &user_message_end_event("please run a tool"));
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &user_message_end_event("please run a tool"),
+        );
 
         // Assistant message lifecycle: MessageStart opens the slot.
-        pump.handle(&mut tui, &assistant_message_start_event());
+        pump.handle(&mut life, &mut tui, &assistant_message_start_event());
 
         // Assistant thinking block → drives the slot.
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ThinkingStart {
                 content_index: 0,
@@ -2112,6 +2117,7 @@ mod tests {
             }),
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ThinkingEnd {
                 content_index: 0,
@@ -2124,6 +2130,7 @@ mod tests {
         // (replay path). The build-on-miss branch creates the
         // tool component AND must drop `current_assistant`.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Main,
@@ -2143,8 +2150,9 @@ mod tests {
         // component appended *after* the tool component, not
         // reuse the thinking-block component that was appended
         // before the tool.
-        pump.handle(&mut tui, &assistant_message_start_event());
+        pump.handle(&mut life, &mut tui, &assistant_message_start_event());
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::TextStart {
                 content_index: 0,
@@ -2152,6 +2160,7 @@ mod tests {
             }),
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::TextEnd {
                 content_index: 0,
@@ -2213,13 +2222,19 @@ mod tests {
         // of those events should materialise an
         // `AssistantMessageComponent`.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
-        pump.handle(&mut tui, &user_message_end_event("please run a tool"));
-        pump.handle(&mut tui, &assistant_message_start_event());
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &user_message_end_event("please run a tool"),
+        );
+        pump.handle(&mut life, &mut tui, &assistant_message_start_event());
 
         // Tool-call deltas; none of these paint into the assistant
         // component, so the slot must NOT be materialised here.
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ToolCallStart {
                 content_index: 0,
@@ -2227,6 +2242,7 @@ mod tests {
             }),
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ToolCallDelta {
                 content_index: 0,
@@ -2235,6 +2251,7 @@ mod tests {
             }),
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ToolCallEnd {
                 content_index: 0,
@@ -2266,6 +2283,7 @@ mod tests {
             timestamp: 0,
         };
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::MessageEnd {
                 agent_id: AgentId::Main,
@@ -2275,6 +2293,7 @@ mod tests {
 
         // Tool runs.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Main,
@@ -2284,6 +2303,7 @@ mod tests {
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Main,
@@ -2330,9 +2350,11 @@ mod tests {
         // We assert that the rendered output still contains the
         // streamed thinking content after the Stop event lands.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         // Open a thinking stream and append a non-trivial body.
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ThinkingStart {
                 content_index: 0,
@@ -2340,6 +2362,7 @@ mod tests {
             }),
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ThinkingDelta {
                 content_index: 0,
@@ -2348,6 +2371,7 @@ mod tests {
             }),
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ThinkingDelta {
                 content_index: 0,
@@ -2360,6 +2384,7 @@ mod tests {
         // without an authoritative snapshot. With the regression in
         // place this wiped the buffer.
         pump.handle(
+            &mut life,
             &mut tui,
             &message_update_event(AssistantMessageEvent::ThinkingEnd {
                 content_index: 0,
@@ -2396,6 +2421,7 @@ mod tests {
         // formatted line inside it (the dim escape wraps the
         // visible body verbatim, so `.contains` is enough).
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         let chat_len_before = {
             let chat = tui
                 .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
@@ -2405,6 +2431,7 @@ mod tests {
         };
         let usage = token_usage([42, 17, 0, 3], [0, 0, 0, 0]);
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
@@ -2477,8 +2504,10 @@ mod tests {
         // transcript order rather than out-of-band from the turn's
         // return value.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         let before = chat_child_count(&mut tui);
         pump.handle(
+            &mut life,
             &mut tui,
             &errored_assistant_message_end(
                 ErrorCategory::Auth,
@@ -2516,8 +2545,10 @@ mod tests {
         // from the message stream, so an aborted `MessageEnd` must not
         // append an error row (that would duplicate the cancel notice).
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         let before = chat_child_count(&mut tui);
         pump.handle(
+            &mut life,
             &mut tui,
             &errored_assistant_message_end(
                 ErrorCategory::Aborted,
@@ -2539,7 +2570,9 @@ mod tests {
         // it from `MessageEnd` keeps it in arrival order, so a preceding
         // turn event (here a usage row) stays above the error row.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::UsageUpdate {
                 agent_id: AgentId::Main,
@@ -2548,6 +2581,7 @@ mod tests {
         );
         let after_usage = chat_child_count(&mut tui);
         pump.handle(
+            &mut life,
             &mut tui,
             &errored_assistant_message_end(
                 ErrorCategory::Auth,
@@ -2586,8 +2620,10 @@ mod tests {
         // "any non-abort error", not retryable-vs-not, so the exhausted
         // attempt's error still shows.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         let before = chat_child_count(&mut tui);
         pump.handle(
+            &mut life,
             &mut tui,
             &errored_assistant_message_end(
                 ErrorCategory::Transient,
@@ -2620,11 +2656,13 @@ mod tests {
         // detail still gets a generic in-band line rather than
         // rendering nothing.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         let before = chat_child_count(&mut tui);
         let mut m = empty_assistant_partial();
         m.stop_reason = StopReason::Error;
         m.error = None;
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::MessageEnd {
                 agent_id: AgentId::Main,
@@ -2660,6 +2698,7 @@ mod tests {
         // the nested sub start/end and only stops on Main's
         // `AgentEnd`.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         fn is_loader_active(tui: &mut Tui) -> bool {
             tui.get_mut_as::<Container>(SlotIndex::Status.idx())
@@ -2674,6 +2713,7 @@ mod tests {
 
         // Main turn starts.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
@@ -2683,6 +2723,7 @@ mod tests {
 
         // Sub-agent starts inside the main turn.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
@@ -2695,6 +2736,7 @@ mod tests {
 
         // Sub-agent ends — main is still running.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
@@ -2710,6 +2752,7 @@ mod tests {
 
         // Main turn ends.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
@@ -2730,13 +2773,16 @@ mod tests {
         // Per-view scoping means an unrelated sub's lifecycle can
         // never toggle the Main view's spinner.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(7),
@@ -2770,6 +2816,7 @@ mod tests {
         // `mark_idle`), not the pump's — so the spinner-off here is
         // purely the per-view scoping, not a drain.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         fn is_loader_active(tui: &mut Tui) -> bool {
             tui.get_mut_as::<Container>(SlotIndex::Status.idx())
@@ -2781,12 +2828,14 @@ mod tests {
 
         // Main turn starts and spawns a sub-agent.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
@@ -2797,6 +2846,7 @@ mod tests {
         // Note: no `AgentEnd(Sub(1))` — simulates the dropped emit.
         // Main's `AgentEnd` fires.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
@@ -2810,7 +2860,7 @@ mod tests {
              the spinner is scoped to the viewed agent",
         );
         assert!(
-            pump.is_running(AgentId::Sub(1)),
+            life.is_running(AgentId::Sub(1)),
             "the leaked sub stays in the set: the binary, not the \
              pump, reconciles it on main-turn completion",
         );
@@ -2825,6 +2875,7 @@ mod tests {
         // it is keyed on Main's own `AgentStart`/`AgentEnd`, not on
         // the (still non-empty) set as a whole.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         fn is_loader_active(tui: &mut Tui) -> bool {
             tui.get_mut_as::<Container>(SlotIndex::Status.idx())
@@ -2837,12 +2888,14 @@ mod tests {
         // Turn 1: main starts, sub-agent starts, but the sub's
         // `AgentEnd` never arrives (leak). Main eventually ends.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(3),
@@ -2850,6 +2903,7 @@ mod tests {
         );
         // Note: no AgentEnd(Sub(3)) here.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
@@ -2868,6 +2922,7 @@ mod tests {
         // on Main's end. The leaked `Sub(3)` never affects the Main
         // view's spinner.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
@@ -2875,6 +2930,7 @@ mod tests {
         );
         assert!(is_loader_active(&mut tui));
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
@@ -2904,9 +2960,11 @@ mod tests {
         // back to the idle Main turns it off; and once the sub ends,
         // viewing it shows no spinner.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         // Create the sub box, then start its turn (sub running).
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
@@ -2922,6 +2980,7 @@ mod tests {
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
@@ -2936,25 +2995,26 @@ mod tests {
         );
 
         // Switch to the running sub: spinner on.
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         assert!(
             loader_active(&mut tui),
             "viewing the running sub, the spinner must be on",
         );
 
         // Back to idle Main: off again.
-        pump.set_active_view(&mut tui, AgentId::Main);
+        pump.set_active_view(&life, &mut tui, AgentId::Main);
         assert!(!loader_active(&mut tui));
 
         // The sub finishes; viewing it now shows no spinner.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
             },
         );
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         assert!(
             !loader_active(&mut tui),
             "viewing the finished sub, the spinner must be off",
@@ -2968,9 +3028,11 @@ mod tests {
         // background activity stays visible while viewing an idle
         // agent.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         for n in [1usize, 2] {
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::SubAgentStart {
                     parent: AgentId::Main,
@@ -2986,6 +3048,7 @@ mod tests {
                 },
             );
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(n),
@@ -3001,7 +3064,7 @@ mod tests {
         );
 
         // Switching the view doesn't change the aggregate.
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         assert!(
             rendered_footer(&mut tui).contains("2 agents"),
             "footer count is view-independent; got {:?}",
@@ -3075,8 +3138,15 @@ mod tests {
     /// Drive a background-bash launch into the pump: the tool call's
     /// cell, the task registration, and the immediately-returning
     /// started result (carrying the task id).
-    fn launch_bash_task(tui: &mut Tui, pump: &mut EventPump, task_id: usize, call_id: &str) {
+    fn launch_bash_task(
+        tui: &mut Tui,
+        pump: &mut EventPump,
+        life: &mut AgentLifecycle,
+        task_id: usize,
+        call_id: &str,
+    ) {
         pump.handle(
+            life,
             tui,
             &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Main,
@@ -3086,6 +3156,7 @@ mod tests {
             },
         );
         pump.handle(
+            life,
             tui,
             &task_start(
                 AgentId::Main,
@@ -3097,6 +3168,7 @@ mod tests {
             ),
         );
         pump.handle(
+            life,
             tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Main,
@@ -3138,10 +3210,16 @@ mod tests {
     #[test]
     fn footer_counts_agents_and_bash_tasks_separately() {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         // One running sub-agent: agents-only indicator.
-        pump.handle(&mut tui, &sub_agent_start(1, "scripted", "scripted-model"));
         pump.handle(
+            &mut life,
+            &mut tui,
+            &sub_agent_start(1, "scripted", "scripted-model"),
+        );
+        pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
@@ -3156,6 +3234,7 @@ mod tests {
 
         // A background bash task joins the indicator.
         pump.handle(
+            &mut life,
             &mut tui,
             &task_start(
                 AgentId::Main,
@@ -3172,6 +3251,7 @@ mod tests {
         // An agent-backed task is NOT double-counted: its sub-agent
         // is what drives the agent count.
         pump.handle(
+            &mut life,
             &mut tui,
             &task_start(
                 AgentId::Main,
@@ -3188,6 +3268,7 @@ mod tests {
 
         // The bash task ends: back to agents-only.
         pump.handle(
+            &mut life,
             &mut tui,
             &task_end(AgentId::Main, 1, "c-bash", TaskStatus::Exited(Some(0))),
         );
@@ -3201,6 +3282,7 @@ mod tests {
         // The sub ends too: the indicator clears (the agent-kind
         // task entry never counts).
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
@@ -3218,19 +3300,22 @@ mod tests {
     #[test]
     fn task_output_live_tails_the_cell_and_task_end_freezes_it() {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
             },
         );
-        launch_bash_task(&mut tui, &mut pump, 1, "c1");
+        launch_bash_task(&mut tui, &mut pump, &mut life, 1, "c1");
         let cell = main_tool_cell(&mut tui);
         assert!(rendered_cell(&mut tui, cell).contains("[task #1]"));
 
         // The owning turn ends — this wipes the agent's tool_index,
         // so subsequent routing exercises the TaskStart snapshot.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
@@ -3240,6 +3325,7 @@ mod tests {
 
         // Live tail lands in the existing cell.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::TaskOutput {
                 agent_id: AgentId::Main,
@@ -3254,12 +3340,14 @@ mod tests {
         // TaskEnd freezes the cell with the terminal-status badge;
         // a straggling snapshot no longer lands.
         pump.handle(
+            &mut life,
             &mut tui,
             &task_end(AgentId::Main, 1, "c1", TaskStatus::Exited(Some(0))),
         );
         let body = rendered_cell(&mut tui, cell);
         assert!(body.contains("[task #1 · exited 0]"), "got:\n{body}");
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::TaskOutput {
                 agent_id: AgentId::Main,
@@ -3276,7 +3364,9 @@ mod tests {
     #[test]
     fn tasks_snapshot_lists_bash_tasks_with_status_and_owner() {
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &task_start(
                 AgentId::Main,
@@ -3288,6 +3378,7 @@ mod tests {
             ),
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &task_start(
                 AgentId::Sub(2),
@@ -3314,6 +3405,7 @@ mod tests {
         // TaskEnd flips the snapshot's status but keeps the entry
         // so the picker's "all" scope can list it.
         pump.handle(
+            &mut life,
             &mut tui,
             &task_end(AgentId::Main, 1, "c1", TaskStatus::Killed),
         );
@@ -3331,7 +3423,9 @@ mod tests {
         // assume a registry or a `tasks` entry exists for a badged
         // cell.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Main,
@@ -3350,6 +3444,7 @@ mod tests {
         // conceivable on weird replays) must be inert: no panic, no
         // tracking, no footer indicator.
         pump.handle(
+            &mut life,
             &mut tui,
             &task_end(AgentId::Main, 7, "c-resumed", TaskStatus::Exited(Some(0))),
         );
@@ -3368,23 +3463,25 @@ mod tests {
         // derived from it. While viewing that agent the spinner must
         // stop, and `is_running` must report `false`.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
             },
         );
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         assert!(loader_active(&mut tui), "viewing the running sub: on");
 
-        pump.mark_idle(&mut tui, AgentId::Sub(1));
+        pump.mark_idle(&mut life, &mut tui, AgentId::Sub(1));
         assert!(
             !loader_active(&mut tui),
             "mark_idle stops the spinner of the viewed agent",
         );
         assert!(
-            !pump.is_running(AgentId::Sub(1)),
+            !life.is_running(AgentId::Sub(1)),
             "mark_idle removes the agent from the running set",
         );
     }
@@ -3397,6 +3494,7 @@ mod tests {
         // initial spawn that finishes `Done`, then feed a fresh
         // start/end pair and assert the box cycles `Running` → `Done`.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         let box_status = |tui: &mut Tui| -> SubAgentStatus {
             tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
@@ -3408,6 +3506,7 @@ mod tests {
 
         // Initial spawn: box created, runs, finishes Done.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
@@ -3423,12 +3522,14 @@ mod tests {
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
@@ -3440,6 +3541,7 @@ mod tests {
         // Continuation: a bare `AgentStart(Sub 1)` flips the box
         // back to Running.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
@@ -3453,6 +3555,7 @@ mod tests {
 
         // The continuation's `AgentEnd` flips it back to Done.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
@@ -3469,9 +3572,11 @@ mod tests {
         // events are skipped. The sub-agent's own events route into
         // the box's inner transcript (its tools render header-only).
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
 
         // Main fires the `agent` tool: no bubble in the main view.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Main,
@@ -3482,6 +3587,7 @@ mod tests {
         );
         // The spawn correlation creates the box in the main transcript.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
@@ -3498,6 +3604,7 @@ mod tests {
         );
         // A sub-agent tool call routes into the box.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Sub(1),
@@ -3507,6 +3614,7 @@ mod tests {
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Sub(1),
@@ -3521,6 +3629,7 @@ mod tests {
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::SubAgentEnd {
                 parent: AgentId::Main,
@@ -3566,7 +3675,9 @@ mod tests {
         // arrives *while observing* the sub-agent must render full, and
         // collapse back to header-only when the user returns to main.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
@@ -3582,8 +3693,9 @@ mod tests {
             },
         );
         // Observe the sub-agent (its box becomes the full view).
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Sub(1),
@@ -3593,6 +3705,7 @@ mod tests {
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Sub(1),
@@ -3622,7 +3735,7 @@ mod tests {
         );
 
         // Back to main: the compact box renders the tool header-only.
-        pump.set_active_view(&mut tui, AgentId::Main);
+        pump.set_active_view(&life, &mut tui, AgentId::Main);
         let main = tui
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
@@ -3648,7 +3761,9 @@ mod tests {
         // `SubAgentBox::set_mode`), independent of the append-time
         // initial state.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
@@ -3665,6 +3780,7 @@ mod tests {
         );
         // Stay on main: the tool is collected header-only.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionStart {
                 agent_id: AgentId::Sub(1),
@@ -3674,6 +3790,7 @@ mod tests {
             },
         );
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Sub(1),
@@ -3704,7 +3821,7 @@ mod tests {
 
         // Switch to observe: the already-collected tool expands to
         // its full body.
-        pump.set_active_view(&mut tui, AgentId::Sub(1));
+        pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         let full = tui
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
@@ -3719,7 +3836,7 @@ mod tests {
         );
 
         // Return to main: it collapses back to header-only.
-        pump.set_active_view(&mut tui, AgentId::Main);
+        pump.set_active_view(&life, &mut tui, AgentId::Main);
         let main_again = tui
             .get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             .expect("chat slot")
@@ -3763,6 +3880,7 @@ mod tests {
         use tokio::time::Instant as TokioInstant;
 
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         // Suppress the implicit bootstrap render so the
         // post-cycle counting window only sees renders from the
         // loader's animation pump.
@@ -3782,18 +3900,21 @@ mod tests {
         // unconditionally.
         for _ in 0..100 {
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::AgentStart {
                     agent_id: AgentId::Main,
                 },
             );
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
                 },
             );
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
@@ -3801,6 +3922,7 @@ mod tests {
                 },
             );
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::AgentEnd {
                     agent_id: AgentId::Main,
@@ -3814,6 +3936,7 @@ mod tests {
         // background `request_render` ticks would still be
         // landing on the channel.
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
@@ -3862,6 +3985,7 @@ mod tests {
         // drop until the runtime tears down — harmless, but
         // noisier than necessary).
         pump.handle(
+            &mut life,
             &mut tui,
             &AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
@@ -3889,6 +4013,7 @@ mod tests {
         // components. Flipping the pump must walk the chat
         // container and expand each one.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
         assert!(!pump.tools_expanded());
 
         // Drive two finished tool calls into the chat slot.
@@ -3898,6 +4023,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::ToolExecutionStart {
                     agent_id: AgentId::Main,
@@ -3907,6 +4033,7 @@ mod tests {
                 },
             );
             pump.handle(
+                &mut life,
                 &mut tui,
                 &AgentEvent::ToolExecutionEnd {
                     agent_id: AgentId::Main,

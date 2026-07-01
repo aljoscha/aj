@@ -33,15 +33,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
-use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TurnError, sub_agent_session_id};
+use aj_agent::{Agent, TurnError, sub_agent_session_id};
 use aj_conf::{
     AgentEnv, Config, ConfigLayer, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel,
     ConfigVerbosity, Severity, SystemPromptSource, display_path,
 };
 use aj_models::auth::AuthStorage;
-use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, validate_thinking_level};
-use aj_models::types::{Speed, StreamOptions, UserContent};
+use aj_models::types::{Speed, UserContent};
 use aj_models::{
     ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
 };
@@ -52,7 +51,6 @@ use aj_tui::components::editor::Editor;
 use aj_tui::terminal::ProcessTerminal;
 use aj_tui::tui::{OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, Tui, TuiEvent};
 use anyhow::{Context, Result};
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -113,35 +111,14 @@ use crate::modes::interactive::event_pump::{
 };
 use crate::modes::interactive::layout::{SlotIndex, build_layout};
 use crate::modes::interactive::render_settings::RenderSettings;
-use crate::modes::interactive::session::{SessionEntry, SessionSpec, SessionWorld};
+use crate::modes::interactive::session::{
+    SessionCore, SessionEntry, SessionSpec, SessionWorld, SubAgentOverrides,
+};
 use crate::modes::interactive::shutdown::{
     print_resume_hint, print_session_usage, print_usage_summary,
 };
 use crate::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
 use crate::turn::{TurnPolicy, TurnStart};
-
-/// Loop-side staged settings for one sub-agent. Each axis is
-/// `Some(..)` only if the user changed it for this agent; axes left
-/// `None` keep whatever the agent itself holds (its spawn-time
-/// inheritance). The `Option<Option<..>>` split on thinking/speed
-/// matters: `Some(None)` means "explicitly set to off/standard".
-///
-/// Entries live in `SessionWorld::sub_overrides` and are re-applied
-/// idempotently at every turn start of the agent they belong to —
-/// an entry is the user's standing choice for that agent.
-#[derive(Default)]
-pub(crate) struct SubAgentOverrides {
-    /// Full bundle swap from a model-selector confirm: provider handle,
-    /// model info, stream options, and the `(provider, id)` key.
-    pub(crate) bundle: Option<(
-        Arc<dyn Provider>,
-        Arc<ModelInfo>,
-        StreamOptions,
-        (String, String),
-    )>,
-    pub(crate) thinking: Option<Option<ThinkingConfig>>,
-    pub(crate) speed: Option<Option<Speed>>,
-}
 
 /// User-facing notice shown when a session-changing command
 /// (resume, new) is invoked while a turn is in flight.
@@ -420,7 +397,7 @@ impl InteractiveMode {
         // path completion live here. Typing `/` at the empty prompt
         // opens the command palette overlay (see the editor's
         // palette trigger), not an inline popup.
-        let working_directory = world.env.working_directory.clone();
+        let working_directory = world.core.env.working_directory.clone();
         if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
             let provider =
                 aj_tui::autocomplete::CombinedAutocompleteProvider::new(working_directory);
@@ -483,7 +460,7 @@ impl InteractiveMode {
         // indicator are pushed by `SessionWorld::install`'s footer
         // sync; the header's session id + banner are set by
         // `install` below as well.
-        let footer_cwd = format!("{}", world.env.working_directory.display());
+        let footer_cwd = format!("{}", world.core.env.working_directory.display());
         if let Some(footer) = tui.get_mut_as::<Footer>(SlotIndex::Footer.idx()) {
             footer.set_cwd(Some(footer_cwd));
         }
@@ -511,7 +488,9 @@ impl InteractiveMode {
                 Severity::Warning => warning_event(&text),
                 Severity::Error => error_event(&text),
             };
-            world.pump.handle(&mut tui, &event);
+            world
+                .pump
+                .handle(&mut world.core.lifecycle, &mut tui, &event);
         }
         // The context notice only applies to fresh sessions: a
         // resumed session keeps the assembled prompt persisted in
@@ -519,32 +498,48 @@ impl InteractiveMode {
         // doesn't govern what's actually sent. Skill-discovery
         // warnings ride along under the same rule.
         if matches!(spec, SessionSpec::Create { .. }) {
-            let env = &world.env;
+            let env = &world.core.env;
             let skill_warnings: Vec<String> = env
                 .skill_diagnostics
                 .iter()
                 .map(|d| d.to_string())
                 .collect();
             let context_notice = build_context_notice(env);
-            world.pump.handle(&mut tui, &notice_event(&context_notice));
+            world.pump.handle(
+                &mut world.core.lifecycle,
+                &mut tui,
+                &notice_event(&context_notice),
+            );
             for warning in &skill_warnings {
-                world.pump.handle(&mut tui, &warning_event(warning));
+                world
+                    .pump
+                    .handle(&mut world.core.lifecycle, &mut tui, &warning_event(warning));
             }
         }
         if sandbox_warning_enabled() {
-            world.pump.handle(&mut tui, &warning_event(SANDBOX_WARNING));
+            world.pump.handle(
+                &mut world.core.lifecycle,
+                &mut tui,
+                &warning_event(SANDBOX_WARNING),
+            );
         }
         if let Some(warning) = &startup_auth_warning {
-            world.pump.handle(&mut tui, &warning_event(warning));
+            world
+                .pump
+                .handle(&mut world.core.lifecycle, &mut tui, &warning_event(warning));
         }
         if let Some(warning) = &tmux_warning {
-            world.pump.handle(&mut tui, &warning_event(warning));
+            world
+                .pump
+                .handle(&mut world.core.lifecycle, &mut tui, &warning_event(warning));
         }
         // Settings restored from a resumed session's log (or the
         // reasons restoration fell back) surface like any other
         // startup notice.
-        for notice in std::mem::take(&mut world.restore_notices) {
-            world.pump.handle(&mut tui, &notice_event(&notice));
+        for notice in std::mem::take(&mut world.core.restore_notices) {
+            world
+                .pump
+                .handle(&mut world.core.lifecycle, &mut tui, &notice_event(&notice));
         }
 
         // Shared, mutable view of the on-disk config. Selector
@@ -624,8 +619,8 @@ impl InteractiveMode {
             let usage = world.usage_summary().await;
             shell
                 .completed_sessions
-                .push((world.session_id.clone(), usage));
-            let previous_id = world.session_id.clone();
+                .push((world.core.session_id.clone(), usage));
+            let previous_id = world.core.session_id.clone();
 
             let config_snapshot = shell.config.lock().expect("config mutex poisoned").clone();
             match build_next_world(
@@ -655,9 +650,11 @@ impl InteractiveMode {
                         AgentId::Main,
                     );
                     for notice in &next.notices {
-                        next.world
-                            .pump
-                            .handle(&mut shell.tui, &notice_event(notice));
+                        next.world.pump.handle(
+                            &mut next.world.core.lifecycle,
+                            &mut shell.tui,
+                            &notice_event(notice),
+                        );
                     }
                     world = next.world;
                 }
@@ -700,7 +697,7 @@ impl InteractiveMode {
                     for (session_id, completed) in &shell.completed_sessions {
                         print_session_usage(session_id, completed);
                     }
-                    print_session_usage(&world.session_id, &summary);
+                    print_session_usage(&world.core.session_id, &summary);
                 }
 
                 // Resume hint is gated on "the session is worth resuming",
@@ -713,11 +710,11 @@ impl InteractiveMode {
                 // shot since the persistence listener writes user
                 // messages inline before the run returns.
                 let resume_eligible = {
-                    let l = world.log.lock().await;
+                    let l = world.core.log.lock().await;
                     l.latest_leaf(ThreadFilter::USER).is_some()
                 };
                 if resume_eligible {
-                    print_resume_hint(&world.session_id);
+                    print_resume_hint(&world.core.session_id);
                 }
             }
             // A fallback rebuild failed, so no world survived the
@@ -896,14 +893,14 @@ fn build_next_world(
         Ok(mut world) => {
             let notice = match &requested {
                 SessionSpec::Create { .. } => {
-                    format!("Started a fresh session ({}).", world.session_id)
+                    format!("Started a fresh session ({}).", world.core.session_id)
                 }
                 SessionSpec::Resume { session_id, .. } => {
                     format!("Switched to session {session_id}.")
                 }
             };
             let mut notices = vec![notice];
-            notices.append(&mut world.restore_notices);
+            notices.append(&mut world.core.restore_notices);
             Ok(NextWorld {
                 world,
                 spec: requested,
@@ -934,7 +931,7 @@ fn build_next_world(
                 catalog,
             )?;
             let mut notices = vec![failure];
-            notices.append(&mut world.restore_notices);
+            notices.append(&mut world.core.restore_notices);
             Ok(NextWorld {
                 world,
                 spec: fallback,
@@ -1025,7 +1022,7 @@ async fn run_session(
     // first turn. Empty for any in-process session switch after the first.
     if !launch_content.is_empty() {
         spawn_turn(
-            world,
+            &world.core,
             &shell.run_config,
             AgentId::Main,
             TurnStart::Content(launch_content),
@@ -1045,7 +1042,7 @@ async fn run_session(
                 match joined {
                     Ok((id, result)) => {
                         turn_cancels.remove(&id);
-                        world.pump.mark_idle(&mut shell.tui, id);
+                        world.pump.mark_idle(&mut world.core.lifecycle, &mut shell.tui, id);
                         // Main-turn completion bounds every nested
                         // initial spawn it started. Drain any sub
                         // still marked running that the binary is NOT
@@ -1054,11 +1051,11 @@ async fn run_session(
                         // footer/spinner. Independent continuations
                         // are in turn_cancels and survive.
                         if id == AgentId::Main {
-                            for sub in world.pump.running_agents() {
+                            for sub in world.core.running_agents() {
                                 if matches!(sub, AgentId::Sub(_))
                                     && !turn_cancels.contains_key(&sub)
                                 {
-                                    world.pump.mark_idle(&mut shell.tui, sub);
+                                    world.pump.mark_idle(&mut world.core.lifecycle, &mut shell.tui, sub);
                                 }
                             }
                         }
@@ -1072,12 +1069,12 @@ async fn run_session(
                         // notice that landed during an aborted turn.)
                         // `Agent::wake` is a no-op when nothing is
                         // pending, so a racing trigger is cheap.
-                        if world.task_registry.has_notices(id)
-                            || world.message_queues.has_pending(id)
+                        if world.core.task_registry.has_notices(id)
+                            || world.core.message_queues.has_pending(id)
                         {
                             spawn_wake_turn(
                                 id,
-                                world,
+                                &world.core,
                                 &shell.run_config,
                                 turn_policy(id, &shell.config),
                                 &mut turns,
@@ -1098,7 +1095,7 @@ async fn run_session(
                                 // is consistent; a brief notice confirms
                                 // Ctrl+C took effect and the session stays
                                 // alive.
-                                world.pump.handle(&mut shell.tui, &notice_event("Turn cancelled."));
+                                world.pump.handle(&mut world.core.lifecycle, &mut shell.tui, &notice_event("Turn cancelled."));
                             }
                             Err(TurnError::Recoverable(_)) => {
                                 // A recoverable failure already rendered
@@ -1139,13 +1136,13 @@ async fn run_session(
                     let name = session.provider_name;
                     match login_outcome {
                         Ok(Ok(())) => {
-                            world.pump.handle(
+                            world.pump.handle(&mut world.core.lifecycle,
                                 &mut shell.tui,
                                 &notice_event(&format!("Logged in to {name}.")),
                             );
                         }
                         Ok(Err(err)) => {
-                            world.pump.handle(
+                            world.pump.handle(&mut world.core.lifecycle,
                                 &mut shell.tui,
                                 &warning_event(&format!("Login to {name} failed: {err}")),
                             );
@@ -1154,7 +1151,7 @@ async fn run_session(
                         // arm already surfaced a "cancelled" notice.
                         Err(join_err) if join_err.is_cancelled() => {}
                         Err(join_err) => {
-                            world.pump.handle(
+                            world.pump.handle(&mut world.core.lifecycle,
                                 &mut shell.tui,
                                 &warning_event(&format!("Login task error: {join_err}")),
                             );
@@ -1244,12 +1241,12 @@ async fn run_session(
                                     yank_pending_into_editor(
                                         &mut shell.tui,
                                         &world.pump,
-                                        &world.message_queues,
+                                        &world.core.message_queues,
                                         active,
                                     );
                                     quit_armed = false;
                                     continue;
-                                } else if world.pump.is_running(active) {
+                                } else if world.core.is_running(active) {
                                     // Viewed agent is a sub running its initial spawn, owned by
                                     // the main turn: cancel the main turn (the child token
                                     // cascades to the sub).
@@ -1259,7 +1256,7 @@ async fn run_session(
                                     yank_pending_into_editor(
                                         &mut shell.tui,
                                         &world.pump,
-                                        &world.message_queues,
+                                        &world.core.message_queues,
                                         active,
                                     );
                                     quit_armed = false;
@@ -1274,14 +1271,14 @@ async fn run_session(
                                 // nothing runs anywhere.
                                 let (agents, tasks) = running_work_counts(
                                     turns.len(),
-                                    &world.task_registry.snapshot(),
+                                    &world.core.task_registry.snapshot(),
                                 );
                                 if agents + tasks > 0 {
                                     if quit_armed {
                                         break Ok(SessionExit::Quit);
                                     }
                                     quit_armed = true;
-                                    world.pump.handle(
+                                    world.pump.handle(&mut world.core.lifecycle,
                                         &mut shell.tui,
                                         &notice_event(&quit_arm_notice(agents, tasks)),
                                     );
@@ -1386,12 +1383,12 @@ async fn run_session(
                                     .map(|e| e.get_expanded_text().trim().to_string())
                                     .unwrap_or_default();
                                 let busy = turn_cancels.contains_key(&target)
-                                    || world.pump.is_running(target);
+                                    || world.core.is_running(target);
                                 if busy {
                                     if text.is_empty() {
-                                        world.message_queues.promote(target);
+                                        world.core.message_queues.promote(target);
                                     } else {
-                                        world.message_queues.append_steering(target, &text);
+                                        world.core.message_queues.append_steering(target, &text);
                                         if let Some(editor) = shell
                                             .tui
                                             .get_mut_as::<Editor>(SlotIndex::Editor.idx())
@@ -1404,7 +1401,7 @@ async fn run_session(
                                 } else if !text.is_empty() {
                                     if spawn_prompt_turn(
                                         &mut shell.tui,
-                                        world,
+                                        &world.core,
                                         &shell.run_config,
                                         target,
                                         text,
@@ -1414,7 +1411,7 @@ async fn run_session(
                                     ) {
                                         sync_editor_enabled(&mut shell.tui);
                                     } else {
-                                        world.pump.handle(
+                                        world.pump.handle(&mut world.core.lifecycle,
                                             &mut shell.tui,
                                             &notice_event("This agent can't be prompted."),
                                         );
@@ -1437,7 +1434,7 @@ async fn run_session(
                                 yank_pending_into_editor(
                                     &mut shell.tui,
                                     &world.pump,
-                                    &world.message_queues,
+                                    &world.core.message_queues,
                                     target,
                                 );
                                 shell.tui.request_render();
@@ -1459,11 +1456,11 @@ async fn run_session(
                                     .get_mut_as::<Editor>(SlotIndex::Editor.idx())
                                     .map(|e| e.get_text().is_empty())
                                     .unwrap_or(false);
-                                if editor_empty && world.message_queues.has_pending(target) {
+                                if editor_empty && world.core.message_queues.has_pending(target) {
                                     yank_pending_into_editor(
                                         &mut shell.tui,
                                         &world.pump,
-                                        &world.message_queues,
+                                        &world.core.message_queues,
                                         target,
                                     );
                                     shell.tui.request_render();
@@ -1574,7 +1571,7 @@ async fn run_session(
                             }
                             let name = session.provider_name.clone();
                             login_session = None;
-                            world.pump.handle(
+                            world.pump.handle(&mut world.core.lifecycle,
                                 &mut shell.tui,
                                 &notice_event(&format!("Login to {name} cancelled.")),
                             );
@@ -1610,7 +1607,7 @@ async fn run_session(
                             ).await {
                                 CommandOutcome::Continue { selector, notice } => {
                                     if let Some(text) = notice {
-                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                        world.pump.handle(&mut world.core.lifecycle, &mut shell.tui, &notice_event(&text));
                                     }
                                     if let Some(sel) = selector {
                                         selectors.push(&mut shell.tui, sel);
@@ -1652,7 +1649,7 @@ async fn run_session(
                             ).await {
                                 CommandOutcome::Continue { selector, notice } => {
                                     if let Some(text) = notice {
-                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                        world.pump.handle(&mut world.core.lifecycle, &mut shell.tui, &notice_event(&text));
                                     }
                                     if let Some(sel) = selector {
                                         selectors.push(&mut shell.tui, sel);
@@ -1694,7 +1691,7 @@ async fn run_session(
                             ).await {
                                 CommandOutcome::Continue { selector, notice } => {
                                     if let Some(text) = notice {
-                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                        world.pump.handle(&mut world.core.lifecycle, &mut shell.tui, &notice_event(&text));
                                     }
                                     if let Some(sel) = selector {
                                         selectors.push(&mut shell.tui, sel);
@@ -1734,7 +1731,7 @@ async fn run_session(
                                 SelectorTransition::Close(effects) => {
                                     selectors.close_all(&mut shell.tui);
                                     if let Some(text) = effects.notice {
-                                        world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                        world.pump.handle(&mut world.core.lifecycle, &mut shell.tui, &notice_event(&text));
                                     }
                                     // A confirmed session pick exits the
                                     // per-session loop. The outer loop in
@@ -1765,7 +1762,7 @@ async fn run_session(
                                                 login_session = Some(session);
                                                 login_task = Some(task);
                                             }
-                                            Err(err) => world.pump.handle(
+                                            Err(err) => world.pump.handle(&mut world.core.lifecycle,
                                                 &mut shell.tui,
                                                 &warning_event(&format!(
                                                     "Couldn't start login: {err}"
@@ -1796,15 +1793,15 @@ async fn run_session(
                                     // so any kept palette closes back to chat.
                                     if matches!(action, CommandAction::Compact) {
                                         if turn_cancels.contains_key(&AgentId::Main)
-                                            || world.pump.is_running(AgentId::Main)
+                                            || world.core.is_running(AgentId::Main)
                                         {
-                                            world.pump.handle(
+                                            world.pump.handle(&mut world.core.lifecycle,
                                                 &mut shell.tui,
                                                 &notice_event(&session_busy_notice("compact")),
                                             );
                                         } else {
                                             spawn_turn(
-                                                world,
+                                                &world.core,
                                                 &shell.run_config,
                                                 AgentId::Main,
                                                 TurnStart::Compact {
@@ -1837,7 +1834,7 @@ async fn run_session(
                                         {
                                             CommandOutcome::Continue { selector, notice } => {
                                                 if let Some(text) = notice {
-                                                    world.pump.handle(&mut shell.tui, &notice_event(&text));
+                                                    world.pump.handle(&mut world.core.lifecycle, &mut shell.tui, &notice_event(&text));
                                                 }
                                                 match selector {
                                                     // `push` hides any kept
@@ -1891,13 +1888,13 @@ async fn run_session(
                             // when the turn ends. The editor already
                             // cleared itself on submit, so we only
                             // record the history entry.
-                            if turn_cancels.contains_key(&target) || world.pump.is_running(target) {
+                            if turn_cancels.contains_key(&target) || world.core.is_running(target) {
                                 if let Some(editor) =
                                     shell.tui.get_mut_as::<Editor>(SlotIndex::Editor.idx())
                                 {
                                     editor.add_to_history(&trimmed);
                                 }
-                                world.message_queues.append_follow_up(target, &trimmed);
+                                world.core.message_queues.append_follow_up(target, &trimmed);
                                 world.pump.sync_pending(&mut shell.tui);
                                 continue;
                             }
@@ -1912,7 +1909,7 @@ async fn run_session(
                             // with the editor left intact.
                             if spawn_prompt_turn(
                                 &mut shell.tui,
-                                world,
+                                &world.core,
                                 &shell.run_config,
                                 target,
                                 trimmed,
@@ -1922,7 +1919,7 @@ async fn run_session(
                             ) {
                                 sync_editor_enabled(&mut shell.tui);
                             } else {
-                                world.pump.handle(
+                                world.pump.handle(&mut world.core.lifecycle,
                                     &mut shell.tui,
                                     &notice_event("This agent can't be prompted."),
                                 );
@@ -1933,9 +1930,9 @@ async fn run_session(
             }
 
             // --- Agent bus event ---
-            maybe_evt = recv_event(&mut world.event_rx) => {
+            maybe_evt = recv_event(&mut world.core.event_rx) => {
                 let Some(event) = maybe_evt else { continue };
-                world.pump.handle(&mut shell.tui, &event);
+                world.pump.handle(&mut world.core.lifecycle, &mut shell.tui, &event);
                 // Wake trigger 1: a background task finished. If its
                 // owner is idle, wake it so the completion notice
                 // reaches the model; a busy owner picks the notice up
@@ -1943,7 +1940,7 @@ async fn run_session(
                 if let AgentEvent::TaskEnd { agent_id, .. } = &event {
                     spawn_wake_turn(
                         *agent_id,
-                        world,
+                        &world.core,
                         &shell.run_config,
                         turn_policy(*agent_id, &shell.config),
                         &mut turns,
@@ -1959,12 +1956,12 @@ async fn run_session(
                 // processed the event, so the owner reads as idle and
                 // the gate inside spawn_wake_turn is open.
                 if let AgentEvent::AgentEnd { agent_id, .. } = &event
-                    && (world.task_registry.has_notices(*agent_id)
-                        || world.message_queues.has_pending(*agent_id))
+                    && (world.core.task_registry.has_notices(*agent_id)
+                        || world.core.message_queues.has_pending(*agent_id))
                 {
                     spawn_wake_turn(
                         *agent_id,
-                        world,
+                        &world.core,
                         &shell.run_config,
                         turn_policy(*agent_id, &shell.config),
                         &mut turns,
@@ -1993,7 +1990,7 @@ async fn run_session(
                 // paints with the new palette automatically.
                 shell.tui.invalidate();
                 shell.tui.request_render();
-                world.pump.handle(
+                world.pump.handle(&mut world.core.lifecycle,
                     &mut shell.tui,
                     &notice_event(&format!("Theme '{name}' reloaded.")),
                 );
@@ -2025,7 +2022,7 @@ async fn run_session(
     // sure those groups are actually killed and reaped before we
     // proceed. Runs on every exit — quit, fatal error, *and* session
     // switches — so an abandoned world never leaks tasks.
-    crate::modes::shutdown_background_tasks(&world.task_registry).await;
+    crate::modes::shutdown_background_tasks(&world.core.task_registry).await;
 
     // Wind down in-flight turns before handing control back to the
     // outer session loop. A session change is only requested with no
@@ -2116,20 +2113,6 @@ fn apply_turn_config(
     }
 }
 
-/// Resolve an `AgentId` to its live handle: the main agent for
-/// `Main`, a retained sub-agent for `Sub(n)` (None if no live
-/// handle, e.g. a resumed sub-agent).
-fn resolve_agent(
-    id: AgentId,
-    main: &Arc<TokioMutex<Agent>>,
-    registry: &SubAgentRegistry,
-) -> Option<SharedAgent> {
-    match id {
-        AgentId::Main => Some(Arc::clone(main)),
-        AgentId::Sub(n) => registry.get(n),
-    }
-}
-
 /// Build the per-agent [`TurnPolicy`]. The Main agent gets reactive
 /// overflow recovery and threshold compaction (both gated on
 /// `auto_compact`); a sub-agent continuation gets neither, since
@@ -2153,7 +2136,7 @@ fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnP
 /// `false` without spawning when `target` has no live handle (e.g. a
 /// resumed sub-agent).
 fn spawn_turn(
-    world: &SessionWorld,
+    core: &SessionCore,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     target: AgentId,
     start: TurnStart,
@@ -2161,12 +2144,12 @@ fn spawn_turn(
     turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
     turn_cancels: &mut HashMap<AgentId, CancellationToken>,
 ) -> bool {
-    let Some(handle) = resolve_agent(target, &world.agent, &world.registry) else {
+    let Some(handle) = core.resolve_agent(target) else {
         return false;
     };
     let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&world.sub_overrides);
-    let log = Arc::clone(&world.log);
+    let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
+    let log = Arc::clone(&core.log);
     let turn_cancel = CancellationToken::new();
     turn_cancels.insert(target, turn_cancel.clone());
     turns.spawn(async move {
@@ -2197,17 +2180,17 @@ fn spawn_turn(
 /// drained, so the loser is a cheap no-op.
 fn spawn_wake_turn(
     owner: AgentId,
-    world: &SessionWorld,
+    core: &SessionCore,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     policy: TurnPolicy,
     turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
     turn_cancels: &mut HashMap<AgentId, CancellationToken>,
 ) {
-    if turn_cancels.contains_key(&owner) || world.pump.is_running(owner) {
+    if turn_cancels.contains_key(&owner) || core.is_running(owner) {
         return;
     }
     spawn_turn(
-        world,
+        core,
         run_config,
         owner,
         TurnStart::Wake,
@@ -2224,7 +2207,7 @@ fn spawn_wake_turn(
 /// sequence.
 fn spawn_prompt_turn(
     tui: &mut Tui,
-    world: &SessionWorld,
+    core: &SessionCore,
     run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     target: AgentId,
     text: String,
@@ -2232,7 +2215,7 @@ fn spawn_prompt_turn(
     turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
     turn_cancels: &mut HashMap<AgentId, CancellationToken>,
 ) -> bool {
-    if resolve_agent(target, &world.agent, &world.registry).is_none() {
+    if core.resolve_agent(target).is_none() {
         return false;
     }
     if let Some(editor) = tui.get_mut_as::<Editor>(SlotIndex::Editor.idx()) {
@@ -2240,7 +2223,7 @@ fn spawn_prompt_turn(
         editor.add_to_history(&text);
     }
     spawn_turn(
-        world,
+        core,
         run_config,
         target,
         TurnStart::Prompt(text),
@@ -3657,7 +3640,7 @@ async fn handle_command(
             // Read-only snapshot: lock the log, compute the digest, and
             // drop the guard at the end of the statement so it is never
             // held across the overlay's lifetime. Safe mid-turn.
-            let stats = world.log.lock().await.stats();
+            let stats = world.core.log.lock().await.stats();
             let inner = crate::modes::interactive::components::session_info::build_overlay(
                 select_list_theme(theme),
                 stats,
@@ -3682,8 +3665,8 @@ async fn handle_command(
             // already dropped at the end of the statement. Mirrors
             // `OpenSessionInfo`, which also reads the log under the
             // lock. Both success and failure surface as a notice.
-            let html = crate::export::render_session_html(&*world.log.lock().await);
-            let notice = match write_session_export(&world.session_id, &html) {
+            let html = crate::export::render_session_html(&*world.core.log.lock().await);
+            let notice = match write_session_export(&world.core.session_id, &html) {
                 Ok(path) => format!("Exported session to {}", display_path(&path)),
                 Err(e) => format!("Export failed: {e}"),
             };
@@ -3750,7 +3733,7 @@ async fn handle_command(
         CommandAction::OpenSessionSelector => {
             // The current session id lets the overlay pre-select the
             // active row once it streams in.
-            let current_session_id = world.session_id.clone();
+            let current_session_id = world.core.session_id.clone();
 
             // Scan previews on a blocking thread so the overlay opens
             // immediately and fills in incrementally as files are read.
@@ -3841,15 +3824,20 @@ async fn handle_command(
             // The picker only lists bash tasks, so resolve the command
             // line for the viewer header; if the task has left the
             // registry there is nothing to show.
-            let command = world.task_registry.summary(id).and_then(|s| match s.kind {
-                aj_agent::tool::TaskKind::Bash { command } => Some(command),
-                aj_agent::tool::TaskKind::Agent { .. } => None,
-            });
+            let command = world
+                .core
+                .task_registry
+                .summary(id)
+                .and_then(|s| match s.kind {
+                    aj_agent::tool::TaskKind::Bash { command } => Some(command),
+                    aj_agent::tool::TaskKind::Agent { .. } => None,
+                });
             match command {
                 Some(command) => {
                     let initial_inner_rows =
                         large_overlay_inner_rows(usize::from(tui.terminal().rows()));
-                    let inner = TaskOutputComponent::new(world.task_registry.clone(), id, command);
+                    let inner =
+                        TaskOutputComponent::new(world.core.task_registry.clone(), id, command);
                     let outcome = inner.outcome_handle();
                     let window = aj_tui::components::overlay_window::OverlayWindow::new(
                         format!("Task #{id}"),
@@ -4190,7 +4178,7 @@ async fn confirm_thinking_for_main(
     // Record the change on the session log's user thread so a later
     // resume restores this level.
     let log_note = {
-        let mut log = world.log.lock().await;
+        let mut log = world.core.log.lock().await;
         log.append_thinking_change(ThreadFilter::USER, name)
             .err()
             .map(|err| format!("(couldn't record in session log: {err})"))
@@ -4230,7 +4218,7 @@ async fn confirm_thinking_for_sub(
     theme: &ThemeHandle,
 ) -> String {
     let target = AgentId::Sub(n);
-    if resolve_agent(target, &world.agent, &world.registry).is_none() {
+    if world.core.resolve_agent(target).is_none() {
         return "This agent can't be prompted.".to_string();
     }
     let name = thinking_level_name(&level);
@@ -4241,6 +4229,7 @@ async fn confirm_thinking_for_sub(
     if let Some(tc) = level.as_ref() {
         let target_info: Option<Arc<ModelInfo>> = {
             let overrides = world
+                .core
                 .sub_overrides
                 .lock()
                 .expect("sub overrides mutex poisoned");
@@ -4267,6 +4256,7 @@ async fn confirm_thinking_for_sub(
     }
     // Stage the standing choice; the sub's next turn applies it.
     world
+        .core
         .sub_overrides
         .lock()
         .expect("sub overrides mutex poisoned")
@@ -4288,7 +4278,7 @@ async fn confirm_thinking_for_sub(
     // Record the change on the sub-agent's log thread so a resumed
     // transcript reflects it.
     let log_note = {
-        let mut log = world.log.lock().await;
+        let mut log = world.core.log.lock().await;
         log.append_thinking_change(ThreadFilter::subagent(n), name)
             .err()
             .map(|err| format!("(couldn't record in session log: {err})"))
@@ -4369,7 +4359,7 @@ async fn confirm_model_for_main(
             // Record the change on the session log's user thread so a
             // later resume restores this model.
             let log_note = {
-                let mut log = world.log.lock().await;
+                let mut log = world.core.log.lock().await;
                 log.append_model_change(ThreadFilter::USER, &info.provider, &info.id)
                     .err()
                     .map(|err| format!("(couldn't record in session log: {err})"))
@@ -4429,13 +4419,14 @@ async fn confirm_model_for_sub(
     world: &mut SessionWorld,
 ) -> String {
     let target = AgentId::Sub(n);
-    if resolve_agent(target, &world.agent, &world.registry).is_none() {
+    if world.core.resolve_agent(target).is_none() {
         return "This agent can't be prompted.".to_string();
     }
     // Effective speed: the staged override for this agent if
     // present, else the target's tracked settings string.
     let staged_speed = {
         let overrides = world
+            .core
             .sub_overrides
             .lock()
             .expect("sub overrides mutex poisoned");
@@ -4467,6 +4458,7 @@ async fn confirm_model_for_sub(
             // sub-agent display tuning isn't exposed, so we accept the
             // gap rather than thread config through the sub path.
             world
+                .core
                 .sub_overrides
                 .lock()
                 .expect("sub overrides mutex poisoned")
@@ -4503,7 +4495,7 @@ async fn confirm_model_for_sub(
             // Record the change on the sub-agent's log thread so a
             // resumed transcript reflects it.
             let log_note = {
-                let mut log = world.log.lock().await;
+                let mut log = world.core.log.lock().await;
                 log.append_model_change(ThreadFilter::subagent(n), &info.provider, &info.id)
                     .err()
                     .map(|err| format!("(couldn't record in session log: {err})"))
@@ -4872,7 +4864,7 @@ async fn confirm_verbosity_for_main(
     }
     // Record on the user thread so a later resume restores this value.
     let log_note = {
-        let mut log = world.log.lock().await;
+        let mut log = world.core.log.lock().await;
         log.append_verbosity_change(ThreadFilter::USER, name)
             .err()
             .map(|err| format!("(couldn't record in session log: {err})"))
@@ -4960,7 +4952,7 @@ async fn confirm_speed_for_main(
             // Record the change on the session log's user thread so a
             // later resume restores this speed.
             let log_note = {
-                let mut log = world.log.lock().await;
+                let mut log = world.core.log.lock().await;
                 log.append_speed_change(ThreadFilter::USER, name)
                     .err()
                     .map(|err| format!("(couldn't record in session log: {err})"))
@@ -5112,7 +5104,7 @@ async fn handle_selector_outcome(
                     // No-op when the user picks the row that's already
                     // active. Saves the rebuild (and the chat-container
                     // clear that would briefly hide the scrollback).
-                    if world.session_id == session_id {
+                    if world.core.session_id == session_id {
                         return SelectorTransition::Close(CloseEffects::notice(format!(
                             "Already on session {session_id}."
                         )));
@@ -5194,7 +5186,7 @@ async fn handle_selector_outcome(
                     // Switch the chat view to the chosen agent and mark
                     // the editor so the user sees which agent they're
                     // observing (cleared when switching back to main).
-                    world.pump.set_active_view(tui, id);
+                    world.pump.set_active_view(&world.core.lifecycle, tui, id);
                     apply_editor_agent_marker(tui, id);
                     apply_editor_border_for_view(tui, theme, &world.pump, &run_config, id);
                     SelectorTransition::Close(CloseEffects::default())
@@ -5218,6 +5210,7 @@ async fn handle_selector_outcome(
                     // live status: the task may have finished while the
                     // picker was up.
                     let live_status = world
+                        .core
                         .task_registry
                         .snapshot()
                         .into_iter()
@@ -5225,7 +5218,7 @@ async fn handle_selector_outcome(
                         .map(|t| t.status);
                     let notice = match live_status {
                         Some(aj_agent::tool::TaskStatus::Running) => {
-                            world.task_registry.kill(id);
+                            world.core.task_registry.kill(id);
                             format!("Killing background task #{id}.")
                         }
                         Some(_) => format!("Background task #{id} already finished."),
@@ -5274,7 +5267,9 @@ async fn handle_selector_outcome(
                 )
                 .await;
                 if let Some(text) = notice {
-                    world.pump.handle(tui, &notice_event(&text));
+                    world
+                        .pump
+                        .handle(&mut world.core.lifecycle, tui, &notice_event(&text));
                 }
             }
             // Clears (project window only) carry the inherited value so
@@ -5301,7 +5296,9 @@ async fn handle_selector_outcome(
                 )
                 .await;
                 if let Some(text) = notice {
-                    world.pump.handle(tui, &notice_event(&text));
+                    world
+                        .pump
+                        .handle(&mut world.core.lifecycle, tui, &notice_event(&text));
                 }
             }
             let outcome_value = outcome.lock().expect("settings outcome poisoned").take();
@@ -5333,7 +5330,9 @@ async fn handle_selector_outcome(
                     format!("Skill {name} {value}. Takes effect for new sessions."),
                     save_note,
                 );
-                world.pump.handle(tui, &notice_event(&notice));
+                world
+                    .pump
+                    .handle(&mut world.core.lifecycle, tui, &notice_event(&notice));
             }
             let outcome_value = outcome.lock().expect("skills outcome poisoned").take();
             match outcome_value {
@@ -5363,7 +5362,9 @@ mod tests {
     use std::path::PathBuf;
 
     use aj_conf::{AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource};
+    use aj_models::types::StreamOptions;
     use tempfile::TempDir;
+    use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
     use crate::modes::interactive::test_support::{
@@ -5736,14 +5737,14 @@ mod tests {
             "requested spec carried through for install"
         );
         assert_ne!(
-            next.world.session_id, previous_id,
+            next.world.core.session_id, previous_id,
             "fresh world gets a new session id"
         );
         assert_eq!(
             next.notices,
             vec![format!(
                 "Started a fresh session ({}).",
-                next.world.session_id
+                next.world.core.session_id
             )]
         );
     }
@@ -5759,7 +5760,7 @@ mod tests {
             .expect("resume request succeeds");
 
         assert_eq!(
-            next.world.session_id, first_id,
+            next.world.core.session_id, first_id,
             "world bound to the requested session"
         );
         assert!(
@@ -5788,7 +5789,7 @@ mod tests {
             .expect("fallback onto the previous session succeeds");
 
         assert_eq!(
-            next.world.session_id, previous_id,
+            next.world.core.session_id, previous_id,
             "fallback world resumes the previous session"
         );
         assert!(
@@ -5863,6 +5864,7 @@ mod tests {
         drive_turn(&world, "delegate").await;
 
         let sub = world
+            .core
             .registry
             .get(1)
             .expect("sub-agent retained under id 1");
@@ -5872,7 +5874,7 @@ mod tests {
             assert_eq!(s.default_thinking(), None, "spawn-time thinking inherited");
             assert_eq!(
                 s.session_id(),
-                Some(format!("{}:sub:1", world.session_id).as_str()),
+                Some(format!("{}:sub:1", world.core.session_id).as_str()),
                 "sub-agent cache key scoped to its id at spawn"
             );
         }
@@ -5896,20 +5898,20 @@ mod tests {
             assert_eq!(s.default_thinking(), None, "sub keeps its thinking");
             assert_eq!(
                 s.session_id(),
-                Some(format!("{}:sub:1", world.session_id).as_str()),
+                Some(format!("{}:sub:1", world.core.session_id).as_str()),
                 "no override: sub keeps its scoped cache key"
             );
         }
 
         // A main turn picks up the new config.
         {
-            let mut m = world.agent.lock().await;
+            let mut m = world.core.agent.lock().await;
             apply_turn_config(AgentId::Main, &mut m, &run_config, &no_overrides);
             assert_eq!(m.model_info().id, "changed");
             assert_eq!(m.default_thinking(), Some(ThinkingConfig::High));
             assert_eq!(
                 m.session_id(),
-                Some(world.session_id.as_str()),
+                Some(world.core.session_id.as_str()),
                 "main agent carries the bare session id as its cache key"
             );
         }
@@ -5936,6 +5938,7 @@ mod tests {
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         drive_turn(&world, "delegate").await;
         let sub = world
+            .core
             .registry
             .get(1)
             .expect("sub-agent retained under id 1");
@@ -5943,14 +5946,19 @@ mod tests {
         // Stage a thinking + speed override only: the model axis is
         // untouched.
         {
-            let mut overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            let mut overrides = world.core.sub_overrides.lock().expect("overrides poisoned");
             let entry = overrides.entry(1).or_default();
             entry.thinking = Some(Some(ThinkingConfig::High));
             entry.speed = Some(Some(Speed::Fast));
         }
         {
             let mut s = sub.lock().await;
-            apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &world.sub_overrides);
+            apply_turn_config(
+                AgentId::Sub(1),
+                &mut s,
+                &run_config,
+                &world.core.sub_overrides,
+            );
             assert_eq!(s.default_thinking(), Some(ThinkingConfig::High));
             assert_eq!(
                 s.model_info().id,
@@ -5961,7 +5969,7 @@ mod tests {
 
         // Stage a bundle override on top: the model swaps too.
         {
-            let mut overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            let mut overrides = world.core.sub_overrides.lock().expect("overrides poisoned");
             overrides.entry(1).or_default().bundle = Some((
                 Arc::new(ScriptedProvider::from_messages(
                     Vec::new(),
@@ -5980,13 +5988,23 @@ mod tests {
             let mut s = sub.lock().await;
             // Applied twice: the entry is a standing choice and
             // re-applies idempotently.
-            apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &world.sub_overrides);
-            apply_turn_config(AgentId::Sub(1), &mut s, &run_config, &world.sub_overrides);
+            apply_turn_config(
+                AgentId::Sub(1),
+                &mut s,
+                &run_config,
+                &world.core.sub_overrides,
+            );
+            apply_turn_config(
+                AgentId::Sub(1),
+                &mut s,
+                &run_config,
+                &world.core.sub_overrides,
+            );
             assert_eq!(s.model_info().id, "override-model");
             assert_eq!(s.default_thinking(), Some(ThinkingConfig::High));
             assert_eq!(
                 s.session_id(),
-                Some(format!("{}:sub:1", world.session_id).as_str()),
+                Some(format!("{}:sub:1", world.core.session_id).as_str()),
                 "bundle override re-scopes the cache key to the sub's id"
             );
         }
@@ -6019,8 +6037,10 @@ mod tests {
         drive_turn(&world, "delegate").await;
         let mut tui = Tui::new(Box::new(StubTerminal));
         build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
-        while let Ok(event) = world.event_rx.try_recv() {
-            world.pump.handle(&mut tui, &event);
+        while let Ok(event) = world.core.event_rx.try_recv() {
+            world
+                .pump
+                .handle(&mut world.core.lifecycle, &mut tui, &event);
         }
         (world, run_config, tui)
     }
@@ -6129,7 +6149,7 @@ mod tests {
             _ => panic!("expected the selector to close"),
         }
         {
-            let overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            let overrides = world.core.sub_overrides.lock().expect("overrides poisoned");
             assert_eq!(
                 overrides.get(&1).and_then(|o| o.thinking.clone()),
                 Some(Some(ThinkingConfig::High)),
@@ -6145,7 +6165,10 @@ mod tests {
             "footer entry updated"
         );
         assert_eq!(
-            sub_thread_settings(&world.log, 1).await.thinking.as_deref(),
+            sub_thread_settings(&world.core.log, 1)
+                .await
+                .thinking
+                .as_deref(),
             Some("high"),
             "change recorded on the sub thread"
         );
@@ -6183,6 +6206,7 @@ mod tests {
         }
         assert!(
             world
+                .core
                 .sub_overrides
                 .lock()
                 .expect("overrides poisoned")
@@ -6206,8 +6230,10 @@ mod tests {
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         let mut tui = Tui::new(Box::new(StubTerminal));
         build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
-        while let Ok(event) = world.event_rx.try_recv() {
-            world.pump.handle(&mut tui, &event);
+        while let Ok(event) = world.core.event_rx.try_recv() {
+            world
+                .pump
+                .handle(&mut world.core.lifecycle, &mut tui, &event);
         }
 
         let config = Arc::new(std::sync::Mutex::new(Config::default()));
@@ -6241,7 +6267,10 @@ mod tests {
             "run config staged for this session"
         );
         assert_eq!(
-            main_thread_settings(&world.log).await.thinking.as_deref(),
+            main_thread_settings(&world.core.log)
+                .await
+                .thinking
+                .as_deref(),
             Some("high"),
             "change recorded on the user thread so a resume restores it"
         );
@@ -6314,7 +6343,7 @@ mod tests {
             _ => panic!("expected the selector to close"),
         }
         {
-            let overrides = world.sub_overrides.lock().expect("overrides poisoned");
+            let overrides = world.core.sub_overrides.lock().expect("overrides poisoned");
             let bundle = overrides
                 .get(&1)
                 .and_then(|o| o.bundle.as_ref())
@@ -6333,7 +6362,7 @@ mod tests {
         assert_eq!(settings.model_id, "claude-x");
         assert_eq!(settings.thinking, "off", "thinking string preserved");
         assert_eq!(
-            sub_thread_settings(&world.log, 1).await.model,
+            sub_thread_settings(&world.core.log, 1).await.model,
             Some(("anthropic".to_string(), "claude-x".to_string())),
             "change recorded on the sub thread"
         );
@@ -6356,8 +6385,10 @@ mod tests {
         let theme = ThemeHandle::new(Theme::bundled_dark());
         let mut tui = Tui::new(Box::new(StubTerminal));
         build_layout(&mut tui, &theme, true);
-        while let Ok(event) = world.event_rx.try_recv() {
-            world.pump.handle(&mut tui, &event);
+        while let Ok(event) = world.core.event_rx.try_recv() {
+            world
+                .pump
+                .handle(&mut world.core.lifecycle, &mut tui, &event);
         }
 
         // A pickable catalog entry whose api has a registered
@@ -6420,7 +6451,7 @@ mod tests {
             "run config staged for this session"
         );
         assert_eq!(
-            main_thread_settings(&world.log).await.model,
+            main_thread_settings(&world.core.log).await.model,
             Some(("anthropic".to_string(), "claude-x".to_string())),
             "change recorded on the user thread so a resume restores it"
         );
@@ -6453,7 +6484,7 @@ mod tests {
         let mut tui = Tui::new(Box::new(StubTerminal));
         build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
 
-        let (task_id, cancel) = world.task_registry.register(
+        let (task_id, cancel) = world.core.task_registry.register(
             AgentId::Main,
             aj_agent::tool::TaskKind::Bash {
                 command: "sleep 5".into(),
@@ -6742,6 +6773,7 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         world
+            .core
             .task_registry
             .push_notice(bash_notice(AgentId::Main, 1, "task #1 done"));
 
@@ -6749,7 +6781,7 @@ mod tests {
         let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
         spawn_wake_turn(
             AgentId::Main,
-            &world,
+            &world.core,
             &run_config,
             test_policy(),
             &mut turns,
@@ -6768,7 +6800,7 @@ mod tests {
         assert_eq!(id, AgentId::Main);
         result.expect("wake turn succeeds");
 
-        let agent = world.agent.lock().await;
+        let agent = world.core.agent.lock().await;
         let transcript = format!("{:?}", agent.messages());
         assert!(
             transcript.contains("<task-notification>\\ntask #1 done\\n</task-notification>"),
@@ -6778,7 +6810,7 @@ mod tests {
             transcript.contains("woke and reacted"),
             "wake turn ran inference: {transcript}"
         );
-        assert!(!world.task_registry.has_notices(AgentId::Main));
+        assert!(!world.core.task_registry.has_notices(AgentId::Main));
     }
 
     /// A busy owner (already in `turn_cancels`) is left alone — the
@@ -6792,6 +6824,7 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         world
+            .core
             .task_registry
             .push_notice(bash_notice(AgentId::Main, 1, "task #1 done"));
 
@@ -6801,7 +6834,7 @@ mod tests {
 
         spawn_wake_turn(
             AgentId::Main,
-            &world,
+            &world.core,
             &run_config,
             test_policy(),
             &mut turns,
@@ -6809,7 +6842,7 @@ mod tests {
         );
         assert!(turns.is_empty(), "busy owner must not get a wake turn");
         assert!(
-            world.task_registry.has_notices(AgentId::Main),
+            world.core.task_registry.has_notices(AgentId::Main),
             "notice stays queued for the busy owner's next drain point"
         );
     }
@@ -6830,7 +6863,7 @@ mod tests {
         let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
         spawn_wake_turn(
             AgentId::Main,
-            &world,
+            &world.core,
             &run_config,
             test_policy(),
             &mut turns,
@@ -6844,7 +6877,7 @@ mod tests {
             .expect("wake turn did not panic");
         assert_eq!(id, AgentId::Main);
         result.expect("empty wake succeeds");
-        let agent = world.agent.lock().await;
+        let agent = world.core.agent.lock().await;
         assert!(agent.messages().is_empty(), "no-op wake leaves no trace");
     }
 
@@ -6870,7 +6903,7 @@ mod tests {
         let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
         let spawned = spawn_prompt_turn(
             &mut tui,
-            &world,
+            &world.core,
             &run_config,
             AgentId::Main,
             "do the thing".to_string(),
@@ -6893,7 +6926,7 @@ mod tests {
             .expect("turn did not panic");
         assert_eq!(id, AgentId::Main);
         result.expect("turn succeeds");
-        let agent = world.agent.lock().await;
+        let agent = world.core.agent.lock().await;
         assert!(format!("{:?}", agent.messages()).contains("do the thing"));
     }
 
@@ -6918,7 +6951,7 @@ mod tests {
         let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
         let spawned = spawn_prompt_turn(
             &mut tui,
-            &world,
+            &world.core,
             &run_config,
             AgentId::Sub(99),
             "x".to_string(),
@@ -6950,20 +6983,30 @@ mod tests {
         build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
 
         world
+            .core
             .message_queues
             .append_follow_up(AgentId::Main, "queued line");
-        let yanked =
-            yank_pending_into_editor(&mut tui, &world.pump, &world.message_queues, AgentId::Main);
+        let yanked = yank_pending_into_editor(
+            &mut tui,
+            &world.pump,
+            &world.core.message_queues,
+            AgentId::Main,
+        );
         assert!(yanked);
         let editor_text = tui
             .get_mut_as::<Editor>(SlotIndex::Editor.idx())
             .map(|e| e.get_text())
             .unwrap();
         assert_eq!(editor_text, "queued line");
-        assert!(!world.message_queues.has_pending(AgentId::Main));
+        assert!(!world.core.message_queues.has_pending(AgentId::Main));
 
         assert!(
-            !yank_pending_into_editor(&mut tui, &world.pump, &world.message_queues, AgentId::Main),
+            !yank_pending_into_editor(
+                &mut tui,
+                &world.pump,
+                &world.core.message_queues,
+                AgentId::Main
+            ),
             "nothing pending → false"
         );
     }
@@ -6980,6 +7023,7 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         world
+            .core
             .message_queues
             .append_follow_up(AgentId::Main, "then tidy up");
 
@@ -6987,7 +7031,7 @@ mod tests {
         let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
         spawn_wake_turn(
             AgentId::Main,
-            &world,
+            &world.core,
             &run_config,
             test_policy(),
             &mut turns,
@@ -7005,13 +7049,13 @@ mod tests {
         assert_eq!(id, AgentId::Main);
         result.expect("wake turn succeeds");
 
-        let agent = world.agent.lock().await;
+        let agent = world.core.agent.lock().await;
         let transcript = format!("{:?}", agent.messages());
         assert!(
             transcript.contains("then tidy up"),
             "follow-up delivered: {transcript}"
         );
-        assert!(!world.message_queues.has_pending(AgentId::Main));
+        assert!(!world.core.message_queues.has_pending(AgentId::Main));
     }
 }
 
@@ -7244,7 +7288,7 @@ mod run_loop_tests {
         // so a fresh resume sees the turn even with the world still live.
         let resumed = aj_session::ConversationLog::resume(
             &h.shell.conversation_persistence,
-            &h.world.session_id,
+            &h.world.core.session_id,
         )
         .expect("resume the written log");
         assert!(

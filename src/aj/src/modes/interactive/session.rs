@@ -11,54 +11,26 @@
 
 use std::sync::Arc;
 
-use aj_agent::bus::SubscriptionHandle;
-use aj_agent::events::{AgentEvent, AgentId};
-use aj_agent::queue::MessageQueues;
+use aj_agent::events::AgentId;
 use aj_agent::types::UsageSummary;
-use aj_agent::{Agent, SubAgentRegistry, TaskRegistry};
-use aj_conf::{AgentEnv, Config};
+use aj_conf::Config;
 use aj_models::registry::ModelInfo;
-use aj_models::{speed_name, thinking_config_name, verbosity_name};
-use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, persistence_listener, replay,
-};
+use aj_session::{ConversationLog, ConversationPersistence, ThreadFilter, replay};
 use aj_tui::tui::Tui;
 use anyhow::Result;
-use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::config::theme::{ThemeHandle, chat_theme};
-use crate::modes::interactive::SubAgentOverrides;
 use crate::modes::interactive::apply_editor_agent_marker;
 use crate::modes::interactive::components::chat_view::ChatView;
 use crate::modes::interactive::components::header::Header;
 use crate::modes::interactive::event_pump::EventPump;
 use crate::modes::interactive::layout::SlotIndex;
 use crate::modes::interactive::render_settings::RenderSettings;
-use crate::modes::interactive::shutdown::build_usage_summary;
-use crate::session_setup::{
-    BuiltAgent, PreparedLog, RestoreContext, RunConfigSnapshot, SessionSource, build_agent,
-    freeze_and_seed, prepare_log,
+use crate::session_setup::{RestoreContext, RunConfigSnapshot};
+
+pub use aj_app::session::{
+    AgentLifecycle, SessionCore, SessionEntry, SessionSpec, SubAgentOverrides,
 };
-
-/// How a session world comes into being and what the user sees
-/// announced when it is installed.
-pub enum SessionSpec {
-    /// Mint a fresh conversation log.
-    Create { entry: SessionEntry },
-    /// Resume the identified log from disk.
-    Resume {
-        session_id: String,
-        entry: SessionEntry,
-    },
-}
-
-/// Whether the world is the process's first or replaces a previous
-/// one; decides the header notice wording.
-pub enum SessionEntry {
-    Startup,
-    Switch,
-}
 
 /// The application name shown in the header notice and the terminal
 /// window title.
@@ -89,80 +61,31 @@ fn header_notice(spec: &SessionSpec) -> String {
     }
 }
 
-/// Everything with session lifetime, built fresh on every session
-/// change and never reseeded after construction. Dropping the world
-/// drops the agent, its bus subscriptions, and the pump in one go.
+/// The interactive TUI's per-session view: a frontend-agnostic
+/// [`SessionCore`] plus the event pump that maps agent events onto
+/// layout mutations. Built fresh on every session change and never
+/// reseeded after construction. Dropping the world drops the core (and
+/// with it the agent and its bus subscriptions) and the pump in one go.
 pub struct SessionWorld {
-    /// The session's agent, freshly constructed for this world.
-    /// Shared because the submit handler spawns a task that holds it
-    /// across `agent.prompt(...).await`.
-    pub agent: Arc<TokioMutex<Agent>>,
-    /// The environment the agent was built against: base prompt,
-    /// AGENTS.md/CLAUDE.md context files, discovered skills, working
-    /// directory. The runtime takes only the assembled prompt, so the
-    /// world keeps this for the startup context notice, the footer
-    /// cwd, and the editor's autocomplete root.
-    pub env: AgentEnv,
-    /// Sub-agent registry injected into `agent`; starts empty, so
-    /// only sub-agents spawned in this session are promptable.
-    pub registry: SubAgentRegistry,
-    /// Background-task registry injected into `agent`; shared with
-    /// the main loop so the wake triggers can poll notices and
-    /// shutdown can kill the task tree. Per-world; `run_session`
-    /// shuts it down on every exit (quit, fatal error, session
-    /// switch), so tasks never outlive their world.
-    pub task_registry: TaskRegistry,
-    /// Shared steering / follow-up queues injected into `agent` (and
-    /// its sub-agents). The main loop's input handlers enqueue onto
-    /// them and the wake triggers poll [`MessageQueues::has_pending`].
-    /// Per-world, like the agent itself.
-    pub message_queues: MessageQueues,
-    /// Loop-side staged settings overrides, keyed by sub-agent id.
-    /// The `/model` / `/thinking` selectors write entries when the
-    /// user changes a sub-agent's settings; the submit handler's
-    /// turn task re-applies them at every turn start (see
-    /// `apply_turn_config`). Sub ids are per-session, so the map
-    /// resets naturally with the world. A sub-agent with no entry
-    /// runs with whatever it already holds (spawn-time inheritance).
-    pub(crate) sub_overrides:
-        Arc<std::sync::Mutex<std::collections::HashMap<usize, SubAgentOverrides>>>,
-    /// The session's on-disk conversation log, shared with the
-    /// persistence listener.
-    pub log: Arc<TokioMutex<ConversationLog>>,
-    /// Convenience copy of the log's session id, readable without
-    /// locking `log`.
-    pub session_id: String,
+    /// Frontend-agnostic session state: agent, registries, log, bus
+    /// subscriptions, staged settings, and the agent-lifecycle sets.
+    pub core: SessionCore,
     /// Maps agent events onto TUI component updates.
     pub pump: EventPump,
-    /// Receiver side of the bus→channel forwarder feeding `pump`.
-    pub event_rx: UnboundedReceiver<AgentEvent>,
-    /// Keeps the bus→channel forwarder subscribed; dropped with the
-    /// world.
-    _event_handle: SubscriptionHandle,
-    /// Keeps the persistence listener subscribed; dropped with the
-    /// world.
-    _persistence_handle: SubscriptionHandle,
-    /// Notices produced by resume-time settings restoration (what
-    /// was restored, or why a recorded value was kept out). Pumped
-    /// onto the chat scrollback by the caller after `install`.
-    pub restore_notices: Vec<String>,
 }
 
 impl SessionWorld {
-    /// Build a world bound to the session `spec` describes. Performs
-    /// everything that doesn't touch the TUI: log resolve
-    /// (create/resume), interrupted-tool-use repair, resume-time
-    /// settings restoration (when `restore` is supplied, the log's
-    /// recorded model/thinking/speed are written back into the
-    /// shared run-config snapshot before the agent is built), agent
-    /// construction off the run-config snapshot, transcript /
-    /// system-prompt / sub-agent-counter seeding, bus subscriptions,
-    /// and pump construction. A fresh log additionally gets its
-    /// initial settings record so a later resume can restore it.
+    /// Build a world bound to the session `spec` describes.
     ///
-    /// On error nothing is shared or installed; the outer session
-    /// loop in `InteractiveMode::run` falls back to resuming the
-    /// previous session.
+    /// Delegates the frontend-agnostic setup (log resolve, repair,
+    /// resume-time settings restoration, agent construction, seeding,
+    /// bus subscriptions) to [`SessionCore::build`], then constructs the
+    /// event pump from the theme, render settings, catalog, and the
+    /// Main-agent footer seed the core hands back.
+    ///
+    /// On error nothing is shared or installed; the outer session loop
+    /// in `InteractiveMode::run` falls back to resuming the previous
+    /// session.
     pub(crate) fn build(
         config: &Config,
         run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
@@ -173,125 +96,16 @@ impl SessionWorld {
         restore: Option<&RestoreContext>,
         catalog: Arc<Vec<ModelInfo>>,
     ) -> Result<SessionWorld> {
-        let source = match spec {
-            SessionSpec::Create { .. } => SessionSource::Create,
-            SessionSpec::Resume { session_id, .. } => SessionSource::Resume {
-                session_id: session_id.clone(),
-            },
-        };
-
-        // Resolve + repair the log and, on a resume with restoration
-        // enabled, write its recorded settings back into the shared
-        // run config before the agent is built off it.
-        let PreparedLog {
-            mut log,
-            transcript,
-            restore_notices,
-        } = prepare_log(persistence, &source, config, run_config, restore)?;
-
-        // Build a fresh agent off the run-config snapshot, which at
-        // this point reflects both runtime `/model` / `/thinking`
-        // choices and any settings just restored from the resumed
-        // log.
-        let (provider, model_info, stream_options, thinking, speed, verbosity, model_key) = {
-            let cfg = run_config.lock().expect("run config mutex poisoned");
-            (
-                Arc::clone(&cfg.provider),
-                Arc::clone(&cfg.model_info),
-                cfg.stream_options.clone(),
-                cfg.thinking.clone(),
-                cfg.speed,
-                cfg.stream_options.verbosity,
-                cfg.model_key.clone(),
-            )
-        };
-        let BuiltAgent {
-            mut agent,
-            env,
-            include_skills,
-        } = build_agent(
-            config,
-            provider,
-            model_info,
-            stream_options,
-            thinking.clone(),
-            speed,
-        );
-
-        // Freeze the system prompt (fresh log) or reuse the persisted
-        // one (resume), then seed the agent's transcript, prompt, and
-        // sub-agent counter floor.
-        freeze_and_seed(
-            &mut log,
-            &mut agent,
-            transcript,
-            &env,
-            include_skills,
-            &model_key,
-            thinking.as_ref(),
-            speed,
-            verbosity,
-        )?;
-
-        // Fresh, empty registry: only sub-agents spawned in this
-        // session become promptable.
-        let registry = SubAgentRegistry::default();
-        agent.set_sub_agent_registry(registry.clone());
-
-        // Fresh task registry, shared with the main loop's wake
-        // triggers; its session-scoped cancellation root is fired
-        // when the world winds down.
-        let task_registry = TaskRegistry::default();
-        agent.set_task_registry(task_registry.clone());
-
-        // Fresh, shared steering / follow-up queues: the TUI input
-        // handlers enqueue onto them while a turn runs, the agent
-        // drains them, and the pump reads them to paint the
-        // pending-message box.
-        let message_queues = MessageQueues::default();
-        agent.set_message_queues(message_queues.clone());
-
-        // Bus subscriptions: the channel forwarder feeds the pump in
-        // the main loop; the persistence listener writes events into
-        // the log. Seeding never emits bus events, so subscription
-        // order relative to it is immaterial.
-        let (event_handle, event_rx) = agent.subscribe_channel();
-        let session_id = log.session_id().to_string();
-        let log = Arc::new(TokioMutex::new(log));
-        let persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
-
-        let main_settings = aj_agent::events::AgentSettings {
-            provider: model_key.0.clone(),
-            model_id: model_key.1.clone(),
-            thinking: thinking_config_name(thinking.as_ref()).to_string(),
-            speed: speed_name(speed).to_string(),
-            verbosity: verbosity_name(verbosity).to_string(),
-        };
-        let context_window = agent.model_info().context_window;
+        let (core, seed) = SessionCore::build(config, run_config, persistence, spec, restore)?;
         let pump = EventPump::new(
             chat_theme(theme, config.syntax_highlighting),
             render_settings.clone(),
-            main_settings,
-            context_window,
+            seed.settings,
+            seed.context_window,
             catalog,
-            message_queues.clone(),
+            core.message_queues.clone(),
         );
-
-        Ok(SessionWorld {
-            agent: Arc::new(TokioMutex::new(agent)),
-            env,
-            registry,
-            task_registry,
-            message_queues,
-            sub_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            log,
-            session_id,
-            pump,
-            event_rx,
-            _event_handle: event_handle,
-            _persistence_handle: persistence_handle,
-            restore_notices,
-        })
+        Ok(SessionWorld { core, pump })
     }
 
     /// Bind this world to the TUI: clear the chat scrollback, reset
@@ -313,15 +127,15 @@ impl SessionWorld {
         {
             // Clone the handle so the guard doesn't borrow `self`,
             // which the pump calls below need mutably.
-            let log = Arc::clone(&self.log);
+            let log = Arc::clone(&self.core.log);
             let log = log.lock().await;
             for event in replay(&log) {
-                self.pump.handle(tui, &event);
+                self.pump.handle(&mut self.core.lifecycle, tui, &event);
             }
             self.reconcile_sub_agent_settings(tui, &log);
         }
         if let Some(header) = tui.get_mut_as::<Header>(SlotIndex::Header.idx()) {
-            header.set_session_id(Some(self.session_id.clone()));
+            header.set_session_id(Some(self.core.session_id.clone()));
             header.set_notice(Some(header_notice(spec)));
         }
         tui.terminal_mut().set_title(&self.window_title());
@@ -334,15 +148,16 @@ impl SessionWorld {
     /// so a session switch retitles the window.
     fn window_title(&self) -> String {
         let cwd = self
+            .core
             .env
             .working_directory
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if self.session_id.is_empty() {
+        if self.core.session_id.is_empty() {
             format!("{APP_TITLE} - {cwd}")
         } else {
-            format!("{APP_TITLE} - {} - {cwd}", self.session_id)
+            format!("{APP_TITLE} - {} - {cwd}", self.core.session_id)
         }
     }
 
@@ -393,8 +208,7 @@ impl SessionWorld {
     /// shutdown banner. Locks the agent, so call only while no turn
     /// is in flight.
     pub async fn usage_summary(&self) -> UsageSummary {
-        let agent = self.agent.lock().await;
-        build_usage_summary(&agent)
+        self.core.usage_summary().await
     }
 }
 
@@ -403,15 +217,17 @@ mod tests {
     use std::time::Duration;
 
     use aj_agent::bus::EventBus;
-    use aj_agent::events::AgentSettings;
+    use aj_agent::events::{AgentEvent, AgentSettings};
     use aj_agent::message::AgentMessage;
     use aj_models::ThinkingConfig;
     use aj_models::auth::AuthStorage;
     use aj_models::registry::ModelRegistry;
     use aj_models::scripted::ScriptedProvider;
     use aj_models::types::{AssistantMessage, Message, Speed, StreamOptions, UserMessage};
+    use aj_session::persistence_listener;
     use aj_tui::component::Component;
     use tempfile::TempDir;
+    use tokio::sync::Mutex as TokioMutex;
 
     use super::*;
     use crate::config::theme::Theme;
@@ -420,6 +236,7 @@ mod tests {
         StubTerminal, build_test_world, create_spec, drive_turn, finalized_text_message,
         one_turn_session, resume_spec, scripted_model_info, scripted_run_config,
     };
+    use crate::session_setup::build_agent;
 
     /// Strip the `dim` SGR codes the header wraps its banner in so
     /// substring assertions see the visible text contiguously.
@@ -466,9 +283,9 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
 
-        let log = world.log.lock().await;
+        let log = world.core.log.lock().await;
         let persisted = log.system_prompt().expect("system prompt frozen on create");
-        let agent = world.agent.lock().await;
+        let agent = world.core.agent.lock().await;
         let held = agent.assembled_system_prompt();
         assert_eq!(persisted, held);
     }
@@ -486,13 +303,13 @@ mod tests {
         let mut world = build_test_world(&persistence, &run_config, &spec).expect("resume world");
 
         {
-            let agent = world.agent.lock().await;
+            let agent = world.core.agent.lock().await;
             let transcript = format!("{:?}", agent.messages());
             assert!(!agent.messages().is_empty(), "transcript seeded");
             assert!(transcript.contains("hello there"), "user prompt seeded");
             assert!(transcript.contains("scripted reply"), "reply seeded");
 
-            let log = world.log.lock().await;
+            let log = world.core.log.lock().await;
             assert_eq!(
                 log.system_prompt().expect("persisted prompt"),
                 agent.assembled_system_prompt(),
@@ -542,18 +359,22 @@ mod tests {
         )
         .agent;
         world_a
+            .core
             .registry
             .insert(7, Arc::new(TokioMutex::new(throwaway)));
-        assert_eq!(world_a.registry.ids(), vec![7]);
+        assert_eq!(world_a.core.registry.ids(), vec![7]);
 
-        let session_id = world_a.session_id.clone();
+        let session_id = world_a.core.session_id.clone();
         drop(world_a);
 
         let run_config = scripted_run_config(Vec::new());
         let world_b = build_test_world(&persistence, &run_config, &resume_spec(&session_id))
             .expect("resume world");
 
-        assert!(world_b.registry.ids().is_empty(), "registry starts empty");
+        assert!(
+            world_b.core.registry.ids().is_empty(),
+            "registry starts empty"
+        );
         let total = world_b.usage_summary().await.total_usage;
         assert_eq!(total.input_tokens, 0);
         assert_eq!(total.output_tokens, 0);
@@ -575,7 +396,7 @@ mod tests {
         // driving the persistence listener directly — the same
         // events a real sub-agent spawn would emit on the bus.
         let bus = EventBus::new();
-        let _h = bus.subscribe(persistence_listener(Arc::clone(&world_a.log)));
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&world_a.core.log)));
         bus.emit(AgentEvent::SubAgentStart {
             parent: AgentId::Main,
             child: AgentId::Sub(3),
@@ -597,7 +418,7 @@ mod tests {
         .await
         .expect("emit sub message");
 
-        let session_id = world_a.session_id.clone();
+        let session_id = world_a.core.session_id.clone();
         drop(world_a);
 
         let run_config = scripted_run_config(Vec::new());
@@ -608,7 +429,7 @@ mod tests {
         // resumed agent therefore mints ids strictly greater than 3
         // (mint-side behavior covered by the `SessionState` unit
         // test in `aj-agent`).
-        assert_eq!(world_b.log.lock().await.max_agent_id(), Some(3));
+        assert_eq!(world_b.core.log.lock().await.max_agent_id(), Some(3));
     }
 
     #[tokio::test]
@@ -625,7 +446,7 @@ mod tests {
         // spawn would emit on the bus, both with the spawn-time
         // settings snapshot.
         let bus = EventBus::new();
-        let _h = bus.subscribe(persistence_listener(Arc::clone(&world_a.log)));
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&world_a.core.log)));
         for n in [1usize, 2] {
             bus.emit(AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
@@ -653,7 +474,7 @@ mod tests {
         // non-punctuation and only reach disk with the next
         // punctuation append, so a follow-up message flushes them.
         {
-            let mut log = world_a.log.lock().await;
+            let mut log = world_a.core.log.lock().await;
             log.append_thinking_change(ThreadFilter::subagent(1), "high")
                 .expect("append thinking change");
             log.append_model_change(ThreadFilter::subagent(1), "anthropic", "claude-x")
@@ -665,7 +486,7 @@ mod tests {
         })
         .await
         .expect("emit flush message");
-        let session_id = world_a.session_id.clone();
+        let session_id = world_a.core.session_id.clone();
         drop(world_a);
 
         let run_config = scripted_run_config(Vec::new());
@@ -721,7 +542,7 @@ mod tests {
             let run_config = scripted_run_config(Vec::new());
             let mut world =
                 build_test_world(&persistence, &run_config, &spec).expect("build world");
-            let expected_id = world.session_id.clone();
+            let expected_id = world.core.session_id.clone();
 
             let mut tui = Tui::new(Box::new(StubTerminal));
             build_layout(&mut tui, &ThemeHandle::new(Theme::bundled_dark()), true);
@@ -844,7 +665,7 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
 
-        let log = world.log.lock().await;
+        let log = world.core.log.lock().await;
         let head = log
             .latest_leaf(ThreadFilter::USER)
             .expect("seed entries give the user thread a leaf");
@@ -870,14 +691,14 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         {
-            let mut log = world.log.lock().await;
+            let mut log = world.core.log.lock().await;
             log.append_thinking_change(ThreadFilter::USER, "high")
                 .expect("thinking change");
             log.append_speed_change(ThreadFilter::USER, "fast")
                 .expect("speed change");
         }
         drive_turn(&world, "hello there").await;
-        let session_id = world.session_id.clone();
+        let session_id = world.core.session_id.clone();
         drop(world);
 
         let run_config = scripted_run_config(Vec::new());
@@ -897,11 +718,12 @@ mod tests {
         assert_eq!(cfg.speed, Some(Speed::Fast));
         assert!(
             world
+                .core
                 .restore_notices
                 .iter()
                 .any(|n| n.contains("Restored model claude-x (anthropic/claude-x)")),
             "restore notice missing: {:?}",
-            world.restore_notices
+            world.core.restore_notices
         );
     }
 
@@ -914,7 +736,7 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         drive_turn(&world, "hello there").await;
-        let session_id = world.session_id.clone();
+        let session_id = world.core.session_id.clone();
         drop(world);
 
         let run_config = scripted_run_config(Vec::new());
@@ -931,11 +753,12 @@ mod tests {
         );
         assert!(
             world
+                .core
                 .restore_notices
                 .iter()
                 .any(|n| n.contains("anthropic/claude-x, which is not available")),
             "fallback notice missing: {:?}",
-            world.restore_notices
+            world.core.restore_notices
         );
     }
 
@@ -948,12 +771,12 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         {
-            let mut log = world.log.lock().await;
+            let mut log = world.core.log.lock().await;
             log.append_thinking_change(ThreadFilter::USER, "bogus")
                 .expect("thinking change");
         }
         drive_turn(&world, "hello there").await;
-        let session_id = world.session_id.clone();
+        let session_id = world.core.session_id.clone();
         drop(world);
 
         let run_config = scripted_run_config(Vec::new());
@@ -966,11 +789,12 @@ mod tests {
         assert_eq!(cfg.thinking, None, "unknown level keeps the current value");
         assert!(
             world
+                .core
                 .restore_notices
                 .iter()
                 .any(|n| n.contains("unknown thinking level \"bogus\"")),
             "unknown-level notice missing: {:?}",
-            world.restore_notices
+            world.core.restore_notices
         );
     }
 
@@ -999,12 +823,12 @@ mod tests {
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         {
-            let mut log = world.log.lock().await;
+            let mut log = world.core.log.lock().await;
             log.append_speed_change(ThreadFilter::USER, "fast")
                 .expect("speed change");
         }
         drive_turn(&world, "hello there").await;
-        let session_id = world.session_id.clone();
+        let session_id = world.core.session_id.clone();
         drop(world);
 
         let run_config = make_run_config(Vec::new());
@@ -1025,11 +849,12 @@ mod tests {
         // failure notice either.
         assert!(
             !world
+                .core
                 .restore_notices
                 .iter()
                 .any(|n| n.contains("Restored model") || n.contains("Couldn't apply")),
             "same-model speed rebuild should be silent: {:?}",
-            world.restore_notices
+            world.core.restore_notices
         );
     }
 }

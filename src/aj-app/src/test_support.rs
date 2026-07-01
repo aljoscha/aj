@@ -19,13 +19,11 @@ use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{
     AssistantContent, AssistantMessage, StopReason, StreamOptions, TextContent,
 };
-use aj_session::{ConversationLog, ConversationPersistence, persistence_listener};
+use aj_session::{ConversationLog, ConversationPersistence};
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::session_setup::{
-    BuiltAgent, PreparedLog, RunConfigSnapshot, SessionSource, build_agent, freeze_and_seed,
-    prepare_log,
-};
+use crate::session::{SessionCore, SessionEntry, SessionSpec};
+use crate::session_setup::RunConfigSnapshot;
 
 /// [`ModelInfo`] consistent with the identity [`ScriptedProvider`]
 /// stamps on every emitted partial, so the agent sees a coherent
@@ -116,13 +114,11 @@ pub fn scripted_run_config_with_window(
     }))
 }
 
-/// Build a headless agent over a fresh (`Create`) session, running the
-/// frontend-agnostic half of the interactive session setup:
-/// [`prepare_log`] -> [`build_agent`] -> [`freeze_and_seed`], then
-/// subscribing the persistence listener so driven turns write real
-/// entries into the returned log. This is the shared core of the
-/// interactive `SessionWorld::build`, minus the event pump, sub-agent
-/// registry, and TUI theme.
+/// Build a headless agent over a fresh (`Create`) session by running
+/// the frontend-agnostic session setup through [`SessionCore::build`],
+/// then decomposing the core into the owned agent, its shared log, and
+/// the persistence subscription. This keeps the seeding sequence in one
+/// place: the same path a live interactive session takes.
 ///
 /// The returned [`SubscriptionHandle`] must be kept alive for the life
 /// of the agent: dropping it detaches the persistence listener, so a
@@ -133,59 +129,10 @@ pub fn build_test_agent(
     run_config: &Arc<StdMutex<RunConfigSnapshot>>,
 ) -> (Agent, Arc<TokioMutex<ConversationLog>>, SubscriptionHandle) {
     let config = Config::default();
-
-    let PreparedLog {
-        mut log,
-        transcript,
-        restore_notices: _,
-    } = prepare_log(
-        persistence,
-        &SessionSource::Create,
-        &config,
-        run_config,
-        None,
-    )
-    .expect("prepare log");
-
-    let (provider, model_info, stream_options, thinking, speed, verbosity, model_key) = {
-        let cfg = run_config.lock().expect("run config mutex poisoned");
-        (
-            Arc::clone(&cfg.provider),
-            Arc::clone(&cfg.model_info),
-            cfg.stream_options.clone(),
-            cfg.thinking.clone(),
-            cfg.speed,
-            cfg.stream_options.verbosity,
-            cfg.model_key.clone(),
-        )
+    let spec = SessionSpec::Create {
+        entry: SessionEntry::Startup,
     };
-    let BuiltAgent {
-        mut agent,
-        env,
-        include_skills,
-    } = build_agent(
-        &config,
-        provider,
-        model_info,
-        stream_options,
-        thinking.clone(),
-        speed,
-    );
-
-    freeze_and_seed(
-        &mut log,
-        &mut agent,
-        transcript,
-        &env,
-        include_skills,
-        &model_key,
-        thinking.as_ref(),
-        speed,
-        verbosity,
-    )
-    .expect("freeze and seed");
-
-    let log = Arc::new(TokioMutex::new(log));
-    let persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
-    (agent, log, persistence_handle)
+    let (core, _seed) = SessionCore::build(&config, run_config, persistence, &spec, None)
+        .expect("build session core");
+    core.into_test_agent()
 }

@@ -46,6 +46,7 @@ use aj::modes::interactive::components::chat_view::ChatView;
 use aj::modes::interactive::event_pump::EventPump;
 use aj::modes::interactive::layout::{SlotIndex, build_layout};
 use aj::modes::interactive::render_settings::RenderSettings;
+use aj::modes::interactive::session::AgentLifecycle;
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::{AgentEvent, AgentSettings};
 use aj_agent::tool::ErasedToolDefinition;
@@ -286,8 +287,9 @@ async fn drive_live_turn(
 /// return the chat container's rendered lines.
 fn render_live(events: &[AgentEvent]) -> Vec<String> {
     let (mut tui, mut pump) = build_tui_and_pump();
+    let mut life = AgentLifecycle::default();
     for event in events {
-        pump.handle(&mut tui, event);
+        pump.handle(&mut life, &mut tui, event);
     }
     render_chat(&mut tui)
 }
@@ -298,8 +300,9 @@ fn render_replay(sessions_dir: &Path, session_id: &str) -> Vec<String> {
     let persistence = ConversationPersistence::new(sessions_dir.to_path_buf());
     let log = ConversationLog::resume(&persistence, session_id).expect("resume log");
     let (mut tui, mut pump) = build_tui_and_pump();
+    let mut life = AgentLifecycle::default();
     for event in replay(&log) {
-        pump.handle(&mut tui, &event);
+        pump.handle(&mut life, &mut tui, &event);
     }
     render_chat(&mut tui)
 }
