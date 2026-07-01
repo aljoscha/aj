@@ -2,6 +2,7 @@
 members = [
     "src/aj",
     "src/aj-agent",
+    "src/aj-app",
     "src/aj-conf",
     "src/aj-models",
     "src/aj-session",

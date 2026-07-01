@@ -72,6 +72,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aj-app"
+version = "0.1.0"
+dependencies = [
+ "aj-agent",
+ "aj-conf",
+ "aj-models",
+ "aj-session",
+ "aj-tools",
+ "anyhow",
+ "arboard",
+ "base64",
+ "chrono",
+ "clap",
+ "flate2",
+ "iana-time-zone",
+ "image",
+ "notify",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aj-conf"
 version = "0.1.0"
 dependencies = [
