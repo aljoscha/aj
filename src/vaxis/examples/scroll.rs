@@ -171,8 +171,9 @@ impl Widget for ScrollModel {
             return ctx.consume_and_redraw();
         }
         if key.matches(Key::TAB, Modifiers::empty()) {
-            let mut sb = self.scroll_bars.borrow_mut();
-            sb.scroll_view.draw_cursor = !sb.scroll_view.draw_cursor;
+            let sb = self.scroll_bars.borrow_mut();
+            let mut sv = sb.scroll_view.borrow_mut();
+            sv.draw_cursor = !sv.draw_cursor;
             return ctx.consume_and_redraw();
         }
         if key.matches(u32::from('v'), Modifiers::CTRL) {
@@ -193,10 +194,8 @@ impl Widget for ScrollModel {
         }
 
         // Anything else is a scroll-view navigation key.
-        self.scroll_bars
-            .borrow_mut()
-            .scroll_view
-            .handle_event(ctx, event);
+        let sb = self.scroll_bars.borrow_mut();
+        sb.scroll_view.borrow_mut().handle_event(ctx, event);
     }
 
     fn wants_events(&self) -> bool {

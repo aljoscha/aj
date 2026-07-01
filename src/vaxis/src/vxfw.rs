@@ -628,6 +628,13 @@ impl Surface {
     /// each child's local frame on the way down. Only widgets that
     /// [`want events`](Widget::wants_events) are added. Asserts `point` lies
     /// within this surface.
+    ///
+    /// NOTE: We visit children in ascending z-index, the same order
+    /// [`render`](Surface::render) paints them. Because a deeper hit is appended
+    /// later and the App treats the last hit as the target, this makes the
+    /// topmost (highest z-index) of overlapping siblings the target, matching
+    /// what the user sees on screen. `render` sorts a copy so it can stay
+    /// `&self`, leaving `self.children` in insertion order, so we re-sort here.
     pub fn hit_test(&self, point: Point, list: &mut Vec<HitResult>) {
         debug_assert!(point.col < self.size.width && point.row < self.size.height);
         if let Some(w) = &self.widget {
@@ -638,7 +645,11 @@ impl Surface {
                 });
             }
         }
-        for child in &self.children {
+        // A stable sort keeps insertion order among equal z-indexes, mirroring
+        // `render`'s stable sort.
+        let mut order: Vec<&SubSurface> = self.children.iter().collect();
+        order.sort_by_key(|child| child.z_index);
+        for child in order {
             if !child.contains_point(point) {
                 continue;
             }
@@ -813,6 +824,62 @@ mod tests {
                 height: 10
             }
         ));
+    }
+
+    #[test]
+    fn hit_test_orders_overlapping_siblings_by_z_index() {
+        // A minimal widget that takes part in event dispatch, so hit_test adds
+        // it to the list.
+        struct Marker;
+        impl Widget for Marker {
+            fn draw(&mut self, _ctx: &DrawContext) -> Surface {
+                unreachable!("this widget is never drawn in the test")
+            }
+            fn wants_events(&self) -> bool {
+                true
+            }
+        }
+
+        let low: WidgetRef = Rc::new(RefCell::new(Marker));
+        let high: WidgetRef = Rc::new(RefCell::new(Marker));
+
+        let child = |w: &WidgetRef, z: u8| SubSurface {
+            origin: RelativePoint { row: 0, col: 0 },
+            surface: Surface {
+                size: Size {
+                    width: 4,
+                    height: 4,
+                },
+                widget: Some(Rc::clone(w)),
+                cursor: None,
+                buffer: Vec::new(),
+                children: Vec::new(),
+            },
+            z_index: z,
+        };
+
+        // Two children fully overlap at the origin. We insert the higher-z child
+        // first so insertion order and z-order disagree: a correct hit_test must
+        // still resolve the higher-z child as the target.
+        let parent = Surface {
+            size: Size {
+                width: 4,
+                height: 4,
+            },
+            widget: None,
+            cursor: None,
+            buffer: Vec::new(),
+            children: vec![child(&high, 5), child(&low, 1)],
+        };
+
+        let mut hits = Vec::new();
+        parent.hit_test(Point { row: 1, col: 1 }, &mut hits);
+
+        // Both overlapping siblings are hit. The higher-z one is deepest (last),
+        // which is what the App pops as the event target.
+        assert_eq!(hits.len(), 2);
+        assert!(widget_eq(&hits[0].widget, &low));
+        assert!(widget_eq(&hits[1].widget, &high));
     }
 
     /// Convention enforcer (the reframed upstream "all widgets have a doctest"
