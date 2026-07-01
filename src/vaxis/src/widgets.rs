@@ -17,6 +17,7 @@ pub mod line_numbers;
 pub mod scroll_view;
 pub mod scrollbar;
 pub mod table;
+pub mod terminal;
 pub mod text_input;
 pub mod text_view;
 pub mod view;
