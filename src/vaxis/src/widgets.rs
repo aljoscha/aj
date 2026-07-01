@@ -27,6 +27,8 @@ pub use crate::widgets::line_numbers::LineNumbers;
 pub use crate::widgets::scroll_view::ScrollView;
 pub use crate::widgets::scrollbar::Scrollbar;
 pub use crate::widgets::table::{TableCell, TableContext, TableRow, draw_table};
+#[cfg(unix)]
+pub use crate::widgets::terminal::Terminal;
 pub use crate::widgets::text_input::TextInput;
 pub use crate::widgets::text_view::{Buffer, BufferWriter, TextView};
 pub use crate::widgets::view::View;

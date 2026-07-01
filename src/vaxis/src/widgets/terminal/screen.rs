@@ -199,6 +199,11 @@ impl Screen {
 
     /// Copies the cursor and every dirty cell into `dst`, clearing this
     /// screen's dirty flags. Only the grapheme, width, and style are copied.
+    ///
+    /// NOTE: the primary back screen is taller than `dst` (the front screen) by
+    /// the scrollback rows, so we clear every source dirty flag but only write
+    /// cells that fall within `dst`. Copying the whole source into a shorter
+    /// destination would index out of bounds.
     pub fn copy_to(&mut self, dst: &mut Screen) {
         dst.cursor = self.cursor.clone();
         for i in 0..self.buf.len() {
@@ -206,6 +211,9 @@ impl Screen {
                 continue;
             }
             self.buf[i].dirty = false;
+            if i >= dst.buf.len() {
+                continue;
+            }
             dst.buf[i].char.clear();
             dst.buf[i].char.push_str(&self.buf[i].char);
             dst.buf[i].width = self.buf[i].width;

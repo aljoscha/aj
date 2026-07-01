@@ -16,11 +16,21 @@
 //! - [`key`]: encoding a [`crate::key::Key`] back into the bytes a child
 //!   expects on its input.
 //!
-//! NOTE: The PTY, the child-process `Command`, and the `Terminal` orchestrator
-//! (reader thread, triple-buffered screens, event queue) are a separate
-//! follow-up. They carry all the OS-specific machinery and are Linux-first.
+//! The PTY, the child-process [`command::Command`], and the [`Terminal`]
+//! orchestrator (reader thread, triple-buffered screens, event channel) carry
+//! all the OS-specific machinery and are Linux-first, gated on `unix`.
 
 pub mod ansi;
 pub mod key;
 pub mod parser;
 pub mod screen;
+
+#[cfg(unix)]
+pub mod command;
+#[cfg(unix)]
+pub mod pty;
+
+#[cfg(unix)]
+mod emulator;
+#[cfg(unix)]
+pub use emulator::{Event, InputEvent, Mode, Options, Terminal, TerminalError};
