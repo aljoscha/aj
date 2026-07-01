@@ -32,6 +32,7 @@ pub mod scripted;
 pub mod session_setup;
 pub mod shutdown;
 pub mod system_prompt;
+pub mod theme;
 pub mod tmux;
 pub mod turn;
 pub mod usage;

@@ -1,445 +1,49 @@
-//! Theme — JSON-loaded palette + builders for the interactive
-//! mode's component themes.
+//! Theme rendering for the aj-tui interactive mode.
 //!
-//! ## Shape
+//! The backend-neutral palette (the [`Theme`] struct, the semantic
+//! [`ThemeColor`] / [`ThemeBg`] tokens, the JSON loader, the file
+//! watcher, and the shared [`ThemeHandle`]) lives in
+//! [`aj_app::theme`] and is re-exported here so existing
+//! `crate::config::theme::...` call sites keep resolving.
 //!
-//! A [`Theme`] is a resolved palette: every semantic token (one of
-//! the [`ThemeColor`] / [`ThemeBg`] variants) maps to a precomputed
-//! ANSI SGR escape, ready to wrap text. The palette is loaded from
-//! a JSON file that uses two layers:
+//! What lives here is aj's rendering half: the ANSI SGR encoding of a
+//! [`ThemeRgb`] (with 256-color downsampling for limited terminals),
+//! the [`ThemeExt`] / [`ThemeHandleExt`] extension traits that wrap
+//! text in those escapes, and the builders that turn a palette into
+//! the `aj-tui` component theme structs ([`MarkdownTheme`],
+//! [`EditorTheme`], [`SelectListTheme`], [`ChatTheme`], …).
 //!
-//! 1. **`vars`** — named hex / 256-color values for reuse.
-//! 2. **`colors`** — semantic tokens; each value is either an
-//!    explicit color (hex, 256-color index, or empty for terminal
-//!    default) or a reference to a `vars` key.
+//! ## ANSI encoding
 //!
-//! Var references resolve transitively so a theme can layer
-//! "purpose" (`accent`, `borderMuted`) on top of "value"
-//! (`#8abeb7`, `#666666`) without duplication.
-//!
-//! ## Built-in themes
-//!
-//! Two palettes ship bundled in the binary: `light` (the default
-//! when `theme` is unset) and `dark` (also the safe fallback when a
-//! named theme fails to parse). The JSON for each lives next to this
-//! file and is embedded via [`include_str!`] so the binary always
-//! loads cleanly offline.
-//!
-//! ## User themes
-//!
-//! Drop a `<name>.json` into `~/.aj/themes/` and set
-//! `theme = "<name>"` in `config.toml`. The loader looks at the
-//! user-themes directory first, falls back to the built-in catalog
-//! on miss, and falls back further to the bundled `dark` theme if
-//! the named theme fails to parse so the binary always comes up
-//! with a working palette.
-//!
-//! ## Color modes
-//!
-//! Modern terminals support 24-bit truecolor; some older ones cap
-//! out at the 256-color palette (Apple Terminal, GNU screen without
-//! `COLORTERM=truecolor`, dumb terminals). [`Theme`] detects this
-//! at construction time from `$COLORTERM` / `$TERM` /
-//! `$TERM_PROGRAM` and downsamples hex values to the 256-color
-//! cube on terminals that can't show them.
-//!
-//! ## Builders
-//!
-//! [`markdown_theme`], [`editor_theme`], and [`select_list_theme`]
-//! consume a [`Theme`] and return populated [`MarkdownTheme`] /
-//! [`EditorTheme`] / [`SelectListTheme`] structs from `aj-tui`,
-//! ready to hand to the matching components.
+//! A frontend that paints into an ANSI terminal bakes each
+//! [`ThemeRgb`] into an SGR prefix at render time. Truecolor
+//! terminals get the 24-bit triple directly. On a 256-color terminal
+//! [`fg_ansi`] / [`bg_ansi`] downsample the hex value to the closest
+//! entry in the xterm 256-color palette (see [`rgb_to_256`]). A
+//! [`ThemeRgb::Default`] token encodes as the terminal's own default
+//! (`\x1b[39m` / `\x1b[49m`), and a [`ThemeRgb::Ansi256`] index passes
+//! straight through.
 
-use std::collections::HashMap;
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::Arc;
 
 use aj_models::ThinkingConfig;
 use aj_tui::components::editor::EditorTheme;
 use aj_tui::components::markdown::{MarkdownTheme, SyntaxStyles};
 use aj_tui::components::select_list::SelectListTheme;
 use aj_tui::style;
-use notify::{EventKind, RecursiveMode, Watcher};
-use serde::Deserialize;
-use thiserror::Error;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-/// Bundled "dark" palette. The safe fallback: loads when an
-/// explicitly-named theme fails to parse so the binary always comes
-/// up with a working palette.
-const DARK_THEME_JSON: &str = include_str!("theme/dark.json");
-
-/// Bundled "light" palette. The default when `theme` is unset in
-/// `config.toml`; also picked explicitly via `theme = "light"`.
-const LIGHT_THEME_JSON: &str = include_str!("theme/light.json");
+// The palette and its loader / watcher / handle are frontend-agnostic
+// and live in `aj_app::theme`. Re-exported so `aj` code keeps saying
+// `crate::config::theme::{...}` and so the extension traits and
+// builders below refer to the types by bare name.
+pub use aj_app::theme::{
+    ColorMode, Theme, ThemeBg, ThemeColor, ThemeError, ThemeHandle, ThemeRgb, ThemeWatcherGuard,
+    watch_user_theme,
+};
 
 // ============================================================================
-// Semantic tokens
+// ANSI encoding — ThemeRgb -> SGR escape
 // ============================================================================
-
-/// Foreground color tokens. Every variant is a *purpose* (e.g.
-/// `Accent`, `Success`, `MdHeading`) the renderers consult — the
-/// concrete value comes from whatever palette is loaded.
-///
-/// The full set matches the schema shipped by the JSON loader so
-/// future renderer additions land here without re-jiggling the
-/// catalog; only a subset is consumed by the builders today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ThemeColor {
-    /// Primary accent: selectors, focused row, prompt cursor.
-    Accent,
-    /// Default border tint.
-    Border,
-    /// Highlighted border tint.
-    BorderAccent,
-    /// Subtle border tint — what the editor uses by default.
-    BorderMuted,
-    /// Success state.
-    Success,
-    /// Error state.
-    Error,
-    /// Warning state.
-    Warning,
-    /// Secondary text.
-    Muted,
-    /// Tertiary, even-more-subtle text.
-    Dim,
-    /// Default text. Renders as the terminal's foreground color.
-    Text,
-    /// Thinking block body text.
-    ThinkingText,
-
-    /// User-message body text.
-    UserMessageText,
-    /// Custom-message body text.
-    CustomMessageText,
-    /// Custom-message type label.
-    CustomMessageLabel,
-    /// Tool-call header title.
-    ToolTitle,
-    /// Tool-call body output.
-    ToolOutput,
-
-    /// Markdown heading.
-    MdHeading,
-    /// Markdown link text.
-    MdLink,
-    /// Markdown link URL trailer.
-    MdLinkUrl,
-    /// Markdown inline code.
-    MdCode,
-    /// Markdown code block body (typically left identity so the
-    /// syntect highlighter's per-token colors win).
-    MdCodeBlock,
-    /// Markdown code block fence/border lines.
-    MdCodeBlockBorder,
-    /// Markdown blockquote text.
-    MdQuote,
-    /// Markdown blockquote prefix bar.
-    MdQuoteBorder,
-    /// Markdown horizontal rule.
-    MdHr,
-    /// Markdown list bullets / numbers.
-    MdListBullet,
-
-    /// Diff added lines (`+`).
-    ToolDiffAdded,
-    /// Diff removed lines (`-`).
-    ToolDiffRemoved,
-    /// Diff context lines.
-    ToolDiffContext,
-
-    /// Syntax: comments.
-    SyntaxComment,
-    /// Syntax: keywords.
-    SyntaxKeyword,
-    /// Syntax: function names.
-    SyntaxFunction,
-    /// Syntax: variable names.
-    SyntaxVariable,
-    /// Syntax: string literals.
-    SyntaxString,
-    /// Syntax: number literals.
-    SyntaxNumber,
-    /// Syntax: type names.
-    SyntaxType,
-    /// Syntax: operators.
-    SyntaxOperator,
-    /// Syntax: punctuation.
-    SyntaxPunctuation,
-
-    /// Editor border in `Off` thinking mode.
-    ThinkingOff,
-    /// Editor border in `Minimal` thinking mode.
-    ThinkingMinimal,
-    /// Editor border in `Low` thinking mode.
-    ThinkingLow,
-    /// Editor border in `Medium` thinking mode.
-    ThinkingMedium,
-    /// Editor border in `High` thinking mode.
-    ThinkingHigh,
-    /// Editor border in `XHigh` thinking mode.
-    ThinkingXhigh,
-
-    /// Editor border in bash quick-command mode.
-    BashMode,
-}
-
-impl ThemeColor {
-    /// JSON-token name used for this semantic color in palette files.
-    pub fn json_key(self) -> &'static str {
-        match self {
-            ThemeColor::Accent => "accent",
-            ThemeColor::Border => "border",
-            ThemeColor::BorderAccent => "borderAccent",
-            ThemeColor::BorderMuted => "borderMuted",
-            ThemeColor::Success => "success",
-            ThemeColor::Error => "error",
-            ThemeColor::Warning => "warning",
-            ThemeColor::Muted => "muted",
-            ThemeColor::Dim => "dim",
-            ThemeColor::Text => "text",
-            ThemeColor::ThinkingText => "thinkingText",
-            ThemeColor::UserMessageText => "userMessageText",
-            ThemeColor::CustomMessageText => "customMessageText",
-            ThemeColor::CustomMessageLabel => "customMessageLabel",
-            ThemeColor::ToolTitle => "toolTitle",
-            ThemeColor::ToolOutput => "toolOutput",
-            ThemeColor::MdHeading => "mdHeading",
-            ThemeColor::MdLink => "mdLink",
-            ThemeColor::MdLinkUrl => "mdLinkUrl",
-            ThemeColor::MdCode => "mdCode",
-            ThemeColor::MdCodeBlock => "mdCodeBlock",
-            ThemeColor::MdCodeBlockBorder => "mdCodeBlockBorder",
-            ThemeColor::MdQuote => "mdQuote",
-            ThemeColor::MdQuoteBorder => "mdQuoteBorder",
-            ThemeColor::MdHr => "mdHr",
-            ThemeColor::MdListBullet => "mdListBullet",
-            ThemeColor::ToolDiffAdded => "toolDiffAdded",
-            ThemeColor::ToolDiffRemoved => "toolDiffRemoved",
-            ThemeColor::ToolDiffContext => "toolDiffContext",
-            ThemeColor::SyntaxComment => "syntaxComment",
-            ThemeColor::SyntaxKeyword => "syntaxKeyword",
-            ThemeColor::SyntaxFunction => "syntaxFunction",
-            ThemeColor::SyntaxVariable => "syntaxVariable",
-            ThemeColor::SyntaxString => "syntaxString",
-            ThemeColor::SyntaxNumber => "syntaxNumber",
-            ThemeColor::SyntaxType => "syntaxType",
-            ThemeColor::SyntaxOperator => "syntaxOperator",
-            ThemeColor::SyntaxPunctuation => "syntaxPunctuation",
-            ThemeColor::ThinkingOff => "thinkingOff",
-            ThemeColor::ThinkingMinimal => "thinkingMinimal",
-            ThemeColor::ThinkingLow => "thinkingLow",
-            ThemeColor::ThinkingMedium => "thinkingMedium",
-            ThemeColor::ThinkingHigh => "thinkingHigh",
-            ThemeColor::ThinkingXhigh => "thinkingXhigh",
-            ThemeColor::BashMode => "bashMode",
-        }
-    }
-
-    /// Full closed enumeration. Used by [`Theme::from_json`] to
-    /// iterate the schema keys when populating the resolved map.
-    fn all() -> &'static [ThemeColor] {
-        &[
-            ThemeColor::Accent,
-            ThemeColor::Border,
-            ThemeColor::BorderAccent,
-            ThemeColor::BorderMuted,
-            ThemeColor::Success,
-            ThemeColor::Error,
-            ThemeColor::Warning,
-            ThemeColor::Muted,
-            ThemeColor::Dim,
-            ThemeColor::Text,
-            ThemeColor::ThinkingText,
-            ThemeColor::UserMessageText,
-            ThemeColor::CustomMessageText,
-            ThemeColor::CustomMessageLabel,
-            ThemeColor::ToolTitle,
-            ThemeColor::ToolOutput,
-            ThemeColor::MdHeading,
-            ThemeColor::MdLink,
-            ThemeColor::MdLinkUrl,
-            ThemeColor::MdCode,
-            ThemeColor::MdCodeBlock,
-            ThemeColor::MdCodeBlockBorder,
-            ThemeColor::MdQuote,
-            ThemeColor::MdQuoteBorder,
-            ThemeColor::MdHr,
-            ThemeColor::MdListBullet,
-            ThemeColor::ToolDiffAdded,
-            ThemeColor::ToolDiffRemoved,
-            ThemeColor::ToolDiffContext,
-            ThemeColor::SyntaxComment,
-            ThemeColor::SyntaxKeyword,
-            ThemeColor::SyntaxFunction,
-            ThemeColor::SyntaxVariable,
-            ThemeColor::SyntaxString,
-            ThemeColor::SyntaxNumber,
-            ThemeColor::SyntaxType,
-            ThemeColor::SyntaxOperator,
-            ThemeColor::SyntaxPunctuation,
-            ThemeColor::ThinkingOff,
-            ThemeColor::ThinkingMinimal,
-            ThemeColor::ThinkingLow,
-            ThemeColor::ThinkingMedium,
-            ThemeColor::ThinkingHigh,
-            ThemeColor::ThinkingXhigh,
-            ThemeColor::BashMode,
-        ]
-    }
-}
-
-/// Background color tokens. Smaller set than [`ThemeColor`] —
-/// backgrounds are concentrated in user / custom / tool message
-/// boxes today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ThemeBg {
-    /// Selected-row background in select-list overlays.
-    SelectedBg,
-    /// User message body background.
-    UserMessageBg,
-    /// Custom message body background.
-    CustomMessageBg,
-    /// Tool-call box background while running.
-    ToolPendingBg,
-    /// Tool-call box background after a successful run.
-    ToolSuccessBg,
-    /// Tool-call box background after a failed run.
-    ToolErrorBg,
-}
-
-impl ThemeBg {
-    /// JSON-token name used for this semantic background in palette
-    /// files.
-    pub fn json_key(self) -> &'static str {
-        match self {
-            ThemeBg::SelectedBg => "selectedBg",
-            ThemeBg::UserMessageBg => "userMessageBg",
-            ThemeBg::CustomMessageBg => "customMessageBg",
-            ThemeBg::ToolPendingBg => "toolPendingBg",
-            ThemeBg::ToolSuccessBg => "toolSuccessBg",
-            ThemeBg::ToolErrorBg => "toolErrorBg",
-        }
-    }
-
-    /// Full closed enumeration. Used by [`Theme::from_json`] to
-    /// iterate the schema keys when populating the resolved map.
-    fn all() -> &'static [ThemeBg] {
-        &[
-            ThemeBg::SelectedBg,
-            ThemeBg::UserMessageBg,
-            ThemeBg::CustomMessageBg,
-            ThemeBg::ToolPendingBg,
-            ThemeBg::ToolSuccessBg,
-            ThemeBg::ToolErrorBg,
-        ]
-    }
-}
-
-// ============================================================================
-// JSON schema
-// ============================================================================
-
-/// A color value as it appears on disk — before var refs are
-/// resolved. Strings carry hex (`#rrggbb`), a var name, or `""`
-/// (terminal default); integers are 256-color palette indexes.
-///
-/// `#[serde(untagged)]` so the field accepts either shape without
-/// a tag.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
-enum ColorValueJson {
-    Str(String),
-    Index(u8),
-}
-
-/// Resolved color — what gets handed to the ANSI encoder. Once var
-/// refs are walked every value is one of these three shapes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ResolvedColor {
-    /// 24-bit RGB triple from a hex literal.
-    Rgb(u8, u8, u8),
-    /// 256-color palette index.
-    Ansi256(u8),
-    /// Terminal default (matches the `""` JSON value).
-    Default,
-}
-
-/// The schema parsed from a palette JSON file.
-#[derive(Debug, Clone, Deserialize)]
-struct ThemeJson {
-    name: String,
-    #[serde(default)]
-    vars: HashMap<String, ColorValueJson>,
-    colors: HashMap<String, ColorValueJson>,
-}
-
-// ============================================================================
-// Color mode detection
-// ============================================================================
-
-/// Whether the terminal can render 24-bit RGB directly. Detected
-/// once at theme construction; truecolor is the default, falling
-/// back to 256-color when the environment hints at a limited
-/// terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorMode {
-    Truecolor,
-    Color256,
-}
-
-impl ColorMode {
-    /// Best-effort detection from the process environment, used to
-    /// pick the downsample boundary between truecolor and 256-color
-    /// output.
-    pub fn detect() -> Self {
-        if let Ok(ct) = env::var("COLORTERM")
-            && (ct == "truecolor" || ct == "24bit")
-        {
-            return ColorMode::Truecolor;
-        }
-        // Windows Terminal supports truecolor.
-        if env::var("WT_SESSION").is_ok() {
-            return ColorMode::Truecolor;
-        }
-        let term = env::var("TERM").unwrap_or_default();
-        // Truly limited terminals.
-        if term.is_empty() || term == "dumb" || term == "linux" {
-            return ColorMode::Color256;
-        }
-        // Apple Terminal doesn't support truecolor.
-        if env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal") {
-            return ColorMode::Color256;
-        }
-        // GNU screen without explicit opt-in.
-        if term == "screen" || term.starts_with("screen-") || term.starts_with("screen.") {
-            return ColorMode::Color256;
-        }
-        ColorMode::Truecolor
-    }
-}
-
-// ============================================================================
-// Color-space helpers
-// ============================================================================
-
-fn hex_to_rgb(hex: &str) -> Result<(u8, u8, u8), ThemeError> {
-    let cleaned = hex.strip_prefix('#').unwrap_or(hex);
-    if cleaned.len() != 6 {
-        return Err(ThemeError::InvalidColor(hex.to_string()));
-    }
-    let r = u8::from_str_radix(&cleaned[0..2], 16)
-        .map_err(|_| ThemeError::InvalidColor(hex.to_string()))?;
-    let g = u8::from_str_radix(&cleaned[2..4], 16)
-        .map_err(|_| ThemeError::InvalidColor(hex.to_string()))?;
-    let b = u8::from_str_radix(&cleaned[4..6], 16)
-        .map_err(|_| ThemeError::InvalidColor(hex.to_string()))?;
-    Ok((r, g, b))
-}
 
 /// The xterm 6x6x6 color cube channel values.
 const CUBE_VALUES: [u8; 6] = [0, 95, 135, 175, 215, 255];
@@ -544,112 +148,40 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
     }
 }
 
-fn fg_ansi(color: &ResolvedColor, mode: ColorMode) -> String {
+/// Encode a foreground [`ThemeRgb`] as an SGR prefix. `Default`
+/// yields the terminal's default foreground. An explicit palette
+/// index passes through. A hex triple is emitted verbatim on
+/// truecolor terminals and downsampled to the 256-color palette
+/// otherwise.
+fn fg_ansi(color: ThemeRgb, mode: ColorMode) -> String {
     match (color, mode) {
-        (ResolvedColor::Default, _) => "\x1b[39m".to_string(),
-        (ResolvedColor::Ansi256(i), _) => format!("\x1b[38;5;{i}m"),
-        (ResolvedColor::Rgb(r, g, b), ColorMode::Truecolor) => {
+        (ThemeRgb::Default, _) => "\x1b[39m".to_string(),
+        (ThemeRgb::Ansi256(i), _) => format!("\x1b[38;5;{i}m"),
+        (ThemeRgb::Rgb(r, g, b), ColorMode::Truecolor) => {
             format!("\x1b[38;2;{r};{g};{b}m")
         }
-        (ResolvedColor::Rgb(r, g, b), ColorMode::Color256) => {
-            let idx = rgb_to_256(*r, *g, *b);
+        (ThemeRgb::Rgb(r, g, b), ColorMode::Color256) => {
+            let idx = rgb_to_256(r, g, b);
             format!("\x1b[38;5;{idx}m")
         }
     }
 }
 
-fn bg_ansi(color: &ResolvedColor, mode: ColorMode) -> String {
+/// Encode a background [`ThemeRgb`] as an SGR prefix. Same rules as
+/// [`fg_ansi`] but targeting the background SGR channel (`48`) and a
+/// `Default` background reset (`\x1b[49m`).
+fn bg_ansi(color: ThemeRgb, mode: ColorMode) -> String {
     match (color, mode) {
-        (ResolvedColor::Default, _) => "\x1b[49m".to_string(),
-        (ResolvedColor::Ansi256(i), _) => format!("\x1b[48;5;{i}m"),
-        (ResolvedColor::Rgb(r, g, b), ColorMode::Truecolor) => {
+        (ThemeRgb::Default, _) => "\x1b[49m".to_string(),
+        (ThemeRgb::Ansi256(i), _) => format!("\x1b[48;5;{i}m"),
+        (ThemeRgb::Rgb(r, g, b), ColorMode::Truecolor) => {
             format!("\x1b[48;2;{r};{g};{b}m")
         }
-        (ResolvedColor::Rgb(r, g, b), ColorMode::Color256) => {
-            let idx = rgb_to_256(*r, *g, *b);
+        (ThemeRgb::Rgb(r, g, b), ColorMode::Color256) => {
+            let idx = rgb_to_256(r, g, b);
             format!("\x1b[48;5;{idx}m")
         }
     }
-}
-
-// ============================================================================
-// Var resolution
-// ============================================================================
-
-/// Walk var-references through `vars` until a concrete color falls
-/// out. Detects cycles via the `visited` set so a malformed theme
-/// produces a clear error rather than an infinite loop.
-fn resolve_var(
-    value: &ColorValueJson,
-    vars: &HashMap<String, ColorValueJson>,
-    visited: &mut Vec<String>,
-) -> Result<ResolvedColor, ThemeError> {
-    match value {
-        ColorValueJson::Index(i) => Ok(ResolvedColor::Ansi256(*i)),
-        ColorValueJson::Str(s) => {
-            if s.is_empty() {
-                return Ok(ResolvedColor::Default);
-            }
-            if let Some(stripped) = s.strip_prefix('#') {
-                let (r, g, b) = hex_to_rgb(stripped)?;
-                return Ok(ResolvedColor::Rgb(r, g, b));
-            }
-            // Bare string: treat as a var reference.
-            if visited.iter().any(|seen| seen == s) {
-                return Err(ThemeError::VarCycle(s.clone()));
-            }
-            let target = vars
-                .get(s)
-                .ok_or_else(|| ThemeError::UnknownVar(s.clone()))?;
-            visited.push(s.clone());
-            let resolved = resolve_var(target, vars, visited);
-            visited.pop();
-            resolved
-        }
-    }
-}
-
-// ============================================================================
-// Theme
-// ============================================================================
-
-/// Errors that can occur loading / parsing a theme.
-#[derive(Debug, Error)]
-pub enum ThemeError {
-    /// The theme file referenced an unknown built-in name and no
-    /// matching `~/.aj/themes/<name>.json` exists.
-    #[error("theme not found: {0}")]
-    NotFound(String),
-    /// The on-disk JSON failed to parse.
-    #[error("failed to parse theme '{0}': {1}")]
-    ParseError(String, serde_json::Error),
-    /// The JSON parsed but a color value is malformed (e.g.
-    /// short hex string).
-    #[error("invalid color value: {0}")]
-    InvalidColor(String),
-    /// A var-reference points to a name that doesn't exist in the
-    /// `vars` map.
-    #[error("unknown var reference: {0}")]
-    UnknownVar(String),
-    /// A chain of var-references loops back to itself.
-    #[error("circular var reference: {0}")]
-    VarCycle(String),
-    /// A required token in the `colors` map is missing.
-    #[error("theme is missing required color token: {0}")]
-    MissingColor(String),
-    /// Reading the file from disk failed.
-    #[error("failed to read theme file '{0}': {1}")]
-    ReadError(PathBuf, std::io::Error),
-}
-
-/// A loaded, var-resolved palette. Each [`ThemeColor`] / [`ThemeBg`]
-/// token maps to a precomputed ANSI SGR escape.
-#[derive(Debug, Clone)]
-pub struct Theme {
-    name: String,
-    mode: ColorMode,
-    fg: HashMap<ThemeColor, String>,
-    bg: HashMap<ThemeBg, String>,
 }
 
 /// Re-emit a background SGR `prefix` after every escape in `text`
@@ -664,454 +196,109 @@ fn reassert_bg(prefix: &str, text: &str) -> String {
         .replace("\x1b[49m", &format!("\x1b[49m{prefix}"))
 }
 
-impl Theme {
-    /// The name carried in the JSON `name` field. Useful for
-    /// "selected theme" indicators in any future settings UI.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
+// ============================================================================
+// Extension traits: ANSI painting over the shared palette
+// ============================================================================
 
-    /// The color mode this theme's ANSI escapes are encoded for.
-    pub fn color_mode(&self) -> ColorMode {
-        self.mode
-    }
+/// aj-tui ANSI painting over a shared [`Theme`].
+///
+/// The palette stores structured [`ThemeRgb`] colors; these methods
+/// bake them into SGR escapes so aj-tui components can paste the
+/// result into a `Line`. Implemented for [`aj_app::theme::Theme`]
+/// rather than defined on it because the ANSI contract is
+/// backend-specific.
+pub trait ThemeExt {
+    /// Wrap `text` in the SGR escape for the given foreground token
+    /// plus the matching reset. The reset is `\x1b[39m` (default
+    /// foreground) so a nested style isn't disturbed.
+    fn fg(&self, token: ThemeColor, text: &str) -> String;
 
-    /// Wrap `text` in the SGR escape for the given foreground
-    /// token plus the matching reset. The reset is `\x1b[39m`
-    /// (default foreground) so a nested style isn't disturbed.
-    pub fn fg(&self, token: ThemeColor, text: &str) -> String {
-        let prefix = self.fg.get(&token).map(|s| s.as_str()).unwrap_or("");
-        format!("{prefix}{text}\x1b[39m")
-    }
-
-    /// Wrap `text` in the SGR escape for the given background
-    /// token plus the matching reset.
+    /// Wrap `text` in the SGR escape for the given background token
+    /// plus the matching reset.
     ///
     /// The background is re-asserted after any embedded escape that
     /// clears it, so `text` may carry full SGR resets (e.g. syntect-
     /// highlighted code lines end in `\x1b[0m`) without punching
     /// holes in a tinted row.
-    pub fn bg(&self, token: ThemeBg, text: &str) -> String {
-        let prefix = self.bg.get(&token).map(|s| s.as_str()).unwrap_or("");
-        format!("{prefix}{}\x1b[49m", reassert_bg(prefix, text))
-    }
+    fn bg(&self, token: ThemeBg, text: &str) -> String;
 
     /// Build a closure that applies the given foreground token to
-    /// arbitrary text. Used by the builder functions below to
-    /// produce the `Arc<dyn Fn(&str) -> String>` closures the
-    /// `aj-tui` theme structs require.
-    pub fn fg_closure(&self, token: ThemeColor) -> Arc<dyn Fn(&str) -> String> {
-        let prefix = self.fg.get(&token).cloned().unwrap_or_default();
-        Arc::new(move |s: &str| format!("{prefix}{s}\x1b[39m"))
-    }
+    /// arbitrary text. Captures the resolved color and color mode so
+    /// the returned closure is `'static`.
+    fn fg_closure(&self, token: ThemeColor) -> Arc<dyn Fn(&str) -> String>;
 
     /// Build a closure that applies the given background token to
     /// arbitrary text. Same embedded-reset handling as [`Self::bg`].
-    pub fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String> {
-        let prefix = self.bg.get(&token).cloned().unwrap_or_default();
-        Arc::new(move |s: &str| format!("{prefix}{}\x1b[49m", reassert_bg(&prefix, s)))
+    fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String>;
+}
+
+impl ThemeExt for Theme {
+    fn fg(&self, token: ThemeColor, text: &str) -> String {
+        format!(
+            "{}{text}\x1b[39m",
+            fg_ansi(self.fg_color(token), self.color_mode())
+        )
     }
 
-    /// Parse a JSON theme document. The default [`ColorMode`] is
-    /// detected from the environment; pass a specific mode via
-    /// [`Theme::from_json_with_mode`] from tests so output stays
-    /// deterministic.
-    pub fn from_json(label: &str, json: &str) -> Result<Self, ThemeError> {
-        Self::from_json_with_mode(label, json, ColorMode::detect())
+    fn bg(&self, token: ThemeBg, text: &str) -> String {
+        let prefix = bg_ansi(self.bg_color(token), self.color_mode());
+        format!("{prefix}{}\x1b[49m", reassert_bg(&prefix, text))
     }
 
-    /// Parse a JSON theme document with an explicit color mode.
-    pub fn from_json_with_mode(
-        label: &str,
-        json: &str,
-        mode: ColorMode,
-    ) -> Result<Self, ThemeError> {
-        let parsed: ThemeJson =
-            serde_json::from_str(json).map_err(|e| ThemeError::ParseError(label.into(), e))?;
+    fn fg_closure(&self, token: ThemeColor) -> Arc<dyn Fn(&str) -> String> {
+        // Both are `Copy`, so the closure owns them and outlives the
+        // borrow of `self`.
+        let color = self.fg_color(token);
+        let mode = self.color_mode();
+        Arc::new(move |s: &str| format!("{}{s}\x1b[39m", fg_ansi(color, mode)))
+    }
 
-        let mut fg = HashMap::with_capacity(ThemeColor::all().len());
-        for token in ThemeColor::all() {
-            let key = token.json_key();
-            let raw = parsed
-                .colors
-                .get(key)
-                .ok_or_else(|| ThemeError::MissingColor(key.to_string()))?;
-            let mut visited = Vec::new();
-            let resolved = resolve_var(raw, &parsed.vars, &mut visited)?;
-            fg.insert(*token, fg_ansi(&resolved, mode));
-        }
-
-        let mut bg = HashMap::with_capacity(ThemeBg::all().len());
-        for token in ThemeBg::all() {
-            let key = token.json_key();
-            let raw = parsed
-                .colors
-                .get(key)
-                .ok_or_else(|| ThemeError::MissingColor(key.to_string()))?;
-            let mut visited = Vec::new();
-            let resolved = resolve_var(raw, &parsed.vars, &mut visited)?;
-            bg.insert(*token, bg_ansi(&resolved, mode));
-        }
-
-        Ok(Theme {
-            name: parsed.name,
-            mode,
-            fg,
-            bg,
+    fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String> {
+        let color = self.bg_color(token);
+        let mode = self.color_mode();
+        Arc::new(move |s: &str| {
+            let prefix = bg_ansi(color, mode);
+            format!("{prefix}{}\x1b[49m", reassert_bg(&prefix, s))
         })
     }
-
-    /// Load the theme `name`. The lookup order is:
-    /// 1. The bundled catalog (`dark`, `light`).
-    /// 2. `~/.aj/themes/<name>.json` if the file exists.
-    ///
-    /// User themes can override built-ins by living in the user
-    /// themes dir under the same name. On parse error this falls
-    /// back to the bundled `dark` palette so the binary always
-    /// comes up with a working theme.
-    pub fn load(name: &str) -> Theme {
-        match Self::load_strict(name) {
-            Ok(theme) => theme,
-            Err(err) => {
-                tracing::warn!("failed to load theme '{name}': {err}; falling back to dark");
-                Self::bundled_dark()
-            }
-        }
-    }
-
-    /// Like [`Theme::load`] but returns the error instead of
-    /// falling back. Tests use this so a malformed bundle fails
-    /// noisily; production code uses [`Theme::load`] for
-    /// resilience.
-    pub fn load_strict(name: &str) -> Result<Theme, ThemeError> {
-        // User dir wins so a user can override the bundled themes
-        // by name. We still need to fail open: a missing user
-        // file falls through to the bundled catalog.
-        if let Some(path) = user_theme_path(name)
-            && path.exists()
-        {
-            let content =
-                fs::read_to_string(&path).map_err(|e| ThemeError::ReadError(path.clone(), e))?;
-            return Self::from_json(&path.display().to_string(), &content);
-        }
-        match name {
-            "dark" => Self::from_json("dark (bundled)", DARK_THEME_JSON),
-            "light" => Self::from_json("light (bundled)", LIGHT_THEME_JSON),
-            other => Err(ThemeError::NotFound(other.to_string())),
-        }
-    }
-
-    /// The bundled `dark` palette. Used as the safe fallback when
-    /// a named theme fails to load. Panics in tests if the bundled
-    /// JSON itself is invalid (which it won't be — it's a fixture
-    /// covered by [`tests::dark_palette_loads`]).
-    pub fn bundled_dark() -> Theme {
-        Self::from_json("dark (bundled)", DARK_THEME_JSON)
-            .expect("bundled dark.json must parse cleanly")
-    }
-
-    /// The bundled `light` palette. Companion to [`Theme::bundled_dark`].
-    pub fn bundled_light() -> Theme {
-        Self::from_json("light (bundled)", LIGHT_THEME_JSON)
-            .expect("bundled light.json must parse cleanly")
-    }
-
-    /// List the theme names known to the loader: every built-in
-    /// plus every `*.json` file in the user themes directory. Used
-    /// by future `/theme` selector autocomplete; the loader doesn't
-    /// otherwise care about discovery.
-    pub fn available() -> Vec<String> {
-        let mut names: Vec<String> = vec!["dark".to_string(), "light".to_string()];
-        if let Some(dir) = user_themes_dir()
-            && let Ok(read) = fs::read_dir(&dir)
-        {
-            for entry in read.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json")
-                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                    && !names.iter().any(|n| n == stem)
-                {
-                    names.push(stem.to_string());
-                }
-            }
-        }
-        names.sort();
-        names
-    }
 }
 
-/// Return the path to a user-defined theme file. Returns `None`
-/// when `$HOME` is unset (the loader silently skips the user dir
-/// in that case).
-fn user_theme_path(name: &str) -> Option<PathBuf> {
-    user_themes_dir().map(|dir| dir.join(format!("{name}.json")))
-}
-
-/// Return `~/.aj/themes/`. Doesn't create the directory; callers
-/// only ever read from it. `None` when `$HOME` is unset.
-fn user_themes_dir() -> Option<PathBuf> {
-    let home = env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".aj").join("themes"))
-}
-
-// ============================================================================
-// ThemeHandle: shared, hot-swappable theme reference
-// ============================================================================
-
-/// Shared, hot-swappable handle to a [`Theme`]. The interactive
-/// mode threads a single [`ThemeHandle`] through every theme
-/// builder so a runtime palette swap (fs-watcher fires; a future
-/// `/theme` selector picks a new theme) is visible to every
-/// component without rebuilding any of them.
+/// Hot-rebinding ANSI painting closures over a shared [`ThemeHandle`].
 ///
-/// The closures returned by [`Self::fg_closure`] /
-/// [`Self::bg_closure`] dereference through the inner [`RwLock`]
-/// on each call, so an in-place [`Self::replace`] is enough to
-/// re-skin everything that's still alive. Callers should follow
-/// up with `tui.invalidate()` + `tui.request_render()` to push
-/// the change to screen.
-#[derive(Clone)]
-pub struct ThemeHandle {
-    inner: Arc<RwLock<Theme>>,
+/// Unlike [`ThemeExt::fg_closure`], these resolve through the shared
+/// handle on each call, so an in-place [`ThemeHandle::replace`]
+/// reskins them without reconstructing the widget that holds them.
+pub trait ThemeHandleExt {
+    /// Build a foreground-painting closure that re-reads the live
+    /// palette on each call.
+    fn fg_closure(&self, token: ThemeColor) -> Arc<dyn Fn(&str) -> String>;
+
+    /// Build a background-painting closure with the same hot-rebind
+    /// semantics as [`Self::fg_closure`].
+    fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String>;
 }
 
-impl ThemeHandle {
-    /// Wrap a freshly-loaded [`Theme`] in a sharable handle.
-    pub fn new(theme: Theme) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(theme)),
-        }
-    }
-
-    /// Replace the inner theme. The next render call from any
-    /// component painted through the closures handed out by
-    /// [`Self::fg_closure`] / [`Self::bg_closure`] picks up the
-    /// new palette automatically; the host is responsible for
-    /// invalidating cached render output (`tui.invalidate()`) and
-    /// requesting a fresh frame (`tui.request_render()`).
-    pub fn replace(&self, theme: Theme) {
-        match self.inner.write() {
-            Ok(mut guard) => *guard = theme,
-            Err(poisoned) => {
-                // Reader thread panicked while holding a read
-                // lock — vanishingly unlikely (we never panic
-                // inside [`Theme::fg`] / [`Theme::bg`]) but if it
-                // happened we'd rather keep the binary alive with
-                // the fresh palette than propagate the panic.
-                let mut guard = poisoned.into_inner();
-                *guard = theme;
-            }
-        }
-    }
-
-    /// Snapshot the active theme's name (e.g. `"dark"`,
-    /// `"light"`, or the user-supplied `"<name>"`). Cheap clone of
-    /// a `String`.
-    pub fn name(&self) -> String {
-        self.read().name().to_string()
-    }
-
-    /// Snapshot the active theme's [`ColorMode`].
-    pub fn color_mode(&self) -> ColorMode {
-        self.read().color_mode()
-    }
-
-    /// Build a foreground-painting closure. The closure resolves
-    /// through the shared lock on each call so a [`Self::replace`]
-    /// reskins it without reconstructing the widget that holds it.
-    pub fn fg_closure(&self, token: ThemeColor) -> Arc<dyn Fn(&str) -> String> {
-        let handle = Arc::clone(&self.inner);
+impl ThemeHandleExt for ThemeHandle {
+    fn fg_closure(&self, token: ThemeColor) -> Arc<dyn Fn(&str) -> String> {
+        let handle = self.clone();
         // The `aj-tui` theme structs hold `Arc<dyn Fn(&str) -> String>`
         // without `Send + Sync` bounds (the TUI thread is the only
-        // consumer). `Arc<RwLock<Theme>>` is `Send + Sync`, but the
-        // closure itself only needs to satisfy the trait object's
-        // bounds, so this is fine.
+        // consumer). The closure itself is `Send + Sync` (it captures
+        // a `ThemeHandle`, which is), but the trait object's bounds are
+        // what clippy checks, so silence it here.
         #[allow(clippy::arc_with_non_send_sync)]
         let closure: Arc<dyn Fn(&str) -> String> =
-            Arc::new(move |s: &str| handle.read().expect("theme rwlock poisoned").fg(token, s));
+            Arc::new(move |s: &str| handle.read().fg(token, s));
         closure
     }
 
-    /// Build a background-painting closure. Same hot-rebind
-    /// semantics as [`Self::fg_closure`].
-    pub fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String> {
-        let handle = Arc::clone(&self.inner);
+    fn bg_closure(&self, token: ThemeBg) -> Arc<dyn Fn(&str) -> String> {
+        let handle = self.clone();
         #[allow(clippy::arc_with_non_send_sync)]
         let closure: Arc<dyn Fn(&str) -> String> =
-            Arc::new(move |s: &str| handle.read().expect("theme rwlock poisoned").bg(token, s));
+            Arc::new(move |s: &str| handle.read().bg(token, s));
         closure
     }
-
-    /// Read access to the underlying [`Theme`]. Used by callers
-    /// that need to read a token directly without going through a
-    /// closure (currently nothing in `aj` does this — exposed
-    /// for completeness and tests).
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Theme> {
-        self.inner.read().expect("theme rwlock poisoned")
-    }
-}
-
-// ============================================================================
-// Theme file watcher
-// ============================================================================
-
-/// Debounce window for fs notifications. Editors writing through
-/// tempfile+rename produce a burst of events; coalescing them
-/// avoids re-parsing the same file 3-4 times in a row.
-const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
-
-/// Guard returned by [`watch_user_theme`]. Dropping it tears down
-/// the notify watcher and the spawned debouncer task.
-pub struct ThemeWatcherGuard {
-    // The notify watcher stops as soon as it's dropped. We hold
-    // it inside the guard so the caller can decide its lifetime.
-    _watcher: notify::RecommendedWatcher,
-}
-
-/// Start watching `~/.aj/themes/<name>.json` for changes.
-///
-/// Returns `None` when:
-/// - `name` refers to a bundled theme (`dark` / `light`) — built-
-///   ins live inside the binary and can't be edited at runtime.
-/// - `$HOME` is unset (no user themes directory).
-/// - The user themes directory doesn't exist (nothing to watch).
-/// - The notify backend fails to initialise (rare; usually a
-///   resource-exhaustion scenario, e.g. `inotify` instances cap).
-///
-/// On a successful return, a debounced re-parse task emits a fresh
-/// [`Theme`] through the returned receiver every time the file
-/// settles after a write burst. Parse errors are swallowed
-/// silently so a mid-save invalid-JSON snapshot doesn't blow away
-/// the running palette.
-///
-/// The watcher targets the **directory** rather than the file
-/// itself: editors that write through tempfile+rename invalidate
-/// a file-level watch on the first event. Watching the directory
-/// survives those rebinds; we filter the event paths to the
-/// matching filename so unrelated files in the same directory are
-/// ignored.
-pub fn watch_user_theme(name: &str) -> Option<(ThemeWatcherGuard, UnboundedReceiver<Theme>)> {
-    let dir = user_themes_dir()?;
-    watch_user_theme_in_dir(&dir, name)
-}
-
-/// Same as [`watch_user_theme`] but with an explicit themes
-/// directory. Exposed for the unit tests so they can drive the
-/// watcher against a tempdir without touching `$HOME`.
-pub(crate) fn watch_user_theme_in_dir(
-    dir: &Path,
-    name: &str,
-) -> Option<(ThemeWatcherGuard, UnboundedReceiver<Theme>)> {
-    // Skip bundled names — there's no on-disk file to watch (the
-    // user can still place a `dark.json` in the user dir to
-    // override the bundled palette, in which case we'd watch
-    // that). Honour the override by checking for the file
-    // existence rather than the name alone.
-    let path = dir.join(format!("{name}.json"));
-    if !path.exists() {
-        return None;
-    }
-    let filename = path.file_name()?.to_owned();
-
-    // Channel feeding from notify's callback to our debouncer
-    // task. We don't care about the event payload; one zero-sized
-    // ping is enough to schedule a reload.
-    let (notify_tx, mut notify_rx) = unbounded_channel::<()>();
-    // The notify callback may fire on a non-tokio thread (e.g.
-    // the inotify reader thread); we filter event paths there to
-    // keep the ping channel low-volume.
-    let filename_for_cb = filename.clone();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let event = match res {
-            Ok(event) => event,
-            Err(err) => {
-                tracing::debug!("theme watcher reported error: {err}");
-                return;
-            }
-        };
-        // Only react to data-changing events. Access-time
-        // updates and metadata-only flips don't change the
-        // file contents.
-        if !matches!(
-            event.kind,
-            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-        ) {
-            return;
-        }
-        // Filter to events that touch our specific theme
-        // file. Some platforms emit events without paths;
-        // when that happens we still ping so the debouncer
-        // can decide based on the file's current state.
-        let mentions_us = event.paths.is_empty()
-            || event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(filename_for_cb.as_os_str()));
-        if !mentions_us {
-            return;
-        }
-        let _ = notify_tx.send(());
-    })
-    .ok()?;
-    watcher
-        .watch(dir, RecursiveMode::NonRecursive)
-        .map_err(|e| {
-            tracing::warn!("theme watcher failed to start: {e}");
-            e
-        })
-        .ok()?;
-
-    let (theme_tx, theme_rx) = unbounded_channel::<Theme>();
-    let path_for_task = path.clone();
-    let mode = ColorMode::detect();
-    tokio::spawn(async move {
-        loop {
-            // Block until the first event arrives.
-            if notify_rx.recv().await.is_none() {
-                // Watcher dropped; the caller is winding down.
-                break;
-            }
-            // Coalesce: sleep the debounce window, then drain
-            // anything that arrived during it. This collapses
-            // editor write bursts into one re-parse.
-            tokio::time::sleep(WATCHER_DEBOUNCE).await;
-            while notify_rx.try_recv().is_ok() {}
-
-            // Quiet period elapsed; attempt the reload. We
-            // tolerate transient ENOENT (editors momentarily
-            // unlink before atomic-rename) and parse failures
-            // (the user is mid-edit) by skipping this iteration
-            // and waiting for the next event.
-            let content = match fs::read_to_string(&path_for_task) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::debug!(
-                        "theme watcher: read failed for {}: {err}",
-                        path_for_task.display()
-                    );
-                    continue;
-                }
-            };
-            let label = path_for_task.display().to_string();
-            match Theme::from_json_with_mode(&label, &content, mode) {
-                Ok(theme) => {
-                    if theme_tx.send(theme).is_err() {
-                        // Receiver dropped; the interactive mode
-                        // has shut down.
-                        break;
-                    }
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        "theme watcher: parse failed for {}: {err}",
-                        path_for_task.display()
-                    );
-                }
-            }
-        }
-    });
-
-    Some((ThemeWatcherGuard { _watcher: watcher }, theme_rx))
 }
 
 // ============================================================================
@@ -1242,7 +429,7 @@ pub struct ChatTheme {
     /// and makes a theme reload reskin both at once.
     pub thinking_text: Arc<dyn Fn(&str) -> String>,
     /// Background-paint closure for the user-message bubble. Wraps
-    /// each rendered row through [`Theme::bg`] with the
+    /// each rendered row through [`ThemeExt::bg`] with the
     /// [`ThemeBg::UserMessageBg`] palette token so the bubble's
     /// inset rectangle reads as a single tinted block.
     pub user_message_bg: Arc<dyn Fn(&str) -> String>,
@@ -1388,12 +575,12 @@ pub fn editor_border_color_for_bash_mode(theme: &ThemeHandle) -> Arc<dyn Fn(&str
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
     fn bg_is_reasserted_after_embedded_resets() {
-        let theme = Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-            .expect("dark.json must parse");
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
         // Extract the raw bg prefix by painting an empty string.
         let prefix = theme
             .bg(ThemeBg::UserMessageBg, "")
@@ -1420,8 +607,7 @@ mod tests {
 
     #[test]
     fn dark_palette_loads() {
-        let theme = Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-            .expect("dark.json must parse");
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
         assert_eq!(theme.name(), "dark");
         // Spot check a couple of tokens to make sure the resolver
         // walked the var ref through to a concrete RGB.
@@ -1435,8 +621,7 @@ mod tests {
 
     #[test]
     fn light_palette_loads() {
-        let theme = Theme::from_json_with_mode("light", LIGHT_THEME_JSON, ColorMode::Truecolor)
-            .expect("light.json must parse");
+        let theme = Theme::bundled_light_with_mode(ColorMode::Truecolor);
         assert_eq!(theme.name(), "light");
         // `accent` resolves to `lightBlue` which is `#5277a3` —
         // verifies var refs walk through to a concrete RGB.
@@ -1449,8 +634,7 @@ mod tests {
         // 256-color mode downsamples hex values to palette
         // indexes. `#9cdcfe` is a light blue — it should land
         // somewhere in the 6x6x6 cube, not in the grayscale ramp.
-        let theme = Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Color256)
-            .expect("dark.json must parse");
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Color256);
         let accent = theme.fg(ThemeColor::Accent, "X");
         assert!(
             accent.contains("\x1b[38;5;"),
@@ -1494,97 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn var_cycle_is_detected() {
-        let json = r#"{
-            "name": "cyclic",
-            "vars": { "a": "b", "b": "a" },
-            "colors": { "accent": "a",
-                "border": "", "borderAccent": "", "borderMuted": "",
-                "success": "", "error": "", "warning": "", "muted": "",
-                "dim": "", "text": "", "thinkingText": "",
-                "selectedBg": "", "userMessageBg": "", "userMessageText": "",
-                "customMessageBg": "", "customMessageText": "",
-                "customMessageLabel": "", "toolPendingBg": "",
-                "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",
-                "toolOutput": "",
-                "mdHeading": "", "mdLink": "", "mdLinkUrl": "", "mdCode": "",
-                "mdCodeBlock": "", "mdCodeBlockBorder": "", "mdQuote": "",
-                "mdQuoteBorder": "", "mdHr": "", "mdListBullet": "",
-                "toolDiffAdded": "", "toolDiffRemoved": "", "toolDiffContext": "",
-                "syntaxComment": "", "syntaxKeyword": "", "syntaxFunction": "",
-                "syntaxVariable": "", "syntaxString": "", "syntaxNumber": "",
-                "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
-                "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
-                "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
-                "bashMode": "" }
-        }"#;
-        let err = Theme::from_json_with_mode("cyclic", json, ColorMode::Truecolor)
-            .expect_err("cyclic var refs must fail to load");
-        assert!(
-            matches!(err, ThemeError::VarCycle(_)),
-            "expected VarCycle, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn missing_required_color_is_reported() {
-        // Schema requires `accent` — drop it and observe the error.
-        let json = r#"{ "name": "broken", "vars": {}, "colors": {} }"#;
-        let err = Theme::from_json_with_mode("broken", json, ColorMode::Truecolor)
-            .expect_err("missing colors must fail to load");
-        assert!(matches!(err, ThemeError::MissingColor(_)));
-    }
-
-    #[test]
-    fn unknown_var_is_reported() {
-        let json = r#"{
-            "name": "broken",
-            "vars": {},
-            "colors": { "accent": "nope",
-                "border": "", "borderAccent": "", "borderMuted": "",
-                "success": "", "error": "", "warning": "", "muted": "",
-                "dim": "", "text": "", "thinkingText": "",
-                "selectedBg": "", "userMessageBg": "", "userMessageText": "",
-                "customMessageBg": "", "customMessageText": "",
-                "customMessageLabel": "", "toolPendingBg": "",
-                "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",
-                "toolOutput": "",
-                "mdHeading": "", "mdLink": "", "mdLinkUrl": "", "mdCode": "",
-                "mdCodeBlock": "", "mdCodeBlockBorder": "", "mdQuote": "",
-                "mdQuoteBorder": "", "mdHr": "", "mdListBullet": "",
-                "toolDiffAdded": "", "toolDiffRemoved": "", "toolDiffContext": "",
-                "syntaxComment": "", "syntaxKeyword": "", "syntaxFunction": "",
-                "syntaxVariable": "", "syntaxString": "", "syntaxNumber": "",
-                "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
-                "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
-                "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
-                "bashMode": "" }
-        }"#;
-        let err = Theme::from_json_with_mode("broken", json, ColorMode::Truecolor)
-            .expect_err("unknown var ref must fail to load");
-        assert!(matches!(err, ThemeError::UnknownVar(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn load_bundled_names() {
-        // `Theme::load` consults the user dir first; absent any
-        // file there it falls back to the bundled name. We test
-        // the success path: both bundled names yield themes.
-        let dark = Theme::load("dark");
-        assert_eq!(dark.name(), "dark");
-        let light = Theme::load("light");
-        assert_eq!(light.name(), "light");
-    }
-
-    #[test]
-    fn load_unknown_name_falls_back_to_dark() {
-        // The user-friendly `load` swallows errors and uses dark
-        // so the binary never fails to come up due to a typo.
-        let theme = Theme::load("definitely-not-a-real-theme-name");
-        assert_eq!(theme.name(), "dark");
-    }
-
-    #[test]
     fn builders_produce_themed_closures() {
         let handle = ThemeHandle::new(Theme::bundled_dark());
         let ml_theme = markdown_theme(&handle, true);
@@ -1619,8 +712,7 @@ mod tests {
         // colors so code blocks track the active theme. Pin the color
         // mode so the assertion is deterministic regardless of the
         // test environment's terminal.
-        let theme = Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-            .expect("bundled dark must parse");
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
         let handle = ThemeHandle::new(theme);
         let ml = markdown_theme(&handle, true);
 
@@ -1634,13 +726,6 @@ mod tests {
             (ml.syntax.string)("s").contains("\x1b[38;2;206;145;120m"),
             "string closure should carry the syntaxString color"
         );
-    }
-
-    #[test]
-    fn available_lists_bundled_names() {
-        let names = Theme::available();
-        assert!(names.contains(&"dark".to_string()));
-        assert!(names.contains(&"light".to_string()));
     }
 
     #[test]
@@ -1706,10 +791,7 @@ mod tests {
     /// `#81a2be`, so the painted string must carry that escape.
     #[test]
     fn editor_border_color_for_thinking_paints_with_level_token() {
-        let handle = ThemeHandle::new(
-            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-                .expect("dark.json must parse"),
-        );
+        let handle = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
         let paint = editor_border_color_for_thinking(&handle, Some(&ThinkingConfig::Medium));
         let painted = paint("─");
         assert!(
@@ -1723,10 +805,7 @@ mod tests {
     /// that mis-routes an unset thinking level surfaces here.
     #[test]
     fn editor_border_color_for_thinking_off_paints_with_off_token() {
-        let handle = ThemeHandle::new(
-            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-                .expect("dark.json must parse"),
-        );
+        let handle = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
         let paint = editor_border_color_for_thinking(&handle, None);
         let painted = paint("─");
         // Dark's `thinkingOff` resolves to `darkGray` → `#505050`.
@@ -1743,10 +822,7 @@ mod tests {
     /// any additional plumbing.
     #[test]
     fn editor_border_color_picks_up_theme_replace() {
-        let handle = ThemeHandle::new(
-            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-                .expect("dark.json must parse"),
-        );
+        let handle = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
         let paint = editor_border_color_for_thinking(&handle, Some(&ThinkingConfig::High));
         let before = paint("─");
         // Dark's `thinkingHigh` resolves to `#b294bb`.
@@ -1755,10 +831,7 @@ mod tests {
             "expected dark `high` tint before swap, got {before:?}"
         );
 
-        handle.replace(
-            Theme::from_json_with_mode("light", LIGHT_THEME_JSON, ColorMode::Truecolor)
-                .expect("light.json must parse"),
-        );
+        handle.replace(Theme::bundled_light_with_mode(ColorMode::Truecolor));
         let after = paint("─");
         // The escape must differ — the closure resolves through
         // the shared handle, so the swap is visible immediately.
@@ -1773,10 +846,7 @@ mod tests {
     /// `BashMode` token, not folded into the thinking mapping.
     #[test]
     fn editor_border_color_for_bash_mode_paints_with_bash_token() {
-        let handle = ThemeHandle::new(
-            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-                .expect("dark.json must parse"),
-        );
+        let handle = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
         let paint = editor_border_color_for_bash_mode(&handle);
         let painted = paint("─");
         // Dark's `bashMode` resolves through `green` → `#b5bd68`.
@@ -1795,10 +865,7 @@ mod tests {
         // The cornerstone hot-reload invariant: a closure obtained
         // before `replace` must paint with the new theme's escape
         // after `replace`.
-        let handle = ThemeHandle::new(
-            Theme::from_json_with_mode("dark", DARK_THEME_JSON, ColorMode::Truecolor)
-                .expect("dark.json must parse"),
-        );
+        let handle = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
         let paint = handle.fg_closure(ThemeColor::Accent);
 
         let before = paint("X");
@@ -1809,10 +876,7 @@ mod tests {
         );
 
         // Swap to the light palette in-place.
-        handle.replace(
-            Theme::from_json_with_mode("light", LIGHT_THEME_JSON, ColorMode::Truecolor)
-                .expect("light.json must parse"),
-        );
+        handle.replace(Theme::bundled_light_with_mode(ColorMode::Truecolor));
         let after = paint("X");
         // Light's accent resolves through `lightBlue` → `#5277a3`.
         assert!(
@@ -1825,168 +889,5 @@ mod tests {
             !after.contains("\x1b[38;2;156;220;254m"),
             "stale dark escape leaked into post-swap output: {after:?}"
         );
-    }
-
-    #[test]
-    fn theme_handle_name_tracks_replacement() {
-        let handle = ThemeHandle::new(Theme::bundled_dark());
-        assert_eq!(handle.name(), "dark");
-        handle.replace(Theme::bundled_light());
-        assert_eq!(handle.name(), "light");
-    }
-
-    // ------------------------------------------------------------
-    // Theme file watcher
-    // ------------------------------------------------------------
-
-    /// Build a minimal JSON theme document with a specified
-    /// `accent` color. Useful for watcher tests that need to
-    /// produce a parseable file with a distinguishing field
-    /// without spelling out the full 51-key schema each time.
-    fn minimal_theme_json(name: &str, accent_hex: &str) -> String {
-        format!(
-            r#"{{
-                "name": "{name}",
-                "vars": {{}},
-                "colors": {{
-                    "accent": "{accent_hex}",
-                    "border": "", "borderAccent": "", "borderMuted": "",
-                    "success": "", "error": "", "warning": "", "muted": "",
-                    "dim": "", "text": "", "thinkingText": "",
-                    "selectedBg": "", "userMessageBg": "", "userMessageText": "",
-                    "customMessageBg": "", "customMessageText": "",
-                    "customMessageLabel": "", "toolPendingBg": "",
-                    "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",
-                    "toolOutput": "",
-                    "mdHeading": "", "mdLink": "", "mdLinkUrl": "", "mdCode": "",
-                    "mdCodeBlock": "", "mdCodeBlockBorder": "", "mdQuote": "",
-                    "mdQuoteBorder": "", "mdHr": "", "mdListBullet": "",
-                    "toolDiffAdded": "", "toolDiffRemoved": "", "toolDiffContext": "",
-                    "syntaxComment": "", "syntaxKeyword": "", "syntaxFunction": "",
-                    "syntaxVariable": "", "syntaxString": "", "syntaxNumber": "",
-                    "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
-                    "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
-                    "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
-                    "bashMode": ""
-                }}
-            }}"#
-        )
-    }
-
-    #[tokio::test]
-    async fn watch_user_theme_returns_none_for_missing_file() {
-        let dir = tempfile::tempdir().expect("tempdir created");
-        // Even though "nothing" sounds like a bundled name (it
-        // isn't), the watcher only fires when the file actually
-        // exists on disk — bundled names need a user override to
-        // be watchable.
-        let result = watch_user_theme_in_dir(dir.path(), "nothing-here");
-        assert!(
-            result.is_none(),
-            "watcher must not start when the theme file is absent"
-        );
-    }
-
-    #[tokio::test]
-    async fn watch_user_theme_delivers_reparsed_theme_on_file_edit() {
-        // End-to-end test: write a theme file, start the watcher,
-        // modify the file, assert that a freshly-parsed `Theme`
-        // arrives on the channel within a reasonable timeout.
-        // Filesystem watch delivery is asynchronous so we give the
-        // pipeline a generous 5-second budget; in practice it
-        // resolves in <500ms on every backend we've tried.
-        let dir = tempfile::tempdir().expect("tempdir created");
-        let path = dir.path().join("custom.json");
-        std::fs::write(&path, minimal_theme_json("custom", "#000000")).expect("write seed");
-
-        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "custom")
-            .expect("watcher should start when the file exists");
-
-        // Trigger a modification. We use `fs::write` (which
-        // truncates and writes) rather than tempfile+rename to
-        // avoid relying on platform-specific atomic-rename
-        // semantics in the test; the production watcher handles
-        // both shapes because it watches the directory.
-        std::fs::write(&path, minimal_theme_json("custom", "#ff0000")).expect("rewrite");
-
-        let new_theme = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("watcher delivered a theme within 5s")
-            .expect("channel was open");
-        assert_eq!(new_theme.name(), "custom");
-        // The new accent should be `#ff0000`; encoded as truecolor
-        // when the host detects it, otherwise as a 256-color
-        // approximation. Accept either since the test runs in
-        // arbitrary terminals.
-        let painted = new_theme.fg(ThemeColor::Accent, "X");
-        let has_truecolor = painted.contains("\x1b[38;2;255;0;0m");
-        let has_256 = painted.contains("\x1b[38;5;");
-        assert!(
-            has_truecolor || has_256,
-            "expected red accent escape post-edit, got {painted:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn watch_user_theme_ignores_unrelated_files_in_same_dir() {
-        // The watcher targets the directory, so unrelated files in
-        // it (themes the user is editing for a *different*
-        // session, log files, etc.) shouldn't trigger reloads.
-        let dir = tempfile::tempdir().expect("tempdir created");
-        let our_path = dir.path().join("ours.json");
-        let other_path = dir.path().join("other.json");
-        std::fs::write(&our_path, minimal_theme_json("ours", "#112233")).expect("write ours");
-
-        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "ours")
-            .expect("watcher should start when the file exists");
-
-        // Write a *different* file. The watcher's filename filter
-        // should drop this event.
-        std::fs::write(&other_path, minimal_theme_json("other", "#445566")).expect("write other");
-
-        // Wait through the debounce window plus a generous margin
-        // for fs-event delivery, then assert no theme arrived. A
-        // false positive here (a stray event) would surface as a
-        // received message — which is exactly what we want to
-        // catch.
-        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
-        assert!(
-            result.is_err(),
-            "watcher fired for an unrelated filename: {:?}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn watch_user_theme_swallows_parse_errors_silently() {
-        // A mid-edit save can momentarily produce invalid JSON.
-        // The watcher should *not* propagate the error; it should
-        // wait for the next write that produces a parseable
-        // document.
-        let dir = tempfile::tempdir().expect("tempdir created");
-        let path = dir.path().join("partial.json");
-        std::fs::write(&path, minimal_theme_json("partial", "#000000")).expect("write seed");
-
-        let (_guard, mut rx) = watch_user_theme_in_dir(dir.path(), "partial")
-            .expect("watcher should start when the file exists");
-
-        // First write: invalid JSON. The watcher should re-read,
-        // fail to parse, and discard silently.
-        std::fs::write(&path, "{ this is not valid json").expect("write invalid");
-        // Give the debouncer time to fire and drop the bad event.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // Channel must still be empty.
-        assert!(
-            rx.try_recv().is_err(),
-            "watcher must not surface a parse error as a Theme"
-        );
-
-        // Second write: valid again. Now we expect a delivery.
-        std::fs::write(&path, minimal_theme_json("partial", "#abcdef")).expect("write valid");
-        let recovered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("watcher recovered within 5s")
-            .expect("channel was open");
-        assert_eq!(recovered.name(), "partial");
     }
 }

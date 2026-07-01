@@ -38,7 +38,7 @@ use aj_tui::tui::RenderHandle;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 
-use crate::config::theme::{ThemeColor, ThemeHandle};
+use crate::config::theme::{ThemeColor, ThemeHandle, ThemeHandleExt};
 
 /// A single display line in the dialog, tagged so the component can
 /// color it through the theme.
