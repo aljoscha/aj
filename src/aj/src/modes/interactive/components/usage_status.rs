@@ -342,7 +342,9 @@ impl UsageStatusComponent {
         let items = match &self.phase {
             Phase::Display => self.display_items(),
             Phase::SelectProvider => provider_items(&self.eligible_providers(), self),
-            Phase::Confirm { provider_id } => confirm_items(self.available_for(provider_id)),
+            Phase::Confirm { provider_id } => {
+                confirm_items(provider_id, self.available_for(provider_id))
+            }
             Phase::Consuming { .. } => vec![SelectItem::new("consuming", "Resetting…")],
             Phase::Failed { message, .. } => failed_items(message),
             Phase::Done { message } => vec![SelectItem::new("done", message)],
@@ -356,11 +358,6 @@ impl UsageStatusComponent {
         } else {
             build_list(items, self.theme.clone())
         };
-        // Default the confirm to "Cancel" so a reflexive Enter doesn't
-        // spend a credit.
-        if matches!(self.phase, Phase::Confirm { .. }) {
-            self.list.select_by_value("cancel");
-        }
     }
 
     /// Rows for the read-only `Display` phase.
@@ -402,22 +399,21 @@ fn build_menu_list(items: Vec<SelectItem>, theme: SelectListTheme) -> SelectList
     SelectList::new(items, visible, theme, layout)
 }
 
-/// Confirm menu: spending a credit or backing out.
-fn confirm_items(available: u32) -> Vec<SelectItem> {
-    let use_desc = if available > 0 {
-        format!("{available} available")
-    } else {
-        "spend one earned reset".to_string()
-    };
+/// Confirm menu: spending a credit or backing out. Names the provider
+/// and what the reset does so the screen stands on its own, and defaults
+/// to the reset since that's the reason the user opened it.
+fn confirm_items(provider_id: &str, available: u32) -> Vec<SelectItem> {
     vec![
-        SelectItem::new("confirm", "Use a reset").with_description(&use_desc),
+        SelectItem::new("confirm", &format!("Use a reset for {provider_id}")).with_description(
+            &format!("clears the current limits · {available} available"),
+        ),
         SelectItem::new("cancel", "Cancel"),
     ]
 }
 
 /// Retry menu shown after a transient consume failure. Defaults to
-/// "Try again": unlike the confirm step, a reflexive Enter here is safe
-/// because the retry reuses the idempotency key and can't double-spend.
+/// "Try again". The retry reuses the idempotency key, so it can't
+/// double-spend even if the failed attempt actually reached the server.
 fn failed_items(message: &str) -> Vec<SelectItem> {
     vec![
         SelectItem::new("retry", "Try again").with_description(message),
@@ -811,11 +807,16 @@ mod tests {
 
         c.handle_input(&Key::char('r'));
         let out = body(&mut c);
-        assert!(out.contains("Use a reset"), "{out}");
+        // The confirm names the provider and defaults to the reset.
+        assert!(out.contains("Use a reset for openai-codex"), "{out}");
         assert!(out.contains("Cancel"), "{out}");
+        assert_eq!(
+            c.list.selected_item().map(|i| i.value.as_str()),
+            Some("confirm")
+        );
 
-        // Cancel is the default selection: Enter backs out to Display.
-        c.handle_input(&Key::enter());
+        // Esc backs out to the read-only page without spending.
+        c.handle_input(&Key::escape());
         let out = body(&mut c);
         assert!(out.contains("5h limit"), "{out}");
         assert!(!out.contains("Use a reset"), "{out}");
