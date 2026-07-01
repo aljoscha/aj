@@ -1,19 +1,14 @@
 //! Shared helpers for the session-lifecycle unit tests in
 //! `session.rs` and `interactive.rs`.
 //!
-//! Lives as a `#[cfg(test)]` child of `modes::interactive` so it can
-//! construct [`RunConfigSnapshot`] (whose fields are `pub(crate)`)
-//! while staying out of release builds.
+//! The TUI-agnostic scripted-provider and run-config builders live in
+//! `aj_app::test_support` and are re-exported here so existing call
+//! sites keep resolving. The SessionWorld / `Terminal`-bound helpers
+//! (which touch aj-tui types) stay in this crate.
 
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 
 use aj_conf::Config;
-use aj_models::registry::ModelInfo;
-use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
-use aj_models::types::{
-    AssistantContent, AssistantMessage, StopReason, StreamOptions, TextContent,
-};
 use aj_session::ConversationPersistence;
 use aj_tui::terminal::Terminal;
 use anyhow::Result;
@@ -23,6 +18,10 @@ use crate::config::theme::{Theme, ThemeHandle};
 use crate::modes::interactive::render_settings::RenderSettings;
 use crate::modes::interactive::session::{SessionEntry, SessionSpec, SessionWorld};
 use crate::session_setup::RunConfigSnapshot;
+
+pub(crate) use aj_app::test_support::{
+    finalized_text_message, scripted_model_info, scripted_run_config,
+};
 
 /// Headless [`Terminal`]: fixed 100×24, writes discarded.
 /// Component output is read via `Component::render`, not the
@@ -47,97 +46,6 @@ impl Terminal for StubTerminal {
     fn clear_screen(&mut self) {}
     fn set_title(&mut self, _: &str) {}
     fn flush(&mut self) {}
-}
-
-/// [`ModelInfo`] consistent with the identity [`ScriptedProvider`]
-/// stamps on every emitted partial, so the agent sees a coherent
-/// provider identity in tests.
-pub(crate) fn scripted_model_info() -> ModelInfo {
-    ModelInfo {
-        id: "scripted".to_string(),
-        name: "scripted".to_string(),
-        api: "scripted".to_string(),
-        provider: "scripted".to_string(),
-        base_url: "scripted://internal".to_string(),
-        reasoning: false,
-        supports_adaptive_thinking: false,
-        supports_verbosity: false,
-        input: vec![aj_models::registry::InputModality::Text],
-        cost: aj_models::registry::ModelCost::default(),
-        context_window: 0,
-        max_tokens: 0,
-        headers: None,
-    }
-}
-
-/// Finalized text-only assistant reply for scripting one-turn
-/// conversations (no tool calls, `EndTurn`).
-pub(crate) fn finalized_text_message(text: &str) -> AssistantMessage {
-    AssistantMessage {
-        content: vec![AssistantContent::Text(TextContent {
-            text: text.to_string(),
-            text_signature: None,
-        })],
-        api: "scripted".to_string(),
-        provider: "scripted".to_string(),
-        model: "scripted".to_string(),
-        response_id: Some("test-msg".to_string()),
-        usage: Default::default(),
-        stop_reason: StopReason::Stop,
-        error: None,
-        timestamp: 0,
-    }
-}
-
-/// Run-config snapshot over a [`ScriptedProvider`] replaying
-/// `messages`. `ExhaustedBehavior::Panic` makes any unscripted
-/// extra inference fail loudly.
-pub(crate) fn scripted_run_config(
-    messages: Vec<AssistantMessage>,
-) -> Arc<StdMutex<RunConfigSnapshot>> {
-    Arc::new(StdMutex::new(RunConfigSnapshot {
-        provider: Arc::new(
-            ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
-                .on_exhausted(ExhaustedBehavior::Panic),
-        ),
-        model_info: Arc::new(scripted_model_info()),
-        stream_options: StreamOptions::default(),
-        thinking: None,
-        speed: None,
-        model_key: ("scripted".to_string(), "scripted".to_string()),
-        session_id: None,
-    }))
-}
-
-/// Like [`scripted_run_config`] but with a non-zero `context_window`,
-/// for tests that exercise occupancy-driven triggers (threshold
-/// compaction, silent overflow).
-pub(crate) fn scripted_run_config_with_window(
-    messages: Vec<AssistantMessage>,
-    context_window: u64,
-) -> Arc<StdMutex<RunConfigSnapshot>> {
-    let mut model_info = scripted_model_info();
-    model_info.context_window = context_window;
-    Arc::new(StdMutex::new(RunConfigSnapshot {
-        provider: Arc::new(
-            ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
-                .on_exhausted(ExhaustedBehavior::Panic),
-        ),
-        model_info: Arc::new(model_info),
-        stream_options: StreamOptions::default(),
-        thinking: None,
-        speed: None,
-        model_key: ("scripted".to_string(), "scripted".to_string()),
-        session_id: None,
-    }))
-}
-
-/// [`finalized_text_message`] carrying a non-zero input-token `usage`,
-/// so occupancy-driven triggers see a real context size.
-pub(crate) fn finalized_text_message_with_usage(text: &str, input_tokens: u64) -> AssistantMessage {
-    let mut m = finalized_text_message(text);
-    m.usage.input = input_tokens;
-    m
 }
 
 /// [`SessionWorld::build`] with a default config, bundled theme,

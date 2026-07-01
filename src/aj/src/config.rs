@@ -5,6 +5,7 @@
 //! [`Theme`](theme::Theme), and the command catalog in
 //! [`commands`], built once at startup.
 
-pub mod commands;
+pub use aj_app::commands;
+
 pub mod keybindings;
 pub mod theme;

@@ -236,8 +236,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{OVERFLOW_GIVEUP, TurnPolicy, TurnStart, drive_turn};
-    use crate::modes::interactive::test_support::{
-        build_test_world, create_spec, finalized_text_message, finalized_text_message_with_usage,
+    use crate::test_support::{
+        build_test_agent, finalized_text_message, finalized_text_message_with_usage,
         scripted_run_config, scripted_run_config_with_window,
     };
 
@@ -292,13 +292,11 @@ mod tests {
             overflow_error_message(),
             finalized_text_message("recovered"),
         ]);
-        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
-
-        let mut agent = world.agent.lock().await;
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
         let policy = recover_policy();
         let result = drive_turn(
             &mut agent,
-            &world.log,
+            &log,
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -328,13 +326,11 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config =
             scripted_run_config(vec![overflow_error_message(), overflow_error_message()]);
-        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
-
-        let mut agent = world.agent.lock().await;
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
         let policy = recover_policy();
         let result = drive_turn(
             &mut agent,
-            &world.log,
+            &log,
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -363,9 +359,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config =
             scripted_run_config(vec![overflow_error_message(), overflow_error_message()]);
-        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
-
-        let mut agent = world.agent.lock().await;
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
 
         let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&warnings);
@@ -378,7 +372,7 @@ mod tests {
         let policy = recover_policy();
         let result = drive_turn(
             &mut agent,
-            &world.log,
+            &log,
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -401,9 +395,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![overflow_error_message()]);
-        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
-
-        let mut agent = world.agent.lock().await;
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
@@ -411,7 +403,7 @@ mod tests {
         };
         let result = drive_turn(
             &mut agent,
-            &world.log,
+            &log,
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -437,9 +429,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![finalized_text_message("done")]);
-        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
-
-        let mut agent = world.agent.lock().await;
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
@@ -447,7 +437,7 @@ mod tests {
         };
         let result = drive_turn(
             &mut agent,
-            &world.log,
+            &log,
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -478,10 +468,13 @@ mod tests {
             ],
             1000,
         );
-        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
-        crate::modes::interactive::test_support::drive_turn(&world, "first question").await;
-
-        let mut agent = world.agent.lock().await;
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+        // Warm-up turn so the log carries prior context for the
+        // threshold compaction to summarize.
+        agent
+            .prompt("first question".to_string(), CancellationToken::new())
+            .await
+            .expect("warm-up turn completes");
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: Some(0.85),
@@ -489,7 +482,7 @@ mod tests {
         };
         let result = drive_turn(
             &mut agent,
-            &world.log,
+            &log,
             &policy,
             TurnStart::Prompt("X".repeat(2000)),
             |_| {},
@@ -517,9 +510,7 @@ mod tests {
             vec![finalized_text_message_with_usage("ok", 100)],
             1000,
         );
-        let world = build_test_world(&persistence, &run_config, &create_spec()).expect("world");
-
-        let mut agent = world.agent.lock().await;
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: Some(0.85),
@@ -527,7 +518,7 @@ mod tests {
         };
         let result = drive_turn(
             &mut agent,
-            &world.log,
+            &log,
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},

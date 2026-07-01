@@ -147,7 +147,7 @@ pub const COMMANDS: &[Command] = &[
         title: "history",
         category: "prompt",
         description: "Search and recall a previous prompt.",
-        action_id: Some(crate::config::keybindings::ACTION_HISTORY_OPEN),
+        action_id: Some(crate::keybindings::ACTION_HISTORY_OPEN),
         action: CommandAction::OpenPromptHistory,
     },
     Command {
@@ -155,7 +155,7 @@ pub const COMMANDS: &[Command] = &[
         title: "switch",
         category: "agent",
         description: "Switch which agent's transcript is shown.",
-        action_id: Some(crate::config::keybindings::ACTION_AGENT_PICKER),
+        action_id: Some(crate::keybindings::ACTION_AGENT_PICKER),
         action: CommandAction::OpenAgentPicker,
     },
     Command {
@@ -195,7 +195,7 @@ pub const COMMANDS: &[Command] = &[
         title: "palette",
         category: "aj",
         description: "Open the command palette.",
-        action_id: Some(crate::config::keybindings::ACTION_PALETTE_OPEN),
+        action_id: Some(crate::keybindings::ACTION_PALETTE_OPEN),
         action: CommandAction::OpenCommandPalette,
     },
     Command {

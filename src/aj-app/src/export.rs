@@ -66,7 +66,7 @@ struct ExportData<'a> {
 ///
 /// Pure over the log: it reads but never mutates, so it is safe to call
 /// while a turn is in flight.
-pub(crate) fn render_session_html(log: &ConversationLog) -> String {
+pub fn render_session_html(log: &ConversationLog) -> String {
     let title = derive_title(log)
         .map(|t| truncate_title(&t))
         .unwrap_or_else(|| "aj session".to_string());

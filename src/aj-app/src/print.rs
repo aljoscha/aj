@@ -14,7 +14,7 @@
 //!   are intentionally suppressed — a caller piping `aj --print`
 //!   into another process wants a clean final answer, not interleaved
 //!   thinking/streaming chatter. Aborted/error stop reasons surface
-//!   via the agent's [`crate::TurnError`] return path and exit
+//!   via the agent's [`TurnError`] return path and exit
 //!   non-zero.
 //! - **JSON** ([`PrintFormat::Json`]). One [`AgentEvent`] per JSONL
 //!   line, in the order they fire on the bus. Same shape the locked
@@ -405,7 +405,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // Kill the background-task tree and reap the process groups
     // before observing the prompt result, so the early error returns
     // below can't orphan tasks.
-    crate::modes::shutdown_background_tasks(&task_registry).await;
+    crate::shutdown_background_tasks(&task_registry).await;
 
     finish_result(prompt_result)?;
 

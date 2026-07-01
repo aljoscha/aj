@@ -1,7 +1,6 @@
 //! `--scripted <NAME>` flag plumbing.
 //!
-//! Both [`interactive`](crate::modes::interactive) and
-//! [`print`](crate::modes::print) modes share the same resolution path:
+//! Both the interactive and print modes share the same resolution path:
 //! given the user-supplied demo name, either look it up in
 //! [`aj_models::scripted::demos`] and hand back a ready-to-
 //! plug-in [`Provider`](aj_models::provider::Provider) handle, or —
@@ -11,8 +10,8 @@
 //!
 //! The resolver is intentionally one-shot: it consumes the flag and
 //! returns the resolved pair in the same shape
-//! [`crate::model::resolve`] produces for real providers, so the two
-//! call sites (`interactive.rs`, `print.rs`) can plug either path into
+//! [`crate::model::resolve`] produces for real providers, so both
+//! frontends can plug either path into
 //! [`Agent::with_provider`](aj_agent::Agent::with_provider) without a
 //! conditional.
 

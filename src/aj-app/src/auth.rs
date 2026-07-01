@@ -11,8 +11,8 @@
 //!   OAuth authorization URL during a login flow.
 //!
 //! The actual interactive login dialog and the [`OAuthCallbacks`]
-//! implementation that drives it live in
-//! [`crate::modes::interactive::components::login_dialog`].
+//! implementation that drives it live in the frontend's login-dialog
+//! component.
 //!
 //! [`OAuthCallbacks`]: aj_models::oauth::OAuthCallbacks
 

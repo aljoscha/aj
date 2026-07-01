@@ -55,25 +55,25 @@ use crate::model::{ModelSelection, ResolvedModel};
 /// Print mode has no loop, so it builds one of these, optionally
 /// overwrites it with the resumed log's recorded settings, and reads
 /// it once to build its agent.
-pub(crate) struct RunConfigSnapshot {
+pub struct RunConfigSnapshot {
     /// Provider handle the next turn streams against.
-    pub(crate) provider: Arc<dyn Provider>,
+    pub provider: Arc<dyn Provider>,
     /// Registry (or scripted) metadata for `provider`'s model.
-    pub(crate) model_info: Arc<ModelInfo>,
+    pub model_info: Arc<ModelInfo>,
     /// Per-call stream options (thinking-display mode, etc.).
-    pub(crate) stream_options: StreamOptions,
+    pub stream_options: StreamOptions,
     /// Default thinking effort for the next turn.
-    pub(crate) thinking: Option<ThinkingConfig>,
+    pub thinking: Option<ThinkingConfig>,
     /// Inference speed mode baked into `stream_options`' headers.
     /// Tracked explicitly so bundle rebuilds (model swap, resume
     /// restore) preserve it and so it can be recorded in the session
     /// log. `None` means standard.
-    pub(crate) speed: Option<Speed>,
+    pub speed: Option<Speed>,
     /// `(provider_id, model_id)` the model selector pre-selects.
     /// Tracked explicitly rather than read off `model_info` because
     /// the scripted path's provider id (from `--model-api`) differs
     /// from `model_info.provider`, which is always `"scripted"`.
-    pub(crate) model_key: (String, String),
+    pub model_key: (String, String),
     /// Stable per-session prompt-cache key (the conversation/session
     /// id). Providers that key prompt caching on it (OpenAI Responses,
     /// Codex) reuse the cached prefix across this session's turns when
@@ -81,7 +81,7 @@ pub(crate) struct RunConfigSnapshot {
     /// turn, but held here separately because a model swap rebuilds
     /// `stream_options` from registry defaults, which would otherwise
     /// drop it. `None` until the log is opened in [`prepare_log`].
-    pub(crate) session_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// Dependencies for resume-time settings restoration: the model
@@ -89,7 +89,7 @@ pub(crate) struct RunConfigSnapshot {
 /// and the credential store backing the rebuilt bundle's lazy API-key
 /// resolver. `None` on the scripted path (and in tests) disables
 /// restoration.
-pub(crate) struct RestoreContext {
+pub struct RestoreContext {
     pub registry: Arc<ModelRegistry>,
     pub auth: AuthStorage,
 }
@@ -129,7 +129,7 @@ fn build_run_config(
 /// registry so the binary owns provider dispatch, API-key resolution,
 /// and speed-driven headers. Both apply the CLI > env > config
 /// model-selection precedence through [`ModelSelection`].
-pub(crate) fn build_initial_run_config(
+pub fn build_initial_run_config(
     args: &Args,
     config: &Config,
     auth: &AuthStorage,
@@ -179,7 +179,7 @@ pub(crate) fn build_initial_run_config(
 /// Project a [`ThinkingConfig`] onto the wire-level [`ThinkingLevel`]
 /// for validation against a model's effort vocabulary. One-to-one,
 /// mirroring the projection the agent applies before each inference.
-pub(crate) fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
+pub fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
     match level {
         ThinkingConfig::Minimal => ThinkingLevel::Minimal,
         ThinkingConfig::Low => ThinkingLevel::Low,
@@ -326,13 +326,13 @@ pub(crate) fn restore_session_settings(
 /// the [`AgentEnv`] it was built against (for a startup context
 /// notice, the footer, and editor autocomplete) and whether the active
 /// tool set gates in the skills listing.
-pub(crate) struct BuiltAgent {
-    pub(crate) agent: Agent,
-    pub(crate) env: AgentEnv,
+pub struct BuiltAgent {
+    pub agent: Agent,
+    pub env: AgentEnv,
     /// Whether the active tools include `read_file`. Skills are
     /// progressive disclosure reachable only with that tool, so this
     /// gates the skills listing in the assembled system prompt.
-    pub(crate) include_skills: bool,
+    pub include_skills: bool,
 }
 
 /// Construct a fresh, not-yet-shared [`Agent`] from the persisted
@@ -344,7 +344,7 @@ pub(crate) struct BuiltAgent {
 /// fresh, so a new session picks up edits to AGENTS.md files, a system
 /// prompt override, and the current date. Skill-discovery diagnostics
 /// ride on the returned `env`. The caller decides how to surface them.
-pub(crate) fn build_agent(
+pub fn build_agent(
     config: &Config,
     provider: Arc<dyn Provider>,
     model_info: Arc<ModelInfo>,
@@ -384,7 +384,7 @@ pub(crate) fn build_agent(
 /// Whether a session is freshly created or resumed from disk. The
 /// mode-agnostic counterpart to the interactive `SessionSpec`, which
 /// additionally carries the header-notice wording.
-pub(crate) enum SessionSource {
+pub enum SessionSource {
     Create,
     Resume { session_id: String },
 }
@@ -397,19 +397,19 @@ impl SessionSource {
 
 /// A resolved conversation log plus the agent seed material derived
 /// from it.
-pub(crate) struct PreparedLog {
+pub struct PreparedLog {
     /// The opened log, not yet shared behind an `Arc<Mutex<_>>`. The
     /// caller still mutates it (system-prompt freeze via
     /// [`freeze_and_seed`]) before installing the persistence
     /// listener.
-    pub(crate) log: ConversationLog,
+    pub log: ConversationLog,
     /// The linearized user thread captured after repair, ready to seed
     /// the agent. Empty for a fresh log.
-    pub(crate) transcript: Vec<AgentMessage>,
+    pub transcript: Vec<AgentMessage>,
     /// Notices from resume-time settings restoration (what was
     /// restored, or why a recorded value was kept out). Empty unless
     /// resuming with a [`RestoreContext`].
-    pub(crate) restore_notices: Vec<String>,
+    pub restore_notices: Vec<String>,
 }
 
 /// Resolve the log for `source`, repair any interrupted tool uses, and
@@ -420,7 +420,7 @@ pub(crate) struct PreparedLog {
 /// the post-repair head so the seed sees any synthesized `tool_result`
 /// the repair walk just wrote. On error nothing is shared or
 /// installed.
-pub(crate) fn prepare_log(
+pub fn prepare_log(
     persistence: &ConversationPersistence,
     source: &SessionSource,
     config: &Config,
@@ -485,7 +485,7 @@ pub(crate) fn prepare_log(
 /// seeded with the transcript, the prompt, and the sub-agent counter
 /// floor (so freshly minted sub-agent ids don't collide with subtrees
 /// already on disk).
-pub(crate) fn freeze_and_seed(
+pub fn freeze_and_seed(
     log: &mut ConversationLog,
     agent: &mut Agent,
     transcript: Vec<AgentMessage>,

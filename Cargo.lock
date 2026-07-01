@@ -22,6 +22,7 @@ name = "aj"
 version = "0.1.0"
 dependencies = [
  "aj-agent",
+ "aj-app",
  "aj-conf",
  "aj-models",
  "aj-session",
@@ -29,14 +30,10 @@ dependencies = [
  "aj-tui",
  "aj-tui-testkit",
  "anyhow",
- "arboard",
  "async-trait",
- "base64",
  "chrono",
  "clap",
  "dotenv",
- "flate2",
- "iana-time-zone",
  "image",
  "notify",
  "rand 0.9.4",
@@ -92,7 +89,10 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

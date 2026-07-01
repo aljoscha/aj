@@ -9,7 +9,6 @@
 use aj::cli::args::{Args, Command};
 use aj::modes::{interactive::InteractiveMode, print};
 use aj_conf::Config;
-use aj_session::ConversationPersistence;
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -48,8 +47,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Some(Command::UpdateModels) => handle_update_models_command().await,
-        Some(Command::ListSessions) => handle_list_sessions(),
+        Some(Command::UpdateModels) => aj_app::handle_update_models_command().await,
+        Some(Command::ListSessions) => aj_app::handle_list_sessions(),
         Some(Command::Continue {
             session_id: _,
             prompt: _,
@@ -73,47 +72,4 @@ async fn dispatch_session_mode(args: Args) -> Result<()> {
     } else {
         InteractiveMode::from_args(args)?.run().await
     }
-}
-
-/// `aj list-sessions`: list existing conversation sessions
-/// for the current project, latest first.
-///
-/// Output: one row per session, formatted as `<session_id>
-/// (modified: <utc-ts>, <size>)`. The underlying iteration,
-/// pre-refactor-format filtering, and size formatting all live
-/// in [`ConversationPersistence::list_sessions`] (`aj-session`);
-/// this function is a thin presentation wrapper.
-fn handle_list_sessions() -> Result<()> {
-    let sessions_dir = Config::get_sessions_dir_path()?;
-    let conversation_persistence = ConversationPersistence::new(sessions_dir);
-    let sessions = conversation_persistence.list_sessions()?;
-
-    if sessions.is_empty() {
-        println!("No conversation sessions found for this project.");
-        return Ok(());
-    }
-
-    for session in sessions {
-        println!(
-            "{} (modified: {}, {})",
-            session.session_id, session.modified, session.size_display
-        );
-    }
-
-    Ok(())
-}
-
-/// `aj update-models`: refresh the on-disk model catalog at
-/// `~/.aj/models.json` from `models.dev`. The `/model` selector
-/// overlay reads that catalog at startup, so running this command
-/// is how users surface freshly-released models to the picker
-/// without restarting from a different catalog source.
-///
-/// The output is a one-line summary (added / removed /
-/// price-changes counts plus total + destination path) suitable
-/// for scripting.
-async fn handle_update_models_command() -> Result<()> {
-    let summary = aj_models::refresh::refresh_user_cache().await?;
-    println!("{}", summary.one_line());
-    Ok(())
 }

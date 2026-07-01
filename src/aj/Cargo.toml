@@ -9,20 +9,17 @@ path = "src/main.rs"
 
 [dependencies]
 aj-agent = { path = "../aj-agent/" }
+aj-app = { path = "../aj-app/" }
 aj-conf = { path = "../aj-conf/" }
 aj-models = { path = "../aj-models/" }
 aj-session = { path = "../aj-session/" }
 aj-tools = { path = "../aj-tools/" }
 aj-tui = { path = "../aj-tui/" }
 anyhow = { workspace = true }
-arboard = { workspace = true }
 async-trait = { workspace = true }
-base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }
-flate2 = { workspace = true }
-iana-time-zone = { workspace = true }
 image = { workspace = true }
 notify = { workspace = true }
 rand = { workspace = true }
@@ -36,6 +33,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+aj-app = { path = "../aj-app/", features = ["test-support"] }
 aj-tui-testkit = { path = "../aj-tui-testkit/" }
 serial_test = { workspace = true }
 tempfile = { workspace = true }

@@ -8,6 +8,13 @@
 
 use aj_conf::AgentEnv;
 
+// The default system prompt is embedded at compile time so the binaries
+// ship as self-contained executables. The file lives next to this
+// crate's `Cargo.toml`. At runtime, a `~/.agents/SYSTEM_PROMPT.md` (or
+// `~/.claude/SYSTEM_PROMPT.md`) override file replaces it; see `AgentEnv`
+// in `aj-conf`.
+pub const SYSTEM_PROMPT: &str = include_str!("../SYSTEM_PROMPT.md");
+
 /// Assemble the full system prompt: the base prompt, the stitched
 /// context files, the optional skills listing, and the trailing
 /// environment block.
