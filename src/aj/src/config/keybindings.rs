@@ -26,64 +26,15 @@ pub use aj_app::keybindings::*;
 
 /// Built-in `aj`-level keybinding definitions.
 ///
-/// Returned as a fresh `Vec` so callers can extend or filter before
-/// handing it to a [`KeybindingsManager`].
+/// Adapts the frontend-agnostic [`aj_app::keybindings::AJ_KEYBINDINGS`]
+/// table into aj-tui [`KeybindingDefinition`]s, preserving the table's
+/// order. Returned as a fresh `Vec` so callers can extend or filter
+/// before handing it to a [`KeybindingsManager`].
 pub fn aj_keybindings() -> KeybindingDefinitions {
-    use KeybindingDefinition as K;
-    vec![
-        (
-            ACTION_THINKING_TOGGLE.to_string(),
-            K::new("alt+t", "Toggle visibility of assistant thinking blocks"),
-        ),
-        (
-            ACTION_TOOLS_EXPAND.to_string(),
-            K::new("alt+o", "Toggle expanded tool output"),
-        ),
-        (
-            ACTION_CLIPBOARD_PASTE_IMAGE.to_string(),
-            K::new("ctrl+v", "Paste image from clipboard"),
-        ),
-        (
-            ACTION_PALETTE_OPEN.to_string(),
-            K::new("ctrl+o", "Open command palette"),
-        ),
-        (
-            ACTION_OVERLAY_CLOSE_ALL.to_string(),
-            K::new("ctrl+c", "Close all open overlays"),
-        ),
-        (
-            ACTION_HISTORY_TOGGLE_SCOPE.to_string(),
-            K::new("ctrl+t", "Toggle prompt-history scope (workspace / all)"),
-        ),
-        (
-            ACTION_HISTORY_OPEN.to_string(),
-            K::new("ctrl+r", "Open prompt-history search"),
-        ),
-        (
-            ACTION_AGENT_PICKER.to_string(),
-            K::new("alt+a", "Open agent picker"),
-        ),
-        (
-            ACTION_AGENT_TOGGLE_SCOPE.to_string(),
-            K::new("ctrl+t", "Toggle agent-picker scope (running / all)"),
-        ),
-        (
-            ACTION_TASK_KILL.to_string(),
-            K::new("ctrl+k", "Kill the selected background task"),
-        ),
-        (
-            ACTION_SUBMIT_STEERING.to_string(),
-            K::new("alt+enter", "Queue / send the message as steering"),
-        ),
-        (
-            ACTION_DEQUEUE.to_string(),
-            K::new("alt+up", "Pull the queued message back into the editor"),
-        ),
-        (
-            ACTION_SETTINGS_CLEAR.to_string(),
-            K::new("ctrl+x", "Clear the selected project override"),
-        ),
-    ]
+    aj_app::keybindings::AJ_KEYBINDINGS
+        .iter()
+        .map(|&(action, chord, desc)| (action.to_string(), KeybindingDefinition::new(chord, desc)))
+        .collect()
 }
 
 /// Combined definitions: every `tui.*` action followed by every

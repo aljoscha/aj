@@ -13,24 +13,11 @@
 
 use std::any::Any;
 
+use aj_app::footer::ContextUsage;
 use aj_tui::ansi::truncate_to_width;
 use aj_tui::component::Component;
 use aj_tui::keys::InputEvent;
 use aj_tui::style;
-
-/// Snapshot describing how full the active model's context window
-/// is. The footer renders this as `tokens/window (percent%)`,
-/// coloring the percentage by occupancy.
-///
-/// `tokens.None` means "not yet known" — typically a fresh session
-/// before the first assistant turn — and renders as `?`. A
-/// `context_window` of `0` suppresses the indicator entirely so
-/// the footer stays silent for models with no published window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextUsage {
-    pub tokens: Option<u64>,
-    pub context_window: u64,
-}
 
 /// Counts of currently-running sub-agents and background (bash)
 /// tasks, plus the resolved key label that opens the agent picker.

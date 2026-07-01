@@ -24,12 +24,15 @@ pub mod clipboard;
 pub mod commands;
 pub mod compaction;
 pub mod export;
+pub mod footer;
 pub mod keybindings;
 pub mod model;
 pub mod print;
 pub mod scripted;
 pub mod session_setup;
+pub mod shutdown;
 pub mod system_prompt;
+pub mod tmux;
 pub mod turn;
 pub mod usage;
 

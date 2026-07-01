@@ -120,6 +120,66 @@ pub const ACTION_DEQUEUE: &str = "aj.message.dequeue";
 /// already-inherited rows and in the user settings window.
 pub const ACTION_SETTINGS_CLEAR: &str = "aj.settings.clear";
 
+/// The `aj.*` actions with their default chord and description, in the
+/// order help screens and the keybindings manager list them.
+///
+/// Each row is `(action_id, default_chord, description)`: the action ID
+/// (one of the `ACTION_*` consts above), the chord it binds to by
+/// default, and the human-readable label. Frontends turn this into their
+/// own binding-definition type against their key-matching layer, so the
+/// data stays here while the manager machinery lives per-binding.
+pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
+    (
+        ACTION_THINKING_TOGGLE,
+        "alt+t",
+        "Toggle visibility of assistant thinking blocks",
+    ),
+    (ACTION_TOOLS_EXPAND, "alt+o", "Toggle expanded tool output"),
+    (
+        ACTION_CLIPBOARD_PASTE_IMAGE,
+        "ctrl+v",
+        "Paste image from clipboard",
+    ),
+    (ACTION_PALETTE_OPEN, "ctrl+o", "Open command palette"),
+    (
+        ACTION_OVERLAY_CLOSE_ALL,
+        "ctrl+c",
+        "Close all open overlays",
+    ),
+    (
+        ACTION_HISTORY_TOGGLE_SCOPE,
+        "ctrl+t",
+        "Toggle prompt-history scope (workspace / all)",
+    ),
+    (ACTION_HISTORY_OPEN, "ctrl+r", "Open prompt-history search"),
+    (ACTION_AGENT_PICKER, "alt+a", "Open agent picker"),
+    (
+        ACTION_AGENT_TOGGLE_SCOPE,
+        "ctrl+t",
+        "Toggle agent-picker scope (running / all)",
+    ),
+    (
+        ACTION_TASK_KILL,
+        "ctrl+k",
+        "Kill the selected background task",
+    ),
+    (
+        ACTION_SUBMIT_STEERING,
+        "alt+enter",
+        "Queue / send the message as steering",
+    ),
+    (
+        ACTION_DEQUEUE,
+        "alt+up",
+        "Pull the queued message back into the editor",
+    ),
+    (
+        ACTION_SETTINGS_CLEAR,
+        "ctrl+x",
+        "Clear the selected project override",
+    ),
+];
+
 /// Canonical display labels for keyboard chords that are deliberately
 /// fixed terminal conventions rather than rebindable actions.
 ///
