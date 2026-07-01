@@ -542,9 +542,12 @@ impl Vaxis {
         // "changed" is therefore misleading: it is true when the two slices are
         // the *same* slice. We own `Vec`s rather than share slice headers, so
         // the pointers coincide only when both are empty (independent empty
-        // `Vec`s share the dangling alignment pointer). The multi_cursor path is
-        // gated on a queried capability we never enable here, so this only
-        // matters once that lands. See the report's fidelity note.
+        // `Vec`s share the dangling alignment pointer). With both slices empty
+        // by default this reduces to `cursor_vis`, so a visible-but-unmoved
+        // cursor already forces `needs_render` every frame (matching upstream,
+        // whose two default `&.{}` slices also compare pointer-equal). The
+        // secondary-cursor re-emit below is additionally gated on
+        // `caps.multi_cursor`, which detection never enables yet.
         let cursor_secondary_changed =
             screen.cursor_vis && same_slice(&screen.cursor_secondary, &self.state.cursor_secondary);
         let needs_render = self.refresh
@@ -647,7 +650,12 @@ impl Vaxis {
                         let skipped_i = (usize::from(row) + skipped_row)
                             * usize::from(self.screen_last.width)
                             + (usize::from(col) + skipped_col);
-                        self.screen_last.buf[skipped_i].skip = true;
+                        // A scaled cell near the right/bottom edge can index
+                        // past the buffer. Upstream reads out of bounds here; we
+                        // skip instead of panicking on untrusted geometry.
+                        if let Some(covered) = self.screen_last.buf.get_mut(skipped_i) {
+                            covered.skip = true;
+                        }
                     }
                 }
             }
