@@ -1,5 +1,26 @@
 # libvaxis Rust Port Plan
 
+## Status: complete
+
+All phases (0-13) are done and committed. The `vaxis`, `vaxis-ucd`, and
+`vaxis-derive` crates build; `cargo fmt`, `cargo clippy --all-targets`, and the
+full test suite (323 tests) are clean, and all 14 examples build. The examples
+were smoke-tested live in tmux and two fresh-eyes reviews (renderer + core wire
+path, and the vxfw core + App) found the port faithful. The findings from those
+passes were amended: the vxfw `App::run` teardown wake, the `image` example
+decoding on-disk PNGs, the `vt` query-reply leak, terminal-emulator hang
+hardening for untrusted child output, `ScrollBars` event routing, and z-ordered
+hit-testing.
+
+Decisions as resolved: D1 = Option A (inline `compact_str` grapheme behind a
+localized alias, with Option B interning still a contained swap); D4 = a
+self-generated UCD 17.0 width-table generator plus `unicode-segmentation` for
+UAX#29; the `Table` reflection (D5) became the `vaxis-derive` `#[derive(TableRow)]`
+macro. Deviations from a literal transliteration are recorded with `NOTE`s at
+their sites (e.g. the multi-cursor slice-identity quirk, the FlexColumn/FlexRow
+asymmetry, reproduced upstream bugs, and the hardening we added for untrusted
+input). Rewiring the `aj` binary onto vaxis remains a separate follow-on.
+
 ## Goal
 
 Port the Zig TUI library [libvaxis](https://github.com/rockorager/libvaxis)
