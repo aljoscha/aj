@@ -11,9 +11,11 @@
 //! - Flex formula: a `FlexColumn` flex child gets `inherent + share`, where
 //!   `share = remaining_space * flex / total_flex`. A `FlexRow` flex child gets
 //!   just `share` (no inherent term, since flex children are never measured).
-//! - Leftover handling: `FlexColumn` subtracts with plain (non-saturating)
-//!   arithmetic for both `remaining_space` and the last child's remainder.
-//!   `FlexRow` saturates both.
+//! - Leftover handling: upstream `FlexColumn` subtracts with plain
+//!   (non-saturating) arithmetic for both `remaining_space` and the last
+//!   child's remainder, where `FlexRow` saturates both. We saturate in both
+//!   widgets so an undersized viewport clips children instead of panicking on
+//!   underflow.
 
 use crate::vxfw::{
     DrawContext, FlexItem, MaxSize, RelativePoint, Size, SubSurface, Surface, Widget, draw_widget,
@@ -62,17 +64,21 @@ impl Widget for FlexColumn {
         let mut children: Vec<SubSurface> = Vec::new();
         let mut second_pass_height: u16 = 0;
         let mut max_width: u16 = 0;
-        // NOTE: plain subtraction, matching upstream (FlexRow saturates here).
-        let remaining_space = max.height - first_pass_height;
+        // NOTE: we deviate from a strict port here. Upstream uses plain
+        // subtraction, which underflows when the children's inherent heights
+        // already exceed the max. Saturating gives flex children no extra
+        // space in that case and the overflowing children are clipped by the
+        // parent surface placement.
+        let remaining_space = max.height.saturating_sub(first_pass_height);
         let len = self.children.len();
         for (idx, child) in self.children.iter().enumerate() {
             let inherent_height = size_list[idx];
             let child_height = if child.flex == 0 {
                 inherent_height
             } else if idx + 1 == len {
-                // The last child takes whatever height is left. Plain
-                // subtraction, matching upstream.
-                max.height - second_pass_height
+                // The last child takes whatever height is left, saturating so
+                // an already overfull column hands it zero height.
+                max.height.saturating_sub(second_pass_height)
             } else {
                 // NOTE: inherent height plus the flex share, where FlexRow uses
                 // the share alone.
@@ -184,5 +190,83 @@ mod tests {
 
         assert_eq!(surface.children[3].surface.size.height, 2 + 3 + 2);
         assert_eq!(surface.children[3].origin.row, row);
+    }
+
+    /// A column layout in the shape of an app shell: fixed header, flexible
+    /// body, fixed editor and footer.
+    fn shell_column() -> WidgetRef {
+        Rc::new(RefCell::new(FlexColumn {
+            children: vec![
+                FlexItem::init(Rc::new(RefCell::new(Text::new("header"))), 0),
+                FlexItem::init(Rc::new(RefCell::new(Text::new("body"))), 1),
+                FlexItem::init(Rc::new(RefCell::new(Text::new("editor"))), 0),
+                FlexItem::init(Rc::new(RefCell::new(Text::new("footer"))), 0),
+            ],
+        }))
+    }
+
+    fn ctx(max_height: u16) -> DrawContext {
+        DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(80),
+                height: Some(max_height),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        }
+    }
+
+    #[test]
+    fn flex_column_undersized_max_height() {
+        // 4 children of inherent height 1 into 2 rows: the fixed pass already
+        // overflows, so the flex child gets no extra space and the overflow is
+        // clipped by the parent surface placement rather than panicking.
+        let flex = shell_column();
+        let surface = draw_widget(&flex, &ctx(2));
+
+        assert_eq!(surface.children.len(), 4);
+        let mut row: i32 = 0;
+        for child in &surface.children {
+            assert_eq!(child.surface.size.height, 1);
+            assert_eq!(child.origin.row, row);
+            row += i32::from(child.surface.size.height);
+        }
+        // The children keep their inherent heights, so the column reports the
+        // full stacked height and the parent clips it to the viewport.
+        assert_eq!(surface.size.height, 4);
+    }
+
+    #[test]
+    fn flex_column_zero_max_height() {
+        let flex = shell_column();
+        let surface = draw_widget(&flex, &ctx(0));
+
+        assert_eq!(surface.children.len(), 4);
+        assert_eq!(surface.size.height, 4);
+    }
+
+    #[test]
+    fn flex_column_undersized_with_last_child_flexible() {
+        // With a flexible last child, the leftover it takes must saturate at
+        // zero once the fixed children have consumed more than the max.
+        let flex: WidgetRef = Rc::new(RefCell::new(FlexColumn {
+            children: vec![
+                FlexItem::init(Rc::new(RefCell::new(Text::new("a"))), 0),
+                FlexItem::init(Rc::new(RefCell::new(Text::new("b"))), 0),
+                FlexItem::init(Rc::new(RefCell::new(Text::new("c"))), 1),
+            ],
+        }));
+        let surface = draw_widget(&flex, &ctx(1));
+
+        assert_eq!(surface.children.len(), 3);
+        assert_eq!(surface.children[2].surface.size.height, 0);
+        assert_eq!(surface.size.height, 2);
     }
 }

@@ -4,8 +4,7 @@
 //! NOTE: See [`FlexColumn`](crate::vxfw::FlexColumn) for the full description of
 //! the deliberate asymmetry between the two (D8), reproduced faithfully rather
 //! than unified. In short, `FlexRow` measures only `flex==0` children in pass
-//! 1, gives flex children just the flex share (no inherent term), and saturates
-//! its subtractions where `FlexColumn` uses plain arithmetic.
+//! 1 and gives flex children just the flex share (no inherent term).
 
 use crate::vxfw::{
     DrawContext, FlexItem, MaxSize, RelativePoint, Size, SubSurface, Surface, Widget, draw_widget,
@@ -58,7 +57,6 @@ impl Widget for FlexRow {
         let mut children: Vec<SubSurface> = Vec::new();
         let mut second_pass_width: u16 = 0;
         let mut max_height: u16 = 0;
-        // NOTE: saturating subtraction, where FlexColumn uses plain.
         let remaining_space = max.width.saturating_sub(first_pass_width);
         let len = self.children.len();
         for (idx, child) in self.children.iter().enumerate() {
@@ -177,5 +175,44 @@ mod tests {
 
         assert_eq!(surface.children[3].surface.size.width, 1 + 3 + 1);
         assert_eq!(surface.children[3].origin.col, col);
+    }
+
+    #[test]
+    fn flex_row_undersized_max_width() {
+        // Two fixed 3-wide children plus a flexible one into 4 columns: the
+        // fixed pass already overflows, so the flexible last child saturates
+        // to zero width and the overflow is clipped by the parent surface
+        // placement rather than panicking. Also exercised at width 0.
+        for max_width in [4, 0] {
+            let flex: WidgetRef = Rc::new(RefCell::new(FlexRow {
+                children: vec![
+                    FlexItem::init(Rc::new(RefCell::new(Text::new("abc"))), 0),
+                    FlexItem::init(Rc::new(RefCell::new(Text::new("def"))), 0),
+                    FlexItem::init(Rc::new(RefCell::new(Text::new("ghi"))), 1),
+                ],
+            }));
+            let ctx = DrawContext {
+                min: Size {
+                    width: 0,
+                    height: 0,
+                },
+                max: MaxSize {
+                    width: Some(max_width),
+                    height: Some(4),
+                },
+                cell_size: Size {
+                    width: 10,
+                    height: 20,
+                },
+                width_method: gwidth::Method::Unicode,
+            };
+
+            let surface = draw_widget(&flex, &ctx);
+            assert_eq!(surface.children.len(), 3);
+            assert_eq!(surface.children[0].surface.size.width, 3);
+            assert_eq!(surface.children[1].surface.size.width, 3);
+            assert_eq!(surface.children[2].surface.size.width, 0);
+            assert_eq!(surface.size.width, 6);
+        }
     }
 }
