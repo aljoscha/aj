@@ -16,6 +16,7 @@ dotenv = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+vaxis = { path = "../vaxis/" }
 
 [lints]
 workspace = true

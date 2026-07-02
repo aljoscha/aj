@@ -3,13 +3,15 @@
 //! Loads `~/.aj/.env`, parses the shared CLI surface
 //! ([`aj_app::cli::args::Args`]), and dispatches. The non-interactive
 //! subcommands and print mode reuse `aj-app` directly, exactly as `aj` does.
-//! The interactive branch is the vaxis frontend, built out in later phases.
+//! The interactive branch is the vaxis frontend (see `interactive`).
 
 use aj_app::cli::args::{Args, Command};
 use aj_conf::Config;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+mod interactive;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,12 +59,13 @@ async fn main() -> Result<()> {
 
 /// Dispatch to the interactive or print mode based on `--print`.
 ///
-/// Print mode reuses `aj-app`'s headless runner. The interactive vaxis
-/// frontend is not wired yet.
+/// Print mode reuses `aj-app`'s headless runner. The interactive branch is
+/// the vaxis alt-screen shell. Its futures are `!Send`, which is fine here:
+/// `#[tokio::main]` drives this future with a top-level `block_on`.
 async fn dispatch_session_mode(args: Args) -> Result<()> {
     if args.print {
         aj_app::print::run(args).await
     } else {
-        bail!("aj-next interactive mode is not implemented yet, use --print for now");
+        interactive::run(args).await
     }
 }
