@@ -124,6 +124,11 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>
             multi_tool,
         ),
         (
+            "diff-edit",
+            "bash seeds a temp file, then edit_file_multi rewrites two spots (unified-diff panel)",
+            diff_edit,
+        ),
+        (
             "parallel-agents",
             "two sub-agents spawned in one turn, each running a bash call, executing concurrently",
             parallel_agents,
@@ -410,6 +415,85 @@ two distinct tool panels with their respective outputs.";
         .text_block(mid)
         .delay(section_delay())
         .tool_call_block_chunked("tu-demo-multi-2", "bash", date_input, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
+
+    let script_3 = builder().start().text_block(wrap).done(DoneReason::Stop);
+
+    vec![script_1, script_2, script_3]
+}
+
+/// `diff-edit`: seed a temp file with `bash`, then rewrite two
+/// far-apart lines via `edit_file_multi` so its `ToolDetails::Diff`
+/// result renders as a unified diff with a hunk separator.
+///
+/// Both tools execute for real, like the bash calls in the other
+/// demos. The demo only touches a fixed path under `/tmp` and the
+/// seed command rewrites the file from scratch on every run, so
+/// repeated runs stay deterministic (the edit always finds the seeded
+/// strings and the diff always looks the same).
+fn diff_edit() -> Vec<ProviderScript> {
+    let intro = "I'll seed a small config file under /tmp, then edit two \
+settings in one call so you can see the unified-diff panel with context \
+lines and a hunk separator. The seed command prints the file back, so its \
+panel also demonstrates the collapsed output tail (Alt+O expands it).";
+    let mid = "The file is in place. Now I'll bump the port and raise the \
+log level in a single edit call.";
+    let wrap = "Done. The panel above should show red/green diff rows with \
+three lines of context around each change and an ellipsis between the two \
+hunks.";
+
+    // Sixteen seeded lines with the two edits more than two context
+    // windows apart, so the renderer's `…` hunk separator appears.
+    // The trailing `cat` echoes the file into stdout, which exceeds
+    // the collapsed five-line tail and exercises the expand toggle.
+    let seed_input = serde_json::json!({
+        "command": "printf '%s\\n' \
+    '# demo config' \
+    '[server]' \
+    'host = localhost' \
+    'port = 8080' \
+    'workers = 4' \
+    'keepalive = true' \
+    'max_body = 1mb' \
+    'tls = off' \
+    '' \
+    '[client]' \
+    'timeout = 30' \
+    'retries = 3' \
+    'verbose = false' \
+    'log_level = info' \
+    'cache = on' \
+    'max_connections = 8' \
+    > /tmp/aj-demo-diff.txt && cat /tmp/aj-demo-diff.txt",
+        "timeout": 5,
+        "description": "Seed the demo config file."
+    });
+    let edit_input = serde_json::json!({
+        "path": "/tmp/aj-demo-diff.txt",
+        "edits": [
+            { "old_string": "port = 8080", "new_string": "port = 9090" },
+            { "old_string": "log_level = info", "new_string": "log_level = debug" },
+        ]
+    });
+
+    let script_1 = builder()
+        .start()
+        .text_block(intro)
+        .delay(section_delay())
+        .tool_call_block_chunked("tu-demo-diff-seed", "bash", seed_input, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
+
+    let script_2 = builder()
+        .start()
+        .text_block(mid)
+        .delay(section_delay())
+        .tool_call_block_chunked(
+            "tu-demo-diff-edit",
+            "edit_file_multi",
+            edit_input,
+            0,
+            Duration::ZERO,
+        )
         .done(DoneReason::ToolUse);
 
     let script_3 = builder().start().text_block(wrap).done(DoneReason::Stop);

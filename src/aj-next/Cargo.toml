@@ -13,9 +13,11 @@ aj-app = { path = "../aj-app/" }
 aj-conf = { path = "../aj-conf/" }
 aj-models = { path = "../aj-models/" }
 aj-session = { path = "../aj-session/" }
+aj-tools = { path = "../aj-tools/" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

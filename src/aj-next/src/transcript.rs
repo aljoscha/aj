@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use aj_app::chat::{ChatState, Entry, EntryKind, NoticeLevel};
-use aj_app::theme::{Theme, ThemeColor, ThemeRgb};
+use aj_app::theme::{Theme, ThemeBg, ThemeColor, ThemeRgb};
 use aj_models::types::AssistantContent;
 use vaxis::cell::{Color, Style};
 use vaxis::mouse;
@@ -20,27 +20,40 @@ use vaxis::vxfw::{
     SubSurface, Surface, TextSpan, Widget, WidgetRef,
 };
 
+use crate::tool_cell::build_tool_cell;
+
 /// Pre-resolved vaxis styles for the transcript's row kinds.
 ///
 /// Resolved once from the theme at construction. The theme's
 /// `ColorMode` (truecolor vs 256-color downsampling) is not applied
 /// yet, we hand the raw palette values to the terminal. Full theming
 /// including downsampling is a later phase.
-struct TranscriptStyles {
-    text: Style,
-    user: Style,
-    thinking: Style,
-    dim: Style,
-    warning: Style,
-    error: Style,
+pub(crate) struct TranscriptStyles {
+    pub(crate) text: Style,
+    pub(crate) user: Style,
+    pub(crate) thinking: Style,
+    pub(crate) dim: Style,
+    pub(crate) warning: Style,
+    pub(crate) error: Style,
+    pub(crate) success: Style,
+    /// Bold tool name in a tool cell's header.
+    pub(crate) bold: Style,
+    pub(crate) diff_add: Style,
+    pub(crate) diff_remove: Style,
+    pub(crate) diff_context: Style,
+    /// Tool-bubble tints per visual status.
+    pub(crate) tool_pending_bg: Color,
+    pub(crate) tool_success_bg: Color,
+    pub(crate) tool_error_bg: Color,
 }
 
 impl TranscriptStyles {
-    fn from_theme(theme: &Theme) -> TranscriptStyles {
+    pub(crate) fn from_theme(theme: &Theme) -> TranscriptStyles {
         let fg = |token: ThemeColor| Style {
             fg: vaxis_color(theme.fg_color(token)),
             ..Style::default()
         };
+        let bg = |token: ThemeBg| vaxis_color(theme.bg_color(token));
         TranscriptStyles {
             text: fg(ThemeColor::Text),
             user: fg(ThemeColor::UserMessageText),
@@ -51,6 +64,17 @@ impl TranscriptStyles {
             dim: fg(ThemeColor::Dim),
             warning: fg(ThemeColor::Warning),
             error: fg(ThemeColor::Error),
+            success: fg(ThemeColor::Success),
+            bold: Style {
+                bold: true,
+                ..fg(ThemeColor::ToolTitle)
+            },
+            diff_add: fg(ThemeColor::ToolDiffAdded),
+            diff_remove: fg(ThemeColor::ToolDiffRemoved),
+            diff_context: fg(ThemeColor::ToolDiffContext),
+            tool_pending_bg: bg(ThemeBg::ToolPendingBg),
+            tool_success_bg: bg(ThemeBg::ToolSuccessBg),
+            tool_error_bg: bg(ThemeBg::ToolErrorBg),
         }
     }
 }
@@ -75,6 +99,13 @@ impl Builder for EntryBuilder {
     fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         let chat = self.chat.borrow();
         let entry = chat.transcript(chat.active_view())?.entries().get(idx)?;
+        // Tool entries get the dedicated bubble widget; everything
+        // else renders as plain styled spans. Both read the display
+        // flags at build time, so flipping a flag only needs a redraw.
+        if let EntryKind::Tool(tool) = &entry.kind {
+            let cell = build_tool_cell(tool, chat.tasks(), chat.tools_expanded, &self.styles);
+            return Some(Rc::new(RefCell::new(cell)));
+        }
         let spans = entry_spans(entry, chat.hide_thinking_block, &self.styles);
         Some(Rc::new(RefCell::new(RichText::new(spans))))
     }
@@ -115,20 +146,27 @@ fn entry_spans(entry: &Entry, hide_thinking: bool, styles: &TranscriptStyles) ->
             }
             spans
         }
-        // Phase-7 placeholders: tool cells, sub-agent boxes, and
-        // compaction rows get real widgets with the component phase.
-        EntryKind::Tool(t) => vec![span(format!("[tool: {}]", t.tool), styles.dim)],
+        // Tool entries render through the `ToolCell` widget (see
+        // `item_at_idx`); this arm only exists so the match stays
+        // total.
+        EntryKind::Tool(_) => Vec::new(),
+        // Phase-7 placeholders: sub-agent boxes and compaction rows
+        // get real widgets in a later chunk.
         EntryKind::SubAgent(s) => vec![span(format!("[sub-agent {}]", s.child), styles.dim)],
         EntryKind::Compaction(_) => vec![span("[compaction]".to_string(), styles.dim)],
+        // Notice and usage rows carry the same one-column left inset
+        // the tool bubbles have, so the transcript's left edge lines
+        // up. Wrapped continuation lines start at column zero, which
+        // is acceptable for these short rows.
         EntryKind::Notice(n) => {
             let style = match n.level {
                 NoticeLevel::Info => styles.dim,
                 NoticeLevel::Warning => styles.warning,
                 NoticeLevel::Error => styles.error,
             };
-            vec![span(n.text.clone(), style)]
+            vec![span(format!(" {}", n.text), style)]
         }
-        EntryKind::TurnUsage(u) => vec![span(u.line(), styles.dim)],
+        EntryKind::TurnUsage(u) => vec![span(format!(" {}", u.line()), styles.dim)],
     };
     // Normalize away trailing newlines so the spacer below yields
     // exactly one blank row regardless of how the content ends.
@@ -370,6 +408,34 @@ mod tests {
             let spans = entry_spans(&t.entries()[0], false, &s);
             assert_eq!(spans[0].style, style);
         }
+    }
+
+    /// Notice and usage rows carry the one-column left inset that
+    /// lines them up with the tool bubbles' content column.
+    #[test]
+    fn notice_and_usage_rows_are_inset_one_column() {
+        let t = transcript_with(EntryKind::Notice(NoticeEntry {
+            level: NoticeLevel::Info,
+            text: "note".into(),
+        }));
+        let spans = entry_spans(&t.entries()[0], false, &styles());
+        assert_eq!(joined(&spans), " note\n\n");
+
+        let t = transcript_with(EntryKind::TurnUsage(aj_app::chat::TurnUsageEntry {
+            agent_id: aj_agent::events::AgentId::Main,
+            usage: aj_agent::types::TokenUsage {
+                accumulated_input: 0,
+                turn_input: 0,
+                accumulated_output: 0,
+                turn_output: 0,
+                accumulated_cache_write: 0,
+                turn_cache_write: 0,
+                accumulated_cache_read: 0,
+                turn_cache_read: 0,
+            },
+        }));
+        let spans = entry_spans(&t.entries()[0], false, &styles());
+        assert!(joined(&spans).starts_with(" Token Usage"), "{spans:?}");
     }
 
     /// A full draw over a populated model must not panic and must pin

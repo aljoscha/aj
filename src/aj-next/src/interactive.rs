@@ -441,6 +441,13 @@ fn is_ctrl_c(event: &Event) -> bool {
     matches!(event, Event::KeyPress(key) if key.matches(u32::from('c'), Modifiers::CTRL))
 }
 
+/// Whether `event` is the tools-expand chord. Hardcoded to alt+o,
+/// the default of `aj_app::keybindings::ACTION_TOOLS_EXPAND`. The
+/// real keymap engine that resolves configured bindings is phase 8.
+fn is_tools_expand(event: &Event) -> bool {
+    matches!(event, Event::KeyPress(key) if key.matches(u32::from('o'), Modifiers::ALT))
+}
+
 /// Runs the interactive shell until the user quits.
 ///
 /// Restores the terminal via [`AsyncApp::shutdown`] on the way out,
@@ -553,13 +560,25 @@ async fn drive(
                             }
                             break;
                         }
-                        if app.handle_input(event).quit {
-                            break;
-                        }
-                        if let Some(text) = shell.borrow().take_submitted()
-                            && let Submit::Busy(text) = handle_submit(world, text)
-                        {
-                            shell.borrow().restore_editor_text(&text);
+                        // Alt+O flips the session-wide tool-output
+                        // expansion flag. Handled host-side because
+                        // the flag lives on the chat model, which the
+                        // widgets read at draw time.
+                        if is_tools_expand(&event) {
+                            {
+                                let mut chat = world.chat.borrow_mut();
+                                chat.tools_expanded = !chat.tools_expanded;
+                            }
+                            app.request_redraw();
+                        } else {
+                            if app.handle_input(event).quit {
+                                break;
+                            }
+                            if let Some(text) = shell.borrow().take_submitted()
+                                && let Submit::Busy(text) = handle_submit(world, text)
+                            {
+                                shell.borrow().restore_editor_text(&text);
+                            }
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -720,6 +739,34 @@ mod tests {
         assert!(is_ctrl_c(&Event::KeyPress(key)));
         assert!(!is_ctrl_c(&Event::KeyPress(vaxis::key::Key {
             codepoint: u32::from('c'),
+            ..vaxis::key::Key::default()
+        })));
+    }
+
+    #[test]
+    fn tools_expand_matches_alt_o_only() {
+        let alt_o = vaxis::key::Key {
+            codepoint: u32::from('o'),
+            mods: Modifiers::ALT,
+            ..vaxis::key::Key::default()
+        };
+        assert!(is_tools_expand(&Event::KeyPress(alt_o)));
+        // A bare `o` (normal typing) must reach the editor.
+        assert!(!is_tools_expand(&Event::KeyPress(vaxis::key::Key {
+            codepoint: u32::from('o'),
+            ..vaxis::key::Key::default()
+        })));
+        // Extra modifiers make it a different chord.
+        assert!(!is_tools_expand(&Event::KeyPress(vaxis::key::Key {
+            codepoint: u32::from('o'),
+            shifted_codepoint: Some(u32::from('O')),
+            mods: Modifiers::ALT | Modifiers::SHIFT,
+            text: Some("O".into()),
+            ..vaxis::key::Key::default()
+        })));
+        assert!(!is_tools_expand(&Event::KeyPress(vaxis::key::Key {
+            codepoint: u32::from('o'),
+            mods: Modifiers::ALT | Modifiers::CTRL,
             ..vaxis::key::Key::default()
         })));
     }

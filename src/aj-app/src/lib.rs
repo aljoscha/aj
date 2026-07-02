@@ -24,6 +24,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod commands;
 pub mod compaction;
+pub mod diff;
 pub mod export;
 pub mod footer;
 pub mod keybindings;
