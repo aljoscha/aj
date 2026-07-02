@@ -10,11 +10,18 @@ structure, implementing features, fixing bugs, and maintaining code quality.
 
 ## Sub-agents
 
-Use sub-agents primarily for **search and exploration** -- figuring out where
-something is, how something is implemented, or how a system works. They're great
-for scouting the codebase.
+Use sub-agents for **search and exploration** -- figuring out where something
+is, how something is implemented, or how a system works. They're great for
+scouting the codebase.
 
-When **writing a spec or implementing something**, the main agent must read the
-relevant files directly to ensure everything is in context. Don't delegate
-implementation or spec-writing work to sub-agents; they lack the full
-conversational context needed to get it right.
+Sub-agents can also handle **well-scoped implementation tasks**: work that is
+self-contained, touches a known set of files, and has clear success criteria.
+Sub-agents don't see the conversation, so the task prompt must carry all
+required context: the files to touch, the intended behavior, constraints, and
+how to verify the result. If you can't write the task down that crisply, do
+the work yourself.
+
+**Spec and design work** stays with the main agent. Its value comes from the
+accumulated conversational context, which a sub-agent doesn't have. The same
+goes for implementation that needs judgment calls likely to require checking
+back with the user.
