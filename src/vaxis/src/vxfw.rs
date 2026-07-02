@@ -47,12 +47,16 @@ use crate::unicode::{self, GraphemeIterator};
 use crate::window::{ChildOptions, Window};
 
 mod app;
+mod app_core;
+#[cfg(unix)]
+mod async_app;
 mod border;
 mod button;
 mod center;
 mod flex_column;
 mod flex_row;
 mod list_view;
+mod loop_event;
 mod padding;
 mod rich_text;
 mod scroll_bars;
@@ -64,6 +68,8 @@ mod text;
 mod text_field;
 
 pub use crate::vxfw::app::{App, Options};
+#[cfg(unix)]
+pub use crate::vxfw::async_app::{AsyncApp, Frame};
 pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
 pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
@@ -175,7 +181,9 @@ pub enum Event {
     ColorReport(cell::Report),
     /// Light/dark OS theme change.
     ColorScheme(cell::Scheme),
-    /// The window size changed. Always delivered once when the App starts.
+    /// The window size changed. The runtimes consume this (resizing the
+    /// screen and requesting a redraw) before focus dispatch, so widgets never
+    /// receive it. Widgets learn their size through layout.
     Winsize(Winsize),
     /// A custom event posted by the application.
     App(UserEvent),
@@ -885,14 +893,15 @@ mod tests {
     /// Convention enforcer (the reframed upstream "all widgets have a doctest"
     /// meta-test). Walks `src/vxfw/` and asserts every widget module file
     /// carries a `#[test]` whose name matches the module file stem (its
-    /// "doctest"). The framework core (`vxfw.rs`) and the `App` runtime
-    /// (`app.rs`) are excluded. This is a lightweight string scan, not an AST
+    /// "doctest"). The framework core (`vxfw.rs`) and the runtime modules
+    /// (the app, engine, and event plumbing files in the excludes list below)
+    /// are excluded. This is a lightweight string scan, not an AST
     /// parse: it only proves the test exists, which is enough to fail CI early
     /// when a widget lands without one. It passes vacuously until widgets land.
     #[test]
     fn all_widgets_have_a_doctest() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vxfw");
-        let excludes = ["app"];
+        let excludes = ["app", "app_core", "async_app", "loop_event"];
         let entries = std::fs::read_dir(&dir).expect("read src/vxfw");
         for entry in entries {
             let path = entry.expect("dir entry").path();

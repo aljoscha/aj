@@ -100,6 +100,19 @@ impl PosixTty {
             fd: borrowed.try_clone_to_owned()?,
         })
     }
+
+    /// Opens a fresh read-only description of `/dev/tty` for an async reader.
+    ///
+    /// This is a new open, not a dup. The async reader puts its fd into
+    /// non-blocking mode, and a dup'd fd shares file status flags with the
+    /// writer through the common open file description, so a dup'd source
+    /// would silently flip the writer non-blocking too. Raw mode lives in the
+    /// terminal's termios, not the open file description, so the returned fd
+    /// still sees the raw mode this `PosixTty` installed.
+    pub fn open_reader(&self) -> io::Result<OwnedFd> {
+        let file = OpenOptions::new().read(true).open("/dev/tty")?;
+        Ok(OwnedFd::from(file))
+    }
 }
 
 /// An independent blocking read handle over the terminal a [`PosixTty`] owns.

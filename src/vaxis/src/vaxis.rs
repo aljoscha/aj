@@ -206,7 +206,7 @@ impl Shared {
     }
 
     /// Blocks until DA1 arrives or `timeout` elapses.
-    fn wait_for_da1(&self, timeout: Duration) {
+    pub(crate) fn wait_for_da1(&self, timeout: Duration) {
         let received = self.da1_received.lock().expect("da1 mutex poisoned");
         let _unused = self
             .da1_condvar
@@ -1034,10 +1034,21 @@ impl Vaxis {
     /// Sends the capability-query batch and blocks until the loop wakes the DA1
     /// handshake (via [`Vaxis::notify_queries_done`]) or `timeout` elapses, then
     /// enables detected features. For a custom main loop, use
-    /// [`Vaxis::query_terminal_send`] and [`Vaxis::enable_detected_features`].
+    /// [`Vaxis::query_terminal_send`] and [`Vaxis::query_terminal_finish`].
     pub fn query_terminal<W: Write>(&mut self, w: &mut W, timeout: Duration) -> Result<(), Error> {
         self.query_terminal_send(w)?;
         self.shared.wait_for_da1(timeout);
+        self.query_terminal_finish(w)
+    }
+
+    /// Completes capability detection: snapshots the detected capabilities and
+    /// enables the detected features.
+    ///
+    /// Call after [`Vaxis::query_terminal_send`] once the DA1 response arrived
+    /// or the wait for it timed out. This must run even on a timeout: it marks
+    /// the query batch done, and without that the input parser keeps treating
+    /// real keypresses (e.g. F3) as probe replies and swallows them.
+    pub fn query_terminal_finish<W: Write>(&mut self, w: &mut W) -> Result<(), Error> {
         self.shared.set_queries_done(true);
         // Snapshot the capabilities the reader detected during the query window
         // into our own `caps`. From here the renderer reads `caps` lock-free.

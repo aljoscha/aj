@@ -1,0 +1,507 @@
+//! The async, host-driven vxfw runtime.
+//!
+//! [`AsyncApp`] owns the terminal and the vxfw engine but not the loop: the
+//! host multiplexes terminal input against its own event sources with
+//! `tokio::select!` and calls back into the driver for dispatch and drawing.
+//! A typical host loop:
+//!
+//! ```ignore
+//! app.init(root.clone(), Options::default()).await?;
+//! loop {
+//!     tokio::select! {
+//!         Some(ev) = app.next_input() => {
+//!             if app.handle_input(ev).quit { break; }
+//!         }
+//!         _ = sleep_until_next_deadline(&app) => { app.fire_due_timers(); }
+//!         // ... the host's own channels, each arm ending in
+//!         // app.request_redraw() when it changed what the widgets show.
+//!     }
+//!     app.render_if_needed(&root)?;
+//! }
+//! app.shutdown().await;
+//! ```
+//!
+//! The futures here are `!Send` ([`WidgetRef`] is an `Rc`), so drive them from
+//! a top-level `block_on` or a `tokio::task::LocalSet`.
+
+use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::error::Error;
+use crate::event_loop::{AsyncInput, async_input};
+use crate::tty::Tty;
+use crate::vaxis::Vaxis;
+use crate::vxfw::app_core::{AppCore, FocusHandler, MouseHandler, reset_event_state};
+use crate::vxfw::loop_event::LoopEvent;
+use crate::vxfw::{Event, EventContext, Options, UserEvent, WidgetRef};
+
+/// The outcome of one dispatch step.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    /// A handler asked to quit the application.
+    pub quit: bool,
+}
+
+/// Panic message for driver methods used before [`AsyncApp::init`].
+const NOT_INITIALIZED: &str = "AsyncApp::init must be called before driving the app";
+
+/// State [`AsyncApp::init`] creates: the async reader, the dispatch handlers,
+/// and the out-of-band resize stream.
+struct Running {
+    input_rx: UnboundedReceiver<LoopEvent>,
+    input: AsyncInput,
+    mouse: MouseHandler,
+    focus: FocusHandler,
+    /// The SIGWINCH stream, installed only when the terminal does not report
+    /// resizes in-band.
+    sigwinch: Option<Signal>,
+}
+
+/// The host-driven widget-framework driver: the shared vxfw engine behind an
+/// async, per-step API.
+///
+/// Lifecycle contract: call [`init`](AsyncApp::init) exactly once before any
+/// other method (the dispatch and render methods panic otherwise), and call
+/// [`shutdown`](AsyncApp::shutdown) on the way out to stop the reader and
+/// restore the terminal. On an unclean drop the reader task aborts and the
+/// posix tty restores termios, but alt screen, mouse, and keyboard state stay
+/// on (the panic hook covers panics).
+///
+/// The redraw latch is per-frame, not per-event: it persists across
+/// [`handle_input`](AsyncApp::handle_input) /
+/// [`fire_due_timers`](AsyncApp::fire_due_timers) calls and clears when a
+/// render draws, while the per-event state (consume, phase) resets after every
+/// dispatch.
+pub struct AsyncApp {
+    core: AppCore,
+    /// The read source, consumed by [`init`](AsyncApp::init) when it spawns
+    /// the async reader.
+    source: Option<OwnedFd>,
+    ctx: EventContext,
+    running: Option<Running>,
+}
+
+impl AsyncApp {
+    /// Builds a driver over a runtime, a writer-side tty, and a read source.
+    ///
+    /// The read source must be a separate open file description of the
+    /// terminal (see
+    /// [`PosixTty::open_reader`](crate::tty::PosixTty::open_reader)), not a
+    /// dup of the writer: the async reader flips its fd non-blocking, and a
+    /// dup would flip the writer with it.
+    pub fn new(vx: Vaxis, tty: Box<dyn Tty>, source: OwnedFd) -> AsyncApp {
+        AsyncApp {
+            core: AppCore {
+                vx,
+                tty,
+                timers: Vec::new(),
+                wants_focus: None,
+            },
+            source: Some(source),
+            ctx: EventContext::new(),
+            running: None,
+        }
+    }
+
+    /// Terminal setup plus the first frame: spawns the async reader, runs
+    /// capability detection off the executor, enters the alt screen, enables
+    /// mouse and bracketed paste, dispatches `Init` and `FocusIn`, and draws.
+    ///
+    /// `opts` is accepted for parity with [`App::run`](crate::vxfw::App::run);
+    /// its framerate is unused because the host paces frames. Panics if called
+    /// twice.
+    pub async fn init(&mut self, root: WidgetRef, _opts: Options) -> Result<(), Error> {
+        // Size the screen from the tty before the first layout so the
+        // cell-size division in layout has a non-zero denominator. The async
+        // reader posts no initial winsize event, so this live read is the only
+        // initial sizing.
+        let ws = self.core.tty.get_winsize()?;
+        self.core.vx.resize(&mut self.core.tty.writer(), ws)?;
+
+        // Spawn the reader before sending the probe batch: the reader is what
+        // consumes the probe replies and fires the DA1 handshake, so sending
+        // first would push the wait below into its timeout.
+        let source = self.source.take().expect("AsyncApp::init called twice");
+        let (input_rx, input) = async_input::<LoopEvent, _>(source, self.core.vx.shared())?;
+
+        self.core.vx.enter_alt_screen(&mut self.core.tty.writer())?;
+        self.core
+            .vx
+            .query_terminal_send(&mut self.core.tty.writer())?;
+        // Park a blocking-pool thread on the DA1 condvar instead of blocking
+        // the runtime. The reader folds capability replies into the shared
+        // state and notifies the condvar when DA1 arrives, or we give up after
+        // the timeout and run with the capabilities detected so far.
+        let shared = self.core.vx.shared();
+        tokio::task::spawn_blocking(move || shared.wait_for_da1(Duration::from_secs(1)))
+            .await
+            .expect("DA1 wait task panicked");
+        self.core
+            .vx
+            .query_terminal_finish(&mut self.core.tty.writer())?;
+        self.core
+            .vx
+            .set_bracketed_paste(&mut self.core.tty.writer(), true)?;
+        self.core
+            .vx
+            .subscribe_to_color_scheme_updates(&mut self.core.tty.writer())?;
+
+        // Only install the out-of-band SIGWINCH stream when the terminal does
+        // not report resizes in-band. We wait until detection finished (above)
+        // to decide.
+        let sigwinch = if self.core.vx.shared().in_band_resize() {
+            None
+        } else {
+            Some(signal(SignalKind::window_change())?)
+        };
+
+        // We do not use pixel mouse, so force it off before enabling mouse mode.
+        self.core.vx.caps.sgr_pixels = false;
+        self.core
+            .vx
+            .set_mouse_mode(&mut self.core.tty.writer(), true)?;
+
+        let mouse = MouseHandler::init(Rc::clone(&root));
+        let mut focus = FocusHandler::init(Rc::clone(&root));
+        focus.path_to_focused.push(Rc::clone(&root));
+        self.running = Some(Running {
+            input_rx,
+            input,
+            mouse,
+            focus,
+            sigwinch,
+        });
+
+        // Always start the app with an init event and a focus event.
+        self.handle_input(Event::Init);
+        self.handle_input(Event::FocusIn);
+
+        // The first frame draws unconditionally.
+        self.render(&root)
+    }
+
+    /// Awaits the next terminal input event. Returns `None` when the reader
+    /// has ended (source EOF or a read error).
+    ///
+    /// Out-of-band SIGWINCH folds in here as a synthesized [`Event::Winsize`]
+    /// read live from the tty, so the host sees one input stream whether or
+    /// not the terminal reports resizes in-band.
+    pub async fn next_input(&mut self) -> Option<Event> {
+        let running = self.running.as_mut().expect(NOT_INITIALIZED);
+        loop {
+            // The select arms only bind an outcome. We act on it after the
+            // select so no arm mutates state the other arm's future borrows.
+            enum Arm {
+                Input(Option<LoopEvent>),
+                Sigwinch(Option<()>),
+            }
+            let has_sigwinch = running.sigwinch.is_some();
+            let arm = tokio::select! {
+                event = running.input_rx.recv() => Arm::Input(event),
+                fired = async {
+                    running
+                        .sigwinch
+                        .as_mut()
+                        .expect("arm guarded on is_some")
+                        .recv()
+                        .await
+                }, if has_sigwinch => Arm::Sigwinch(fired),
+            };
+            match arm {
+                Arm::Input(event) => return event.map(LoopEvent::into_event),
+                // The signal stream ended. Stop selecting on it.
+                Arm::Sigwinch(None) => running.sigwinch = None,
+                Arm::Sigwinch(Some(())) => {
+                    // A live ioctl so the reported size is the current one,
+                    // not a snapshot from before the resize. A failed ioctl
+                    // drops this resize and keeps waiting for input.
+                    if let Ok(ws) = self.core.tty.get_winsize() {
+                        return Some(Event::Winsize(ws));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs one input event through the engine: mouse hit-test plus
+    /// enter/leave plus capture/target/bubble, or focus-path dispatch, or an
+    /// internal resize. Applies the resulting commands and any focus change.
+    /// Sets the redraw latch as widgets request it.
+    pub fn handle_input(&mut self, event: Event) -> Frame {
+        let running = self.running.as_mut().expect(NOT_INITIALIZED);
+        match &event {
+            Event::Mouse(mouse) => {
+                running
+                    .mouse
+                    .handle_mouse(&mut self.core, &mut self.ctx, *mouse)
+            }
+            Event::FocusOut => {
+                running.mouse.mouse_exit(&mut self.core, &mut self.ctx);
+                running.focus.handle_event(&mut self.ctx, &event);
+                self.core.handle_command(&mut self.ctx.cmds);
+            }
+            Event::Winsize(ws) => {
+                // A resize failure is a tty write failure. We swallow it here
+                // so the dispatch API stays infallible. The next render writes
+                // to the same tty and reports it.
+                let _ = self.core.vx.resize(&mut self.core.tty.writer(), *ws);
+                self.ctx.redraw = true;
+            }
+            _ => {
+                running.focus.handle_event(&mut self.ctx, &event);
+                self.core.handle_command(&mut self.ctx.cmds);
+            }
+        }
+        // Per-event reset (defer semantics): clears consume_event and the
+        // phase but leaves the per-frame redraw latch.
+        reset_event_state(&mut self.ctx);
+
+        // Apply a focus change requested by a handler, and drain the commands
+        // the focus events produced.
+        if let Some(widget) = self.core.wants_focus.take() {
+            running.focus.focus_widget(&mut self.ctx, widget);
+            self.core.handle_command(&mut self.ctx.cmds);
+        }
+        Frame {
+            quit: self.ctx.quit,
+        }
+    }
+
+    /// Dispatches a host event to the focused widget as [`Event::App`].
+    pub fn post_app_event(&mut self, event: UserEvent) -> Frame {
+        self.handle_input(Event::App(event))
+    }
+
+    /// The soonest pending tick deadline, for the host's timer select arm.
+    pub fn next_tick_deadline(&self) -> Option<Instant> {
+        // `timers` is kept sorted with the soonest deadline last.
+        self.core.timers.last().map(|t| t.deadline)
+    }
+
+    /// Fires every due tick, delivering [`Event::Tick`], and applies the
+    /// resulting commands and any focus change.
+    pub fn fire_due_timers(&mut self) -> Frame {
+        let running = self.running.as_mut().expect(NOT_INITIALIZED);
+        self.core.check_timers(&mut self.ctx);
+        // A tick handler may request focus without requesting a redraw, so we
+        // apply the change here rather than leaving it to the next input or
+        // render.
+        if let Some(widget) = self.core.wants_focus.take() {
+            running.focus.focus_widget(&mut self.ctx, widget);
+            self.core.handle_command(&mut self.ctx.cmds);
+        }
+        Frame {
+            quit: self.ctx.quit,
+        }
+    }
+
+    /// Marks the frame dirty so the next [`render_if_needed`] draws.
+    ///
+    /// [`render_if_needed`]: AsyncApp::render_if_needed
+    pub fn request_redraw(&mut self) {
+        self.ctx.redraw = true;
+    }
+
+    /// Whether a redraw is pending.
+    pub fn needs_redraw(&self) -> bool {
+        self.ctx.redraw
+    }
+
+    /// Lays out the root, updates mouse and focus state against the fresh
+    /// surface, and diff-renders to the tty. Clears the redraw latch.
+    pub fn render(&mut self, root: &WidgetRef) -> Result<(), Error> {
+        let running = self.running.as_mut().expect(NOT_INITIALIZED);
+        self.ctx.redraw = false;
+        debug_assert!(self.ctx.cmds.is_empty());
+
+        let mut surface = self.core.do_layout(root);
+        // Updating the mouse against the fresh surface may change hover state
+        // and request another redraw.
+        running
+            .mouse
+            .update_mouse(&mut self.core, &surface, &mut self.ctx);
+        if let Some(widget) = self.core.wants_focus.take() {
+            running.focus.focus_widget(&mut self.ctx, widget);
+            self.core.handle_command(&mut self.ctx.cmds);
+        }
+        debug_assert!(self.ctx.cmds.is_empty());
+        if self.ctx.redraw {
+            // The mouse or focus updates dirtied the tree again. Re-lay-out
+            // for this draw and leave the latch set so the next
+            // render_if_needed draws the settled state, matching the
+            // synchronous frame loop.
+            surface = self.core.do_layout(root);
+        }
+
+        running.mouse.last_frame = surface;
+        running.focus.update(&running.mouse.last_frame);
+        let focused = Rc::clone(&running.focus.focused);
+        self.core.render(&running.mouse.last_frame, &focused)
+    }
+
+    /// Calls [`render`](AsyncApp::render) only when a redraw is pending. The
+    /// common per-iteration call.
+    pub fn render_if_needed(&mut self, root: &WidgetRef) -> Result<(), Error> {
+        if self.ctx.redraw {
+            self.render(root)?;
+        }
+        Ok(())
+    }
+
+    /// The underlying runtime, for host needs the
+    /// [`Command`](crate::vxfw::Command) enum does not cover.
+    pub fn vaxis(&mut self) -> &mut Vaxis {
+        &mut self.core.vx
+    }
+
+    /// Runs `f` with the tty's buffered writer, for custom escape sequences.
+    /// The caller flushes if the bytes must go out immediately.
+    pub fn with_writer<R>(&mut self, f: impl FnOnce(&mut dyn Write) -> R) -> R {
+        f(self.core.tty.writer())
+    }
+
+    /// Restores the terminal: stops the reader, leaves the alt screen,
+    /// disables mouse and paste, shows the cursor, and flushes. Best-effort.
+    pub async fn shutdown(mut self) {
+        // The async reader parks on a shutdown Notify rather than a blocking
+        // read, so no wake byte is needed: signal and join.
+        if let Some(running) = self.running.take() {
+            running.input.shutdown();
+            let _ = running.input.join().await;
+        }
+        // Best-effort restore, and flush because the writer is buffered and
+        // the reset bytes must reach the terminal before the host prints to
+        // stdout.
+        let _ = self.core.vx.reset_state(&mut self.core.tty.writer());
+        let _ = self.core.tty.writer().flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::os::fd::OwnedFd;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::Winsize;
+    use crate::tty::TestTty;
+    use crate::vaxis::Options as VaxisOptions;
+    use crate::vxfw::{DrawContext, Surface, Tick, Widget, to_widget_ref};
+
+    /// A root widget that records the keys and ticks it receives, consuming
+    /// each and requesting a redraw.
+    #[derive(Default)]
+    struct Recorder {
+        keys: Vec<u32>,
+        ticks: usize,
+    }
+
+    impl Widget for Recorder {
+        fn draw(&mut self, ctx: &DrawContext) -> Surface {
+            Surface::with_size(ctx.max.size())
+        }
+        fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+            match event {
+                Event::KeyPress(key) => {
+                    self.keys.push(key.codepoint);
+                    ctx.consume_and_redraw();
+                }
+                Event::Tick => {
+                    self.ticks += 1;
+                    ctx.consume_and_redraw();
+                }
+                _ => {}
+            }
+        }
+        fn wants_events(&self) -> bool {
+            true
+        }
+    }
+
+    /// Writes `bytes` to the pipe write end, panicking on short write.
+    fn write_all(fd: &OwnedFd, bytes: &[u8]) {
+        let n = nix::unistd::write(fd, bytes).expect("write to pipe");
+        assert_eq!(n, bytes.len(), "short write to pipe");
+    }
+
+    /// Builds and initializes an `AsyncApp` over a `TestTty` and a pipe. The
+    /// returned write end feeds the reader. Keep it alive or the reader sees
+    /// EOF.
+    async fn init_app() -> (AsyncApp, OwnedFd, Rc<RefCell<Recorder>>, WidgetRef) {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        // Answer the DA1 probe up front so init's detection wait returns as
+        // soon as the reader consumes it, instead of after the 1s timeout.
+        // The handshake latches, so consuming the reply before the probe
+        // batch even goes out still unblocks the wait.
+        write_all(&write_fd, b"\x1b[?c");
+
+        let recorder = Rc::new(RefCell::new(Recorder::default()));
+        let root: WidgetRef = to_widget_ref(Rc::clone(&recorder));
+        let mut app = AsyncApp::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+            read_fd,
+        );
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        (app, write_fd, recorder, root)
+    }
+
+    #[tokio::test]
+    async fn key_press_reaches_the_widget_and_latches_redraw() {
+        let (mut app, write_fd, recorder, _root) = init_app().await;
+        assert!(!app.needs_redraw(), "init's first draw clears the latch");
+
+        write_all(&write_fd, b"j");
+        let event = app.next_input().await.expect("input event");
+        let frame = app.handle_input(event);
+
+        assert!(!frame.quit);
+        assert!(app.needs_redraw());
+        assert_eq!(recorder.borrow().keys, vec![u32::from('j')]);
+    }
+
+    #[tokio::test]
+    async fn winsize_event_resizes_the_screen_and_latches_redraw() {
+        let (mut app, _write_fd, _recorder, _root) = init_app().await;
+
+        let frame = app.handle_input(Event::Winsize(Winsize {
+            rows: 50,
+            cols: 100,
+            x_pixel: 800,
+            y_pixel: 1200,
+        }));
+
+        assert!(!frame.quit);
+        assert!(app.needs_redraw());
+        let screen = app.vaxis().screen.borrow();
+        assert_eq!(screen.width, 100);
+        assert_eq!(screen.height, 50);
+    }
+
+    #[tokio::test]
+    async fn due_timers_deliver_tick_to_the_widget() {
+        let (mut app, _write_fd, recorder, root) = init_app().await;
+
+        app.core.timers.push(Tick {
+            deadline: Instant::now() - Duration::from_millis(1),
+            widget: Rc::clone(&root),
+        });
+        assert!(app.next_tick_deadline().is_some());
+
+        let frame = app.fire_due_timers();
+
+        assert!(!frame.quit);
+        assert!(app.needs_redraw());
+        assert_eq!(recorder.borrow().ticks, 1);
+        assert!(app.next_tick_deadline().is_none());
+    }
+}
