@@ -1,0 +1,21 @@
+[package]
+name = "aj-next"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "aj-next"
+path = "src/main.rs"
+
+[dependencies]
+aj-app = { path = "../aj-app/" }
+aj-conf = { path = "../aj-conf/" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+dotenv = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

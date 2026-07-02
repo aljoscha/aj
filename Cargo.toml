@@ -5,6 +5,7 @@ members = [
     "src/aj-app",
     "src/aj-conf",
     "src/aj-models",
+    "src/aj-next",
     "src/aj-session",
     "src/aj-tools",
     "src/aj-tui-testkit",
