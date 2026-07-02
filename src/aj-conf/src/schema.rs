@@ -624,6 +624,17 @@ pub struct Config {
     /// summarized range depends only on how much recent context we want
     /// to retain, not on the model. Defaults to `20_000`.
     pub compact_keep_recent: u64,
+    /// Route eligible `bash` tool commands through `rtk`
+    /// (https://github.com/rtk-ai/rtk), a CLI proxy that compresses
+    /// common dev-command output before it reaches the model. The
+    /// rewrite is delegated to rtk's own rewriter (`rtk hook check`),
+    /// the same engine the Claude Code / Cursor hooks use, so it
+    /// handles compounds, pipes, and `env`/`sudo` prefixes. Defaults
+    /// to `false` (opt-in). Silently falls back to plain `bash` when
+    /// `rtk` is not on `PATH`. Note that a redirected command like
+    /// `git status > out` captures rtk's compressed output in the
+    /// file, not the raw form.
+    pub bash_rtk: bool,
 }
 
 impl Default for Config {
@@ -649,6 +660,7 @@ impl Default for Config {
             auto_compact: true,
             compact_threshold: 0.85,
             compact_keep_recent: 20_000,
+            bash_rtk: false,
         }
     }
 }
@@ -886,6 +898,17 @@ impl Config {
             },
             display_fn: |c| c.image_block.to_string(),
             to_toml_fn: |c| bool_item(c.image_block, false),
+        },
+        ConfigOption {
+            name: "bash_rtk",
+            description: "Route eligible bash commands through rtk to compress their output.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.bash_rtk = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.bash_rtk.to_string(),
+            to_toml_fn: |c| bool_item(c.bash_rtk, false),
         },
         ConfigOption {
             name: "syntax_highlighting",
@@ -1839,6 +1862,7 @@ theme = "dark"
 disabled_tools = ["bash"]
 disabled_skills = ["scratch"]
 hide_thinking_block = true
+bash_rtk = true
 "#;
         let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
         assert!(diagnostics.is_empty(), "got drift: {diagnostics:?}");
@@ -1858,6 +1882,7 @@ hide_thinking_block = true
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
         assert_eq!(config.disabled_skills, vec!["scratch".to_string()]);
         assert!(config.hide_thinking_block);
+        assert!(config.bash_rtk);
     }
 
     #[test]

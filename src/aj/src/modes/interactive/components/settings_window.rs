@@ -120,6 +120,7 @@ pub struct SettingsCurrentValues {
     pub image_block: bool,
     pub syntax_highlighting: bool,
     pub auto_compact: bool,
+    pub bash_rtk: bool,
     /// Compaction threshold fraction, formatted for display/editing
     /// (e.g. `"0.85"`).
     pub compact_threshold: String,
@@ -544,6 +545,9 @@ fn build_items(
             "auto_compact" => {
                 items.push(bool_item(option, current.auto_compact, None));
             }
+            "bash_rtk" => {
+                items.push(bool_item(option, current.bash_rtk, None));
+            }
             "compact_threshold" => {
                 let mut item = SettingItem::with_submenu(
                     option.name,
@@ -958,6 +962,7 @@ mod tests {
             image_block: false,
             syntax_highlighting: false,
             auto_compact: true,
+            bash_rtk: false,
             compact_threshold: "0.85".to_string(),
             compact_keep_recent: "20000".to_string(),
         }

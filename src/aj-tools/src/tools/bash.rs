@@ -54,7 +54,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aj_agent::tool::{
@@ -129,7 +129,26 @@ const UPDATE_DEBOUNCE: Duration = Duration::from_millis(100);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
-pub struct BashTool;
+pub struct BashTool {
+    /// When true, eligible commands are dispatched through `rtk`
+    /// (https://github.com/rtk-ai/rtk) to compress their output before
+    /// it reaches the model. See [`rtk_rewrite`] for the eligibility
+    /// rules and [`rtk_available`] for the PATH probe.
+    rtk: bool,
+}
+
+impl BashTool {
+    /// Construct with the given rtk passthrough setting.
+    pub fn with_rtk(rtk: bool) -> Self {
+        Self { rtk }
+    }
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self { rtk: false }
+    }
+}
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
 pub struct BashInput {
@@ -150,6 +169,83 @@ pub struct BashInput {
 
 fn default_timeout() -> u64 {
     30
+}
+
+impl BashTool {
+    /// Return the `rtk`-rewritten command if passthrough is enabled,
+    /// or `None` to run the command verbatim. Delegates the actual
+    /// rewriting to `rtk hook check`, the dry-run form of the same
+    /// engine the Claude Code / Cursor / Gemini PreToolUse hooks use,
+    /// so we inherit rtk's shell-aware handling of compounds, pipes,
+    /// and `env`/`sudo` prefixes instead of maintaining our own
+    /// approximation of rtk's subcommand catalog.
+    async fn rtk_rewrite(&self, command: &str) -> Option<String> {
+        if !self.rtk || !rtk_available() {
+            return None;
+        }
+        rtk_hook_check(command).await
+    }
+}
+
+/// Whether an `rtk` executable is reachable on `PATH`. Resolved once
+/// and cached for the process lifetime: rtk being installed or removed
+/// mid-session is rare, and we'd otherwise attempt a spawn on every
+/// bash call even when rtk is absent.
+fn rtk_available() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(find_rtk_on_path)
+}
+
+fn find_rtk_on_path() -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        // `rtk.exe` on Windows, `rtk` elsewhere. Checking both is
+        // harmless and keeps the probe platform-agnostic.
+        dir.join("rtk").is_file() || dir.join("rtk.exe").is_file()
+    })
+}
+
+/// Ask `rtk` whether it would rewrite `command`, via the dry-run form
+/// of its hook engine (`rtk hook check <command>`). On a rewrite this
+/// returns the rewritten string (e.g. `git status` -> `rtk git
+/// status`, `cargo fmt && cargo check` -> `rtk cargo fmt && rtk cargo
+/// check`). Returns `None` on no-rewrite, on rtk being missing or
+/// misbehaving, or on timeout. In every case the caller falls back to
+/// running the original command verbatim.
+///
+/// `command` is passed as a single argv element so shell
+/// metacharacters in it are never interpreted by a shell at this
+/// layer. rtk parses the string itself. The 500ms timeout guards
+/// against a wedged rtk blocking the tool call.
+async fn rtk_hook_check(command: &str) -> Option<String> {
+    let output = tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::process::Command::new("rtk")
+            .arg("hook")
+            .arg("check")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await;
+    let output = match output {
+        Ok(Ok(o)) => o,
+        // Timeout, spawn failure, or rtk missing: run verbatim.
+        _ => return None,
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let rewritten = String::from_utf8_lossy(&output.stdout);
+    let rewritten = rewritten.trim();
+    if rewritten.is_empty() || rewritten == command {
+        return None;
+    }
+    Some(rewritten.to_string())
 }
 
 impl ToolDefinition for BashTool {
@@ -180,6 +276,19 @@ impl ToolDefinition for BashTool {
         let timeout = Duration::from_secs(input.timeout);
         let command = input.command.clone();
 
+        // Optionally dispatch through `rtk` to compress output. The
+        // model-facing `command` stays the original. Only the string
+        // handed to `bash -c` is rewritten, so snapshots, the wire
+        // trailer, and `ToolDetails::Bash` keep showing what the model
+        // asked for.
+        let executed = match self.rtk_rewrite(&command).await {
+            Some(rewritten) => {
+                tracing::debug!(original = %command, rewritten = %rewritten, "rtk passthrough");
+                rewritten
+            }
+            None => command.clone(),
+        };
+
         // Build the child. `process_group(0)` makes the child the
         // leader of a new process group so signaling the group reaches
         // every descendant the shell may have spawned (a `Child::kill`
@@ -191,7 +300,7 @@ impl ToolDefinition for BashTool {
         // come.
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
-            .arg(&command)
+            .arg(&executed)
             .current_dir(&working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1146,6 +1255,55 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tokio_util::sync::CancellationToken;
 
+    #[tokio::test]
+    async fn rtk_hook_check_rewrites_known_commands() {
+        if !rtk_available() {
+            return;
+        }
+        // Plain single commands get the rtk prefix.
+        assert_eq!(
+            rtk_hook_check("git status").await.as_deref(),
+            Some("rtk git status")
+        );
+        // rtk's rewriter is shell-aware: it rewrites each eligible
+        // subcommand in a compound, handles env/sudo prefixes, and
+        // rewrites only the producer side of a pipe. We inherit that
+        // by delegating rather than reimplementing it.
+        assert_eq!(
+            rtk_hook_check("cargo fmt && cargo check").await.as_deref(),
+            Some("rtk cargo fmt && rtk cargo check")
+        );
+        assert_eq!(
+            rtk_hook_check("env FOO=bar git status").await.as_deref(),
+            Some("env FOO=bar rtk git status")
+        );
+        assert_eq!(
+            rtk_hook_check("git log | grep foo").await.as_deref(),
+            Some("rtk git log | grep foo")
+        );
+    }
+
+    #[tokio::test]
+    async fn rtk_hook_check_returns_none_for_non_rewriteable() {
+        if !rtk_available() {
+            return;
+        }
+        // rtk declines commands it has no proxy for (echo) and the
+        // shell-builtin collision (test); we surface that as None and
+        // run the original verbatim.
+        assert_eq!(rtk_hook_check("echo hi").await, None);
+        assert_eq!(rtk_hook_check("test -f x").await, None);
+    }
+
+    #[tokio::test]
+    async fn rtk_rewrite_disabled_when_rtk_flag_off() {
+        // With passthrough off the method short-circuits before
+        // touching the PATH cache or spawning rtk, so no rtk
+        // installation is needed for this test.
+        let tool = BashTool::with_rtk(false);
+        assert_eq!(tool.rtk_rewrite("git status").await, None);
+    }
+
     /// `ToolContext` wrapper that records every `emit_update` snapshot
     /// for assertion. Delegates everything else to a [`DummyToolContext`].
     struct RecordingCtx {
@@ -1234,7 +1392,10 @@ mod tests {
     /// call.
     #[test]
     fn execution_mode_is_sequential() {
-        assert_eq!(BashTool.execution_mode(), ExecutionMode::Sequential);
+        assert_eq!(
+            BashTool::default().execution_mode(),
+            ExecutionMode::Sequential
+        );
     }
 
     /// Successful command. Wire content carries stdout verbatim;
@@ -1243,7 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn echo_returns_stdout_and_exit_zero() {
         let mut ctx = DummyToolContext::default();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1290,7 +1451,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_code_is_not_marked_as_error() {
         let mut ctx = DummyToolContext::default();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1323,7 +1484,7 @@ mod tests {
     #[tokio::test]
     async fn stderr_is_captured_under_its_own_header() {
         let mut ctx = DummyToolContext::default();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1363,7 +1524,7 @@ mod tests {
         // `yes` would be unbounded; bound it with `head -c` so the
         // command terminates naturally. Each "ABCDEFGH\n" is 9 bytes,
         // so 200 KB ≈ 22_756 lines — well over the 2000-line cap too.
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1439,7 +1600,7 @@ mod tests {
         // One ~120 KB line with no internal newlines, no trailing
         // newline. Exceeds the 50 KB byte cap; line cap is irrelevant
         // (one line total).
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1496,7 +1657,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1540,7 +1701,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1581,7 +1742,7 @@ mod tests {
     async fn timeout_kills_command_and_marks_error() {
         let mut ctx = DummyToolContext::default();
         let start = Instant::now();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1619,7 +1780,7 @@ mod tests {
     #[tokio::test]
     async fn emit_update_fires_during_execution() {
         let (mut ctx, updates) = RecordingCtx::new();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1672,7 +1833,7 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_surfaces_as_normal_failure() {
         let mut ctx = DummyToolContext::default();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1705,7 +1866,7 @@ mod tests {
             working_directory: dir.path().to_path_buf(),
             ..DummyToolContext::default()
         };
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1788,7 +1949,7 @@ mod tests {
         command: &str,
         timeout: u64,
     ) -> (aj_agent::tool::TaskId, PathBuf) {
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 ctx,
                 BashInput {
@@ -1842,7 +2003,7 @@ mod tests {
     #[tokio::test]
     async fn background_started_result_carries_id_and_spill_path() {
         let mut ctx = DummyToolContext::default();
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {

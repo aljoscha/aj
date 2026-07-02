@@ -316,7 +316,7 @@ mod tests {
     /// Start `command` as a background bash task on `ctx`, returning
     /// the task id and spill path.
     async fn start_background(ctx: &mut DummyToolContext, command: &str) -> (TaskId, PathBuf) {
-        let outcome = BashTool
+        let outcome = BashTool::default()
             .execute(
                 ctx,
                 BashInput {

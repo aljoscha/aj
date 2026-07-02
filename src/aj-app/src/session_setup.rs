@@ -355,6 +355,7 @@ pub fn build_agent(
     let tools = builtin_tools(
         &BuiltinToolOptions {
             image_auto_resize: config.image_auto_resize,
+            bash_rtk: config.bash_rtk,
         },
         &config.disabled_tools,
     );

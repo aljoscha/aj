@@ -378,7 +378,7 @@ async fn replay_renders_bash_tool_identically_to_live() {
     });
     assert_live_matches_replay(
         "bash",
-        BashTool.into(),
+        BashTool::default().into(),
         "tu-bash",
         "bash",
         input,

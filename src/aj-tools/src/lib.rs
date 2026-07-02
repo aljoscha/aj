@@ -35,18 +35,23 @@ pub use tools::todo::{TodoReadTool, TodoWriteTool};
 pub use tools::write_file::WriteFileTool;
 
 /// Cross-cutting settings the binary feeds into builtin tool
-/// construction. Currently image-related flags only.
+/// construction.
 #[derive(Clone)]
 pub struct BuiltinToolOptions {
     /// Forwarded to [`ReadFileTool::with_auto_resize`]. Default
     /// `true`; flip via `image_auto_resize` in `~/.aj/config.toml`.
     pub image_auto_resize: bool,
+    /// Forwarded to [`BashTool::with_rtk`]. Default `false`; enable
+    /// via `bash_rtk` in `~/.aj/config.toml`. Routes eligible bash
+    /// commands through `rtk` to compress their output.
+    pub bash_rtk: bool,
 }
 
 impl Default for BuiltinToolOptions {
     fn default() -> Self {
         Self {
             image_auto_resize: true,
+            bash_rtk: false,
         }
     }
 }
@@ -59,7 +64,7 @@ impl Default for BuiltinToolOptions {
 pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefinition> {
     vec![
         AgentTool.into(),
-        BashTool.into(),
+        BashTool::with_rtk(options.bash_rtk).into(),
         ReadFileTool::with_auto_resize(options.image_auto_resize).into(),
         WriteFileTool.into(),
         EditFileTool.into(),

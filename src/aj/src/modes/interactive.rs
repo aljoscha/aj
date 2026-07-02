@@ -2538,6 +2538,7 @@ fn settings_values_from_config(config: &Config, catalog: &[ModelInfo]) -> Settin
         image_block: config.image_block,
         syntax_highlighting: config.syntax_highlighting,
         auto_compact: config.auto_compact,
+        bash_rtk: config.bash_rtk,
         compact_threshold: config.compact_threshold.to_string(),
         compact_keep_recent: config.compact_keep_recent.to_string(),
     }
@@ -3613,6 +3614,7 @@ async fn handle_command(
                     image_block: cfg.image_block,
                     syntax_highlighting: cfg.syntax_highlighting,
                     auto_compact: cfg.auto_compact,
+                    bash_rtk: cfg.bash_rtk,
                     compact_threshold: cfg.compact_threshold.to_string(),
                     compact_keep_recent: cfg.compact_keep_recent.to_string(),
                 }
