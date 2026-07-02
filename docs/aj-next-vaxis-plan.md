@@ -283,9 +283,10 @@ Recommended structure for `aj-next`'s interactive mode:
   data. Much of the current pump's state (`AgentRender`, `TaskInfo`,
   `AgentFooters`, `running_agents`, `compacting`, `message_queues`, `catalog`)
   is already data, not widgets.
-- An **AgentEvent reducer** applies each event to the model and flags a redraw.
-  This is the `aj-next` analogue of `EventPump::handle`, but it mutates data, not
-  widgets. It is unit-testable without a terminal.
+- An **AgentEvent reducer** is the chat-domain state update function. It applies
+  each event to the model and flags a redraw. This is the `aj-next` analogue of
+  `EventPump::handle`, but it mutates data, not widgets. It is not a vaxis
+  widget or component, and it is unit-testable without a terminal.
 - The **chat view** is a `ListView` whose source builds a `vxfw` widget per
   model entry on demand. Streaming updates mutate the model entry and request a
   redraw. Follow-tail and scroll position are view state.

@@ -4,7 +4,12 @@
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec defines the one true
 interface for `aj-next`'s interactive rendering: a backend-neutral **chat model**
-(`ChatState`) plus a pure **reducer** that folds each `AgentEvent` into it.
+(`ChatState`) plus an **`AgentEvent` reducer** that applies each event to that
+model.
+
+The reducer is the state update function for the chat domain. It takes the
+current `ChatState` plus an `AgentEvent`, mutates the model, and reports whether
+the UI should redraw. It is not a vaxis widget or component.
 
 It lives in `aj-app` and is consumed only by `aj-next`. `aj`'s imperative
 `EventPump` is untouched (see the option-2 decision in the plan). The reducer is
@@ -16,14 +21,16 @@ so it is unit-testable with no terminal.
 In `aj-tui` the pump reaches into the live component tree, addressing widgets by
 container index and mutating them in place. In a retained cell framework
 (`vxfw`), the natural shape is inverted: the app owns a data model, and widgets
-draw themselves from it. So `aj-next` keeps a `ChatState`, a reducer applies
+draw themselves from it. So `aj-next` keeps a `ChatState`, the reducer applies
 `AgentEvent`s to it, and the chat view is a `vxfw` scroll container whose source
 builds one widget per model entry. This makes the state layer pure and testable,
 and keeps widget internals out of the event path.
 
 The reducer is pure domain logic with no TUI dependency, which is why it belongs
-in `aj-app` rather than in `aj-next`. It costs the same to write either place, and
-`aj-app` gives it a shared home and terminal-free tests.
+in `aj-app` rather than in `aj-next`. It is the `aj-next` analogue of
+`EventPump::handle`, but it updates transcript data instead of live widgets. It
+costs the same to write either place, and `aj-app` gives it a shared home and
+terminal-free tests.
 
 ## The boundary: what the reducer owns vs what the view owns
 
