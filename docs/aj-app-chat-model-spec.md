@@ -70,7 +70,7 @@ pub struct ChatState {
     footers: AgentFooters,
 
     /// Model catalog, for resolving a settings bundle's context window.
-    catalog: Arc<ModelCatalog>,
+    catalog: Arc<Vec<ModelInfo>>,
 
     /// Display flags the view reads at draw time. Flipping one is a redraw,
     /// not a walk of components (the pump walks; the view just re-reads).
@@ -96,7 +96,9 @@ pub enum EntryKind {
     SubAgent(SubAgentEntry),
     Compaction(CompactionEntry),
     Notice(NoticeEntry),
-    TurnUsage(TokenUsage),
+    TurnUsage(TurnUsageEntry),   // { agent_id, usage }, the (sub agent N)
+                                 // prefix needs the emitting agent and line()
+                                 // keeps formatting out of the view
 }
 ```
 
@@ -129,8 +131,10 @@ pub struct ToolEntry {
     pub tool: String,
     pub args: serde_json::Value,     // empty object on the replay/build-on-miss path
     pub status: ToolStatus,          // Running | Done { is_error }
-    pub details: ToolDetails,        // partial while running, final on end
-    pub content: Vec<UserContent>,   // finalized wire content (for inline images)
+    pub details: Option<ToolDetails>, // None until the first partial arrives
+    pub content: Arc<[UserContent]>,  // finalized wire content (for inline images),
+                                      // the Arc the events carry, a refcount bump
+                                      // instead of a deep copy of image bytes
     /// Set when a background task attaches to this cell (bash/agent task badge).
     pub task: Option<TaskId>,
     /// Sub-agent tools render header-only unless the sub is being observed.
@@ -146,7 +150,9 @@ pub struct SubAgentEntry {
 
 pub struct CompactionEntry { pub tokens_before: u64, pub tokens_after: u64, pub summary: String }
 
-pub struct NoticeEntry { pub level: NoticeLevel, pub text: String }  // Info | Warning | Error | Retry
+pub struct NoticeEntry { pub level: NoticeLevel, pub text: String }  // Info | Warning | Error
+// Retries render as warnings, matching the pump's yellow row, so there is no
+// separate Retry level.
 
 pub struct AgentRender {
     /// The in-flight assistant entry for this agent, or None between turns.
@@ -178,7 +184,7 @@ view state). The reducer updates them, so its signature takes them alongside the
 model:
 
 ```
-pub fn reduce(state: &mut ChatState, lifecycle: &mut SessionLifecycle, event: AgentEvent) -> Redraw;
+pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: AgentEvent) -> Redraw;
 ```
 
 The event is taken by value: `aj-next` owns each `AgentEvent` off
@@ -187,7 +193,7 @@ The event is taken by value: `aj-next` owns each `AgentEvent` off
 subscriber, so the reducer does not need to leave the event intact for anyone
 else.
 
-where `SessionLifecycle { running_agents: HashSet<AgentId>, compacting: HashSet<AgentId> }`
+where `AgentLifecycle { running_agents: HashSet<AgentId>, compacting: HashSet<AgentId> }`
 is the type `SessionCore` owns. `Redraw` is a simple "did anything change"
 signal the host turns into `app.request_redraw()`. Both types are in `aj-app`, so
 this coupling is intra-crate. `aj` does not use the reducer: its pump updates
@@ -211,10 +217,10 @@ encoded in `EventPump::handle` and the message/tool handlers. Routing is by
 | `ToolExecutionUpdate` | Skip `agent`. Update the mapped `ToolEntry`'s `details` (+ `content`) with the cumulative partial. |
 | `ToolExecutionEnd` | Skip `agent`. Build the entry on miss (replay path: no Start seen, args empty), then set `status: Done{is_error}`, `details`, `content`. The build-on-miss branch replicates the live bookkeeping (record `tool_index`, clear `current_assistant`). |
 | `Notice` / `Warning` / `Error` | Append `NoticeEntry` with level `Info` / `Warning` / `Error`. |
-| `StreamRetry` | Append `NoticeEntry{Retry}` with the retry cadence line (the failed attempt's error already rendered from its `MessageEnd`). |
+| `StreamRetry` | Append `NoticeEntry{Warning}` with the retry cadence line (the failed attempt's error already rendered from its `MessageEnd`). |
 | `UsageUpdate` | Append a `TurnUsage` entry and fold into `footers.record_turn_usage(id, usage)`. The footer tracks the viewed agent, so the view repaints the footer only when `id == active_view`. |
 | `CompactionStart` | `lifecycle.compacting.insert(id)`; the view labels the spinner "Compacting context...". |
-| `CompactionProgress` | Relabel the spinner per phase (`Summarizing` / `SummarizingTurnPrefix` / `Saving`). No model entry. |
+| `CompactionProgress` | Record the phase in `ChatState.compaction_phase` for the view's spinner label (`Summarizing` / `SummarizingTurnPrefix` / `Saving`). No transcript entry. |
 | `CompactionEnd` | `lifecycle.compacting.remove(id)`. On `error`, append `Notice{Warning}` "Compaction failed: ...". On `summary` (success), append `CompactionEntry` and `footers.set_context_tokens(id, tokens_after)` (no `UsageUpdate` follows compaction). On neither, append `Notice{Info}` "Compaction canceled." |
 | `SubAgentStart` | Ensure the `Sub(n)` transcript and a `SubAgentEntry{Running}` in the parent (the box). Seed `footers.note_settings(child, settings, resolve_window(settings))`. The running status and footer count derive from the paired `AgentStart(Sub n)`. |
 | `SubAgentEnd` | Set the `Sub(n)` box status to `Done`. |
@@ -310,7 +316,7 @@ ever retired or refactored onto the model. Until then, a change to the
   cadence is unchanged: one `MessageUpdate` per provider chunk, one throttled
   redraw.
 - **C-3. Lifecycle-set ownership. Resolved: in `SessionCore`.** `reduce` takes
-  `SessionLifecycle` by `&mut`, so `running_agents` / `compacting` are one source
+  `AgentLifecycle` by `&mut`, so `running_agents` / `compacting` are one source
   of truth shared with the turn primitives and the quit-arm logic.
 - **C-4. Pending queues. Resolved: re-read live.** The view re-reads the live
   `MessageQueues` snapshot on `QueueUpdate`, matching the pump and guarding
