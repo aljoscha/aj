@@ -78,7 +78,7 @@ pub use crate::vxfw::flex_row::FlexRow;
 pub use crate::vxfw::list_view::{Builder, ListView, Source};
 pub use crate::vxfw::padding::{PadValues, Padding};
 pub use crate::vxfw::rich_text::{RichText, TextSpan};
-pub use crate::vxfw::scroll_bars::ScrollBars;
+pub use crate::vxfw::scroll_bars::{ScrollBars, ScrollableView};
 pub use crate::vxfw::scroll_view::ScrollView;
 pub use crate::vxfw::sized_box::SizedBox;
 pub use crate::vxfw::spinner::Spinner;

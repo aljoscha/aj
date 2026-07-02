@@ -23,8 +23,8 @@ use crate::cell::{Cell, Character};
 use crate::key::{Key, Modifiers};
 use crate::mouse;
 use crate::vxfw::{
-    DrawContext, Event, EventContext, MaxSize, RelativePoint, Size, SubSurface, Surface, Widget,
-    WidgetRef, draw_widget,
+    DrawContext, Event, EventContext, MaxSize, RelativePoint, ScrollableView, Size, SubSurface,
+    Surface, Widget, WidgetRef, draw_widget,
 };
 
 /// Lazily builds the widget for an item index.
@@ -606,6 +606,54 @@ fn total_height(list: &[SubSurface]) -> usize {
     list.iter()
         .map(|child| usize::from(child.surface.size.height))
         .sum()
+}
+
+impl ScrollableView for ListView {
+    fn total_item_count(&self) -> usize {
+        if let Some(c) = self.item_count {
+            return usize::try_from(c).expect("item count fits usize");
+        }
+        match &self.children {
+            Source::Slice(slice) => slice.len(),
+            Source::Builder(builder) => {
+                let cursor = usize::try_from(self.cursor).expect("cursor fits usize");
+                let mut counter = 0;
+                while builder.item_at_idx(counter, cursor).is_some() {
+                    counter += 1;
+                }
+                counter
+            }
+        }
+    }
+
+    fn scroll_top(&self) -> u32 {
+        self.scroll.top
+    }
+
+    fn has_more_below(&self) -> bool {
+        self.scroll.has_more
+    }
+
+    fn set_scroll_top(&mut self, top: u32) {
+        // A fresh anchor at `top`: the old line offset and any pending wheel
+        // amount belong to the previous position and would misplace the jump.
+        self.scroll = Scroll {
+            top,
+            ..Scroll::default()
+        };
+    }
+
+    // The list has no horizontal axis.
+
+    fn scroll_left(&self) -> u32 {
+        0
+    }
+
+    fn has_more_right(&self) -> bool {
+        false
+    }
+
+    fn set_scroll_left(&mut self, _left: u32) {}
 }
 
 impl Widget for ListView {

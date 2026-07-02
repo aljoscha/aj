@@ -172,7 +172,7 @@ impl Widget for ScrollModel {
         }
         if key.matches(Key::TAB, Modifiers::empty()) {
             let sb = self.scroll_bars.borrow_mut();
-            let mut sv = sb.scroll_view.borrow_mut();
+            let mut sv = sb.view.borrow_mut();
             sv.draw_cursor = !sv.draw_cursor;
             return ctx.consume_and_redraw();
         }
@@ -195,7 +195,7 @@ impl Widget for ScrollModel {
 
         // Anything else is a scroll-view navigation key.
         let sb = self.scroll_bars.borrow_mut();
-        sb.scroll_view.borrow_mut().handle_event(ctx, event);
+        sb.view.borrow_mut().handle_event(ctx, event);
     }
 
     fn wants_events(&self) -> bool {

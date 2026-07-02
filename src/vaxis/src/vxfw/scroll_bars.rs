@@ -1,10 +1,11 @@
-//! [`ScrollBars`]: wraps a [`ScrollView`] and draws draggable scroll bars.
+//! [`ScrollBars`]: wraps a scrollable view and draws draggable scroll bars.
 //!
-//! This is the only widget that overrides [`capture_event`](Widget::capture_event):
-//! while a thumb is being dragged it intercepts the drag and release in the
-//! capturing phase, before they reach the inner content, and translates the
-//! thumb position into a scroll position by reaching directly into the
-//! [`ScrollView`]'s `scroll` state.
+//! The wrapped view is anything implementing [`ScrollableView`], by default a
+//! [`ScrollView`]. This is the only widget that overrides
+//! [`capture_event`](Widget::capture_event): while a thumb is being dragged it
+//! intercepts the drag and release in the capturing phase, before they reach
+//! the inner content, and translates the thumb position into a scroll position
+//! via the view's [`ScrollableView`] scroll accessors.
 //!
 //! The bars are sized with floating-point proportions of an estimated content
 //! extent. When no estimate is given we fall back to the number and width of the
@@ -18,7 +19,7 @@ use crate::cell::{Cell, Character, Color, Style};
 use crate::mouse;
 use crate::vxfw::scroll_view::ScrollView;
 use crate::vxfw::{
-    DrawContext, Event, EventContext, RelativePoint, Size, Source, SubSurface, Surface, Widget,
+    DrawContext, Event, EventContext, RelativePoint, Size, SubSurface, Surface, Widget,
     draw_widget, to_widget_ref,
 };
 
@@ -47,20 +48,45 @@ mod num {
     }
 }
 
-/// A [`ScrollView`] with draggable, hoverable scroll bars.
+/// What [`ScrollBars`] needs from the view it wraps.
 ///
-/// The wrapped view is held behind an `Rc<RefCell<ScrollView>>` so it has a
-/// stable widget identity. [`draw`](Widget::draw) stamps the inner view's
-/// surface with that identity via [`draw_widget`] and appends it as a child, so
-/// the event bus hit-tests and routes wheel and key events to the inner
-/// [`ScrollView`]. The bars' own hover and thumb-drag interaction stays in this
-/// widget's [`handle_event`](Widget::handle_event) and
-/// [`capture_event`](Widget::capture_event), reaching into `scroll_view.scroll`
-/// directly.
-pub struct ScrollBars {
-    /// The wrapped scroll view. The bars are drawn for this view, and its widget
+/// The bars size and place their thumbs from the total item count and the
+/// scroll position the view reconciled on its last draw, and drag-to-jump
+/// writes that position back directly. A view without a horizontal axis
+/// reports zero and no-more on the horizontal accessors and ignores
+/// horizontal jumps.
+pub trait ScrollableView: Widget {
+    /// Total number of items, walking the source when it is not known up
+    /// front.
+    fn total_item_count(&self) -> usize;
+    /// Index of the top in-view item, as of the last draw.
+    fn scroll_top(&self) -> u32;
+    /// Whether more content lies below the viewport, as of the last draw.
+    fn has_more_below(&self) -> bool;
+    /// Jumps the viewport so `top` is the first in-view item.
+    fn set_scroll_top(&mut self, top: u32);
+    /// Left column of the viewport, as of the last draw.
+    fn scroll_left(&self) -> u32;
+    /// Whether more content lies right of the viewport, as of the last draw.
+    fn has_more_right(&self) -> bool;
+    /// Jumps the viewport to start at column `left`.
+    fn set_scroll_left(&mut self, left: u32);
+}
+
+/// A scrollable view with draggable, hoverable scroll bars.
+///
+/// The wrapped view is held behind an `Rc<RefCell<V>>` so it has a stable
+/// widget identity. [`draw`](Widget::draw) stamps the inner view's surface
+/// with that identity via [`draw_widget`] and appends it as a child, so the
+/// event bus hit-tests and routes wheel and key events to the inner view. The
+/// bars' own hover and thumb-drag interaction stays in this widget's
+/// [`handle_event`](Widget::handle_event) and
+/// [`capture_event`](Widget::capture_event), reaching into the view through
+/// [`ScrollableView`].
+pub struct ScrollBars<V: ScrollableView + 'static = ScrollView> {
+    /// The wrapped view. The bars are drawn for this view, and its widget
     /// identity is stamped so the bus routes scroll events to it.
-    pub scroll_view: Rc<RefCell<ScrollView>>,
+    pub view: Rc<RefCell<V>>,
     /// Whether to draw the horizontal scroll bar.
     pub draw_horizontal_scrollbar: bool,
     /// Whether to draw the vertical scroll bar.
@@ -110,11 +136,11 @@ fn drag_thumb(grapheme: &str) -> Cell {
     }
 }
 
-impl ScrollBars {
-    /// Wraps `scroll_view` with both bars enabled and the default thumb cells.
-    pub fn new(scroll_view: ScrollView) -> ScrollBars {
+impl<V: ScrollableView + 'static> ScrollBars<V> {
+    /// Wraps `view` with both bars enabled and the default thumb cells.
+    pub fn new(view: V) -> ScrollBars<V> {
         ScrollBars {
-            scroll_view: Rc::new(RefCell::new(scroll_view)),
+            view: Rc::new(RefCell::new(view)),
             draw_horizontal_scrollbar: true,
             draw_vertical_scrollbar: true,
             estimated_content_height: None,
@@ -143,32 +169,13 @@ impl ScrollBars {
     }
 }
 
-/// Total number of items in the scroll view: its `item_count`, a slice's
-/// length, or a count of how many indices the builder yields.
-fn total_item_count(sv: &ScrollView) -> usize {
-    if let Some(c) = sv.item_count {
-        return usize::try_from(c).expect("item count fits usize");
-    }
-    match &sv.children {
-        Source::Slice(slice) => slice.len(),
-        Source::Builder(builder) => {
-            let cursor = usize::try_from(sv.cursor).expect("cursor fits usize");
-            let mut counter = 0;
-            while builder.item_at_idx(counter, cursor).is_some() {
-                counter += 1;
-            }
-            counter
-        }
-    }
-}
-
-impl Widget for ScrollBars {
+impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
         let mut children: Vec<SubSurface> = Vec::new();
 
         // A stable identity for the inner view so `draw_widget` can stamp its
         // surface and the bus routes wheel and key events to it.
-        let scroll_view_ref = to_widget_ref(Rc::clone(&self.scroll_view));
+        let scroll_view_ref = to_widget_ref(Rc::clone(&self.view));
 
         // No bars: draw the scroll view directly.
         if !self.draw_vertical_scrollbar && !self.draw_horizontal_scrollbar {
@@ -221,10 +228,10 @@ impl Widget for ScrollBars {
         });
 
         // Vertical scroll bar. Read the reconciled scroll state through the
-        // shared handle; the bar and thumb geometry derive from it.
+        // shared handle, the bar and thumb geometry derive from it.
         let (scroll_top, has_more_vertical) = {
-            let sv = self.scroll_view.borrow();
-            (sv.scroll.top, sv.scroll.has_more_vertical)
+            let view = self.view.borrow();
+            (view.scroll_top(), view.has_more_below())
         };
         if self.draw_vertical_scrollbar && !(scroll_top == 0 && !has_more_vertical) {
             // The bar spans the scroll view, which is one row shorter than the
@@ -235,8 +242,7 @@ impl Widget for ScrollBars {
                 .height
                 .saturating_sub(u16::from(self.draw_horizontal_scrollbar));
             let widget_height_f = f32::from(scroll_view_height);
-            let total_num_children_f =
-                num::usize_to_f32(total_item_count(&self.scroll_view.borrow()));
+            let total_num_children_f = num::usize_to_f32(self.view.borrow().total_item_count());
 
             let thumb_height: u16 = if let Some(h) = self.estimated_content_height {
                 let content_height_f = num::u32_to_f32(h);
@@ -293,8 +299,8 @@ impl Widget for ScrollBars {
         // Horizontal scroll bar. Drawn only when there is horizontal content to
         // reach, either because we are scrolled right or there is more to show.
         let (scroll_left, has_more_horizontal) = {
-            let sv = self.scroll_view.borrow();
-            (sv.scroll.left, sv.scroll.has_more_horizontal)
+            let view = self.view.borrow();
+            (view.scroll_left(), view.has_more_right())
         };
         let should_draw_horizontal = scroll_left > 0 || has_more_horizontal;
         if self.draw_horizontal_scrollbar && should_draw_horizontal {
@@ -385,15 +391,16 @@ impl Widget for ScrollBars {
                     .row
                     .saturating_sub(i16::from(self.mouse_offset_into_thumb));
                 if new_thumb_top <= 0 {
-                    self.scroll_view.borrow_mut().scroll.top = 0;
+                    self.view.borrow_mut().set_scroll_top(0);
                     return ctx.consume_and_redraw();
                 }
                 let new_thumb_top_f = f32::from(new_thumb_top);
                 let widget_height_f = f32::from(self.last_frame_size.height);
-                let total_num_children_f =
-                    num::usize_to_f32(total_item_count(&self.scroll_view.borrow()));
+                let total_num_children_f = num::usize_to_f32(self.view.borrow().total_item_count());
                 let new_top_child_idx_f = new_thumb_top_f * total_num_children_f / widget_height_f;
-                self.scroll_view.borrow_mut().scroll.top = num::f32_to_u32(new_top_child_idx_f);
+                self.view
+                    .borrow_mut()
+                    .set_scroll_top(num::f32_to_u32(new_top_child_idx_f));
                 return ctx.consume_and_redraw();
             }
         }
@@ -419,7 +426,7 @@ impl Widget for ScrollBars {
                     .col
                     .saturating_sub(i16::from(self.mouse_offset_into_thumb));
                 if new_thumb_col_start <= 0 {
-                    self.scroll_view.borrow_mut().scroll.left = 0;
+                    self.view.borrow_mut().set_scroll_left(0);
                     return ctx.consume_and_redraw();
                 }
                 let new_thumb_col_start_f = f32::from(new_thumb_col_start);
@@ -428,8 +435,9 @@ impl Widget for ScrollBars {
                 let new_view_col_start_f =
                     new_thumb_col_start_f * max_content_width_f / widget_width_f;
                 let new_view_col_start = num::f32_to_u32(new_view_col_start_f.ceil());
-                self.scroll_view.borrow_mut().scroll.left =
-                    new_view_col_start.min(self.last_frame_max_content_width);
+                self.view
+                    .borrow_mut()
+                    .set_scroll_left(new_view_col_start.min(self.last_frame_max_content_width));
                 ctx.consume_and_redraw();
             }
         }
@@ -512,10 +520,100 @@ mod tests {
 
     use super::*;
     use crate::gwidth;
-    use crate::vxfw::{MaxSize, Point, Text, WidgetRef, widget_eq};
+    use crate::vxfw::{MaxSize, Point, Source, Text, WidgetRef, widget_eq};
 
     fn text(s: &str) -> WidgetRef {
         Rc::new(RefCell::new(Text::new(s)))
+    }
+
+    /// `ScrollBars` composes with a `ListView` through `ScrollableView`: the
+    /// vertical bar draws only when the list overflows the viewport, and a
+    /// thumb drag jumps the list's scroll position.
+    #[test]
+    fn scroll_bars_wraps_a_list_view() {
+        use crate::vxfw::ListView;
+
+        // Twenty one-row items in a five-row viewport.
+        let items: Vec<WidgetRef> = (0..20).map(|i| text(&i.to_string())).collect();
+        let mut lv = ListView::new(Source::Slice(items));
+        lv.draw_cursor = false;
+
+        let mut sb = ScrollBars::new(lv);
+        sb.draw_horizontal_scrollbar = false;
+        let inner = Rc::clone(&sb.view);
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(8),
+                height: Some(5),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+
+        // Overflowing content: the inner list plus the vertical bar, with a
+        // thumb pinned to the top (5 of 20 items visible, thumb row 0).
+        let surface = sb.draw(&ctx);
+        assert_eq!(surface.children.len(), 2);
+        let bar = surface
+            .children
+            .iter()
+            .find(|child| child.surface.size.width == 1 && child.origin.col == 7)
+            .expect("the vertical scroll bar was drawn");
+        assert_eq!(bar.surface.read_cell(0, 0).char.grapheme(), "▐");
+
+        // Press on the thumb starts a drag.
+        let mut ec = EventContext::new();
+        let press = Event::Mouse(mouse::Mouse {
+            col: 7,
+            row: 0,
+            xoffset: 0,
+            yoffset: 0,
+            button: mouse::Button::Left,
+            mods: mouse::Modifiers::empty(),
+            kind: mouse::Type::Press,
+        });
+        sb.handle_event(&mut ec, &press);
+        assert!(ec.consume_event, "the press was grabbed by the thumb");
+
+        // Dragging two rows down jumps the list: 2/5 of 20 items = item 8.
+        let mut ec = EventContext::new();
+        let drag = Event::Mouse(mouse::Mouse {
+            col: 7,
+            row: 2,
+            xoffset: 0,
+            yoffset: 0,
+            button: mouse::Button::Left,
+            mods: mouse::Modifiers::empty(),
+            kind: mouse::Type::Drag,
+        });
+        sb.capture_event(&mut ec, &drag);
+        assert!(ec.consume_event, "the drag was intercepted");
+        assert_eq!(inner.borrow().scroll_top(), 8);
+
+        // Redraw reconciles: the thumb followed the drag away from the top.
+        let surface = sb.draw(&ctx);
+        let bar = surface
+            .children
+            .iter()
+            .find(|child| child.surface.size.width == 1 && child.origin.col == 7)
+            .expect("the vertical scroll bar is still drawn");
+        assert_eq!(bar.surface.read_cell(0, 0).char.grapheme(), " ");
+
+        // Short content: no bar, just the inner list.
+        let mut lv = ListView::new(Source::Slice(vec![text("a"), text("b")]));
+        lv.draw_cursor = false;
+        let mut sb = ScrollBars::new(lv);
+        sb.draw_horizontal_scrollbar = false;
+        let surface = sb.draw(&ctx);
+        assert_eq!(surface.children.len(), 1);
     }
 
     #[test]
@@ -602,7 +700,7 @@ mod tests {
         // bar_height^2 / estimate = 25 / 12 rounds to a two-row thumb, so a
         // clip would shrink it to one row and the assertions would catch it.
         sb.estimated_content_height = Some(12);
-        let inner = Rc::clone(&sb.scroll_view);
+        let inner = Rc::clone(&sb.view);
         let scroll_bars: WidgetRef = Rc::new(RefCell::new(sb));
 
         let ctx = DrawContext {
@@ -677,7 +775,7 @@ mod tests {
         let mut sb = ScrollBars::new(sv);
         sb.estimated_content_height = Some(20);
         // Keep a handle to the inner view to inspect its scroll state later.
-        let inner = Rc::clone(&sb.scroll_view);
+        let inner = Rc::clone(&sb.view);
         let scroll_bars: WidgetRef = Rc::new(RefCell::new(sb));
 
         let ctx = DrawContext {

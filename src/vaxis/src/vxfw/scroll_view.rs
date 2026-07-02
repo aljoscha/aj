@@ -22,8 +22,8 @@ use crate::cell::{Cell, Character};
 use crate::key::{Key, Modifiers};
 use crate::mouse;
 use crate::vxfw::{
-    Builder, DrawContext, Event, EventContext, MaxSize, RelativePoint, Size, Source, SubSurface,
-    Surface, Widget, WidgetRef, draw_widget,
+    Builder, DrawContext, Event, EventContext, MaxSize, RelativePoint, ScrollableView, Size,
+    Source, SubSurface, Surface, Widget, WidgetRef, draw_widget,
 };
 
 /// Adapts a borrowed slice of widgets to the [`Builder`] interface.
@@ -519,6 +519,51 @@ fn total_height(list: &[SubSurface]) -> usize {
     list.iter()
         .map(|child| usize::from(child.surface.size.height))
         .sum()
+}
+
+impl ScrollableView for ScrollView {
+    fn total_item_count(&self) -> usize {
+        if let Some(c) = self.item_count {
+            return usize::try_from(c).expect("item count fits usize");
+        }
+        match &self.children {
+            Source::Slice(slice) => slice.len(),
+            Source::Builder(builder) => {
+                let cursor = usize::try_from(self.cursor).expect("cursor fits usize");
+                let mut counter = 0;
+                while builder.item_at_idx(counter, cursor).is_some() {
+                    counter += 1;
+                }
+                counter
+            }
+        }
+    }
+
+    fn scroll_top(&self) -> u32 {
+        self.scroll.top
+    }
+
+    fn has_more_below(&self) -> bool {
+        self.scroll.has_more_vertical
+    }
+
+    fn set_scroll_top(&mut self, top: u32) {
+        // Top only: line offsets and pending scroll are left for the next
+        // draw to reconcile.
+        self.scroll.top = top;
+    }
+
+    fn scroll_left(&self) -> u32 {
+        self.scroll.left
+    }
+
+    fn has_more_right(&self) -> bool {
+        self.scroll.has_more_horizontal
+    }
+
+    fn set_scroll_left(&mut self, left: u32) {
+        self.scroll.left = left;
+    }
 }
 
 impl Widget for ScrollView {

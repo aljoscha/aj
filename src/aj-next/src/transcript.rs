@@ -14,11 +14,11 @@ use aj_app::chat::{ChatState, Entry, EntryKind, NoticeLevel, UserEntry};
 use aj_app::theme::{Theme, ThemeBg, ThemeColor, ThemeRgb};
 use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
-use vaxis::cell::{Color, Style};
+use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::mouse;
 use vaxis::vxfw::{
-    Builder, DrawContext, Event, EventContext, ListView, RelativePoint, RichText, Source,
-    SubSurface, Surface, TextSpan, Widget, WidgetRef,
+    Builder, DrawContext, Event, EventContext, ListView, RelativePoint, RichText, ScrollBars,
+    Source, SubSurface, Surface, TextSpan, Widget, WidgetRef,
 };
 
 use crate::bubble::Bubble;
@@ -303,35 +303,77 @@ fn entry_spans(entry: &Entry, hide_thinking: bool, styles: &TranscriptStyles) ->
     spans
 }
 
-/// The chat area: a follow-tail `ListView` over the active transcript.
+/// The chat area: a follow-tail `ListView` over the active transcript,
+/// wrapped in [`ScrollBars`] for the vertical scrollbar thumb (Spec E
+/// section 1). The bar reserves the rightmost column and hides its
+/// thumb while the transcript fits the viewport.
 ///
-/// The widget owns the list directly (rather than as a child
-/// `WidgetRef`) so mouse events hit-test to this widget and are
-/// forwarded, letting follow-tail observe the wheel before the list
-/// consumes it.
+/// The bars stamp the list's widget identity, so content-area mouse
+/// events hit-test to the list itself. This view is always an ancestor
+/// in the hit list, so it observes those events in the capturing phase
+/// (wheel-up disengages follow-tail, an active thumb drag is
+/// intercepted). Events over the bar column hit-test to this view and
+/// are forwarded from [`handle_event`](Widget::handle_event).
 pub struct TranscriptView {
     chat: Rc<RefCell<ChatState>>,
-    list: ListView,
+    /// The chat list, shared with `bars`, which draws it and routes
+    /// thumb drag-to-jump into it.
+    list: Rc<RefCell<ListView>>,
+    bars: ScrollBars<ListView>,
     /// While true, every draw pins the viewport to the bottom so a
-    /// streaming turn stays in view. Wheel-up disengages, a scroll
-    /// that lands back at the bottom re-engages (Spec E section 1).
+    /// streaming turn stays in view. Wheel-up and thumb drags
+    /// disengage, a scroll that lands back at the bottom re-engages
+    /// (Spec E section 1).
     follow_tail: bool,
 }
 
 impl TranscriptView {
     pub fn new(chat: Rc<RefCell<ChatState>>, theme: &Theme) -> TranscriptView {
+        let styles = Rc::new(TranscriptStyles::from_theme(theme));
         let builder = EntryBuilder {
             chat: Rc::clone(&chat),
-            styles: Rc::new(TranscriptStyles::from_theme(theme)),
+            styles: Rc::clone(&styles),
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
         // Free-scroll mode: no item cursor while the editor owns the
         // keyboard. Transcript-focus mode arrives in a later phase.
         list.draw_cursor = false;
+        let mut bars = ScrollBars::new(list);
+        bars.draw_horizontal_scrollbar = false;
+        // A muted thumb that brightens while dragged, from the same
+        // dim/text palette the transcript rows use.
+        let thumb = |grapheme: &str, style: Style| Cell {
+            char: Character::new(grapheme, 1),
+            style,
+            ..Cell::default()
+        };
+        bars.vertical_scrollbar_thumb = thumb("\u{2590}", styles.dim);
+        bars.vertical_scrollbar_hover_thumb = thumb("\u{2588}", styles.dim);
+        bars.vertical_scrollbar_drag_thumb = thumb("\u{2588}", styles.text);
+        let list = Rc::clone(&bars.view);
         TranscriptView {
             chat,
             list,
+            bars,
             follow_tail: true,
+        }
+    }
+
+    /// Mouse observation shared by both dispatch phases: an active
+    /// thumb drag is handed to the bars (and disengages follow-tail
+    /// when it moves the viewport), and any manual wheel-up means the
+    /// user wants to read history, so new content must stop yanking
+    /// the viewport to the bottom.
+    fn observe_mouse(&mut self, ctx: &mut EventContext, event: &Event, m: &mouse::Mouse) {
+        self.bars.capture_event(ctx, event);
+        if ctx.consume_event {
+            if m.kind == mouse::Type::Drag {
+                self.follow_tail = false;
+            }
+            return;
+        }
+        if m.button == mouse::Button::WheelUp {
+            self.follow_tail = false;
         }
     }
 }
@@ -354,40 +396,66 @@ impl Widget for TranscriptView {
                 .map(|t| t.entries().len())
                 .unwrap_or(0)
         };
-        // The builder has no inherent end-of-list knowledge worth
-        // walking for, so refresh the exact count every draw. It also
-        // makes `scroll_to_bottom` cheap (no builder walk).
-        self.list.item_count = Some(u32::try_from(count).expect("entry count fits u32"));
-        if self.follow_tail {
-            self.list.scroll_to_bottom();
+        {
+            let mut list = self.list.borrow_mut();
+            // The builder has no inherent end-of-list knowledge worth
+            // walking for, so refresh the exact count every draw. It also
+            // makes `scroll_to_bottom` cheap (no builder walk).
+            list.item_count = Some(u32::try_from(count).expect("entry count fits u32"));
+            if self.follow_tail {
+                list.scroll_to_bottom();
+            }
         }
-        let list_surface = self.list.draw(ctx);
+        // The bars draw the list one column narrower and add the thumb
+        // when the reconciled scroll says the transcript overflows.
+        let bars_surface = self.bars.draw(ctx);
         // The draw reconciled any pending wheel scroll, so "we are at
         // the bottom" is now accurate. Landing there re-engages
         // follow-tail.
-        if self.list.is_at_bottom() {
+        if self.list.borrow().is_at_bottom() {
             self.follow_tail = true;
         }
-        // Wrap the list in an opaque full-size surface: the list draws
+        // Wrap the bars in an opaque full-size surface: the list draws
         // no background of its own (draw_cursor off), and without one
         // stale cells from the previous frame would survive a scroll.
         let mut surface = Surface::with_size(ctx.max.size());
         surface.children.push(SubSurface {
             origin: RelativePoint { col: 0, row: 0 },
-            surface: list_surface,
+            surface: bars_surface,
             z_index: 0,
         });
         surface
     }
 
-    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+    fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        // Content-area mouse events target the inner list, so they
+        // pass through here on the way down.
         if let Event::Mouse(m) = event {
-            // Any manual upward scroll means the user wants to read
-            // history: stop yanking the viewport to the bottom.
-            if m.button == mouse::Button::WheelUp {
-                self.follow_tail = false;
+            self.observe_mouse(ctx, event, m);
+        }
+    }
+
+    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        match event {
+            Event::Mouse(m) => {
+                self.observe_mouse(ctx, event, m);
+                if ctx.consume_event {
+                    return;
+                }
+                // Thumb hover and press-to-drag live in the bars'
+                // bubbling-phase handler.
+                self.bars.handle_event(ctx, event);
+                if ctx.consume_event {
+                    return;
+                }
+                if m.button == mouse::Button::WheelUp {
+                    self.follow_tail = false;
+                }
+                self.list.borrow_mut().handle_event(ctx, event);
             }
-            self.list.handle_event(ctx, event);
+            // The bars cancel an in-flight drag when the mouse leaves.
+            Event::MouseLeave => self.bars.handle_event(ctx, event),
+            _ => {}
         }
     }
 
@@ -682,6 +750,19 @@ mod tests {
     /// the tail while follow-tail is engaged.
     #[test]
     fn draw_renders_bottom_of_a_long_transcript() {
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+
+        let surface = view.draw(&draw_ctx(40, 10));
+        assert_eq!(surface.size.height, 10);
+        assert!(view.follow_tail, "short draw at bottom keeps follow-tail");
+        // The last visible child is the final entry (spacer included).
+        assert!(view.list.borrow().is_at_bottom());
+    }
+
+    /// A chat model with `n` one-line notice rows (two transcript rows
+    /// each, counting the spacer).
+    fn chat_with_notices(n: usize) -> Rc<RefCell<ChatState>> {
         use aj_agent::events::AgentSettings;
         use std::sync::Arc;
 
@@ -697,7 +778,7 @@ mod tests {
             Arc::new(Vec::new()),
         );
         let mut lifecycle = aj_app::session::AgentLifecycle::default();
-        for i in 0..50 {
+        for i in 0..n {
             let _ = aj_app::chat::reduce(
                 &mut chat,
                 &mut lifecycle,
@@ -707,14 +788,126 @@ mod tests {
                 },
             );
         }
-        let chat = Rc::new(RefCell::new(chat));
-        let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
-        let mut view = TranscriptView::new(Rc::clone(&chat), &theme);
+        Rc::new(RefCell::new(chat))
+    }
 
+    fn transcript_view(chat: &Rc<RefCell<ChatState>>) -> TranscriptView {
+        let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
+        TranscriptView::new(Rc::clone(chat), &theme)
+    }
+
+    fn mouse(col: i16, row: i16, kind: mouse::Type) -> Event {
+        Event::Mouse(mouse::Mouse {
+            col,
+            row,
+            xoffset: 0,
+            yoffset: 0,
+            button: mouse::Button::Left,
+            mods: mouse::Modifiers::empty(),
+            kind,
+        })
+    }
+
+    /// The scrollbar thumb draws in the reserved last column only when
+    /// the transcript overflows the viewport (Spec E section 1).
+    #[test]
+    fn thumb_draws_only_when_the_transcript_overflows() {
+        // Fifty two-row entries overflow the 10-row viewport. Follow-tail
+        // pins the viewport to the bottom, so the thumb sits at the bar's
+        // lower end.
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
         let surface = view.draw(&draw_ctx(40, 10));
-        assert_eq!(surface.size.height, 10);
-        assert!(view.follow_tail, "short draw at bottom keeps follow-tail");
-        // The last visible child is the final entry (spacer included).
-        assert!(view.list.is_at_bottom());
+        let grid = crate::test_support::flatten(&surface);
+        let thumb_rows: Vec<usize> = (0..10)
+            .filter(|&row| grid[row][39].char.grapheme() == "\u{2590}")
+            .collect();
+        assert_eq!(thumb_rows, vec![9], "thumb pinned to the bottom");
+
+        // One entry fits: no thumb, a blank gutter column.
+        let chat = chat_with_notices(1);
+        let mut view = transcript_view(&chat);
+        let surface = view.draw(&draw_ctx(40, 10));
+        let grid = crate::test_support::flatten(&surface);
+        for row in &grid {
+            assert_eq!(row[39].char.grapheme(), " ");
+        }
+    }
+
+    /// Dragging the thumb jumps the viewport and disengages
+    /// follow-tail, and a drag that lands back at the bottom re-engages
+    /// it, the same rule wheel scrolling follows (Spec E section 1).
+    #[test]
+    fn thumb_drag_disengages_follow_tail_until_back_at_bottom() {
+        // An 11-row viewport over fifty two-row entries: the one-row
+        // thumb sits at bar row 10 while follow-tail pins the bottom.
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 11);
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail);
+
+        // The bar column hit-tests to this view, so the press arrives
+        // via handle_event and the bars grab it.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(39, 10, mouse::Type::Press));
+        assert!(ec.consume_event, "the thumb grabbed the press");
+        assert!(view.follow_tail, "a press alone does not disengage");
+
+        // Drags over the content area target the inner list, so they
+        // arrive via the capturing phase. Dragging to the top jumps the
+        // viewport there and disengages follow-tail.
+        let mut ec = EventContext::new();
+        view.capture_event(&mut ec, &mouse(20, 0, mouse::Type::Drag));
+        assert!(ec.consume_event, "the drag was intercepted");
+        assert!(!view.follow_tail, "dragging disengages follow-tail");
+        let surface = view.draw(&ctx);
+        let rows = crate::test_support::rows(&surface);
+        assert!(rows[0].contains("row 0"), "{rows:?}");
+        assert!(!view.follow_tail, "not at the bottom, still disengaged");
+
+        // Dragging back to the bar's end lands the viewport at the
+        // bottom, which the post-draw check turns into re-engagement.
+        let mut ec = EventContext::new();
+        view.capture_event(&mut ec, &mouse(20, 10, mouse::Type::Drag));
+        assert!(!view.follow_tail, "re-engage waits for the draw");
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail, "landing at the bottom re-engages");
+        let mut ec = EventContext::new();
+        view.capture_event(&mut ec, &mouse(20, 10, mouse::Type::Release));
+        assert!(ec.consume_event, "the release ends the drag");
+    }
+
+    /// Wheel-up disengages follow-tail whether it arrives at this view
+    /// (bar column, or direct forwarding) or in the capturing phase on
+    /// its way to the inner list.
+    #[test]
+    fn wheel_up_disengages_follow_tail_in_both_phases() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+        let wheel_up = Event::Mouse(mouse::Mouse {
+            col: 20,
+            row: 5,
+            xoffset: 0,
+            yoffset: 0,
+            button: mouse::Button::WheelUp,
+            mods: mouse::Modifiers::empty(),
+            kind: mouse::Type::Press,
+        });
+
+        let mut view = transcript_view(&chat);
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail);
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &wheel_up);
+        assert!(!view.follow_tail, "handle_event path disengages");
+
+        let mut view = transcript_view(&chat);
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail);
+        let mut ec = EventContext::new();
+        view.capture_event(&mut ec, &wheel_up);
+        assert!(!ec.consume_event, "the wheel still reaches the list");
+        assert!(!view.follow_tail, "capture path disengages");
     }
 }
