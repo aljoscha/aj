@@ -34,12 +34,16 @@ use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, TurnError};
+use aj_app::settings::{
+    ConfigLayers, ConfigTarget, FooterUpdate, MainConfirm, PersistAction, SpeedConfirm, SubConfirm,
+    persist_setting, persist_user,
+};
 use aj_conf::{
-    AgentEnv, Config, ConfigLayer, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel,
-    ConfigVerbosity, Severity, SystemPromptSource, display_path,
+    AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
+    SystemPromptSource, display_path,
 };
 use aj_models::auth::AuthStorage;
-use aj_models::registry::{ModelInfo, validate_thinking_level};
+use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, UserContent};
 use aj_models::{
     ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
@@ -61,7 +65,6 @@ use crate::config::theme::{
     Theme, ThemeHandle, ThemeWatcherGuard, editor_border_color_for_thinking, select_list_theme,
     settings_list_theme, watch_user_theme,
 };
-use crate::model::{ResolvedModel, from_model_info};
 use crate::modes::interactive::components::agent_picker::{
     AgentPickerComponent, AgentPickerOutcome, AgentPickerOutcomeHandle,
 };
@@ -728,70 +731,6 @@ impl InteractiveMode {
         }
 
         run_result
-    }
-}
-
-/// The two config-file layers the interactive shell can edit.
-///
-/// The effective [`Config`] a running session reads is held separately
-/// in `Shell::config` (so the many readers stay unchanged); whenever a
-/// layer changes, [`Self::effective`] recomputes it. The user layer is
-/// the base; the project layer overlays it (see [`ConfigLayer`]).
-struct ConfigLayers {
-    /// `~/.aj/config.toml` (defaults plus the user's overrides).
-    user: Config,
-    /// `<git-root>/.aj/config.toml` overlay; empty outside a project.
-    project: ConfigLayer,
-    /// Where the project layer persists, or `None` when the process is
-    /// not inside a git repository (project editing is unavailable).
-    project_path: Option<PathBuf>,
-}
-
-impl ConfigLayers {
-    /// The effective config: the project layer overlaid on the user
-    /// layer. This is what `Shell::config` should be set to.
-    fn effective(&self) -> Config {
-        self.project.overlay_onto(&self.user)
-    }
-}
-
-/// Which configuration layer a settings edit persists to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigTarget {
-    /// The user's `~/.aj/config.toml`.
-    User,
-    /// The current project's `<git-root>/.aj/config.toml`.
-    Project,
-}
-
-/// How a confirmed setting change persists, beyond the effect it
-/// always has on the running session.
-///
-/// The `/thinking` and `/model` overlays are session-scoped
-/// ([`PersistAction::None`]); the settings windows persist to a config
-/// layer as the new default for future sessions. A project clear
-/// removes the key so the value falls back to the user (or built-in)
-/// default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistAction {
-    /// Session only: leave every config file untouched.
-    None,
-    /// Write the value to the user `config.toml`.
-    User,
-    /// Write the value to the project `config.toml` as an override.
-    ProjectSet,
-    /// Remove the key(s) from the project `config.toml`.
-    ProjectClear,
-}
-
-impl PersistAction {
-    /// The persist action for a value change (not a clear) made in a
-    /// settings window targeting `target`.
-    fn set_for(target: ConfigTarget) -> Self {
-        match target {
-            ConfigTarget::User => PersistAction::User,
-            ConfigTarget::Project => PersistAction::ProjectSet,
-        }
     }
 }
 
@@ -2787,142 +2726,6 @@ fn apply_editor_agent_marker(tui: &mut Tui, id: AgentId) {
     }
 }
 
-/// Map the agent's live default thinking back onto its persisted
-/// `config.toml` representation. The forward map
-/// [`crate::model::default_thinking_from_config`] collapses
-/// [`ConfigThinkingLevel::Off`] to `None`; this is its exact inverse,
-/// so a popup choice round-trips through `config.toml` unchanged.
-fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> ConfigThinkingLevel {
-    use aj_models::ThinkingConfig;
-    match thinking {
-        None => ConfigThinkingLevel::Off,
-        Some(ThinkingConfig::Minimal) => ConfigThinkingLevel::Minimal,
-        Some(ThinkingConfig::Low) => ConfigThinkingLevel::Low,
-        Some(ThinkingConfig::Medium) => ConfigThinkingLevel::Medium,
-        Some(ThinkingConfig::High) => ConfigThinkingLevel::High,
-        Some(ThinkingConfig::XHigh) => ConfigThinkingLevel::XHigh,
-        Some(ThinkingConfig::Max) => ConfigThinkingLevel::Max,
-    }
-}
-
-/// Apply `mutate` to the shared [`Config`] and persist it to
-/// `~/.aj/config.toml`. Selector outcomes change live agent/TUI state
-/// for the running session; this mirrors the change into the
-/// persisted config so it survives a restart.
-///
-/// The write goes through [`Config::persist_changed`], which merges
-/// only the options this change touched onto the latest on-disk file
-/// under a cross-process lock — so a second `aj` editing a different
-/// key isn't clobbered. The in-memory mutation is applied first and
-/// the guard dropped before the write, so the live change takes effect
-/// regardless and the (best-effort) persistence never holds the config
-/// mutex across file I/O.
-///
-/// A save failure returns a user-facing notice (to append to the
-/// action's confirmation) rather than an error. Returns `None` on
-/// success.
-/// Apply `mutate` to the user config layer, refresh the effective
-/// config the running session reads, and persist the user
-/// `~/.aj/config.toml`.
-///
-/// Selector outcomes change live agent/TUI state for the running
-/// session; this mirrors the change into the user layer so it survives
-/// a restart. The in-memory mutation and the effective-config refresh
-/// happen first, under the layers lock, which is dropped before the
-/// file write so persistence never holds the lock across I/O. The
-/// write goes through [`Config::persist_changed`] (a comment-preserving
-/// per-key merge under a cross-process lock). A save failure returns a
-/// user-facing notice rather than an error.
-fn persist_user(
-    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
-    effective: &Arc<std::sync::Mutex<Config>>,
-    mutate: impl FnOnce(&mut Config),
-) -> Option<String> {
-    let (baseline, updated) = {
-        let mut l = layers.lock().expect("config layers mutex poisoned");
-        let baseline = l.user.clone();
-        mutate(&mut l.user);
-        let updated = l.user.clone();
-        *effective.lock().expect("config mutex poisoned") = l.effective();
-        (baseline, updated)
-    };
-    match updated.persist_changed(&baseline) {
-        Ok(()) => None,
-        Err(err) => Some(format!("(couldn't save to config.toml: {err})")),
-    }
-}
-
-/// Set or clear keys in the project config layer, refresh the effective
-/// config, and persist the project `<git-root>/.aj/config.toml`.
-///
-/// Each entry is `(option_name, Some(value) to set | None to remove)`.
-/// A set stores an explicit override (presence-tracked), so even a
-/// value equal to the built-in default is written and shadows the user
-/// layer. Mirrors [`persist_user`]'s discipline: the in-memory edit and
-/// effective-config refresh run under the layers lock, the file write
-/// off it. Reports the first set error (or a save failure) as a notice;
-/// returns a notice too when there is no project (not in a git repo).
-fn persist_project(
-    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
-    effective: &Arc<std::sync::Mutex<Config>>,
-    entries: &[(&str, Option<&str>)],
-) -> Option<String> {
-    let (baseline, updated, path, set_error) = {
-        let mut l = layers.lock().expect("config layers mutex poisoned");
-        let Some(path) = l.project_path.clone() else {
-            return Some("(no project config: not inside a git repository)".to_string());
-        };
-        let baseline = l.project.clone();
-        let mut set_error = None;
-        for (key, value) in entries {
-            match value {
-                Some(v) => {
-                    if let Err(e) = l.project.set_str(key, v) {
-                        set_error = Some(format!("(couldn't set {key}: {e})"));
-                        break;
-                    }
-                }
-                None => l.project.clear(key),
-            }
-        }
-        let updated = l.project.clone();
-        *effective.lock().expect("config mutex poisoned") = l.effective();
-        (baseline, updated, path, set_error)
-    };
-    if let Some(err) = set_error {
-        return Some(err);
-    }
-    match updated.persist(&baseline, &path) {
-        Ok(()) => None,
-        Err(err) => Some(format!("(couldn't save to project config.toml: {err})")),
-    }
-}
-
-/// Persist a single-key settings change to the layer named by
-/// `persist`, the common case for the settings-window arms.
-///
-/// `value` is the canonical string to write (`None` means "unset this
-/// key"). For the user layer the change is applied via `user_mutate`
-/// (which keeps the existing default-dropping semantics: a value equal
-/// to the default removes the key). For the project layer the value is
-/// stored verbatim as an override, or removed when `value` is `None`
-/// (an explicit "unset"/"default" choice) or `persist` is a clear.
-fn persist_setting(
-    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
-    effective: &Arc<std::sync::Mutex<Config>>,
-    persist: PersistAction,
-    key: &str,
-    value: Option<&str>,
-    user_mutate: impl FnOnce(&mut Config),
-) -> Option<String> {
-    match persist {
-        PersistAction::None => None,
-        PersistAction::User => persist_user(layers, effective, user_mutate),
-        PersistAction::ProjectSet => persist_project(layers, effective, &[(key, value)]),
-        PersistAction::ProjectClear => persist_project(layers, effective, &[(key, None)]),
-    }
-}
-
 /// Inner-content row count for the compact overlays (palette, help,
 /// model / thinking pickers, the read-only auth / usage / session-info
 /// pages). Total rendered height including chrome is
@@ -4015,14 +3818,12 @@ async fn handle_command(
     }
 }
 
-/// Whether a confirmed model or thinking pick should also become the
-/// default for new sessions.
-///
-/// Apply a confirmed thinking pick to the main agent: stage into the
-/// run config, record on the session log's user thread, and refresh
-/// footer + border. The `persist` action additionally writes (or
-/// clears) the choice in a config layer as the default for new
-/// sessions. Returns the user-facing notice.
+/// Apply a confirmed thinking pick to the main agent, then reconcile
+/// the view. The shared [`aj_app::settings::confirm_thinking_for_main`]
+/// core stages the run config, records the change on the session log's
+/// user thread, and persists it per `persist`. This wrapper applies the
+/// editor border tint and the footer note. Returns the user-facing
+/// notice.
 async fn confirm_thinking_for_main(
     tui: &mut Tui,
     level: Option<ThinkingConfig>,
@@ -4033,71 +3834,43 @@ async fn confirm_thinking_for_main(
     world: &mut SessionWorld,
     theme: &ThemeHandle,
 ) -> String {
-    // Stage the new thinking effort into the loop-side snapshot; the
-    // next turn applies it. Never locks the agent, so it's safe while
-    // a turn is running (the in-flight turn keeps its effort; the
-    // change takes effect next turn). Read the rest of the settings
-    // identity back for the footer entry.
-    let (settings, window) = {
-        let mut cfg = run_config.lock().expect("run config mutex poisoned");
-        cfg.thinking = level.clone();
-        (
-            aj_agent::events::AgentSettings {
-                provider: cfg.model_key.0.clone(),
-                model_id: cfg.model_key.1.clone(),
-                thinking: thinking_level_name(&level).to_string(),
-                speed: speed_name(cfg.speed).to_string(),
-                verbosity: verbosity_name(cfg.stream_options.verbosity).to_string(),
-            },
-            cfg.model_info.context_window,
-        )
-    };
-    // Mirror the change onto the editor's border tint so the visual
-    // cue tracks the active reasoning mode — but only when the user
-    // is viewing the agent the change applies to.
+    // Mirror the change onto the editor's border tint so the visual cue
+    // tracks the active reasoning mode, but only when the user is
+    // viewing the agent the change applies to. Independent of the config
+    // staging in the core, so we do it up front and keep `level`.
     if world.pump.active_view(tui) == AgentId::Main {
         apply_editor_border_for_thinking(tui, theme, level.as_ref());
     }
+    let MainConfirm { footer, notice } = aj_app::settings::confirm_thinking_for_main(
+        level,
+        persist,
+        run_config,
+        config,
+        layers,
+        &world.core,
+    )
+    .await;
     // Footer surfaces the active thinking effort; record the new
     // settings so the change is visible without waiting for a turn.
-    world
-        .pump
-        .note_agent_settings(tui, AgentId::Main, settings, window);
-    let name = thinking_level_name(&level);
-    // Record the change on the session log's user thread so a later
-    // resume restores this level.
-    let log_note = {
-        let mut log = world.core.log.lock().await;
-        log.append_thinking_change(ThreadFilter::USER, name)
-            .err()
-            .map(|err| format!("(couldn't record in session log: {err})"))
-    };
-    // Persist as the new default only when the change should outlive
-    // this session (the settings windows). The `/thinking` overlay
-    // command is session-scoped: it relies on the session-log record
-    // above to survive a resume and leaves the default untouched.
-    let save_note = persist_setting(
-        layers,
-        config,
-        persist,
-        "thinking",
-        Some(thinking_level_name(&level)),
-        |c| c.thinking = Some(config_thinking_level(level.as_ref())),
-    );
-    let mut notice = format!("Thinking effort set to {name}.");
-    for note in [save_note, log_note].into_iter().flatten() {
-        notice.push(' ');
-        notice.push_str(&note);
+    if let Some(FooterUpdate {
+        settings,
+        context_window,
+    }) = footer
+    {
+        world
+            .pump
+            .note_agent_settings(tui, AgentId::Main, settings, context_window);
     }
     notice
 }
 
-/// Apply a confirmed thinking pick to sub-agent `n`: validate
-/// against the target's model, stage into the world's override map
-/// (applied at the sub's next turn start), record on the sub's log
-/// thread, and refresh its footer entry. Deliberately does not touch
-/// `config.toml` or the run config — those record the session
-/// default, which is main's concern. Returns the user-facing notice.
+/// Apply a confirmed thinking pick to sub-agent `n`, then reconcile the
+/// view. The shared [`aj_app::settings::confirm_thinking_for_sub`] core
+/// validates against the target's model, stages the override, and
+/// records the change on the sub's log thread. This wrapper resolves the
+/// validation fallback from the frontend's tracked model, refreshes the
+/// sub's footer entry, and re-tints the border. Returns the user-facing
+/// notice.
 async fn confirm_thinking_for_sub(
     tui: &mut Tui,
     level: Option<ThinkingConfig>,
@@ -4107,84 +3880,45 @@ async fn confirm_thinking_for_sub(
     theme: &ThemeHandle,
 ) -> String {
     let target = AgentId::Sub(n);
-    if world.core.resolve_agent(target).is_none() {
-        return "This agent can't be prompted.".to_string();
-    }
-    let name = thinking_level_name(&level);
-    // Validate against the target's model: the staged bundle
-    // override's info if present, else a catalog lookup by the
-    // target's settings keys, else skip (same lenient posture as
-    // scripted mode).
-    if let Some(tc) = level.as_ref() {
-        let target_info: Option<Arc<ModelInfo>> = {
-            let overrides = world
-                .core
-                .sub_overrides
-                .lock()
-                .expect("sub overrides mutex poisoned");
-            overrides
-                .get(&n)
-                .and_then(|o| o.bundle.as_ref())
-                .map(|(_, info, _, _)| Arc::clone(info))
+    // The model the footer currently shows for the target, resolved to a
+    // catalog entry. The core uses it as the validation fallback when no
+    // bundle override is staged for the agent. Reading it is side-effect
+    // free, so we compute it up front regardless of whether the core
+    // ends up needing it.
+    let tracked_model = world.pump.agent_settings(target).and_then(|s| {
+        model_catalog
+            .iter()
+            .find(|m| m.provider == s.provider && m.id == s.model_id)
+            .cloned()
+            .map(Arc::new)
+    });
+    let SubConfirm { notice, applied } =
+        aj_app::settings::confirm_thinking_for_sub(level.clone(), n, tracked_model, &world.core)
+            .await;
+    if applied {
+        let name = thinking_level_name(&level);
+        // Refresh the target's footer entry: same identity, new
+        // thinking string, window unchanged.
+        if let Some(mut settings) = world.pump.agent_settings(target).cloned() {
+            settings.thinking = name.to_string();
+            let window = world.pump.agent_context_window(target);
+            world
+                .pump
+                .note_agent_settings(tui, target, settings, window);
         }
-        .or_else(|| {
-            world.pump.agent_settings(target).and_then(|s| {
-                model_catalog
-                    .iter()
-                    .find(|m| m.provider == s.provider && m.id == s.model_id)
-                    .cloned()
-                    .map(Arc::new)
-            })
-        });
-        if let Some(info) = target_info
-            && let Err(msg) =
-                validate_thinking_level(&info, &crate::session_setup::thinking_level_for(tc))
-        {
-            return format!("Can't set thinking level {name:?} for agent {n}: {msg}");
+        if world.pump.active_view(tui) == target {
+            apply_editor_border_for_thinking(tui, theme, level.as_ref());
         }
-    }
-    // Stage the standing choice; the sub's next turn applies it.
-    world
-        .core
-        .sub_overrides
-        .lock()
-        .expect("sub overrides mutex poisoned")
-        .entry(n)
-        .or_default()
-        .thinking = Some(level.clone());
-    // Refresh the target's footer entry: same identity, new
-    // thinking string, window unchanged.
-    if let Some(mut settings) = world.pump.agent_settings(target).cloned() {
-        settings.thinking = name.to_string();
-        let window = world.pump.agent_context_window(target);
-        world
-            .pump
-            .note_agent_settings(tui, target, settings, window);
-    }
-    if world.pump.active_view(tui) == target {
-        apply_editor_border_for_thinking(tui, theme, level.as_ref());
-    }
-    // Record the change on the sub-agent's log thread so a resumed
-    // transcript reflects it.
-    let log_note = {
-        let mut log = world.core.log.lock().await;
-        log.append_thinking_change(ThreadFilter::subagent(n), name)
-            .err()
-            .map(|err| format!("(couldn't record in session log: {err})"))
-    };
-    let mut notice = format!("Thinking effort set to {name} for agent {n}.");
-    if let Some(note) = log_note {
-        notice.push(' ');
-        notice.push_str(&note);
     }
     notice
 }
 
-/// Apply a confirmed model pick to the main agent: rebuild the
-/// bundle, stage into the run config, record on the session log's
-/// user thread, and refresh the footer. The `persist` action
-/// additionally writes (or clears) the choice in a config layer as the
-/// default for new sessions. Returns the user-facing notice.
+/// Apply a confirmed model pick to the main agent, then reconcile the
+/// view. The shared [`aj_app::settings::confirm_model_for_main`] core
+/// rebuilds the bundle, stages the run config, records the change on the
+/// session log's user thread, and persists it per `persist`. This
+/// wrapper notes the new footer identity (skipped on a rebuild failure).
+/// Returns the user-facing notice.
 async fn confirm_model_for_main(
     tui: &mut Tui,
     info: ModelInfo,
@@ -4195,111 +3929,38 @@ async fn confirm_model_for_main(
     layers: &Arc<std::sync::Mutex<ConfigLayers>>,
     world: &mut SessionWorld,
 ) -> String {
-    // Construct a fresh provider handle from the picked catalog
-    // entry, carrying the active speed over so e.g. `--speed fast`
-    // survives a model pick (degrading silently on providers
-    // that ignore it).
-    let speed = {
-        let cfg = run_config.lock().expect("run config mutex poisoned");
-        cfg.speed
-    };
-    match from_model_info(auth, info.clone(), speed) {
-        Ok(ResolvedModel {
-            provider,
-            model_info,
-            mut stream_options,
-        }) => {
-            // Re-apply the configured thinking-display mode and
-            // verbosity: the rebuilt baseline options would otherwise
-            // silently drop them on every model swap.
-            let (display, verbosity) = {
-                let cfg = config.lock().expect("config mutex poisoned");
-                (cfg.thinking_display, cfg.verbosity)
-            };
-            crate::model::apply_thinking_display(&mut stream_options, display);
-            crate::model::apply_verbosity(&mut stream_options, verbosity);
-            // Stage the swap into the loop-side snapshot (provider +
-            // model + options + the pre-select key); the next turn
-            // applies it. Never locks the agent, so it's safe
-            // mid-turn — the in-flight turn keeps its model and the
-            // swap takes effect next turn. Thinking effort is
-            // preserved; read it back for the footer entry.
-            let (current_thinking, current_verbosity) = {
-                let mut cfg = run_config.lock().expect("run config mutex poisoned");
-                cfg.provider = provider;
-                cfg.model_info = model_info;
-                cfg.stream_options = stream_options;
-                cfg.model_key = (info.provider.clone(), info.id.clone());
-                (cfg.thinking.clone(), cfg.stream_options.verbosity)
-            };
-            // Record the new settings identity so the footer's model
-            // line and context-window denominator reflect the swap
-            // immediately rather than waiting for the next turn.
-            let settings = aj_agent::events::AgentSettings {
-                provider: info.provider.clone(),
-                model_id: info.id.clone(),
-                thinking: thinking_level_name(&current_thinking).to_string(),
-                speed: speed_name(speed).to_string(),
-                verbosity: verbosity_name(current_verbosity).to_string(),
-            };
-            world
-                .pump
-                .note_agent_settings(tui, AgentId::Main, settings, info.context_window);
-            // Record the change on the session log's user thread so a
-            // later resume restores this model.
-            let log_note = {
-                let mut log = world.core.log.lock().await;
-                log.append_model_change(ThreadFilter::USER, &info.provider, &info.id)
-                    .err()
-                    .map(|err| format!("(couldn't record in session log: {err})"))
-            };
-            // Persist the model choice (provider + id) as the new
-            // default only when the change should outlive this session
-            // (the settings windows). The `/model` overlay command is
-            // session-scoped: it relies on the session-log record above
-            // to survive a resume and leaves the default untouched.
-            // `model_url` is intentionally left untouched: it's a
-            // user-supplied endpoint override, not part of "which
-            // model", and pinning the catalog's base URL into it would
-            // freeze out future `models.json` updates.
-            let save_note = match persist {
-                PersistAction::None => None,
-                PersistAction::User => persist_user(layers, config, |c| {
-                    c.model_api = Some(info.provider.clone());
-                    c.model_name = Some(info.id.clone());
-                }),
-                PersistAction::ProjectSet => persist_project(
-                    layers,
-                    config,
-                    &[
-                        ("model_api", Some(info.provider.as_str())),
-                        ("model_name", Some(info.id.as_str())),
-                    ],
-                ),
-                PersistAction::ProjectClear => {
-                    persist_project(layers, config, &[("model_api", None), ("model_name", None)])
-                }
-            };
-            let mut notice = format!(
-                "Model set to {} ({}/{}).",
-                info.name, info.provider, info.id
-            );
-            for note in [save_note, log_note].into_iter().flatten() {
-                notice.push(' ');
-                notice.push_str(&note);
-            }
-            notice
-        }
-        Err(err) => format!("Failed to switch to {}: {err}", info.name),
+    let MainConfirm { footer, notice } = aj_app::settings::confirm_model_for_main(
+        info,
+        persist,
+        auth,
+        run_config,
+        config,
+        layers,
+        &world.core,
+    )
+    .await;
+    // Record the new settings identity so the footer's model line and
+    // context-window denominator reflect the swap immediately rather
+    // than waiting for the next turn.
+    if let Some(FooterUpdate {
+        settings,
+        context_window,
+    }) = footer
+    {
+        world
+            .pump
+            .note_agent_settings(tui, AgentId::Main, settings, context_window);
     }
+    notice
 }
 
-/// Apply a confirmed model pick to sub-agent `n`: rebuild the
-/// bundle at the target's effective speed, stage it into the world's
-/// override map (applied at the sub's next turn start), record on
-/// the sub's log thread, and refresh its footer entry. Deliberately
-/// does not touch `config.toml` or the run config. Returns the
-/// user-facing notice.
+/// Apply a confirmed model pick to sub-agent `n`, then reconcile the
+/// view. The shared [`aj_app::settings::confirm_model_for_sub`] core
+/// rebuilds the bundle at the resolved effective speed, stages it into
+/// the override map, and records the change on the sub's log thread.
+/// This wrapper resolves the effective speed from the frontend's tracked
+/// state and refreshes the sub's footer entry (preserving its thinking
+/// and verbosity strings). Returns the user-facing notice.
 async fn confirm_model_for_sub(
     tui: &mut Tui,
     info: ModelInfo,
@@ -4308,11 +3969,9 @@ async fn confirm_model_for_sub(
     world: &mut SessionWorld,
 ) -> String {
     let target = AgentId::Sub(n);
-    if world.core.resolve_agent(target).is_none() {
-        return "This agent can't be prompted.".to_string();
-    }
-    // Effective speed: the staged override for this agent if
-    // present, else the target's tracked settings string.
+    // Effective speed: the staged override for this agent if present,
+    // else the target's tracked settings string. The rebuilt bundle
+    // re-stamps this speed's headers.
     let staged_speed = {
         let overrides = world
             .core
@@ -4329,78 +3988,33 @@ async fn confirm_model_for_sub(
             .and_then(|s| speed_from_name(&s.speed))
             .flatten(),
     };
-    match from_model_info(auth, info.clone(), effective_speed) {
-        Ok(ResolvedModel {
-            provider,
-            model_info,
-            stream_options,
-        }) => {
-            // Stage the standing bundle choice; the sub's next turn
-            // applies it.
-            //
-            // NOTE(aljoscha): the rebuilt bundle's `stream_options`
-            // come from `from_model_info` (defaults), so a sub's
-            // `thinking_display` and `verbosity` revert to the server
-            // default on a model swap. Unlike the main path
-            // (`confirm_model_for_main`), we don't re-apply the config
-            // values here. The two settings behave identically, and
-            // sub-agent display tuning isn't exposed, so we accept the
-            // gap rather than thread config through the sub path.
-            world
-                .core
-                .sub_overrides
-                .lock()
-                .expect("sub overrides mutex poisoned")
-                .entry(n)
-                .or_default()
-                .bundle = Some((
-                provider,
-                model_info,
-                stream_options,
-                (info.provider.clone(), info.id.clone()),
-            ));
-            // Refresh the target's footer entry: new identity, the
-            // catalog entry's window, thinking string preserved.
-            let preserved_thinking = world
-                .pump
-                .agent_settings(target)
-                .map(|s| s.thinking.clone())
-                .unwrap_or_else(|| "off".to_string());
-            let preserved_verbosity = world
-                .pump
-                .agent_settings(target)
-                .map(|s| s.verbosity.clone())
-                .unwrap_or_else(|| "default".to_string());
-            let settings = aj_agent::events::AgentSettings {
-                provider: info.provider.clone(),
-                model_id: info.id.clone(),
-                thinking: preserved_thinking,
-                speed: speed_name(effective_speed).to_string(),
-                verbosity: preserved_verbosity,
-            };
-            world
-                .pump
-                .note_agent_settings(tui, target, settings, info.context_window);
-            // Record the change on the sub-agent's log thread so a
-            // resumed transcript reflects it.
-            let log_note = {
-                let mut log = world.core.log.lock().await;
-                log.append_model_change(ThreadFilter::subagent(n), &info.provider, &info.id)
-                    .err()
-                    .map(|err| format!("(couldn't record in session log: {err})"))
-            };
-            let mut notice = format!(
-                "Model set to {} ({}/{}) for agent {n}.",
-                info.name, info.provider, info.id
-            );
-            if let Some(note) = log_note {
-                notice.push(' ');
-                notice.push_str(&note);
-            }
-            notice
-        }
-        Err(err) => format!("Failed to switch to {}: {err}", info.name),
+    let SubConfirm { notice, applied } =
+        aj_app::settings::confirm_model_for_sub(&info, n, auth, effective_speed, &world.core).await;
+    if applied {
+        // Refresh the target's footer entry: new identity, the catalog
+        // entry's window, thinking and verbosity strings preserved.
+        let preserved_thinking = world
+            .pump
+            .agent_settings(target)
+            .map(|s| s.thinking.clone())
+            .unwrap_or_else(|| "off".to_string());
+        let preserved_verbosity = world
+            .pump
+            .agent_settings(target)
+            .map(|s| s.verbosity.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let settings = aj_agent::events::AgentSettings {
+            provider: info.provider.clone(),
+            model_id: info.id.clone(),
+            thinking: preserved_thinking,
+            speed: speed_name(effective_speed).to_string(),
+            verbosity: preserved_verbosity,
+        };
+        world
+            .pump
+            .note_agent_settings(tui, target, settings, info.context_window);
     }
+    notice
 }
 
 /// Apply one settings-window change to the running session and
@@ -4527,8 +4141,15 @@ async fn apply_setting_change(
                 }
             };
             Some(
-                confirm_verbosity_for_main(verbosity, persist, run_config, config, layers, world)
-                    .await,
+                aj_app::settings::confirm_verbosity_for_main(
+                    verbosity,
+                    persist,
+                    run_config,
+                    config,
+                    layers,
+                    &world.core,
+                )
+                .await,
             )
         }
         "theme" => {
@@ -4729,62 +4350,14 @@ async fn apply_setting_change(
     }
 }
 
-/// Apply a confirmed output-verbosity pick to the main agent: stage
-/// it onto the run config's stream options, persist to `config.toml`,
-/// and record on the session log's user thread. Verbosity is a plain
-/// stream-option field (no headers, no bundle rebuild), so unlike
-/// `confirm_speed_for_main` this neither rebuilds the provider nor
-/// touches the footer. Providers gate the field on per-model support,
-/// so on a model that ignores verbosity this records the preference
-/// without changing what's sent. Returns the user-facing notice.
-async fn confirm_verbosity_for_main(
-    verbosity: Option<ConfigVerbosity>,
-    persist: PersistAction,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    config: &Arc<std::sync::Mutex<Config>>,
-    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
-    world: &SessionWorld,
-) -> String {
-    let unified = verbosity.map(crate::model::config_verbosity_to_unified);
-    let name = verbosity_name(unified);
-    {
-        let mut cfg = run_config.lock().expect("run config mutex poisoned");
-        cfg.stream_options.verbosity = unified;
-    }
-    // Record on the user thread so a later resume restores this value.
-    let log_note = {
-        let mut log = world.core.log.lock().await;
-        log.append_verbosity_change(ThreadFilter::USER, name)
-            .err()
-            .map(|err| format!("(couldn't record in session log: {err})"))
-    };
-    // The verbosity name (`low`/`medium`/`high`) is the canonical
-    // config value; `None` means "unset" and removes the key.
-    let verbosity_str = verbosity.map(|v| v.to_string());
-    let save_note = persist_setting(
-        layers,
-        config,
-        persist,
-        "verbosity",
-        verbosity_str.as_deref(),
-        |c| c.verbosity = verbosity,
-    );
-    let mut notice = format!("Output verbosity set to {name}. Takes effect next turn.");
-    for note in [save_note, log_note].into_iter().flatten() {
-        notice.push(' ');
-        notice.push_str(&note);
-    }
-    notice
-}
-
-/// Apply a speed change to the main agent: rebuild the provider
-/// bundle at the current model so the speed-derived headers are
-/// re-stamped, stage it into the run config, persist to
-/// `config.toml`, record on the session log's user thread, and
-/// refresh the footer. On a rebuild failure (e.g. scripted mode,
-/// whose provider isn't in the registry) nothing is staged and the
-/// settings row is reverted via `corrections`. Returns the
-/// user-facing notice.
+/// Apply a speed change to the main agent, then reconcile the view.
+/// The shared [`aj_app::settings::confirm_speed_for_main`] core rebuilds
+/// the provider bundle at the current model (re-stamping speed-derived
+/// headers), stages the run config, records the change on the session
+/// log's user thread, and persists it per `persist`. This wrapper notes
+/// the new footer identity on success, or reverts the settings row via
+/// `corrections` when the rebuild fails (e.g. scripted mode, whose
+/// provider isn't in the registry). Returns the user-facing notice.
 async fn confirm_speed_for_main(
     tui: &mut Tui,
     speed: Option<Speed>,
@@ -4796,81 +4369,33 @@ async fn confirm_speed_for_main(
     world: &mut SessionWorld,
     corrections: &SettingsCorrectionsHandle,
 ) -> String {
-    let name = speed_name(speed);
-    let (model_info, prev_speed) = {
-        let cfg = run_config.lock().expect("run config mutex poisoned");
-        ((*cfg.model_info).clone(), cfg.speed)
-    };
-    match from_model_info(auth, model_info, speed) {
-        Ok(ResolvedModel {
-            provider,
-            model_info,
-            mut stream_options,
-        }) => {
-            // The rebuilt baseline options would otherwise drop the
-            // configured thinking-display mode and verbosity.
-            let (display, verbosity) = {
-                let cfg = config.lock().expect("config mutex poisoned");
-                (cfg.thinking_display, cfg.verbosity)
-            };
-            crate::model::apply_thinking_display(&mut stream_options, display);
-            crate::model::apply_verbosity(&mut stream_options, verbosity);
-            // Stage into the loop-side snapshot; the next turn
-            // applies it. Never locks the agent, so it's safe
-            // mid-turn.
-            let (settings, window) = {
-                let mut cfg = run_config.lock().expect("run config mutex poisoned");
-                cfg.provider = provider;
-                cfg.model_info = model_info;
-                cfg.stream_options = stream_options;
-                cfg.speed = speed;
-                (
-                    aj_agent::events::AgentSettings {
-                        provider: cfg.model_key.0.clone(),
-                        model_id: cfg.model_key.1.clone(),
-                        thinking: thinking_level_name(&cfg.thinking).to_string(),
-                        speed: name.to_string(),
-                        verbosity: verbosity_name(cfg.stream_options.verbosity).to_string(),
-                    },
-                    cfg.model_info.context_window,
-                )
-            };
+    match aj_app::settings::confirm_speed_for_main(
+        speed,
+        persist,
+        auth,
+        run_config,
+        config,
+        layers,
+        &world.core,
+    )
+    .await
+    {
+        SpeedConfirm::Applied {
+            footer:
+                FooterUpdate {
+                    settings,
+                    context_window,
+                },
+            notice,
+        } => {
             world
                 .pump
-                .note_agent_settings(tui, AgentId::Main, settings, window);
-            // Record the change on the session log's user thread so a
-            // later resume restores this speed.
-            let log_note = {
-                let mut log = world.core.log.lock().await;
-                log.append_speed_change(ThreadFilter::USER, name)
-                    .err()
-                    .map(|err| format!("(couldn't record in session log: {err})"))
-            };
-            // "standard" persists to the user layer as key removal:
-            // it's the default, and `speed_from_name` maps it to `None`
-            // on the wire. The project layer stores it explicitly so it
-            // can override a user `fast`.
-            let save_note = persist_setting(layers, config, persist, "speed", Some(name), |c| {
-                c.speed = match speed {
-                    None | Some(Speed::Standard) => None,
-                    Some(Speed::Fast) => Some(ConfigSpeed::Fast),
-                };
-            });
-            let mut notice = format!("Speed set to {name}. Takes effect next turn.");
-            for note in [save_note, log_note].into_iter().flatten() {
-                notice.push(' ');
-                notice.push_str(&note);
-            }
+                .note_agent_settings(tui, AgentId::Main, settings, context_window);
             notice
         }
-        Err(err) => {
-            push_correction(
-                corrections,
-                tui,
-                "speed",
-                speed_name(prev_speed).to_string(),
-            );
-            format!("Failed to set speed {name}: {err}")
+        SpeedConfirm::Failed { previous, notice } => {
+            push_correction(corrections, tui, "speed", previous);
+            notice
         }
     }
 }
@@ -5942,7 +5467,7 @@ mod tests {
     fn empty_layers() -> Arc<std::sync::Mutex<ConfigLayers>> {
         Arc::new(std::sync::Mutex::new(ConfigLayers {
             user: Config::default(),
-            project: ConfigLayer::default(),
+            project: aj_conf::ConfigLayer::default(),
             project_path: None,
         }))
     }
@@ -7115,7 +6640,7 @@ mod run_loop_tests {
             theme,
             config_layers: Arc::new(std::sync::Mutex::new(ConfigLayers {
                 user: config.clone(),
-                project: ConfigLayer::default(),
+                project: aj_conf::ConfigLayer::default(),
                 project_path: None,
             })),
             config: Arc::new(std::sync::Mutex::new(config)),

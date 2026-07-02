@@ -31,6 +31,7 @@ pub mod print;
 pub mod scripted;
 pub mod session;
 pub mod session_setup;
+pub mod settings;
 pub mod shutdown;
 pub mod system_prompt;
 pub mod theme;
