@@ -39,9 +39,30 @@ pub(crate) struct Bubble {
     /// Style used for the trailing spacer row and the plain
     /// fallback paths.
     pub(crate) base: Style,
+    /// When false, long content lines truncate with an ellipsis at
+    /// the inner width instead of wrapping. The pending-message box
+    /// uses this so a wide draft can't grow the box row by row.
+    pub(crate) softwrap: bool,
+    /// Whether the untinted spacer row below the bubble is drawn.
+    /// Transcript entries carry it so consecutive rows don't collide;
+    /// the pending-message box sits flush above the editor and skips
+    /// it.
+    pub(crate) trailing_spacer: bool,
 }
 
 impl Bubble {
+    /// A transcript-entry bubble: wrapped content plus the trailing
+    /// untinted spacer row every transcript entry carries.
+    pub(crate) fn entry(text: Vec<TextSpan>, bg: Option<Color>, base: Style) -> Bubble {
+        Bubble {
+            text,
+            bg,
+            base,
+            softwrap: true,
+            trailing_spacer: true,
+        }
+    }
+
     /// Plain fallback: wrapped text with no bubble or background,
     /// plus the one-blank-row spacer every transcript entry carries.
     /// Used for `header_only` cells and for degenerate widths where
@@ -56,7 +77,9 @@ impl Bubble {
             style: self.base,
             ..TextSpan::default()
         });
-        RichText::new(spans).draw(ctx)
+        let mut rich = RichText::new(spans);
+        rich.softwrap = self.softwrap;
+        rich.draw(ctx)
     }
 }
 
@@ -93,6 +116,7 @@ impl Widget for Bubble {
         let mut rich = RichText::new(self.text.clone());
         rich.width_basis = WidthBasis::Parent;
         rich.base_style = bg_style;
+        rich.softwrap = self.softwrap;
         let mut inner = rich.draw(&inner_ctx);
         // Span-styled cells keep their own (bg-less) style when the
         // wrap engine writes them over the base fill, so stamp the
@@ -102,14 +126,14 @@ impl Widget for Bubble {
         }
 
         // The outer surface: bg-filled padding frame around the
-        // content, plus one default (untinted) spacer row at the
-        // bottom standing in for the `\n\n` spacer the span-based
-        // entries carry.
+        // content, plus (for transcript entries) one default
+        // (untinted) spacer row at the bottom standing in for the
+        // `\n\n` spacer the span-based entries carry.
         let content_height = inner.size.height;
         let bubble_height = content_height + 2 * PADDING_Y;
         let mut surface = Surface::with_size(Size {
             width,
-            height: bubble_height + 1,
+            height: bubble_height + u16::from(self.trailing_spacer),
         });
         let bg_cell = Cell {
             style: bg_style,

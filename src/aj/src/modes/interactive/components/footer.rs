@@ -13,11 +13,15 @@
 
 use std::any::Any;
 
-use aj_app::footer::ContextUsage;
+use aj_app::footer::{ContextUsage, UsageSeverity, context_usage_display};
 use aj_tui::ansi::truncate_to_width;
 use aj_tui::component::Component;
 use aj_tui::keys::InputEvent;
 use aj_tui::style;
+
+/// The shared token formatter, re-exported so sibling components
+/// (e.g. the compaction summary) keep their existing import path.
+pub(crate) use aj_app::footer::format_tokens;
 
 /// Counts of currently-running sub-agents and background (bash)
 /// tasks, plus the resolved key label that opens the agent picker.
@@ -145,16 +149,7 @@ impl AsRef<dyn Any> for Footer {
 /// nonzero. Plain text so it inherits the dim wrap applied in
 /// [`Component::render`], like the model/cwd parts.
 fn render_agent_activity(a: &AgentActivity) -> String {
-    let mut parts = Vec::new();
-    if a.agents > 0 {
-        let noun = if a.agents == 1 { "agent" } else { "agents" };
-        parts.push(format!("{} {}", a.agents, noun));
-    }
-    if a.tasks > 0 {
-        let noun = if a.tasks == 1 { "task" } else { "tasks" };
-        parts.push(format!("{} {}", a.tasks, noun));
-    }
-    format!("{} ({})", parts.join(", "), a.open_hint)
+    aj_app::footer::format_agent_activity(a.agents, a.tasks, &a.open_hint)
 }
 
 /// Format `usage` as e.g. `"12.3k/200k (6.1%)"`. The percentage
@@ -169,58 +164,18 @@ fn render_agent_activity(a: &AgentActivity) -> String {
 /// all-reset `\x1b[0m`. That preserves the surrounding
 /// `style::dim` from `render`, so the colored substring still
 /// reads as dim-yellow / dim-red rather than a vivid pop.
-///
-/// Token counts large enough to lose precision in the `u64 ->
-/// f64` cast (>2^53 tokens) are well past any model's published
-/// context window.
-#[allow(clippy::as_conversions)]
 fn render_context_usage(usage: ContextUsage) -> Option<String> {
-    if usage.context_window == 0 {
-        return None;
-    }
-    let window_str = format_tokens(usage.context_window);
-    match usage.tokens {
-        None => Some(format!("?/{window_str}")),
-        Some(tokens) => {
-            let tokens_str = format_tokens(tokens);
-            let percent = (tokens as f64 / usage.context_window as f64) * 100.0;
-            let pct_str = format!("({percent:.1}%)");
-            let pct_colored = if percent > 90.0 {
-                style::red(&pct_str)
-            } else if percent > 70.0 {
-                style::yellow(&pct_str)
-            } else {
-                pct_str
+    let display = context_usage_display(usage)?;
+    match display.percent {
+        None => Some(display.ratio),
+        Some(pct) => {
+            let pct_colored = match display.severity {
+                UsageSeverity::Critical => style::red(&pct),
+                UsageSeverity::Warning => style::yellow(&pct),
+                UsageSeverity::Normal => pct,
             };
-            Some(format!("{tokens_str}/{window_str} {pct_colored}"))
+            Some(format!("{} {pct_colored}", display.ratio))
         }
-    }
-}
-
-/// Compact token-count formatter: `987` → `"987"`, `2_500` →
-/// `"2.5k"`, `247_321` → `"247k"`, `2_500_000` → `"2.5M"`,
-/// `12_000_000` → `"12M"`. One decimal at the low end of each
-/// scale, integer at the high end — keeps the rendered string
-/// narrow without losing useful precision.
-///
-/// Counts large enough to lose precision in the `u64 -> f64`
-/// cast (>2^53) are well past anything a context window or a
-/// realistic session would reach.
-#[allow(clippy::as_conversions)]
-pub(crate) fn format_tokens(n: u64) -> String {
-    if n < 1_000 {
-        format!("{n}")
-    } else if n < 10_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else if n < 1_000_000 {
-        // Half-up rounding to the nearest thousand. Integer
-        // division truncates, so adding 500 first picks the
-        // closer thousand without floating-point.
-        format!("{}k", (n + 500) / 1_000)
-    } else if n < 10_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else {
-        format!("{}M", (n + 500_000) / 1_000_000)
     }
 }
 

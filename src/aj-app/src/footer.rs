@@ -32,6 +32,110 @@ pub struct ContextUsage {
     pub context_window: u64,
 }
 
+/// How urgently a footer should color the occupancy percentage.
+/// Thresholds are shared across frontends: `Warning` strictly above
+/// 70% occupancy, `Critical` strictly above 90%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSeverity {
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// Display form of a [`ContextUsage`], split so a frontend can apply
+/// its own color to the percentage substring: `ratio` is the
+/// `12.3k/200k` (or `?/200k`) prefix, `percent` the `(6.1%)` part
+/// (`None` when the token count is unknown), and `severity` the
+/// threshold classification of that percentage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextUsageDisplay {
+    pub ratio: String,
+    pub percent: Option<String>,
+    pub severity: UsageSeverity,
+}
+
+/// Build the display form of `usage`. Returns `None` when
+/// `context_window` is 0; the footer has nothing meaningful to say in
+/// that case and the indicator drops out of the row.
+///
+/// Token counts large enough to lose precision in the `u64 -> f64`
+/// cast (>2^53 tokens) are well past any model's published context
+/// window.
+#[allow(clippy::as_conversions)]
+pub fn context_usage_display(usage: ContextUsage) -> Option<ContextUsageDisplay> {
+    if usage.context_window == 0 {
+        return None;
+    }
+    let window_str = format_tokens(usage.context_window);
+    match usage.tokens {
+        None => Some(ContextUsageDisplay {
+            ratio: format!("?/{window_str}"),
+            percent: None,
+            severity: UsageSeverity::Normal,
+        }),
+        Some(tokens) => {
+            let percent = (tokens as f64 / usage.context_window as f64) * 100.0;
+            let severity = if percent > 90.0 {
+                UsageSeverity::Critical
+            } else if percent > 70.0 {
+                UsageSeverity::Warning
+            } else {
+                UsageSeverity::Normal
+            };
+            Some(ContextUsageDisplay {
+                ratio: format!("{}/{window_str}", format_tokens(tokens)),
+                percent: Some(format!("({percent:.1}%)")),
+                severity,
+            })
+        }
+    }
+}
+
+/// Compact token-count formatter: `987` → `"987"`, `2_500` →
+/// `"2.5k"`, `247_321` → `"247k"`, `2_500_000` → `"2.5M"`,
+/// `12_000_000` → `"12M"`. One decimal at the low end of each
+/// scale, integer at the high end. That keeps the rendered string
+/// narrow without losing useful precision.
+///
+/// Counts large enough to lose precision in the `u64 -> f64`
+/// cast (>2^53) are well past anything a context window or a
+/// realistic session would reach.
+#[allow(clippy::as_conversions)]
+pub fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        format!("{n}")
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else if n < 1_000_000 {
+        // Half-up rounding to the nearest thousand. Integer
+        // division truncates, so adding 500 first picks the
+        // closer thousand without floating-point.
+        format!("{}k", (n + 500) / 1_000)
+    } else if n < 10_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{}M", (n + 500_000) / 1_000_000)
+    }
+}
+
+/// Format the footer's agent-activity part as `"1 agent (hint)"` /
+/// `"2 agents, 1 task (hint)"`. Each count appears only when nonzero;
+/// `agents == 0 && tasks == 0` is never passed (callers suppress the
+/// part entirely). `open_hint` is the frontend-resolved key label
+/// that opens the agent picker.
+pub fn format_agent_activity(agents: usize, tasks: usize, open_hint: &str) -> String {
+    let mut parts = Vec::new();
+    if agents > 0 {
+        let noun = if agents == 1 { "agent" } else { "agents" };
+        parts.push(format!("{agents} {noun}"));
+    }
+    if tasks > 0 {
+        let noun = if tasks == 1 { "task" } else { "tasks" };
+        parts.push(format!("{tasks} {noun}"));
+    }
+    format!("{} ({open_hint})", parts.join(", "))
+}
+
 /// Displayable state for one agent: its settings identity plus the
 /// context-occupancy pair.
 #[derive(Debug, Clone)]
@@ -274,5 +378,86 @@ mod tests {
         f.note_settings(AgentId::Sub(2), settings("haiku", "off"), 100_000);
         assert_eq!(f.settings(AgentId::Sub(2)), Some(&settings("haiku", "off")));
         assert_eq!(f.settings(AgentId::Sub(9)), None);
+    }
+
+    /// Sanity-check the scale-aware token formatter at each band
+    /// boundary so a refactor can't silently change displayed values.
+    #[test]
+    fn format_tokens_spans_all_bands() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(987), "987");
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(format_tokens(2_500), "2.5k");
+        assert_eq!(format_tokens(9_999), "10.0k");
+        assert_eq!(format_tokens(10_000), "10k");
+        assert_eq!(format_tokens(247_321), "247k");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(2_500_000), "2.5M");
+        assert_eq!(format_tokens(12_000_000), "12M");
+    }
+
+    #[test]
+    fn context_usage_display_renders_unknown_tokens_as_question_mark() {
+        let d = context_usage_display(ContextUsage {
+            tokens: None,
+            context_window: 200_000,
+        })
+        .expect("non-empty window should render");
+        assert_eq!(d.ratio, "?/200k");
+        assert_eq!(d.percent, None);
+        assert_eq!(d.severity, UsageSeverity::Normal);
+    }
+
+    #[test]
+    fn context_usage_display_suppresses_zero_window() {
+        assert!(
+            context_usage_display(ContextUsage {
+                tokens: Some(1_000),
+                context_window: 0,
+            })
+            .is_none(),
+            "a 0-token context window suppresses the indicator",
+        );
+    }
+
+    /// The severity thresholds are strict: exactly 70% / 90% stay a
+    /// band lower, one token past crosses.
+    #[test]
+    fn context_usage_display_classifies_thresholds() {
+        let severity = |tokens: u64| {
+            context_usage_display(ContextUsage {
+                tokens: Some(tokens),
+                context_window: 200_000,
+            })
+            .expect("rendered")
+            .severity
+        };
+        assert_eq!(severity(20_000), UsageSeverity::Normal);
+        assert_eq!(severity(140_000), UsageSeverity::Normal);
+        assert_eq!(severity(140_001), UsageSeverity::Warning);
+        assert_eq!(severity(180_000), UsageSeverity::Warning);
+        assert_eq!(severity(180_001), UsageSeverity::Critical);
+    }
+
+    #[test]
+    fn context_usage_display_formats_ratio_and_percent() {
+        let d = context_usage_display(ContextUsage {
+            tokens: Some(20_000),
+            context_window: 200_000,
+        })
+        .expect("rendered");
+        assert_eq!(d.ratio, "20k/200k");
+        assert_eq!(d.percent.as_deref(), Some("(10.0%)"));
+    }
+
+    #[test]
+    fn format_agent_activity_handles_counts_and_plurals() {
+        assert_eq!(format_agent_activity(1, 0, "alt+a"), "1 agent (alt+a)");
+        assert_eq!(format_agent_activity(3, 0, "alt+a"), "3 agents (alt+a)");
+        assert_eq!(format_agent_activity(0, 1, "alt+a"), "1 task (alt+a)");
+        assert_eq!(
+            format_agent_activity(2, 2, "alt+a"),
+            "2 agents, 2 tasks (alt+a)",
+        );
     }
 }

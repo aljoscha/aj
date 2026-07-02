@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use aj_app::chat::{ChatState, Entry, EntryKind, NoticeLevel, UserEntry};
+use aj_app::footer::format_tokens;
 use aj_app::theme::{Theme, ThemeBg, ThemeColor, ThemeRgb};
 use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
@@ -23,9 +24,11 @@ use vaxis::vxfw::{
 
 use crate::bubble::Bubble;
 use crate::subagent_box::{SubAgentBox, build_subagent_box};
-use crate::tool_cell::{HintKind, build_tool_cell, expand_hint};
+use crate::tool_cell::{EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint};
 
-/// Pre-resolved vaxis styles for the transcript's row kinds.
+/// Pre-resolved vaxis styles for the transcript's row kinds. The
+/// status chrome (loader, footer, pending box) shares the same
+/// palette, so its widgets hold a clone too.
 ///
 /// Resolved once from the theme at construction. The theme's
 /// `ColorMode` (truecolor vs 256-color downsampling) is not applied
@@ -39,6 +42,9 @@ pub(crate) struct TranscriptStyles {
     pub(crate) warning: Style,
     pub(crate) error: Style,
     pub(crate) success: Style,
+    /// The theme's primary accent, where `aj` uses its cyan (the
+    /// loader spinner, the pending box's kind label).
+    pub(crate) accent: Style,
     /// Bold tool name in a tool cell's header.
     pub(crate) bold: Style,
     pub(crate) diff_add: Style,
@@ -70,6 +76,7 @@ impl TranscriptStyles {
             warning: fg(ThemeColor::Warning),
             error: fg(ThemeColor::Error),
             success: fg(ThemeColor::Success),
+            accent: fg(ThemeColor::Accent),
             bold: Style {
                 bold: true,
                 ..fg(ThemeColor::ToolTitle)
@@ -172,6 +179,7 @@ pub(crate) fn build_entry_widget(
         _ => EntryWidget::Rich(RichText::new(entry_spans(
             entry,
             chat.hide_thinking_block,
+            chat.tools_expanded,
             styles,
         ))),
     }
@@ -221,16 +229,17 @@ fn build_user_bubble(user: &UserEntry, expanded: bool, styles: &TranscriptStyles
             },
         ));
     }
-    Bubble {
-        text: spans,
-        bg: Some(styles.user_message_bg),
-        base: styles.text,
-    }
+    Bubble::entry(spans, Some(styles.user_message_bg), styles.text)
 }
 
 /// Build the styled spans for one entry, ending in a blank spacer row
 /// so consecutive entries don't visually collide.
-fn entry_spans(entry: &Entry, hide_thinking: bool, styles: &TranscriptStyles) -> Vec<TextSpan> {
+fn entry_spans(
+    entry: &Entry,
+    hide_thinking: bool,
+    tools_expanded: bool,
+    styles: &TranscriptStyles,
+) -> Vec<TextSpan> {
     let span = |text: String, style: Style| TextSpan {
         text,
         style,
@@ -274,9 +283,30 @@ fn entry_spans(entry: &Entry, hide_thinking: bool, styles: &TranscriptStyles) ->
         // enough.
         EntryKind::Tool(_) => Vec::new(),
         EntryKind::SubAgent(s) => vec![span(format!("[sub-agent {}]", s.child), styles.dim)],
-        // Phase-7 placeholder: compaction rows get a real widget in a
-        // later chunk.
-        EntryKind::Compaction(_) => vec![span("[compaction]".to_string(), styles.dim)],
+        // The durable record of a context compaction: a dim header
+        // stating the token delta, expandable to the generated
+        // summary. Folding rides the session-wide `tools_expanded`
+        // flag, the same one tool bodies honor, so a compaction
+        // summary expands and collapses together with tool results
+        // under one keystroke.
+        EntryKind::Compaction(c) => {
+            // One-column inset like the notice rows, no vertical
+            // padding of its own (the trailing spacer supplies the
+            // gap).
+            let mut header = format!(" {}", compaction_header(c.tokens_before, c.tokens_after));
+            if !tools_expanded && !c.summary.is_empty() {
+                header.push_str(&format!(" ({EXPAND_KEY_LABEL} to expand)"));
+            }
+            let mut spans = vec![span(header, styles.dim)];
+            if tools_expanded && !c.summary.is_empty() {
+                // Markdown rendering is deferred, so the summary
+                // shows as plain wrapped text, separated from the
+                // header by one blank row.
+                spans.push(span("\n\n".to_string(), styles.text));
+                spans.push(span(c.summary.clone(), styles.text));
+            }
+            spans
+        }
         // Notice and usage rows carry the same one-column left inset
         // the tool bubbles have, so the transcript's left edge lines
         // up. Wrapped continuation lines start at column zero, which
@@ -301,6 +331,23 @@ fn entry_spans(entry: &Entry, hide_thinking: bool, styles: &TranscriptStyles) ->
     // engine renders as a blank spacer row.
     spans.push(span("\n\n".to_string(), styles.text));
     spans
+}
+
+/// Header line for a compaction row: `Context compacted: 152k → 48k
+/// tokens (freed 68%)`. `freed` is `0` when occupancy didn't drop (a
+/// degenerate compaction), avoiding a misleading negative percentage.
+#[allow(clippy::as_conversions)]
+fn compaction_header(tokens_before: u64, tokens_after: u64) -> String {
+    let freed = if tokens_before > tokens_after && tokens_before > 0 {
+        ((tokens_before - tokens_after) as f64 / tokens_before as f64 * 100.0).round() as u64
+    } else {
+        0
+    };
+    format!(
+        "Context compacted: {} → {} tokens (freed {freed}%)",
+        format_tokens(tokens_before),
+        format_tokens(tokens_after),
+    )
 }
 
 /// The chat area: a follow-tail `ListView` over the active transcript,
@@ -466,7 +513,9 @@ impl Widget for TranscriptView {
 
 #[cfg(test)]
 mod tests {
-    use aj_app::chat::{AssistantEntry, EntryId, NoticeEntry, Transcript, UserEntry};
+    use aj_app::chat::{
+        AssistantEntry, CompactionEntry, EntryId, NoticeEntry, Transcript, UserEntry,
+    };
     use aj_models::types::{
         AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, UserContent,
     };
@@ -532,7 +581,7 @@ mod tests {
             content: vec![UserContent::text("hello")],
             collapsible: false,
         }));
-        let spans = entry_spans(&t.entries()[0], false, &styles());
+        let spans = entry_spans(&t.entries()[0], false, false, &styles());
         assert_eq!(joined(&spans), "\n\n");
     }
 
@@ -667,7 +716,7 @@ mod tests {
             ]),
             finalized: true,
         }));
-        let spans = entry_spans(&t.entries()[0], false, &styles());
+        let spans = entry_spans(&t.entries()[0], false, false, &styles());
         // Trailing newline of the last block is normalized so the
         // spacer contributes exactly one blank row.
         assert_eq!(joined(&spans), "Thinking: pondering\n\nanswer\n\n");
@@ -683,7 +732,7 @@ mod tests {
             })]),
             finalized: true,
         }));
-        let spans = entry_spans(&t.entries()[0], true, &styles());
+        let spans = entry_spans(&t.entries()[0], true, false, &styles());
         assert_eq!(joined(&spans), "Thinking…\n\n");
     }
 
@@ -697,7 +746,7 @@ mod tests {
             })]),
             finalized: true,
         }));
-        let spans = entry_spans(&t.entries()[0], false, &styles());
+        let spans = entry_spans(&t.entries()[0], false, false, &styles());
         assert_eq!(joined(&spans), "[Redacted thinking: ]\n\n");
     }
 
@@ -713,7 +762,7 @@ mod tests {
                 level,
                 text: "note".into(),
             }));
-            let spans = entry_spans(&t.entries()[0], false, &s);
+            let spans = entry_spans(&t.entries()[0], false, false, &s);
             assert_eq!(spans[0].style, style);
         }
     }
@@ -726,7 +775,7 @@ mod tests {
             level: NoticeLevel::Info,
             text: "note".into(),
         }));
-        let spans = entry_spans(&t.entries()[0], false, &styles());
+        let spans = entry_spans(&t.entries()[0], false, false, &styles());
         assert_eq!(joined(&spans), " note\n\n");
 
         let t = transcript_with(EntryKind::TurnUsage(aj_app::chat::TurnUsageEntry {
@@ -742,8 +791,67 @@ mod tests {
                 turn_cache_read: 0,
             },
         }));
-        let spans = entry_spans(&t.entries()[0], false, &styles());
+        let spans = entry_spans(&t.entries()[0], false, false, &styles());
         assert!(joined(&spans).starts_with(" Token Usage"), "{spans:?}");
+    }
+
+    /// The freed percentage rounds from the token delta and clamps at
+    /// 0 when occupancy didn't drop.
+    #[test]
+    fn compaction_header_states_freed_percentage_and_clamps() {
+        assert_eq!(
+            compaction_header(100_000, 25_000),
+            "Context compacted: 100k → 25k tokens (freed 75%)",
+        );
+        assert_eq!(
+            compaction_header(1_000, 2_000),
+            "Context compacted: 1.0k → 2.0k tokens (freed 0%)",
+        );
+        assert_eq!(
+            compaction_header(0, 0),
+            "Context compacted: 0 → 0 tokens (freed 0%)",
+        );
+    }
+
+    fn compaction(summary: &str) -> Transcript {
+        transcript_with(EntryKind::Compaction(CompactionEntry {
+            tokens_before: 100_000,
+            tokens_after: 25_000,
+            summary: summary.into(),
+        }))
+    }
+
+    #[test]
+    fn collapsed_compaction_hides_summary_and_advertises_expand() {
+        let t = compaction("secret summary body");
+        let spans = entry_spans(&t.entries()[0], false, false, &styles());
+        let text = joined(&spans);
+        assert!(text.contains("Context compacted"), "{text:?}");
+        assert!(text.contains("(freed 75%)"), "{text:?}");
+        assert!(text.contains("(Alt+O to expand)"), "{text:?}");
+        assert!(!text.contains("secret summary body"), "{text:?}");
+        assert!(text.starts_with(' '), "one-column inset: {text:?}");
+        assert_eq!(spans[0].style, styles().dim, "dim header");
+    }
+
+    /// With nothing to reveal there is nothing to advertise.
+    #[test]
+    fn collapsed_compaction_without_summary_has_no_expand_hint() {
+        let t = compaction("");
+        let spans = entry_spans(&t.entries()[0], false, false, &styles());
+        assert!(!joined(&spans).contains("to expand"), "{spans:?}");
+    }
+
+    #[test]
+    fn expanded_compaction_shows_summary_after_a_blank_row() {
+        let t = compaction("the full summary body");
+        let spans = entry_spans(&t.entries()[0], false, true, &styles());
+        let text = joined(&spans);
+        assert!(!text.contains("to expand"), "{text:?}");
+        assert!(
+            text.contains("tokens (freed 75%)\n\nthe full summary body"),
+            "blank row between header and body: {text:?}",
+        );
     }
 
     /// A full draw over a populated model must not panic and must pin

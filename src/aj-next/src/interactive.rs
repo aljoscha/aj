@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::queue::MessageQueues;
 use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
 use aj_app::commands::load_model_catalog;
@@ -35,10 +36,13 @@ use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
     AsyncApp, DrawContext, Event, EventContext, FlexColumn, FlexItem, Options, Surface, Text,
-    TextField, Widget, WidgetRef, draw_widget, to_widget_ref,
+    TextField, UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
-use crate::transcript::TranscriptView;
+use crate::footer::FooterLine;
+use crate::pending::PendingBox;
+use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
+use crate::transcript::{TranscriptStyles, TranscriptView};
 
 /// Everything the select loop mutates besides the `AsyncApp`: the
 /// session core, the shared chat model, and the turn bookkeeping.
@@ -51,6 +55,12 @@ struct World {
     /// loop mutates it (via [`reduce`] and the arm helpers). The view
     /// reads it at draw time. Never borrowed across an await.
     chat: Rc<RefCell<ChatState>>,
+    /// Mirror of the lifecycle bits the status chrome (loader,
+    /// footer) reads at draw time, shared with those widgets and
+    /// refreshed by [`sync_status`] once per loop iteration. The
+    /// `AgentLifecycle` itself stays on `core`, where the reducer and
+    /// the turn-join arm mutate it.
+    status: Rc<RefCell<StatusState>>,
     config: Arc<StdMutex<Config>>,
     run_config: Arc<StdMutex<RunConfigSnapshot>>,
     /// In-flight turns keyed by the agent running them, plus the
@@ -198,6 +208,7 @@ async fn build_world(
     Ok(World {
         core,
         chat: Rc::new(RefCell::new(chat)),
+        status: Rc::new(RefCell::new(StatusState::default())),
         config: Arc::new(StdMutex::new(config)),
         run_config,
         turns: JoinSet::new(),
@@ -286,30 +297,46 @@ fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
     }
 }
 
-/// Outcome of an editor submit.
-enum Submit {
-    /// A turn was spawned (or a notice explains why not).
-    Handled,
-    /// The viewed agent is busy. The caller restores the text into
-    /// the editor.
-    Busy(String),
+/// Mirror the lifecycle bits the status chrome reads into the shared
+/// [`StatusState`] cell, returning whether the viewed agent is busy.
+/// Called once per loop iteration right before rendering, so every
+/// mutation path (event batch, turn join, submits) shares one sync
+/// point and the mirror can't silently drift.
+fn sync_status(world: &World) -> bool {
+    let active = world.chat.borrow().active_view();
+    let life = &world.core.lifecycle;
+    let next = StatusState {
+        running: life.is_running(active),
+        compacting: life.is_compacting(active),
+        sub_agents_running: life
+            .running_agents()
+            .into_iter()
+            .filter(|a| matches!(a, AgentId::Sub(_)))
+            .count(),
+    };
+    *world.status.borrow_mut() = next;
+    next.busy()
 }
 
-/// Handle an editor submit: spawn a prompt turn on the viewed agent if
-/// it is idle.
+/// Handle an editor submit: spawn a prompt turn on the viewed agent
+/// if it is idle, or queue the text as a follow-up while it is busy.
 ///
-/// While a turn runs, `aj` queues the submit as a follow-up message.
-/// aj-next has no pending-message UI yet, so the simplest faithful
-/// behavior is to refuse and let the caller put the text back in the
-/// editor. Queueing arrives with the pending box in a later phase.
-fn handle_submit(world: &mut World, text: String) -> Submit {
+/// A queued message shows in the pending box (which reads the live
+/// queue snapshot at draw) and is delivered by the post-turn wake:
+/// `handle_turn_join` and the `AgentEnd` trigger in [`drain_events`]
+/// both spawn a wake when `message_queues.has_pending`. Steering
+/// (Alt+Enter) and dequeue-to-edit (Up / Alt+Up) are phase 8, as is
+/// editor history (the vaxis `TextField` has none yet, where `aj`
+/// records the queued text into its editor history here).
+fn handle_submit(world: &mut World, text: String) {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
-        return Submit::Handled;
+        return;
     }
     let target = world.chat.borrow().active_view();
     if world.turn_cancels.contains_key(&target) || world.core.is_running(target) {
-        return Submit::Busy(trimmed);
+        world.core.message_queues.append_follow_up(target, &trimmed);
+        return;
     }
     let policy = turn_policy(target, &world.config);
     // The user's message row arrives back over the bus as
@@ -326,7 +353,6 @@ fn handle_submit(world: &mut World, text: String) -> Submit {
     if !spawned {
         fold_notice(world, "This agent can't be prompted.");
     }
-    Submit::Handled
 }
 
 /// Handle one completed turn from the join set. Returns `Err` only for
@@ -414,9 +440,12 @@ fn cancel_viewed_turn(world: &World) -> bool {
 /// The root widget: the base layout plus the editor submit plumbing.
 struct Shell {
     layout: WidgetRef,
-    /// Typed handle to the editor so `Init` can focus it and the host
-    /// can restore refused submits.
+    /// Typed handle to the editor so `Init` can focus it.
     editor: Rc<RefCell<TextField>>,
+    /// Typed handle to the loader line so host-posted app events (the
+    /// busy-edge wake, see [`drive`]) reach it. The loader is not on
+    /// the focus path, so the Shell forwards from its capturing phase.
+    status_line: Rc<RefCell<StatusLine>>,
     /// Latest submitted editor text, parked by the `on_submit`
     /// callback for the host loop to collect after dispatch. The
     /// callback can't spawn turns itself (it has no session access).
@@ -424,29 +453,52 @@ struct Shell {
 }
 
 impl Shell {
-    fn new(chat: Rc<RefCell<ChatState>>, theme: &Theme, header: String, footer: String) -> Shell {
+    fn new(
+        chat: Rc<RefCell<ChatState>>,
+        status: Rc<RefCell<StatusState>>,
+        queues: MessageQueues,
+        theme: &Theme,
+        header: String,
+        cwd: String,
+    ) -> Shell {
         let submitted: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let editor = Rc::new(RefCell::new(TextField::new()));
         {
             let slot = Rc::clone(&submitted);
-            // The TextField clears itself on submit. The host restores
-            // the text if the submit is refused.
+            // The TextField clears itself on submit. A busy-agent
+            // submit is queued (not restored), so the clear is right
+            // either way.
             editor.borrow_mut().on_submit = Some(Box::new(move |_ctx, text| {
                 *slot.borrow_mut() = Some(text.to_string());
             }));
         }
-        let transcript = Rc::new(RefCell::new(TranscriptView::new(chat, theme)));
+        let styles = Rc::new(TranscriptStyles::from_theme(theme));
+        let transcript = Rc::new(RefCell::new(TranscriptView::new(Rc::clone(&chat), theme)));
+        let status_line = StatusLine::new(Rc::clone(&chat), Rc::clone(&status), Rc::clone(&styles));
+        let pending = Rc::new(RefCell::new(PendingBox::new(
+            Rc::clone(&chat),
+            queues,
+            Rc::clone(&styles),
+        )));
+        let footer = Rc::new(RefCell::new(FooterLine::new(chat, status, styles, cwd)));
+        // Slot order mirrors `aj`'s layout: header, chat (flex),
+        // status, pending, editor, footer. The status and pending
+        // slots collapse to zero height while idle/empty, so the
+        // editor sits flush under the chat between turns.
         let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
             children: vec![
                 FlexItem::init(Rc::new(RefCell::new(Text::new(&header))), 0),
                 FlexItem::init(to_widget_ref(transcript), 1),
+                FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
+                FlexItem::init(to_widget_ref(pending), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
-                FlexItem::init(Rc::new(RefCell::new(Text::new(&footer))), 0),
+                FlexItem::init(to_widget_ref(footer), 0),
             ],
         }));
         Shell {
             layout,
             editor,
+            status_line,
             submitted,
         }
     }
@@ -454,11 +506,6 @@ impl Shell {
     /// Collect a submit parked by the editor callback, if any.
     fn take_submitted(&self) -> Option<String> {
         self.submitted.borrow_mut().take()
-    }
-
-    /// Put refused submit text back into the (already cleared) editor.
-    fn restore_editor_text(&self, text: &str) {
-        self.editor.borrow_mut().insert_slice_at_cursor(text);
     }
 }
 
@@ -469,6 +516,16 @@ impl Widget for Shell {
         // takes no events, and the children (transcript, editor) keep
         // their own identities for hit-testing.
         draw_widget(&self.layout, ctx)
+    }
+
+    fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        // Host-posted app events target the focused widget (the
+        // editor), but the loader is what needs them. The Shell is
+        // the root of every focus path, so forward from the capturing
+        // phase without consuming.
+        if let Event::App(_) = event {
+            self.status_line.borrow_mut().handle_event(ctx, event);
+        }
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
@@ -524,18 +581,14 @@ pub async fn run(args: Args) -> Result<()> {
     // the phase-6 default.
     let theme = Theme::bundled_dark();
     let header = format!("aj-next — {}", world.core.session_id);
-    let footer = {
-        let chat = world.chat.borrow();
-        match chat.footers().model_line(AgentId::Main) {
-            Some(line) => format!("{line} — ctrl+c to quit"),
-            None => "ctrl+c to quit".to_string(),
-        }
-    };
+    let cwd = format!("{}", world.core.env.working_directory.display());
     let shell = Rc::new(RefCell::new(Shell::new(
         Rc::clone(&world.chat),
+        Rc::clone(&world.status),
+        world.core.message_queues.clone(),
         &theme,
         header,
-        footer,
+        cwd,
     )));
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
 
@@ -570,6 +623,9 @@ async fn drive(
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
 ) -> Result<()> {
+    // Rising-edge tracker for the loader's animation: the tick chain
+    // is armed once per idle-to-busy transition, not per iteration.
+    let mut was_busy = false;
     loop {
         // Compute the tick deadline before the select so no arm holds
         // a borrow of `app` another arm needs. The sleep expression is
@@ -625,10 +681,8 @@ async fn drive(
                             if app.handle_input(event).quit {
                                 break;
                             }
-                            if let Some(text) = shell.borrow().take_submitted()
-                                && let Submit::Busy(text) = handle_submit(world, text)
-                            {
-                                shell.borrow().restore_editor_text(&text);
+                            if let Some(text) = shell.borrow().take_submitted() {
+                                handle_submit(world, text);
                             }
                         }
                     }
@@ -646,6 +700,19 @@ async fn drive(
                 }
             }
         }
+        // One status sync per iteration, whatever the arm did. On the
+        // idle-to-busy edge, post the loader wake: widgets can only
+        // schedule ticks from an event handler, so the host hands the
+        // loader an app event to arm its animation chain (the Shell
+        // forwards it, see `Shell::capture_event`).
+        let busy = sync_status(world);
+        if busy && !was_busy {
+            let _ = app.post_app_event(UserEvent {
+                name: STATUS_WAKE_EVENT.to_string(),
+                data: None,
+            });
+        }
+        was_busy = busy;
         app.render_if_needed(root)?;
     }
 
@@ -709,9 +776,11 @@ mod tests {
     fn test_shell() -> Rc<RefCell<Shell>> {
         Rc::new(RefCell::new(Shell::new(
             empty_chat(),
+            Rc::new(RefCell::new(StatusState::default())),
+            MessageQueues::default(),
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
             "aj-next".to_string(),
-            "ctrl+c to quit".to_string(),
+            "/tmp".to_string(),
         )))
     }
 
@@ -831,10 +900,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        assert!(matches!(
-            handle_submit(&mut world, "hi there".to_string()),
-            Submit::Handled
-        ));
+        handle_submit(&mut world, "hi there".to_string());
         assert!(world.turn_cancels.contains_key(&AgentId::Main));
 
         // Turn-join arm.
@@ -938,10 +1004,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "background-task").await;
 
-        assert!(matches!(
-            handle_submit(&mut world, "run it".to_string()),
-            Submit::Handled
-        ));
+        handle_submit(&mut world, "run it".to_string());
         let joined = join_next_or_pending(&mut world.turns).await;
         handle_turn_join(&mut world, joined).expect("prompt turn settles");
 
@@ -1034,24 +1097,86 @@ mod tests {
         );
     }
 
-    /// A busy submit is refused and handed back for the editor.
+    /// A submit while the viewed agent runs queues a follow-up: the
+    /// pending snapshot fills, the post-turn wake consumes it, and
+    /// the queued text lands in the transcript as a user entry.
     #[tokio::test]
-    async fn submit_while_running_is_refused_with_the_text() {
+    async fn submit_while_running_queues_and_the_wake_delivers_it() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        assert!(matches!(
-            handle_submit(&mut world, "first".to_string()),
-            Submit::Handled
-        ));
-        match handle_submit(&mut world, "second".to_string()) {
-            Submit::Busy(text) => assert_eq!(text, "second"),
-            Submit::Handled => panic!("busy submit must be refused"),
+        handle_submit(&mut world, "first".to_string());
+        assert!(world.turn_cancels.contains_key(&AgentId::Main));
+
+        // Wait until the prompt's own user message landed before
+        // queueing: the turn drains the follow-up queue right at its
+        // start (before appending the prompt), so a message queued
+        // before that point would be delivered by the first turn
+        // instead of the wake.
+        let saw_prompt = |world: &World| {
+            let chat = world.chat.borrow();
+            chat.transcript(AgentId::Main)
+                .expect("main transcript")
+                .entries()
+                .iter()
+                .any(|e| matches!(&e.kind, EntryKind::User(u) if u.joined_text() == "first"))
+        };
+        while !saw_prompt(&world) {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                world.core.event_rx.recv(),
+            )
+            .await
+            .expect("an event arrives before the timeout")
+            .expect("event channel open");
+            let _ = drain_events(&mut world, event);
         }
 
-        // Wind the spawned turn down so the test doesn't leak it.
+        handle_submit(&mut world, "second".to_string());
+        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        assert_eq!(
+            snapshot.kind,
+            Some(aj_agent::queue::PendingKind::FollowUp),
+            "busy submit queues instead of spawning",
+        );
+        assert_eq!(snapshot.text, "second");
+
+        // First turn settles; the join handler sees the pending
+        // follow-up and spawns the wake turn.
         let joined = join_next_or_pending(&mut world.turns).await;
-        handle_turn_join(&mut world, joined).expect("turn settles");
+        handle_turn_join(&mut world, joined).expect("prompt turn settles");
+        assert!(
+            world.turn_cancels.contains_key(&AgentId::Main),
+            "post-turn wake spawned for the pending message",
+        );
+
+        // The wake consumes the queue and delivers the message.
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("wake turn settles");
+        assert!(
+            world
+                .core
+                .message_queues
+                .snapshot(AgentId::Main)
+                .kind
+                .is_none(),
+            "queue drained by the wake",
+        );
+        while let Ok(event) = world.core.event_rx.try_recv() {
+            let _ = drain_events(&mut world, event);
+        }
+        let chat = world.chat.borrow();
+        let entries = chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries();
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.kind,
+                EntryKind::User(u) if u.joined_text() == "second"
+            )),
+            "queued text landed as a user entry",
+        );
     }
 
     /// Ctrl+C with a driven turn cancels it (and is absorbed); with
@@ -1063,10 +1188,7 @@ mod tests {
 
         assert!(!cancel_viewed_turn(&world), "idle: fall through to quit");
 
-        assert!(matches!(
-            handle_submit(&mut world, "go".to_string()),
-            Submit::Handled
-        ));
+        handle_submit(&mut world, "go".to_string());
         assert!(cancel_viewed_turn(&world), "running turn is cancelled");
 
         let joined = join_next_or_pending(&mut world.turns).await;

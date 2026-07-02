@@ -44,7 +44,7 @@ const BASH_COLLAPSED_LINES: usize = 5;
 /// Hardcoded to the default `aj.tools.expand` binding (alt+o, see
 /// `aj_app::keybindings::AJ_KEYBINDINGS`). The real keymap engine
 /// that resolves configured bindings is phase 8.
-const EXPAND_KEY_LABEL: &str = "Alt+O";
+pub(crate) const EXPAND_KEY_LABEL: &str = "Alt+O";
 
 /// Whether a collapse hint describes head- or tail-truncated content.
 /// The phrasing (`N more lines` vs `N earlier lines`) keeps the hint
@@ -524,11 +524,7 @@ pub(crate) fn build_tool_cell(
         // Header-only: just the wrapped header line, no bubble,
         // background, or body, so the tool composes inside the
         // sub-agent box's own painted background.
-        return Bubble {
-            text: flatten_lines(vec![header], styles),
-            bg: None,
-            base: styles.text,
-        };
+        return Bubble::entry(flatten_lines(vec![header], styles), None, styles.text);
     }
 
     // A freshly started call has no details yet: the bubble shows
@@ -542,11 +538,7 @@ pub(crate) fn build_tool_cell(
         VisualStatus::Succeeded => styles.tool_success_bg,
         VisualStatus::Failed => styles.tool_error_bg,
     };
-    Bubble {
-        text: flatten_lines(lines, styles),
-        bg: Some(bg),
-        base: styles.text,
-    }
+    Bubble::entry(flatten_lines(lines, styles), Some(bg), styles.text)
 }
 
 #[cfg(test)]

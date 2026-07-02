@@ -12,7 +12,10 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod bubble;
+mod footer;
 mod interactive;
+mod pending;
+mod status;
 mod subagent_box;
 #[cfg(test)]
 mod test_support;
