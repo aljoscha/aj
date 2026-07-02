@@ -19,6 +19,7 @@ use aj_session::ConversationPersistence;
 use anyhow::Result;
 
 pub mod auth;
+pub mod chat;
 pub mod cli;
 pub mod clipboard;
 pub mod commands;
