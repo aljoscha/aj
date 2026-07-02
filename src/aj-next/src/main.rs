@@ -12,6 +12,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod interactive;
+mod transcript;
 
 #[tokio::main]
 async fn main() -> Result<()> {

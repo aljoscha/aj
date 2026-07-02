@@ -139,12 +139,17 @@ dependencies = [
 name = "aj-next"
 version = "0.1.0"
 dependencies = [
+ "aj-agent",
  "aj-app",
  "aj-conf",
+ "aj-models",
+ "aj-session",
  "anyhow",
  "clap",
  "dotenv",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "vaxis",

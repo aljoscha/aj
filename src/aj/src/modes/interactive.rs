@@ -30,10 +30,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
-use aj_agent::{Agent, TurnError};
 use aj_app::settings::{
     ConfigLayers, ConfigTarget, FooterUpdate, MainConfirm, PersistAction, SpeedConfirm, SubConfirm,
     persist_setting, persist_user,
@@ -121,7 +121,7 @@ use crate::modes::interactive::shutdown::{
     print_resume_hint, print_session_usage, print_usage_summary,
 };
 use crate::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
-use crate::turn::{TurnPolicy, TurnStart};
+use crate::turn::{TurnPolicy, TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn};
 
 /// User-facing notice shown when a session-changing command
 /// (resume, new) is invoked while a turn is in flight.
@@ -1951,83 +1951,6 @@ async fn recv_event(rx: &mut UnboundedReceiver<AgentEvent>) -> Option<AgentEvent
     rx.recv().await
 }
 
-/// Spawn a turn sequence for `target` onto `turns`: resolve the agent
-/// handle, mint the per-sequence cancel token (into `turn_cancels`,
-/// which Ctrl+C fires), and drive `start` plus its automatic
-/// continuations via [`crate::turn::drive_turn`]. The spawned task
-/// re-stamps the staged run config before each inference. Returns
-/// `false` without spawning when `target` has no live handle (e.g. a
-/// resumed sub-agent).
-fn spawn_turn(
-    core: &SessionCore,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    target: AgentId,
-    start: TurnStart,
-    policy: TurnPolicy,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
-) -> bool {
-    let Some(handle) = core.resolve_agent(target) else {
-        return false;
-    };
-    let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
-    let log = Arc::clone(&core.log);
-    let turn_cancel = CancellationToken::new();
-    turn_cancels.insert(target, turn_cancel.clone());
-    turns.spawn(async move {
-        let mut a = handle.lock().await;
-        let result = crate::turn::drive_turn(
-            &mut a,
-            &log,
-            &policy,
-            start,
-            |agent: &mut Agent| {
-                crate::turn::apply_turn_config(
-                    target,
-                    agent,
-                    &run_config_for_turn,
-                    &sub_overrides_for_turn,
-                );
-            },
-            turn_cancel,
-        )
-        .await;
-        (target, result)
-    });
-    true
-}
-
-/// Spawn a wake turn on `owner` if it is idle, delivering queued
-/// notices / messages. This is the single post-turn wake path: the
-/// driver itself does not deliver queued work, so the loop starts a
-/// wake here whenever an agent has work pending and no turn in flight.
-/// A busy owner is left alone (its running turn drains steering
-/// mid-flight). Both wake triggers may fire for the same notice;
-/// `Agent::wake` returns `Empty` (emitting nothing) once the queue is
-/// drained, so the loser is a cheap no-op.
-fn spawn_wake_turn(
-    owner: AgentId,
-    core: &SessionCore,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    policy: TurnPolicy,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
-) {
-    if turn_cancels.contains_key(&owner) || core.is_running(owner) {
-        return;
-    }
-    spawn_turn(
-        core,
-        run_config,
-        owner,
-        TurnStart::Wake,
-        policy,
-        turns,
-        turn_cancels,
-    );
-}
-
 /// Spawn a user-prompt turn for `target`. Resolves the handle first and
 /// leaves the editor intact on a miss (returning `false`) so the caller
 /// can surface a notice and the user keeps their text; otherwise clears
@@ -2095,22 +2018,6 @@ fn yank_pending_into_editor(
 /// case a future state needs to hard-disable submit.
 fn sync_editor_enabled(tui: &mut Tui) {
     set_editor_submit_enabled(tui, true);
-}
-
-/// Await the next completed turn, or pend forever when no turn is
-/// in flight (mirrors the old `task_done` future so the select arm
-/// stays simple).
-async fn join_next_or_pending(
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-) -> Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError> {
-    if turns.is_empty() {
-        std::future::pending().await
-    } else {
-        turns
-            .join_next()
-            .await
-            .expect("non-empty JoinSet yields Some")
-    }
 }
 
 /// Pull one [`Theme`] off the theme-watcher channel. Mirrors the

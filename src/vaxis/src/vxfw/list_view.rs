@@ -289,14 +289,26 @@ impl ListView {
         let Some(count) = self.known_item_count() else {
             return;
         };
-        self.scroll = if count == 0 {
-            Scroll::default()
-        } else {
-            Scroll {
-                top: count - 1,
-                ..Scroll::default()
-            }
+        // Position the window one past the last item. The next draw's downward
+        // fill then runs out immediately and the back-fill lays out a full
+        // viewport ending at the last item's bottom edge. Anchoring at
+        // `count - 1` instead would pin the viewport to the top of the last
+        // item, hiding its tail whenever it is taller than the viewport.
+        self.scroll = Scroll {
+            top: count,
+            ..Scroll::default()
         };
+    }
+
+    /// Whether the last draw reached the end of the list, i.e. the
+    /// final item's bottom edge landed inside the viewport and the
+    /// list is scrolled to the bottom.
+    ///
+    /// Reflects the most recent [`draw`](Widget::draw): scroll events
+    /// only accumulate pending state, so query this after a draw, not
+    /// after an event.
+    pub fn is_at_bottom(&self) -> bool {
+        !self.scroll.has_more
     }
 
     /// Inserts children at the front of `child_list` until `add_height` lines
@@ -865,9 +877,46 @@ mod tests {
         list_view.scroll_to_bottom();
 
         assert_eq!(list_view.cursor, 0);
-        assert_eq!(list_view.scroll.top, 2);
+        // One past the end: the draw back-fills upward from the last item.
+        assert_eq!(list_view.scroll.top, 3);
         assert_eq!(list_view.scroll.offset, 0);
         assert_eq!(list_view.item_count, Some(3));
+    }
+
+    #[test]
+    fn list_view_scroll_to_bottom_shows_the_tail_of_an_oversized_last_item() {
+        // The last item is far taller than the 8-row viewport. Following the
+        // tail must anchor its bottom edge to the viewport bottom, not pin
+        // the viewport to its top rows.
+        let tall = (0..31)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut list_view = ListView::new(Source::Slice(vec![text("a"), text("b"), text(&tall)]));
+
+        let ctx = draw_ctx(16, 8);
+        list_view.scroll_to_bottom();
+        let surface = list_view.draw(&ctx);
+
+        let last = surface.children.last().expect("visible child");
+        assert_eq!(last.surface.size.height, 31);
+        assert_eq!(last.origin.row + i32::from(last.surface.size.height), 8);
+        assert!(list_view.is_at_bottom());
+    }
+
+    #[test]
+    fn list_view_scroll_to_bottom_on_an_underfull_list_anchors_from_the_top() {
+        let mut list_view = ListView::new(Source::Slice(vec![text("a"), text("b"), text("c")]));
+
+        let ctx = draw_ctx(16, 8);
+        list_view.scroll_to_bottom();
+        let surface = list_view.draw(&ctx);
+
+        assert_eq!(surface.children.len(), 3);
+        assert_eq!(surface.children[0].origin.row, 0);
+        assert_eq!(list_view.scroll.top, 0);
+        assert_eq!(list_view.scroll.offset, 0);
+        assert!(list_view.is_at_bottom());
     }
 
     #[test]

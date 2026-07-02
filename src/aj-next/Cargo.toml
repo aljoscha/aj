@@ -8,15 +8,23 @@ name = "aj-next"
 path = "src/main.rs"
 
 [dependencies]
+aj-agent = { path = "../aj-agent/" }
 aj-app = { path = "../aj-app/" }
 aj-conf = { path = "../aj-conf/" }
+aj-models = { path = "../aj-models/" }
+aj-session = { path = "../aj-session/" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 vaxis = { path = "../vaxis/" }
+
+[dev-dependencies]
+aj-app = { path = "../aj-app/", features = ["test-support"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

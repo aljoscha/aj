@@ -25,10 +25,11 @@ use aj_models::types::UserContent;
 use aj_session::ConversationLog;
 use aj_session::compaction::should_compact;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::run_compaction;
-use crate::session::SubAgentOverrides;
+use crate::session::{SessionCore, SubAgentOverrides};
 use crate::session_setup::RunConfigSnapshot;
 
 /// How a turn sequence begins.
@@ -158,6 +159,93 @@ pub fn apply_turn_config(
 /// overflows again. Shared so interactive and print word it identically.
 const OVERFLOW_GIVEUP: &str =
     "context overflow recovery failed; reduce context or switch to a larger-context model";
+
+/// Spawn a turn sequence for `target` onto `turns`: resolve the agent
+/// handle, mint the per-sequence cancel token (into `turn_cancels`,
+/// which the host's Ctrl+C fires), and drive `start` plus its automatic
+/// continuations via [`drive_turn`]. The spawned task re-stamps the
+/// staged run config before each inference. Returns `false` without
+/// spawning when `target` has no live handle (e.g. a resumed
+/// sub-agent).
+pub fn spawn_turn(
+    core: &SessionCore,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    target: AgentId,
+    start: TurnStart,
+    policy: TurnPolicy,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) -> bool {
+    let Some(handle) = core.resolve_agent(target) else {
+        return false;
+    };
+    let run_config_for_turn = Arc::clone(run_config);
+    let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
+    let log = Arc::clone(&core.log);
+    let turn_cancel = CancellationToken::new();
+    turn_cancels.insert(target, turn_cancel.clone());
+    turns.spawn(async move {
+        let mut a = handle.lock().await;
+        let result = drive_turn(
+            &mut a,
+            &log,
+            &policy,
+            start,
+            |agent: &mut Agent| {
+                apply_turn_config(target, agent, &run_config_for_turn, &sub_overrides_for_turn);
+            },
+            turn_cancel,
+        )
+        .await;
+        (target, result)
+    });
+    true
+}
+
+/// Spawn a wake turn on `owner` if it is idle, delivering queued
+/// notices / messages. This is the single post-turn wake path: the
+/// driver itself does not deliver queued work, so the host starts a
+/// wake here whenever an agent has work pending and no turn in flight.
+/// A busy owner is left alone (its running turn drains steering
+/// mid-flight). Both wake triggers may fire for the same notice;
+/// `Agent::wake` returns `Empty` (emitting nothing) once the queue is
+/// drained, so the loser is a cheap no-op.
+pub fn spawn_wake_turn(
+    owner: AgentId,
+    core: &SessionCore,
+    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+    policy: TurnPolicy,
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+) {
+    if turn_cancels.contains_key(&owner) || core.is_running(owner) {
+        return;
+    }
+    spawn_turn(
+        core,
+        run_config,
+        owner,
+        TurnStart::Wake,
+        policy,
+        turns,
+        turn_cancels,
+    );
+}
+
+/// Await the next completed turn, or pend forever when no turn is in
+/// flight, so a host's `select!` arm stays simple.
+pub async fn join_next_or_pending(
+    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
+) -> Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError> {
+    if turns.is_empty() {
+        std::future::pending().await
+    } else {
+        turns
+            .join_next()
+            .await
+            .expect("non-empty JoinSet yields Some")
+    }
+}
 
 /// Drive one turn and its automatic continuations to quiescence.
 ///
