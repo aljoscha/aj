@@ -32,7 +32,7 @@ plan for the shape and phasing, then a spec for the detail.
 | A. `AsyncApp` in vaxis (`vaxis-async-app-spec.md`) | The async vxfw driver: the shared `AppCore`, async capability detection, live resize, teardown, the host `select!` loop | 5 | A-1..A-3 |
 | B. vxfw editor (`vaxis-editor-spec.md`) | The multi-line `TextArea` widget: the shared word engine, kill-ring, undo, history, autocomplete | 5 | B-1..B-4 |
 | C. Chat model + reducer (`aj-app-chat-model-spec.md`) | `ChatState` and the pure `AgentEvent` reducer that both live and replay feed | 6 | C-1..C-4 |
-| E. Alt-screen UX (`vaxis-altscreen-ux-spec.md`) | Follow-tail scrolling, in-app selection/copy, in-transcript search, the overlay/modal stack, focus, exit behavior | 5-9 | E-1..E-5 |
+| E. Alt-screen UX (`vaxis-altscreen-ux-spec.md`) | Follow-tail scrolling, the scrollbar thumb, in-app selection/copy, in-transcript search, the overlay/modal stack, focus, exit behavior | 5-9 | E-1..E-6 |
 | F. Input, keymap, leader sequences (`vaxis-input-keymap-spec.md`) | Capture/bubble dispatch, the `KeymapController`, the leader-sequence engine, the dispatch-debug aids | 5, 8 | F-1..F-4 |
 
 All spec-level decisions (A-F) are resolved. The plan-level decisions D1-D6 are

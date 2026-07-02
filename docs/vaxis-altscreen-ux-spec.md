@@ -43,6 +43,18 @@ can read history while the agent works. Scrolling back to the bottom re-engages
 `follow_tail`. This is the behavior native scrollback gave for free, made
 explicit.
 
+**Scrollbar thumb.** The chat view shows a vertical scrollbar thumb so the
+user can see how much transcript is above and below the viewport, and drag
+it to jump. `vxfw`'s `ScrollBars` widget already wraps a scrollable view
+with a draggable thumb sized from an estimated content extent, so the chat
+`ListView` is wrapped in one. The thumb is only drawn when the transcript
+overflows the viewport (content taller than the slot), matching how a
+native scrollbar hides itself for short content. Dragging the thumb moves
+the viewport directly and disengages `follow_tail`; dragging or scrolling
+back to the bottom re-engages it, the same rule as wheel and page-key
+scrolling. This is a position affordance only, it does not change the
+follow-tail, scroll-input, or selection model above.
+
 **Scroll input routing.** The editor is normally focused (it wants arrows and
 line-editing keys), so transcript scrolling must work without stealing the
 editor's keys:
@@ -274,9 +286,10 @@ session is always on disk and resumable regardless.
 Aligns with the plan's phases 5-9.
 
 - **E1 (with the shell skeleton, plan phase 5):** the base layout `FlexColumn` and
-  the chat `ListView` with follow-tail, wheel + page-key scrolling, and
-  transcript-focus mode (cursor navigation). Exit behavior (clean exit + usage
-  banner + resume hint). No overlays yet.
+  the chat `ListView` (wrapped in `ScrollBars` for the vertical thumb) with
+  follow-tail, wheel + page-key scrolling, and transcript-focus mode (cursor
+  navigation). Exit behavior (clean exit + usage banner + resume hint). No
+  overlays yet.
 - **E2 (with components, plan phase 7):** per-view scroll on `active_view` switch,
   the status/pending/header/footer slots wired to the model, in-app selection
   (mouse drag + auto-scroll, Shift+arrow keyboard selection, select-to-copy via
@@ -312,3 +325,9 @@ Aligns with the plan's phases 5-9.
   highlight machinery. Default trigger Alt+S (not Ctrl+F, which is `forward-char`
   in the editor), plus `/` `?` `n` `N` in transcript-focus mode. Case-insensitive
   smart-case substring, next/prev with scroll-to-match.
+- **E-6. Scrollbar thumb. Resolved: build it.** The chat view shows a vertical
+  scrollbar thumb, via the `vxfw` `ScrollBars` widget wrapping the chat
+  `ListView`. It is drawn only when the transcript overflows the viewport, gives a
+  position affordance and drag-to-jump, and reuses the follow-tail engage/disengage
+  rules. Part of E1 so the position affordance ships with the first chat view, not
+  deferred to polish.
