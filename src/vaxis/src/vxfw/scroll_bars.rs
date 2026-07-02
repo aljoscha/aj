@@ -154,7 +154,7 @@ fn total_item_count(sv: &ScrollView) -> usize {
         Source::Builder(builder) => {
             let cursor = usize::try_from(sv.cursor).expect("cursor fits usize");
             let mut counter = 0;
-            while builder.item(counter, cursor).is_some() {
+            while builder.item_at_idx(counter, cursor).is_some() {
                 counter += 1;
             }
             counter

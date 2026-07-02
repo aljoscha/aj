@@ -22,17 +22,17 @@ use crate::cell::{Cell, Character};
 use crate::key::{Key, Modifiers};
 use crate::mouse;
 use crate::vxfw::{
-    DrawContext, Event, EventContext, ListSource, MaxSize, RelativePoint, Size, Source, SubSurface,
+    Builder, DrawContext, Event, EventContext, MaxSize, RelativePoint, Size, Source, SubSurface,
     Surface, Widget, WidgetRef, draw_widget,
 };
 
-/// Adapts a borrowed slice of widgets to the [`ListSource`] interface.
+/// Adapts a borrowed slice of widgets to the [`Builder`] interface.
 struct SliceBuilder<'a> {
     slice: &'a [WidgetRef],
 }
 
-impl ListSource for SliceBuilder<'_> {
-    fn item(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
+impl Builder for SliceBuilder<'_> {
+    fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         self.slice.get(idx).map(Rc::clone)
     }
 }
@@ -108,9 +108,10 @@ impl Scroll {
 
 /// A two-axis scrolling container of widgets.
 ///
-/// Construct with [`ScrollView::new`] and tweak the public fields. The widget is
-/// stateful and interactive: it overrides [`wants_events`](Widget::wants_events)
-/// and mutates its scroll position during draw.
+/// Construct with [`ScrollView::new`] and tweak `draw_cursor`,
+/// `cursor_indicator`, and `wheel_scroll`. The widget is stateful and
+/// interactive: it overrides [`wants_events`](Widget::wants_events) and mutates
+/// its scroll position during draw.
 pub struct ScrollView {
     pub(crate) children: Source,
     pub(crate) cursor: u32,
@@ -168,7 +169,7 @@ impl ScrollView {
                     let prev = self.cursor;
                     self.cursor += 1;
                     while builder
-                        .item(
+                        .item_at_idx(
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                         )
@@ -204,7 +205,7 @@ impl ScrollView {
                     let prev = self.cursor;
                     self.cursor -= 1;
                     while builder
-                        .item(
+                        .item_at_idx(
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                         )
@@ -237,7 +238,7 @@ impl ScrollView {
     fn insert_children(
         &mut self,
         ctx: &DrawContext,
-        builder: &dyn ListSource,
+        builder: &dyn Builder,
         child_list: &mut Vec<SubSurface>,
         add_height: i32,
     ) {
@@ -250,7 +251,7 @@ impl ScrollView {
         let mut upheight = add_height;
         loop {
             let top = usize::try_from(self.scroll.top).expect("top fits usize");
-            let Some(child) = builder.item(top, cursor) else {
+            let Some(child) = builder.item_at_idx(top, cursor) else {
                 break;
             };
             // Children are drawn with a fully unbounded max so they keep their
@@ -297,7 +298,7 @@ impl ScrollView {
     }
 
     /// Reconciles the pending scroll into a concrete child layout.
-    fn draw_builder(&mut self, ctx: &DrawContext, builder: &dyn ListSource) -> Surface {
+    fn draw_builder(&mut self, ctx: &DrawContext, builder: &dyn Builder) -> Surface {
         let max_size = ctx.max.size();
         let cursor = usize::try_from(self.cursor).expect("cursor fits usize");
         let left = i32::try_from(self.scroll.left).expect("left fits i32");
@@ -329,7 +330,7 @@ impl ScrollView {
         // equivalent, so we break out of a `loop` and set `has_more_vertical` on
         // the run-out path directly.
         loop {
-            let Some(child) = builder.item(i, cursor) else {
+            let Some(child) = builder.item_at_idx(i, cursor) else {
                 self.scroll.has_more_vertical = false;
                 break;
             };
@@ -369,7 +370,7 @@ impl ScrollView {
         // last drawn one. If it does not exist we just drew the final item, so
         // there is nothing more below.
         if self.scroll.has_more_vertical && accumulated_height <= i32::from(max_size.height) {
-            if builder.item(i, cursor).is_none() {
+            if builder.item_at_idx(i, cursor).is_none() {
                 self.scroll.has_more_vertical = false;
             }
         }

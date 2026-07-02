@@ -75,7 +75,7 @@ pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
 pub use crate::vxfw::flex_column::FlexColumn;
 pub use crate::vxfw::flex_row::FlexRow;
-pub use crate::vxfw::list_view::{ListSource, ListView, Source};
+pub use crate::vxfw::list_view::{Builder, ListView, Source};
 pub use crate::vxfw::padding::{PadValues, Padding};
 pub use crate::vxfw::rich_text::{RichText, TextSpan};
 pub use crate::vxfw::scroll_bars::ScrollBars;

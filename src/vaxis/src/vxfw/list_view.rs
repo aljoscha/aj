@@ -27,23 +27,24 @@ use crate::vxfw::{
     WidgetRef, draw_widget,
 };
 
-/// Lazily provides the widget for a list index.
+/// Lazily builds the widget for an item index.
 ///
 /// `idx` is the item index and `cursor` is the list's current cursor index, so
-/// a source can render the cursored row differently. Returning `None` marks the
-/// end of the list: the first index that yields `None` bounds the list.
-pub trait ListSource {
+/// a builder can render the cursored item differently. Returning `None` marks
+/// the end of the list. The first index that yields `None` bounds the list.
+pub trait Builder {
     /// Returns the widget at `idx`, or `None` if `idx` is past the end.
-    fn item(&self, idx: usize, cursor: usize) -> Option<WidgetRef>;
+    fn item_at_idx(&self, idx: usize, cursor: usize) -> Option<WidgetRef>;
 }
 
-/// Where a list-style widget gets its children.
+/// Where a scrolling widget gets its children.
 ///
-/// A `Slice` knows its length up front. A `Builder` is a lazy [`ListSource`],
-/// used for lists too large to materialize or whose rows depend on the cursor.
+/// A `Slice` knows its length up front. A `Builder` lazily builds child widgets
+/// by item index, which is useful for large lists or items whose rendering
+/// depends on the cursor.
 pub enum Source {
     Slice(Vec<WidgetRef>),
-    Builder(Box<dyn ListSource>),
+    Builder(Box<dyn Builder>),
 }
 
 impl Default for Source {
@@ -52,7 +53,7 @@ impl Default for Source {
     }
 }
 
-/// Adapts a borrowed slice of widgets to the [`ListSource`] interface.
+/// Adapts a borrowed slice of widgets to the [`Builder`] interface.
 ///
 /// `draw` resolves a `Source::Slice` into one of these so the slice and builder
 /// paths share a single `draw_builder`.
@@ -60,8 +61,8 @@ struct SliceBuilder<'a> {
     slice: &'a [WidgetRef],
 }
 
-impl ListSource for SliceBuilder<'_> {
-    fn item(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
+impl Builder for SliceBuilder<'_> {
+    fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         self.slice.get(idx).map(Rc::clone)
     }
 }
@@ -113,7 +114,7 @@ impl Scroll {
     }
 }
 
-/// The indicator drawn in the cursor gutter next to the cursored row.
+/// The indicator drawn in the cursor gutter next to the cursored item.
 ///
 /// NOTE: This is a const in `ListView` but a field in `ScrollView`, matching
 /// the upstream asymmetry.
@@ -179,7 +180,7 @@ impl ListView {
                     // Walk back until we land on an item that exists, finding the
                     // last item when we stepped past the end.
                     while builder
-                        .item(
+                        .item_at_idx(
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                         )
@@ -215,7 +216,7 @@ impl ListView {
                     let prev = self.cursor;
                     self.cursor -= 1;
                     while builder
-                        .item(
+                        .item_at_idx(
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                             usize::try_from(self.cursor).expect("cursor fits usize"),
                         )
@@ -303,7 +304,7 @@ impl ListView {
     fn insert_children(
         &mut self,
         ctx: &DrawContext,
-        builder: &dyn ListSource,
+        builder: &dyn Builder,
         child_list: &mut Vec<SubSurface>,
         add_height: i32,
     ) {
@@ -315,7 +316,7 @@ impl ListView {
         let mut upheight = add_height;
         loop {
             let top = usize::try_from(self.scroll.top).expect("top fits usize");
-            let Some(child) = builder.item(top, cursor) else {
+            let Some(child) = builder.item_at_idx(top, cursor) else {
                 break;
             };
             // NOTE: plain subtraction for the width here, where the down-loop
@@ -369,7 +370,7 @@ impl ListView {
     ///
     /// `builder` is the resolved source (a slice adapter or the user's builder).
     /// This is the heart of the state machine described in the module docs.
-    fn draw_builder(&mut self, ctx: &DrawContext, builder: &dyn ListSource) -> Surface {
+    fn draw_builder(&mut self, ctx: &DrawContext, builder: &dyn Builder) -> Surface {
         let max_size = ctx.max.size();
         let cursor = usize::try_from(self.cursor).expect("cursor fits usize");
 
@@ -408,7 +409,7 @@ impl ListView {
         // no such construct, so we break out of a `loop` and set `has_more` on
         // the run-out path directly.
         loop {
-            let Some(child) = builder.item(i, cursor) else {
+            let Some(child) = builder.item_at_idx(i, cursor) else {
                 // Ran out of items: nothing more below.
                 self.scroll.has_more = false;
                 break;
@@ -785,8 +786,8 @@ mod tests {
         calls: Rc<StdCell<usize>>,
     }
 
-    impl ListSource for CountingBuilder {
-        fn item(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
+    impl Builder for CountingBuilder {
+        fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
             self.calls.set(self.calls.get() + 1);
             if idx >= self.len {
                 return None;

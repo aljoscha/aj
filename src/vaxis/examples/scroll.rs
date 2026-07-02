@@ -30,7 +30,7 @@ use vaxis::key::{Key, Modifiers};
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    App, DrawContext, Event, EventContext, ListSource, MaxSize, Options, RelativePoint, ScrollBars,
+    App, Builder, DrawContext, Event, EventContext, MaxSize, Options, RelativePoint, ScrollBars,
     ScrollView, Size, Source, SubSurface, Surface, Text, Widget, WidgetRef, draw_widget,
     to_widget_ref,
 };
@@ -109,8 +109,8 @@ struct RowSource {
     rows: Vec<WidgetRef>,
 }
 
-impl ListSource for RowSource {
-    fn item(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
+impl Builder for RowSource {
+    fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         self.rows.get(idx).cloned()
     }
 }

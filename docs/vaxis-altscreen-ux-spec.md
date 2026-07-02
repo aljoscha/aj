@@ -27,7 +27,7 @@ equivalents.
 The chat view is a `vxfw::ListView` over the active transcript's entry widgets,
 built from `ChatState` (Spec C). `ListView` is the substrate for three reasons:
 it scrolls by line (smooth reading of long messages), it materializes items
-lazily through a `ListSource` (a long transcript only builds the visible entry
+lazily through `Source::Builder` (a long transcript only builds the visible entry
 widgets each frame), and it has a movable item cursor we use for keyboard
 navigation and selection. The cursor is hidden (`draw_cursor = false`) in the
 default editor-focused mode, so the chat reads as plain free-scroll, and shown

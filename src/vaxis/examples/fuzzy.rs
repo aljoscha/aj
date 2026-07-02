@@ -35,7 +35,7 @@ use vaxis::tty::PosixTty;
 use vaxis::unicode::grapheme_iterator;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    App, DrawContext, Event, EventContext, ListSource, ListView, MaxSize, Options, RelativePoint,
+    App, Builder, DrawContext, Event, EventContext, ListView, MaxSize, Options, RelativePoint,
     RichText, Source, SubSurface, Surface, Text, TextField, TextSpan, Widget, WidgetRef,
     draw_widget, to_widget_ref,
 };
@@ -45,8 +45,8 @@ struct FilteredSource {
     filtered: Rc<RefCell<Vec<WidgetRef>>>,
 }
 
-impl ListSource for FilteredSource {
-    fn item(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
+impl Builder for FilteredSource {
+    fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         self.filtered.borrow().get(idx).cloned()
     }
 }
