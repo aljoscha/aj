@@ -11,7 +11,11 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+mod bubble;
 mod interactive;
+mod subagent_box;
+#[cfg(test)]
+mod test_support;
 mod tool_cell;
 mod transcript;
 

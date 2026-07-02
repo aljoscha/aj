@@ -133,6 +133,11 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>
             "two sub-agents spawned in one turn, each running a bash call, executing concurrently",
             parallel_agents,
         ),
+        (
+            "background-task",
+            "bash launched with run_in_background: task badge lifecycle plus the completion notice",
+            background_task,
+        ),
     ]
 }
 
@@ -585,6 +590,53 @@ the same turn, made its own bash call, and reported back independently.";
         child_report(),
         parent_wrap,
     ]
+}
+
+/// `background-task`: one `bash` call launched with
+/// `run_in_background`, so the launch cell carries the task badge
+/// through its lifecycle (`[task #N]` → `[task #N · exited 0]`) and
+/// the completion notice arrives as a collapsible task-notification
+/// user message.
+///
+/// The command runs for real. `sleep 1` keeps the running badge on
+/// screen long enough to observe, and comfortably outlasts the
+/// second inference, so the task normally finishes after the turn
+/// ended and the host's `TaskEnd` wake trigger delivers the notice.
+/// The third script is consumed by whichever inference follows the
+/// notification: the wake turn on the usual path, or the same turn's
+/// next inference if the task happened to finish early. Both paths
+/// consume the scripts in the same order, so the demo stays
+/// deterministic.
+fn background_task() -> Vec<ProviderScript> {
+    let intro = "I'll launch a short background task so you can watch the \
+launch cell's badge lifecycle: it should read [task #N] while the task runs \
+and flip to [task #N · exited 0] when it finishes.";
+    let mid = "The task is running in the background. When it completes, a \
+collapsible task-notification message should appear below and I'll get woken \
+up to acknowledge it.";
+    let wrap = "The background task finished with exit code 0. The \
+notification above should render as a tinted user-message bubble, and the \
+launch cell's badge should now show the terminal status.";
+
+    let tool_input = serde_json::json!({
+        "command": "sleep 1 && echo 'background job finished'",
+        "timeout": 30,
+        "description": "Demo background task (sleep, then a line of output).",
+        "run_in_background": true,
+    });
+
+    let script_1 = builder()
+        .start()
+        .text_block(intro)
+        .delay(section_delay())
+        .tool_call_block_chunked("tu-demo-bg", "bash", tool_input, 0, Duration::ZERO)
+        .done(DoneReason::ToolUse);
+
+    let script_2 = builder().start().text_block(mid).done(DoneReason::Stop);
+
+    let script_3 = builder().start().text_block(wrap).done(DoneReason::Stop);
+
+    vec![script_1, script_2, script_3]
 }
 
 // ===========================================================================

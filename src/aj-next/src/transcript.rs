@@ -3,16 +3,17 @@
 //!
 //! One list item per [`Entry`], built on demand from the shared
 //! [`ChatState`] via `Source::Builder`, so a long transcript only
-//! materializes the visible rows each frame. Rendering is the phase-6
-//! slice: plain wrapped text per entry kind (markdown parity, tool
-//! cells, and sub-agent boxes come with the component phase).
+//! materializes the visible rows each frame. The per-entry widget
+//! builder ([`build_entry_widget`]) is shared with the sub-agent
+//! box, which lays the same widgets out inside its own frame.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use aj_app::chat::{ChatState, Entry, EntryKind, NoticeLevel};
+use aj_app::chat::{ChatState, Entry, EntryKind, NoticeLevel, UserEntry};
 use aj_app::theme::{Theme, ThemeBg, ThemeColor, ThemeRgb};
 use aj_models::types::AssistantContent;
+use aj_tools::sanitize_terminal_output;
 use vaxis::cell::{Color, Style};
 use vaxis::mouse;
 use vaxis::vxfw::{
@@ -20,7 +21,9 @@ use vaxis::vxfw::{
     SubSurface, Surface, TextSpan, Widget, WidgetRef,
 };
 
-use crate::tool_cell::build_tool_cell;
+use crate::bubble::Bubble;
+use crate::subagent_box::{SubAgentBox, build_subagent_box};
+use crate::tool_cell::{HintKind, build_tool_cell, expand_hint};
 
 /// Pre-resolved vaxis styles for the transcript's row kinds.
 ///
@@ -45,6 +48,8 @@ pub(crate) struct TranscriptStyles {
     pub(crate) tool_pending_bg: Color,
     pub(crate) tool_success_bg: Color,
     pub(crate) tool_error_bg: Color,
+    /// The user-message bubble tint.
+    pub(crate) user_message_bg: Color,
 }
 
 impl TranscriptStyles {
@@ -75,6 +80,7 @@ impl TranscriptStyles {
             tool_pending_bg: bg(ThemeBg::ToolPendingBg),
             tool_success_bg: bg(ThemeBg::ToolSuccessBg),
             tool_error_bg: bg(ThemeBg::ToolErrorBg),
+            user_message_bg: bg(ThemeBg::UserMessageBg),
         }
     }
 }
@@ -88,6 +94,12 @@ fn vaxis_color(rgb: ThemeRgb) -> Color {
     }
 }
 
+/// Source-line count shown for a collapsible user message (a harness
+/// task notification) while collapsed. A short preview keeps a long
+/// notification from flooding the scrollback while still surfacing
+/// its first (and most informative) line.
+const USER_COLLAPSED_LINES: usize = 10;
+
 /// Lazily builds one row widget per transcript entry of the active
 /// view. Shared with the [`ListView`] it feeds.
 struct EntryBuilder {
@@ -99,15 +111,120 @@ impl Builder for EntryBuilder {
     fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         let chat = self.chat.borrow();
         let entry = chat.transcript(chat.active_view())?.entries().get(idx)?;
-        // Tool entries get the dedicated bubble widget; everything
-        // else renders as plain styled spans. Both read the display
-        // flags at build time, so flipping a flag only needs a redraw.
-        if let EntryKind::Tool(tool) = &entry.kind {
-            let cell = build_tool_cell(tool, chat.tasks(), chat.tools_expanded, &self.styles);
-            return Some(Rc::new(RefCell::new(cell)));
+        // Widgets read the display flags at build time, so flipping a
+        // flag only needs a redraw.
+        Some(
+            match build_entry_widget(entry, &chat, &self.styles, false) {
+                EntryWidget::Bubble(b) => Rc::new(RefCell::new(b)),
+                EntryWidget::Rich(r) => Rc::new(RefCell::new(r)),
+                EntryWidget::SubAgent(b) => Rc::new(RefCell::new(b)),
+            },
+        )
+    }
+}
+
+/// A built per-entry widget. One enum instead of a boxed trait
+/// object so the `ListView` path can wrap each concrete type in its
+/// own `WidgetRef` (the unsize coercion needs the concrete type).
+pub(crate) enum EntryWidget {
+    Bubble(Bubble),
+    Rich(RichText),
+    SubAgent(SubAgentBox),
+}
+
+impl EntryWidget {
+    /// Erase to a boxed widget, for the sub-agent box's child list.
+    pub(crate) fn into_boxed(self) -> Box<dyn Widget> {
+        match self {
+            EntryWidget::Bubble(b) => Box::new(b),
+            EntryWidget::Rich(r) => Box::new(r),
+            EntryWidget::SubAgent(b) => Box::new(b),
         }
-        let spans = entry_spans(entry, chat.hide_thinking_block, &self.styles);
-        Some(Rc::new(RefCell::new(RichText::new(spans))))
+    }
+}
+
+/// Build the widget for one transcript entry. Shared between the
+/// top-level list and the sub-agent box's inner layout.
+///
+/// `nested` is true when building inside a sub-agent box: a nested
+/// `SubAgent` entry then renders as the dim stub line instead of
+/// recursing. Sub-agents can't spawn sub-agents (the `agent` tool is
+/// excluded from their tool list), so that arm is defensive only.
+pub(crate) fn build_entry_widget(
+    entry: &Entry,
+    chat: &ChatState,
+    styles: &TranscriptStyles,
+    nested: bool,
+) -> EntryWidget {
+    match &entry.kind {
+        EntryKind::Tool(tool) => EntryWidget::Bubble(build_tool_cell(
+            tool,
+            chat.tasks(),
+            chat.tools_expanded,
+            styles,
+        )),
+        EntryKind::User(user) => {
+            EntryWidget::Bubble(build_user_bubble(user, chat.tools_expanded, styles))
+        }
+        EntryKind::SubAgent(s) if !nested => {
+            EntryWidget::SubAgent(build_subagent_box(s, chat, styles))
+        }
+        _ => EntryWidget::Rich(RichText::new(entry_spans(
+            entry,
+            chat.hide_thinking_block,
+            styles,
+        ))),
+    }
+}
+
+/// Build the user-message bubble: the full message under the
+/// user-message tint, with no `> ` prefix (the tint is the entire
+/// visual cue, which also keeps the text cleanly copy-pasteable).
+///
+/// Harness-injected task notifications (`collapsible`) fold to their
+/// first [`USER_COLLAPSED_LINES`] source lines plus an italic expand
+/// hint, and expand together with tool output under the session-wide
+/// `tools_expanded` flag. Typed prompts always render in full.
+fn build_user_bubble(user: &UserEntry, expanded: bool, styles: &TranscriptStyles) -> Bubble {
+    let span = |text: String, style: Style| TextSpan {
+        text,
+        style,
+        ..TextSpan::default()
+    };
+    // Task notifications embed captured task output, so the text is
+    // not guaranteed to be terminal-safe the way a typed prompt is.
+    let text = sanitize_terminal_output(&user.joined_text());
+    let mut lines: Vec<&str> = text.lines().collect();
+    let fold = user.collapsible && !expanded && lines.len() > USER_COLLAPSED_LINES;
+    let hint = fold.then(|| {
+        let more = lines.len() - USER_COLLAPSED_LINES;
+        lines.truncate(USER_COLLAPSED_LINES);
+        expand_hint(more, HintKind::More)
+    });
+    let mut spans = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            spans.push(span("\n".into(), styles.user));
+        }
+        spans.push(span((*line).to_string(), styles.user));
+    }
+    if let Some(hint) = hint {
+        // Italic rather than dim: the hint sits on the bubble tint,
+        // where the muted-but-legible cue is the slant (mirroring
+        // `aj`'s markdown-emphasis hint).
+        spans.push(span("\n".into(), styles.user));
+        spans.push(span(
+            hint,
+            Style {
+                italic: true,
+                ..styles.text
+            },
+        ));
+    }
+    Bubble {
+        text: spans,
+        bg: Some(styles.user_message_bg),
+        base: styles.text,
     }
 }
 
@@ -120,7 +237,10 @@ fn entry_spans(entry: &Entry, hide_thinking: bool, styles: &TranscriptStyles) ->
         ..TextSpan::default()
     };
     let mut spans = match &entry.kind {
-        EntryKind::User(u) => vec![span(format!("> {}", u.joined_text()), styles.user)],
+        // User entries render through the bubble widget (see
+        // `build_entry_widget`). This arm only exists so the match
+        // stays total.
+        EntryKind::User(_) => Vec::new(),
         EntryKind::Assistant(a) => {
             let mut spans = Vec::new();
             for block in &a.message.content {
@@ -146,13 +266,16 @@ fn entry_spans(entry: &Entry, hide_thinking: bool, styles: &TranscriptStyles) ->
             }
             spans
         }
-        // Tool entries render through the `ToolCell` widget (see
-        // `item_at_idx`); this arm only exists so the match stays
-        // total.
+        // Tool entries render through the `ToolCell` bubble and
+        // sub-agent entries through the `SubAgentBox` (see
+        // `build_entry_widget`). The `SubAgent` arm is only reachable
+        // as the nested-inside-a-box fallback, which can't occur live
+        // (sub-agents don't spawn sub-agents), so a dim stub is
+        // enough.
         EntryKind::Tool(_) => Vec::new(),
-        // Phase-7 placeholders: sub-agent boxes and compaction rows
-        // get real widgets in a later chunk.
         EntryKind::SubAgent(s) => vec![span(format!("[sub-agent {}]", s.child), styles.dim)],
+        // Phase-7 placeholder: compaction rows get a real widget in a
+        // later chunk.
         EntryKind::Compaction(_) => vec![span("[compaction]".to_string(), styles.dim)],
         // Notice and usage rows carry the same one-column left inset
         // the tool bubbles have, so the transcript's left edge lines
@@ -334,13 +457,130 @@ mod tests {
     }
 
     #[test]
-    fn user_entry_renders_prefixed_text_with_spacer() {
+    fn user_entry_spans_are_empty_the_bubble_renders_it() {
+        // User entries render through `build_user_bubble`, so the
+        // span path only carries the spacer.
         let t = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
             collapsible: false,
         }));
         let spans = entry_spans(&t.entries()[0], false, &styles());
-        assert_eq!(joined(&spans), "> hello\n\n");
+        assert_eq!(joined(&spans), "\n\n");
+    }
+
+    /// A long task notification with a recognisable first line and a
+    /// tail marker well past [`USER_COLLAPSED_LINES`].
+    fn notification() -> UserEntry {
+        let mut lines = vec![
+            "<task-notification>".to_string(),
+            "Background task #1 finished: sleep - exit code 0".to_string(),
+        ];
+        for i in 1..30 {
+            lines.push(format!("tick {i}"));
+        }
+        lines.push("SECRET_TAIL_MARKER".to_string());
+        lines.push("</task-notification>".to_string());
+        UserEntry {
+            content: vec![UserContent::text(lines.join("\n"))],
+            collapsible: true,
+        }
+    }
+
+    fn bubble_rows(user: &UserEntry, expanded: bool, width: u16) -> Vec<String> {
+        let mut bubble = build_user_bubble(user, expanded, &styles());
+        let surface = bubble.draw(&crate::test_support::draw_ctx(width, None));
+        crate::test_support::rows(&surface)
+    }
+
+    #[test]
+    fn user_bubble_paints_the_tint_and_drops_the_prefix() {
+        let user = UserEntry {
+            content: vec![UserContent::text("hello world")],
+            collapsible: false,
+        };
+        let s = styles();
+        let mut bubble = build_user_bubble(&user, false, &s);
+        let surface = bubble.draw(&crate::test_support::draw_ctx(40, None));
+        let r = crate::test_support::rows(&surface);
+        // One padding row above and below the content, then the
+        // untinted spacer row. No `> ` quote prefix: the tint is the
+        // whole cue.
+        assert_eq!(r.len(), 4, "{r:?}");
+        assert_eq!(r[0], "");
+        assert_eq!(r[1], " hello world");
+        assert_eq!(r[2], "");
+        assert_eq!(r[3], "");
+        let grid = crate::test_support::flatten(&surface);
+        for row in grid.iter().take(3) {
+            for cell in row {
+                assert_eq!(cell.style.bg, s.user_message_bg);
+            }
+        }
+        assert!(grid[3].iter().all(|c| c.style.bg == Color::Default));
+    }
+
+    #[test]
+    fn collapsible_notification_folds_to_ten_lines_with_italic_hint() {
+        let user = notification();
+        let r = bubble_rows(&user, false, 80);
+        let body = r.join("\n");
+        assert!(body.contains("Background task #1 finished"), "{r:?}");
+        assert!(!body.contains("SECRET_TAIL_MARKER"), "{r:?}");
+        // 10 source lines + the hint row + 2 pads + spacer.
+        assert!(
+            body.contains("more lines, Alt+O to expand)"),
+            "hint present: {r:?}",
+        );
+        assert_eq!(r.len(), 10 + 1 + 2 + 1, "{r:?}");
+        // The hint row is italic.
+        let s = styles();
+        let mut bubble = build_user_bubble(&user, false, &s);
+        let surface = bubble.draw(&crate::test_support::draw_ctx(80, None));
+        let grid = crate::test_support::flatten(&surface);
+        let hint_row = &grid[11];
+        assert!(
+            hint_row
+                .iter()
+                .filter(|c| !c.char.grapheme().trim().is_empty())
+                .all(|c| c.style.italic),
+            "hint cells are italic",
+        );
+    }
+
+    #[test]
+    fn expanded_notification_shows_the_full_body() {
+        let user = notification();
+        let r = bubble_rows(&user, true, 80);
+        let body = r.join("\n");
+        assert!(body.contains("SECRET_TAIL_MARKER"), "{r:?}");
+        assert!(!body.contains("to expand"), "{r:?}");
+    }
+
+    #[test]
+    fn non_collapsible_long_message_is_never_folded() {
+        let lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
+        let user = UserEntry {
+            content: vec![UserContent::text(lines.join("\n"))],
+            collapsible: false,
+        };
+        let r = bubble_rows(&user, false, 80);
+        let body = r.join("\n");
+        assert!(body.contains("line 29"), "{r:?}");
+        assert!(!body.contains("to expand"), "{r:?}");
+    }
+
+    #[test]
+    fn short_collapsible_notification_is_not_truncated() {
+        let user = UserEntry {
+            content: vec![UserContent::text(
+                "<task-notification>\ntask #1 done\n</task-notification>",
+            )],
+            collapsible: true,
+        };
+        let r = bubble_rows(&user, false, 80);
+        let body = r.join("\n");
+        assert!(body.contains("task #1 done"), "{r:?}");
+        assert!(!body.contains("to expand"), "{r:?}");
     }
 
     #[test]

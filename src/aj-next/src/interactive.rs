@@ -224,16 +224,66 @@ fn fold_notice(world: &mut World, text: &str) {
 }
 
 /// Fold `first` plus everything else already buffered on the event
-/// channel into the chat model. Returns whether anything changed
-/// renderable state, so the caller requests one redraw per batch, not
-/// one per streaming chunk.
-fn drain_events(world: &mut World, first: AgentEvent) -> bool {
-    let mut chat = world.chat.borrow_mut();
-    let mut redraw = reduce(&mut chat, &mut world.core.lifecycle, first).0;
-    while let Ok(event) = world.core.event_rx.try_recv() {
-        redraw |= reduce(&mut chat, &mut world.core.lifecycle, event).0;
+/// channel into the chat model.
+///
+/// Returns whether anything changed renderable state (so the caller
+/// requests one redraw per batch, not one per streaming chunk) plus
+/// the agents that earned a post-turn wake while draining. Wake
+/// triggers, matching `aj`'s mid-select set:
+///
+/// - `TaskEnd`: the owner is woken unconditionally so the completion
+///   notice reaches the model the moment the task finishes. The gate
+///   inside `spawn_wake_turn` skips busy owners, which pick the
+///   notice up at their next drain point instead.
+/// - `AgentEnd` with queued notices or pending messages: a sub's
+///   initial run is nested inside the parent's turn (not driven
+///   through the JoinSet), so the turn-completion trigger never sees
+///   it end. Without this, a notice arriving after that run's last
+///   drain point would rot until the next prompt. The condition is
+///   checked after the event reduced, so the owner reads as idle and
+///   the gate inside `spawn_wake_turn` is open.
+fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
+    let mut redraw = false;
+    let mut wake_targets = Vec::new();
+    let mut next = Some(first);
+    while let Some(event) = next {
+        // Capture the trigger before the reducer consumes the event.
+        let trigger = match &event {
+            AgentEvent::TaskEnd { agent_id, .. } => Some((*agent_id, false)),
+            AgentEvent::AgentEnd { agent_id, .. } => Some((*agent_id, true)),
+            _ => None,
+        };
+        {
+            let mut chat = world.chat.borrow_mut();
+            redraw |= reduce(&mut chat, &mut world.core.lifecycle, event).0;
+        }
+        if let Some((id, conditional)) = trigger
+            && (!conditional
+                || world.core.task_registry.has_notices(id)
+                || world.core.message_queues.has_pending(id))
+        {
+            wake_targets.push(id);
+        }
+        next = world.core.event_rx.try_recv().ok();
     }
-    redraw
+    (redraw, wake_targets)
+}
+
+/// Spawn the post-turn wakes earned while draining a batch of events.
+/// `spawn_wake_turn` gates on busy owners, so duplicate targets in
+/// one batch are harmless.
+fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
+    for id in targets {
+        let policy = turn_policy(id, &world.config);
+        spawn_wake_turn(
+            id,
+            &world.core,
+            &world.run_config,
+            policy,
+            &mut world.turns,
+            &mut world.turn_cancels,
+        );
+    }
 }
 
 /// Outcome of an editor submit.
@@ -302,9 +352,8 @@ fn handle_turn_join(
     }
     // Post-turn wake: deliver queued task notices the moment the agent
     // goes idle. `Agent::wake` is a no-op when nothing is pending.
-    // NOTE: `aj` additionally wakes on live `TaskStart`/`TaskEnd`
-    // triggers mid-select. aj-next only wakes here, which is enough
-    // until background-task UI lands.
+    // Live `TaskEnd`/`AgentEnd` events trigger the same wake mid-select
+    // (see `drain_events`), covering tasks that finish between turns.
     if world.core.task_registry.has_notices(id) || world.core.message_queues.has_pending(id) {
         let policy = turn_policy(id, &world.config);
         spawn_wake_turn(
@@ -540,10 +589,12 @@ async fn drive(
                 // `None` (channel closed) can't happen while the core
                 // holds its forwarder subscription. Treat it as a
                 // no-op rather than tearing the session down.
-                if let Some(event) = maybe_event
-                    && drain_events(world, event)
-                {
-                    app.request_redraw();
+                if let Some(event) = maybe_event {
+                    let (redraw, wake_targets) = drain_events(world, event);
+                    spawn_wakes(world, wake_targets);
+                    if redraw {
+                        app.request_redraw();
+                    }
                 }
             }
 
@@ -793,7 +844,7 @@ mod tests {
 
         // Event arm: everything the turn emitted is buffered now.
         let first = world.core.event_rx.try_recv().expect("events buffered");
-        assert!(drain_events(&mut world, first));
+        assert!(drain_events(&mut world, first).0);
 
         {
             let chat = world.chat.borrow();
@@ -843,6 +894,144 @@ mod tests {
 
     fn lifecycle_running(world: &World) -> bool {
         world.core.is_running(AgentId::Main)
+    }
+
+    /// `drain_events` reports the wake targets `aj` triggers on
+    /// mid-select: every `TaskEnd` unconditionally, `AgentEnd` only
+    /// when the agent has queued notices or pending messages.
+    #[tokio::test]
+    async fn drain_events_reports_wake_triggers() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+
+        let task_end = AgentEvent::TaskEnd {
+            agent_id: AgentId::Main,
+            task_id: 1,
+            call_id: "tu-1".into(),
+            status: aj_agent::tool::TaskStatus::Exited(Some(0)),
+            label: "cmd".into(),
+        };
+        let (_, wake) = drain_events(&mut world, task_end);
+        assert_eq!(wake, vec![AgentId::Main], "TaskEnd wakes unconditionally");
+
+        let agent_end = || AgentEvent::AgentEnd {
+            agent_id: AgentId::Main,
+            messages: Vec::new(),
+        };
+        let (_, wake) = drain_events(&mut world, agent_end());
+        assert!(wake.is_empty(), "idle AgentEnd with nothing queued");
+
+        world
+            .core
+            .message_queues
+            .append_follow_up(AgentId::Main, "queued follow-up");
+        let (_, wake) = drain_events(&mut world, agent_end());
+        assert_eq!(wake, vec![AgentId::Main], "AgentEnd with pending work");
+    }
+
+    /// End-to-end over the `background-task` demo: the launch turn
+    /// spawns a real background bash task, its completion triggers a
+    /// wake turn, and the wake delivers the collapsible
+    /// task-notification plus the wrap-up response.
+    #[tokio::test]
+    async fn background_task_completion_wakes_the_agent() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "background-task").await;
+
+        assert!(matches!(
+            handle_submit(&mut world, "run it".to_string()),
+            Submit::Handled
+        ));
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("prompt turn settles");
+
+        // The wake turn is spawned either by the turn join above (the
+        // task finished while the turn still streamed, so its notice
+        // was already queued) or by the TaskEnd trigger while draining
+        // here. Loop until one of the two paths armed a turn.
+        while world.turn_cancels.is_empty() {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                world.core.event_rx.recv(),
+            )
+            .await
+            .expect("an event arrives before the timeout")
+            .expect("event channel open");
+            let (_, wake_targets) = drain_events(&mut world, event);
+            spawn_wakes(&mut world, wake_targets);
+        }
+
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("wake turn settles");
+        // Fold the buffered tail. Wake targets are ignored on purpose:
+        // the TaskEnd may sit in this tail, and re-waking the idle
+        // agent with no notices left would only spawn a no-op turn the
+        // test would have to join.
+        while let Ok(event) = world.core.event_rx.try_recv() {
+            let _ = drain_events(&mut world, event);
+        }
+
+        let chat = world.chat.borrow();
+        let entries = chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries();
+        // The launch cell persisted the task id in its bash payload.
+        let launch = entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntryKind::Tool(t) => Some(t),
+                _ => None,
+            })
+            .expect("launch tool cell");
+        assert!(
+            matches!(
+                &launch.details,
+                Some(aj_agent::tool::ToolDetails::Bash {
+                    task_id: Some(_),
+                    ..
+                })
+            ),
+            "launch cell records the task id: {:?}",
+            launch.details,
+        );
+        // The task reached its terminal status in the model.
+        assert!(
+            chat.tasks()
+                .values()
+                .any(|info| info.status == aj_agent::tool::TaskStatus::Exited(Some(0))),
+            "task tracked to exited 0: {:?}",
+            chat.tasks(),
+        );
+        // The completion notice arrived as a collapsible user bubble.
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.kind, EntryKind::User(u) if u.collapsible)),
+            "collapsible task-notification entry present",
+        );
+        // The wrap-up response followed the notification.
+        let wrap = entries
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                EntryKind::Assistant(a) => Some(a),
+                _ => None,
+            })
+            .expect("wrap-up assistant entry");
+        let text: String = wrap
+            .message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                aj_models::types::AssistantContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("The background task finished"),
+            "wake turn consumed the wrap-up script: {text:?}",
+        );
     }
 
     /// A busy submit is refused and handed back for the editor.

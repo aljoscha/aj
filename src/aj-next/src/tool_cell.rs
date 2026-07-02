@@ -1,13 +1,11 @@
 //! The tool-execution cell: one tool call's bubble in the transcript.
 //!
 //! Renders a [`aj_app::chat::ToolEntry`] as a full-width tinted
-//! rectangle: the `{glyph} {tool}({args})` header, an optional task
+//! [`Bubble`]: the `{glyph} {tool}({args})` header, an optional task
 //! badge, and a body dispatched on the entry's
-//! [`aj_agent::tool::ToolDetails`] variant. The header and body sit
-//! inside the bubble at a one-column inset, framed by one bg-painted
-//! blank row above and below. Sub-agent tool entries flagged
-//! `header_only` render as a bare wrapped header line instead, so
-//! they compose inside the sub-agent box.
+//! [`aj_agent::tool::ToolDetails`] variant. Sub-agent tool entries
+//! flagged `header_only` render as a bare wrapped header line
+//! instead, so they compose inside the sub-agent box.
 //!
 //! The cell is a plain function of the entry plus the session-wide
 //! `tools_expanded` flag: the transcript's builder constructs a fresh
@@ -22,21 +20,11 @@ use aj_tools::sanitize_terminal_output;
 use aj_tools::tools::bash::stream_marker;
 use aj_tools::tools::todo::format_todo_list;
 use serde_json::Value;
-use vaxis::cell::{Cell, Color, Style};
-use vaxis::vxfw::{
-    DrawContext, MaxSize, RelativePoint, RichText, Size, SubSurface, Surface, TextSpan, Widget,
-    WidthBasis,
-};
+use vaxis::cell::Style;
+use vaxis::vxfw::TextSpan;
 
+use crate::bubble::Bubble;
 use crate::transcript::TranscriptStyles;
-
-/// Horizontal padding inside the bubble (one column on each side so
-/// the tinted rectangle reads as an inset block rather than
-/// edge-to-edge text).
-const PADDING_X: u16 = 1;
-/// Vertical padding inside the bubble: one bg-painted blank row above
-/// and below the content.
-const PADDING_Y: u16 = 1;
 
 /// Maximum body lines rendered for a head-truncated tool output
 /// (`Text` / `SubAgentReport` variants) when collapsed. Sized to give
@@ -52,12 +40,6 @@ const REPORT_COLLAPSED_LINES: usize = TEXT_COLLAPSED_LINES;
 /// Number of trailing lines kept per bash stream when collapsed.
 const BASH_COLLAPSED_LINES: usize = 5;
 
-/// Minimum total render width at which the bubble framing kicks in.
-/// Below this we fall back to a plain header+body listing so the
-/// bg-padding pipeline (two cells of horizontal padding plus at least
-/// one cell of content) doesn't paint a degenerate row.
-const MIN_BUBBLE_WIDTH: u16 = 3;
-
 /// Display label of the tools-expand chord shown in collapse hints.
 /// Hardcoded to the default `aj.tools.expand` binding (alt+o, see
 /// `aj_app::keybindings::AJ_KEYBINDINGS`). The real keymap engine
@@ -68,7 +50,7 @@ const EXPAND_KEY_LABEL: &str = "Alt+O";
 /// The phrasing (`N more lines` vs `N earlier lines`) keeps the hint
 /// honest about which end of the stream got dropped.
 #[derive(Clone, Copy)]
-enum HintKind {
+pub(crate) enum HintKind {
     /// Body was truncated to its head, the hidden lines come after
     /// the visible ones (`Text`, `SubAgentReport`).
     More,
@@ -78,8 +60,9 @@ enum HintKind {
 }
 
 /// Format the `… (N <kind> lines, <key> to expand)` hint line that
-/// signals a collapsed tool body has more content.
-fn expand_hint(more: usize, kind: HintKind) -> String {
+/// signals a collapsed body has more content. Shared with the user
+/// bubble's task-notification fold.
+pub(crate) fn expand_hint(more: usize, kind: HintKind) -> String {
     let word = match kind {
         HintKind::More => "more",
         HintKind::Earlier => "earlier",
@@ -527,27 +510,13 @@ fn flatten_lines(lines: Vec<Line>, styles: &TranscriptStyles) -> Vec<TextSpan> {
     spans
 }
 
-/// The transcript widget for one tool entry. Built fresh per draw by
-/// the transcript's entry builder.
-pub(crate) struct ToolCell {
-    /// Header plus body, flattened with `\n` separators.
-    text: Vec<TextSpan>,
-    /// The bubble's background tint. `None` renders the bare wrapped
-    /// text with no bubble (the `header_only` mode used inside
-    /// sub-agent boxes).
-    bg: Option<Color>,
-    /// Style used for the trailing spacer row and the plain
-    /// fallback paths.
-    base: Style,
-}
-
 /// Build the widget for `entry` under the current expansion flag.
 pub(crate) fn build_tool_cell(
     entry: &ToolEntry,
     tasks: &BTreeMap<TaskId, TaskInfo>,
     expanded: bool,
     styles: &TranscriptStyles,
-) -> ToolCell {
+) -> Bubble {
     let status = derive_status(entry, tasks);
     let header = header_line(entry, status, tasks, styles);
 
@@ -555,7 +524,7 @@ pub(crate) fn build_tool_cell(
         // Header-only: just the wrapped header line, no bubble,
         // background, or body, so the tool composes inside the
         // sub-agent box's own painted background.
-        return ToolCell {
+        return Bubble {
             text: flatten_lines(vec![header], styles),
             bg: None,
             base: styles.text,
@@ -573,97 +542,10 @@ pub(crate) fn build_tool_cell(
         VisualStatus::Succeeded => styles.tool_success_bg,
         VisualStatus::Failed => styles.tool_error_bg,
     };
-    ToolCell {
+    Bubble {
         text: flatten_lines(lines, styles),
         bg: Some(bg),
         base: styles.text,
-    }
-}
-
-impl ToolCell {
-    /// Plain fallback: wrapped text with no bubble or background,
-    /// plus the one-blank-row spacer every transcript entry carries.
-    /// Used for `header_only` cells and for degenerate widths where
-    /// the bubble framing can't paint.
-    fn draw_plain(&self, ctx: &DrawContext) -> Surface {
-        let mut spans = self.text.clone();
-        // A trailing "\n\n" adds one empty hard line, which the wrap
-        // engine renders as the blank spacer row (the same shape the
-        // other transcript entries use).
-        spans.push(span("\n\n", self.base));
-        RichText::new(spans).draw(ctx)
-    }
-}
-
-impl Widget for ToolCell {
-    fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        let width = ctx.max.width.unwrap_or(ctx.min.width);
-        let Some(bg) = self.bg else {
-            return self.draw_plain(ctx);
-        };
-        if width < MIN_BUBBLE_WIDTH {
-            return self.draw_plain(ctx);
-        }
-
-        let bg_style = Style {
-            bg,
-            ..Style::default()
-        };
-
-        // Lay the content out at the inset width. `Parent` width
-        // basis plus the bg-carrying base style make the content
-        // surface span the full inner width with tinted fill cells,
-        // so short lines' tails paint the tint too.
-        let inner_width = width - 2 * PADDING_X;
-        let inner_ctx = ctx.with_constraints(
-            Size {
-                width: inner_width,
-                height: 0,
-            },
-            MaxSize {
-                width: Some(inner_width),
-                height: None,
-            },
-        );
-        let mut rich = RichText::new(self.text.clone());
-        rich.width_basis = WidthBasis::Parent;
-        rich.base_style = bg_style;
-        let mut inner = rich.draw(&inner_ctx);
-        // Span-styled cells keep their own (bg-less) style when the
-        // wrap engine writes them over the base fill, so stamp the
-        // tint onto every cell after the fact.
-        for cell in &mut inner.buffer {
-            cell.style.bg = bg;
-        }
-
-        // The outer surface: bg-filled padding frame around the
-        // content, plus one default (untinted) spacer row at the
-        // bottom standing in for the `\n\n` spacer the span-based
-        // entries carry.
-        let content_height = inner.size.height;
-        let bubble_height = content_height + 2 * PADDING_Y;
-        let mut surface = Surface::with_size(Size {
-            width,
-            height: bubble_height + 1,
-        });
-        let bg_cell = Cell {
-            style: bg_style,
-            ..Cell::default()
-        };
-        for row in 0..bubble_height {
-            for col in 0..width {
-                surface.write_cell(col, row, bg_cell.clone());
-            }
-        }
-        surface.children.push(SubSurface {
-            origin: RelativePoint {
-                col: i32::from(PADDING_X),
-                row: i32::from(PADDING_Y),
-            },
-            surface: inner,
-            z_index: 0,
-        });
-        surface
     }
 }
 
@@ -678,9 +560,11 @@ mod tests {
     use aj_agent::tool::{TodoItem, TodoPriority, TodoStatus};
     use aj_app::chat::{ChatState, reduce};
     use aj_app::theme::{ColorMode, Theme};
-    use vaxis::vxfw::MaxSize;
+    use vaxis::cell::Color;
+    use vaxis::vxfw::{DrawContext, MaxSize, Size, Surface, Widget};
 
     use super::*;
+    use crate::test_support::{flatten, rows};
     use crate::transcript::TranscriptView;
 
     fn styles() -> TranscriptStyles {
@@ -700,21 +584,7 @@ mod tests {
     }
 
     fn draw_ctx(width: u16) -> DrawContext {
-        DrawContext {
-            min: Size {
-                width: 0,
-                height: 0,
-            },
-            max: MaxSize {
-                width: Some(width),
-                height: None,
-            },
-            cell_size: Size {
-                width: 10,
-                height: 20,
-            },
-            width_method: vaxis::gwidth::Method::Unicode,
-        }
+        crate::test_support::draw_ctx(width, None)
     }
 
     /// A running tool entry with the given name and args.
@@ -780,57 +650,8 @@ mod tests {
 
     /// Composite a surface tree (buffer plus children by z-order)
     /// into a flat cell grid, the way `Surface::render` paints it.
-    fn flatten(surface: &Surface) -> Vec<Vec<Cell>> {
-        let w = usize::from(surface.size.width);
-        let h = usize::from(surface.size.height);
-        let mut grid = vec![vec![Cell::default(); w]; h];
-        if !surface.buffer.is_empty() {
-            for (i, cell) in surface.buffer.iter().enumerate() {
-                grid[i / w][i % w] = cell.clone();
-            }
-        }
-        let mut order: Vec<&SubSurface> = surface.children.iter().collect();
-        order.sort_by_key(|c| c.z_index);
-        for child in order {
-            let sub = flatten(&child.surface);
-            for (r, sub_row) in sub.iter().enumerate() {
-                let Ok(rr) = usize::try_from(child.origin.row + i32::try_from(r).expect("row"))
-                else {
-                    continue;
-                };
-                if rr >= h {
-                    continue;
-                }
-                for (c, cell) in sub_row.iter().enumerate() {
-                    let Ok(cc) = usize::try_from(child.origin.col + i32::try_from(c).expect("col"))
-                    else {
-                        continue;
-                    };
-                    if cc >= w {
-                        continue;
-                    }
-                    grid[rr][cc] = cell.clone();
-                }
-            }
-        }
-        grid
-    }
-
-    /// The visible text of each composited row, right-trimmed.
-    fn rows(surface: &Surface) -> Vec<String> {
-        flatten(surface)
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|c| c.char.grapheme())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
-    }
-
-    fn draw(cell: &mut ToolCell, width: u16) -> Surface {
+    /// See `test_support` for the shared helpers.
+    fn draw(cell: &mut Bubble, width: u16) -> Surface {
         cell.draw(&draw_ctx(width))
     }
 
