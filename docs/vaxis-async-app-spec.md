@@ -89,7 +89,8 @@ pub struct AsyncApp { /* AppCore + input receiver + resize source + handlers */ 
 pub struct Frame { pub quit: bool }   // outcome of one dispatch step
 
 impl AsyncApp {
-    /// Build over a runtime, a writer-side tty, and a read source (a dup'd fd).
+    /// Build over a runtime, a writer-side tty, and a read source (a
+    /// separately opened terminal fd, see "The read source" below).
     pub fn new(vx: Vaxis, tty: Box<dyn Tty>, source: OwnedFd) -> AsyncApp;
 
     /// Terminal setup + first layout. Async so capability detection does not
@@ -150,20 +151,50 @@ semantics.
 ## Terminal setup: async capability detection
 
 `App::run` calls the blocking `query_terminal`, which parks up to a second
-waiting for the DA1 response. `AsyncApp::init` must not block the runtime, so it
-uses the split form the runtime already exposes:
+waiting for the DA1 response. `AsyncApp::init` must not block the runtime, so
+the blocking call splits into three steps:
 
-1. `vx.query_terminal_send(writer)` to emit the capability-probe batch.
-2. Await the shared handshake with a timeout: the async reader folds capability
-   responses into `Shared` exactly as the threaded loop does (see
-   `async_reader`), and wakes the DA1 signal. `init` awaits that signal (a
-   tokio-friendly wait) or a 1s timeout, without blocking the executor.
-3. `vx.enable_detected_features(writer)` to apply what was detected.
+1. `vx.query_terminal_send(writer)` to emit the capability-probe batch
+   (already public).
+2. Await the DA1 handshake with a timeout, off the executor:
+   `Shared::wait_for_da1` becomes `pub(crate)` and `init` runs it on the
+   blocking pool (`spawn_blocking` over the `Arc<Shared>` clone). The async
+   reader already folds capability responses into `Shared` and fires the
+   condvar via `notify_da1`, so no new wake mechanism is needed. DA1 never
+   reaches the event channel (`InputCore::dispatch` intercepts it before the
+   sink), so awaiting the channel instead would not wake. Parking one
+   blocking-pool thread for at most a second, once at startup, is exactly what
+   the blocking pool is for.
+3. `vx.query_terminal_finish(writer)`, a new method carrying the post-wait
+   tail of `query_terminal`: `set_queries_done(true)`, snapshot
+   `caps = shared.detected()`, sync `screen.width_method`, then
+   `enable_detected_features`. `query_terminal` itself becomes
+   send + wait + finish. The `set_queries_done(true)` step matters most on
+   **timeout**: without it the input parser keeps treating real keypresses
+   (e.g. F3) as probe replies and swallows them.
 
-The rest of setup mirrors `App::run`: `resize` from the initial winsize before
-first layout, `enter_alt_screen`, `set_bracketed_paste(true)`,
+The rest of setup mirrors `App::run`: `resize` from a live `tty.get_winsize()`
+before first layout (the async reader posts no initial winsize event),
+`enter_alt_screen`, `set_bracketed_paste(true)`,
 `subscribe_to_color_scheme_updates`, force `caps.sgr_pixels = false`, then
-`set_mouse_mode(true)`.
+`set_mouse_mode(true)`. The first frame draws unconditionally.
+
+## The read source: a fresh fd, not a dup
+
+`async_input` sets `O_NONBLOCK` on its source fd. A fd obtained via `dup(2)`
+(what `PosixTty::dup_reader` does) shares file status flags with the writer
+through the common open file description, so the writer would silently turn
+non-blocking and large frames would start failing with `WouldBlock` once the
+kernel tty buffer fills (easy over ssh). The threaded loop never hits this
+because its reads stay blocking.
+
+So the read source for `AsyncApp` must be a separate open file description:
+add `PosixTty::open_reader(&self) -> io::Result<OwnedFd>` doing a fresh
+`open("/dev/tty", O_RDONLY)`. Raw mode lives in the termios of the terminal
+itself, not the description, so the new fd sees the raw mode `PosixTty`
+installed. Tests keep passing pipe/PTY fds directly, as `async_reader`'s tests
+already do. `OwnedFd` stays the parameter type: `AsyncFd` takes ownership and
+close-on-drop gives clean teardown.
 
 ## Resize: fix the live-winsize gap
 
@@ -185,6 +216,11 @@ correctly:
 Recommendation: fold SIGWINCH into `next_input` so the host sees a single input
 stream and resize "just works" on both paths. This is the concrete live-resize
 fix the plan promised.
+
+Note: widgets never receive `Event::Winsize`. Both runtimes consume it (resize
+plus redraw) before focus dispatch, and widgets learn the size purely through
+layout. The stale `Event::Winsize` doc comment in `vxfw.rs` ("Always delivered
+once when the App starts.") gets fixed as part of this work.
 
 ## Teardown
 
@@ -233,6 +269,29 @@ Tick borrow note: `next_tick_deadline()` + a `tokio::time::sleep_until` computed
 each iteration avoids holding a `&self` future across a `&mut self` call inside
 the `select!`. `sleep_until_next_deadline` returns a future that resolves far in
 the future when there are no timers.
+
+## Engine-fidelity notes
+
+Subtleties of `App`'s loop that `AsyncApp` must reproduce, not simplify:
+
+- The `EventContext` redraw latch is per-frame, not per-event. `AsyncApp` keeps
+  the latch across `handle_input` / `fire_due_timers` / `post_app_event` calls
+  and clears it only when `render` draws. Per-event state (`consume_event`,
+  `phase`) resets after every dispatch, and commands drain after every
+  dispatch, including after applying `wants_focus`.
+- `wants_focus` applies at two points: after each input batch and again after
+  `update_mouse` during render. `handle_input` covers the first, `render` the
+  second.
+- `render` reproduces the double-layout dance: layout, `update_mouse` (which
+  may set redraw or request focus), re-apply `wants_focus`, re-layout if
+  redraw got re-set, then store the surface as `last_frame`, update the focus
+  path, and diff-render.
+- `AsyncApp` futures are `!Send` (`WidgetRef` is `Rc<RefCell<...>>`). Fine on a
+  top-level `block_on` or a `LocalSet`. Document it.
+- Terminal restore is the host's job via `shutdown()`. On an unclean drop, the
+  reader task aborts and `PosixTty::Drop` restores termios, but alt screen,
+  mouse, and kitty-keyboard state stay on (the panic hook covers panics).
+  Document that hosts must call `shutdown`.
 
 ## Tests
 
