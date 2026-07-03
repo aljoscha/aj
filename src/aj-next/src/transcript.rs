@@ -411,6 +411,17 @@ impl TranscriptView {
         }
     }
 
+    /// Re-engage follow-tail so the next draw pins the viewport to the
+    /// bottom. Used on a session rebuild: the view's `chat` cell keeps its
+    /// identity across the swap (the outer loop overwrites its contents in
+    /// place), so the fresh session's transcript opens at the tail rather
+    /// than wherever the previous session was scrolled. The draw path
+    /// refreshes `item_count` before scrolling, so we needn't touch the
+    /// list's scroll offset here.
+    pub(crate) fn reset_to_tail(&mut self) {
+        self.follow_tail = true;
+    }
+
     /// Rebuild the transcript's styles from a fresh palette, for a
     /// runtime theme swap. Replaces the row builder (so the per-entry
     /// widgets, which are rebuilt every frame, pick up the new colors)

@@ -16,17 +16,18 @@ use std::time::Instant;
 use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
 use aj_agent::queue::MessageQueues;
+use aj_agent::types::UsageSummary;
 use aj_app::actions::AjAction;
 use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
 use aj_app::commands::{CommandAction, load_model_catalog};
 use aj_app::keybindings::fixed_keys;
-use aj_app::session::{SessionCore, SessionEntry, SessionSpec};
-use aj_app::session_setup::{RunConfigSnapshot, build_initial_run_config};
+use aj_app::session::{SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec};
+use aj_app::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
 use aj_app::settings::{
     ConfigLayers, ConfigTarget, FooterUpdate, MainConfirm, PersistAction, SpeedConfirm, SubConfirm,
 };
-use aj_app::shutdown::{format_resume_hint, format_usage_summary};
+use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_usage_summary};
 use aj_app::theme::{ColorMode, Theme, ThemeHandle, ThemeWatcherGuard, watch_user_theme};
 use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn, turn_policy};
 use aj_conf::{
@@ -38,8 +39,9 @@ use aj_models::types::Speed;
 use aj_models::{
     ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
 };
-use aj_session::{ConversationPersistence, PromptEntry, ThreadFilter, replay};
+use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter, replay};
 use anyhow::{Context, Result, anyhow};
+use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -59,6 +61,7 @@ use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
+use crate::session_selector::{SessionScan, fill_session_scan, open_session_selector};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
     UNSET_VALUE, open_model, open_settings, open_skills, open_thinking,
@@ -111,6 +114,11 @@ struct World {
     /// The project's sessions store, shared with the prompt-history scan
     /// (run detached on a blocking thread off the drive loop).
     persistence: ConversationPersistence,
+    /// Resume-time settings-restoration context, resolved once at startup
+    /// and reused when a session switch rebuilds onto another session so a
+    /// resumed session's recorded model/thinking/speed are restored the
+    /// same way the process's first session's are. `None` in scripted mode.
+    restore: Option<RestoreContext>,
 }
 
 /// Build the session world: run config, session core, and the chat
@@ -261,7 +269,140 @@ async fn build_world(
         turn_cancels: HashMap::new(),
         auth: auth.clone(),
         persistence: persistence.clone(),
+        restore,
     })
+}
+
+/// A freshly built session ready to install over the running one: the new
+/// core, the seeded chat model, and the notices to fold after install (the
+/// switch/create confirmation plus any resume-restore notices).
+struct NextSession {
+    core: SessionCore,
+    chat: ChatState,
+    notices: Vec<String>,
+}
+
+/// Build the session a new-session or resume request asks for, reusing the
+/// world's process-lifetime handles (config, run config, catalog,
+/// persistence, restore context).
+///
+/// If the requested build fails, falls back to resuming `previous_id` (the
+/// session that just ended, whose log is on disk and current) and reports
+/// the failure as the notice instead. Returns `Err` only when the fallback
+/// build fails too, which the outer loop treats as fatal. Touches no widget
+/// state: installing the returned session stays with the caller.
+async fn build_next_session(
+    world: &World,
+    spec: SessionSpec,
+    previous_id: &str,
+) -> Result<NextSession> {
+    let config = world.config.lock().expect("config mutex poisoned").clone();
+    let (mut core, seed, notice) = match SessionCore::build(
+        &config,
+        &world.run_config,
+        &world.persistence,
+        &spec,
+        world.restore.as_ref(),
+    ) {
+        Ok((core, seed)) => {
+            let notice = switch_notice(&spec, &core.session_id);
+            (core, seed, notice)
+        }
+        Err(err) => {
+            // The requested build failed. Fall back to the session that
+            // just ended so the user keeps a live world, and report why.
+            let failure = switch_failure_notice(&spec, &err);
+            let fallback = SessionSpec::Resume {
+                session_id: previous_id.to_string(),
+                entry: SessionEntry::Switch,
+            };
+            let (core, seed) = SessionCore::build(
+                &config,
+                &world.run_config,
+                &world.persistence,
+                &fallback,
+                world.restore.as_ref(),
+            )?;
+            (core, seed, failure)
+        }
+    };
+
+    // Seed a fresh chat from the built core, replaying a resumed session's
+    // history through the same reducer the live events use. Replay never
+    // hits the bus, so nothing is double-persisted; a fresh log replays
+    // nothing.
+    let mut chat = ChatState::new(
+        seed.settings,
+        seed.context_window,
+        Arc::clone(&world.catalog),
+    );
+    chat.hide_thinking_block = config.hide_thinking_block;
+    chat.show_image_in_terminal = config.image_show_in_terminal;
+    {
+        let log = Arc::clone(&core.log);
+        let log = log.lock().await;
+        for event in replay(&log) {
+            let _ = reduce(&mut chat, &mut core.lifecycle, event);
+        }
+    }
+
+    // The switch/create confirmation first, then any resume-restore
+    // notices, folded by the caller after install so they sit on top of the
+    // replayed history.
+    let mut notices = vec![notice];
+    notices.append(&mut core.restore_notices);
+    Ok(NextSession {
+        core,
+        chat,
+        notices,
+    })
+}
+
+/// Confirmation notice for a successful session change, matching aj.
+fn switch_notice(spec: &SessionSpec, session_id: &str) -> String {
+    match spec {
+        SessionSpec::Create { .. } => format!("Started a fresh session ({session_id})."),
+        SessionSpec::Resume { session_id, .. } => format!("Switched to session {session_id}."),
+    }
+}
+
+/// Failure notice when a requested session change couldn't be built (the
+/// host falls back to resuming the previous session), matching aj.
+fn switch_failure_notice(spec: &SessionSpec, err: &anyhow::Error) -> String {
+    match spec {
+        SessionSpec::Create { .. } => format!("Failed to start a fresh session: {err}"),
+        SessionSpec::Resume { session_id, .. } => {
+            format!("Failed to switch to session {session_id}: {err}")
+        }
+    }
+}
+
+/// Install a freshly built [`NextSession`] over the running world in place.
+///
+/// Rebind by replace-contents: the `chat` and `status` cells keep their
+/// identity across the swap (every chrome widget and the keymap's dispatch
+/// closure hold clones of these Rcs, captured once at [`Shell::new`]), so
+/// overwriting their contents repoints the whole UI at the new session
+/// without rebuilding a widget or re-initializing the app. Only the handles
+/// a content swap can't reach are repointed in [`Shell::rebind`]: the
+/// pending box's message queues (the new agent owns fresh ones) and the
+/// header id.
+fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: NextSession) {
+    *world.chat.borrow_mut() = next.chat;
+    // Status is resynced from the new core once per iteration; reset it so
+    // the frame between install and the next sync shows idle chrome.
+    *world.status.borrow_mut() = StatusState::default();
+    world.core = next.core;
+    // A session change is only requested with no turn in flight (the outer
+    // loop shut the outgoing turns down, and the guard refuses mid-turn
+    // requests), so this is already empty; clear defensively.
+    world.turn_cancels.clear();
+    shell.borrow().rebind(world);
+    // Folded after the install so they land in the new session's chat, on
+    // top of any replayed history.
+    for notice in next.notices {
+        fold_notice(world, &notice);
+    }
 }
 
 /// Wrap a host-side notice in the [`AgentEvent::Notice`] shape so it
@@ -853,13 +994,37 @@ async fn apply_command_action(
             );
             ActionEffect::OpenedOverlay
         }
-        // 8D-3 adds the session/history/agent/login surfaces.
+        // Session-changing commands tear down the current world and rebuild
+        // it, which must never abort in-flight work, so refuse them mid-turn
+        // (matching aj). The user can cancel the turn and retry.
         CommandAction::OpenSessionSelector => {
-            fold_notice(world, "Session switching is not wired up yet.");
-            ActionEffect::Redraw
+            // Any host-driven turn in flight (Main, a wake turn, or a
+            // user-driven sub turn) blocks the switch, matching aj's
+            // `!turns.is_empty()` guard and the `world.turns.is_empty()`
+            // debug-assert the drive loop honors the request under.
+            if !world.turns.is_empty() {
+                fold_notice(world, &session_busy_notice("switch sessions"));
+                return ActionEffect::Redraw;
+            }
+            let handles = shell.borrow().overlay_handles();
+            open_session_selector(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.session_scan,
+                &handles.session_request,
+                world.core.session_id.clone(),
+            );
+            ActionEffect::OpenedOverlay
         }
         CommandAction::NewSession => {
-            fold_notice(world, "Starting a new session is not wired up yet.");
+            if !world.turns.is_empty() {
+                fold_notice(world, &session_busy_notice("start a new session"));
+            } else {
+                // No overlay: park the request straight away. The drive
+                // loop's post-input check turns it into `SessionExit::New`.
+                *shell.borrow().session_request.borrow_mut() = Some(SessionRequest::New);
+            }
             ActionEffect::Redraw
         }
         CommandAction::OpenPromptHistory => {
@@ -1657,6 +1822,25 @@ fn spawn_history_scan(
     });
 }
 
+/// Scan the project's session previews on a blocking thread, delivering
+/// them to the drive loop over `tx`.
+///
+/// The scan walks on-disk JSONL logs (blocking IO), so it runs on the
+/// blocking pool rather than the loop. The select it fills is `!Send`, so
+/// it stays on the host side; only the `Send` previews cross the task
+/// boundary. Previews are collected newest-first (the streaming walk's
+/// order) and delivered in one batch, matching the loop's fill-once
+/// overlay pattern.
+fn spawn_session_scan(world: &World, tx: &UnboundedSender<Vec<SessionPreview>>) {
+    let tx = tx.clone();
+    let persistence = world.persistence.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut previews = Vec::new();
+        persistence.list_session_previews_streaming(&mut |batch| previews.extend(batch));
+        let _ = tx.send(previews);
+    });
+}
+
 /// The shared handles the drive loop hands to a config-editing overlay's open
 /// function. Gathered from the shell in one borrow so the open call site never
 /// holds a shell borrow across it.
@@ -1672,6 +1856,10 @@ struct OverlayHandles {
     history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
     /// Where the prompt-history overlay parks a recalled prompt.
     recall_slot: Rc<RefCell<Option<String>>>,
+    /// Where the session selector parks its preview-scan request.
+    session_scan: Rc<RefCell<Option<SessionScan>>>,
+    /// Where the session selector parks a confirmed resume request.
+    session_request: Rc<RefCell<Option<SessionRequest>>>,
 }
 
 /// The root widget: the keymap controller wrapping the base layout, the
@@ -1744,6 +1932,16 @@ struct Shell {
     /// A recalled prompt parked by the prompt-history overlay, collected
     /// by the drive loop and dropped into the editor.
     recall_slot: Rc<RefCell<Option<String>>>,
+    /// Typed handle to the header line, so a session rebuild can refresh
+    /// the shown session id in place.
+    header: Rc<RefCell<Text>>,
+    /// A session-preview scan request parked by the session selector on
+    /// open, for the drive loop to run off the loop and fill.
+    session_scan: Rc<RefCell<Option<SessionScan>>>,
+    /// A session change parked by the `NewSession` command or a confirmed
+    /// session-selector pick. Drained after each input event; a `Some`
+    /// exits the drive loop with the matching [`SessionExit`].
+    session_request: Rc<RefCell<Option<SessionRequest>>>,
 }
 
 impl Shell {
@@ -1791,9 +1989,10 @@ impl Shell {
         // status, pending, editor, footer. The status and pending
         // slots collapse to zero height while idle/empty, so the
         // editor sits flush under the chat between turns.
+        let header_line = Rc::new(RefCell::new(Text::new(&header)));
         let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
             children: vec![
-                FlexItem::init(Rc::new(RefCell::new(Text::new(&header))), 0),
+                FlexItem::init(to_widget_ref(Rc::clone(&header_line)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&transcript)), 1),
                 FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
@@ -1812,6 +2011,8 @@ impl Shell {
         let picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>> = Rc::new(RefCell::new(None));
         let history_fetch: Rc<RefCell<Option<HistoryFetch>>> = Rc::new(RefCell::new(None));
         let recall_slot: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let session_scan: Rc<RefCell<Option<SessionScan>>> = Rc::new(RefCell::new(None));
+        let session_request: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
             turn_running: false,
@@ -1900,6 +2101,9 @@ impl Shell {
             picker_outcome,
             history_fetch,
             recall_slot,
+            header: header_line,
+            session_scan,
+            session_request,
         }
     }
 
@@ -1944,6 +2148,18 @@ impl Shell {
         self.recall_slot.borrow_mut().take()
     }
 
+    /// Collect the session-preview scan request parked by the selector, if any.
+    fn take_session_scan(&self) -> Option<SessionScan> {
+        self.session_scan.borrow_mut().take()
+    }
+
+    /// Collect a parked session change (new session or a confirmed resume),
+    /// if any. The drive loop turns a `Some` into the matching
+    /// [`SessionExit`].
+    fn take_session_request(&self) -> Option<SessionRequest> {
+        self.session_request.borrow_mut().take()
+    }
+
     /// The shared handles the drive loop needs to open a config-editing
     /// overlay: the stack it pushes onto, the editor (focus fallback), a live
     /// chrome snapshot, and the activity / settings-window / picker /
@@ -1958,6 +2174,8 @@ impl Shell {
             picker_outcome: Rc::clone(&self.picker_outcome),
             history_fetch: Rc::clone(&self.history_fetch),
             recall_slot: Rc::clone(&self.recall_slot),
+            session_scan: Rc::clone(&self.session_scan),
+            session_request: Rc::clone(&self.session_request),
         }
     }
 
@@ -1979,6 +2197,31 @@ impl Shell {
             ui.restyle(&chrome);
         }
         *self.chrome.borrow_mut() = chrome;
+    }
+
+    /// Repoint the session-scoped handles a replace-contents swap can't
+    /// reach onto the freshly built `world`, and reset the transcript to a
+    /// fresh-session view.
+    ///
+    /// The `chat` and `status` cells are shared by identity across sessions
+    /// (the outer loop overwrites their contents in place), so the chrome
+    /// widgets and the keymap's dispatch closure keep pointing at the live
+    /// model with nothing to do here. Two handles do need repointing: the
+    /// pending box's message queues, because `SessionCore::build` mints
+    /// fresh queues wired into the new agent and the old clone would observe
+    /// a detached queue, and the header id. We also drop the transcript back
+    /// to follow-tail so the next session opens pinned to the bottom.
+    ///
+    /// NOTE: the root `Shell` instance and the `AsyncApp` are deliberately
+    /// left untouched: the app's mouse/focus handlers hold the root Shell Rc
+    /// captured at `init`, so rebuilding the root or re-initializing the app
+    /// would strand them. We swap the Shell's innards, never the Shell.
+    fn rebind(&self, world: &World) {
+        self.pending
+            .borrow_mut()
+            .set_queues(world.core.message_queues.clone());
+        self.header.borrow_mut().text = format!("aj-next — {}", world.core.session_id);
+        self.transcript.borrow_mut().reset_to_tail();
     }
 }
 
@@ -2161,23 +2404,78 @@ pub async fn run(args: Args) -> Result<()> {
 
     // Hot-reload watcher for a user theme (bundled names have no on-disk
     // source, so this is inert for `dark` / `light` with no override).
-    let theme_watch = ThemeWatch::install(&theme_name);
+    let mut theme_watch = ThemeWatch::install(&theme_name);
 
-    // Restore the terminal even when the loop exits with a render
-    // error, otherwise the user is left stuck on the alt screen.
-    let result = drive(&mut app, &root, &shell, &mut world, theme_watch).await;
+    // Outer session loop. Each iteration drives one session to completion;
+    // a new-session or resume request exits `drive` with the matching
+    // `SessionExit`, whereupon we tear the outgoing session down and build
+    // the next one over the same Shell (see `install_next_session`). Quit
+    // and fatal errors break out. Usage of each torn-down session is
+    // snapshotted for the shutdown banner so a multi-session process
+    // itemizes every session, matching `aj`.
+    let mut completed_sessions: Vec<(String, UsageSummary)> = Vec::new();
+    // Whether a live session survived the loop. A fatal build failure (both
+    // the requested build and its previous-session fallback failed) leaves
+    // `world` pointing at the already-torn-down outgoing session, whose
+    // usage was snapshotted into `completed_sessions` just above the build.
+    // The banner then prints that list alone and skips the live block, so
+    // the outgoing session isn't counted twice.
+    let mut live_survived = true;
+    let run_result: Result<()> = loop {
+        // Restore the terminal even when the loop exits with a render error,
+        // otherwise the user is left stuck on the alt screen.
+        let exit = drive(&mut app, &root, &shell, &mut world, &mut theme_watch).await;
 
-    // Kill the background-task tree before tearing down turns, so
-    // detached process groups are killed and reaped. Then wind down
-    // any in-flight turn tasks.
-    aj_app::shutdown_background_tasks(&world.core.task_registry).await;
-    world.turns.shutdown().await;
+        // Wind down the outgoing session's work on every exit path (quit,
+        // fatal, or switch): kill the background-task tree before tearing
+        // down turns so detached process groups are killed and reaped, so
+        // an abandoned session never leaks tasks. A session change is only
+        // requested with no turn in flight, so the turn shutdown is a no-op
+        // there.
+        aj_app::shutdown_background_tasks(&world.core.task_registry).await;
+        world.turns.shutdown().await;
+
+        let spec = match exit {
+            Ok(SessionExit::Quit) => break Ok(()),
+            Err(fatal) => break Err(fatal),
+            Ok(SessionExit::New) => SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            Ok(SessionExit::Switch(session_id)) => SessionSpec::Resume {
+                session_id,
+                entry: SessionEntry::Switch,
+            },
+        };
+
+        // Snapshot the outgoing session's usage for the banner before we
+        // rebuild over it. The replacement session's usage starts at zero,
+        // so nothing is double-counted (including on the fallback path,
+        // which resumes the same session in a fresh world).
+        let usage = world.core.usage_summary().await;
+        completed_sessions.push((world.core.session_id.clone(), usage));
+        let previous_id = world.core.session_id.clone();
+
+        match build_next_session(&world, spec, &previous_id).await {
+            Ok(next) => {
+                install_next_session(&mut world, &shell, next);
+                app.request_redraw();
+            }
+            // Both the requested build and the fallback failed: no session
+            // survived, so there is nothing to install. Break with the error
+            // and let the banner itemize what the completed sessions hold.
+            Err(err) => {
+                live_survived = false;
+                break Err(err);
+            }
+        }
+    };
+
     app.shutdown().await;
 
     // The alt screen wiped the conversation from the terminal, so the
     // normal screen gets the usage banner and the resume hint.
-    print_exit_banner(&world).await;
-    result
+    print_exit_banner(&world, &completed_sessions, live_survived).await;
+    run_result
 }
 
 /// The configured theme name, if any, from the world's config layer.
@@ -2237,15 +2535,20 @@ async fn recv_theme(rx: Option<&mut UnboundedReceiver<Theme>>) -> Option<Theme> 
     }
 }
 
-/// The host select loop: turn joins, agent events, terminal input,
-/// widget timers, theme reloads, and async read-only overlay fills.
+/// The host select loop for one session: turn joins, agent events,
+/// terminal input, widget timers, theme reloads, and async overlay fills.
+///
+/// Returns the reason the session ended: `Quit` when the user quits or
+/// input ends, `New` / `Switch(id)` when a session change is requested (only
+/// ever with no turn in flight). The outer loop in [`run`] tears the session
+/// down and, for a change, builds the next one over the same Shell.
 async fn drive(
     app: &mut AsyncApp,
     root: &WidgetRef,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
-    mut theme_watch: ThemeWatch,
-) -> Result<()> {
+    theme_watch: &mut ThemeWatch,
+) -> Result<SessionExit> {
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
     let mut was_busy = false;
@@ -2265,7 +2568,12 @@ async fn drive(
     // so a scope toggle's stale scan can't overwrite the current view.
     let (history_tx, mut history_rx) = unbounded_channel::<(HistoryScope, Vec<PromptEntry>)>();
     let mut pending_history: Option<(HistoryScope, Rc<RefCell<FilterableSelect>>)> = None;
-    loop {
+    // Session-selector preview scans deliver their previews here. The
+    // `SessionScan` (holding the `!Send` select) stays on the host side
+    // while the blocking scan sends only the (Send) previews back.
+    let (session_tx, mut session_rx) = unbounded_channel::<Vec<SessionPreview>>();
+    let mut pending_session: Option<SessionScan> = None;
+    let exit = loop {
         // Compute the tick deadline before the select so no arm holds
         // a borrow of `app` another arm needs. The sleep expression is
         // evaluated even when the guard is false, hence the fallback.
@@ -2340,6 +2648,19 @@ async fn drive(
                 }
             }
 
+            // --- Session-selector preview fill ---
+            // Fill once the scan lands: build the rows, pre-select the
+            // active session, and tag it. A late result with no pending
+            // scan (the overlay was closed) is dropped.
+            maybe_sessions = session_rx.recv() => {
+                if let Some(previews) = maybe_sessions
+                    && let Some(scan) = pending_session.take()
+                {
+                    fill_session_scan(&scan, &previews, Utc::now());
+                    app.request_redraw();
+                }
+            }
+
             // --- Terminal input ---
             event = app.next_input() => {
                 match event {
@@ -2350,7 +2671,7 @@ async fn drive(
                         // The host only collects what the handlers
                         // parked.
                         if app.handle_input(event).quit {
-                            break;
+                            break Ok(SessionExit::Quit);
                         }
                         if let Some(text) = shell.borrow().take_submitted() {
                             handle_submit(world, text);
@@ -2391,7 +2712,7 @@ async fn drive(
                         // overlay (this event may have confirmed one).
                         let activity = shell.borrow().take_activity();
                         if !activity.is_empty()
-                            && apply_selector_activity(world, shell, &mut theme_watch, activity)
+                            && apply_selector_activity(world, shell, theme_watch, activity)
                                 .await
                         {
                             app.request_redraw();
@@ -2426,10 +2747,27 @@ async fn drive(
                             spawn_history_scan(world, fetch.scope, &history_tx);
                             pending_history = Some((fetch.scope, fetch.select));
                         }
+                        // A session-selector open: run the preview scan off
+                        // the loop and remember the selector to fill.
+                        if let Some(scan) = shell.borrow().take_session_scan() {
+                            spawn_session_scan(world, &session_tx);
+                            pending_session = Some(scan);
+                        }
+                        // A parked session change (the `NewSession` command
+                        // or a confirmed resume pick). A change is only ever
+                        // requested with no turn in flight, so tearing the
+                        // world down can't strand a running turn.
+                        if let Some(request) = shell.borrow().take_session_request() {
+                            debug_assert!(
+                                world.turns.is_empty(),
+                                "session change requested mid-turn"
+                            );
+                            break Ok(request.into_exit());
+                        }
                     }
                     // The reader ended (EOF or a read error), so no
                     // further input can arrive.
-                    None => break,
+                    None => break Ok(SessionExit::Quit),
                 }
             }
 
@@ -2437,7 +2775,7 @@ async fn drive(
                 if deadline.is_some() =>
             {
                 if app.fire_due_timers().quit {
-                    break;
+                    break Ok(SessionExit::Quit);
                 }
             }
         }
@@ -2467,25 +2805,72 @@ async fn drive(
         }
         quit_was_armed = quit_armed;
         app.render_if_needed(root)?;
-    }
+    };
 
-    Ok(())
+    exit
 }
 
 /// Print the end-of-session usage banner and resume hint to stdout,
 /// dimmed and indented like `aj`'s shutdown banner. Call after the alt
 /// screen is torn down and with no turn in flight (reading the agent's
 /// usage locks it).
-async fn print_exit_banner(world: &World) {
+///
+/// A single-session process prints one bare usage block. When the process
+/// spanned several sessions (new-session / resume), each torn-down
+/// session's usage was snapshotted into `completed` in order; itemize them
+/// first, each under a dim `Session: <id>` header, then the live session's
+/// block, matching `aj`.
+///
+/// `live_survived` is false only on the fatal build-failure path, where
+/// `world` still points at the already-torn-down outgoing session (itself
+/// the last entry in `completed`). We then print `completed` alone and skip
+/// the live block and the resume hint, so that session isn't counted twice.
+async fn print_exit_banner(
+    world: &World,
+    completed: &[(String, UsageSummary)],
+    live_survived: bool,
+) {
     fn dim(s: &str) -> String {
         format!("\x1b[2m{s}\x1b[22m")
     }
-    let summary = world.core.usage_summary().await;
-    println!();
-    for line in format_usage_summary(&summary).lines() {
-        println!(" {}", dim(line));
+    fn print_block(header: Option<&str>, summary: &UsageSummary) {
+        println!();
+        if let Some(header) = header {
+            println!(" {}", dim(header));
+        }
+        for line in format_usage_summary(summary).lines() {
+            println!(" {}", dim(line));
+        }
+        println!();
     }
-    println!();
+
+    // No live world survived the loop: the outgoing session's usage is
+    // already in `completed`, so print that list and stop.
+    if !live_survived {
+        for (session_id, completed_summary) in completed {
+            print_block(
+                Some(&format_session_usage_header(session_id)),
+                completed_summary,
+            );
+        }
+        return;
+    }
+
+    let summary = world.core.usage_summary().await;
+    if completed.is_empty() {
+        print_block(None, &summary);
+    } else {
+        for (session_id, completed_summary) in completed {
+            print_block(
+                Some(&format_session_usage_header(session_id)),
+                completed_summary,
+            );
+        }
+        print_block(
+            Some(&format_session_usage_header(&world.core.session_id)),
+            &summary,
+        );
+    }
     // Only sessions with at least one persisted user-thread leaf are
     // worth resuming. A fresh session the user quit without typing
     // anything gets no hint.
@@ -3791,41 +4176,24 @@ mod tests {
         assert!(app.handle_input(event).quit, "confirming quit quits");
     }
 
-    /// The still-deferred 8D-3 commands fold a "not wired up yet" notice
-    /// rather than silently doing nothing.
+    /// The still-deferred login/logout commands fold a "not wired up yet"
+    /// notice rather than silently doing nothing (8D-3b-ii wires them up).
     #[tokio::test]
     async fn deferred_commands_fold_a_notice() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await,
+            apply_command_action(&mut world, &shell, CommandAction::OpenLoginSelector).await,
             ActionEffect::Redraw
         ));
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::NewSession).await,
+            apply_command_action(&mut world, &shell, CommandAction::OpenLogoutSelector).await,
             ActionEffect::Redraw
         ));
-        let notices: Vec<String> = world
-            .chat
-            .borrow()
-            .transcript(AgentId::Main)
-            .expect("main transcript")
-            .entries()
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EntryKind::Notice(n) => Some(n.text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices.iter().any(|n| n.contains("Session switching")),
-            "{notices:?}"
-        );
-        assert!(
-            notices.iter().any(|n| n.contains("new session")),
-            "{notices:?}"
-        );
+        let notices = main_notices(&world);
+        assert!(notices.iter().any(|n| n.contains("Login")), "{notices:?}");
+        assert!(notices.iter().any(|n| n.contains("Logout")), "{notices:?}");
     }
 
     /// Confirming session info opens a "Loading…" overlay and parks a
@@ -4665,5 +5033,304 @@ mod tests {
             .take_history_fetch()
             .expect("toggle parked a scan");
         assert_eq!(fetch.scope, HistoryScope::All);
+    }
+
+    // ---- Session selector, new session, rebuild loop (8D-3b-i) ----
+
+    /// Build a scripted session over `dir`'s shared persistence, run one
+    /// prompt turn to completion so the session file carries a first user
+    /// message, and return its session id. Seeds the selector and the
+    /// rebuild loop with real on-disk sessions.
+    async fn create_disk_session(dir: &TempDir, prompt: &str) -> String {
+        let mut world = scripted_world(dir, "streaming-text").await;
+        run_prompt(&mut world, prompt).await;
+        let id = world.core.session_id.clone();
+        aj_app::shutdown_background_tasks(&world.core.task_registry).await;
+        world.turns.shutdown().await;
+        id
+    }
+
+    /// Submit `prompt` into `world`, settle the turn, and drain its events
+    /// into the chat model (and, via the persistence listener, to disk).
+    async fn run_prompt(world: &mut World, prompt: &str) {
+        handle_submit(world, prompt.to_string());
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(world, joined).expect("turn settles");
+        while let Ok(event) = world.core.event_rx.try_recv() {
+            let _ = drain_events(world, event);
+        }
+    }
+
+    /// The `NewSession` command parks a new-session request while idle; the
+    /// drive loop turns that into `SessionExit::New`.
+    #[tokio::test]
+    async fn new_session_command_parks_a_new_request() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::NewSession).await,
+            ActionEffect::Redraw
+        ));
+        assert!(matches!(
+            shell.borrow().take_session_request(),
+            Some(SessionRequest::New)
+        ));
+    }
+
+    /// Both session-changing commands are refused while a turn runs (aj's
+    /// spirit: rebuilding the world under a live turn would strand it). The
+    /// refusal folds a notice and parks nothing.
+    #[tokio::test]
+    async fn session_commands_refused_mid_turn() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        handle_submit(&mut world, "go".to_string());
+        assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
+
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await,
+            ActionEffect::Redraw
+        ));
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "no selector opened mid-turn"
+        );
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::NewSession).await,
+            ActionEffect::Redraw
+        ));
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "no switch parked mid-turn"
+        );
+
+        let notices = main_notices(&world);
+        assert!(
+            notices.iter().any(|n| n.contains("switch sessions")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("start a new session")),
+            "{notices:?}"
+        );
+
+        // Settle the turn so teardown is clean.
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// The selector opens showing a loading placeholder, fills from a real
+    /// persistence scan, tags the current session, and confirming a
+    /// different row parks a resume request the drive loop turns into
+    /// `SessionExit::Switch`.
+    #[tokio::test]
+    async fn session_selector_fills_and_confirms_a_switch() {
+        let dir = TempDir::new().expect("tempdir");
+        let alpha = create_disk_session(&dir, "alpha session prompt").await;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        // Give the current session recognizable on-disk content so its row
+        // scans in and can carry the `(current)` tag.
+        run_prompt(&mut world, "current session prompt").await;
+
+        let effect =
+            apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        let scan = shell
+            .borrow()
+            .take_session_scan()
+            .expect("open parked a preview scan");
+        let loading = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(loading.contains("Loading"), "loading state: {loading}");
+
+        // Run the scan synchronously (what `spawn_session_scan` does off the
+        // loop) and fill, as the drive loop's fill arm would.
+        let mut previews = Vec::new();
+        world
+            .persistence
+            .list_session_previews_streaming(&mut |batch| previews.extend(batch));
+        assert!(
+            previews.len() >= 2,
+            "alpha + the current session are on disk: {}",
+            previews.len()
+        );
+        fill_session_scan(&scan, &previews, Utc::now());
+        app.render(&root).expect("render");
+
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(rows.contains("(current)"), "current session tagged: {rows}");
+
+        // Filter to alpha and confirm; the switch request is parked and the
+        // overlay closes.
+        writer.write_all(b"alpha session\r").expect("query + enter");
+        for _ in 0..14 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert!(
+            matches!(
+                shell.borrow().take_session_request(),
+                Some(SessionRequest::Resume(id)) if id == alpha
+            ),
+            "confirming a different session parks a resume for its id"
+        );
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "confirm closed the selector"
+        );
+    }
+
+    /// Confirming the pre-selected current session is a no-op close (parks
+    /// nothing); Esc cancels the same way.
+    #[tokio::test]
+    async fn session_selector_current_is_noop_and_esc_cancels() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "current session prompt").await;
+
+        // Confirm the pre-selected current row: no switch parked.
+        apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        focus_overlay(&mut app, &root);
+        let scan = shell.borrow().take_session_scan().expect("scan parked");
+        let mut previews = Vec::new();
+        world
+            .persistence
+            .list_session_previews_streaming(&mut |batch| previews.extend(batch));
+        fill_session_scan(&scan, &previews, Utc::now());
+        app.render(&root).expect("render");
+        writer.write_all(b"\r").expect("enter on the current row");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "the current row is a no-op"
+        );
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "confirm closed the selector"
+        );
+
+        // Re-open and Esc: cancels without parking a switch.
+        apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        focus_overlay(&mut app, &root);
+        shell.borrow().take_session_scan();
+        writer.write_all(b"\x1b").expect("esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "esc parks nothing"
+        );
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "esc closed the selector"
+        );
+    }
+
+    /// The rebuild path: a switch tears the running session down and builds
+    /// the next over the same Shell, rebinding by content-swap so the
+    /// transcript renders the new session's model and the pending box reads
+    /// the new agent's queues. The outgoing session's usage accumulates for
+    /// the shutdown banner.
+    #[tokio::test]
+    async fn switch_rebuilds_the_session_and_accumulates_usage() {
+        let dir = TempDir::new().expect("tempdir");
+        let beta = create_disk_session(&dir, "beta session prompt").await;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "alpha session prompt").await;
+        let alpha_id = world.core.session_id.clone();
+
+        // Snapshot the outgoing usage, as the outer loop does before it
+        // rebuilds.
+        let mut completed: Vec<(String, UsageSummary)> = Vec::new();
+        completed.push((alpha_id.clone(), world.core.usage_summary().await));
+
+        // Switch to beta: build then install over the same Shell.
+        let next = build_next_session(
+            &world,
+            SessionSpec::Resume {
+                session_id: beta.clone(),
+                entry: SessionEntry::Switch,
+            },
+            &alpha_id,
+        )
+        .await
+        .expect("build beta");
+        install_next_session(&mut world, &shell, next);
+
+        assert_eq!(world.core.session_id, beta, "world rebuilt onto beta");
+        // The transcript renders beta's replayed content, not alpha's, which
+        // proves every chrome widget follows the content-swapped chat cell.
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            rows.contains("beta session prompt"),
+            "beta content shown: {rows}"
+        );
+        assert!(
+            !rows.contains("alpha session prompt"),
+            "alpha content gone after the swap: {rows}"
+        );
+        // The header id followed the swap.
+        assert_eq!(
+            shell.borrow().header.borrow().text,
+            format!("aj-next — {beta}")
+        );
+        // The pending box reads the new agent's queues (rebound on the
+        // swap), so a message queued on the new core previews.
+        world
+            .core
+            .message_queues
+            .append_follow_up(AgentId::Main, "queued after switch");
+        let pending = Rc::clone(&shell.borrow().pending);
+        let pending_rows = crate::test_support::rows(
+            &pending
+                .borrow_mut()
+                .draw(&crate::test_support::draw_ctx(80, None)),
+        );
+        assert!(
+            pending_rows.join("\n").contains("queued after switch"),
+            "pending box repointed to the new queues: {pending_rows:?}"
+        );
+        world.core.message_queues.clear(AgentId::Main);
+
+        // Switch again, this time to a fresh session; usage keeps
+        // accumulating and the new session's transcript is empty.
+        completed.push((
+            world.core.session_id.clone(),
+            world.core.usage_summary().await,
+        ));
+        let prev = world.core.session_id.clone();
+        let next = build_next_session(
+            &world,
+            SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            &prev,
+        )
+        .await
+        .expect("build fresh");
+        install_next_session(&mut world, &shell, next);
+
+        assert_ne!(world.core.session_id, beta, "a fresh session was minted");
+        let fresh_rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            !fresh_rows.contains("beta session prompt"),
+            "fresh session opens empty: {fresh_rows}"
+        );
+
+        // The banner itemizes both completed sessions in order (aj's
+        // accumulation), then the live one.
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].0, alpha_id);
+        assert_eq!(completed[1].0, beta);
+        // Formatting the banner over the accumulated list must not panic.
+        print_exit_banner(&world, &completed, true).await;
     }
 }

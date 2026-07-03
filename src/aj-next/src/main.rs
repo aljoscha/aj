@@ -21,6 +21,7 @@ mod overlay;
 mod palette;
 mod pending;
 mod prompt_history;
+mod session_selector;
 mod settings_ui;
 mod status;
 mod subagent_box;

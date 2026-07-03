@@ -69,6 +69,14 @@ impl PendingBox {
         self.styles = styles;
     }
 
+    /// Repoint at a new session's message queues, for a session rebuild.
+    /// `SessionCore::build` mints fresh queues wired into the new agent, so
+    /// the clone taken at construction would otherwise observe a queue no
+    /// longer connected to the live agent.
+    pub(crate) fn set_queues(&mut self, queues: MessageQueues) {
+        self.queues = queues;
+    }
+
     /// Hint spans describing the pending message's kind and the
     /// gestures that act on it, mirroring `aj`'s wording.
     fn hint(&self, kind: PendingKind) -> Vec<TextSpan> {
