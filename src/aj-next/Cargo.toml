@@ -27,6 +27,7 @@ vaxis = { path = "../vaxis/" }
 
 [dev-dependencies]
 aj-app = { path = "../aj-app/", features = ["test-support"] }
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

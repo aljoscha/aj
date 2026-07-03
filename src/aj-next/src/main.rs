@@ -19,6 +19,7 @@ mod keymap;
 mod overlay;
 mod palette;
 mod pending;
+mod settings_ui;
 mod status;
 mod subagent_box;
 #[cfg(test)]

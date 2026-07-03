@@ -57,7 +57,10 @@ pub(crate) fn open_palette(
     fetch_slot: &Rc<RefCell<Option<PendingFetch>>>,
     ctx: &mut EventContext,
 ) {
-    let select = Rc::new(RefCell::new(FilterableSelect::new(palette_items())));
+    let select = Rc::new(RefCell::new(FilterableSelect::new(
+        palette_items(),
+        chrome.borrow().select.clone(),
+    )));
     let focus = select.borrow().focus_target();
     // Recover the action from the confirmed row via its filter key, which
     // is `"{category} {title}"` and unique per command.

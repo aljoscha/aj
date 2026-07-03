@@ -23,12 +23,21 @@ use aj_app::commands::{CommandAction, load_model_catalog};
 use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionCore, SessionEntry, SessionSpec};
 use aj_app::session_setup::{RunConfigSnapshot, build_initial_run_config};
+use aj_app::settings::{
+    ConfigLayers, ConfigTarget, FooterUpdate, MainConfirm, PersistAction, SpeedConfirm, SubConfirm,
+};
 use aj_app::shutdown::{format_resume_hint, format_usage_summary};
 use aj_app::theme::{ColorMode, Theme, ThemeHandle, ThemeWatcherGuard, watch_user_theme};
 use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn, turn_policy};
-use aj_conf::{Config, ConfigDiagnostic, ConfigSpeed, Severity};
+use aj_conf::{
+    Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
+};
 use aj_models::auth::AuthStorage;
+use aj_models::registry::ModelInfo;
 use aj_models::types::Speed;
+use aj_models::{
+    ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
+};
 use aj_session::{ConversationPersistence, ThreadFilter, replay};
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -48,8 +57,18 @@ use crate::keymap::{HostCtx, build_keymap};
 use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
+use crate::settings_ui::{
+    MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
+    UNSET_VALUE, open_model, open_settings, open_skills, open_thinking,
+};
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::transcript::{TranscriptStyles, TranscriptView};
+
+/// App-event name the drive loop posts after opening an overlay outside
+/// dispatch. The Shell handles it by moving focus onto the top overlay: the
+/// drive loop owns the session world but has no [`EventContext`] to move focus
+/// itself, so it delegates the focus move to the shell via this event.
+const REFOCUS_OVERLAY_EVENT: &str = "aj-next.refocus-overlay";
 
 /// Everything the select loop mutates besides the `AsyncApp`: the
 /// session core, the shared chat model, and the turn bookkeeping.
@@ -69,6 +88,14 @@ struct World {
     /// the turn-join arm mutate it.
     status: Rc<RefCell<StatusState>>,
     config: Arc<StdMutex<Config>>,
+    /// The user + project config layers behind the effective `config`. The
+    /// settings windows mutate one layer, recompute the effective config, and
+    /// persist that layer's file (see [`aj_app::settings`]).
+    config_layers: Arc<StdMutex<ConfigLayers>>,
+    /// The model catalog, shared with the model selector and the settings
+    /// window's model submenu. Also seeds [`ChatState`]'s context-window
+    /// resolver.
+    catalog: Arc<Vec<ModelInfo>>,
     run_config: Arc<StdMutex<RunConfigSnapshot>>,
     /// In-flight turns keyed by the agent running them, plus the
     /// host's clone of each turn's cancel token. The token map's key
@@ -89,11 +116,12 @@ struct World {
 /// frame shows them.
 async fn build_world(
     args: &Args,
-    config: Config,
+    layers: ConfigLayers,
     diagnostics: &[ConfigDiagnostic],
     auth: &AuthStorage,
     persistence: &ConversationPersistence,
 ) -> Result<World> {
+    let config = layers.effective();
     let speed = match args.speed.as_deref() {
         Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
         None => config.speed,
@@ -141,7 +169,7 @@ async fn build_world(
         SessionCore::build(&config, &run_config, persistence, &spec, restore.as_ref())?;
 
     let catalog = load_model_catalog();
-    let mut chat = ChatState::new(seed.settings, seed.context_window, catalog);
+    let mut chat = ChatState::new(seed.settings, seed.context_window, Arc::clone(&catalog));
     chat.hide_thinking_block = config.hide_thinking_block;
     chat.show_image_in_terminal = config.image_show_in_terminal;
 
@@ -220,6 +248,8 @@ async fn build_world(
         chat: Rc::new(RefCell::new(chat)),
         status: Rc::new(RefCell::new(StatusState::default())),
         config: Arc::new(StdMutex::new(config)),
+        config_layers: Arc::new(StdMutex::new(layers)),
+        catalog,
         run_config,
         turns: JoinSet::new(),
         turn_cancels: HashMap::new(),
@@ -620,15 +650,30 @@ fn write_session_export(session_id: &str, html: &str) -> Result<std::path::PathB
     Ok(path)
 }
 
+/// What applying a parked [`CommandAction`] did, so the drive loop knows
+/// whether to redraw and whether to move focus onto a freshly opened overlay.
+enum ActionEffect {
+    /// Nothing to do.
+    None,
+    /// Renderable state changed; request a redraw.
+    Redraw,
+    /// An overlay was opened from the host loop; focus it and redraw.
+    OpenedOverlay,
+}
+
 /// Apply a [`CommandAction`] the palette parked for the host loop.
 ///
-/// The palette handles the overlay-opening commands (help, auth, session
-/// info, usage), `Quit`, and re-open itself in its confirm callback,
-/// where the live focus context is available. Only the commands that need
-/// the world (compact, export) or aren't wired yet reach here. Returns
-/// whether renderable state changed, so the caller can request one
-/// redraw.
-async fn apply_command_action(world: &mut World, action: CommandAction) -> bool {
+/// The palette handles the read-only overlays (help, auth, session info,
+/// usage), `Quit`, and re-open in its confirm callback, where the focus
+/// context is available. The config-editing surfaces (thinking, model,
+/// settings, skills) need the session world, which only the host owns, so they
+/// open here and rely on the [`REFOCUS_OVERLAY_EVENT`] the caller posts to move
+/// focus onto them.
+async fn apply_command_action(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    action: CommandAction,
+) -> ActionEffect {
     match action {
         CommandAction::Compact => {
             // `/compact` runs as a tracked turn (it owns the turn
@@ -653,7 +698,7 @@ async fn apply_command_action(world: &mut World, action: CommandAction) -> bool 
                     &mut world.turn_cancels,
                 );
             }
-            true
+            ActionEffect::Redraw
         }
         CommandAction::ExportHtml => {
             // Render under the log lock (read-only, so it can't deadlock a
@@ -665,53 +710,162 @@ async fn apply_command_action(world: &mut World, action: CommandAction) -> bool 
                 Err(e) => format!("Export failed: {e}"),
             };
             fold_notice(world, &notice);
-            true
-        }
-        // 8D-2 adds the model/thinking/settings/skills surfaces.
-        CommandAction::OpenModelSelector => {
-            fold_notice(world, "Model selection is not wired up yet.");
-            true
+            ActionEffect::Redraw
         }
         CommandAction::OpenThinkingSelector => {
-            fold_notice(world, "Thinking-level selection is not wired up yet.");
-            true
+            let target = world.chat.borrow().active_view();
+            let current = viewed_thinking(world, target);
+            let handles = shell.borrow().overlay_handles();
+            open_thinking(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.activity,
+                target,
+                current,
+            );
+            ActionEffect::OpenedOverlay
+        }
+        CommandAction::OpenModelSelector => {
+            let target = world.chat.borrow().active_view();
+            let current = viewed_model(world, target);
+            let handles = shell.borrow().overlay_handles();
+            open_model(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.activity,
+                Arc::clone(&world.catalog),
+                target,
+                Some(current),
+            );
+            ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSettings => {
-            fold_notice(world, "The settings window is not wired up yet.");
-            true
+            let values = user_settings_values(world);
+            // The user window has no inherited layer and no project keys;
+            // the clear path is inert there.
+            let inherited = user_settings_values(world);
+            let handles = shell.borrow().overlay_handles();
+            open_settings(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.activity,
+                &handles.settings_ui,
+                ConfigTarget::User,
+                values,
+                inherited,
+                std::collections::BTreeSet::new(),
+                settings_catalogs(world),
+            );
+            ActionEffect::OpenedOverlay
         }
         CommandAction::OpenProjectSettings => {
-            fold_notice(world, "The project settings window is not wired up yet.");
-            true
+            // Per-project settings need a git repository. The effective
+            // config-layer view shows what the project pins; the user layer is
+            // what a clear reverts to.
+            let has_project = world
+                .config_layers
+                .lock()
+                .expect("config layers mutex poisoned")
+                .project_path
+                .is_some();
+            if !has_project {
+                fold_notice(
+                    world,
+                    "Project settings need a git repository (no .git found above the \
+                     working directory).",
+                );
+                return ActionEffect::Redraw;
+            }
+            let (effective, user, set_keys) = {
+                let l = world
+                    .config_layers
+                    .lock()
+                    .expect("config layers mutex poisoned");
+                let effective = world.config.lock().expect("config mutex poisoned").clone();
+                let set_keys: std::collections::BTreeSet<String> =
+                    l.project.set_keys().map(String::from).collect();
+                (effective, l.user.clone(), set_keys)
+            };
+            let values = SettingsValues::from_config(&effective, &world.catalog);
+            let inherited = SettingsValues::from_config(&user, &world.catalog);
+            let handles = shell.borrow().overlay_handles();
+            open_settings(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.activity,
+                &handles.settings_ui,
+                ConfigTarget::Project,
+                values,
+                inherited,
+                set_keys,
+                settings_catalogs(world),
+            );
+            ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSkills => {
-            fold_notice(world, "The skills window is not wired up yet.");
-            true
+            // Rediscover skills at open time so the window reflects the on-disk
+            // state (and the current `disabled_skills`) rather than the frozen
+            // session snapshot.
+            let (skills, _diag) = {
+                let cfg = world.config.lock().expect("config mutex poisoned");
+                aj_conf::skills::discover_skills(&cfg.disabled_skills)
+            };
+            if skills.is_empty() {
+                fold_notice(
+                    world,
+                    "No skills found. Put skills in ~/.agents/skills/ or .agents/skills/ \
+                     (also: .aj/, .claude/).",
+                );
+                return ActionEffect::Redraw;
+            }
+            let rows: Vec<SkillRow> = skills
+                .into_iter()
+                .map(|s| SkillRow {
+                    name: s.name,
+                    description: s.description,
+                    path: aj_conf::display_path(&s.path),
+                    enabled: s.enabled,
+                    disable_model_invocation: s.disable_model_invocation,
+                })
+                .collect();
+            let handles = shell.borrow().overlay_handles();
+            open_skills(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.activity,
+                rows,
+            );
+            ActionEffect::OpenedOverlay
         }
         // 8D-3 adds the session/history/agent/login surfaces.
         CommandAction::OpenSessionSelector => {
             fold_notice(world, "Session switching is not wired up yet.");
-            true
+            ActionEffect::Redraw
         }
         CommandAction::NewSession => {
             fold_notice(world, "Starting a new session is not wired up yet.");
-            true
+            ActionEffect::Redraw
         }
         CommandAction::OpenPromptHistory => {
             fold_notice(world, "Prompt history search is not wired up yet.");
-            true
+            ActionEffect::Redraw
         }
         CommandAction::OpenAgentPicker => {
             fold_notice(world, "The agent picker is not wired up yet.");
-            true
+            ActionEffect::Redraw
         }
         CommandAction::OpenLoginSelector => {
             fold_notice(world, "Login is not wired up yet.");
-            true
+            ActionEffect::Redraw
         }
         CommandAction::OpenLogoutSelector => {
             fold_notice(world, "Logout is not wired up yet.");
-            true
+            ActionEffect::Redraw
         }
         // Handled in the palette confirm (overlay openers, quit, re-open)
         // or never a catalog command (`OpenTaskOutput`). Nothing to do.
@@ -721,7 +875,602 @@ async fn apply_command_action(world: &mut World, action: CommandAction) -> bool 
         | CommandAction::OpenSessionInfo
         | CommandAction::OpenCommandPalette
         | CommandAction::Quit
-        | CommandAction::OpenTaskOutput { .. } => false,
+        | CommandAction::OpenTaskOutput { .. } => ActionEffect::None,
+    }
+}
+
+/// The viewed agent's current thinking level, from its footer entry, falling
+/// back to the run config when it has no entry.
+fn viewed_thinking(world: &World, target: AgentId) -> Option<ThinkingConfig> {
+    world
+        .chat
+        .borrow()
+        .footers()
+        .settings(target)
+        .and_then(|s| thinking_config_from_name(&s.thinking))
+        .unwrap_or_else(|| {
+            world
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .thinking
+                .clone()
+        })
+}
+
+/// The viewed agent's current `(provider, id)`, from its footer entry, falling
+/// back to the run config's model key.
+fn viewed_model(world: &World, target: AgentId) -> (String, String) {
+    world
+        .chat
+        .borrow()
+        .footers()
+        .settings(target)
+        .map(|s| (s.provider.clone(), s.model_id.clone()))
+        .unwrap_or_else(|| {
+            world
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .model_key
+                .clone()
+        })
+}
+
+/// The catalog and name sets the settings window's submenus need. Rediscovered
+/// per open so newly added skills are togglable without a restart.
+fn settings_catalogs(world: &World) -> SettingsCatalogs {
+    let tools: Vec<String> = aj_tools::get_builtin_tools(&aj_tools::BuiltinToolOptions::default())
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    let skills: Vec<String> = aj_conf::skills::discover_skills(&[])
+        .0
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    SettingsCatalogs {
+        models: Arc::clone(&world.catalog),
+        themes: Theme::available(),
+        tools,
+        skills,
+    }
+}
+
+/// The live settings-window values the user window opens with: model /
+/// thinking / speed / verbosity from the run config (the next-turn truth), the
+/// render toggles from the chat model, the rest from the effective config.
+fn user_settings_values(world: &World) -> SettingsValues {
+    let run_cfg = world.run_config.lock().expect("run config mutex poisoned");
+    let cfg = world.config.lock().expect("config mutex poisoned");
+    let chat = world.chat.borrow();
+    SettingsValues {
+        model_key: run_cfg.model_key.clone(),
+        model_url: cfg.model_url.clone(),
+        thinking: aj_app::commands::thinking_level_name(&run_cfg.thinking).to_string(),
+        thinking_display: cfg.thinking_display.map(|d| d.to_string()),
+        speed: speed_name(run_cfg.speed).to_string(),
+        verbosity: run_cfg
+            .stream_options
+            .verbosity
+            .map(|v| verbosity_name(Some(v)).to_string()),
+        theme: cfg.theme.clone().unwrap_or_else(|| "light".to_string()),
+        disabled_tools: cfg.disabled_tools.clone(),
+        disabled_skills: cfg.disabled_skills.clone(),
+        hide_thinking_block: chat.hide_thinking_block,
+        image_auto_resize: cfg.image_auto_resize,
+        image_show_in_terminal: chat.show_image_in_terminal,
+        image_block: cfg.image_block,
+        bash_rtk: cfg.bash_rtk,
+        syntax_highlighting: cfg.syntax_highlighting,
+        auto_compact: cfg.auto_compact,
+        compact_threshold: cfg.compact_threshold.to_string(),
+        compact_keep_recent: cfg.compact_keep_recent.to_string(),
+    }
+}
+
+/// Apply one batch of confirmed config edits parked by the overlays through
+/// the shared settings core, reconciling the chat model and folding a notice
+/// for each. Returns whether anything changed renderable state.
+async fn apply_selector_activity(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    theme_watch: &mut ThemeWatch,
+    activity: Vec<SelectorActivity>,
+) -> bool {
+    let mut changed = false;
+    for item in activity {
+        changed = true;
+        match item {
+            SelectorActivity::ThinkingConfirmed { target, level } => {
+                let notice = confirm_thinking(world, target, level).await;
+                fold_notice(world, &notice);
+            }
+            SelectorActivity::ModelConfirmed { target, info } => {
+                let notice = confirm_model(world, target, *info).await;
+                fold_notice(world, &notice);
+            }
+            SelectorActivity::SettingChange { target, id, value } => {
+                let persist = PersistAction::set_for(target);
+                if let Some(notice) =
+                    apply_setting_change(world, shell, theme_watch, persist, &id, &value).await
+                {
+                    fold_notice(world, &notice);
+                }
+            }
+            SelectorActivity::SettingClear { id, inherited } => {
+                if let Some(notice) = apply_setting_change(
+                    world,
+                    shell,
+                    theme_watch,
+                    PersistAction::ProjectClear,
+                    &id,
+                    &inherited,
+                )
+                .await
+                {
+                    fold_notice(world, &notice);
+                }
+            }
+            SelectorActivity::SkillToggle { name, disable } => {
+                let notice = apply_skill_toggle(world, &name, disable);
+                fold_notice(world, &notice);
+            }
+        }
+    }
+    changed
+}
+
+/// Record a main-agent footer update into the chat model so its model line and
+/// context gauge reflect the change without waiting for the next turn.
+fn note_main_footer(world: &World, footer: Option<FooterUpdate>) {
+    if let Some(FooterUpdate {
+        settings,
+        context_window,
+    }) = footer
+    {
+        world.chat.borrow_mut().footers_mut().note_settings(
+            AgentId::Main,
+            settings,
+            context_window,
+        );
+    }
+}
+
+/// Apply a confirmed thinking pick (session-scoped) and reconcile the footer.
+async fn confirm_thinking(world: &World, target: AgentId, level: Option<ThinkingConfig>) -> String {
+    match target {
+        AgentId::Main => {
+            let MainConfirm { footer, notice } = aj_app::settings::confirm_thinking_for_main(
+                level,
+                PersistAction::None,
+                &world.run_config,
+                &world.config,
+                &world.config_layers,
+                &world.core,
+            )
+            .await;
+            note_main_footer(world, footer);
+            notice
+        }
+        AgentId::Sub(n) => confirm_thinking_sub(world, n, level).await,
+    }
+}
+
+/// Apply a confirmed thinking pick to sub-agent `n`, refreshing its footer
+/// entry on success. The validation fallback is the model the footer tracks.
+async fn confirm_thinking_sub(world: &World, n: usize, level: Option<ThinkingConfig>) -> String {
+    let target = AgentId::Sub(n);
+    let tracked = world
+        .chat
+        .borrow()
+        .footers()
+        .settings(target)
+        .and_then(|s| {
+            world
+                .catalog
+                .iter()
+                .find(|m| m.provider == s.provider && m.id == s.model_id)
+                .cloned()
+                .map(Arc::new)
+        });
+    let SubConfirm { notice, applied } =
+        aj_app::settings::confirm_thinking_for_sub(level.clone(), n, tracked, &world.core).await;
+    if applied {
+        let name = aj_app::commands::thinking_level_name(&level).to_string();
+        let entry = world.chat.borrow().footers().settings(target).cloned();
+        if let Some(mut settings) = entry {
+            let window = world
+                .chat
+                .borrow()
+                .footers()
+                .context_usage(target)
+                .context_window;
+            settings.thinking = name;
+            world
+                .chat
+                .borrow_mut()
+                .footers_mut()
+                .note_settings(target, settings, window);
+        }
+    }
+    notice
+}
+
+/// Apply a confirmed model pick (session-scoped) and reconcile the footer.
+async fn confirm_model(world: &World, target: AgentId, info: ModelInfo) -> String {
+    match target {
+        AgentId::Main => {
+            let MainConfirm { footer, notice } = aj_app::settings::confirm_model_for_main(
+                info,
+                PersistAction::None,
+                &world.auth,
+                &world.run_config,
+                &world.config,
+                &world.config_layers,
+                &world.core,
+            )
+            .await;
+            note_main_footer(world, footer);
+            notice
+        }
+        AgentId::Sub(n) => confirm_model_sub(world, n, info).await,
+    }
+}
+
+/// Apply a confirmed model pick to sub-agent `n`, refreshing its footer entry
+/// on success at the speed the frontend tracks for it.
+async fn confirm_model_sub(world: &World, n: usize, info: ModelInfo) -> String {
+    let target = AgentId::Sub(n);
+    let staged_speed = world
+        .core
+        .sub_overrides
+        .lock()
+        .expect("sub overrides mutex poisoned")
+        .get(&n)
+        .and_then(|o| o.speed);
+    let effective_speed = match staged_speed {
+        Some(speed) => speed,
+        None => world
+            .chat
+            .borrow()
+            .footers()
+            .settings(target)
+            .and_then(|s| speed_from_name(&s.speed))
+            .flatten(),
+    };
+    let SubConfirm { notice, applied } = aj_app::settings::confirm_model_for_sub(
+        &info,
+        n,
+        &world.auth,
+        effective_speed,
+        &world.core,
+    )
+    .await;
+    if applied {
+        let (thinking, verbosity) = {
+            let chat = world.chat.borrow();
+            let settings = chat.footers().settings(target);
+            (
+                settings
+                    .map(|s| s.thinking.clone())
+                    .unwrap_or_else(|| "off".to_string()),
+                settings
+                    .map(|s| s.verbosity.clone())
+                    .unwrap_or_else(|| "default".to_string()),
+            )
+        };
+        let settings = aj_agent::events::AgentSettings {
+            provider: info.provider.clone(),
+            model_id: info.id.clone(),
+            thinking,
+            speed: speed_name(effective_speed).to_string(),
+            verbosity,
+        };
+        world
+            .chat
+            .borrow_mut()
+            .footers_mut()
+            .note_settings(target, settings, info.context_window);
+    }
+    notice
+}
+
+/// Persist a skills-window toggle into `disabled_skills` (user layer). Only
+/// changes what new sessions list to the model; the running system prompt is
+/// frozen, which the notice says.
+fn apply_skill_toggle(world: &World, name: &str, disable: bool) -> String {
+    let save = aj_app::settings::persist_user(&world.config_layers, &world.config, |c| {
+        if disable {
+            if !c.disabled_skills.iter().any(|n| n == name) {
+                c.disabled_skills.push(name.to_string());
+            }
+        } else {
+            c.disabled_skills.retain(|n| n != name);
+        }
+    });
+    join_notice(
+        format!(
+            "Skill {name} {}. Takes effect for new sessions.",
+            if disable { "disabled" } else { "enabled" }
+        ),
+        save,
+    )
+}
+
+/// Append an optional follow-up note (e.g. a persist failure) to a
+/// confirmation notice.
+fn join_notice(mut notice: String, note: Option<String>) -> String {
+    if let Some(note) = note {
+        notice.push(' ');
+        notice.push_str(&note);
+    }
+    notice
+}
+
+/// Revert a settings-window row's displayed value after a failed apply, so the
+/// window never shows a value that isn't actually active. No-op when the
+/// window has closed.
+fn revert_setting_row(shell: &Rc<RefCell<Shell>>, id: &str, value: &str) {
+    if let Some(ui) = shell.borrow().settings_ui.borrow().as_ref() {
+        ui.list.borrow().set_value(id, value);
+    }
+}
+
+/// Apply one settings-window change (or project clear) to the running session
+/// and persist it per `persist`. Returns the user-facing notice.
+///
+/// Live-appliable settings reuse the same confirm cores as their dedicated
+/// selectors (model, thinking, speed, verbosity); the render toggles mutate
+/// the chat model; the theme row reloads the palette and re-tints live; the
+/// rest are plain config-backed values persisted with a "takes effect" note.
+/// A failed apply reverts the row's display through [`revert_setting_row`].
+async fn apply_setting_change(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    theme_watch: &mut ThemeWatch,
+    persist: PersistAction,
+    id: &str,
+    value: &str,
+) -> Option<String> {
+    match id {
+        MODEL_SETTING_ID => {
+            let Some(info) = value.split_once('/').and_then(|(provider, model_id)| {
+                world
+                    .catalog
+                    .iter()
+                    .find(|m| m.provider == provider && m.id == model_id)
+                    .cloned()
+            }) else {
+                let active = {
+                    let cfg = world.run_config.lock().expect("run config mutex poisoned");
+                    format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
+                };
+                revert_setting_row(shell, MODEL_SETTING_ID, &active);
+                return Some(format!("Unknown model {value}."));
+            };
+            let MainConfirm { footer, notice } = aj_app::settings::confirm_model_for_main(
+                info,
+                persist,
+                &world.auth,
+                &world.run_config,
+                &world.config,
+                &world.config_layers,
+                &world.core,
+            )
+            .await;
+            note_main_footer(world, footer);
+            // The core reports a rebuild failure only as notice text; compare
+            // the staged key so the row reverts to the model actually active.
+            let active = {
+                let cfg = world.run_config.lock().expect("run config mutex poisoned");
+                format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
+            };
+            if active != value {
+                revert_setting_row(shell, MODEL_SETTING_ID, &active);
+            }
+            Some(notice)
+        }
+        "thinking" => match thinking_config_from_name(value) {
+            Some(level) => {
+                let MainConfirm { footer, notice } = aj_app::settings::confirm_thinking_for_main(
+                    level,
+                    persist,
+                    &world.run_config,
+                    &world.config,
+                    &world.config_layers,
+                    &world.core,
+                )
+                .await;
+                note_main_footer(world, footer);
+                Some(notice)
+            }
+            None => Some(format!("Unknown thinking level {value:?}.")),
+        },
+        "thinking_display" => {
+            let display = if value == UNSET_VALUE {
+                None
+            } else {
+                match value.parse::<ConfigThinkingDisplay>() {
+                    Ok(d) => Some(d),
+                    Err(err) => return Some(format!("Can't set thinking_display: {err}")),
+                }
+            };
+            {
+                let mut cfg = world.run_config.lock().expect("run config mutex poisoned");
+                aj_app::model::apply_thinking_display(&mut cfg.stream_options, display);
+            }
+            // The "default" sentinel unsets the key in either layer.
+            let value_opt = (value != UNSET_VALUE).then_some(value);
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "thinking_display",
+                value_opt,
+                |c| c.thinking_display = display,
+            );
+            Some(join_notice(
+                format!("Thinking display set to {value}. Takes effect next turn."),
+                save,
+            ))
+        }
+        "speed" => match speed_from_name(value) {
+            Some(speed) => match aj_app::settings::confirm_speed_for_main(
+                speed,
+                persist,
+                &world.auth,
+                &world.run_config,
+                &world.config,
+                &world.config_layers,
+                &world.core,
+            )
+            .await
+            {
+                SpeedConfirm::Applied { footer, notice } => {
+                    note_main_footer(world, Some(footer));
+                    Some(notice)
+                }
+                SpeedConfirm::Failed { previous, notice } => {
+                    revert_setting_row(shell, "speed", &previous);
+                    Some(notice)
+                }
+            },
+            None => Some(format!("Unknown speed {value:?}.")),
+        },
+        "verbosity" => {
+            let verbosity = if value == UNSET_VALUE {
+                None
+            } else {
+                match value.parse::<ConfigVerbosity>() {
+                    Ok(v) => Some(v),
+                    Err(err) => return Some(format!("Can't set verbosity: {err}")),
+                }
+            };
+            Some(
+                aj_app::settings::confirm_verbosity_for_main(
+                    verbosity,
+                    persist,
+                    &world.run_config,
+                    &world.config,
+                    &world.config_layers,
+                    &world.core,
+                )
+                .await,
+            )
+        }
+        "theme" => {
+            let mode = shell.borrow().theme.color_mode();
+            match Theme::load_strict_with_mode(value, mode) {
+                Ok(loaded) => {
+                    {
+                        let s = shell.borrow();
+                        s.theme.replace(loaded);
+                    }
+                    // Re-tint the whole UI, including the open settings window.
+                    shell.borrow().restyle();
+                    // Re-point the hot-reload watcher at the new theme's file.
+                    *theme_watch = ThemeWatch::install(value);
+                    let save = aj_app::settings::persist_setting(
+                        &world.config_layers,
+                        &world.config,
+                        persist,
+                        "theme",
+                        Some(value),
+                        |c| c.theme = Some(value.to_string()),
+                    );
+                    Some(join_notice(format!("Theme set to {value}."), save))
+                }
+                Err(err) => {
+                    let active = {
+                        let cfg = world.config.lock().expect("config mutex poisoned");
+                        cfg.theme.clone().unwrap_or_else(|| "light".to_string())
+                    };
+                    revert_setting_row(shell, "theme", &active);
+                    Some(format!("Couldn't load theme {value:?}: {err}"))
+                }
+            }
+        }
+        "hide_thinking_block" => {
+            let hide = value == "true";
+            world.chat.borrow_mut().hide_thinking_block = hide;
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "hide_thinking_block",
+                Some(value),
+                |c| c.hide_thinking_block = hide,
+            );
+            Some(join_notice(
+                format!(
+                    "Thinking blocks {}.",
+                    if hide { "hidden" } else { "expanded" }
+                ),
+                save,
+            ))
+        }
+        "image_show_in_terminal" => {
+            let show = value == "true";
+            world.chat.borrow_mut().show_image_in_terminal = show;
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "image_show_in_terminal",
+                Some(value),
+                |c| c.image_show_in_terminal = show,
+            );
+            Some(join_notice(
+                format!("image_show_in_terminal set to {show}."),
+                save,
+            ))
+        }
+        "model_url" => {
+            let url = (!value.is_empty()).then(|| value.to_string());
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "model_url",
+                url.as_deref(),
+                |c| c.model_url = url.clone(),
+            );
+            let what = match &url {
+                Some(u) => format!("set to {u}"),
+                None => "unset".to_string(),
+            };
+            Some(join_notice(
+                format!("model_url {what}. Takes effect on restart."),
+                save,
+            ))
+        }
+        // Everything else is a plain config-backed value with no extra live
+        // side effect: route it through the schema so a freshly-added option
+        // is editable without a bespoke arm here. A project clear carries an
+        // already-valid inherited value, so it skips validation.
+        other => {
+            let Some(option) = Config::option(other) else {
+                return Some(format!("Unknown setting {other:?}."));
+            };
+            if persist != PersistAction::ProjectClear
+                && let Err(err) = option.apply_str(value, &mut Config::default())
+            {
+                return Some(format!("Can't set {other}: {err}"));
+            }
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                other,
+                Some(value),
+                |c| {
+                    // Pre-validated above, so this can't fail.
+                    let _ = option.apply_str(value, c);
+                },
+            );
+            Some(join_notice(format!("{other} set to {value}."), save))
+        }
     }
 }
 
@@ -760,6 +1509,17 @@ fn spawn_overlay_fetch(
             });
         }
     }
+}
+
+/// The shared handles the drive loop hands to a config-editing overlay's open
+/// function. Gathered from the shell in one borrow so the open call site never
+/// holds a shell borrow across it.
+struct OverlayHandles {
+    stack: Rc<RefCell<OverlayStack>>,
+    editor: WidgetRef,
+    chrome: OverlayChrome,
+    activity: Rc<RefCell<Vec<SelectorActivity>>>,
+    settings_ui: Rc<RefCell<Option<SettingsUi>>>,
 }
 
 /// The root widget: the keymap controller wrapping the base layout, the
@@ -814,6 +1574,15 @@ struct Shell {
     transcript: Rc<RefCell<TranscriptView>>,
     pending: Rc<RefCell<PendingBox>>,
     footer: Rc<RefCell<FooterLine>>,
+    /// Confirmed config edits parked by the selector and settings overlays
+    /// for the drive loop to apply through the shared settings core (the
+    /// overlays can't reach the async cores or the session world). Drained
+    /// after each input event.
+    selector_activity: Rc<RefCell<Vec<SelectorActivity>>>,
+    /// Live handles to an open settings window, so a failed apply can revert a
+    /// row and a theme swap can re-tint the window. `None` when no settings
+    /// window is open.
+    settings_ui: Rc<RefCell<Option<SettingsUi>>>,
 }
 
 impl Shell {
@@ -876,6 +1645,9 @@ impl Shell {
         let command_slot: Rc<RefCell<Option<CommandAction>>> = Rc::new(RefCell::new(None));
         let fetch_slot: Rc<RefCell<Option<PendingFetch>>> = Rc::new(RefCell::new(None));
         let host_action: Rc<RefCell<Option<AjAction>>> = Rc::new(RefCell::new(None));
+        let selector_activity: Rc<RefCell<Vec<SelectorActivity>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let settings_ui: Rc<RefCell<Option<SettingsUi>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
             turn_running: false,
@@ -893,6 +1665,7 @@ impl Shell {
             let chrome_for_actions = Rc::clone(&chrome);
             let command_slot_for_actions = Rc::clone(&command_slot);
             let fetch_slot_for_actions = Rc::clone(&fetch_slot);
+            let settings_ui_for_actions = Rc::clone(&settings_ui);
             let action_slot = Rc::clone(&host_action);
             Box::new(move |ctx, action| match action {
                 AjAction::ThinkingToggle => {
@@ -922,6 +1695,9 @@ impl Shell {
                 }
                 AjAction::CloseAllOverlays => {
                     overlays_for_actions.borrow_mut().close_all();
+                    // Release any settings-window handles so a closed window is
+                    // never re-tinted or reverted by the host.
+                    *settings_ui_for_actions.borrow_mut() = None;
                     ctx.request_focus(Rc::clone(&editor_widget));
                     ctx.redraw = true;
                 }
@@ -955,6 +1731,8 @@ impl Shell {
             transcript,
             pending,
             footer,
+            selector_activity,
+            settings_ui,
         }
     }
 
@@ -978,12 +1756,31 @@ impl Shell {
         self.fetch_slot.borrow_mut().take()
     }
 
+    /// Drain the confirmed config edits parked by the selector and settings
+    /// overlays, for the drive loop to apply. Empty when nothing was edited.
+    fn take_activity(&self) -> Vec<SelectorActivity> {
+        std::mem::take(&mut self.selector_activity.borrow_mut())
+    }
+
+    /// The shared handles the drive loop needs to open a config-editing
+    /// overlay: the stack it pushes onto, the editor (focus fallback), a live
+    /// chrome snapshot, and the activity / settings-window slots.
+    fn overlay_handles(&self) -> OverlayHandles {
+        OverlayHandles {
+            stack: Rc::clone(&self.overlays),
+            editor: to_widget_ref(Rc::clone(&self.editor)),
+            chrome: self.chrome.borrow().clone(),
+            activity: Rc::clone(&self.selector_activity),
+            settings_ui: Rc::clone(&self.settings_ui),
+        }
+    }
+
     /// Rebuild every style struct from the current theme, for a runtime
-    /// swap (hot-reload now, the settings theme row in 8D-2). Every
+    /// swap (hot-reload, or the settings window's theme row). Every
     /// palette-consuming widget is rebuilt in place, so editor text and
-    /// transcript scroll survive the swap. Overlays opened after this
-    /// pick up the new chrome, an already-open overlay keeps its baked
-    /// styles until reopened.
+    /// transcript scroll survive the swap. An open settings window is
+    /// re-tinted live (its list band and its window chrome); other overlays
+    /// opened before the swap keep their baked styles until reopened.
     fn restyle(&self) {
         let t = self.theme.read();
         let styles = Rc::new(TranscriptStyles::from_theme(&t));
@@ -991,7 +1788,11 @@ impl Shell {
         self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
         self.pending.borrow_mut().set_styles(Rc::clone(&styles));
         self.footer.borrow_mut().set_styles(styles);
-        *self.chrome.borrow_mut() = OverlayChrome::from_theme(&t);
+        let chrome = OverlayChrome::from_theme(&t);
+        if let Some(ui) = self.settings_ui.borrow().as_ref() {
+            ui.restyle(&chrome);
+        }
+        *self.chrome.borrow_mut() = chrome;
     }
 }
 
@@ -1055,12 +1856,26 @@ impl Widget for Shell {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
-        // Host-posted app events target the focused widget (the
-        // editor), but the loader is what needs them. The Shell is
-        // the root of every focus path, so forward from the capturing
-        // phase without consuming.
-        if let Event::App(_) = event {
-            self.status_line.borrow_mut().handle_event(ctx, event);
+        // Host-posted app events target the focused widget, but they're
+        // meant for the Shell chrome. The Shell is the root of every focus
+        // path, so it forwards them from the capturing phase without
+        // consuming.
+        if let Event::App(user) = event {
+            if user.name == REFOCUS_OVERLAY_EVENT {
+                // An overlay was opened from the drive loop, which has no
+                // event context of its own. Move focus onto the top overlay
+                // (or back to the editor when the stack is somehow empty).
+                let target = self
+                    .overlays
+                    .borrow()
+                    .top()
+                    .map(|o| Rc::clone(&o.focus))
+                    .unwrap_or_else(|| to_widget_ref(Rc::clone(&self.editor)));
+                ctx.request_focus(target);
+                ctx.redraw = true;
+            } else {
+                self.status_line.borrow_mut().handle_event(ctx, event);
+            }
         }
     }
 
@@ -1095,18 +1910,24 @@ fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// spawned task.
 pub async fn run(args: Args) -> Result<()> {
     // Configuration mirrors `aj`: user config overlaid with the
-    // per-project layer, CLI > env > config precedence downstream.
+    // per-project layer, CLI > env > config precedence downstream. The
+    // layers are kept editable behind [`ConfigLayers`] so the settings
+    // windows can mutate one layer and persist its file.
     let (user_config, user_diagnostics) = Config::load();
     let (project_layer, project_diagnostics) = Config::load_project();
     let mut diagnostics = user_diagnostics;
     diagnostics.extend(project_diagnostics);
-    let config = project_layer.overlay_onto(&user_config);
+    let layers = ConfigLayers {
+        user: user_config,
+        project: project_layer,
+        project_path: Config::project_config_file_path(),
+    };
 
     let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
     let sessions_dir = Config::get_sessions_dir_path()?;
     let persistence = ConversationPersistence::new(sessions_dir);
 
-    let mut world = build_world(&args, config, &diagnostics, &auth, &persistence).await?;
+    let mut world = build_world(&args, layers, &diagnostics, &auth, &persistence).await?;
 
     // Resolve the configured theme (default `light`, matching `aj`) and
     // load it at the env-detected color mode. `AsyncApp::init` runs the
@@ -1332,20 +2153,40 @@ async fn drive(
                             app.request_redraw();
                         }
                         // A palette-confirmed command the host owns
-                        // (compact, export, the not-yet-wired selectors).
-                        // Bind the take out of the borrow first so no
+                        // (compact, export, or a config-editing overlay to
+                        // open). Bind the take out of the borrow first so no
                         // RefCell ref is held across the await below.
                         let command = shell.borrow().take_command();
-                        if let Some(action) = command
-                            && apply_command_action(world, action).await
-                        {
-                            app.request_redraw();
+                        if let Some(action) = command {
+                            match apply_command_action(world, shell, action).await {
+                                ActionEffect::None => {}
+                                ActionEffect::Redraw => app.request_redraw(),
+                                ActionEffect::OpenedOverlay => {
+                                    // The overlay was pushed from the host,
+                                    // which has no event context; hand the
+                                    // focus move to the shell via an app event.
+                                    app.post_app_event(UserEvent {
+                                        name: REFOCUS_OVERLAY_EVENT.to_string(),
+                                        data: None,
+                                    });
+                                    app.request_redraw();
+                                }
+                            }
                         }
                         // A just-opened async read-only overlay: kick off
                         // its fetch and remember the list to fill.
                         if let Some(fetch) = shell.borrow().take_fetch() {
                             spawn_overlay_fetch(world, fetch.kind, &fetch_tx);
                             pending_fills.push((fetch.kind, fetch.list));
+                        }
+                        // Config edits parked by a selector or settings
+                        // overlay (this event may have confirmed one).
+                        let activity = shell.borrow().take_activity();
+                        if !activity.is_empty()
+                            && apply_selector_activity(world, shell, &mut theme_watch, activity)
+                                .await
+                        {
+                            app.request_redraw();
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -1491,12 +2332,27 @@ mod tests {
 
     /// Build a [`World`] over a scripted provider through the real
     /// setup path (`build_initial_run_config` + `SessionCore::build`),
-    /// with persistence and auth confined to a tempdir.
+    /// with persistence and auth confined to a tempdir. The config layers
+    /// default to empty with no project path (persistence is unavailable).
     async fn scripted_world(dir: &TempDir, demo: &str) -> World {
+        scripted_world_with_layers(dir, demo, default_layers()).await
+    }
+
+    /// Empty config layers with no project path, for tests that don't
+    /// exercise persistence.
+    fn default_layers() -> ConfigLayers {
+        ConfigLayers {
+            user: Config::default(),
+            project: aj_conf::ConfigLayer::default(),
+            project_path: None,
+        }
+    }
+
+    async fn scripted_world_with_layers(dir: &TempDir, demo: &str, layers: ConfigLayers) -> World {
         let args = Args::parse_from(["aj-next", "--scripted", demo]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        build_world(&args, Config::default(), &[], &auth, &persistence)
+        build_world(&args, layers, &[], &auth, &persistence)
             .await
             .expect("build world")
     }
@@ -2695,15 +3551,21 @@ mod tests {
         assert!(app.handle_input(event).quit, "confirming quit quits");
     }
 
-    /// The not-yet-wired commands fold a "not wired up yet" notice rather
-    /// than silently doing nothing.
+    /// The still-deferred 8D-3 commands fold a "not wired up yet" notice
+    /// rather than silently doing nothing.
     #[tokio::test]
     async fn deferred_commands_fold_a_notice() {
         let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "streaming-text").await;
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        assert!(apply_command_action(&mut world, CommandAction::OpenModelSelector).await);
-        assert!(apply_command_action(&mut world, CommandAction::OpenSessionSelector).await);
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await,
+            ActionEffect::Redraw
+        ));
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::OpenPromptHistory).await,
+            ActionEffect::Redraw
+        ));
         let notices: Vec<String> = world
             .chat
             .borrow()
@@ -2717,11 +3579,11 @@ mod tests {
             })
             .collect();
         assert!(
-            notices.iter().any(|n| n.contains("Model selection")),
+            notices.iter().any(|n| n.contains("Session switching")),
             "{notices:?}"
         );
         assert!(
-            notices.iter().any(|n| n.contains("Session switching")),
+            notices.iter().any(|n| n.contains("Prompt history")),
             "{notices:?}"
         );
     }
@@ -2876,5 +3738,405 @@ mod tests {
             rows.iter().any(|row| row.contains("line-079")),
             "tail still in view, the wheel never reached the list: {rows:?}"
         );
+    }
+
+    // ---- Config selectors and settings windows (8D-2) ----
+
+    /// Build a world, a shell over its chat, and an initialized app, so a test
+    /// can open a config-editing overlay from the host path and then drive it
+    /// through real key dispatch. The overlay is focused via the same refocus
+    /// app event the drive loop posts.
+    async fn world_shell_app(
+        dir: &TempDir,
+        demo: &str,
+        layers: ConfigLayers,
+    ) -> (World, Rc<RefCell<Shell>>, AsyncApp, PipeWriter, WidgetRef) {
+        let world = scripted_world_with_layers(dir, demo, layers).await;
+        let shell = Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            world.core.message_queues.clone(),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
+            "aj-next".to_string(),
+            "/tmp".to_string(),
+        )));
+        let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"\x1b[?c").expect("write DA1 reply");
+        let mut app = AsyncApp::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+            reader.into(),
+        );
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        (world, shell, app, writer, root)
+    }
+
+    /// Post the refocus app event and render, moving focus onto the overlay
+    /// the host just opened (the drive loop does this after
+    /// `ActionEffect::OpenedOverlay`).
+    fn focus_overlay(app: &mut AsyncApp, root: &WidgetRef) {
+        app.post_app_event(UserEvent {
+            name: REFOCUS_OVERLAY_EVENT.to_string(),
+            data: None,
+        });
+        app.render(root).expect("render");
+    }
+
+    /// A watcher for a bundled theme is inert (no on-disk source), which is
+    /// all the apply path needs for tests that don't exercise reloads.
+    fn inert_theme_watch() -> ThemeWatch {
+        ThemeWatch::install("dark")
+    }
+
+    /// Pin `$HOME` to a scratch dir for the test, restoring it on drop, so
+    /// user-layer persistence writes into a tempdir rather than the real
+    /// `~/.aj`. Paired with `#[serial]` since env mutation is process-wide.
+    struct HomeGuard {
+        prior: Option<String>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> HomeGuard {
+            let prior = std::env::var("HOME").ok();
+            // SAFETY: `#[serial]` keeps other threads out; Drop restores it.
+            unsafe {
+                std::env::set_var("HOME", path);
+            }
+            HomeGuard { prior }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// The thinking selector, driven through real dispatch: open from the
+    /// host path, filter to `high`, confirm. The change updates the footer and
+    /// stages the run config, is recorded on the session log, and (session
+    /// scoped) leaves the user config untouched.
+    #[tokio::test]
+    async fn thinking_selector_updates_footer_and_is_session_scoped() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::OpenThinkingSelector).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        assert!(shell.borrow().overlays.borrow().is_open());
+
+        // Filter to "high" (the exact match ranks first) and confirm.
+        writer.write_all(b"high\r").expect("write query + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "confirm closed the selector"
+        );
+
+        let activity = shell.borrow().take_activity();
+        assert_eq!(activity.len(), 1, "confirm parked one thinking change");
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(&mut world, &shell, &mut watch, activity).await;
+
+        // The footer reflects the pick immediately.
+        assert_eq!(
+            world
+                .chat
+                .borrow()
+                .footers()
+                .settings(AgentId::Main)
+                .map(|s| s.thinking.clone()),
+            Some("high".to_string())
+        );
+        // The run config staged it for the next turn.
+        assert_eq!(
+            world.run_config.lock().unwrap().thinking,
+            Some(ThinkingConfig::High)
+        );
+        // Session-scoped: the user config layer's default is unchanged (still
+        // the `Config::default` value, not the picked `high`).
+        assert_eq!(
+            world.config_layers.lock().unwrap().user.thinking,
+            Config::default().thinking,
+            "the persisted default was left untouched"
+        );
+        // But the session log records it so a resume restores it.
+        let recorded = {
+            world
+                .core
+                .log
+                .lock()
+                .await
+                .latest_leaf(ThreadFilter::USER)
+                .is_some()
+        };
+        assert!(recorded, "thinking change recorded on the session log");
+    }
+
+    /// The model selector's confirm updates the footer identity and is
+    /// session-scoped (the user config layer stays untouched).
+    #[tokio::test]
+    async fn model_confirm_updates_footer_and_is_session_scoped() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, _app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let info = world.catalog.first().cloned().expect("catalog non-empty");
+
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::ModelConfirmed {
+                target: AgentId::Main,
+                info: Box::new(info.clone()),
+            }],
+        )
+        .await;
+
+        let settings = world
+            .chat
+            .borrow()
+            .footers()
+            .settings(AgentId::Main)
+            .cloned()
+            .expect("footer entry");
+        assert_eq!(settings.provider, info.provider);
+        assert_eq!(settings.model_id, info.id);
+        // Session-scoped: no persisted default.
+        let layers = world.config_layers.lock().unwrap();
+        assert!(layers.user.model_api.is_none());
+        assert!(layers.user.model_name.is_none());
+    }
+
+    /// The settings window, driven through real dispatch: open it, filter to
+    /// the thinking row, open its picker submenu, pick `high`. The change
+    /// stages the run config and persists `thinking = "high"` to the tempdir
+    /// user config, while the window stays open.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_window_persists_thinking_to_user_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let _home = HomeGuard::set(dir.path());
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::OpenSettings).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+
+        // Filter to the thinking row and open its picker submenu.
+        writer.write_all(b"thinking\r").expect("filter + enter");
+        for _ in 0..9 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        // The picker opened in dispatch and moved focus; render so its focus
+        // path lands before the next keys.
+        app.render(&root).expect("render");
+        writer.write_all(b"high\r").expect("pick + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+
+        let activity = shell.borrow().take_activity();
+        assert_eq!(activity.len(), 1, "one settings change staged");
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(&mut world, &shell, &mut watch, activity).await;
+
+        // Staged into the run config for the next turn.
+        assert_eq!(
+            world.run_config.lock().unwrap().thinking,
+            Some(ThinkingConfig::High)
+        );
+        // Persisted to the tempdir user config.toml.
+        let config_path = dir.path().join(".aj").join("config.toml");
+        let contents = std::fs::read_to_string(&config_path).expect("config.toml written");
+        assert!(contents.contains("thinking = \"high\""), "got: {contents}");
+        // The window stays open across an edit.
+        assert!(shell.borrow().overlays.borrow().is_open());
+    }
+
+    /// The project settings window persists an override to the project config
+    /// file, and the clear chord removes it, reverting the effective value to
+    /// the user default.
+    #[tokio::test]
+    async fn project_settings_persist_then_clear() {
+        let dir = TempDir::new().expect("tempdir");
+        let project_path = dir.path().join("repo").join(".aj").join("config.toml");
+        let layers = ConfigLayers {
+            user: Config::default(),
+            project: aj_conf::ConfigLayer::default(),
+            project_path: Some(project_path.clone()),
+        };
+        let (world, shell, _app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", layers).await;
+        let mut watch = inert_theme_watch();
+
+        // Set a project override for a plain bool option.
+        apply_setting_change(
+            &world,
+            &shell,
+            &mut watch,
+            PersistAction::ProjectSet,
+            "auto_compact",
+            "false",
+        )
+        .await;
+        let contents = std::fs::read_to_string(&project_path).expect("project config written");
+        assert!(contents.contains("auto_compact = false"), "got: {contents}");
+        assert!(
+            !world.config.lock().unwrap().auto_compact,
+            "effective config picks up the override"
+        );
+
+        // Clear it: the key is removed and the effective value reverts to the
+        // user default (true).
+        apply_setting_change(
+            &world,
+            &shell,
+            &mut watch,
+            PersistAction::ProjectClear,
+            "auto_compact",
+            "true",
+        )
+        .await;
+        let contents = std::fs::read_to_string(&project_path).expect("project config present");
+        assert!(
+            !contents.contains("auto_compact"),
+            "override cleared: {contents}"
+        );
+        assert!(
+            world.config.lock().unwrap().auto_compact,
+            "effective reverts to the user default"
+        );
+    }
+
+    /// Project settings outside a git repo (no project path) folds a notice
+    /// rather than opening the window.
+    #[tokio::test]
+    async fn project_settings_without_a_repo_folds_a_notice() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        assert!(matches!(
+            apply_command_action(&mut world, &shell, CommandAction::OpenProjectSettings).await,
+            ActionEffect::Redraw
+        ));
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "no window opened"
+        );
+        let notices: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Notice(n) => Some(n.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("git repository")),
+            "{notices:?}"
+        );
+    }
+
+    /// A speed change whose provider rebuild fails (the scripted provider is
+    /// not in the registry) reverts the settings row to the previous value.
+    #[tokio::test]
+    async fn speed_change_failure_reverts_the_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let mut watch = inert_theme_watch();
+
+        // Open the settings window so the revert has a live row to fix.
+        apply_command_action(&mut world, &shell, CommandAction::OpenSettings).await;
+        // Simulate the widget's optimistic edit before the apply fails.
+        {
+            let ui = shell.borrow();
+            let ui = ui.settings_ui.borrow();
+            ui.as_ref()
+                .unwrap()
+                .list
+                .borrow()
+                .set_value("speed", "fast");
+        }
+
+        let notice = apply_setting_change(
+            &world,
+            &shell,
+            &mut watch,
+            PersistAction::User,
+            "speed",
+            "fast",
+        )
+        .await
+        .expect("speed apply returns a notice");
+        assert!(notice.contains("Failed to set speed"), "got: {notice}");
+
+        // The row reverted to the still-active speed.
+        let reverted = {
+            let ui = shell.borrow();
+            let ui = ui.settings_ui.borrow();
+            ui.as_ref().unwrap().list.borrow().value_of("speed")
+        };
+        assert_eq!(reverted.as_deref(), Some("standard"));
+    }
+
+    /// A skills toggle persists into `disabled_skills` on the user layer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn skill_toggle_persists_to_disabled_skills() {
+        let dir = TempDir::new().expect("tempdir");
+        let _home = HomeGuard::set(dir.path());
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let mut watch = inert_theme_watch();
+
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::SkillToggle {
+                name: "demo-skill".to_string(),
+                disable: true,
+            }],
+        )
+        .await;
+
+        assert!(
+            world
+                .config_layers
+                .lock()
+                .unwrap()
+                .user
+                .disabled_skills
+                .iter()
+                .any(|s| s == "demo-skill"),
+            "the skill is disabled in the user layer"
+        );
+        let config_path = dir.path().join(".aj").join("config.toml");
+        let contents = std::fs::read_to_string(&config_path).expect("config.toml written");
+        assert!(contents.contains("demo-skill"), "got: {contents}");
     }
 }

@@ -77,7 +77,7 @@ pub use crate::vxfw::async_app::{AsyncApp, Frame};
 pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
 pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
-pub use crate::vxfw::filterable_select::{FilterableSelect, SelectItem};
+pub use crate::vxfw::filterable_select::{FilterableSelect, SelectItem, SelectStyles};
 pub use crate::vxfw::flex_column::FlexColumn;
 pub use crate::vxfw::flex_row::FlexRow;
 pub use crate::vxfw::keymap::{

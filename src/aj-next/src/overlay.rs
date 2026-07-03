@@ -15,10 +15,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use aj_app::theme::{Theme, ThemeColor};
+use aj_app::theme::{Theme, ThemeBg, ThemeColor};
 use vaxis::cell::Style;
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, RelativePoint, Size, Surface, Widget, WidgetRef,
+    DrawContext, Event, EventContext, RelativePoint, SelectStyles, Size, Surface, Widget, WidgetRef,
 };
 
 use crate::transcript::vaxis_color;
@@ -201,12 +201,15 @@ impl Widget for Scrim {
 
 /// Frame styles for overlay windows, resolved once from the theme with the
 /// same token mapping `aj` uses: a muted border, a bold accent title, and a
-/// dim key-hint subtitle.
+/// dim key-hint subtitle. Carries the pick-list row styles too so a list
+/// overlay (palette, selectors, settings) draws its selection band from the
+/// same palette snapshot.
 #[derive(Clone)]
 pub(crate) struct OverlayChrome {
     pub(crate) border: Style,
     pub(crate) title: Style,
     pub(crate) subtitle: Style,
+    pub(crate) select: SelectStyles,
 }
 
 impl OverlayChrome {
@@ -223,7 +226,23 @@ impl OverlayChrome {
                 ..fg(ThemeColor::Accent)
             },
             subtitle: fg(ThemeColor::Dim),
+            select: select_styles_from_theme(theme),
         }
+    }
+}
+
+/// Pick-list row styles from the theme: the E-7 full-width band over
+/// `ThemeBg::SelectedBg` with normal text on top, and a dim secondary column.
+pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
+    let mode = theme.color_mode();
+    let fg = |token: ThemeColor| Style {
+        fg: vaxis_color(theme.fg_color(token), mode),
+        ..Style::default()
+    };
+    SelectStyles {
+        selected_bg: vaxis_color(theme.bg_color(ThemeBg::SelectedBg), mode),
+        label: fg(ThemeColor::Text),
+        secondary: fg(ThemeColor::Dim),
     }
 }
 
