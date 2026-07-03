@@ -16,15 +16,23 @@
 //!
 //! # Word classification
 //!
-//! Word motion and the word-kill operations classify codepoints by Unicode
-//! General Category, not by UAX#29 word segmentation. A codepoint is a word
-//! constituent when it is a letter (Lu, Ll, Lt, Lm, Lo), a number (Nd, Nl, No),
-//! a mark (Mn, Mc, Me), connector punctuation (Pc), or `_`. Everything else,
-//! including dashes, dots, and path separators, is a boundary. This matches
-//! readline's notion of a word.
+//! Word motion and the class-based word kills (Alt+B/F, Alt+D, Alt+Backspace)
+//! run on the shared word-motion engine with its readline classifier
+//! ([`ReadlineWords`](crate::text::word_motion::ReadlineWords)). A grapheme is a
+//! word constituent when its base scalar is a letter (Lu, Ll, Lt, Lm, Lo), a
+//! number (Nd, Nl, No), a mark (Mn, Mc, Me), connector punctuation (Pc), or `_`.
+//! Everything else, including dashes, dots, and path separators, is a boundary
+//! the engine skips together with whitespace. This is readline's notion of a
+//! word.
+//!
+//! The whitespace-only kill (Ctrl+W,
+//! [`delete_word_before_whitespace`](TextField::delete_word_before_whitespace))
+//! is separate: it deletes back to the nearest whitespace, so it classifies by
+//! whitespace alone rather than by the word set.
 
 use crate::cell::{Cell, Character, CursorShape, Style};
 use crate::key::{Key, Modifiers};
+use crate::text::word_motion::{ReadlineWords, word_left, word_right};
 use crate::unicode::grapheme_iterator;
 use crate::vxfw::{CursorState, DrawContext, Event, EventContext, Size, Surface, Widget};
 
@@ -181,56 +189,23 @@ impl TextField {
 
     /// Moves the cursor backward by one word.
     ///
-    /// Skips trailing non-word codepoints, then the word itself, matching
+    /// Skips trailing non-word graphemes, then the word itself, matching
     /// readline's backward-word.
     pub fn move_backward_wordwise(&mut self) {
-        let i = {
-            let first_half = self.buf.first_half().as_bytes();
-            let mut i = first_half.len();
-            while i > 0 {
-                let decoded = decode_codepoint_before(first_half, i);
-                if is_word_codepoint(decoded.cp) {
-                    break;
-                }
-                i = decoded.start;
-            }
-            while i > 0 {
-                let decoded = decode_codepoint_before(first_half, i);
-                if !is_word_codepoint(decoded.cp) {
-                    break;
-                }
-                i = decoded.start;
-            }
-            i
-        };
-        self.buf.move_gap_left(self.buf.cursor - i);
+        let first_half = self.buf.first_half();
+        let target = word_left(first_half, first_half.len(), &ReadlineWords);
+        let amount = first_half.len() - target;
+        self.buf.move_gap_left(amount);
     }
 
     /// Moves the cursor forward by one word.
     ///
-    /// Skips leading non-word codepoints, then the word itself, landing at the
+    /// Skips leading non-word graphemes, then the word itself, landing at the
     /// end of the next word, matching readline's forward-word.
     pub fn move_forward_wordwise(&mut self) {
-        let i = {
-            let second_half = self.buf.second_half().as_bytes();
-            let mut i = 0usize;
-            while i < second_half.len() {
-                let decoded = decode_codepoint_at(second_half, i);
-                if is_word_codepoint(decoded.cp) {
-                    break;
-                }
-                i += decoded.len;
-            }
-            while i < second_half.len() {
-                let decoded = decode_codepoint_at(second_half, i);
-                if !is_word_codepoint(decoded.cp) {
-                    break;
-                }
-                i += decoded.len;
-            }
-            i
-        };
-        self.buf.move_gap_right(i);
+        let second_half = self.buf.second_half();
+        let amount = word_right(second_half, 0, &ReadlineWords);
+        self.buf.move_gap_right(amount);
     }
 
     /// Deletes the word before the cursor by character class (Alt+Backspace).
@@ -268,26 +243,9 @@ impl TextField {
 
     /// Deletes the word after the cursor by character class (Alt+D).
     pub fn delete_word_after(&mut self) {
-        let i = {
-            let second_half = self.buf.second_half().as_bytes();
-            let mut i = 0usize;
-            while i < second_half.len() {
-                let decoded = decode_codepoint_at(second_half, i);
-                if is_word_codepoint(decoded.cp) {
-                    break;
-                }
-                i += decoded.len;
-            }
-            while i < second_half.len() {
-                let decoded = decode_codepoint_at(second_half, i);
-                if !is_word_codepoint(decoded.cp) {
-                    break;
-                }
-                i += decoded.len;
-            }
-            i
-        };
-        self.buf.grow_gap_right(i);
+        let second_half = self.buf.second_half();
+        let amount = word_right(second_half, 0, &ReadlineWords);
+        self.buf.grow_gap_right(amount);
     }
 
     /// Clears the text, freeing the buffer, and resets the scroll state.
@@ -557,51 +515,14 @@ fn ellipsis_cell(style: Style) -> Cell {
     }
 }
 
-/// A decoded codepoint plus where it sits in the byte slice it came from.
+/// A decoded codepoint plus where it starts in the byte slice it came from.
 struct DecodedCodepoint {
     cp: u32,
     start: usize,
-    len: usize,
-}
-
-/// Length in bytes of the UTF-8 sequence a lead byte introduces, defaulting to
-/// 1 for continuation or otherwise invalid lead bytes.
-fn utf8_byte_sequence_length(first: u8) -> usize {
-    match first {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF7 => 4,
-        _ => 1,
-    }
 }
 
 fn is_utf8_continuation_byte(c: u8) -> bool {
     (c & 0b1100_0000) == 0b1000_0000
-}
-
-/// Decodes the codepoint starting at `start`. On a truncated or invalid
-/// sequence it falls back to the raw lead byte as a 1-byte codepoint.
-fn decode_codepoint_at(bytes: &[u8], start: usize) -> DecodedCodepoint {
-    let first = bytes[start];
-    let len = utf8_byte_sequence_length(first);
-    let capped_len = len.min(bytes.len() - start);
-    let slice = &bytes[start..start + capped_len];
-    match std::str::from_utf8(slice)
-        .ok()
-        .and_then(|s| s.chars().next())
-    {
-        Some(ch) => DecodedCodepoint {
-            cp: u32::from(ch),
-            start,
-            len: capped_len,
-        },
-        None => DecodedCodepoint {
-            cp: u32::from(first),
-            start,
-            len: 1,
-        },
-    }
 }
 
 /// Decodes the codepoint ending just before `end` by walking back over
@@ -620,37 +541,12 @@ fn decode_codepoint_before(bytes: &[u8], end: usize) -> DecodedCodepoint {
         Some(ch) => DecodedCodepoint {
             cp: u32::from(ch),
             start,
-            len: end - start,
         },
         None => DecodedCodepoint {
             cp: u32::from(bytes[end - 1]),
             start: end - 1,
-            len: 1,
         },
     }
-}
-
-/// True if `cp` is a readline-style word constituent. See the module docs for
-/// the exact General Category set.
-fn is_word_codepoint(cp: u32) -> bool {
-    if cp == u32::from('_') {
-        return true;
-    }
-    matches!(
-        vaxis_ucd::general_category(cp),
-        GeneralCategory::UppercaseLetter
-            | GeneralCategory::LowercaseLetter
-            | GeneralCategory::TitlecaseLetter
-            | GeneralCategory::ModifierLetter
-            | GeneralCategory::OtherLetter
-            | GeneralCategory::DecimalNumber
-            | GeneralCategory::LetterNumber
-            | GeneralCategory::OtherNumber
-            | GeneralCategory::NonspacingMark
-            | GeneralCategory::SpacingMark
-            | GeneralCategory::EnclosingMark
-            | GeneralCategory::ConnectorPunctuation
-    )
 }
 
 fn is_whitespace_codepoint(cp: u32) -> bool {

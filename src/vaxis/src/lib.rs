@@ -5,8 +5,9 @@
 //! [`internal_screen`]) viewed through clipped [`window`] handles, a pure
 //! input [`parser`] feeding [`key`], [`mouse`], and [`event`] value types, a
 //! thread-safe [`queue`] and threaded [`event_loop`], the [`tty`] OS boundary,
-//! the [`vaxis`] runtime and renderer, kitty graphics ([`image`]), and the two
-//! widget layers ([`widgets`], [`vxfw`]).
+//! the [`vaxis`] runtime and renderer, kitty graphics ([`image`]), the two
+//! widget layers ([`widgets`], [`vxfw`]), and the widget-free text-editing
+//! primitives ([`text`]) the widgets build on.
 //!
 //! Shared leaf types that everything else depends on (such as [`Winsize`])
 //! live here at the crate root to break the import cycles upstream expresses
@@ -27,6 +28,7 @@ pub mod mouse;
 pub mod parser;
 pub mod queue;
 pub mod screen;
+pub mod text;
 pub mod tty;
 pub mod unicode;
 pub mod vaxis;
