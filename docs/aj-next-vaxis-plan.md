@@ -384,6 +384,40 @@ Mouse interactions, image protocols (kitty/iterm via `vaxis::image`), OSC 52
 clipboard, terminal title, tmux notice, shutdown banner, theme hot-reload.
 Decide the endgame (keep both binaries, or cut over `aj-next` -> `aj` later).
 
+### Phase 9 execution breakdown
+
+Phases 0-8 are done. What the plan calls "Phase 9" spans two big deferred
+components (the editor and the transcript UX, each owned by a companion spec)
+plus the small chrome items. We execute it in ordered sub-chunks, each landing
+green with the implementer/reviewer loop and its own commit:
+
+- **9-Editor (Spec B).** The largest piece, so it is phased as Spec B lays out.
+  - **B1a: shared editing primitives into `vaxis`.** Port `KillRing` and
+    `UndoStack` verbatim, and build the pluggable word-motion engine (`CharClass`,
+    `WordClassifier`, one engine, `ReadlineWords` + `EmacsWords` classifiers).
+    Adopt the engine in `TextField` only if its ported word-motion tests stay
+    green, else leave `TextField` faithful and use the engine in `TextArea` only.
+  - **B1b: the `TextArea` widget.** Document model, cursor, vertical movement with
+    the sticky column and atomic-segment snap, insert/delete/kill/yank/undo,
+    history, width-aware wrapping, the bordered scroll window with the top-bar
+    label and `up N more` indicator, submit-vs-newline, palette trigger. Swap the
+    shell's `TextField` for it and wire history seed/record and hint labels.
+  - **B2: paste markers and jump mode.** Large-paste markers with `expanded_text`,
+    the `pastes` map, and char-jump mode.
+  - **B3: autocomplete.** The provider traits, data types, and inline popup into
+    `vxfw`; the concrete `@`/`/`/`#` providers into `aj-next`; async delivery
+    through the host `select!`.
+- **9-Markdown.** A markdown renderer for assistant, user, and compaction text
+  (plain-wrapped today). The single biggest visual-parity gap.
+- **9-Transcript (Spec E, remaining).** In-transcript search (not on Ctrl+F),
+  free-form selection and copy over the transcript, and the transcript-focus
+  keyboard mode.
+- **9-Chrome.** Image protocols (kitty/iTerm2), remaining mouse interactions,
+  terminal title, tmux notice, and the small wired-up stubs (launch-prompt input,
+  clipboard image paste, palette subtitle labels, palette-to-selector Esc
+  chaining, the E-8 grouped help screen).
+- **9-Endgame.** Decide whether to keep both binaries or cut `aj-next` over.
+
 ## Design decisions (resolved in companion specs)
 
 These plan-level decisions are settled. Each is now owned by a companion spec.
