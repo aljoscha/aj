@@ -184,7 +184,9 @@ pub mod anthropic {
     //! Usage source for Anthropic Claude.ai subscription accounts.
 
     use anthropic_sdk::client::Client;
-    use anthropic_sdk::usage::{OAuthExtraUsage, OAuthUsage, OAuthUsageWindow};
+    use anthropic_sdk::usage::{
+        OAuthExtraUsage, OAuthMoney, OAuthSpend, OAuthUsage, OAuthUsageLimit, OAuthUsageWindow,
+    };
     use async_trait::async_trait;
     use chrono::DateTime;
 
@@ -226,17 +228,38 @@ pub mod anthropic {
         }
     }
 
-    /// Map the wire response to the generic report: known windows in
-    /// display order, plus a usage-credits note when enabled.
+    /// Map the wire response to the generic report.
     ///
-    /// Anthropic doesn't report window lengths numerically, but its
-    /// field names pin them down: `five_hour` is the 5-hour session
-    /// window and every `seven_day*` field is a weekly window. We pass
-    /// those known lengths through [`window_label`] so the rows read
-    /// the same as Codex's, and append the per-model scope (Sonnet,
-    /// Opus, ...) as a qualifier where Anthropic splits the weekly
-    /// budget by model.
+    /// `limits` is provider-defined and carries scoped windows without
+    /// requiring us to know model names in advance. Legacy top-level
+    /// windows remain as a fallback when `limits` is absent or empty.
     fn map_usage(usage: &OAuthUsage) -> ProviderUsage {
+        let windows = usage
+            .limits
+            .as_deref()
+            .map(map_limits)
+            .filter(|windows| !windows.is_empty())
+            .unwrap_or_else(|| map_legacy_windows(usage));
+
+        let mut notes = Vec::new();
+        if let Some(note) = usage.spend.as_ref().and_then(spend_note) {
+            notes.push(note);
+        }
+        if let Some(note) = usage.extra_usage.as_ref().and_then(extra_usage_note) {
+            if !notes.iter().any(|existing| existing == &note) {
+                notes.push(note);
+            }
+        }
+
+        ProviderUsage {
+            windows,
+            notes,
+            // Anthropic has no rate-limit reset-credit mechanism.
+            reset_credits: None,
+        }
+    }
+
+    fn map_legacy_windows(usage: &OAuthUsage) -> Vec<UsageWindow> {
         const FIVE_HOURS_MINS: i64 = 5 * 60;
         const SEVEN_DAYS_MINS: i64 = 7 * 24 * 60;
         let labeled: &[(&Option<OAuthUsageWindow>, i64, Option<&str>)] = &[
@@ -251,38 +274,119 @@ pub mod anthropic {
             ),
         ];
 
-        let mut windows = Vec::new();
-        for (window, minutes, qualifier) in labeled {
-            let Some(window) = window else { continue };
-            // A window without a utilization number carries no
-            // information; skip it rather than rendering "?% used".
-            let Some(utilization) = window.utilization else {
-                continue;
-            };
-            let base = super::window_label(Some(*minutes));
-            let label = match qualifier {
-                Some(qualifier) => format!("{base} ({qualifier})"),
-                None => base,
-            };
-            windows.push(UsageWindow {
-                label,
-                used: (utilization / 100.0).clamp(0.0, 1.0),
-                resets_at: window.resets_at.as_deref().and_then(parse_reset),
-            });
-        }
+        labeled
+            .iter()
+            .filter_map(|(window, minutes, qualifier)| {
+                let window = window.as_ref()?;
+                let utilization = window.utilization?;
+                let base = super::window_label(Some(*minutes));
+                let label = match qualifier {
+                    Some(qualifier) => format!("{base} ({qualifier})"),
+                    None => base,
+                };
+                Some(UsageWindow {
+                    label,
+                    used: percent_to_fraction(utilization),
+                    resets_at: window.resets_at.as_deref().and_then(parse_reset),
+                })
+            })
+            .collect()
+    }
 
-        let mut notes = Vec::new();
-        if let Some(extra) = &usage.extra_usage {
-            if let Some(note) = extra_usage_note(extra) {
-                notes.push(note);
+    fn map_limits(limits: &[OAuthUsageLimit]) -> Vec<UsageWindow> {
+        limits.iter().filter_map(limit_window).collect()
+    }
+
+    fn limit_window(limit: &OAuthUsageLimit) -> Option<UsageWindow> {
+        let percent = limit.percent?;
+        Some(UsageWindow {
+            label: limit_label(limit),
+            used: percent_to_fraction(percent),
+            resets_at: limit.resets_at.as_deref().and_then(parse_reset),
+        })
+    }
+
+    fn limit_label(limit: &OAuthUsageLimit) -> String {
+        let base = limit_base_label(limit);
+        match limit_qualifier(limit) {
+            Some(qualifier) => format!("{base} ({qualifier})"),
+            None => base,
+        }
+    }
+
+    fn limit_base_label(limit: &OAuthUsageLimit) -> String {
+        const FIVE_HOURS_MINS: i64 = 5 * 60;
+        const DAY_MINS: i64 = 24 * 60;
+        const SEVEN_DAYS_MINS: i64 = 7 * DAY_MINS;
+        const THIRTY_DAYS_MINS: i64 = 30 * DAY_MINS;
+
+        let kind = limit.kind.as_deref();
+        let group = limit.group.as_deref();
+        if matches!(kind, Some("session")) || matches!(group, Some("session")) {
+            super::window_label(Some(FIVE_HOURS_MINS))
+        } else if kind.is_some_and(|kind| kind.starts_with("weekly"))
+            || matches!(group, Some("weekly"))
+        {
+            super::window_label(Some(SEVEN_DAYS_MINS))
+        } else if kind.is_some_and(|kind| kind.starts_with("daily"))
+            || matches!(group, Some("daily"))
+        {
+            super::window_label(Some(DAY_MINS))
+        } else if kind.is_some_and(|kind| kind.starts_with("monthly"))
+            || matches!(group, Some("monthly"))
+        {
+            super::window_label(Some(THIRTY_DAYS_MINS))
+        } else if let Some(kind) = kind.or(group) {
+            format!("{} limit", humanize_identifier(kind))
+        } else {
+            super::window_label(None)
+        }
+    }
+
+    fn limit_qualifier(limit: &OAuthUsageLimit) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(scope) = &limit.scope {
+            if let Some(model) = &scope.model {
+                if let Some(name) = model.display_name.as_deref().or(model.id.as_deref()) {
+                    parts.push(name.to_string());
+                }
+            }
+            if let Some(surface) = scope.surface.as_deref() {
+                parts.push(humanize_identifier(surface));
             }
         }
+        if parts.is_empty() && matches!(limit.kind.as_deref(), Some("weekly_all")) {
+            parts.push("all models".to_string());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
 
-        ProviderUsage {
-            windows,
-            notes,
-            // Anthropic has no rate-limit reset-credit mechanism.
-            reset_credits: None,
+    fn percent_to_fraction(percent: f64) -> f64 {
+        (percent / 100.0).clamp(0.0, 1.0)
+    }
+
+    fn humanize_identifier(value: &str) -> String {
+        let words: Vec<String> = value
+            .split(['_', '-', ' '])
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect();
+        if words.is_empty() {
+            value.to_string()
+        } else {
+            words.join(" ")
         }
     }
 
@@ -293,24 +397,73 @@ pub mod anthropic {
             .map(|dt| dt.timestamp_millis())
     }
 
-    /// Render the usage-credit state as one note line, or `None` when
-    /// credits are disabled / unreported.
-    fn extra_usage_note(extra: &OAuthExtraUsage) -> Option<String> {
-        if extra.is_enabled != Some(true) {
-            return None;
+    fn spend_note(spend: &OAuthSpend) -> Option<String> {
+        if spend.enabled == Some(false) {
+            return Some(match spend.disabled_reason.as_deref() {
+                Some(reason) => format!(
+                    "Usage credits: off ({})",
+                    humanize_identifier(reason).to_lowercase()
+                ),
+                None => "Usage credits: off".to_string(),
+            });
         }
-        let used = format_money(extra.used_credits.unwrap_or(0.0), extra.currency.as_deref());
-        let limit = match extra.monthly_limit {
-            Some(limit) => format_money(limit, extra.currency.as_deref()),
-            None => "unlimited".to_string(),
-        };
-        Some(format!("Extra usage credits: {used} of {limit} spent"))
+
+        let used = spend.used.as_ref().and_then(format_money_amount);
+        let limit = spend
+            .limit
+            .as_ref()
+            .or(spend.cap.as_ref())
+            .and_then(format_money_amount);
+        match (used, limit, spend.percent) {
+            (Some(used), Some(limit), _) => Some(format!("Usage credits: {used} of {limit} spent")),
+            (Some(used), None, _) => Some(format!("Usage credits: {used} spent")),
+            (None, None, Some(percent)) => Some(format!(
+                "Usage credits: {:.0}% used",
+                percent.clamp(0.0, 100.0)
+            )),
+            (None, None, None) => spend.disabled_reason.as_deref().map(|reason| {
+                format!(
+                    "Usage credits: {}",
+                    humanize_identifier(reason).to_lowercase()
+                )
+            }),
+            (None, Some(limit), _) => Some(format!("Usage credits: limit {limit}")),
+        }
     }
 
-    /// Format an amount of cents as money, e.g. `$12.34` for USD or
-    /// `12.34 EUR` otherwise.
-    fn format_money(cents: f64, currency: Option<&str>) -> String {
-        let amount = cents / 100.0;
+    fn extra_usage_note(extra: &OAuthExtraUsage) -> Option<String> {
+        if extra.is_enabled != Some(true) {
+            return extra.disabled_reason.as_deref().map(|reason| {
+                format!(
+                    "Usage credits: off ({})",
+                    humanize_identifier(reason).to_lowercase()
+                )
+            });
+        }
+        let decimals = extra.decimal_places.unwrap_or(2);
+        let used = format_money_minor(
+            extra.used_credits.unwrap_or(0.0),
+            extra.currency.as_deref(),
+            decimals,
+        );
+        let limit = match extra.monthly_limit {
+            Some(limit) => format_money_minor(limit, extra.currency.as_deref(), decimals),
+            None => "unlimited".to_string(),
+        };
+        Some(format!("Usage credits: {used} of {limit} spent"))
+    }
+
+    fn format_money_amount(money: &OAuthMoney) -> Option<String> {
+        Some(format_money_minor(
+            money.amount_minor?,
+            money.currency.as_deref(),
+            money.exponent.unwrap_or(2),
+        ))
+    }
+
+    fn format_money_minor(amount_minor: f64, currency: Option<&str>, exponent: u32) -> String {
+        let divisor = 10_f64.powi(i32::try_from(exponent).unwrap_or(2));
+        let amount = amount_minor / divisor;
         match currency {
             None | Some("USD") => format!("${amount:.2}"),
             Some(other) => format!("{amount:.2} {other}"),
@@ -340,6 +493,95 @@ pub mod anthropic {
         }
 
         #[test]
+        fn maps_provider_limits_without_model_allowlist() {
+            let usage: OAuthUsage = serde_json::from_str(
+                r#"{
+                    "five_hour": {"utilization": 1.0},
+                    "limits": [
+                        {
+                            "group": "session",
+                            "kind": "session",
+                            "percent": 27,
+                            "resets_at": "2026-07-03T16:10:00.481021+00:00"
+                        },
+                        {
+                            "group": "weekly",
+                            "kind": "weekly_all",
+                            "percent": 55,
+                            "resets_at": "2026-07-06T21:00:00.481042+00:00"
+                        },
+                        {
+                            "group": "weekly",
+                            "kind": "weekly_scoped",
+                            "percent": 100,
+                            "resets_at": "2026-07-06T21:00:00.481308+00:00",
+                            "scope": {
+                                "model": {"display_name": "Fable", "id": null},
+                                "surface": null
+                            },
+                            "severity": "critical",
+                            "is_active": true
+                        }
+                    ]
+                }"#,
+            )
+            .unwrap();
+
+            let report = map_usage(&usage);
+            let labels: Vec<&str> = report.windows.iter().map(|w| w.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec![
+                    "5h limit",
+                    "Weekly limit (all models)",
+                    "Weekly limit (Fable)"
+                ]
+            );
+            assert_eq!(report.windows[0].used, 0.27);
+            assert_eq!(report.windows[2].used, 1.0);
+            assert!(report.windows[2].resets_at.is_some());
+        }
+
+        #[test]
+        fn provider_limits_fall_back_when_empty() {
+            let usage: OAuthUsage = serde_json::from_str(
+                r#"{
+                    "five_hour": {"utilization": 50.0},
+                    "limits": [{"kind": "weekly_scoped"}]
+                }"#,
+            )
+            .unwrap();
+
+            let report = map_usage(&usage);
+            let labels: Vec<&str> = report.windows.iter().map(|w| w.label.as_str()).collect();
+            assert_eq!(labels, vec!["5h limit"]);
+        }
+
+        #[test]
+        fn spend_note_formats_credit_shape() {
+            let spend: OAuthSpend = serde_json::from_str(
+                r#"{
+                    "enabled": true,
+                    "used": {"amount_minor": 123, "currency": "USD", "exponent": 2},
+                    "limit": {"amount_minor": 5000, "currency": "USD", "exponent": 2}
+                }"#,
+            )
+            .unwrap();
+            assert_eq!(
+                spend_note(&spend).unwrap(),
+                "Usage credits: $1.23 of $50.00 spent"
+            );
+
+            let disabled: OAuthSpend =
+                serde_json::from_str(r#"{"enabled": false, "disabled_reason": "out_of_credits"}"#)
+                    .unwrap();
+            assert_eq!(
+                spend_note(&disabled).unwrap(),
+                "Usage credits: off (out of credits)"
+            );
+        }
+
+        #[test]
         fn extra_usage_note_formats_money() {
             let extra: OAuthExtraUsage = serde_json::from_str(
                 r#"{"is_enabled": true, "monthly_limit": 5000, "used_credits": 123, "currency": "USD"}"#,
@@ -347,7 +589,7 @@ pub mod anthropic {
             .unwrap();
             assert_eq!(
                 extra_usage_note(&extra).unwrap(),
-                "Extra usage credits: $1.23 of $50.00 spent"
+                "Usage credits: $1.23 of $50.00 spent"
             );
         }
 
@@ -359,12 +601,17 @@ pub mod anthropic {
             .unwrap();
             assert_eq!(
                 extra_usage_note(&unlimited).unwrap(),
-                "Extra usage credits: 2.00 EUR of unlimited spent"
+                "Usage credits: 2.00 EUR of unlimited spent"
             );
 
-            let disabled: OAuthExtraUsage =
-                serde_json::from_str(r#"{"is_enabled": false}"#).unwrap();
-            assert!(extra_usage_note(&disabled).is_none());
+            let disabled: OAuthExtraUsage = serde_json::from_str(
+                r#"{"is_enabled": false, "disabled_reason": "out_of_credits"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                extra_usage_note(&disabled).unwrap(),
+                "Usage credits: off (out of credits)"
+            );
         }
     }
 }
