@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use aj_agent::queue::{MessageQueues, PendingKind};
 use aj_app::chat::ChatState;
@@ -28,12 +29,18 @@ use crate::transcript::TranscriptStyles;
 /// the editor off-screen.
 const MAX_BODY_LINES: usize = 6;
 
-/// Hardcoded default key labels for the hint line. `aj` resolves
-/// these through its keybindings manager (`tui.editor.cursorUp` and
-/// the steering submit action); the real keymap engine that resolves
-/// configured bindings is phase 8.
+/// Display label of the edit gesture in the hint line. The plain Up
+/// arrow is an editor-level convention (`tui.editor.cursorUp` in aj's
+/// vocabulary), not an `aj.*` action, so it is spelled here.
 const EDIT_KEY_LABEL: &str = "Up";
-const STEER_KEY_LABEL: &str = "Alt+Enter";
+
+/// Display label of the steer chord, resolved from the shared default
+/// binding table. Follows user `[keybindings]` overrides once those
+/// land.
+static STEER_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
+    aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_SUBMIT_STEERING)
+        .expect("aj.message.steer has a default chord")
+});
 
 /// Box above the editor previewing the viewed agent's pending message.
 pub(crate) struct PendingBox {
@@ -70,7 +77,8 @@ impl PendingBox {
                 span("queued".to_string(), self.styles.accent),
                 span(
                     format!(
-                        "  \u{2022}  sends when the turn ends  \u{2022}  {EDIT_KEY_LABEL} to edit  \u{2022}  {STEER_KEY_LABEL} to steer"
+                        "  \u{2022}  sends when the turn ends  \u{2022}  {EDIT_KEY_LABEL} to edit  \u{2022}  {steer} to steer",
+                        steer = STEER_KEY_LABEL.as_str(),
                     ),
                     self.styles.dim,
                 ),

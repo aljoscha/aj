@@ -295,7 +295,8 @@ fn entry_spans(
             // gap).
             let mut header = format!(" {}", compaction_header(c.tokens_before, c.tokens_after));
             if !tools_expanded && !c.summary.is_empty() {
-                header.push_str(&format!(" ({EXPAND_KEY_LABEL} to expand)"));
+                let key = EXPAND_KEY_LABEL.as_str();
+                header.push_str(&format!(" ({key} to expand)"));
             }
             let mut spans = vec![span(header, styles.dim)];
             if tools_expanded && !c.summary.is_empty() {

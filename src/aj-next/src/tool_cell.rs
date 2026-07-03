@@ -12,6 +12,7 @@
 //! widget per draw, so there is no cache or event handling here.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
 use aj_app::chat::{TaskInfo, ToolEntry, ToolStatus};
@@ -40,11 +41,13 @@ const REPORT_COLLAPSED_LINES: usize = TEXT_COLLAPSED_LINES;
 /// Number of trailing lines kept per bash stream when collapsed.
 const BASH_COLLAPSED_LINES: usize = 5;
 
-/// Display label of the tools-expand chord shown in collapse hints.
-/// Hardcoded to the default `aj.tools.expand` binding (alt+o, see
-/// `aj_app::keybindings::AJ_KEYBINDINGS`). The real keymap engine
-/// that resolves configured bindings is phase 8.
-pub(crate) const EXPAND_KEY_LABEL: &str = "Alt+O";
+/// Display label of the tools-expand chord shown in collapse hints,
+/// resolved from the shared default binding table. Follows user
+/// `[keybindings]` overrides once those land.
+pub(crate) static EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
+    aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND)
+        .expect("aj.tools.expand has a default chord")
+});
 
 /// Whether a collapse hint describes head- or tail-truncated content.
 /// The phrasing (`N more lines` vs `N earlier lines`) keeps the hint
@@ -67,7 +70,8 @@ pub(crate) fn expand_hint(more: usize, kind: HintKind) -> String {
         HintKind::More => "more",
         HintKind::Earlier => "earlier",
     };
-    format!("… ({more} {word} lines, {EXPAND_KEY_LABEL} to expand)")
+    let key = EXPAND_KEY_LABEL.as_str();
+    format!("… ({more} {word} lines, {key} to expand)")
 }
 
 /// How the finished (or running) call should read to the viewer.

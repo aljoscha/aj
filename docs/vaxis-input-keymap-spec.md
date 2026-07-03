@@ -153,6 +153,17 @@ inert while a modal is up, close-all only applies while an overlay is open). It
 also drives the palette and hint UIs, which gray out disabled actions instead of
 hardcoding availability.
 
+**Hint labels are resolved, never hardcoded.** Any keyboard shortcut printed in
+the UI (expand hints, footer hints, pending-box hints, overlay subtitles, the
+help screen) must resolve through the keybinding data (`aj-app`'s
+`default_action_shortcut` today, the merged user keymap once `[keybindings]`
+config lands), formatted by the shared `format_keybinding`. `aj` already works
+this way via `format_action_shortcut`, and `aj-next` must too: a rebound action
+then relabels every hint automatically, and no string literal can drift from
+the actual binding. The only exceptions are the `fixed_keys` labels (Ctrl+C,
+Ctrl+Y), which are deliberately not rebindable and have named constants for
+their labels.
+
 ## Actions, not per-node intents
 
 amp decouples key to intent to action by walking `Actions` widgets up the focus

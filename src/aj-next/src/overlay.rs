@@ -18,7 +18,8 @@ use std::rc::Rc;
 use aj_app::theme::{Theme, ThemeColor};
 use vaxis::cell::Style;
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, RelativePoint, Size, Surface, Widget, WidgetRef,
+    DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, Size,
+    Surface, Widget, WidgetRef,
 };
 
 use crate::transcript::vaxis_color;
@@ -145,9 +146,6 @@ impl OverlayStack {
 
     /// Tears the whole stack down (a terminal confirm or the close-all
     /// chord). Focus then belongs to the editor.
-    // The close-all chord arrives with the keymap wiring, but the teardown
-    // is part of the stack's contract already.
-    #[allow(dead_code)]
     pub(crate) fn close_all(&mut self) {
         self.levels.clear();
     }
@@ -201,6 +199,7 @@ impl Widget for Scrim {
 /// Frame styles for overlay windows, resolved once from the theme with the
 /// same token mapping `aj` uses: a muted border, a bold accent title, and a
 /// dim key-hint subtitle.
+#[derive(Clone)]
 pub(crate) struct OverlayChrome {
     pub(crate) border: Style,
     pub(crate) title: Style,
@@ -234,6 +233,61 @@ pub(crate) fn close_top(
 ) {
     let parent_focus = stack.borrow_mut().back();
     ctx.request_focus(parent_focus.unwrap_or_else(|| Rc::clone(fallback)));
+    ctx.redraw = true;
+}
+
+/// Opens the placeholder command palette (a small centered
+/// filterable-select overlay) on `stack` and moves focus into its filter
+/// field.
+///
+/// The confirm/cancel callbacks capture the shared handles, not the widget
+/// that opened the palette: they run while an overlay widget is borrowed
+/// during dispatch, so they must not re-enter it. Confirm parks the picked
+/// label in `selection_slot` for the host loop and closes. Cancel just
+/// closes. Both restore focus through [`close_top`], with `editor` as the
+/// stack-empty fallback.
+pub(crate) fn open_palette(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    selection_slot: &Rc<RefCell<Option<String>>>,
+    ctx: &mut EventContext,
+) {
+    let select = Rc::new(RefCell::new(FilterableSelect::new(
+        placeholder_palette_items(),
+    )));
+    let focus = select.borrow().focus_target();
+    {
+        let mut select = select.borrow_mut();
+        let stack_for_confirm = Rc::clone(stack);
+        let editor_for_confirm = Rc::clone(editor);
+        let slot = Rc::clone(selection_slot);
+        select.on_confirm = Some(Box::new(move |ctx, item| {
+            *slot.borrow_mut() = Some(item.label.trim().to_string());
+            close_top(&stack_for_confirm, ctx, &editor_for_confirm);
+        }));
+        let stack_for_cancel = Rc::clone(stack);
+        let editor_for_cancel = Rc::clone(editor);
+        select.on_cancel = Some(Box::new(move |ctx| {
+            close_top(&stack_for_cancel, ctx, &editor_for_cancel)
+        }));
+    }
+    let mut window = OverlayWindow::new("Commands", vaxis::vxfw::to_widget_ref(select));
+    // TODO(aljoscha): resolve the subtitle labels through the keybinding
+    // data instead of hardcoding them (Spec F's hint-label rule). `aj`'s
+    // `subtitle_confirm_close` resolves `tui.input.submit` /
+    // `tui.select.cancel` / close-all, but that vocabulary only arrives
+    // with the real selector port that replaces this placeholder palette.
+    window.subtitle = "Enter to confirm  \u{2022}  Esc to close".to_string();
+    window.border_style = chrome.border;
+    window.title_style = chrome.title;
+    window.subtitle_style = chrome.subtitle;
+    stack.borrow_mut().push(OpenOverlay {
+        widget: vaxis::vxfw::to_widget_ref(Rc::new(RefCell::new(window))),
+        focus: Rc::clone(&focus),
+        placement: OverlayPlacement::Small,
+    });
+    ctx.request_focus(focus);
     ctx.redraw = true;
 }
 

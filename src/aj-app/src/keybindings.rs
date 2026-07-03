@@ -180,6 +180,88 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The default chord for `action_id`, from [`AJ_KEYBINDINGS`]. `None`
+/// for unknown action IDs.
+pub fn default_chord(action_id: &str) -> Option<&'static str> {
+    AJ_KEYBINDINGS
+        .iter()
+        .find(|(id, _, _)| *id == action_id)
+        .map(|(_, chord, _)| *chord)
+}
+
+/// Convert a canonical keybinding string like `"ctrl+o"` or
+/// `"alt+shift+t"` or `"escape"` into the display form
+/// `"Ctrl+O"` / `"Alt+Shift+T"` / `"Esc"` used in UI surfaces
+/// (palette shortcut column, overlay subtitles, hint lines).
+///
+/// Splits on `+`, maps modifier and named-key segments to their
+/// display labels, title-cases everything else, and rejoins.
+///
+/// NOTE: `aj-tui` carries the same formatter for the `aj` binary
+/// (bound to its own keybindings manager). Both format the canonical
+/// chord grammar of [`AJ_KEYBINDINGS`], so their display spellings
+/// must agree.
+pub fn format_keybinding(canonical: &str) -> String {
+    canonical
+        .split('+')
+        .map(format_key_segment)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn format_key_segment(seg: &str) -> String {
+    let lower = seg.to_ascii_lowercase();
+    match lower.as_str() {
+        "ctrl" => "Ctrl".to_string(),
+        "alt" => "Alt".to_string(),
+        "shift" => "Shift".to_string(),
+        // `super` is the only "windows/command/meta" modifier the
+        // canonical grammar recognizes (`crate::actions::parse_chord`
+        // deliberately rejects `meta`/`hyper`). We display it under the
+        // same `super` spelling so the label can't advertise a modifier
+        // the matcher rejects. Unknown spellings like `cmd`/`meta` fall
+        // through to the title-case arm, the same as any other
+        // unrecognized segment.
+        "super" => "Super".to_string(),
+        "escape" | "esc" => "Esc".to_string(),
+        "enter" | "return" => "Enter".to_string(),
+        "tab" => "Tab".to_string(),
+        "space" => "Space".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "delete" | "del" => "Del".to_string(),
+        "home" => "Home".to_string(),
+        "end" => "End".to_string(),
+        "pageup" => "PgUp".to_string(),
+        "pagedown" => "PgDn".to_string(),
+        "left" => "Left".to_string(),
+        "right" => "Right".to_string(),
+        "up" => "Up".to_string(),
+        "down" => "Down".to_string(),
+        "insert" => "Insert".to_string(),
+        _ => {
+            // Title-case: uppercase the first character, leave the
+            // rest as-is so symbol-only segments like `]` survive
+            // and function keys like `f1` become `F1`.
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// The default chord for `action_id` formatted for display via
+/// [`format_keybinding`], for hint labels. `None` for unknown action
+/// IDs.
+///
+/// This resolves the built-in default only. Once user `[keybindings]`
+/// overrides land (see `crate::actions::default_global_bindings`), hint
+/// surfaces resolve through the merged bindings instead.
+pub fn default_action_shortcut(action_id: &str) -> Option<String> {
+    default_chord(action_id).map(format_keybinding)
+}
+
 /// Canonical display labels for keyboard chords that are deliberately
 /// fixed terminal conventions rather than rebindable actions.
 ///
@@ -197,4 +279,45 @@ pub mod fixed_keys {
 
     /// Copy the authorization URL to the clipboard (login dialog).
     pub const CTRL_Y: &str = "Ctrl+Y";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_keybinding_handles_modifiers_and_named_keys() {
+        assert_eq!(format_keybinding("ctrl+o"), "Ctrl+O");
+        assert_eq!(format_keybinding("escape"), "Esc");
+        assert_eq!(format_keybinding("alt+shift+t"), "Alt+Shift+T");
+        assert_eq!(format_keybinding("ctrl+left"), "Ctrl+Left");
+        assert_eq!(format_keybinding("enter"), "Enter");
+        assert_eq!(format_keybinding("pageUp"), "PgUp");
+        assert_eq!(format_keybinding("ctrl+]"), "Ctrl+]");
+        assert_eq!(format_keybinding("super+k"), "Super+K");
+    }
+
+    #[test]
+    fn format_keybinding_does_not_advertise_unmatched_modifiers() {
+        // `cmd`/`meta` are not part of the canonical grammar
+        // (`crate::actions::parse_chord` rejects them, so the binding
+        // never fires). The display side must not pretty-print them as
+        // a recognized modifier: they title-case like any other unknown
+        // segment, so a hint can't pretend the binding is valid.
+        assert_eq!(format_keybinding("cmd+k"), "Cmd+K");
+        assert_eq!(format_keybinding("meta+k"), "Meta+K");
+    }
+
+    #[test]
+    fn default_action_shortcut_resolves_the_table() {
+        assert_eq!(
+            default_action_shortcut(ACTION_TOOLS_EXPAND).as_deref(),
+            Some("Alt+O")
+        );
+        assert_eq!(
+            default_action_shortcut(ACTION_SUBMIT_STEERING).as_deref(),
+            Some("Alt+Enter")
+        );
+        assert_eq!(default_action_shortcut("aj.unknown"), None);
+    }
 }

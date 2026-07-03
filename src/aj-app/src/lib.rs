@@ -18,6 +18,7 @@ use aj_conf::Config;
 use aj_session::ConversationPersistence;
 use anyhow::Result;
 
+pub mod actions;
 pub mod auth;
 pub mod chat;
 pub mod cli;

@@ -16,9 +16,11 @@ use std::time::Instant;
 use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
+use aj_app::actions::AjAction;
 use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
 use aj_app::commands::load_model_catalog;
+use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionCore, SessionEntry, SessionSpec};
 use aj_app::session_setup::{RunConfigSnapshot, build_initial_run_config};
 use aj_app::shutdown::{format_resume_hint, format_usage_summary};
@@ -31,20 +33,17 @@ use aj_session::{ConversationPersistence, ThreadFilter, replay};
 use anyhow::{Context, Result, anyhow};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use vaxis::key::Modifiers;
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    AsyncApp, DrawContext, Event, EventContext, FilterableSelect, FlexColumn, FlexItem, MaxSize,
-    Options, OverlayWindow, RelativePoint, Size, SubSurface, Surface, Text, TextField, UserEvent,
-    Widget, WidgetRef, draw_widget, to_widget_ref,
+    AsyncApp, DrawContext, Event, EventContext, FlexColumn, FlexItem, KeymapController, MaxSize,
+    Options, RelativePoint, Size, SubSurface, Surface, Text, TextField, UserEvent, Widget,
+    WidgetRef, draw_widget, to_widget_ref,
 };
 
 use crate::footer::FooterLine;
-use crate::overlay::{
-    OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, Scrim, close_top,
-    placeholder_palette_items,
-};
+use crate::keymap::{HostCtx, build_keymap};
+use crate::overlay::{OverlayChrome, OverlayStack, Scrim, open_palette};
 use crate::pending::PendingBox;
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::transcript::{TranscriptStyles, TranscriptView};
@@ -329,10 +328,9 @@ fn sync_status(world: &World) -> bool {
 /// A queued message shows in the pending box (which reads the live
 /// queue snapshot at draw) and is delivered by the post-turn wake:
 /// `handle_turn_join` and the `AgentEnd` trigger in [`drain_events`]
-/// both spawn a wake when `message_queues.has_pending`. Steering
-/// (Alt+Enter) and dequeue-to-edit (Up / Alt+Up) are phase 8, as is
-/// editor history (the vaxis `TextField` has none yet, where `aj`
-/// records the queued text into its editor history here).
+/// both spawn a wake when `message_queues.has_pending`. Editor
+/// history is not recorded here (the vaxis `TextField` has none yet,
+/// where `aj` records the queued text into its editor history).
 fn handle_submit(world: &mut World, text: String) {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
@@ -417,14 +415,9 @@ fn handle_turn_join(
     }
 }
 
-/// Ctrl+C acts on the agent the user is viewing: cancel its running
-/// turn instead of quitting. Returns whether the press was absorbed
-/// (something was running). `false` means the host should quit.
-///
-/// This is the phase-6 slice of `aj`'s Ctrl+C ladder: no overlay
-/// stack, no pending-message yank, and no "press again to quit"
-/// arming while other agents or background tasks run. Those arrive
-/// with the keymap and overlay phases.
+/// Cancel the viewed agent's running turn. Returns whether anything
+/// was cancelled. Fired by the keymap's `CancelTurn` action, whose
+/// predicate keeps it off the dispatch path while nothing runs.
 fn cancel_viewed_turn(world: &World) -> bool {
     let active = world.chat.borrow().active_view();
     if let Some(token) = world.turn_cancels.get(&active) {
@@ -442,10 +435,172 @@ fn cancel_viewed_turn(world: &World) -> bool {
     false
 }
 
-/// The root widget: the base layout, the editor submit plumbing, and the
-/// overlay stack drawn above everything while it is open.
+/// Counts of running work a quit would tear down, for the Ctrl+C
+/// quit-arming notice: (agents, bash tasks). Ported from `aj`.
+///
+/// Binary-driven turns plus running agent-backed tasks (background
+/// sub-agent runs, which the `turns` JoinSet doesn't track) make up
+/// the agent count, running bash tasks the task count.
+fn running_work_counts(driven_turns: usize, tasks: &[aj_agent::TaskSummary]) -> (usize, usize) {
+    let mut agents = driven_turns;
+    let mut bash = 0;
+    for task in tasks {
+        if task.status != aj_agent::tool::TaskStatus::Running {
+            continue;
+        }
+        match task.kind {
+            aj_agent::tool::TaskKind::Agent { .. } => agents += 1,
+            aj_agent::tool::TaskKind::Bash { .. } => bash += 1,
+        }
+    }
+    (agents, bash)
+}
+
+/// Quit-arming notice for a Ctrl+C while other work runs, `aj`'s exact
+/// wording: `"N agents / M tasks still running — press Ctrl+C again to
+/// quit"`, each part present only when nonzero. Callers ensure at
+/// least one count is nonzero.
+fn quit_arm_notice(agents: usize, tasks: usize) -> String {
+    let mut parts = Vec::new();
+    if agents > 0 {
+        parts.push(format!(
+            "{agents} agent{}",
+            if agents == 1 { "" } else { "s" }
+        ));
+    }
+    if tasks > 0 {
+        parts.push(format!("{tasks} task{}", if tasks == 1 { "" } else { "s" }));
+    }
+    let quit = fixed_keys::CTRL_C;
+    format!(
+        "{} still running — press {quit} again to quit",
+        parts.join(" / ")
+    )
+}
+
+/// The notice folded into chat when the first Ctrl+C of the quit
+/// sequence lands: `aj`'s running-work warning when a quit would tear
+/// work down, a bare press-again hint otherwise.
+///
+/// NOTE: `aj` quits immediately when nothing runs anywhere. The keymap
+/// ladder (Spec F) always arms, using the two-press sequence as the
+/// confirm, so the bare hint covers the case `aj` never renders.
+fn quit_arm_text(world: &World) -> String {
+    let (agents, tasks) =
+        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+    if agents + tasks > 0 {
+        quit_arm_notice(agents, tasks)
+    } else {
+        format!("Press {} again to quit", fixed_keys::CTRL_C)
+    }
+}
+
+/// Pull the viewed agent's queued message back into the editor,
+/// prepending it to whatever is currently typed (blank-line joined).
+/// Returns whether anything was yanked. Ported from `aj`: used by the
+/// dequeue chord and the per-view cancel restore.
+fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> bool {
+    let target = world.chat.borrow().active_view();
+    let Some(text) = world.core.message_queues.take_pending(target) else {
+        return false;
+    };
+    let shell = shell.borrow();
+    let mut editor = shell.editor.borrow_mut();
+    let current = editor.to_owned_slice();
+    let combined = if current.trim().is_empty() {
+        text
+    } else {
+        format!("{text}\n\n{current}")
+    };
+    editor.insert_slice_at_cursor(&combined);
+    true
+}
+
+/// The steer gesture (Alt+Enter), ported from `aj`: while the viewed
+/// agent is busy, queue the editor text as steering (or promote the
+/// pending follow-up when the editor is empty). While idle there is
+/// nothing to steer yet, so a non-empty editor starts a normal turn.
+fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
+    let target = world.chat.borrow().active_view();
+    // Draining the editor is right on every branch below: the queue
+    // and spawn paths clear it (matching `aj`), and the no-op branches
+    // only run when it was already empty.
+    let text = {
+        let shell = shell.borrow();
+        let mut editor = shell.editor.borrow_mut();
+        editor.to_owned_slice().trim().to_string()
+    };
+    let busy = world.turn_cancels.contains_key(&target) || world.core.is_running(target);
+    if busy {
+        if text.is_empty() {
+            world.core.message_queues.promote(target);
+        } else {
+            world.core.message_queues.append_steering(target, &text);
+        }
+    } else if !text.is_empty() {
+        handle_submit(world, text);
+    }
+}
+
+/// Execute a keymap action that needs the session world, parked by the
+/// controller's handler for the host loop (widgets can't reach the
+/// turn bookkeeping or the queues). Returns whether renderable state
+/// changed.
+fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjAction) -> bool {
+    match action {
+        AjAction::CancelTurn => {
+            if cancel_viewed_turn(world) {
+                // Don't discard what the user lined up: pull any queued
+                // message back into the editor (matching `aj`). Without
+                // this, the post-turn wake would deliver it right after
+                // the cancel.
+                return yank_pending_into_editor(world, shell);
+            }
+            false
+        }
+        AjAction::Steer => {
+            handle_steer(world, shell);
+            true
+        }
+        AjAction::Dequeue => yank_pending_into_editor(world, shell),
+        // Placeholder notices: the clipboard paste and the two overlay
+        // openers arrive with the selector/clipboard ports in the next
+        // chunks.
+        AjAction::PasteImage => {
+            fold_notice(world, "Clipboard image paste is not wired up yet.");
+            true
+        }
+        AjAction::HistoryOpen => {
+            fold_notice(world, "Prompt history search is not wired up yet.");
+            true
+        }
+        AjAction::AgentPickerOpen => {
+            fold_notice(world, "The agent picker is not wired up yet.");
+            true
+        }
+        // Handled inside the controller's dispatch-side handler (see
+        // `Shell::new`), never parked for the host.
+        AjAction::ThinkingToggle
+        | AjAction::ToolsExpand
+        | AjAction::PaletteOpen
+        | AjAction::CloseAllOverlays
+        | AjAction::Quit => false,
+    }
+}
+
+/// The root widget: the keymap controller wrapping the base layout, the
+/// editor submit plumbing, and the overlay stack drawn above everything
+/// while it is open.
 struct Shell {
-    layout: WidgetRef,
+    /// The keymap controller wrapping the base layout. Drawn (and thereby
+    /// placed on the focus path) by [`Shell::draw`], which also appends
+    /// the overlay children to its surface so an open overlay is a
+    /// descendant and the controller's capture chords pre-empt it.
+    keymap: Rc<RefCell<KeymapController<AjAction, HostCtx>>>,
+    /// The context the keymap predicates read. Overlay liveness is live
+    /// through the shared stack, `turn_running` is refreshed by the drive
+    /// loop's per-iteration sync (see [`sync_keymap_ctx`]).
+    keymap_ctx: Rc<RefCell<HostCtx>>,
     /// Typed handle to the editor so `Init` can focus it.
     editor: Rc<RefCell<TextField>>,
     /// Typed handle to the loader line so host-posted app events (the
@@ -456,14 +611,16 @@ struct Shell {
     /// callback for the host loop to collect after dispatch. The
     /// callback can't spawn turns itself (it has no session access).
     submitted: Rc<RefCell<Option<String>>>,
+    /// The keymap action awaiting the host loop, parked by the
+    /// controller's handler (the same slot pattern as `submitted`) for
+    /// the actions that need the session world.
+    host_action: Rc<RefCell<Option<AjAction>>>,
     /// The modal stack. Shared: overlay callbacks (confirm/cancel) mutate
     /// it from inside dispatch while the Shell reads it at draw time.
     overlays: Rc<RefCell<OverlayStack>>,
     /// The scrim widget, kept across frames so its identity is stable for
     /// hit-testing.
     scrim: Rc<RefCell<Scrim>>,
-    /// Frame styles for overlay windows, resolved from the theme.
-    overlay_chrome: OverlayChrome,
     /// Label of the palette row the user confirmed, parked by the palette's
     /// `on_confirm` for the host loop to collect after dispatch (the same
     /// slot pattern as `submitted`).
@@ -498,7 +655,12 @@ impl Shell {
             queues,
             Rc::clone(&styles),
         )));
-        let footer = Rc::new(RefCell::new(FooterLine::new(chat, status, styles, cwd)));
+        let footer = Rc::new(RefCell::new(FooterLine::new(
+            Rc::clone(&chat),
+            status,
+            styles,
+            cwd,
+        )));
         // Slot order mirrors `aj`'s layout: header, chat (flex),
         // status, pending, editor, footer. The status and pending
         // slots collapse to zero height while idle/empty, so the
@@ -513,15 +675,81 @@ impl Shell {
                 FlexItem::init(to_widget_ref(footer), 0),
             ],
         }));
+
+        let overlays = Rc::new(RefCell::new(OverlayStack::default()));
+        let palette_selection: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let host_action: Rc<RefCell<Option<AjAction>>> = Rc::new(RefCell::new(None));
+        let keymap_ctx = Rc::new(RefCell::new(HostCtx {
+            overlays: Rc::clone(&overlays),
+            turn_running: false,
+        }));
+
+        // The controller's action handler. Actions whose effects are
+        // reachable from widget land (the chat model, the overlay
+        // stack, the quit flag) execute here, inside dispatch, where
+        // the live `EventContext` can move focus. The rest park in the
+        // `host_action` slot for the drive loop, which owns the world.
+        let on_action: Box<dyn FnMut(&mut EventContext, &AjAction)> = {
+            let chat = Rc::clone(&chat);
+            let overlays_for_actions = Rc::clone(&overlays);
+            let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
+            let chrome = OverlayChrome::from_theme(theme);
+            let selection_slot = Rc::clone(&palette_selection);
+            let action_slot = Rc::clone(&host_action);
+            Box::new(move |ctx, action| match action {
+                AjAction::ThinkingToggle => {
+                    // Matches aj's `aj.thinking.toggle` handler: flip the
+                    // hide flag, no notice (the transcript shows the new
+                    // state).
+                    let mut chat = chat.borrow_mut();
+                    chat.hide_thinking_block = !chat.hide_thinking_block;
+                    ctx.redraw = true;
+                }
+                AjAction::ToolsExpand => {
+                    let mut chat = chat.borrow_mut();
+                    chat.tools_expanded = !chat.tools_expanded;
+                    ctx.redraw = true;
+                }
+                AjAction::PaletteOpen => {
+                    // The binding's predicate already gates on "no overlay
+                    // open", matching aj's inert-while-modal behavior.
+                    open_palette(
+                        &overlays_for_actions,
+                        &editor_widget,
+                        &chrome,
+                        &selection_slot,
+                        ctx,
+                    );
+                }
+                AjAction::CloseAllOverlays => {
+                    overlays_for_actions.borrow_mut().close_all();
+                    ctx.request_focus(Rc::clone(&editor_widget));
+                    ctx.redraw = true;
+                }
+                AjAction::Quit => ctx.quit = true,
+                AjAction::CancelTurn
+                | AjAction::Steer
+                | AjAction::Dequeue
+                | AjAction::PasteImage
+                | AjAction::HistoryOpen
+                | AjAction::AgentPickerOpen => {
+                    *action_slot.borrow_mut() = Some(*action);
+                }
+            })
+        };
+        let keymap =
+            KeymapController::new(build_keymap(), Rc::clone(&keymap_ctx), layout, on_action);
+
         Shell {
-            layout,
+            keymap,
+            keymap_ctx,
             editor,
             status_line,
             submitted,
-            overlays: Rc::new(RefCell::new(OverlayStack::default())),
+            host_action,
+            overlays,
             scrim: Rc::new(RefCell::new(Scrim)),
-            overlay_chrome: OverlayChrome::from_theme(theme),
-            palette_selection: Rc::new(RefCell::new(None)),
+            palette_selection,
         }
     }
 
@@ -530,62 +758,27 @@ impl Shell {
         self.submitted.borrow_mut().take()
     }
 
+    /// Collect a keymap action parked for the host loop, if any.
+    fn take_host_action(&self) -> Option<AjAction> {
+        self.host_action.borrow_mut().take()
+    }
+
     /// Collect a palette confirmation parked by its callback, if any.
     fn take_palette_selection(&self) -> Option<String> {
         self.palette_selection.borrow_mut().take()
-    }
-
-    /// Opens the placeholder command palette (a small centered
-    /// filterable-select overlay) and moves focus into its filter field.
-    ///
-    /// The confirm/cancel callbacks capture shared handles instead of the
-    /// Shell itself: they run while an overlay widget is borrowed during
-    /// dispatch, so they must not re-enter the Shell. Confirm parks the
-    /// picked label in the selection slot for the host loop and closes;
-    /// cancel just closes. Both restore focus through `close_top`.
-    fn open_palette(&self, ctx: &mut EventContext) {
-        let select = Rc::new(RefCell::new(FilterableSelect::new(
-            placeholder_palette_items(),
-        )));
-        let focus = select.borrow().focus_target();
-        {
-            let mut select = select.borrow_mut();
-            let stack = Rc::clone(&self.overlays);
-            let editor: WidgetRef = to_widget_ref(Rc::clone(&self.editor));
-            let slot = Rc::clone(&self.palette_selection);
-            select.on_confirm = Some(Box::new(move |ctx, item| {
-                *slot.borrow_mut() = Some(item.label.trim().to_string());
-                close_top(&stack, ctx, &editor);
-            }));
-            let stack = Rc::clone(&self.overlays);
-            let editor: WidgetRef = to_widget_ref(Rc::clone(&self.editor));
-            select.on_cancel = Some(Box::new(move |ctx| close_top(&stack, ctx, &editor)));
-        }
-        let mut window = OverlayWindow::new("Commands", to_widget_ref(select));
-        window.subtitle = "Enter to confirm  \u{2022}  Esc to close".to_string();
-        window.border_style = self.overlay_chrome.border;
-        window.title_style = self.overlay_chrome.title;
-        window.subtitle_style = self.overlay_chrome.subtitle;
-        self.overlays.borrow_mut().push(OpenOverlay {
-            widget: to_widget_ref(Rc::new(RefCell::new(window))),
-            focus: Rc::clone(&focus),
-            placement: OverlayPlacement::Small,
-        });
-        ctx.request_focus(focus);
-        ctx.redraw = true;
     }
 }
 
 impl Widget for Shell {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        // The caller's draw_widget re-stamps the returned surface with
-        // the Shell's identity, replacing the column's. The column
-        // takes no events, and the children (transcript, editor) keep
-        // their own identities for hit-testing. When the keymap
-        // controller lands as the root's wrapper, this surface becomes
-        // its child and the overlay children below stay descendants of
-        // the Shell's surface, so the composition is unchanged.
-        let mut surface = draw_widget(&self.layout, ctx);
+        // Draw through the keymap controller so its identity sits on
+        // the focus path between the Shell and everything below. The
+        // scrim and the top overlay are appended to the controller's
+        // surface, not the Shell's, for the same reason: the
+        // controller must be an ancestor of an open overlay so its
+        // capture chords (close-all) run before the overlay's widgets
+        // see the key.
+        let mut inner = draw_widget(&to_widget_ref(Rc::clone(&self.keymap)), ctx);
         let overlays = self.overlays.borrow();
         if let Some(top) = overlays.top() {
             let term = ctx.max.size();
@@ -599,7 +792,7 @@ impl Widget for Shell {
                 },
                 MaxSize::from_size(term),
             );
-            surface.children.push(SubSurface {
+            inner.children.push(SubSurface {
                 origin: RelativePoint { row: 0, col: 0 },
                 surface: draw_widget(&to_widget_ref(Rc::clone(&self.scrim)), &scrim_ctx),
                 z_index: 1,
@@ -612,13 +805,27 @@ impl Widget for Shell {
                 },
                 MaxSize::from_size(size),
             );
-            surface.children.push(SubSurface {
+            inner.children.push(SubSurface {
                 origin,
                 surface: draw_widget(&top.widget, &overlay_ctx),
                 z_index: 2,
             });
         }
-        surface
+        // Wrap the controller's surface instead of returning it: the
+        // caller's draw_widget re-stamps whatever we return with the
+        // Shell's identity, which would erase the controller's stamp
+        // and drop it from the focus path.
+        Surface {
+            size: inner.size,
+            widget: None,
+            cursor: None,
+            buffer: Vec::new(),
+            children: vec![SubSurface {
+                origin: RelativePoint { row: 0, col: 0 },
+                surface: inner,
+                z_index: 0,
+            }],
+        }
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
@@ -628,19 +835,6 @@ impl Widget for Shell {
         // phase without consuming.
         if let Event::App(_) = event {
             self.status_line.borrow_mut().handle_event(ctx, event);
-        }
-        // TEMPORARY: the palette-open chord, hardcoded to ctrl+o, the
-        // default of `aj_app::keybindings::ACTION_PALETTE_OPEN`. The keymap
-        // controller that resolves configured bindings in this same
-        // capturing position replaces this in the next phase. Inert while
-        // an overlay is up, matching `aj`.
-        if let Event::KeyPress(key) = event
-            && key.matches(u32::from('o'), Modifiers::CTRL)
-        {
-            if !self.overlays.borrow().is_open() {
-                self.open_palette(ctx);
-            }
-            ctx.consume_and_redraw();
         }
     }
 
@@ -656,18 +850,14 @@ impl Widget for Shell {
     }
 }
 
-/// Whether `event` is the Ctrl+C chord. Intercepted host-side (before
-/// widget dispatch) because its meaning depends on turn state the
-/// widgets don't have.
-fn is_ctrl_c(event: &Event) -> bool {
-    matches!(event, Event::KeyPress(key) if key.matches(u32::from('c'), Modifiers::CTRL))
-}
-
-/// Whether `event` is the tools-expand chord. Hardcoded to alt+o,
-/// the default of `aj_app::keybindings::ACTION_TOOLS_EXPAND`. The
-/// real keymap engine that resolves configured bindings is phase 8.
-fn is_tools_expand(event: &Event) -> bool {
-    matches!(event, Event::KeyPress(key) if key.matches(u32::from('o'), Modifiers::ALT))
+/// Whether the viewed agent is busy from the host's perspective (a
+/// binary-driven turn in `turn_cancels`, or a running initial
+/// sub-agent spawn), mirrored into the keymap context. Called from the
+/// drive loop's per-iteration sync point, its single writer.
+fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
+    let active = world.chat.borrow().active_view();
+    let busy = world.turn_cancels.contains_key(&active) || world.core.is_running(active);
+    shell.borrow().keymap_ctx.borrow_mut().turn_running = busy;
 }
 
 /// Runs the interactive shell until the user quits.
@@ -742,6 +932,10 @@ async fn drive(
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
     let mut was_busy = false;
+    // Rising-edge tracker for the quit-arm notice: the keymap's only
+    // sequence is the ctrl+c ctrl+c quit chord, so a pending sequence
+    // means the quit is armed and the arm notice folds once per arm.
+    let mut quit_was_armed = false;
     loop {
         // Compute the tick deadline before the select so no arm holds
         // a borrow of `app` another arm needs. The sleep expression is
@@ -774,39 +968,28 @@ async fn drive(
             event = app.next_input() => {
                 match event {
                     Some(event) => {
-                        // Ctrl+C is intercepted before widget dispatch:
-                        // cancel the viewed agent's turn if one runs,
-                        // quit otherwise.
-                        if is_ctrl_c(&event) {
-                            if cancel_viewed_turn(world) {
-                                continue;
-                            }
+                        // Every global chord (the ctrl+c ladder, the
+                        // toggles, the overlay openers) is matched by
+                        // the keymap controller inside this dispatch.
+                        // The host only collects what the handlers
+                        // parked.
+                        if app.handle_input(event).quit {
                             break;
                         }
-                        // Alt+O flips the session-wide tool-output
-                        // expansion flag. Handled host-side because
-                        // the flag lives on the chat model, which the
-                        // widgets read at draw time.
-                        if is_tools_expand(&event) {
-                            {
-                                let mut chat = world.chat.borrow_mut();
-                                chat.tools_expanded = !chat.tools_expanded;
-                            }
+                        if let Some(text) = shell.borrow().take_submitted() {
+                            handle_submit(world, text);
+                        }
+                        if let Some(action) = shell.borrow().take_host_action()
+                            && handle_host_action(world, shell, action)
+                        {
                             app.request_redraw();
-                        } else {
-                            if app.handle_input(event).quit {
-                                break;
-                            }
-                            if let Some(text) = shell.borrow().take_submitted() {
-                                handle_submit(world, text);
-                            }
-                            // A confirmed palette row becomes a chat notice.
-                            // Placeholder effect: the real command dispatch
-                            // arrives with the selector port.
-                            if let Some(row) = shell.borrow().take_palette_selection() {
-                                fold_notice(world, &format!("{row} selected"));
-                                app.request_redraw();
-                            }
+                        }
+                        // A confirmed palette row becomes a chat notice.
+                        // Placeholder effect: the real command dispatch
+                        // arrives with the selector port.
+                        if let Some(row) = shell.borrow().take_palette_selection() {
+                            fold_notice(world, &format!("{row} selected"));
+                            app.request_redraw();
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -829,6 +1012,7 @@ async fn drive(
         // loader an app event to arm its animation chain (the Shell
         // forwards it, see `Shell::capture_event`).
         let busy = sync_status(world);
+        sync_keymap_ctx(world, shell);
         if busy && !was_busy {
             let _ = app.post_app_event(UserEvent {
                 name: STATUS_WAKE_EVENT.to_string(),
@@ -836,6 +1020,17 @@ async fn drive(
             });
         }
         was_busy = busy;
+        // Surface the quit arming: the sequence-start is consumed
+        // silently by the keymap engine, so the host folds the arm
+        // notice (aj's wording) when a quit sequence newly pends. The
+        // engine handles the disarm side (timeout or another key), no
+        // notice needed there.
+        let quit_armed = shell.borrow().keymap.borrow().pending_sequence().is_some();
+        if quit_armed && !quit_was_armed {
+            fold_notice(world, &quit_arm_text(world));
+            app.request_redraw();
+        }
+        quit_was_armed = quit_armed;
         app.render_if_needed(root)?;
     }
 
@@ -978,46 +1173,246 @@ mod tests {
         assert_eq!(shell.borrow().editor.borrow().graphemes_before_cursor(), 0);
     }
 
-    #[test]
-    fn ctrl_c_is_recognized_host_side() {
-        let key = vaxis::key::Key {
-            codepoint: u32::from('c'),
-            mods: Modifiers::CTRL,
-            ..vaxis::key::Key::default()
-        };
-        assert!(is_ctrl_c(&Event::KeyPress(key)));
-        assert!(!is_ctrl_c(&Event::KeyPress(vaxis::key::Key {
-            codepoint: u32::from('c'),
-            ..vaxis::key::Key::default()
-        })));
+    /// The tools-expand chord (alt+o) flips the chat model's flag through
+    /// the keymap controller's capture phase: the editor never sees the
+    /// key, and a plain `o` still reaches it.
+    #[tokio::test]
+    async fn tools_expand_chord_flips_the_flag_via_the_keymap() {
+        let chat = empty_chat();
+        let (mut app, mut writer, shell, _root) = init_app_with_chat(Rc::clone(&chat)).await;
+
+        // ESC-prefixed 'o' is the legacy encoding of alt+o.
+        writer.write_all(b"\x1bo").expect("write alt+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(chat.borrow().tools_expanded);
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            0,
+            "the chord never reached the editor"
+        );
+
+        // A plain 'o' is normal typing.
+        writer.write_all(b"o").expect("write o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(chat.borrow().tools_expanded, "unchanged by plain typing");
+        assert_eq!(shell.borrow().editor.borrow().graphemes_before_cursor(), 1);
     }
 
-    #[test]
-    fn tools_expand_matches_alt_o_only() {
-        let alt_o = vaxis::key::Key {
-            codepoint: u32::from('o'),
-            mods: Modifiers::ALT,
-            ..vaxis::key::Key::default()
+    /// The thinking toggle (alt+t) flips thinking-block visibility, per
+    /// aj's `aj.thinking.toggle` semantics.
+    #[tokio::test]
+    async fn thinking_toggle_chord_flips_visibility_via_the_keymap() {
+        let chat = empty_chat();
+        let (mut app, mut writer, _shell, _root) = init_app_with_chat(Rc::clone(&chat)).await;
+        let initial = chat.borrow().hide_thinking_block;
+
+        writer.write_all(b"\x1bt").expect("write alt+t");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(chat.borrow().hide_thinking_block, !initial);
+
+        writer.write_all(b"\x1bt").expect("write alt+t");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(chat.borrow().hide_thinking_block, initial);
+    }
+
+    /// The world-facing chords park their action for the host loop.
+    #[tokio::test]
+    async fn host_actions_park_in_the_slot() {
+        let (mut app, mut writer, shell, _root) = init_app().await;
+        let mut press = async |bytes: &[u8]| {
+            writer.write_all(bytes).expect("write chord");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
         };
-        assert!(is_tools_expand(&Event::KeyPress(alt_o)));
-        // A bare `o` (normal typing) must reach the editor.
-        assert!(!is_tools_expand(&Event::KeyPress(vaxis::key::Key {
-            codepoint: u32::from('o'),
-            ..vaxis::key::Key::default()
-        })));
-        // Extra modifiers make it a different chord.
-        assert!(!is_tools_expand(&Event::KeyPress(vaxis::key::Key {
-            codepoint: u32::from('o'),
-            shifted_codepoint: Some(u32::from('O')),
-            mods: Modifiers::ALT | Modifiers::SHIFT,
-            text: Some("O".into()),
-            ..vaxis::key::Key::default()
-        })));
-        assert!(!is_tools_expand(&Event::KeyPress(vaxis::key::Key {
-            codepoint: u32::from('o'),
-            mods: Modifiers::ALT | Modifiers::CTRL,
-            ..vaxis::key::Key::default()
-        })));
+
+        // Alt+Enter (ESC CR) steers, Alt+Up (CSI 1;3A) dequeues, Ctrl+V
+        // pastes, Ctrl+R opens history, Alt+A the agent picker.
+        press(b"\x1b\r").await;
+        assert_eq!(shell.borrow().take_host_action(), Some(AjAction::Steer));
+        press(b"\x1b[1;3A").await;
+        assert_eq!(shell.borrow().take_host_action(), Some(AjAction::Dequeue));
+        press(&[0x16]).await;
+        assert_eq!(
+            shell.borrow().take_host_action(),
+            Some(AjAction::PasteImage)
+        );
+        press(&[0x12]).await;
+        assert_eq!(
+            shell.borrow().take_host_action(),
+            Some(AjAction::HistoryOpen)
+        );
+        press(b"\x1ba").await;
+        assert_eq!(
+            shell.borrow().take_host_action(),
+            Some(AjAction::AgentPickerOpen)
+        );
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            0,
+            "none of the chords leaked into the editor"
+        );
+    }
+
+    /// The ctrl+c ladder through real dispatch. While the viewed agent
+    /// runs, ctrl+c parks `CancelTurn` and nothing arms. While idle, the
+    /// first ctrl+c arms the quit sequence and the second quits.
+    #[tokio::test]
+    async fn ctrl_c_ladder_cancels_then_arms_then_quits() {
+        let (mut app, mut writer, shell, _root) = init_app().await;
+
+        // Running: cancel, no arming.
+        shell.borrow().keymap_ctx.borrow_mut().turn_running = true;
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit);
+        assert_eq!(
+            shell.borrow().take_host_action(),
+            Some(AjAction::CancelTurn)
+        );
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_none());
+
+        // Idle: the first press arms instead of quitting.
+        shell.borrow().keymap_ctx.borrow_mut().turn_running = false;
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit);
+        assert!(shell.borrow().take_host_action().is_none());
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_some());
+
+        // The second press completes the quit sequence.
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(app.handle_input(event).quit);
+    }
+
+    /// The 8A parity trap: an armed quit drops out when a turn starts,
+    /// so the next ctrl+c cancels instead of quitting. The engine
+    /// re-checks the sequence predicate on every advance.
+    #[tokio::test]
+    async fn armed_quit_falls_through_to_cancel_when_a_turn_starts() {
+        let (mut app, mut writer, shell, _root) = init_app().await;
+
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit);
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_some());
+
+        shell.borrow().keymap_ctx.borrow_mut().turn_running = true;
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit, "did not quit");
+        assert_eq!(
+            shell.borrow().take_host_action(),
+            Some(AjAction::CancelTurn)
+        );
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_none());
+    }
+
+    /// The quit sequence's timeout disarms it through the real timer
+    /// machinery: after the tick fires, the next ctrl+c re-arms instead
+    /// of quitting.
+    #[tokio::test]
+    async fn quit_arm_times_out_and_disarms() {
+        let (mut app, mut writer, shell, _root) = init_app().await;
+        // A zero timeout makes the scheduled disarm tick due immediately.
+        shell.borrow().keymap.borrow_mut().timeout_ms = 0;
+
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit);
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_some());
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(!app.fire_due_timers().quit);
+        assert!(
+            shell.borrow().keymap.borrow().pending_sequence().is_none(),
+            "the timeout disarmed the sequence"
+        );
+
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit, "re-armed, did not quit");
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_some());
+    }
+
+    /// With an overlay open, ctrl+c closes the whole stack instead of
+    /// cancelling or arming, even while a turn runs, and focus returns
+    /// to the editor.
+    #[tokio::test]
+    async fn ctrl_c_closes_overlays_instead_of_cancelling() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(shell.borrow().overlays.borrow().is_open());
+        app.render(&root).expect("render");
+
+        shell.borrow().keymap_ctx.borrow_mut().turn_running = true;
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit);
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "close-all tore the stack down"
+        );
+        assert!(
+            shell.borrow().take_host_action().is_none(),
+            "the running turn was left alone"
+        );
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_none());
+        app.render(&root).expect("render");
+
+        writer.write_all(b"x").expect("write key");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            1,
+            "focus is back in the editor"
+        );
+    }
+
+    /// The quit-arm notice strings, aj's wording plus the bare hint for
+    /// the nothing-running arm that aj never renders (it quits at once).
+    #[test]
+    fn quit_arm_notice_wording() {
+        assert_eq!(
+            quit_arm_notice(1, 0),
+            "1 agent still running — press Ctrl+C again to quit"
+        );
+        assert_eq!(
+            quit_arm_notice(2, 1),
+            "2 agents / 1 task still running — press Ctrl+C again to quit"
+        );
+        assert_eq!(
+            quit_arm_notice(0, 3),
+            "3 tasks still running — press Ctrl+C again to quit"
+        );
+    }
+
+    /// `quit_arm_text` picks the running-work notice when a quit would
+    /// tear work down and the bare press-again hint otherwise.
+    #[tokio::test]
+    async fn quit_arm_text_reflects_running_work() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+        assert_eq!(quit_arm_text(&world), "Press Ctrl+C again to quit");
+
+        handle_submit(&mut world, "go".to_string());
+        assert_eq!(
+            quit_arm_text(&world),
+            "1 agent still running — press Ctrl+C again to quit"
+        );
+
+        // Settle the turn so world teardown is clean.
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
     /// End-to-end over the real session path: submit a prompt into a
@@ -1335,6 +1730,218 @@ mod tests {
         )));
     }
 
+    /// Shell over the world's own chat and queues, for the host-action
+    /// tests that touch both (the editor lives on the Shell, the queues
+    /// on the world).
+    async fn world_and_shell(dir: &TempDir, demo: &str) -> (World, Rc<RefCell<Shell>>) {
+        let world = scripted_world(dir, demo).await;
+        let shell = Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            world.core.message_queues.clone(),
+            &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            "aj-next".to_string(),
+            "/tmp".to_string(),
+        )));
+        (world, shell)
+    }
+
+    /// Alt+Enter's steer action while the viewed agent is busy: editor
+    /// text queues as steering (and the editor clears), an empty editor
+    /// promotes the pending follow-up.
+    #[tokio::test]
+    async fn steer_action_queues_steering_and_promotes_follow_ups() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        handle_submit(&mut world, "first".to_string());
+        assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
+
+        // Busy + editor text: queue as steering, clear the editor.
+        shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .insert_slice_at_cursor("steer this");
+        handle_host_action(&mut world, &shell, AjAction::Steer);
+        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
+        assert_eq!(snapshot.text, "steer this");
+        assert_eq!(
+            shell.borrow().editor.borrow_mut().to_owned_slice(),
+            "",
+            "the steered text left the editor"
+        );
+
+        // Busy + empty editor + pending follow-up: promote to steering.
+        world.core.message_queues.clear(AgentId::Main);
+        world
+            .core
+            .message_queues
+            .append_follow_up(AgentId::Main, "follow-up");
+        handle_host_action(&mut world, &shell, AjAction::Steer);
+        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        assert_eq!(
+            snapshot.kind,
+            Some(aj_agent::queue::PendingKind::Steering),
+            "the pending follow-up escalated"
+        );
+        assert_eq!(snapshot.text, "follow-up");
+
+        // Settle the turn so world teardown is clean. Drop the queue
+        // first so the join's wake gate has nothing to deliver.
+        world.core.message_queues.clear(AgentId::Main);
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// Alt+Enter's steer action while idle starts a normal turn (there
+    /// is nothing to steer yet), matching aj.
+    #[tokio::test]
+    async fn steer_action_spawns_a_turn_while_idle() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .insert_slice_at_cursor("hi there");
+        handle_host_action(&mut world, &shell, AjAction::Steer);
+        assert!(
+            world.turn_cancels.contains_key(&AgentId::Main),
+            "idle steer spawned a prompt turn"
+        );
+        assert!(
+            world
+                .core
+                .message_queues
+                .snapshot(AgentId::Main)
+                .kind
+                .is_none(),
+            "nothing queued"
+        );
+
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("turn settles");
+        let first = world.core.event_rx.try_recv().expect("events buffered");
+        drain_events(&mut world, first);
+        let chat = world.chat.borrow();
+        let entries = chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries();
+        assert!(entries.iter().any(|e| matches!(
+            &e.kind,
+            EntryKind::User(u) if u.joined_text() == "hi there"
+        )));
+    }
+
+    /// Alt+Up's dequeue action pulls the queued message back into the
+    /// editor, prepending it to the current draft (blank-line joined),
+    /// and empties the queue.
+    #[tokio::test]
+    async fn dequeue_action_yanks_the_pending_message_into_the_editor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        handle_submit(&mut world, "first".to_string());
+        handle_submit(&mut world, "queued line".to_string());
+        assert_eq!(
+            world.core.message_queues.snapshot(AgentId::Main).text,
+            "queued line"
+        );
+
+        shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .insert_slice_at_cursor("draft");
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert_eq!(
+            shell.borrow().editor.borrow_mut().to_owned_slice(),
+            "queued line\n\ndraft"
+        );
+        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+
+        // Nothing pending: the yank reports no change.
+        assert!(!handle_host_action(&mut world, &shell, AjAction::Dequeue));
+
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// Cancelling a turn restores the queued message into the editor
+    /// (matching aj) instead of letting the post-turn wake deliver it.
+    #[tokio::test]
+    async fn cancel_action_yanks_the_pending_message_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        handle_submit(&mut world, "first".to_string());
+        handle_submit(&mut world, "second".to_string());
+
+        assert!(handle_host_action(&mut world, &shell, AjAction::CancelTurn));
+        assert_eq!(
+            shell.borrow().editor.borrow_mut().to_owned_slice(),
+            "second",
+            "the queued follow-up came back to the editor"
+        );
+        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        assert!(
+            world.turn_cancels.is_empty(),
+            "no wake spawned, the queue was empty"
+        );
+    }
+
+    /// The placeholder host actions fold a notice so the chords aren't
+    /// silent dead ends.
+    #[tokio::test]
+    async fn placeholder_actions_fold_notices() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        assert!(handle_host_action(&mut world, &shell, AjAction::PasteImage));
+        assert!(handle_host_action(
+            &mut world,
+            &shell,
+            AjAction::HistoryOpen
+        ));
+        assert!(handle_host_action(
+            &mut world,
+            &shell,
+            AjAction::AgentPickerOpen
+        ));
+        let chat = world.chat.borrow();
+        let notices: Vec<String> = chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Notice(n) => Some(n.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("image paste")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("history search")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("agent picker")),
+            "{notices:?}"
+        );
+    }
+
     // ---- Overlay substrate ----
 
     /// The TestTty geometry every overlay test runs against.
@@ -1418,9 +2025,11 @@ mod tests {
         })
     }
 
-    /// The Shell's draw appends the scrim and the top overlay above the
-    /// base layout, in z order and at the ported placement, and the
-    /// deepest hit at base-layout coordinates is the scrim.
+    /// The Shell's draw wraps the keymap controller's surface (so the
+    /// controller sits on the focus path) and appends the scrim and the
+    /// top overlay above the base layout, in z order and at the ported
+    /// placement. The deepest hit at base-layout coordinates is the
+    /// scrim.
     #[test]
     fn overlay_draw_appends_scrim_and_overlay_above_the_base() {
         use vaxis::vxfw::{Point, widget_eq};
@@ -1440,11 +2049,34 @@ mod tests {
         );
 
         let mut ev_ctx = EventContext::new();
-        shell.borrow_mut().open_palette(&mut ev_ctx);
+        {
+            let shell = shell.borrow();
+            let editor: WidgetRef = to_widget_ref(Rc::clone(&shell.editor));
+            let chrome = OverlayChrome::from_theme(&Theme::bundled_dark_with_mode(
+                aj_app::theme::ColorMode::Truecolor,
+            ));
+            open_palette(
+                &shell.overlays,
+                &editor,
+                &chrome,
+                &shell.palette_selection,
+                &mut ev_ctx,
+            );
+        }
         assert!(shell.borrow().overlays.borrow().is_open());
 
         let surface = shell.borrow_mut().draw(&ctx);
-        let scrim = surface
+        // The wrapper's sole z-0 child is the keymap controller's
+        // surface, which carries the base layout plus the overlay
+        // children.
+        assert_eq!(surface.children.len(), 1);
+        let inner = &surface.children[0].surface;
+        let controller = to_widget_ref(Rc::clone(&shell.borrow().keymap));
+        assert!(widget_eq(
+            inner.widget.as_ref().expect("controller stamped"),
+            &controller,
+        ));
+        let scrim = inner
             .children
             .iter()
             .find(|c| c.z_index == 1)
@@ -1464,7 +2096,7 @@ mod tests {
         ));
         // The Small placement at 80x40: 75% width rounds to 60, below the
         // 72-column floor, and 22 inner rows plus 4 chrome, centered.
-        let overlay = surface
+        let overlay = inner
             .children
             .iter()
             .find(|c| c.z_index == 2)

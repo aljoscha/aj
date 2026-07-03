@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use aj_agent::tool::{TaskKind, TaskStatus};
 use aj_app::chat::ChatState;
@@ -17,11 +18,12 @@ use crate::status::StatusState;
 use crate::transcript::TranscriptStyles;
 
 /// Display label of the agent-picker chord shown in the activity
-/// part. Hardcoded to the default `aj.agent.open` binding (alt+a, see
-/// `aj_app::keybindings::AJ_KEYBINDINGS`), rendered the way `aj`'s
-/// shortcut formatter titles it. The real keymap engine that resolves
-/// configured bindings is phase 8.
-const AGENT_PICKER_KEY_LABEL: &str = "Alt+A";
+/// part, resolved from the shared default binding table. Follows user
+/// `[keybindings]` overrides once those land.
+static AGENT_PICKER_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
+    aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_AGENT_PICKER)
+        .expect("aj.agent.open has a default chord")
+});
 
 /// The footer row widget.
 pub(crate) struct FooterLine {
@@ -93,7 +95,7 @@ impl Widget for FooterLine {
             .count();
         if agents + tasks > 0 {
             parts.push(vec![span(
-                format_agent_activity(agents, tasks, AGENT_PICKER_KEY_LABEL),
+                format_agent_activity(agents, tasks, AGENT_PICKER_KEY_LABEL.as_str()),
                 dim,
             )]);
         }

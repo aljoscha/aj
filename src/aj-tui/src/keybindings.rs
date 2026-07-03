@@ -275,6 +275,10 @@ impl KeybindingsManager {
 /// display labels, title-cases everything else, and rejoins. The
 /// canonical form parsed here is the same form stored by
 /// [`KeybindingsManager::get_keys`].
+///
+/// NOTE: `aj_app::keybindings` carries the same formatter for the
+/// vaxis frontend. Both format the canonical chord grammar of
+/// `AJ_KEYBINDINGS`, so their display spellings must agree.
 pub fn format_keybinding(canonical: &str) -> String {
     canonical
         .split('+')
