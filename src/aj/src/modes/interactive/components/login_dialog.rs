@@ -29,6 +29,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use aj_app::auth::{LoginLine, auth_lines};
 use aj_models::oauth::{OAuthAuthInfo, OAuthCallbacks, OAuthError};
 use aj_tui::component::Component;
 use aj_tui::components::text_input::TextInput;
@@ -39,18 +40,6 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use crate::config::theme::{ThemeColor, ThemeHandle, ThemeHandleExt};
-
-/// A single display line in the dialog, tagged so the component can
-/// color it through the theme.
-#[derive(Clone)]
-pub enum LoginLine {
-    /// Plain informational text.
-    Info(String),
-    /// The authorization URL (rendered in the accent color).
-    Url(String),
-    /// A progress/status update emitted by the flow.
-    Progress(String),
-}
 
 /// Display state shared between [`TuiOAuthCallbacks`] (writer, on the
 /// login task) and [`LoginDialogComponent`] (reader, on the UI
@@ -354,69 +343,6 @@ impl TuiOAuthCallbacks {
     }
 }
 
-/// Compose the dialog's authorization-step lines plus the URL we store
-/// for clipboard copy.
-///
-/// Pure so the headless wording can be unit-tested without sniffing the
-/// environment through [`crate::auth::browser_available`] or touching the
-/// clipboard. `copy` is the rendered shortcut for the copy action.
-///
-/// The headless wording depends on whether the provider has a hosted
-/// manual page ([`OAuthAuthInfo::manual_url`]). With one, the user pastes
-/// a code that page shows. Without one (the redirect targets this
-/// machine's loopback, which a remote browser can't reach), the user has
-/// to copy the failed-redirect URL out of their browser's address bar, so
-/// we say so explicitly.
-fn auth_lines(can_open: bool, info: &OAuthAuthInfo<'_>, copy: &str) -> (Vec<LoginLine>, String) {
-    let mut lines = Vec::new();
-
-    if can_open {
-        lines.push(LoginLine::Info(
-            "Opening your browser to authorize…".to_string(),
-        ));
-        if let Some(instructions) = info.instructions {
-            lines.push(LoginLine::Info(instructions.to_string()));
-        }
-        lines.push(LoginLine::Info(format!(
-            "If it doesn't open, click or copy ({copy}) this URL:"
-        )));
-        lines.push(LoginLine::Url(info.url.to_string()));
-        if let Some(manual) = info.manual_url {
-            lines.push(LoginLine::Info(
-                "On a different machine? Open this URL instead, then paste the code it shows:"
-                    .to_string(),
-            ));
-            lines.push(LoginLine::Url(manual.to_string()));
-        }
-        return (lines, info.url.to_string());
-    }
-
-    lines.push(LoginLine::Info(
-        "No browser detected on this machine (headless/SSH).".to_string(),
-    ));
-    match info.manual_url {
-        Some(manual) => {
-            lines.push(LoginLine::Info(format!(
-                "Open this URL on another device ({copy} to copy), then paste the code it shows:"
-            )));
-            lines.push(LoginLine::Url(manual.to_string()));
-            (lines, manual.to_string())
-        }
-        None => {
-            lines.push(LoginLine::Info(format!(
-                "Open this URL on another device and sign in ({copy} to copy):"
-            )));
-            lines.push(LoginLine::Url(info.url.to_string()));
-            lines.push(LoginLine::Info(
-                "Your browser will then try to reach this machine and show a connection error. \
-                 That's expected: copy the full URL from its address bar and paste it here."
-                    .to_string(),
-            ));
-            (lines, info.url.to_string())
-        }
-    }
-}
-
 #[async_trait]
 impl OAuthCallbacks for TuiOAuthCallbacks {
     fn on_auth(&self, info: OAuthAuthInfo<'_>) {
@@ -634,85 +560,5 @@ mod tests {
         );
         // The URL text still shows so the user can copy it manually.
         assert!(body.contains(url), "{body:?}");
-    }
-
-    /// Collect the line bodies (ignoring the line kind) for assertions.
-    fn joined(lines: &[LoginLine]) -> String {
-        lines
-            .iter()
-            .map(|l| match l {
-                LoginLine::Info(t) | LoginLine::Url(t) | LoginLine::Progress(t) => t.as_str(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn urls(lines: &[LoginLine]) -> Vec<String> {
-        lines
-            .iter()
-            .filter_map(|l| match l {
-                LoginLine::Url(u) => Some(u.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Headless with no hosted manual page (e.g. openai-codex): the user
-    /// must copy the failed-redirect URL out of the address bar, so the
-    /// wording has to call that out and we surface the authorize URL.
-    #[test]
-    fn auth_lines_headless_without_hosted_page_explains_address_bar_copy() {
-        let info = OAuthAuthInfo {
-            url: "https://auth.example.com/authorize?x=1",
-            manual_url: None,
-            instructions: Some("ignored when headless"),
-        };
-        let (lines, stored) = auth_lines(false, &info, "Ctrl+Y");
-        let body = joined(&lines);
-        assert!(body.contains("headless/SSH"), "{body}");
-        assert!(body.contains("address bar"), "{body}");
-        assert!(body.contains("connection error"), "{body}");
-        assert_eq!(urls(&lines), vec![info.url.to_string()]);
-        assert_eq!(stored, info.url);
-    }
-
-    /// Headless with a hosted manual page (e.g. anthropic): lead with the
-    /// manual URL and tell the user to paste the code it shows.
-    #[test]
-    fn auth_lines_headless_with_hosted_page_says_paste_code() {
-        let info = OAuthAuthInfo {
-            url: "http://localhost:1455/auth/callback?x=1",
-            manual_url: Some("https://hosted.example.com/code"),
-            instructions: None,
-        };
-        let (lines, stored) = auth_lines(false, &info, "Ctrl+Y");
-        let body = joined(&lines);
-        assert!(body.contains("paste the code it shows"), "{body}");
-        assert!(!body.contains("address bar"), "{body}");
-        assert_eq!(urls(&lines), vec!["https://hosted.example.com/code"]);
-        assert_eq!(stored, "https://hosted.example.com/code");
-    }
-
-    /// With a browser available we open the automatic URL, store it for
-    /// copy, and list a hosted manual URL as a secondary fallback.
-    #[test]
-    fn auth_lines_with_browser_lists_both_urls() {
-        let info = OAuthAuthInfo {
-            url: "http://localhost:1455/auth/callback?x=1",
-            manual_url: Some("https://hosted.example.com/code"),
-            instructions: Some("Complete login in your browser."),
-        };
-        let (lines, stored) = auth_lines(true, &info, "Ctrl+Y");
-        let body = joined(&lines);
-        assert!(body.contains("Opening your browser"), "{body}");
-        assert!(body.contains("Complete login in your browser."), "{body}");
-        assert_eq!(
-            urls(&lines),
-            vec![
-                info.url.to_string(),
-                "https://hosted.example.com/code".to_string()
-            ]
-        );
-        assert_eq!(stored, info.url);
     }
 }

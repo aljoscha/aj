@@ -59,6 +59,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::LoginLine;
 use crate::cli::args::{Args, Command};
 use crate::config::commands::{CommandAction, load_model_catalog, thinking_level_name};
 use crate::config::theme::{
@@ -75,7 +76,7 @@ use crate::modes::interactive::components::auth_status::AuthStatusOutcomeHandle;
 use crate::modes::interactive::components::command_palette::CommandPaletteOutcomeHandle;
 use crate::modes::interactive::components::footer::Footer;
 use crate::modes::interactive::components::login_dialog::{
-    LoginDialogComponent, LoginDialogState, LoginLine, TuiOAuthCallbacks,
+    LoginDialogComponent, LoginDialogState, TuiOAuthCallbacks,
 };
 use crate::modes::interactive::components::model_selector::{
     ModelIdentityRef, ModelSelectorComponent, ModelSelectorOutcome,

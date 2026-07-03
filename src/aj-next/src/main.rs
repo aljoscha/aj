@@ -17,6 +17,7 @@ mod content_overlay;
 mod footer;
 mod interactive;
 mod keymap;
+mod login;
 mod overlay;
 mod palette;
 mod pending;

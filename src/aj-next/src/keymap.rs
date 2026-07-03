@@ -31,6 +31,11 @@ pub(crate) struct HostCtx {
     /// running initial sub-agent spawn), i.e. whether Ctrl+C has
     /// something to cancel.
     pub(crate) turn_running: bool,
+    /// Whether an OAuth login dialog is up. It is a modal like the other
+    /// overlays, but its own Esc/Ctrl+C handling flips a cancel flag the
+    /// drive loop polls, so the close-all chord must not pre-empt it.
+    /// The drive loop is this field's single writer.
+    pub(crate) login_active: bool,
 }
 
 fn overlay_open(cx: &HostCtx) -> bool {
@@ -47,6 +52,14 @@ fn can_cancel(cx: &HostCtx) -> bool {
 
 fn can_arm_quit(cx: &HostCtx) -> bool {
     no_overlay(cx) && !cx.turn_running
+}
+
+/// Close-all is inert while a login dialog is up: the dialog owns its own
+/// Esc/Ctrl+C teardown (flipping a cancel flag the drive loop polls), so
+/// letting the close-all chord fire would drop the overlay without
+/// aborting the login task.
+fn overlay_open_no_login(cx: &HostCtx) -> bool {
+    overlay_open(cx) && !cx.login_active
 }
 
 /// Translate a parsed chord into a vaxis activator.
@@ -114,7 +127,7 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         // close-all only exists while one is, and the render toggles
         // plus the clipboard paste work regardless.
         let enabled: fn(&HostCtx) -> bool = match binding.action {
-            AjAction::CloseAllOverlays => overlay_open,
+            AjAction::CloseAllOverlays => overlay_open_no_login,
             AjAction::PaletteOpen
             | AjAction::HistoryOpen
             | AjAction::AgentPickerOpen
@@ -140,6 +153,7 @@ mod tests {
         HostCtx {
             overlays: Rc::new(RefCell::new(OverlayStack::default())),
             turn_running,
+            login_active: false,
         }
     }
 
@@ -255,6 +269,31 @@ mod tests {
         assert_eq!(
             keymap.match_single(&alt_enter, BindingPhase::Capture, &idle),
             Some(&AjAction::Steer)
+        );
+    }
+
+    /// While a login dialog is up, the close-all chord (ctrl+c) is inert:
+    /// the dialog owns its own Esc/Ctrl+C teardown, so the chord must not
+    /// pre-empt it. The dialog is a leaf on the focus path and handles the
+    /// key itself.
+    #[test]
+    fn close_all_is_inert_while_login_is_active() {
+        let keymap = build_keymap();
+        let ctrl_c = key(u32::from('c'), Modifiers::CTRL);
+        let mut modal = ctx(false);
+        modal.login_active = true;
+        modal
+            .overlays
+            .borrow_mut()
+            .push(crate::overlay::OpenOverlay {
+                widget: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                focus: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                placement: crate::overlay::OverlayPlacement::Small,
+            });
+        assert_eq!(
+            keymap.match_single(&ctrl_c, BindingPhase::Capture, &modal),
+            None,
+            "ctrl+c falls through to the login dialog, not close-all"
         );
     }
 }

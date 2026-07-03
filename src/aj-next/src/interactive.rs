@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -33,7 +34,7 @@ use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn,
 use aj_conf::{
     Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
 };
-use aj_models::auth::AuthStorage;
+use aj_models::auth::{AuthError, AuthStorage};
 use aj_models::registry::ModelInfo;
 use aj_models::types::Speed;
 use aj_models::{
@@ -57,6 +58,10 @@ use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker}
 use crate::content_overlay::{auth_rows, session_info_rows, set_rows, usage_rows};
 use crate::footer::FooterLine;
 use crate::keymap::{HostCtx, build_keymap};
+use crate::login::{
+    AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, open_login_dialog,
+    open_login_picker, open_logout_picker,
+};
 use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
@@ -421,6 +426,203 @@ fn fold_notice(world: &mut World, text: &str) {
         &mut world.core.lifecycle,
         notice_event(text),
     );
+}
+
+/// Fold `text` into the chat model as a Main-agent warning row, for
+/// failures the user should notice (e.g. a login that errored out).
+fn fold_warning(world: &mut World, text: &str) {
+    let _ = reduce(
+        &mut world.chat.borrow_mut(),
+        &mut world.core.lifecycle,
+        AgentEvent::Warning {
+            agent_id: AgentId::Main,
+            text: text.to_string(),
+        },
+    );
+}
+
+/// An in-flight OAuth login the drive loop is tracking.
+///
+/// Kept outside the overlay stack because the flow is async and
+/// long-running rather than a synchronous confirm/cancel selector, but
+/// paired with the dialog overlay it pushed. Carries the provider's
+/// display name (for the completion notice), the cancel flag the dialog
+/// (Esc/Ctrl+C) flips, and the spawned task's handle the loop awaits.
+struct LoginSession {
+    provider_name: String,
+    cancel: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<Result<(), AuthError>>,
+}
+
+/// Mount the login dialog and spawn the OAuth flow, tracking it in
+/// `login_session`.
+///
+/// The dialog widget (Rc/RefCell) stays host-side; only the `Send` shared
+/// handles (the `Arc<Mutex>` state + pending-input slot and the redraw
+/// sender) cross into the spawned task via [`DialogCallbacks`], so the
+/// `!Send` widget is never moved onto the tokio task.
+fn start_login(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+    login_session: &mut Option<LoginSession>,
+    redraw_tx: &UnboundedSender<()>,
+    provider_id: String,
+    provider_name: String,
+) {
+    // Shared handles: the dialog (UI thread) holds clones; the originals
+    // move into the login task's callbacks.
+    let state = Arc::new(StdMutex::new(LoginDialogState::default()));
+    // Seed a line so the dialog isn't blank before the flow's first
+    // callback lands.
+    state
+        .lock()
+        .expect("login dialog state poisoned")
+        .lines
+        .push(aj_app::auth::LoginLine::Progress(
+            "Starting login\u{2026}".to_string(),
+        ));
+    let pending_input = Arc::new(StdMutex::new(None));
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    {
+        let handles = shell.borrow().overlay_handles();
+        let theme = shell.borrow().theme.clone();
+        let snapshot = theme.read();
+        open_login_dialog(
+            &handles.stack,
+            &handles.chrome,
+            &snapshot,
+            &provider_name,
+            Arc::clone(&state),
+            Arc::clone(&pending_input),
+            Arc::clone(&cancel),
+        );
+    }
+
+    let auth = world.auth.clone();
+    let redraw = redraw_tx.clone();
+    let task_state = Arc::clone(&state);
+    let task_pending = Arc::clone(&pending_input);
+    let handle = tokio::spawn(async move {
+        let callbacks = DialogCallbacks::new(task_state, task_pending, redraw);
+        auth.login(&provider_id, &callbacks).await
+    });
+
+    *login_session = Some(LoginSession {
+        provider_name,
+        cancel,
+        handle,
+    });
+    // The overlay was pushed from the host (no EventContext), so hand the
+    // focus move to the shell, matching the other host-driven opens.
+    app.post_app_event(UserEvent {
+        name: REFOCUS_OVERLAY_EVENT.to_string(),
+        data: None,
+    });
+    app.request_redraw();
+}
+
+/// Pop the login dialog (the top overlay) and hand focus back via the
+/// refocus event, which lands on the parent overlay or the editor.
+fn close_login_overlay(shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp) {
+    shell.borrow().overlays.borrow_mut().back();
+    app.post_app_event(UserEvent {
+        name: REFOCUS_OVERLAY_EVENT.to_string(),
+        data: None,
+    });
+}
+
+/// Apply a confirmed login/logout provider pick. Login mounts the dialog
+/// and spawns the flow; logout is a quick disk write done inline.
+async fn apply_auth_request(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+    login_session: &mut Option<LoginSession>,
+    redraw_tx: &UnboundedSender<()>,
+    request: AuthPickerRequest,
+) {
+    match request {
+        AuthPickerRequest::Login {
+            provider_id,
+            provider_name,
+        } => start_login(
+            world,
+            shell,
+            app,
+            login_session,
+            redraw_tx,
+            provider_id,
+            provider_name,
+        ),
+        AuthPickerRequest::Logout { provider_id } => {
+            let notice = match world.auth.logout(&provider_id).await {
+                Ok(()) => format!("Logged out of {provider_id}."),
+                Err(err) => format!("Failed to log out of {provider_id}: {err}"),
+            };
+            fold_notice(world, &notice);
+            app.request_redraw();
+        }
+    }
+}
+
+/// Tear down the login dialog when the shared cancel flag is set (the
+/// dialog's Esc/Ctrl+C flipped it). Aborts the task and folds a notice;
+/// a no-op when no login is in flight or the flag is clear.
+///
+/// We take `login_session` before aborting so the completion arm (which
+/// keys off `login_session`) then sees `None` and its future pends,
+/// avoiding a double-close of the overlay.
+fn cancel_login(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+    login_session: &mut Option<LoginSession>,
+) {
+    if !login_session
+        .as_ref()
+        .is_some_and(|s| s.cancel.load(Ordering::Relaxed))
+    {
+        return;
+    }
+    let session = login_session.take().expect("login session present");
+    session.handle.abort();
+    close_login_overlay(shell, app);
+    fold_notice(
+        world,
+        &format!("Login to {} cancelled.", session.provider_name),
+    );
+    app.request_redraw();
+}
+
+/// Handle the login task completing: close the dialog, fold the outcome
+/// notice, and clear the session.
+///
+/// The abort branch is effectively unreachable through the cancel-poll,
+/// which takes `login_session` before aborting (so this select arm then
+/// sees `None` and its future pends forever). We keep it so a task
+/// cancelled by any other means stays quiet rather than surfacing a
+/// spurious error.
+fn finish_login(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+    login_session: &mut Option<LoginSession>,
+    outcome: Result<Result<(), AuthError>, tokio::task::JoinError>,
+) {
+    let Some(session) = login_session.take() else {
+        return;
+    };
+    close_login_overlay(shell, app);
+    let name = session.provider_name;
+    match outcome {
+        Ok(Ok(())) => fold_notice(world, &format!("Logged in to {name}.")),
+        Ok(Err(err)) => fold_warning(world, &format!("Login to {name} failed: {err}")),
+        Err(join) if join.is_cancelled() => {}
+        Err(join) => fold_warning(world, &format!("Login task error: {join}")),
+    }
+    app.request_redraw();
 }
 
 /// Fold `first` plus everything else already buffered on the event
@@ -1054,12 +1256,70 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenLoginSelector => {
-            fold_notice(world, "Login is not wired up yet.");
-            ActionEffect::Redraw
+            // The picker needs the OAuth provider list plus each one's
+            // credential summary, both async. `apply_command_action` is
+            // already async, so build the rows inline and open a fully
+            // populated picker (no loading/fill dance needed).
+            let providers = world.auth.oauth_provider_ids().await;
+            if providers.is_empty() {
+                fold_notice(world, "No OAuth providers are available to log in to.");
+                return ActionEffect::Redraw;
+            }
+            let mut rows = Vec::with_capacity(providers.len());
+            for (id, name) in &providers {
+                let status = aj_app::auth::provider_status(&world.auth, id, Some(name)).await;
+                rows.push(AuthRow {
+                    provider_id: id.clone(),
+                    label: name.clone(),
+                    summary: status.summary,
+                });
+            }
+            let handles = shell.borrow().overlay_handles();
+            open_login_picker(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.auth_request,
+                rows,
+            );
+            ActionEffect::OpenedOverlay
         }
         CommandAction::OpenLogoutSelector => {
-            fold_notice(world, "Logout is not wired up yet.");
-            ActionEffect::Redraw
+            // Only stored credentials can be logged out: env vars and
+            // --api-key aren't persisted, so they never appear here.
+            let mut stored = world.auth.list().await.unwrap_or_default();
+            if stored.is_empty() {
+                fold_notice(
+                    world,
+                    "No stored credentials to remove. (Env vars and --api-key aren't \
+                     stored and can't be logged out.)",
+                );
+                return ActionEffect::Redraw;
+            }
+            stored.sort();
+            let oauth = world.auth.oauth_provider_ids().await;
+            let mut rows = Vec::with_capacity(stored.len());
+            for id in &stored {
+                let name = oauth
+                    .iter()
+                    .find(|(pid, _)| pid == id)
+                    .map(|(_, n)| n.as_str());
+                let status = aj_app::auth::provider_status(&world.auth, id, name).await;
+                rows.push(AuthRow {
+                    provider_id: id.clone(),
+                    label: name.map(|n| n.to_string()).unwrap_or_else(|| id.clone()),
+                    summary: status.summary,
+                });
+            }
+            let handles = shell.borrow().overlay_handles();
+            open_logout_picker(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.auth_request,
+                rows,
+            );
+            ActionEffect::OpenedOverlay
         }
         // Handled in the palette confirm (overlay openers, quit, re-open)
         // or never a catalog command (`OpenTaskOutput`). Nothing to do.
@@ -1860,6 +2120,8 @@ struct OverlayHandles {
     session_scan: Rc<RefCell<Option<SessionScan>>>,
     /// Where the session selector parks a confirmed resume request.
     session_request: Rc<RefCell<Option<SessionRequest>>>,
+    /// Where the login/logout picker parks a confirmed provider action.
+    auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
 }
 
 /// The root widget: the keymap controller wrapping the base layout, the
@@ -1942,6 +2204,10 @@ struct Shell {
     /// session-selector pick. Drained after each input event; a `Some`
     /// exits the drive loop with the matching [`SessionExit`].
     session_request: Rc<RefCell<Option<SessionRequest>>>,
+    /// A confirmed login/logout provider pick parked by the auth picker,
+    /// drained by the drive loop (which owns the credential store and the
+    /// login task machinery).
+    auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
 }
 
 impl Shell {
@@ -2013,9 +2279,11 @@ impl Shell {
         let recall_slot: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let session_scan: Rc<RefCell<Option<SessionScan>>> = Rc::new(RefCell::new(None));
         let session_request: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
+        let auth_request: Rc<RefCell<Option<AuthPickerRequest>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
             turn_running: false,
+            login_active: false,
         }));
 
         // The controller's action handler. Actions whose effects are
@@ -2104,6 +2372,7 @@ impl Shell {
             header: header_line,
             session_scan,
             session_request,
+            auth_request,
         }
     }
 
@@ -2160,6 +2429,12 @@ impl Shell {
         self.session_request.borrow_mut().take()
     }
 
+    /// Collect a confirmed login/logout provider pick parked by the auth
+    /// picker, if any.
+    fn take_auth_request(&self) -> Option<AuthPickerRequest> {
+        self.auth_request.borrow_mut().take()
+    }
+
     /// The shared handles the drive loop needs to open a config-editing
     /// overlay: the stack it pushes onto, the editor (focus fallback), a live
     /// chrome snapshot, and the activity / settings-window / picker /
@@ -2176,6 +2451,7 @@ impl Shell {
             recall_slot: Rc::clone(&self.recall_slot),
             session_scan: Rc::clone(&self.session_scan),
             session_request: Rc::clone(&self.session_request),
+            auth_request: Rc::clone(&self.auth_request),
         }
     }
 
@@ -2573,6 +2849,15 @@ async fn drive(
     // while the blocking scan sends only the (Send) previews back.
     let (session_tx, mut session_rx) = unbounded_channel::<Vec<SessionPreview>>();
     let mut pending_session: Option<SessionScan> = None;
+    // OAuth login redraw pings. The login task runs on tokio, off this
+    // `!Send` thread, so it can't call `request_redraw` itself. Each ping
+    // it sends turns into one repaint via the select arm below. The sender
+    // lives for the whole loop, so the receiver never observes a close.
+    let (login_redraw_tx, mut login_redraw_rx) = unbounded_channel::<()>();
+    // The in-flight OAuth login, if any. Tracked here (not on the overlay
+    // stack) because it is async and long-running, but paired with the
+    // dialog overlay it pushed.
+    let mut login_session: Option<LoginSession> = None;
     let exit = loop {
         // Compute the tick deadline before the select so no arm holds
         // a borrow of `app` another arm needs. The sleep expression is
@@ -2659,6 +2944,29 @@ async fn drive(
                     fill_session_scan(&scan, &previews, Utc::now());
                     app.request_redraw();
                 }
+            }
+
+            // --- Login dialog redraw ping ---
+            // The login task pushed a line (or revealed the paste prompt)
+            // and pinged for a repaint. This is the cross-thread redraw
+            // wake: the task can't call `request_redraw`, so it sends here.
+            maybe_ping = login_redraw_rx.recv() => {
+                if maybe_ping.is_some() {
+                    app.request_redraw();
+                }
+            }
+
+            // --- OAuth login task finished ---
+            // Pends forever while no login is in flight. When one is, the
+            // handle resolves on success, failure, or abort; `finish_login`
+            // closes the dialog and folds the outcome.
+            login_outcome = async {
+                match login_session.as_mut() {
+                    Some(session) => (&mut session.handle).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                finish_login(world, shell, app, &mut login_session, login_outcome);
             }
 
             // --- Terminal input ---
@@ -2753,6 +3061,25 @@ async fn drive(
                             spawn_session_scan(world, &session_tx);
                             pending_session = Some(scan);
                         }
+                        // A confirmed login/logout provider pick from the
+                        // auth picker. Bind out of the borrow first so no
+                        // RefCell ref is held across the await inside.
+                        let auth_request = shell.borrow().take_auth_request();
+                        if let Some(request) = auth_request {
+                            apply_auth_request(
+                                world,
+                                shell,
+                                app,
+                                &mut login_session,
+                                &login_redraw_tx,
+                                request,
+                            )
+                            .await;
+                        }
+                        // Login cancellation: the dialog's Esc/Ctrl+C flipped
+                        // the shared flag. Tear the dialog down and abort the
+                        // task.
+                        cancel_login(world, shell, app, &mut login_session);
                         // A parked session change (the `NewSession` command
                         // or a confirmed resume pick). A change is only ever
                         // requested with no turn in flight, so tearing the
@@ -2786,6 +3113,10 @@ async fn drive(
         // forwards it, see `Shell::capture_event`).
         let busy = sync_status(world);
         sync_keymap_ctx(world, shell);
+        // The close-all chord must not pre-empt the login dialog's own
+        // Esc/Ctrl+C teardown, so mirror the login liveness into the
+        // keymap context. This loop is the field's single writer.
+        shell.borrow().keymap_ctx.borrow_mut().login_active = login_session.is_some();
         if busy && !was_busy {
             let _ = app.post_app_event(UserEvent {
                 name: STATUS_WAKE_EVENT.to_string(),
@@ -3585,6 +3916,38 @@ mod tests {
         (world, shell)
     }
 
+    /// Like [`init_app`] but over a real scripted [`World`] plus a [`Shell`]
+    /// bound to it, so tests can exercise the host arms that need all three
+    /// of the app, the world, and the shell (the login/logout flow).
+    async fn init_app_with_world(
+        dir: &TempDir,
+        demo: &str,
+    ) -> (AsyncApp, PipeWriter, World, Rc<RefCell<Shell>>, WidgetRef) {
+        let world = scripted_world(dir, demo).await;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"\x1b[?c").expect("write DA1 reply");
+        let shell = Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            world.core.message_queues.clone(),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(
+                aj_app::theme::ColorMode::Truecolor,
+            )),
+            "aj-next".to_string(),
+            "/tmp".to_string(),
+        )));
+        let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
+        let mut app = AsyncApp::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+            reader.into(),
+        );
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        (app, writer, world, shell, root)
+    }
+
     /// Alt+Enter's steer action while the viewed agent is busy: editor
     /// text queues as steering (and the editor clears), an empty editor
     /// promotes the pending follow-up.
@@ -4176,24 +4539,234 @@ mod tests {
         assert!(app.handle_input(event).quit, "confirming quit quits");
     }
 
-    /// The still-deferred login/logout commands fold a "not wired up yet"
-    /// notice rather than silently doing nothing (8D-3b-ii wires them up).
+    /// `/login` opens a picker over the OAuth providers (the default
+    /// registry is non-empty, so it opens rather than folding a notice).
     #[tokio::test]
-    async fn deferred_commands_fold_a_notice() {
+    async fn login_picker_opens_over_providers() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenLoginSelector).await,
-            ActionEffect::Redraw
-        ));
-        assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenLogoutSelector).await,
-            ActionEffect::Redraw
-        ));
-        let notices = main_notices(&world);
-        assert!(notices.iter().any(|n| n.contains("Login")), "{notices:?}");
-        assert!(notices.iter().any(|n| n.contains("Logout")), "{notices:?}");
+        let effect =
+            apply_command_action(&mut world, &shell, CommandAction::OpenLoginSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "picker open");
+    }
+
+    /// `/logout` with nothing stored folds an explanatory notice instead
+    /// of opening an empty picker.
+    #[tokio::test]
+    async fn logout_picker_empty_folds_notice() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        let effect =
+            apply_command_action(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
+        assert!(matches!(effect, ActionEffect::Redraw));
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "no picker");
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("No stored credentials")),
+            "{:?}",
+            main_notices(&world)
+        );
+    }
+
+    /// `/logout` lists a stored credential, and confirming it (the drive
+    /// loop's auth-request drain) removes it from `auth.json` and folds a
+    /// notice.
+    #[tokio::test]
+    async fn logout_removes_stored_credential_and_notes_it() {
+        use aj_models::auth::AuthCredential;
+        use aj_models::oauth::OAuthCredentials;
+
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, _writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        world
+            .auth
+            .set(
+                "anthropic",
+                AuthCredential::OAuth(OAuthCredentials::new("r", "a", 0)),
+            )
+            .await
+            .expect("seed stored credential");
+
+        // The picker would list it.
+        let effect =
+            apply_command_action(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+
+        // Confirming parks a Logout request; drain it the way the loop does.
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
+        apply_auth_request(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            AuthPickerRequest::Logout {
+                provider_id: "anthropic".to_string(),
+            },
+        )
+        .await;
+
+        assert!(
+            world.auth.get("anthropic").await.expect("read").is_none(),
+            "credential removed"
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("Logged out of anthropic")),
+            "{:?}",
+            main_notices(&world)
+        );
+    }
+
+    /// Confirming a login provider mounts the dialog overlay, tracks a
+    /// `LoginSession`, and seeds the "Starting login…" line. The spawned
+    /// task is aborted before it can run the real OAuth flow.
+    #[tokio::test]
+    async fn start_login_mounts_dialog_and_tracks_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, _writer, world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            "anthropic".to_string(),
+            "Anthropic (Claude Pro/Max)".to_string(),
+        );
+
+        assert!(login_session.is_some(), "session tracked");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "dialog open");
+        let body = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(body.contains("Starting login"), "seed line: {body}");
+        assert!(body.contains("Anthropic"), "provider in title: {body}");
+
+        // Abort the spawned flow before it (never having been polled) can
+        // touch the network.
+        login_session.take().unwrap().handle.abort();
+    }
+
+    /// The login-task completion arm closes the dialog and folds a success
+    /// notice on `Ok(Ok(()))`.
+    #[tokio::test]
+    async fn finish_login_success_closes_dialog_and_notes() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, _writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            "anthropic".to_string(),
+            "Anthropic".to_string(),
+        );
+        login_session.as_mut().unwrap().handle.abort();
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
+
+        finish_login(&mut world, &shell, &mut app, &mut login_session, Ok(Ok(())));
+        assert!(login_session.is_none(), "session cleared");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("Logged in to Anthropic")),
+            "{:?}",
+            main_notices(&world)
+        );
+    }
+
+    /// A failed login folds a warning and still closes the dialog.
+    #[tokio::test]
+    async fn finish_login_failure_warns_and_closes() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, _writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            "anthropic".to_string(),
+            "Anthropic".to_string(),
+        );
+        login_session.as_mut().unwrap().handle.abort();
+
+        finish_login(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            Ok(Err(AuthError::OAuth(
+                aj_models::oauth::OAuthError::Cancelled,
+            ))),
+        );
+        assert!(login_session.is_none());
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("Login to Anthropic failed")),
+            "{:?}",
+            main_notices(&world)
+        );
+    }
+
+    /// The cancel-poll aborts the task, closes the dialog, and folds the
+    /// cancelled notice when the dialog flips the shared flag.
+    #[tokio::test]
+    async fn cancel_login_aborts_closes_and_notes() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, _writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            "anthropic".to_string(),
+            "Anthropic".to_string(),
+        );
+        // The dialog would flip this on Esc/Ctrl+C.
+        login_session
+            .as_ref()
+            .unwrap()
+            .cancel
+            .store(true, Ordering::Relaxed);
+
+        cancel_login(&mut world, &shell, &mut app, &mut login_session);
+        assert!(login_session.is_none(), "session cleared");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("Login to Anthropic cancelled")),
+            "{:?}",
+            main_notices(&world)
+        );
     }
 
     /// Confirming session info opens a "Loading…" overlay and parks a
