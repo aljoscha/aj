@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 mod bubble;
 mod footer;
 mod interactive;
+mod overlay;
 mod pending;
 mod status;
 mod subagent_box;

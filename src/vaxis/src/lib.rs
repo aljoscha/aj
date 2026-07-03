@@ -17,6 +17,7 @@ pub mod ctlseqs;
 pub mod error;
 pub mod event;
 pub mod event_loop;
+pub mod fuzzy;
 pub mod grapheme_cache;
 pub mod gwidth;
 pub mod image;

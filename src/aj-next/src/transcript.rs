@@ -93,7 +93,7 @@ impl TranscriptStyles {
 }
 
 /// Map a theme palette value onto a vaxis color.
-fn vaxis_color(rgb: ThemeRgb) -> Color {
+pub(crate) fn vaxis_color(rgb: ThemeRgb) -> Color {
     match rgb {
         ThemeRgb::Rgb(r, g, b) => Color::Rgb([r, g, b]),
         ThemeRgb::Ansi256(i) => Color::Index(i),

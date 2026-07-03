@@ -10,6 +10,7 @@ base64 = { workspace = true }
 bitflags = { workspace = true }
 compact_str = { workspace = true }
 image = { workspace = true }
+nucleo-matcher = { workspace = true }
 phf = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

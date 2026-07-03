@@ -35,11 +35,16 @@ use vaxis::key::Modifiers;
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    AsyncApp, DrawContext, Event, EventContext, FlexColumn, FlexItem, Options, Surface, Text,
-    TextField, UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
+    AsyncApp, DrawContext, Event, EventContext, FilterableSelect, FlexColumn, FlexItem, MaxSize,
+    Options, OverlayWindow, RelativePoint, Size, SubSurface, Surface, Text, TextField, UserEvent,
+    Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
 use crate::footer::FooterLine;
+use crate::overlay::{
+    OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, Scrim, close_top,
+    placeholder_palette_items,
+};
 use crate::pending::PendingBox;
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::transcript::{TranscriptStyles, TranscriptView};
@@ -437,7 +442,8 @@ fn cancel_viewed_turn(world: &World) -> bool {
     false
 }
 
-/// The root widget: the base layout plus the editor submit plumbing.
+/// The root widget: the base layout, the editor submit plumbing, and the
+/// overlay stack drawn above everything while it is open.
 struct Shell {
     layout: WidgetRef,
     /// Typed handle to the editor so `Init` can focus it.
@@ -450,6 +456,18 @@ struct Shell {
     /// callback for the host loop to collect after dispatch. The
     /// callback can't spawn turns itself (it has no session access).
     submitted: Rc<RefCell<Option<String>>>,
+    /// The modal stack. Shared: overlay callbacks (confirm/cancel) mutate
+    /// it from inside dispatch while the Shell reads it at draw time.
+    overlays: Rc<RefCell<OverlayStack>>,
+    /// The scrim widget, kept across frames so its identity is stable for
+    /// hit-testing.
+    scrim: Rc<RefCell<Scrim>>,
+    /// Frame styles for overlay windows, resolved from the theme.
+    overlay_chrome: OverlayChrome,
+    /// Label of the palette row the user confirmed, parked by the palette's
+    /// `on_confirm` for the host loop to collect after dispatch (the same
+    /// slot pattern as `submitted`).
+    palette_selection: Rc<RefCell<Option<String>>>,
 }
 
 impl Shell {
@@ -500,12 +518,61 @@ impl Shell {
             editor,
             status_line,
             submitted,
+            overlays: Rc::new(RefCell::new(OverlayStack::default())),
+            scrim: Rc::new(RefCell::new(Scrim)),
+            overlay_chrome: OverlayChrome::from_theme(theme),
+            palette_selection: Rc::new(RefCell::new(None)),
         }
     }
 
     /// Collect a submit parked by the editor callback, if any.
     fn take_submitted(&self) -> Option<String> {
         self.submitted.borrow_mut().take()
+    }
+
+    /// Collect a palette confirmation parked by its callback, if any.
+    fn take_palette_selection(&self) -> Option<String> {
+        self.palette_selection.borrow_mut().take()
+    }
+
+    /// Opens the placeholder command palette (a small centered
+    /// filterable-select overlay) and moves focus into its filter field.
+    ///
+    /// The confirm/cancel callbacks capture shared handles instead of the
+    /// Shell itself: they run while an overlay widget is borrowed during
+    /// dispatch, so they must not re-enter the Shell. Confirm parks the
+    /// picked label in the selection slot for the host loop and closes;
+    /// cancel just closes. Both restore focus through `close_top`.
+    fn open_palette(&self, ctx: &mut EventContext) {
+        let select = Rc::new(RefCell::new(FilterableSelect::new(
+            placeholder_palette_items(),
+        )));
+        let focus = select.borrow().focus_target();
+        {
+            let mut select = select.borrow_mut();
+            let stack = Rc::clone(&self.overlays);
+            let editor: WidgetRef = to_widget_ref(Rc::clone(&self.editor));
+            let slot = Rc::clone(&self.palette_selection);
+            select.on_confirm = Some(Box::new(move |ctx, item| {
+                *slot.borrow_mut() = Some(item.label.trim().to_string());
+                close_top(&stack, ctx, &editor);
+            }));
+            let stack = Rc::clone(&self.overlays);
+            let editor: WidgetRef = to_widget_ref(Rc::clone(&self.editor));
+            select.on_cancel = Some(Box::new(move |ctx| close_top(&stack, ctx, &editor)));
+        }
+        let mut window = OverlayWindow::new("Commands", to_widget_ref(select));
+        window.subtitle = "Enter to confirm  \u{2022}  Esc to close".to_string();
+        window.border_style = self.overlay_chrome.border;
+        window.title_style = self.overlay_chrome.title;
+        window.subtitle_style = self.overlay_chrome.subtitle;
+        self.overlays.borrow_mut().push(OpenOverlay {
+            widget: to_widget_ref(Rc::new(RefCell::new(window))),
+            focus: Rc::clone(&focus),
+            placement: OverlayPlacement::Small,
+        });
+        ctx.request_focus(focus);
+        ctx.redraw = true;
     }
 }
 
@@ -514,8 +581,44 @@ impl Widget for Shell {
         // The caller's draw_widget re-stamps the returned surface with
         // the Shell's identity, replacing the column's. The column
         // takes no events, and the children (transcript, editor) keep
-        // their own identities for hit-testing.
-        draw_widget(&self.layout, ctx)
+        // their own identities for hit-testing. When the keymap
+        // controller lands as the root's wrapper, this surface becomes
+        // its child and the overlay children below stay descendants of
+        // the Shell's surface, so the composition is unchanged.
+        let mut surface = draw_widget(&self.layout, ctx);
+        let overlays = self.overlays.borrow();
+        if let Some(top) = overlays.top() {
+            let term = ctx.max.size();
+            // The scrim above the base layout (z 1), the top overlay above
+            // the scrim (z 2). Only the top of the stack is drawn: a pushed
+            // child hides its parent, the scrim provides the backdrop.
+            let scrim_ctx = ctx.with_constraints(
+                Size {
+                    width: 0,
+                    height: 0,
+                },
+                MaxSize::from_size(term),
+            );
+            surface.children.push(SubSurface {
+                origin: RelativePoint { row: 0, col: 0 },
+                surface: draw_widget(&to_widget_ref(Rc::clone(&self.scrim)), &scrim_ctx),
+                z_index: 1,
+            });
+            let (origin, size) = top.placement.resolve(term);
+            let overlay_ctx = ctx.with_constraints(
+                Size {
+                    width: 0,
+                    height: 0,
+                },
+                MaxSize::from_size(size),
+            );
+            surface.children.push(SubSurface {
+                origin,
+                surface: draw_widget(&top.widget, &overlay_ctx),
+                z_index: 2,
+            });
+        }
+        surface
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
@@ -525,6 +628,19 @@ impl Widget for Shell {
         // phase without consuming.
         if let Event::App(_) = event {
             self.status_line.borrow_mut().handle_event(ctx, event);
+        }
+        // TEMPORARY: the palette-open chord, hardcoded to ctrl+o, the
+        // default of `aj_app::keybindings::ACTION_PALETTE_OPEN`. The keymap
+        // controller that resolves configured bindings in this same
+        // capturing position replaces this in the next phase. Inert while
+        // an overlay is up, matching `aj`.
+        if let Event::KeyPress(key) = event
+            && key.matches(u32::from('o'), Modifiers::CTRL)
+        {
+            if !self.overlays.borrow().is_open() {
+                self.open_palette(ctx);
+            }
+            ctx.consume_and_redraw();
         }
     }
 
@@ -684,6 +800,13 @@ async fn drive(
                             if let Some(text) = shell.borrow().take_submitted() {
                                 handle_submit(world, text);
                             }
+                            // A confirmed palette row becomes a chat notice.
+                            // Placeholder effect: the real command dispatch
+                            // arrives with the selector port.
+                            if let Some(row) = shell.borrow().take_palette_selection() {
+                                fold_notice(world, &format!("{row} selected"));
+                                app.request_redraw();
+                            }
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -773,9 +896,9 @@ mod tests {
         )))
     }
 
-    fn test_shell() -> Rc<RefCell<Shell>> {
+    fn test_shell_with_chat(chat: Rc<RefCell<ChatState>>) -> Rc<RefCell<Shell>> {
         Rc::new(RefCell::new(Shell::new(
-            empty_chat(),
+            chat,
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
@@ -788,13 +911,19 @@ mod tests {
     /// pipe as the read source. Keep the returned writer alive or the
     /// reader sees EOF.
     async fn init_app() -> (AsyncApp, PipeWriter, Rc<RefCell<Shell>>, WidgetRef) {
+        init_app_with_chat(empty_chat()).await
+    }
+
+    async fn init_app_with_chat(
+        chat: Rc<RefCell<ChatState>>,
+    ) -> (AsyncApp, PipeWriter, Rc<RefCell<Shell>>, WidgetRef) {
         let (reader, mut writer) = std::io::pipe().expect("pipe");
         // Answer the DA1 probe up front so init's capability wait
         // returns as soon as the reader consumes the reply instead of
         // after its timeout.
         writer.write_all(b"\x1b[?c").expect("write DA1 reply");
 
-        let shell = test_shell();
+        let shell = test_shell_with_chat(chat);
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
         let mut app = AsyncApp::new(
             Vaxis::new(VaxisOptions::default()),
@@ -1204,5 +1333,309 @@ mod tests {
             &e.kind,
             EntryKind::Notice(n) if n.text == "Turn cancelled."
         )));
+    }
+
+    // ---- Overlay substrate ----
+
+    /// The TestTty geometry every overlay test runs against.
+    fn full_draw_ctx() -> DrawContext {
+        DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(80),
+                height: Some(40),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: vaxis::gwidth::Method::Unicode,
+        }
+    }
+
+    /// Composites a surface tree into plain text rows, blitting buffers
+    /// depth-first with children in ascending z order, the same order
+    /// `Surface::render` paints. Lets tests read "what's on screen"
+    /// without a terminal.
+    fn flatten(surface: &Surface) -> Vec<String> {
+        fn blit(surface: &Surface, row_off: i32, col_off: i32, grid: &mut [Vec<char>]) {
+            let width = usize::from(surface.size.width);
+            for (i, cell) in surface.buffer.iter().enumerate() {
+                let row = row_off + i32::try_from(i / width).expect("row fits i32");
+                let col = col_off + i32::try_from(i % width).expect("col fits i32");
+                let (Ok(row), Ok(col)) = (usize::try_from(row), usize::try_from(col)) else {
+                    continue;
+                };
+                if row >= grid.len() || col >= grid[row].len() {
+                    continue;
+                }
+                grid[row][col] = cell.char.grapheme().chars().next().unwrap_or(' ');
+            }
+            let mut order: Vec<&SubSurface> = surface.children.iter().collect();
+            order.sort_by_key(|child| child.z_index);
+            for child in order {
+                blit(
+                    &child.surface,
+                    row_off + child.origin.row,
+                    col_off + child.origin.col,
+                    grid,
+                );
+            }
+        }
+        let mut grid =
+            vec![vec![' '; usize::from(surface.size.width)]; usize::from(surface.size.height)];
+        blit(surface, 0, 0, &mut grid);
+        grid.into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect()
+    }
+
+    /// Fold `count` numbered notice rows into `chat` so the transcript
+    /// overflows the 40-row test viewport.
+    fn fold_lines(chat: &Rc<RefCell<ChatState>>, count: usize) {
+        let mut lifecycle = aj_app::session::AgentLifecycle::default();
+        for i in 0..count {
+            let _ = reduce(
+                &mut chat.borrow_mut(),
+                &mut lifecycle,
+                notice_event(&format!("line-{i:03}")),
+            );
+        }
+    }
+
+    fn wheel_up_at(row: i16, col: i16) -> Event {
+        Event::Mouse(vaxis::mouse::Mouse {
+            col,
+            row,
+            xoffset: 0,
+            yoffset: 0,
+            button: vaxis::mouse::Button::WheelUp,
+            mods: vaxis::mouse::Modifiers::empty(),
+            kind: vaxis::mouse::Type::Press,
+        })
+    }
+
+    /// The Shell's draw appends the scrim and the top overlay above the
+    /// base layout, in z order and at the ported placement, and the
+    /// deepest hit at base-layout coordinates is the scrim.
+    #[test]
+    fn overlay_draw_appends_scrim_and_overlay_above_the_base() {
+        use vaxis::vxfw::{Point, widget_eq};
+
+        let chat = empty_chat();
+        // Enough entries to fill the whole chat slot, so base content shows
+        // in the rows above the overlay box.
+        fold_lines(&chat, 40);
+        let shell = test_shell_with_chat(chat);
+        let ctx = full_draw_ctx();
+
+        // Before opening: the base content is visible.
+        let base = flatten(&shell.borrow_mut().draw(&ctx));
+        assert!(
+            base.iter().any(|row| row.contains("line-")),
+            "base rows visible before the overlay: {base:?}"
+        );
+
+        let mut ev_ctx = EventContext::new();
+        shell.borrow_mut().open_palette(&mut ev_ctx);
+        assert!(shell.borrow().overlays.borrow().is_open());
+
+        let surface = shell.borrow_mut().draw(&ctx);
+        let scrim = surface
+            .children
+            .iter()
+            .find(|c| c.z_index == 1)
+            .expect("scrim child at z 1");
+        assert_eq!(
+            scrim.surface.size,
+            Size {
+                width: 80,
+                height: 40
+            },
+            "scrim covers the viewport"
+        );
+        let scrim_widget = to_widget_ref(Rc::clone(&shell.borrow().scrim));
+        assert!(widget_eq(
+            scrim.surface.widget.as_ref().expect("scrim stamped"),
+            &scrim_widget,
+        ));
+        // The Small placement at 80x40: 75% width rounds to 60, below the
+        // 72-column floor, and 22 inner rows plus 4 chrome, centered.
+        let overlay = surface
+            .children
+            .iter()
+            .find(|c| c.z_index == 2)
+            .expect("overlay child at z 2");
+        assert_eq!(overlay.origin, RelativePoint { row: 7, col: 4 });
+        assert_eq!(
+            overlay.surface.size,
+            Size {
+                width: 72,
+                height: 26
+            }
+        );
+
+        // What's on screen: the chrome title where the overlay sits, and
+        // the base content still visible around the floating window (the
+        // scrim paints nothing). The overlay box starts at row 7, so the
+        // rows above it show the transcript.
+        let rows = flatten(&surface);
+        assert!(rows[7].contains(" Commands "), "title row: {:?}", rows[7]);
+        assert!(
+            rows[..7].iter().any(|row| row.contains("line-")),
+            "base content visible above the overlay: {:?}",
+            &rows[..7]
+        );
+
+        // A point in the base layout hit-tests to the scrim (topmost-last),
+        // so the scrim is the mouse target there.
+        let mut hits = Vec::new();
+        surface.hit_test(Point { row: 3, col: 3 }, &mut hits);
+        let deepest = hits.last().expect("hits at base coords");
+        assert!(widget_eq(&deepest.widget, &scrim_widget));
+
+        // A point on the overlay's filter row targets the overlay's own
+        // widgets, not the scrim.
+        let mut hits = Vec::new();
+        surface.hit_test(Point { row: 9, col: 10 }, &mut hits);
+        let deepest = hits.last().expect("hits at overlay coords");
+        assert!(!widget_eq(&deepest.widget, &scrim_widget));
+    }
+
+    /// Ctrl+O opens the palette and moves focus into its filter: keys
+    /// typed while it is open never reach the editor. Esc closes it and
+    /// returns focus, so the next key lands in the editor again.
+    #[tokio::test]
+    async fn ctrl_o_opens_the_palette_and_esc_returns_focus_to_the_editor() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(shell.borrow().overlays.borrow().is_open());
+        // The focus change lands on the dispatch path at the next layout.
+        app.render(&root).expect("render");
+
+        writer.write_all(b"q").expect("write key");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            0,
+            "typed key went to the palette filter, not the editor"
+        );
+
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(!shell.borrow().overlays.borrow().is_open(), "esc closes");
+        assert!(shell.borrow().take_palette_selection().is_none());
+        app.render(&root).expect("render");
+
+        writer.write_all(b"x").expect("write key");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            1,
+            "focus is back in the editor"
+        );
+    }
+
+    /// Typing narrows the palette rows and Enter confirms the highlighted
+    /// one: the selection is parked for the host loop, the overlay closes,
+    /// and focus returns to the editor.
+    #[tokio::test]
+    async fn palette_filter_narrows_and_enter_confirms() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+
+        // "quit" matches only the Quit row's `{category} {title}` filter
+        // key, so Enter must confirm it rather than the first catalog row.
+        writer.write_all(b"quit\r").expect("write query + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+
+        let selection = shell
+            .borrow()
+            .take_palette_selection()
+            .expect("confirm parked the row");
+        assert!(selection.contains("Quit"), "selection: {selection:?}");
+        assert!(!shell.borrow().overlays.borrow().is_open());
+        app.render(&root).expect("render");
+
+        writer.write_all(b"x").expect("write key");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            1,
+            "focus is back in the editor"
+        );
+    }
+
+    /// Control for the scrim test below: without an overlay, wheel-up at
+    /// transcript coordinates scrolls the transcript, so the tail line
+    /// leaves the viewport.
+    #[tokio::test]
+    async fn wheel_up_scrolls_the_transcript_without_an_overlay() {
+        let chat = empty_chat();
+        fold_lines(&chat, 80);
+        let (mut app, _writer, shell, _root) = init_app_with_chat(chat).await;
+
+        for _ in 0..2 {
+            app.handle_input(wheel_up_at(3, 3));
+        }
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        assert!(
+            !rows.iter().any(|row| row.contains("line-079")),
+            "tail scrolled out of view: {rows:?}"
+        );
+    }
+
+    /// With the palette open, the same wheel-up at transcript coordinates
+    /// targets the scrim, which consumes it: after closing the overlay the
+    /// transcript still shows its tail, untouched by the wheel.
+    ///
+    /// NOTE: only the at-target/bubble consumption is blocked. Base widgets
+    /// intersecting the point still observe the event in their capturing
+    /// phase before the scrim consumes it (see the `Scrim` docs), which is
+    /// why this asserts on the scroll position rather than follow-tail.
+    #[tokio::test]
+    async fn wheel_at_transcript_coords_is_blocked_while_the_palette_is_open() {
+        let chat = empty_chat();
+        fold_lines(&chat, 80);
+        let (mut app, mut writer, shell, root) = init_app_with_chat(chat).await;
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+
+        // (3, 3) is base-layout territory: outside the centered 72x26
+        // palette box, inside the transcript.
+        for _ in 0..2 {
+            app.handle_input(wheel_up_at(3, 3));
+        }
+
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(!shell.borrow().overlays.borrow().is_open());
+
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        assert!(
+            rows.iter().any(|row| row.contains("line-079")),
+            "tail still in view, the wheel never reached the list: {rows:?}"
+        );
     }
 }

@@ -191,10 +191,16 @@ layout-driven sizing, which is the natural vxfw model.
 `SubSurface`s and focus.
 
 **Drawing.** When the overlay stack is non-empty, the root draws, above the base
-layout, (1) a dim full-viewport scrim `SubSurface` and (2) the top overlay as a
-`SubSurface` at a higher `z_index`, positioned from its anchor. Only the top
-overlay is drawn, matching `aj`'s "push hides the parent" behavior, with the scrim
-providing the modal backdrop. Anchor and sizing port from `aj`'s `OverlayOptions`
+layout, (1) a full-viewport **transparent** scrim `SubSurface` and (2) the top
+overlay as a `SubSurface` at a higher `z_index`, positioned from its anchor. The
+scrim paints nothing (an empty-buffer surface blits no cells but still
+hit-tests), so the overlay window floats over the fully visible base layout,
+the same composition `aj` uses (it draws no backdrop either). Dimming the base
+is not expressible anyway: surfaces composite by opaque cell blits, and cells
+styled with default or indexed colors have no known RGB to scale. The scrim's
+job is purely behavioral, blocking mouse input from reaching the base layout.
+Only the top overlay is drawn, matching `aj`'s "push hides the parent" behavior.
+Anchor and sizing port from `aj`'s `OverlayOptions`
 (center anchor, width as a percentage with min/max, capped height) into a small
 placement config the root uses to compute the overlay's origin from the terminal
 size.

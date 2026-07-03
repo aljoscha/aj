@@ -53,11 +53,13 @@ mod async_app;
 mod border;
 mod button;
 mod center;
+mod filterable_select;
 mod flex_column;
 mod flex_row;
 mod keymap;
 mod list_view;
 mod loop_event;
+mod overlay_window;
 mod padding;
 mod rich_text;
 mod scroll_bars;
@@ -75,6 +77,7 @@ pub use crate::vxfw::async_app::{AsyncApp, Frame};
 pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
 pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
+pub use crate::vxfw::filterable_select::{FilterableSelect, SelectItem};
 pub use crate::vxfw::flex_column::FlexColumn;
 pub use crate::vxfw::flex_row::FlexRow;
 pub use crate::vxfw::keymap::{
@@ -82,6 +85,9 @@ pub use crate::vxfw::keymap::{
     SeqStep,
 };
 pub use crate::vxfw::list_view::{Builder, ListView, Source};
+pub use crate::vxfw::overlay_window::{
+    OVERLAY_WINDOW_CHROME_COLS, OVERLAY_WINDOW_CHROME_ROWS, OverlayWindow,
+};
 pub use crate::vxfw::padding::{PadValues, Padding};
 pub use crate::vxfw::rich_text::{RichText, TextSpan};
 pub use crate::vxfw::scroll_bars::{ScrollBars, ScrollableView};

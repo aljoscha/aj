@@ -388,6 +388,14 @@ impl FocusHandler {
         }
 
         self.path_to_focused.reverse();
+
+        // The focused widget can vanish from the tree (a host that pops a
+        // modal without moving focus, say). Fall back to a root-only path so
+        // the next key still dispatches to the root instead of panicking on
+        // an empty path in `handle_event`.
+        if self.path_to_focused.is_empty() {
+            self.path_to_focused.push(Rc::clone(&self.root));
+        }
     }
 
     /// Whether `surface` or one of its descendants is the focused widget,
@@ -500,10 +508,13 @@ mod tests {
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    use super::AppCore;
+    use super::{AppCore, FocusHandler};
     use crate::tty::TestTty;
     use crate::vaxis::{Options as VaxisOptions, Vaxis};
-    use crate::vxfw::{DrawContext, Event, EventContext, Phase, Surface, Tick, Widget, WidgetRef};
+    use crate::vxfw::{
+        DrawContext, Event, EventContext, MaxSize, Phase, Size, Surface, Tick, Widget, WidgetRef,
+        draw_widget, widget_eq,
+    };
 
     #[test]
     fn timer_consume_does_not_leak_to_the_next_event() {
@@ -546,5 +557,48 @@ mod tests {
         assert!(ctx.redraw);
         assert!(!ctx.consume_event);
         assert_eq!(ctx.phase, Phase::Capturing);
+    }
+
+    #[test]
+    fn focus_path_falls_back_to_root_when_the_focused_widget_vanishes() {
+        struct Blank;
+        impl Widget for Blank {
+            fn draw(&mut self, ctx: &DrawContext) -> Surface {
+                Surface::with_size(ctx.max.size())
+            }
+            fn wants_events(&self) -> bool {
+                true
+            }
+        }
+
+        let root: WidgetRef = Rc::new(RefCell::new(Blank));
+        let vanished: WidgetRef = Rc::new(RefCell::new(Blank));
+        let mut focus = FocusHandler::init(Rc::clone(&root));
+        focus.focused = vanished;
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(10),
+                height: Some(4),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: crate::gwidth::Method::Unicode,
+        };
+        // The focused widget never drew into the tree, so the rebuilt path
+        // must degrade to a root-only path rather than an empty one, which
+        // would panic on the next dispatch.
+        focus.update(&draw_widget(&root, &ctx));
+        assert_eq!(focus.path_to_focused.len(), 1);
+        assert!(widget_eq(&focus.path_to_focused[0], &root));
+
+        let mut ev_ctx = EventContext::new();
+        focus.handle_event(&mut ev_ctx, &Event::Tick);
     }
 }

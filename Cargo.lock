@@ -3381,6 +3381,7 @@ dependencies = [
  "ignore",
  "image",
  "nix",
+ "nucleo-matcher",
  "phf",
  "serial_test",
  "signal-hook",
