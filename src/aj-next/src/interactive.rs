@@ -14,36 +14,39 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use aj_agent::TurnError;
-use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
 use aj_agent::queue::MessageQueues;
 use aj_app::actions::AjAction;
 use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
-use aj_app::commands::load_model_catalog;
+use aj_app::commands::{CommandAction, load_model_catalog};
 use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionCore, SessionEntry, SessionSpec};
 use aj_app::session_setup::{RunConfigSnapshot, build_initial_run_config};
 use aj_app::shutdown::{format_resume_hint, format_usage_summary};
-use aj_app::theme::Theme;
+use aj_app::theme::{ColorMode, Theme, ThemeHandle, ThemeWatcherGuard, watch_user_theme};
 use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn, turn_policy};
 use aj_conf::{Config, ConfigDiagnostic, ConfigSpeed, Severity};
 use aj_models::auth::AuthStorage;
 use aj_models::types::Speed;
 use aj_session::{ConversationPersistence, ThreadFilter, replay};
 use anyhow::{Context, Result, anyhow};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    AsyncApp, DrawContext, Event, EventContext, FlexColumn, FlexItem, KeymapController, MaxSize,
-    Options, RelativePoint, Size, SubSurface, Surface, Text, TextField, UserEvent, Widget,
+    AsyncApp, DrawContext, Event, EventContext, FlexColumn, FlexItem, KeymapController, ListView,
+    MaxSize, Options, RelativePoint, Size, SubSurface, Surface, Text, TextField, UserEvent, Widget,
     WidgetRef, draw_widget, to_widget_ref,
 };
 
+use crate::content_overlay::{auth_rows, session_info_rows, set_rows, usage_rows};
 use crate::footer::FooterLine;
 use crate::keymap::{HostCtx, build_keymap};
-use crate::overlay::{OverlayChrome, OverlayStack, Scrim, open_palette};
+use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
+use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::transcript::{TranscriptStyles, TranscriptView};
@@ -72,6 +75,9 @@ struct World {
     /// set is exactly "agents this host is currently driving".
     turns: JoinSet<(AgentId, Result<(), TurnError>)>,
     turn_cancels: HashMap<AgentId, CancellationToken>,
+    /// Credential store, shared with the async read-only overlays (auth
+    /// status, usage) whose fetches run detached off the drive loop.
+    auth: AuthStorage,
 }
 
 /// Build the session world: run config, session core, and the chat
@@ -217,6 +223,7 @@ async fn build_world(
         run_config,
         turns: JoinSet::new(),
         turn_cancels: HashMap::new(),
+        auth: auth.clone(),
     })
 }
 
@@ -588,6 +595,173 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
     }
 }
 
+/// The notice `aj` folds when a command that needs an idle agent is
+/// chosen mid-turn.
+fn session_busy_notice(what: &str) -> String {
+    format!(
+        "Can't {what} while a turn is running \u{2014} press {} to cancel it first.",
+        fixed_keys::CTRL_C
+    )
+}
+
+/// Write rendered session HTML to `~/.aj/exports/aj-session-<id>.html`,
+/// creating the directory if needed. Returns the path written.
+///
+/// Exports live under the managed config dir rather than the working
+/// directory so an export from inside a git repo doesn't drop an
+/// untracked file into the user's tree. The notice reports the full path.
+fn write_session_export(session_id: &str, html: &str) -> Result<std::path::PathBuf> {
+    let dir = Config::get_config_dir()
+        .context("failed to resolve ~/.aj")?
+        .join("exports");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!("aj-session-{session_id}.html"));
+    std::fs::write(&path, html).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Apply a [`CommandAction`] the palette parked for the host loop.
+///
+/// The palette handles the overlay-opening commands (help, auth, session
+/// info, usage), `Quit`, and re-open itself in its confirm callback,
+/// where the live focus context is available. Only the commands that need
+/// the world (compact, export) or aren't wired yet reach here. Returns
+/// whether renderable state changed, so the caller can request one
+/// redraw.
+async fn apply_command_action(world: &mut World, action: CommandAction) -> bool {
+    match action {
+        CommandAction::Compact => {
+            // `/compact` runs as a tracked turn (it owns the turn
+            // machinery the palette confirm can't reach). Busy agents get
+            // the same notice `aj` folds rather than a silent no-op.
+            if world.turn_cancels.contains_key(&AgentId::Main)
+                || world.core.is_running(AgentId::Main)
+            {
+                fold_notice(world, &session_busy_notice("compact"));
+            } else {
+                let policy = turn_policy(AgentId::Main, &world.config);
+                spawn_turn(
+                    &world.core,
+                    &world.run_config,
+                    AgentId::Main,
+                    TurnStart::Compact {
+                        reason: CompactionReason::Manual,
+                        instructions: None,
+                    },
+                    policy,
+                    &mut world.turns,
+                    &mut world.turn_cancels,
+                );
+            }
+            true
+        }
+        CommandAction::ExportHtml => {
+            // Render under the log lock (read-only, so it can't deadlock a
+            // turn), then write with the guard already dropped. Both
+            // outcomes surface as a notice.
+            let html = aj_app::export::render_session_html(&*world.core.log.lock().await);
+            let notice = match write_session_export(&world.core.session_id, &html) {
+                Ok(path) => format!("Exported session to {}", aj_conf::display_path(&path)),
+                Err(e) => format!("Export failed: {e}"),
+            };
+            fold_notice(world, &notice);
+            true
+        }
+        // 8D-2 adds the model/thinking/settings/skills surfaces.
+        CommandAction::OpenModelSelector => {
+            fold_notice(world, "Model selection is not wired up yet.");
+            true
+        }
+        CommandAction::OpenThinkingSelector => {
+            fold_notice(world, "Thinking-level selection is not wired up yet.");
+            true
+        }
+        CommandAction::OpenSettings => {
+            fold_notice(world, "The settings window is not wired up yet.");
+            true
+        }
+        CommandAction::OpenProjectSettings => {
+            fold_notice(world, "The project settings window is not wired up yet.");
+            true
+        }
+        CommandAction::OpenSkills => {
+            fold_notice(world, "The skills window is not wired up yet.");
+            true
+        }
+        // 8D-3 adds the session/history/agent/login surfaces.
+        CommandAction::OpenSessionSelector => {
+            fold_notice(world, "Session switching is not wired up yet.");
+            true
+        }
+        CommandAction::NewSession => {
+            fold_notice(world, "Starting a new session is not wired up yet.");
+            true
+        }
+        CommandAction::OpenPromptHistory => {
+            fold_notice(world, "Prompt history search is not wired up yet.");
+            true
+        }
+        CommandAction::OpenAgentPicker => {
+            fold_notice(world, "The agent picker is not wired up yet.");
+            true
+        }
+        CommandAction::OpenLoginSelector => {
+            fold_notice(world, "Login is not wired up yet.");
+            true
+        }
+        CommandAction::OpenLogoutSelector => {
+            fold_notice(world, "Logout is not wired up yet.");
+            true
+        }
+        // Handled in the palette confirm (overlay openers, quit, re-open)
+        // or never a catalog command (`OpenTaskOutput`). Nothing to do.
+        CommandAction::Help
+        | CommandAction::OpenAuthStatus
+        | CommandAction::OpenUsageStatus
+        | CommandAction::OpenSessionInfo
+        | CommandAction::OpenCommandPalette
+        | CommandAction::Quit
+        | CommandAction::OpenTaskOutput { .. } => false,
+    }
+}
+
+/// Spawn the async fetch backing a read-only overlay, delivering its
+/// rendered rows back to the drive loop over `tx`.
+///
+/// The row list is `!Send`, so it stays with the caller (the drive loop
+/// remembers it and fills it when the result lands). Only the fetched
+/// data crosses the task boundary, all of which is `Send`.
+fn spawn_overlay_fetch(
+    world: &World,
+    kind: FetchKind,
+    tx: &UnboundedSender<(FetchKind, Vec<String>)>,
+) {
+    let tx = tx.clone();
+    match kind {
+        FetchKind::Auth => {
+            let auth = world.auth.clone();
+            tokio::spawn(async move {
+                let rows = auth_rows(&aj_app::auth::collect_statuses(&auth).await);
+                let _ = tx.send((FetchKind::Auth, rows));
+            });
+        }
+        FetchKind::Usage => {
+            let auth = world.auth.clone();
+            tokio::spawn(async move {
+                let rows = usage_rows(&aj_app::usage::collect_usage(&auth).await);
+                let _ = tx.send((FetchKind::Usage, rows));
+            });
+        }
+        FetchKind::SessionInfo => {
+            let log = Arc::clone(&world.core.log);
+            tokio::spawn(async move {
+                let stats = { log.lock().await.stats() };
+                let _ = tx.send((FetchKind::SessionInfo, session_info_rows(&stats)));
+            });
+        }
+    }
+}
+
 /// The root widget: the keymap controller wrapping the base layout, the
 /// editor submit plumbing, and the overlay stack drawn above everything
 /// while it is open.
@@ -621,10 +795,25 @@ struct Shell {
     /// The scrim widget, kept across frames so its identity is stable for
     /// hit-testing.
     scrim: Rc<RefCell<Scrim>>,
-    /// Label of the palette row the user confirmed, parked by the palette's
-    /// `on_confirm` for the host loop to collect after dispatch (the same
-    /// slot pattern as `submitted`).
-    palette_selection: Rc<RefCell<Option<String>>>,
+    /// A host-applied command parked by the palette's confirm (compact,
+    /// export, and the not-yet-wired selectors), collected after dispatch.
+    command_slot: Rc<RefCell<Option<CommandAction>>>,
+    /// A request to fill a just-opened async read-only overlay, parked by
+    /// the palette's confirm for the drive loop to fetch and deliver.
+    fetch_slot: Rc<RefCell<Option<PendingFetch>>>,
+    /// The live theme handle, read by [`Shell::restyle`] to rebuild every
+    /// style struct after a runtime swap. Shared with the drive loop,
+    /// which replaces it on a hot-reload.
+    theme: ThemeHandle,
+    /// Overlay frame styles, shared with the palette-open handler so a
+    /// theme swap re-tints overlays opened afterward. Rebuilt by
+    /// [`Shell::restyle`].
+    chrome: Rc<RefCell<OverlayChrome>>,
+    /// Typed handles to the palette-consuming widgets, kept so
+    /// [`Shell::restyle`] can push rebuilt styles into them.
+    transcript: Rc<RefCell<TranscriptView>>,
+    pending: Rc<RefCell<PendingBox>>,
+    footer: Rc<RefCell<FooterLine>>,
 }
 
 impl Shell {
@@ -632,7 +821,7 @@ impl Shell {
         chat: Rc<RefCell<ChatState>>,
         status: Rc<RefCell<StatusState>>,
         queues: MessageQueues,
-        theme: &Theme,
+        theme: ThemeHandle,
         header: String,
         cwd: String,
     ) -> Shell {
@@ -647,8 +836,15 @@ impl Shell {
                 *slot.borrow_mut() = Some(text.to_string());
             }));
         }
-        let styles = Rc::new(TranscriptStyles::from_theme(theme));
-        let transcript = Rc::new(RefCell::new(TranscriptView::new(Rc::clone(&chat), theme)));
+        // Resolve the initial styles and chrome from a single snapshot of
+        // the theme, then keep the handle for the runtime re-style path.
+        let (styles, transcript, chrome) = {
+            let t = theme.read();
+            let styles = Rc::new(TranscriptStyles::from_theme(&t));
+            let transcript = Rc::new(RefCell::new(TranscriptView::new(Rc::clone(&chat), &t)));
+            (styles, transcript, OverlayChrome::from_theme(&t))
+        };
+        let chrome = Rc::new(RefCell::new(chrome));
         let status_line = StatusLine::new(Rc::clone(&chat), Rc::clone(&status), Rc::clone(&styles));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
@@ -668,16 +864,17 @@ impl Shell {
         let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
             children: vec![
                 FlexItem::init(Rc::new(RefCell::new(Text::new(&header))), 0),
-                FlexItem::init(to_widget_ref(transcript), 1),
+                FlexItem::init(to_widget_ref(Rc::clone(&transcript)), 1),
                 FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
-                FlexItem::init(to_widget_ref(pending), 0),
+                FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
-                FlexItem::init(to_widget_ref(footer), 0),
+                FlexItem::init(to_widget_ref(Rc::clone(&footer)), 0),
             ],
         }));
 
         let overlays = Rc::new(RefCell::new(OverlayStack::default()));
-        let palette_selection: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let command_slot: Rc<RefCell<Option<CommandAction>>> = Rc::new(RefCell::new(None));
+        let fetch_slot: Rc<RefCell<Option<PendingFetch>>> = Rc::new(RefCell::new(None));
         let host_action: Rc<RefCell<Option<AjAction>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
@@ -693,8 +890,9 @@ impl Shell {
             let chat = Rc::clone(&chat);
             let overlays_for_actions = Rc::clone(&overlays);
             let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
-            let chrome = OverlayChrome::from_theme(theme);
-            let selection_slot = Rc::clone(&palette_selection);
+            let chrome_for_actions = Rc::clone(&chrome);
+            let command_slot_for_actions = Rc::clone(&command_slot);
+            let fetch_slot_for_actions = Rc::clone(&fetch_slot);
             let action_slot = Rc::clone(&host_action);
             Box::new(move |ctx, action| match action {
                 AjAction::ThinkingToggle => {
@@ -716,8 +914,9 @@ impl Shell {
                     open_palette(
                         &overlays_for_actions,
                         &editor_widget,
-                        &chrome,
-                        &selection_slot,
+                        &chrome_for_actions,
+                        &command_slot_for_actions,
+                        &fetch_slot_for_actions,
                         ctx,
                     );
                 }
@@ -749,7 +948,13 @@ impl Shell {
             host_action,
             overlays,
             scrim: Rc::new(RefCell::new(Scrim)),
-            palette_selection,
+            command_slot,
+            fetch_slot,
+            theme,
+            chrome,
+            transcript,
+            pending,
+            footer,
         }
     }
 
@@ -763,9 +968,30 @@ impl Shell {
         self.host_action.borrow_mut().take()
     }
 
-    /// Collect a palette confirmation parked by its callback, if any.
-    fn take_palette_selection(&self) -> Option<String> {
-        self.palette_selection.borrow_mut().take()
+    /// Collect a host-applied command parked by the palette, if any.
+    fn take_command(&self) -> Option<CommandAction> {
+        self.command_slot.borrow_mut().take()
+    }
+
+    /// Collect an async-overlay fetch request parked by the palette, if any.
+    fn take_fetch(&self) -> Option<PendingFetch> {
+        self.fetch_slot.borrow_mut().take()
+    }
+
+    /// Rebuild every style struct from the current theme, for a runtime
+    /// swap (hot-reload now, the settings theme row in 8D-2). Every
+    /// palette-consuming widget is rebuilt in place, so editor text and
+    /// transcript scroll survive the swap. Overlays opened after this
+    /// pick up the new chrome, an already-open overlay keeps its baked
+    /// styles until reopened.
+    fn restyle(&self) {
+        let t = self.theme.read();
+        let styles = Rc::new(TranscriptStyles::from_theme(&t));
+        self.transcript.borrow_mut().set_styles(Rc::clone(&styles));
+        self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
+        self.pending.borrow_mut().set_styles(Rc::clone(&styles));
+        self.footer.borrow_mut().set_styles(styles);
+        *self.chrome.borrow_mut() = OverlayChrome::from_theme(&t);
     }
 }
 
@@ -882,17 +1108,22 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut world = build_world(&args, config, &diagnostics, &auth, &persistence).await?;
 
-    // Full theming (config-selected themes, hot reload) is a later
-    // phase. The bundled dark palette at the detected color mode is
-    // the phase-6 default.
-    let theme = Theme::bundled_dark();
+    // Resolve the configured theme (default `light`, matching `aj`) and
+    // load it at the env-detected color mode. `AsyncApp::init` runs the
+    // async DA1 probe, so the true-color capability isn't known until
+    // after init; we reconcile the mode below once it is. Building the
+    // theme now with `ColorMode::detect` is the documented fallback for
+    // "theme built before init".
+    let theme_name = resolve_theme_name(world_config_theme(&world).as_deref()).to_string();
+    let env_mode = ColorMode::detect();
+    let theme = ThemeHandle::new(Theme::load_with_mode(&theme_name, env_mode));
     let header = format!("aj-next — {}", world.core.session_id);
     let cwd = format!("{}", world.core.env.working_directory.display());
     let shell = Rc::new(RefCell::new(Shell::new(
         Rc::clone(&world.chat),
         Rc::clone(&world.status),
         world.core.message_queues.clone(),
-        &theme,
+        theme.clone(),
         header,
         cwd,
     )));
@@ -903,9 +1134,31 @@ pub async fn run(args: Args) -> Result<()> {
     let mut app = AsyncApp::new(Vaxis::new(VaxisOptions::default()), Box::new(tty), reader);
     app.init(Rc::clone(&root), Options::default()).await?;
 
+    // Reconcile the color mode against the terminal's probed capability.
+    // A positive `caps.rgb` (the terminal affirmed truecolor during the
+    // init probe) upgrades an env guess of Color256, but a negative probe
+    // never downgrades the env guess: most terminals don't answer the
+    // truecolor query at all, and the env heuristic is the better signal
+    // for them. When the mode actually changes we reload the theme and
+    // re-style every widget through the same path a hot-reload uses.
+    let probed_mode = if app.vaxis().caps.rgb {
+        ColorMode::Truecolor
+    } else {
+        env_mode
+    };
+    if probed_mode != theme.color_mode() {
+        theme.replace(Theme::load_with_mode(&theme_name, probed_mode));
+        shell.borrow().restyle();
+        app.request_redraw();
+    }
+
+    // Hot-reload watcher for a user theme (bundled names have no on-disk
+    // source, so this is inert for `dark` / `light` with no override).
+    let theme_watch = ThemeWatch::install(&theme_name);
+
     // Restore the terminal even when the loop exits with a render
     // error, otherwise the user is left stuck on the alt screen.
-    let result = drive(&mut app, &root, &shell, &mut world).await;
+    let result = drive(&mut app, &root, &shell, &mut world, theme_watch).await;
 
     // Kill the background-task tree before tearing down turns, so
     // detached process groups are killed and reaped. Then wind down
@@ -920,14 +1173,71 @@ pub async fn run(args: Args) -> Result<()> {
     result
 }
 
-/// The host select loop: turn joins, agent events, terminal input, and
-/// widget timers. Later phases add their own arms (theme reloads, task
-/// wake triggers) to this exact select.
+/// The configured theme name, if any, from the world's config layer.
+fn world_config_theme(world: &World) -> Option<String> {
+    world
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .theme
+        .clone()
+}
+
+/// Resolve the startup theme name from `config.theme`. An unset key
+/// defaults to `light` (matching `aj`'s interactive default); an
+/// explicit name passes through. A failed load of that name is a
+/// separate concern handled by [`Theme::load_with_mode`], which falls
+/// back to the bundled `dark` palette.
+fn resolve_theme_name(configured: Option<&str>) -> &str {
+    configured.unwrap_or("light")
+}
+
+/// Owns the theme fs-watcher for the session: the notify guard (held
+/// for its `Drop`) plus the receiver the drive loop's reload arm polls.
+struct ThemeWatch {
+    /// Kept alive so the watcher runs; dropping it stops the watcher.
+    /// Never read.
+    _guard: Option<ThemeWatcherGuard>,
+    rx: Option<UnboundedReceiver<Theme>>,
+}
+
+impl ThemeWatch {
+    /// Install a watcher for `name`. Only user-supplied themes get one;
+    /// bundled `dark` / `light` palettes live in the binary with no
+    /// on-disk source. [`watch_user_theme`] short-circuits on a missing
+    /// file or an unavailable notify backend, leaving both fields `None`
+    /// so the reload arm is inert.
+    fn install(name: &str) -> ThemeWatch {
+        match watch_user_theme(name) {
+            Some((guard, rx)) => ThemeWatch {
+                _guard: Some(guard),
+                rx: Some(rx),
+            },
+            None => ThemeWatch {
+                _guard: None,
+                rx: None,
+            },
+        }
+    }
+}
+
+/// Pull one reparsed [`Theme`] off the watcher channel. When no watcher
+/// is active the future pends forever, so the `select!` arm is a no-op.
+async fn recv_theme(rx: Option<&mut UnboundedReceiver<Theme>>) -> Option<Theme> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The host select loop: turn joins, agent events, terminal input,
+/// widget timers, theme reloads, and async read-only overlay fills.
 async fn drive(
     app: &mut AsyncApp,
     root: &WidgetRef,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
+    mut theme_watch: ThemeWatch,
 ) -> Result<()> {
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
@@ -936,6 +1246,11 @@ async fn drive(
     // sequence is the ctrl+c ctrl+c quit chord, so a pending sequence
     // means the quit is armed and the arm notice folds once per arm.
     let mut quit_was_armed = false;
+    // Async read-only overlay fills. The list handle is `!Send`, so it
+    // stays here (paired with its `FetchKind`) while the detached fetch
+    // sends only the rendered rows back over the channel.
+    let (fetch_tx, mut fetch_rx) = unbounded_channel::<(FetchKind, Vec<String>)>();
+    let mut pending_fills: Vec<(FetchKind, Rc<RefCell<ListView>>)> = Vec::new();
     loop {
         // Compute the tick deadline before the select so no arm holds
         // a borrow of `app` another arm needs. The sleep expression is
@@ -964,6 +1279,38 @@ async fn drive(
                 }
             }
 
+            // --- Theme reload (fs-watcher) ---
+            // Coalesced re-parses of `~/.aj/themes/<name>.json` land
+            // here. Replacing the handle and re-styling rebuilds every
+            // widget's palette in place; a `None` means the watcher was
+            // torn down, so we stop polling to avoid spinning.
+            maybe_theme = recv_theme(theme_watch.rx.as_mut()) => {
+                match maybe_theme {
+                    Some(new_theme) => {
+                        let name = new_theme.name().to_string();
+                        {
+                            let shell = shell.borrow();
+                            shell.theme.replace(new_theme);
+                            shell.restyle();
+                        }
+                        fold_notice(world, &format!("Theme '{name}' reloaded."));
+                        app.request_redraw();
+                    }
+                    None => theme_watch.rx = None,
+                }
+            }
+
+            // --- Async read-only overlay fill ---
+            maybe_fill = fetch_rx.recv() => {
+                if let Some((kind, rows)) = maybe_fill
+                    && let Some(pos) = pending_fills.iter().position(|(k, _)| *k == kind)
+                {
+                    let (_, list) = pending_fills.remove(pos);
+                    set_rows(&list, rows);
+                    app.request_redraw();
+                }
+            }
+
             // --- Terminal input ---
             event = app.next_input() => {
                 match event {
@@ -984,12 +1331,21 @@ async fn drive(
                         {
                             app.request_redraw();
                         }
-                        // A confirmed palette row becomes a chat notice.
-                        // Placeholder effect: the real command dispatch
-                        // arrives with the selector port.
-                        if let Some(row) = shell.borrow().take_palette_selection() {
-                            fold_notice(world, &format!("{row} selected"));
+                        // A palette-confirmed command the host owns
+                        // (compact, export, the not-yet-wired selectors).
+                        // Bind the take out of the borrow first so no
+                        // RefCell ref is held across the await below.
+                        let command = shell.borrow().take_command();
+                        if let Some(action) = command
+                            && apply_command_action(world, action).await
+                        {
                             app.request_redraw();
+                        }
+                        // A just-opened async read-only overlay: kick off
+                        // its fetch and remember the list to fill.
+                        if let Some(fetch) = shell.borrow().take_fetch() {
+                            spawn_overlay_fetch(world, fetch.kind, &fetch_tx);
+                            pending_fills.push((fetch.kind, fetch.list));
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -1096,7 +1452,9 @@ mod tests {
             chat,
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
-            &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(
+                aj_app::theme::ColorMode::Truecolor,
+            )),
             "aj-next".to_string(),
             "/tmp".to_string(),
         )))
@@ -1739,7 +2097,9 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
-            &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(
+                aj_app::theme::ColorMode::Truecolor,
+            )),
             "aj-next".to_string(),
             "/tmp".to_string(),
         )));
@@ -2052,14 +2412,12 @@ mod tests {
         {
             let shell = shell.borrow();
             let editor: WidgetRef = to_widget_ref(Rc::clone(&shell.editor));
-            let chrome = OverlayChrome::from_theme(&Theme::bundled_dark_with_mode(
-                aj_app::theme::ColorMode::Truecolor,
-            ));
             open_palette(
                 &shell.overlays,
                 &editor,
-                &chrome,
-                &shell.palette_selection,
+                &shell.chrome,
+                &shell.command_slot,
+                &shell.fetch_slot,
                 &mut ev_ctx,
             );
         }
@@ -2164,7 +2522,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert!(!shell.borrow().overlays.borrow().is_open(), "esc closes");
-        assert!(shell.borrow().take_palette_selection().is_none());
+        assert!(shell.borrow().take_command().is_none());
         app.render(&root).expect("render");
 
         writer.write_all(b"x").expect("write key");
@@ -2178,8 +2536,8 @@ mod tests {
     }
 
     /// Typing narrows the palette rows and Enter confirms the highlighted
-    /// one: the selection is parked for the host loop, the overlay closes,
-    /// and focus returns to the editor.
+    /// one. Confirming a host-applied command (compact) parks its action
+    /// for the drive loop, closes the overlay, and returns focus.
     #[tokio::test]
     async fn palette_filter_narrows_and_enter_confirms() {
         let (mut app, mut writer, shell, root) = init_app().await;
@@ -2189,19 +2547,19 @@ mod tests {
         app.handle_input(event);
         app.render(&root).expect("render");
 
-        // "quit" matches only the Quit row's `{category} {title}` filter
-        // key, so Enter must confirm it rather than the first catalog row.
-        writer.write_all(b"quit\r").expect("write query + enter");
-        for _ in 0..5 {
+        // "compact" matches only the compact row's `{category} {title}`
+        // filter key, so Enter confirms it rather than the first row.
+        writer.write_all(b"compact\r").expect("write query + enter");
+        for _ in 0..8 {
             let event = app.next_input().await.expect("input event");
             app.handle_input(event);
         }
 
-        let selection = shell
+        let action = shell
             .borrow()
-            .take_palette_selection()
-            .expect("confirm parked the row");
-        assert!(selection.contains("Quit"), "selection: {selection:?}");
+            .take_command()
+            .expect("confirm parked a host command");
+        assert_eq!(action, CommandAction::Compact, "confirmed the compact row");
         assert!(!shell.borrow().overlays.borrow().is_open());
         app.render(&root).expect("render");
 
@@ -2213,6 +2571,255 @@ mod tests {
             1,
             "focus is back in the editor"
         );
+    }
+
+    /// Confirming Help from the palette opens the help overlay on top of
+    /// the palette (chaining): Esc returns to the palette, a second Esc
+    /// returns to the editor.
+    #[tokio::test]
+    async fn palette_help_chains_and_esc_walks_back_to_the_editor() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "palette open");
+
+        // Filter to "help" and confirm: the help overlay pushes on top of
+        // the palette, which stays underneath.
+        writer.write_all(b"help\r").expect("write query + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            2,
+            "help pushed over the palette"
+        );
+        assert!(
+            shell.borrow().take_command().is_none(),
+            "an overlay-opening command is not parked for the host"
+        );
+        app.render(&root).expect("render");
+
+        // Esc closes the help overlay back to the palette.
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "esc returned to the palette"
+        );
+        app.render(&root).expect("render");
+
+        // Esc closes the palette back to the editor.
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(!shell.borrow().overlays.borrow().is_open(), "editor again");
+        app.render(&root).expect("render");
+        writer.write_all(b"x").expect("write key");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            1,
+            "focus is back in the editor"
+        );
+    }
+
+    /// The help overlay renders shortcuts resolved from the keybinding
+    /// data: the palette-open row shows the resolved chord, not a literal.
+    #[tokio::test]
+    async fn palette_help_renders_resolved_shortcuts() {
+        use vaxis::vxfw::MaxSize;
+
+        let (mut app, mut writer, shell, root) = init_app().await;
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        writer.write_all(b"help\r").expect("write query + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        app.render(&root).expect("render");
+
+        // Draw the whole shell and read the help overlay's rows.
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(120),
+                height: Some(40),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: vaxis::gwidth::Method::Unicode,
+        };
+        let rows = flatten(&shell.borrow_mut().draw(&ctx)).join("\n");
+        let resolved =
+            aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
+                .expect("palette-open has a default chord");
+        assert!(
+            rows.contains(&resolved),
+            "help overlay shows the resolved shortcut {resolved:?}: {rows}"
+        );
+    }
+
+    /// Confirming Quit from the palette quits the app: the dispatch sets
+    /// the quit flag on the confirming keystroke.
+    #[tokio::test]
+    async fn palette_quit_quits() {
+        let (mut app, mut writer, _shell, root) = init_app().await;
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+
+        // "quit" narrows to the quit row; Enter confirms it.
+        writer.write_all(b"quit").expect("write query");
+        for _ in 0..4 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        writer.write_all(b"\r").expect("write enter");
+        let event = app.next_input().await.expect("input event");
+        assert!(app.handle_input(event).quit, "confirming quit quits");
+    }
+
+    /// The not-yet-wired commands fold a "not wired up yet" notice rather
+    /// than silently doing nothing.
+    #[tokio::test]
+    async fn deferred_commands_fold_a_notice() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+
+        assert!(apply_command_action(&mut world, CommandAction::OpenModelSelector).await);
+        assert!(apply_command_action(&mut world, CommandAction::OpenSessionSelector).await);
+        let notices: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Notice(n) => Some(n.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("Model selection")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("Session switching")),
+            "{notices:?}"
+        );
+    }
+
+    /// Confirming session info opens a "Loading…" overlay and parks a
+    /// fetch; filling it (what the host does after the async lookup)
+    /// replaces the body with the resolved content.
+    #[tokio::test]
+    async fn palette_session_info_opens_loading_then_fills() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        // Render so the palette's focus request lands before we type.
+        app.render(&root).expect("render");
+        writer.write_all(b"info\r").expect("write query + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            2,
+            "info overlay open"
+        );
+        let fetch = shell
+            .borrow()
+            .take_fetch()
+            .expect("session info parked an async fetch");
+        assert_eq!(fetch.kind, FetchKind::SessionInfo);
+        app.render(&root).expect("render");
+        let loading = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(loading.contains("Loading"), "loading state: {loading}");
+
+        // Fill the overlay the way the drive loop does once the fetch
+        // returns.
+        crate::content_overlay::set_rows(&fetch.list, vec!["id  session-xyz".to_string()]);
+        let filled = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(filled.contains("session-xyz"), "filled state: {filled}");
+        assert!(!filled.contains("Loading"), "loading replaced: {filled}");
+    }
+
+    /// The theme name resolves from config, defaulting to `light` like
+    /// `aj` and passing an explicit name (bundled or user) through.
+    #[test]
+    fn resolve_theme_name_defaults_to_light() {
+        assert_eq!(resolve_theme_name(None), "light");
+        assert_eq!(resolve_theme_name(Some("dark")), "dark");
+        assert_eq!(resolve_theme_name(Some("solarized")), "solarized");
+    }
+
+    /// A theme swap followed by `restyle` rebuilds the resolved styles:
+    /// the overlay chrome and a widget's drawn colors change from the dark
+    /// palette to the light one.
+    #[test]
+    fn theme_swap_restyles_chrome_and_widgets() {
+        let theme = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
+        let shell = Rc::new(RefCell::new(Shell::new(
+            empty_chat(),
+            Rc::new(RefCell::new(StatusState::default())),
+            MessageQueues::default(),
+            theme.clone(),
+            "aj-next".to_string(),
+            "/tmp/project".to_string(),
+        )));
+
+        let dark_border = shell.borrow().chrome.borrow().border;
+        let dark_title = shell.borrow().chrome.borrow().title;
+        let dark_footer = footer_fg_colors(&shell);
+
+        theme.replace(Theme::bundled_light_with_mode(ColorMode::Truecolor));
+        shell.borrow().restyle();
+
+        let light_border = shell.borrow().chrome.borrow().border;
+        let light_title = shell.borrow().chrome.borrow().title;
+        let light_footer = footer_fg_colors(&shell);
+
+        assert_ne!(dark_border, light_border, "overlay border re-resolved");
+        assert_ne!(dark_title, light_title, "overlay title re-resolved");
+        assert_ne!(
+            dark_footer, light_footer,
+            "the footer widget's drawn colors changed with the theme"
+        );
+    }
+
+    /// The set of foreground colors the footer widget draws, for the
+    /// re-style assertion above.
+    fn footer_fg_colors(shell: &Rc<RefCell<Shell>>) -> Vec<vaxis::cell::Color> {
+        let footer = Rc::clone(&shell.borrow().footer);
+        let surface = footer
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(80, None));
+        crate::test_support::flatten(&surface)
+            .into_iter()
+            .flatten()
+            .filter(|c| !c.char.grapheme().trim().is_empty())
+            .map(|c| c.style.fg)
+            .collect()
     }
 
     /// Control for the scrim test below: without an overlay, wheel-up at

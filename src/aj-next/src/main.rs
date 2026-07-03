@@ -12,10 +12,12 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod bubble;
+mod content_overlay;
 mod footer;
 mod interactive;
 mod keymap;
 mod overlay;
+mod palette;
 mod pending;
 mod status;
 mod subagent_box;

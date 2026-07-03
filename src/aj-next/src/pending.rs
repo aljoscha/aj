@@ -64,6 +64,11 @@ impl PendingBox {
         }
     }
 
+    /// Replace the palette styles, for a runtime theme swap.
+    pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>) {
+        self.styles = styles;
+    }
+
     /// Hint spans describing the pending message's kind and the
     /// gestures that act on it, mirroring `aj`'s wording.
     fn hint(&self, kind: PendingKind) -> Vec<TextSpan> {

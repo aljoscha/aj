@@ -95,6 +95,11 @@ impl StatusLine {
         })
     }
 
+    /// Replace the palette styles, for a runtime theme swap.
+    pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>) {
+        self.styles = styles;
+    }
+
     /// The loader message for the current activity. Compaction labels
     /// win over the default because a compacting agent may also be
     /// mid-turn (auto-compaction runs inside the turn ladder).

@@ -48,6 +48,11 @@ impl FooterLine {
             cwd,
         }
     }
+
+    /// Replace the palette styles, for a runtime theme swap.
+    pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>) {
+        self.styles = styles;
+    }
 }
 
 impl Widget for FooterLine {

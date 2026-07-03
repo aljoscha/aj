@@ -15,6 +15,7 @@ aj-models = { path = "../aj-models/" }
 aj-session = { path = "../aj-session/" }
 aj-tools = { path = "../aj-tools/" }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }
 serde_json = { workspace = true }

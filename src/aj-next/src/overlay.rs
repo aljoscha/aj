@@ -18,8 +18,7 @@ use std::rc::Rc;
 use aj_app::theme::{Theme, ThemeColor};
 use vaxis::cell::Style;
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, Size,
-    Surface, Widget, WidgetRef,
+    DrawContext, Event, EventContext, RelativePoint, Size, Surface, Widget, WidgetRef,
 };
 
 use crate::transcript::vaxis_color;
@@ -49,13 +48,10 @@ pub(crate) enum OverlayPlacement {
     /// stretch uncomfortably wide on large monitors, at a fixed height of
     /// 22 inner rows plus chrome.
     Small,
-    /// The content-heavy overlays (session switcher, prompt history):
-    /// centered, ~85% of the terminal width clamped to [72, 120] columns,
-    /// with inner rows at ~80% of the terminal height minus chrome, clamped
-    /// to [14, 32].
-    // No overlay uses this placement yet (the selectors that need it are
-    // the next port); the geometry is exercised by tests below.
-    #[allow(dead_code)]
+    /// The content-heavy overlays (help, auth status, session info,
+    /// usage): centered, ~85% of the terminal width clamped to
+    /// [72, 120] columns, with inner rows at ~80% of the terminal
+    /// height minus chrome, clamped to [14, 32].
     Large,
 }
 
@@ -123,6 +119,13 @@ pub(crate) struct OverlayStack {
 impl OverlayStack {
     pub(crate) fn is_open(&self) -> bool {
         !self.levels.is_empty()
+    }
+
+    /// Number of overlays currently stacked. Used by tests to assert the
+    /// chaining depth (palette plus a child it opened).
+    #[cfg(test)]
+    pub(crate) fn depth(&self) -> usize {
+        self.levels.len()
     }
 
     /// The overlay currently drawn and focused.
@@ -208,8 +211,9 @@ pub(crate) struct OverlayChrome {
 
 impl OverlayChrome {
     pub(crate) fn from_theme(theme: &Theme) -> OverlayChrome {
+        let mode = theme.color_mode();
         let fg = |token: ThemeColor| Style {
-            fg: vaxis_color(theme.fg_color(token)),
+            fg: vaxis_color(theme.fg_color(token), mode),
             ..Style::default()
         };
         OverlayChrome {
@@ -234,87 +238,6 @@ pub(crate) fn close_top(
     let parent_focus = stack.borrow_mut().back();
     ctx.request_focus(parent_focus.unwrap_or_else(|| Rc::clone(fallback)));
     ctx.redraw = true;
-}
-
-/// Opens the placeholder command palette (a small centered
-/// filterable-select overlay) on `stack` and moves focus into its filter
-/// field.
-///
-/// The confirm/cancel callbacks capture the shared handles, not the widget
-/// that opened the palette: they run while an overlay widget is borrowed
-/// during dispatch, so they must not re-enter it. Confirm parks the picked
-/// label in `selection_slot` for the host loop and closes. Cancel just
-/// closes. Both restore focus through [`close_top`], with `editor` as the
-/// stack-empty fallback.
-pub(crate) fn open_palette(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    selection_slot: &Rc<RefCell<Option<String>>>,
-    ctx: &mut EventContext,
-) {
-    let select = Rc::new(RefCell::new(FilterableSelect::new(
-        placeholder_palette_items(),
-    )));
-    let focus = select.borrow().focus_target();
-    {
-        let mut select = select.borrow_mut();
-        let stack_for_confirm = Rc::clone(stack);
-        let editor_for_confirm = Rc::clone(editor);
-        let slot = Rc::clone(selection_slot);
-        select.on_confirm = Some(Box::new(move |ctx, item| {
-            *slot.borrow_mut() = Some(item.label.trim().to_string());
-            close_top(&stack_for_confirm, ctx, &editor_for_confirm);
-        }));
-        let stack_for_cancel = Rc::clone(stack);
-        let editor_for_cancel = Rc::clone(editor);
-        select.on_cancel = Some(Box::new(move |ctx| {
-            close_top(&stack_for_cancel, ctx, &editor_for_cancel)
-        }));
-    }
-    let mut window = OverlayWindow::new("Commands", vaxis::vxfw::to_widget_ref(select));
-    // TODO(aljoscha): resolve the subtitle labels through the keybinding
-    // data instead of hardcoding them (Spec F's hint-label rule). `aj`'s
-    // `subtitle_confirm_close` resolves `tui.input.submit` /
-    // `tui.select.cancel` / close-all, but that vocabulary only arrives
-    // with the real selector port that replaces this placeholder palette.
-    window.subtitle = "Enter to confirm  \u{2022}  Esc to close".to_string();
-    window.border_style = chrome.border;
-    window.title_style = chrome.title;
-    window.subtitle_style = chrome.subtitle;
-    stack.borrow_mut().push(OpenOverlay {
-        widget: vaxis::vxfw::to_widget_ref(Rc::new(RefCell::new(window))),
-        focus: Rc::clone(&focus),
-        placement: OverlayPlacement::Small,
-    });
-    ctx.request_focus(focus);
-    ctx.redraw = true;
-}
-
-/// Placeholder rows for the proof-of-mechanism palette. The real command
-/// catalog (and its dispatch) arrives with the selector port. These only
-/// exercise the overlay stack end to end.
-///
-/// Row shape mirrors the real palette: the display label is the stable
-/// `{category}  {title}` columns, the filter key is `{category} {title}` so
-/// typing a category surfaces its whole group.
-pub(crate) fn placeholder_palette_items() -> Vec<vaxis::vxfw::SelectItem> {
-    [
-        ("model", "Switch model"),
-        ("model", "Set thinking level"),
-        ("session", "Switch session"),
-        ("session", "Compact conversation"),
-        ("help", "Show help"),
-        ("app", "Quit"),
-    ]
-    .into_iter()
-    .map(|(category, title)| {
-        vaxis::vxfw::SelectItem::new(
-            format!("{category:<10} {title}"),
-            format!("{category} {title}"),
-        )
-    })
-    .collect()
 }
 
 #[cfg(test)]

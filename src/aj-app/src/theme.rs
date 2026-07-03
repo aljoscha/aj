@@ -428,6 +428,114 @@ impl ColorMode {
 // Color-space helpers
 // ============================================================================
 
+/// The xterm 6x6x6 color cube channel values.
+const CUBE_VALUES: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// The xterm 24-step grayscale ramp values (palette indices
+/// 232..=255). Computed as `8 + i * 10` per the ramp definition.
+fn gray_values() -> [u8; 24] {
+    let mut out = [0u8; 24];
+    let mut i: u8 = 0;
+    while i < 24 {
+        out[usize::from(i)] = 8 + i * 10;
+        i += 1;
+    }
+    out
+}
+
+fn closest_cube_index(value: u8) -> usize {
+    let mut min_dist = u32::MAX;
+    let mut min_idx = 0usize;
+    for (i, &v) in CUBE_VALUES.iter().enumerate() {
+        let dist = u32::from(value).abs_diff(u32::from(v));
+        if dist < min_dist {
+            min_dist = dist;
+            min_idx = i;
+        }
+    }
+    min_idx
+}
+
+fn closest_gray_index(value: u8) -> usize {
+    let grays = gray_values();
+    let mut min_dist = u32::MAX;
+    let mut min_idx = 0usize;
+    for (i, &v) in grays.iter().enumerate() {
+        let dist = u32::from(value).abs_diff(u32::from(v));
+        if dist < min_dist {
+            min_dist = dist;
+            min_idx = i;
+        }
+    }
+    min_idx
+}
+
+fn color_distance(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
+    // Weighted squared distance with BT.601 luma coefficients
+    // (0.299/0.587/0.114), scaled by 1000 to stay in integer math.
+    // We only care about the order of distances, not their absolute
+    // values, so the scaling factor cancels out.
+    //
+    // Worst-case input is `dr = 255`, so `dr*dr = 65_025`, weighted by
+    // 587 yields ~38M. Summing three weighted terms stays well under
+    // u32::MAX.
+    let dr = u32::from(r1).abs_diff(u32::from(r2));
+    let dg = u32::from(g1).abs_diff(u32::from(g2));
+    let db = u32::from(b1).abs_diff(u32::from(b2));
+    dr * dr * 299 + dg * dg * 587 + db * db * 114
+}
+
+/// Map a 24-bit RGB triple onto the closest entry in the xterm
+/// 256-color palette.
+///
+/// The 6x6x6 cube wins for any non-neutral hue. The 24-step grayscale
+/// ramp wins only when the color is nearly desaturated (max-min channel
+/// spread < 10) and the grayscale entry is empirically closer than the
+/// cube pick, so a deliberate cyan or red tint isn't flattened to gray
+/// on limited terminals.
+///
+/// This lives here rather than in a frontend because both the `aj`
+/// (ANSI-SGR) and `aj-next` (vaxis) renderers downsample the same
+/// palette, and the mapping must agree between them. It depends only on
+/// std, so it doesn't pull a TUI backend into `aj-app`.
+pub fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    let ri = closest_cube_index(r);
+    let gi = closest_cube_index(g);
+    let bi = closest_cube_index(b);
+    let cube_r = CUBE_VALUES[ri];
+    let cube_g = CUBE_VALUES[gi];
+    let cube_b = CUBE_VALUES[bi];
+    let cube_index =
+        u8::try_from(16 + 36 * ri + 6 * gi + bi).expect("6x6x6 cube indices stay within u8 range");
+    let cube_dist = color_distance(r, g, b, cube_r, cube_g, cube_b);
+
+    // Compute luma in integer arithmetic: BT.601 coefficients are
+    // 0.299/0.587/0.114, scaling by 1000 keeps three decimals of
+    // precision without touching floats. The max possible sum is
+    // 255*1000, which fits in u32 with room to spare.
+    let luma_scaled = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
+    // Round-to-nearest by adding half the divisor before dividing.
+    let gray_u32 = (luma_scaled + 500) / 1000;
+    // `gray_u32` is at most ((255*1000)+500)/1000 = 255, so this
+    // try_from never fails, `.unwrap_or(255)` is defensive only.
+    let gray_clamped = u8::try_from(gray_u32).unwrap_or(255);
+    let grays = gray_values();
+    let gi_ramp = closest_gray_index(gray_clamped);
+    let gray_value = grays[gi_ramp];
+    let gray_index = u8::try_from(232 + gi_ramp).expect("grayscale indices fit in u8");
+    let gray_dist = color_distance(r, g, b, gray_value, gray_value, gray_value);
+
+    let max_c = r.max(g).max(b);
+    let min_c = r.min(g).min(b);
+    let spread = max_c.saturating_sub(min_c);
+
+    if spread < 10 && gray_dist < cube_dist {
+        gray_index
+    } else {
+        cube_index
+    }
+}
+
 fn hex_to_rgb(hex: &str) -> Result<(u8, u8, u8), ThemeError> {
     let cleaned = hex.strip_prefix('#').unwrap_or(hex);
     if cleaned.len() != 6 {
@@ -610,11 +718,20 @@ impl Theme {
     /// back to the bundled `dark` palette so the binary always
     /// comes up with a working theme.
     pub fn load(name: &str) -> Theme {
-        match Self::load_strict(name) {
+        Self::load_with_mode(name, ColorMode::detect())
+    }
+
+    /// Like [`Theme::load`] but with an explicit [`ColorMode`]. A
+    /// frontend that resolves the terminal's true-color capability
+    /// after startup (e.g. from an async DA1 probe) uses this to load
+    /// the palette at the detected boundary instead of the env-based
+    /// [`ColorMode::detect`] guess.
+    pub fn load_with_mode(name: &str, mode: ColorMode) -> Theme {
+        match Self::load_strict_with_mode(name, mode) {
             Ok(theme) => theme,
             Err(err) => {
                 tracing::warn!("failed to load theme '{name}': {err}; falling back to dark");
-                Self::bundled_dark()
+                Self::bundled_dark_with_mode(mode)
             }
         }
     }
@@ -624,6 +741,11 @@ impl Theme {
     /// noisily; production code uses [`Theme::load`] for
     /// resilience.
     pub fn load_strict(name: &str) -> Result<Theme, ThemeError> {
+        Self::load_strict_with_mode(name, ColorMode::detect())
+    }
+
+    /// Like [`Theme::load_strict`] but with an explicit [`ColorMode`].
+    pub fn load_strict_with_mode(name: &str, mode: ColorMode) -> Result<Theme, ThemeError> {
         // User dir wins so a user can override the bundled themes
         // by name. We still need to fail open: a missing user
         // file falls through to the bundled catalog.
@@ -632,11 +754,11 @@ impl Theme {
         {
             let content =
                 fs::read_to_string(&path).map_err(|e| ThemeError::ReadError(path.clone(), e))?;
-            return Self::from_json(&path.display().to_string(), &content);
+            return Self::from_json_with_mode(&path.display().to_string(), &content, mode);
         }
         match name {
-            "dark" => Self::from_json("dark (bundled)", DARK_THEME_JSON),
-            "light" => Self::from_json("light (bundled)", LIGHT_THEME_JSON),
+            "dark" => Self::from_json_with_mode("dark (bundled)", DARK_THEME_JSON, mode),
+            "light" => Self::from_json_with_mode("light (bundled)", LIGHT_THEME_JSON, mode),
             other => Err(ThemeError::NotFound(other.to_string())),
         }
     }
@@ -1040,6 +1162,26 @@ mod tests {
         let names = Theme::available();
         assert!(names.contains(&"dark".to_string()));
         assert!(names.contains(&"light".to_string()));
+    }
+
+    // ------------------------------------------------------------
+    // rgb_to_256 downsampling
+    // ------------------------------------------------------------
+
+    #[test]
+    fn rgb_to_256_keeps_saturated_colors_in_cube() {
+        // A saturated cyan maps into the 6x6x6 cube (indices 16..=231),
+        // never the grayscale ramp.
+        let idx = rgb_to_256(0x00, 0xd7, 0xff);
+        assert!((16..=231).contains(&idx), "cyan mapped to {idx}");
+    }
+
+    #[test]
+    fn rgb_to_256_uses_grayscale_for_neutral_colors() {
+        // A near-neutral mid-gray maps into the grayscale ramp
+        // (232..=255), which tracks luma more finely than the cube.
+        let idx = rgb_to_256(128, 128, 128);
+        assert!((232..=255).contains(&idx), "gray mapped to {idx}");
     }
 
     // ------------------------------------------------------------

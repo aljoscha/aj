@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use aj_app::chat::{ChatState, Entry, EntryKind, NoticeLevel, UserEntry};
 use aj_app::footer::format_tokens;
-use aj_app::theme::{Theme, ThemeBg, ThemeColor, ThemeRgb};
+use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256};
 use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
 use vaxis::cell::{Cell, Character, Color, Style};
@@ -30,10 +30,12 @@ use crate::tool_cell::{EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint}
 /// status chrome (loader, footer, pending box) shares the same
 /// palette, so its widgets hold a clone too.
 ///
-/// Resolved once from the theme at construction. The theme's
-/// `ColorMode` (truecolor vs 256-color downsampling) is not applied
-/// yet, we hand the raw palette values to the terminal. Full theming
-/// including downsampling is a later phase.
+/// Resolved once from the theme at construction. `Rgb` values are
+/// downsampled to the 256-color palette when the theme's
+/// [`ColorMode`] is `Color256` (vaxis emits RGB SGR unconditionally
+/// and never downsamples, so the frontend does it here). A theme swap
+/// rebuilds the whole struct, see [`TranscriptView::set_styles`] and
+/// the shell's re-style path.
 pub(crate) struct TranscriptStyles {
     pub(crate) text: Style,
     pub(crate) user: Style,
@@ -60,11 +62,12 @@ pub(crate) struct TranscriptStyles {
 
 impl TranscriptStyles {
     pub(crate) fn from_theme(theme: &Theme) -> TranscriptStyles {
+        let mode = theme.color_mode();
         let fg = |token: ThemeColor| Style {
-            fg: vaxis_color(theme.fg_color(token)),
+            fg: vaxis_color(theme.fg_color(token), mode),
             ..Style::default()
         };
-        let bg = |token: ThemeBg| vaxis_color(theme.bg_color(token));
+        let bg = |token: ThemeBg| vaxis_color(theme.bg_color(token), mode);
         TranscriptStyles {
             text: fg(ThemeColor::Text),
             user: fg(ThemeColor::UserMessageText),
@@ -92,10 +95,20 @@ impl TranscriptStyles {
     }
 }
 
-/// Map a theme palette value onto a vaxis color.
-pub(crate) fn vaxis_color(rgb: ThemeRgb) -> Color {
+/// Map a theme palette value onto a vaxis color, downsampling to the
+/// 256-color palette when `mode` is `Color256`.
+///
+/// vaxis writes an `Rgb` color as a truecolor SGR sequence with no
+/// downsampling of its own, so a limited terminal would see garbled
+/// colors. We fold the same `rgb_to_256` mapping the `aj` frontend
+/// uses into a palette index here, so both frontends render a
+/// `Color256` theme identically.
+pub(crate) fn vaxis_color(rgb: ThemeRgb, mode: ColorMode) -> Color {
     match rgb {
-        ThemeRgb::Rgb(r, g, b) => Color::Rgb([r, g, b]),
+        ThemeRgb::Rgb(r, g, b) => match mode {
+            ColorMode::Truecolor => Color::Rgb([r, g, b]),
+            ColorMode::Color256 => Color::Index(rgb_to_256(r, g, b)),
+        },
         ThemeRgb::Ansi256(i) => Color::Index(i),
         ThemeRgb::Default => Color::Default,
     }
@@ -388,16 +401,7 @@ impl TranscriptView {
         list.draw_cursor = false;
         let mut bars = ScrollBars::new(list);
         bars.draw_horizontal_scrollbar = false;
-        // A muted thumb that brightens while dragged, from the same
-        // dim/text palette the transcript rows use.
-        let thumb = |grapheme: &str, style: Style| Cell {
-            char: Character::new(grapheme, 1),
-            style,
-            ..Cell::default()
-        };
-        bars.vertical_scrollbar_thumb = thumb("\u{2590}", styles.dim);
-        bars.vertical_scrollbar_hover_thumb = thumb("\u{2588}", styles.dim);
-        bars.vertical_scrollbar_drag_thumb = thumb("\u{2588}", styles.text);
+        apply_scrollbar_thumbs(&mut bars, &styles);
         let list = Rc::clone(&bars.view);
         TranscriptView {
             chat,
@@ -405,6 +409,20 @@ impl TranscriptView {
             bars,
             follow_tail: true,
         }
+    }
+
+    /// Rebuild the transcript's styles from a fresh palette, for a
+    /// runtime theme swap. Replaces the row builder (so the per-entry
+    /// widgets, which are rebuilt every frame, pick up the new colors)
+    /// and re-applies the scrollbar thumb tints. Scroll position is
+    /// left untouched, so a reload doesn't jump the viewport.
+    pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>) {
+        let builder = EntryBuilder {
+            chat: Rc::clone(&self.chat),
+            styles: Rc::clone(&styles),
+        };
+        self.list.borrow_mut().children = Source::Builder(Box::new(builder));
+        apply_scrollbar_thumbs(&mut self.bars, &styles);
     }
 
     /// Mouse observation shared by both dispatch phases: an active
@@ -424,6 +442,20 @@ impl TranscriptView {
             self.follow_tail = false;
         }
     }
+}
+
+/// Set the scrollbar's muted-thumb tints from the transcript palette:
+/// a dim thumb that brightens on hover and to the text color while
+/// dragged.
+fn apply_scrollbar_thumbs(bars: &mut ScrollBars<ListView>, styles: &TranscriptStyles) {
+    let thumb = |grapheme: &str, style: Style| Cell {
+        char: Character::new(grapheme, 1),
+        style,
+        ..Cell::default()
+    };
+    bars.vertical_scrollbar_thumb = thumb("\u{2590}", styles.dim);
+    bars.vertical_scrollbar_hover_thumb = thumb("\u{2588}", styles.dim);
+    bars.vertical_scrollbar_drag_thumb = thumb("\u{2588}", styles.text);
 }
 
 impl Widget for TranscriptView {
@@ -749,6 +781,31 @@ mod tests {
         }));
         let spans = entry_spans(&t.entries()[0], false, false, &styles());
         assert_eq!(joined(&spans), "[Redacted thinking: ]\n\n");
+    }
+
+    #[test]
+    fn vaxis_color_downsamples_rgb_only_in_color256_mode() {
+        let rgb = ThemeRgb::Rgb(0x00, 0xd7, 0xff);
+        // Truecolor keeps the 24-bit triple. Color256 folds it to the
+        // shared `rgb_to_256` index (identical to the `aj` frontend).
+        assert_eq!(
+            vaxis_color(rgb, ColorMode::Truecolor),
+            Color::Rgb([0x00, 0xd7, 0xff])
+        );
+        assert_eq!(
+            vaxis_color(rgb, ColorMode::Color256),
+            Color::Index(rgb_to_256(0x00, 0xd7, 0xff))
+        );
+        // Explicit palette indices and terminal-default pass through in
+        // both modes.
+        assert_eq!(
+            vaxis_color(ThemeRgb::Ansi256(5), ColorMode::Color256),
+            Color::Index(5)
+        );
+        assert_eq!(
+            vaxis_color(ThemeRgb::Default, ColorMode::Color256),
+            Color::Default
+        );
     }
 
     #[test]

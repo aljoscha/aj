@@ -38,115 +38,16 @@ use aj_tui::style;
 // builders below refer to the types by bare name.
 pub use aj_app::theme::{
     ColorMode, Theme, ThemeBg, ThemeColor, ThemeError, ThemeHandle, ThemeRgb, ThemeWatcherGuard,
-    watch_user_theme,
+    rgb_to_256, watch_user_theme,
 };
 
 // ============================================================================
 // ANSI encoding — ThemeRgb -> SGR escape
 // ============================================================================
 
-/// The xterm 6x6x6 color cube channel values.
-const CUBE_VALUES: [u8; 6] = [0, 95, 135, 175, 215, 255];
-
-/// The xterm 24-step grayscale ramp values (palette indices
-/// 232..=255). Computed as `8 + i * 10` per the ramp definition.
-fn gray_values() -> [u8; 24] {
-    let mut out = [0u8; 24];
-    let mut i: u8 = 0;
-    while i < 24 {
-        out[usize::from(i)] = 8 + i * 10;
-        i += 1;
-    }
-    out
-}
-
-fn closest_cube_index(value: u8) -> usize {
-    let mut min_dist = u32::MAX;
-    let mut min_idx = 0usize;
-    for (i, &v) in CUBE_VALUES.iter().enumerate() {
-        let dist = u32::from(value).abs_diff(u32::from(v));
-        if dist < min_dist {
-            min_dist = dist;
-            min_idx = i;
-        }
-    }
-    min_idx
-}
-
-fn closest_gray_index(value: u8) -> usize {
-    let grays = gray_values();
-    let mut min_dist = u32::MAX;
-    let mut min_idx = 0usize;
-    for (i, &v) in grays.iter().enumerate() {
-        let dist = u32::from(value).abs_diff(u32::from(v));
-        if dist < min_dist {
-            min_dist = dist;
-            min_idx = i;
-        }
-    }
-    min_idx
-}
-
-fn color_distance(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
-    // Weighted squared distance with BT.601 luma coefficients
-    // (0.299/0.587/0.114), scaled by 1000 to stay in integer math.
-    // We only care about the order of distances, not their
-    // absolute values, so the scaling factor cancels out.
-    //
-    // Worst-case input is `dr = 255` → `dr*dr = 65_025`, weighted
-    // by 587 yields ~38M. Summing three weighted terms stays well
-    // under u32::MAX.
-    let dr = u32::from(r1).abs_diff(u32::from(r2));
-    let dg = u32::from(g1).abs_diff(u32::from(g2));
-    let db = u32::from(b1).abs_diff(u32::from(b2));
-    dr * dr * 299 + dg * dg * 587 + db * db * 114
-}
-
-/// Map a 24-bit RGB triple onto the closest entry in the xterm
-/// 256-color palette. The 6x6x6 cube wins for any non-neutral
-/// hue; the 24-step grayscale ramp wins only when the color is
-/// nearly desaturated (max-min channel spread < 10) *and* the
-/// grayscale entry is empirically closer than the cube pick.
-fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
-    let ri = closest_cube_index(r);
-    let gi = closest_cube_index(g);
-    let bi = closest_cube_index(b);
-    let cube_r = CUBE_VALUES[ri];
-    let cube_g = CUBE_VALUES[gi];
-    let cube_b = CUBE_VALUES[bi];
-    let cube_index =
-        u8::try_from(16 + 36 * ri + 6 * gi + bi).expect("6x6x6 cube indices stay within u8 range");
-    let cube_dist = color_distance(r, g, b, cube_r, cube_g, cube_b);
-
-    // Compute luma in integer arithmetic: BT.601 coefficients are
-    // 0.299/0.587/0.114; scaling by 1000 keeps three decimals of
-    // precision without touching floats. The max possible sum is
-    // 255*1000, which fits in u32 with room to spare.
-    let luma_scaled = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
-    // Round-to-nearest by adding half the divisor before dividing.
-    let gray_u32 = (luma_scaled + 500) / 1000;
-    // `gray_u32` is at most ((255*1000)+500)/1000 = 255, so this
-    // try_from never fails; `.unwrap_or(255)` is defensive only.
-    let gray_clamped = u8::try_from(gray_u32).unwrap_or(255);
-    let grays = gray_values();
-    let gi_ramp = closest_gray_index(gray_clamped);
-    let gray_value = grays[gi_ramp];
-    let gray_index = u8::try_from(232 + gi_ramp).expect("grayscale indices fit in u8");
-    let gray_dist = color_distance(r, g, b, gray_value, gray_value, gray_value);
-
-    let max_c = r.max(g).max(b);
-    let min_c = r.min(g).min(b);
-    let spread = max_c.saturating_sub(min_c);
-
-    // Only prefer grayscale when the color is nearly neutral, so
-    // a deliberate cyan / red tint isn't flattened to gray on
-    // limited terminals.
-    if spread < 10 && gray_dist < cube_dist {
-        gray_index
-    } else {
-        cube_index
-    }
-}
+// The RGB -> 256-color downsampling (`rgb_to_256`) lives in
+// `aj_app::theme` and is re-exported above, since both frontends
+// downsample the same palette and the mapping must agree.
 
 /// Encode a foreground [`ThemeRgb`] as an SGR prefix. `Default`
 /// yields the terminal's default foreground. An explicit palette
