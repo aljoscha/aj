@@ -38,7 +38,7 @@ use aj_models::types::Speed;
 use aj_models::{
     ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
 };
-use aj_session::{ConversationPersistence, ThreadFilter, replay};
+use aj_session::{ConversationPersistence, PromptEntry, ThreadFilter, replay};
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
@@ -46,22 +46,25 @@ use tokio_util::sync::CancellationToken;
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    AsyncApp, DrawContext, Event, EventContext, FlexColumn, FlexItem, KeymapController, ListView,
-    MaxSize, Options, RelativePoint, Size, SubSurface, Surface, Text, TextField, UserEvent, Widget,
-    WidgetRef, draw_widget, to_widget_ref,
+    AsyncApp, DrawContext, Event, EventContext, FilterableSelect, FlexColumn, FlexItem,
+    KeymapController, ListView, MaxSize, Options, RelativePoint, Size, SubSurface, Surface, Text,
+    TextField, UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
+use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
 use crate::content_overlay::{auth_rows, session_info_rows, set_rows, usage_rows};
 use crate::footer::FooterLine;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
+use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
     UNSET_VALUE, open_model, open_settings, open_skills, open_thinking,
 };
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
+use crate::task_output::open_task_output;
 use crate::transcript::{TranscriptStyles, TranscriptView};
 
 /// App-event name the drive loop posts after opening an overlay outside
@@ -105,6 +108,9 @@ struct World {
     /// Credential store, shared with the async read-only overlays (auth
     /// status, usage) whose fetches run detached off the drive loop.
     auth: AuthStorage,
+    /// The project's sessions store, shared with the prompt-history scan
+    /// (run detached on a blocking thread off the drive loop).
+    persistence: ConversationPersistence,
 }
 
 /// Build the session world: run config, session core, and the chat
@@ -254,6 +260,7 @@ async fn build_world(
         turns: JoinSet::new(),
         turn_cancels: HashMap::new(),
         auth: auth.clone(),
+        persistence: persistence.clone(),
     })
 }
 
@@ -600,20 +607,24 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
             true
         }
         AjAction::Dequeue => yank_pending_into_editor(world, shell),
-        // Placeholder notices: the clipboard paste and the two overlay
-        // openers arrive with the selector/clipboard ports in the next
-        // chunks.
+        // The clipboard paste arrives with the clipboard port in a later
+        // chunk, so it still folds a placeholder notice.
         AjAction::PasteImage => {
             fold_notice(world, "Clipboard image paste is not wired up yet.");
             true
         }
+        // The direct chords (ctrl+r, alt+a) open the same overlays as the
+        // palette commands. Park the matching command so the host's
+        // `apply_command_action` opens it on the next drive-loop step
+        // (which owns the refocus move). Nothing renders here yet, so no
+        // redraw.
         AjAction::HistoryOpen => {
-            fold_notice(world, "Prompt history search is not wired up yet.");
-            true
+            *shell.borrow().command_slot.borrow_mut() = Some(CommandAction::OpenPromptHistory);
+            false
         }
         AjAction::AgentPickerOpen => {
-            fold_notice(world, "The agent picker is not wired up yet.");
-            true
+            *shell.borrow().command_slot.borrow_mut() = Some(CommandAction::OpenAgentPicker);
+            false
         }
         // Handled inside the controller's dispatch-side handler (see
         // `Shell::new`), never parked for the host.
@@ -852,12 +863,30 @@ async fn apply_command_action(
             ActionEffect::Redraw
         }
         CommandAction::OpenPromptHistory => {
-            fold_notice(world, "Prompt history search is not wired up yet.");
-            ActionEffect::Redraw
+            let handles = shell.borrow().overlay_handles();
+            open_prompt_history(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.history_fetch,
+                &handles.recall_slot,
+            );
+            ActionEffect::OpenedOverlay
         }
         CommandAction::OpenAgentPicker => {
-            fold_notice(world, "The agent picker is not wired up yet.");
-            ActionEffect::Redraw
+            let snapshot = {
+                let chat = world.chat.borrow();
+                PickerSnapshot::gather(&chat)
+            };
+            let handles = shell.borrow().overlay_handles();
+            open_agent_picker(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.picker_outcome,
+                snapshot,
+            );
+            ActionEffect::OpenedOverlay
         }
         CommandAction::OpenLoginSelector => {
             fold_notice(world, "Login is not wired up yet.");
@@ -877,6 +906,91 @@ async fn apply_command_action(
         | CommandAction::Quit
         | CommandAction::OpenTaskOutput { .. } => ActionEffect::None,
     }
+}
+
+/// Apply an agent-picker outcome the widget parked. Observing an agent
+/// swaps the viewed transcript; opening a task drills into the read-only
+/// task viewer (which opens a child overlay, hence [`ActionEffect::OpenedOverlay`]);
+/// killing a task cancels it through the registry and folds a notice.
+fn apply_picker_outcome(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    outcome: AgentPickerOutcome,
+) -> ActionEffect {
+    match outcome {
+        AgentPickerOutcome::Observe(id) => {
+            // The transcript view reads `active_view` at draw, and the
+            // per-iteration status/keymap sync picks up the new view, so
+            // switching plus a redraw is all it takes.
+            world.chat.borrow_mut().set_active_view(id);
+            ActionEffect::Redraw
+        }
+        AgentPickerOutcome::OpenTask(id) => {
+            // The picker only lists bash tasks, so resolve the command
+            // line for the viewer header. A task that left the registry
+            // between the snapshot and now has nothing to show.
+            let command = world
+                .core
+                .task_registry
+                .summary(id)
+                .and_then(|s| match s.kind {
+                    aj_agent::tool::TaskKind::Bash { command } => Some(command),
+                    aj_agent::tool::TaskKind::Agent { .. } => None,
+                });
+            match command {
+                Some(command) => {
+                    let handles = shell.borrow().overlay_handles();
+                    open_task_output(
+                        &handles.stack,
+                        &handles.editor,
+                        &handles.chrome,
+                        world.core.task_registry.clone(),
+                        id,
+                        command,
+                    );
+                    ActionEffect::OpenedOverlay
+                }
+                None => {
+                    fold_notice(
+                        world,
+                        &format!("Background task #{id} is no longer available."),
+                    );
+                    ActionEffect::Redraw
+                }
+            }
+        }
+        AgentPickerOutcome::Kill(id) => {
+            // The picker rows are a snapshot from open time, so consult
+            // the live status: the task may have finished while the picker
+            // was up.
+            let live = world
+                .core
+                .task_registry
+                .snapshot()
+                .into_iter()
+                .find(|t| t.id == id)
+                .map(|t| t.status);
+            let notice = match live {
+                Some(aj_agent::tool::TaskStatus::Running) => {
+                    world.core.task_registry.kill(id);
+                    format!("Killing background task #{id}.")
+                }
+                Some(_) => format!("Background task #{id} already finished."),
+                None => format!("Background task #{id} is not in the registry (already gone?)."),
+            };
+            fold_notice(world, &notice);
+            ActionEffect::Redraw
+        }
+    }
+}
+
+/// Recall a prompt-history pick into the editor, replacing whatever is
+/// typed. Recall does not submit, so the user can edit before sending.
+fn recall_into_editor(shell: &Rc<RefCell<Shell>>, text: &str) {
+    let shell = shell.borrow();
+    let mut editor = shell.editor.borrow_mut();
+    editor.clear_retaining_capacity();
+    editor.insert_slice_at_cursor(text);
 }
 
 /// The viewed agent's current thinking level, from its footer entry, falling
@@ -1511,6 +1625,38 @@ fn spawn_overlay_fetch(
     }
 }
 
+/// Spawn the prompt-history scan for `scope` on a blocking thread,
+/// delivering its entries back to the drive loop over `tx`.
+///
+/// The scan walks on-disk JSONL logs (blocking IO), so it runs on the
+/// blocking pool rather than the loop. The select widget it fills is
+/// `!Send`, so it stays on the host side; only the `Send` entries and
+/// the scope tag cross the task boundary. The scope tag lets the fill
+/// arm drop a superseded toggle's late result.
+fn spawn_history_scan(
+    world: &World,
+    scope: HistoryScope,
+    tx: &UnboundedSender<(HistoryScope, Vec<PromptEntry>)>,
+) {
+    let tx = tx.clone();
+    let persistence = world.persistence.clone();
+    tokio::task::spawn_blocking(move || {
+        let entries = match scope {
+            HistoryScope::Workspace => aj_session::workspace_history(&persistence, MAX_ENTRIES),
+            HistoryScope::All => match Config::get_sessions_base_dir_path() {
+                Ok(base) => aj_session::all_workspaces_history(&base, MAX_ENTRIES),
+                // Fall back to the current workspace so the toggle still
+                // shows something when the base dir can't be resolved.
+                Err(err) => {
+                    tracing::debug!("could not resolve sessions base dir: {err}");
+                    aj_session::workspace_history(&persistence, MAX_ENTRIES)
+                }
+            },
+        };
+        let _ = tx.send((scope, entries));
+    });
+}
+
 /// The shared handles the drive loop hands to a config-editing overlay's open
 /// function. Gathered from the shell in one borrow so the open call site never
 /// holds a shell borrow across it.
@@ -1520,6 +1666,12 @@ struct OverlayHandles {
     chrome: OverlayChrome,
     activity: Rc<RefCell<Vec<SelectorActivity>>>,
     settings_ui: Rc<RefCell<Option<SettingsUi>>>,
+    /// Where the agent picker parks its confirmed pick / kill.
+    picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>>,
+    /// Where the prompt-history overlay parks a scan request.
+    history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
+    /// Where the prompt-history overlay parks a recalled prompt.
+    recall_slot: Rc<RefCell<Option<String>>>,
 }
 
 /// The root widget: the keymap controller wrapping the base layout, the
@@ -1583,6 +1735,15 @@ struct Shell {
     /// row and a theme swap can re-tint the window. `None` when no settings
     /// window is open.
     settings_ui: Rc<RefCell<Option<SettingsUi>>>,
+    /// The agent picker's confirmed pick / kill, parked for the drive
+    /// loop (which owns the chat model and the task registry).
+    picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>>,
+    /// A prompt-history scan request parked by the overlay (on open and
+    /// on scope toggle) for the drive loop to run and fill.
+    history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
+    /// A recalled prompt parked by the prompt-history overlay, collected
+    /// by the drive loop and dropped into the editor.
+    recall_slot: Rc<RefCell<Option<String>>>,
 }
 
 impl Shell {
@@ -1648,6 +1809,9 @@ impl Shell {
         let selector_activity: Rc<RefCell<Vec<SelectorActivity>>> =
             Rc::new(RefCell::new(Vec::new()));
         let settings_ui: Rc<RefCell<Option<SettingsUi>>> = Rc::new(RefCell::new(None));
+        let picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>> = Rc::new(RefCell::new(None));
+        let history_fetch: Rc<RefCell<Option<HistoryFetch>>> = Rc::new(RefCell::new(None));
+        let recall_slot: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
             turn_running: false,
@@ -1733,6 +1897,9 @@ impl Shell {
             footer,
             selector_activity,
             settings_ui,
+            picker_outcome,
+            history_fetch,
+            recall_slot,
         }
     }
 
@@ -1762,9 +1929,25 @@ impl Shell {
         std::mem::take(&mut self.selector_activity.borrow_mut())
     }
 
+    /// Collect an agent-picker outcome parked by the widget, if any.
+    fn take_picker_outcome(&self) -> Option<AgentPickerOutcome> {
+        self.picker_outcome.borrow_mut().take()
+    }
+
+    /// Collect a prompt-history scan request parked by the overlay, if any.
+    fn take_history_fetch(&self) -> Option<HistoryFetch> {
+        self.history_fetch.borrow_mut().take()
+    }
+
+    /// Collect a recalled prompt parked by the prompt-history overlay, if any.
+    fn take_recall(&self) -> Option<String> {
+        self.recall_slot.borrow_mut().take()
+    }
+
     /// The shared handles the drive loop needs to open a config-editing
     /// overlay: the stack it pushes onto, the editor (focus fallback), a live
-    /// chrome snapshot, and the activity / settings-window slots.
+    /// chrome snapshot, and the activity / settings-window / picker /
+    /// history / recall slots.
     fn overlay_handles(&self) -> OverlayHandles {
         OverlayHandles {
             stack: Rc::clone(&self.overlays),
@@ -1772,6 +1955,9 @@ impl Shell {
             chrome: self.chrome.borrow().clone(),
             activity: Rc::clone(&self.selector_activity),
             settings_ui: Rc::clone(&self.settings_ui),
+            picker_outcome: Rc::clone(&self.picker_outcome),
+            history_fetch: Rc::clone(&self.history_fetch),
+            recall_slot: Rc::clone(&self.recall_slot),
         }
     }
 
@@ -2072,6 +2258,13 @@ async fn drive(
     // sends only the rendered rows back over the channel.
     let (fetch_tx, mut fetch_rx) = unbounded_channel::<(FetchKind, Vec<String>)>();
     let mut pending_fills: Vec<(FetchKind, Rc<RefCell<ListView>>)> = Vec::new();
+    // Prompt-history scans deliver their entries here. The select handle
+    // is `!Send`, so it stays paired with the requested scope on the host
+    // side while the blocking scan sends only the (Send) entries back. A
+    // result fills only when its scope still matches the pending request,
+    // so a scope toggle's stale scan can't overwrite the current view.
+    let (history_tx, mut history_rx) = unbounded_channel::<(HistoryScope, Vec<PromptEntry>)>();
+    let mut pending_history: Option<(HistoryScope, Rc<RefCell<FilterableSelect>>)> = None;
     loop {
         // Compute the tick deadline before the select so no arm holds
         // a borrow of `app` another arm needs. The sleep expression is
@@ -2132,6 +2325,21 @@ async fn drive(
                 }
             }
 
+            // --- Prompt-history scan fill ---
+            // Fill only when the result's scope still matches the pending
+            // request. A superseded toggle's late scan is dropped, so the
+            // list never flips back to a stale scope's rows.
+            maybe_history = history_rx.recv() => {
+                if let Some((scope, entries)) = maybe_history
+                    && let Some((pending_scope, select)) = &pending_history
+                    && *pending_scope == scope
+                {
+                    select.borrow().set_items(crate::prompt_history::build_items(&entries));
+                    pending_history = None;
+                    app.request_redraw();
+                }
+            }
+
             // --- Terminal input ---
             event = app.next_input() => {
                 match event {
@@ -2187,6 +2395,36 @@ async fn drive(
                                 .await
                         {
                             app.request_redraw();
+                        }
+                        // An agent-picker outcome (observe / drill into a
+                        // task / kill). Opening the task viewer pushes a
+                        // child overlay, so it takes the same refocus path
+                        // as a host-opened selector.
+                        if let Some(outcome) = shell.borrow().take_picker_outcome() {
+                            match apply_picker_outcome(world, shell, outcome) {
+                                ActionEffect::None => {}
+                                ActionEffect::Redraw => app.request_redraw(),
+                                ActionEffect::OpenedOverlay => {
+                                    app.post_app_event(UserEvent {
+                                        name: REFOCUS_OVERLAY_EVENT.to_string(),
+                                        data: None,
+                                    });
+                                    app.request_redraw();
+                                }
+                            }
+                        }
+                        // A prompt-history recall: drop the chosen text
+                        // into the editor (it does not submit).
+                        if let Some(text) = shell.borrow().take_recall() {
+                            recall_into_editor(shell, &text);
+                            app.request_redraw();
+                        }
+                        // A prompt-history scan request (open or scope
+                        // toggle): run the scan off the loop on a blocking
+                        // thread and remember the select to fill.
+                        if let Some(fetch) = shell.borrow().take_history_fetch() {
+                            spawn_history_scan(world, fetch.scope, &history_tx);
+                            pending_history = Some((fetch.scope, fetch.select));
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -3115,26 +3353,36 @@ mod tests {
         );
     }
 
-    /// The placeholder host actions fold a notice so the chords aren't
-    /// silent dead ends.
+    /// The remaining placeholder host action (clipboard paste) folds a
+    /// notice; the two overlay openers instead park their command for the
+    /// host to open the overlay.
     #[tokio::test]
-    async fn placeholder_actions_fold_notices() {
+    async fn placeholder_and_opener_host_actions() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         assert!(handle_host_action(&mut world, &shell, AjAction::PasteImage));
-        assert!(handle_host_action(
-            &mut world,
-            &shell,
-            AjAction::HistoryOpen
-        ));
-        assert!(handle_host_action(
-            &mut world,
-            &shell,
-            AjAction::AgentPickerOpen
-        ));
-        let chat = world.chat.borrow();
-        let notices: Vec<String> = chat
+        assert_eq!(
+            shell.borrow().take_command(),
+            None,
+            "paste is not an overlay opener"
+        );
+
+        // The overlay openers park the matching command (opened next step).
+        handle_host_action(&mut world, &shell, AjAction::HistoryOpen);
+        assert_eq!(
+            shell.borrow().take_command(),
+            Some(CommandAction::OpenPromptHistory)
+        );
+        handle_host_action(&mut world, &shell, AjAction::AgentPickerOpen);
+        assert_eq!(
+            shell.borrow().take_command(),
+            Some(CommandAction::OpenAgentPicker)
+        );
+
+        let notices: Vec<String> = world
+            .chat
+            .borrow()
             .transcript(AgentId::Main)
             .expect("main transcript")
             .entries()
@@ -3146,14 +3394,6 @@ mod tests {
             .collect();
         assert!(
             notices.iter().any(|n| n.contains("image paste")),
-            "{notices:?}"
-        );
-        assert!(
-            notices.iter().any(|n| n.contains("history search")),
-            "{notices:?}"
-        );
-        assert!(
-            notices.iter().any(|n| n.contains("agent picker")),
             "{notices:?}"
         );
     }
@@ -3563,7 +3803,7 @@ mod tests {
             ActionEffect::Redraw
         ));
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenPromptHistory).await,
+            apply_command_action(&mut world, &shell, CommandAction::NewSession).await,
             ActionEffect::Redraw
         ));
         let notices: Vec<String> = world
@@ -3583,7 +3823,7 @@ mod tests {
             "{notices:?}"
         );
         assert!(
-            notices.iter().any(|n| n.contains("Prompt history")),
+            notices.iter().any(|n| n.contains("new session")),
             "{notices:?}"
         );
     }
@@ -4138,5 +4378,292 @@ mod tests {
         let config_path = dir.path().join(".aj").join("config.toml");
         let contents = std::fs::read_to_string(&config_path).expect("config.toml written");
         assert!(contents.contains("demo-skill"), "got: {contents}");
+    }
+
+    // ---- Agent picker, task viewer, prompt history (8D-3a) ----
+
+    /// A no-op output source, enough for the registry to resolve a task.
+    struct NoOutput;
+
+    impl aj_agent::tool::TaskOutputSource for NoOutput {
+        fn snapshot(&self) -> aj_agent::tool::TaskRead {
+            aj_agent::tool::TaskRead::default()
+        }
+    }
+
+    /// Register a running background bash task and return its id.
+    fn register_bash_task(world: &World, command: &str) -> aj_agent::tool::TaskId {
+        let (id, _cancel) = world.core.task_registry.register(
+            AgentId::Main,
+            aj_agent::tool::TaskKind::Bash {
+                command: command.to_string(),
+            },
+            command.to_string(),
+            Arc::new(NoOutput),
+        );
+        id
+    }
+
+    /// Fold a running sub-agent and a running bash task into the world's
+    /// chat model through the reducer, so a picker snapshot lists both.
+    fn seed_sub_and_task(world: &mut World) {
+        let settings = aj_agent::events::AgentSettings {
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        };
+        let events = [
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "do the thing".into(),
+                settings,
+            },
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "tu-1".into(),
+                kind: aj_agent::tool::TaskKind::Bash {
+                    command: "cargo build".into(),
+                },
+                label: "cargo build".into(),
+            },
+        ];
+        for event in events {
+            let _ = reduce(
+                &mut world.chat.borrow_mut(),
+                &mut world.core.lifecycle,
+                event,
+            );
+        }
+    }
+
+    fn main_notices(world: &World) -> Vec<String> {
+        world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Notice(n) => Some(n.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The picker snapshot lists the main agent, a running sub-agent, and
+    /// a running bash task, all from the chat model.
+    #[tokio::test]
+    async fn agent_picker_snapshot_lists_main_sub_and_running_task() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+        seed_sub_and_task(&mut world);
+
+        let snapshot = PickerSnapshot::gather(&world.chat.borrow());
+        assert!(snapshot.agents.iter().any(|a| a.id == AgentId::Main));
+        assert!(
+            snapshot.agents.iter().any(|a| a.id == AgentId::Sub(1)
+                && a.status == Some(aj_app::chat::SubAgentStatus::Running)),
+            "running sub listed: {:?}",
+            snapshot.agents
+        );
+        assert_eq!(snapshot.tasks.len(), 1, "one bash task");
+        assert_eq!(
+            snapshot.tasks[0].status,
+            aj_agent::tool::TaskStatus::Running
+        );
+        assert!(snapshot.tasks[0].command.contains("cargo build"));
+        assert_eq!(snapshot.active, AgentId::Main);
+    }
+
+    /// The `OpenAgentPicker` command opens the picker overlay from the
+    /// host path.
+    #[tokio::test]
+    async fn open_agent_picker_command_opens_the_overlay() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        seed_sub_and_task(&mut world);
+        let effect = apply_command_action(&mut world, &shell, CommandAction::OpenAgentPicker).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        assert!(shell.borrow().overlays.borrow().is_open());
+    }
+
+    /// Observing an agent from the picker switches the viewed transcript.
+    #[tokio::test]
+    async fn agent_picker_observe_switches_the_view() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        assert_eq!(world.chat.borrow().active_view(), AgentId::Main);
+        let effect = apply_picker_outcome(
+            &mut world,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(2)),
+        );
+        assert!(matches!(effect, ActionEffect::Redraw));
+        assert_eq!(world.chat.borrow().active_view(), AgentId::Sub(2));
+    }
+
+    /// Drilling into a task opens the viewer overlay; an id that has left
+    /// the registry folds a notice instead.
+    #[tokio::test]
+    async fn agent_picker_open_task_opens_the_viewer() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let id = register_bash_task(&world, "cargo test");
+
+        let effect = apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id));
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        assert!(shell.borrow().overlays.borrow().is_open(), "viewer open");
+
+        let effect = apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(9_999));
+        assert!(matches!(effect, ActionEffect::Redraw));
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("no longer available")),
+            "gone task folds a notice"
+        );
+    }
+
+    /// Killing a task consults the live status: running kills and notes
+    /// it, terminal reports already-finished, unknown reports gone.
+    #[tokio::test]
+    async fn agent_picker_kill_folds_notice_by_live_status() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let id = register_bash_task(&world, "sleep 100");
+
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id));
+        world
+            .core
+            .task_registry
+            .set_status(id, aj_agent::tool::TaskStatus::Killed);
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id));
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(9_999));
+
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("Killing background task")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("already finished")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("not in the registry")),
+            "{notices:?}"
+        );
+    }
+
+    /// The task viewer, opened from the host path, renders the task's
+    /// output and status. (`Ctrl+K`/close behavior is covered by the
+    /// widget's own tests.)
+    #[tokio::test]
+    async fn task_viewer_renders_output_from_the_registry() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let id = register_bash_task(&world, "echo hello");
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id));
+        // The viewer shows the command header and a running status.
+        let rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(rendered.contains("echo hello"), "command: {rendered}");
+        assert!(rendered.contains("running"), "status: {rendered}");
+    }
+
+    /// Prompt history opens showing a loading placeholder, fills from a
+    /// scan, filters, and confirming recalls the full prompt into the
+    /// editor without submitting.
+    #[tokio::test]
+    async fn prompt_history_opens_loading_fills_filters_and_recalls() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+
+        let effect =
+            apply_command_action(&mut world, &shell, CommandAction::OpenPromptHistory).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+
+        // The initial current-workspace scan was parked; before it fills,
+        // the list shows the loading placeholder.
+        let fetch = shell
+            .borrow()
+            .take_history_fetch()
+            .expect("initial scan parked");
+        assert_eq!(fetch.scope, HistoryScope::Workspace);
+        let loading = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(loading.contains("Loading"), "loading state: {loading}");
+
+        // Fill the list as the drive loop would once the scan lands.
+        fetch
+            .select
+            .borrow()
+            .set_items(crate::prompt_history::build_items(&[
+                PromptEntry {
+                    text: "fix the bug".into(),
+                    project: None,
+                },
+                PromptEntry {
+                    text: "add a test".into(),
+                    project: None,
+                },
+            ]));
+        app.render(&root).expect("render");
+
+        // Filter to "test" (only the second prompt matches) and confirm.
+        writer.write_all(b"test\r").expect("query + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+
+        let text = shell
+            .borrow()
+            .take_recall()
+            .expect("confirm recalled a prompt");
+        assert_eq!(text, "add a test");
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "confirm closed the overlay"
+        );
+
+        // Recall drops the full text into the editor (what the drive loop
+        // does with the parked recall).
+        recall_into_editor(&shell, &text);
+        assert_eq!(
+            shell.borrow().editor.borrow().graphemes_before_cursor(),
+            u16::try_from("add a test".chars().count()).unwrap(),
+            "the recalled prompt is in the editor"
+        );
+    }
+
+    /// Ctrl+T in the prompt-history overlay reparks a scan for the other
+    /// scope.
+    #[tokio::test]
+    async fn prompt_history_ctrl_t_reparks_the_all_scope_scan() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        apply_command_action(&mut world, &shell, CommandAction::OpenPromptHistory).await;
+        focus_overlay(&mut app, &root);
+        // Drop the initial workspace scan.
+        shell.borrow().take_history_fetch();
+
+        writer.write_all(&[0x14]).expect("ctrl+t");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+
+        let fetch = shell
+            .borrow()
+            .take_history_fetch()
+            .expect("toggle parked a scan");
+        assert_eq!(fetch.scope, HistoryScope::All);
     }
 }

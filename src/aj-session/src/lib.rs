@@ -23,6 +23,7 @@ pub mod compaction;
 pub mod listener;
 pub mod log;
 pub mod persistence;
+pub mod prompt_history;
 pub mod repair;
 pub mod replay;
 pub mod stats;
@@ -37,6 +38,9 @@ pub use log::{
     EntryId, SessionSettings, ThreadFilter, ThreadKind,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
+pub use prompt_history::{
+    PromptEntry, all_workspaces_history, scan_file_user_prompts, workspace_history,
+};
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;
 pub use stats::SessionStats;

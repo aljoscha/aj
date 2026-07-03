@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use aj_session::ConversationPersistence;
+use aj_session::{ConversationPersistence, scan_file_user_prompts};
 use aj_tui::component::Component;
 use aj_tui::components::filterable_select::FilterableSelect;
 use aj_tui::components::select_list::{
@@ -41,7 +41,6 @@ use aj_tui::tui::RenderHandle;
 use crate::config::keybindings::ACTION_HISTORY_TOGGLE_SCOPE;
 use crate::modes::interactive::components::outcome::OutcomeSlot;
 use crate::modes::interactive::components::streaming_scan::StreamingScan;
-use crate::modes::interactive::editor_ext::scan_file_user_prompts;
 
 /// Cap on how many prompts a single scope retains. Generous enough
 /// to cover any realistic history while bounding the scan + the

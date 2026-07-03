@@ -23,7 +23,7 @@ mod model;
 mod reducer;
 
 pub use model::{
-    AssistantEntry, ChatState, CompactionEntry, Entry, EntryId, EntryKind, NoticeEntry,
+    AgentEntry, AssistantEntry, ChatState, CompactionEntry, Entry, EntryId, EntryKind, NoticeEntry,
     NoticeLevel, SubAgentEntry, SubAgentStatus, TaskInfo, ToolEntry, ToolStatus, Transcript,
     TurnUsageEntry, UserEntry,
 };

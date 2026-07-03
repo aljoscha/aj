@@ -11,6 +11,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+mod agent_picker;
 mod bubble;
 mod content_overlay;
 mod footer;
@@ -19,9 +20,11 @@ mod keymap;
 mod overlay;
 mod palette;
 mod pending;
+mod prompt_history;
 mod settings_ui;
 mod status;
 mod subagent_box;
+mod task_output;
 #[cfg(test)]
 mod test_support;
 mod tool_cell;

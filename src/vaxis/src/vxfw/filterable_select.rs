@@ -284,6 +284,32 @@ impl FilterableSelect {
         *self.styles.borrow_mut() = styles;
     }
 
+    /// Replace the item set and re-apply the active filter, keeping the
+    /// filter field and list widgets (so focus survives). Resets the
+    /// cursor to the top. Used when the row source changes wholesale (a
+    /// scope toggle, or an async fill).
+    pub fn set_items(&self, items: Vec<SelectItem>) {
+        let mut state = self.state.borrow_mut();
+        state.items = items;
+        apply_filter(&mut state, &mut self.list.borrow_mut());
+    }
+
+    /// Append `items` to the row set and re-apply the active filter,
+    /// keeping the widgets and the cursor position. Used to stream in
+    /// batches of an incremental scan without clearing what already
+    /// showed.
+    pub fn extend_items(&self, items: Vec<SelectItem>) {
+        let cursor = self.list.borrow().cursor;
+        {
+            let mut state = self.state.borrow_mut();
+            state.items.extend(items);
+            apply_filter(&mut state, &mut self.list.borrow_mut());
+        }
+        // `apply_filter` reset the cursor to the top; restore it so a
+        // streamed append doesn't yank the highlight back up.
+        self.list.borrow_mut().jump_to_item(cursor);
+    }
+
     /// Move the cursor onto the first visible item matching `pred`, used to
     /// pre-select the currently-active row on open. A no-op when nothing
     /// matches.

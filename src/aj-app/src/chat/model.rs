@@ -302,6 +302,17 @@ pub struct TaskInfo {
     pub cell: Option<EntryId>,
 }
 
+/// A known agent, snapshotted for the agent picker: the main agent or a
+/// sub-agent with the task that spawned it and its run status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEntry {
+    pub id: AgentId,
+    /// The sub-agent's task description. `None` for the main agent.
+    pub task: Option<String>,
+    /// The sub-agent's run status. `None` for the main agent.
+    pub status: Option<SubAgentStatus>,
+}
+
 /// The chat view's data model. Mutated only by [`crate::chat::reduce`]
 /// and the explicit setters here. Views read it at draw time.
 pub struct ChatState {
@@ -402,6 +413,39 @@ impl ChatState {
     /// The tracked background tasks, in id order.
     pub fn tasks(&self) -> &BTreeMap<TaskId, TaskInfo> {
         &self.tasks
+    }
+
+    /// Snapshot of every known agent for the agent picker: the main
+    /// agent first, then each sub-agent in ascending index order with
+    /// the task that spawned it and its run status.
+    ///
+    /// A sub-agent is "known" once its parent transcript holds its box
+    /// entry (recorded in `sub_boxes` at `SubAgentStart`). The task and
+    /// status are read from that [`SubAgentEntry`], which the reducer
+    /// keeps current.
+    pub fn agents(&self) -> Vec<AgentEntry> {
+        let mut out = vec![AgentEntry {
+            id: AgentId::Main,
+            task: None,
+            status: None,
+        }];
+        let mut subs: Vec<usize> = self.sub_boxes.keys().copied().collect();
+        subs.sort_unstable();
+        for n in subs {
+            let Some(&(parent, id)) = self.sub_boxes.get(&n) else {
+                continue;
+            };
+            if let Some(entry) = self.transcripts.get(&parent).and_then(|t| t.get(id))
+                && let EntryKind::SubAgent(sub) = &entry.kind
+            {
+                out.push(AgentEntry {
+                    id: AgentId::Sub(n),
+                    task: Some(sub.task.clone()),
+                    status: Some(sub.status),
+                });
+            }
+        }
+        out
     }
 
     /// The per-agent footer store.

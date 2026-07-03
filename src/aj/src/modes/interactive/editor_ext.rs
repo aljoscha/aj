@@ -12,14 +12,8 @@
 //! so no separate "record" path lives here.
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
 
-use aj_agent::message::{AgentMessage, AgentMessageKind};
-use aj_agent::tool::TASK_NOTIFICATION_OPEN_TAG;
-use aj_models::types::{Message, UserContent};
-use aj_session::{ConversationEntry, ConversationEntryKind, ConversationPersistence, ThreadKind};
+use aj_session::{ConversationPersistence, scan_file_user_prompts};
 use aj_tui::components::editor::Editor;
 
 /// Default cap on the number of prompts retained.
@@ -86,7 +80,7 @@ impl PromptHistory {
     /// - A line that is not valid UTF-8 is skipped without aborting
     ///   the rest of the file.
     /// - A line that is valid UTF-8 but does not parse as a
-    ///   [`ConversationEntry`] is skipped without aborting the rest
+    ///   conversation entry is skipped without aborting the rest
     ///   of the file.
     /// - Subagent threads and meta entries are ignored — only
     ///   top-level user messages count as "prompts the human typed".
@@ -176,121 +170,6 @@ impl PromptHistory {
     }
 }
 
-/// Pull text-block content out of a user message, joining multiple
-/// text blocks with a newline. Returns `None` if there is no text
-/// content (e.g. a tool-result message or an assistant message).
-pub(crate) fn extract_user_prompt_text(msg: &AgentMessage) -> Option<String> {
-    let user = match &msg.kind {
-        AgentMessageKind::Wire(Message::User(u)) => u,
-        _ => return None,
-    };
-    let parts: Vec<&str> = user
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            UserContent::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
-}
-
-/// Read the user-typed prompt texts from one session file, in
-/// chronological (file) order. Shared by the editor's Up-arrow ring
-/// and the `/history` overlay; each caller applies its own trimming
-/// and dedup to the raw joined text returned here.
-///
-/// A session log is mostly assistant turns and tool results whose
-/// bodies dwarf the occasional user prompt. To keep a scan of a large
-/// project's logs cheap, each line is first parsed into a tiny
-/// [`PromptHead`] capturing only the thread and message role; the
-/// expensive full [`ConversationEntry`] parse (which allocates the
-/// message-content tree) runs only for lines that really are top-level
-/// user messages.
-///
-/// Honors the failure-isolation contract documented on
-/// [`PromptHistory::bootstrap`]: an unreadable file yields no prompts,
-/// and non-UTF-8 or unparseable lines are skipped without aborting the
-/// rest of the file.
-pub(crate) fn scan_file_user_prompts(path: &Path) -> Vec<String> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!("skipping unreadable session file {}: {e}", path.display());
-            return Vec::new();
-        }
-    };
-
-    let mut prompts = Vec::new();
-    for (lineno, line) in BufReader::new(file).lines().enumerate() {
-        // A non-UTF-8 (or IO-erroring) line is skipped, not fatal:
-        // the failure-isolation property a flat-file format lacks.
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let head: PromptHead = match serde_json::from_str(&line) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::debug!(
-                    "skipping unparseable line {} in {}: {e}",
-                    lineno + 1,
-                    path.display()
-                );
-                continue;
-            }
-        };
-        if !head.is_user_prompt() {
-            continue;
-        }
-        // Confirmed a top-level user message; the full parse is what
-        // actually pulls the text content out.
-        if let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line)
-            && let ConversationEntryKind::Message { message: msg } = entry.entry
-            && let Some(text) = extract_user_prompt_text(&msg)
-            // Task-completion notices are persisted as user-role messages so
-            // the model sees them, but they're harness-injected, not typed by
-            // the user. They must not surface in prompt history.
-            && !text.trim_start().starts_with(TASK_NOTIFICATION_OPEN_TAG)
-        {
-            prompts.push(text);
-        }
-    }
-    prompts
-}
-
-/// A minimal view of one log line: just enough to tell whether it is a
-/// top-level user message. Unlisted fields (including the message
-/// `content`) are ignored, so serde walks past the heavy body without
-/// allocating it.
-#[derive(serde::Deserialize)]
-struct PromptHead {
-    thread: ThreadKind,
-    #[serde(default)]
-    message: Option<PromptHeadMessage>,
-}
-
-#[derive(serde::Deserialize)]
-struct PromptHeadMessage {
-    #[serde(default)]
-    role: Option<String>,
-}
-
-impl PromptHead {
-    /// A line is a user prompt when it is on the user thread and its
-    /// message role is `user` (the `role` tag of [`Message::User`]).
-    /// Assistant / tool-result messages and non-message entries
-    /// (system prompt, settings records) are excluded.
-    fn is_user_prompt(&self) -> bool {
-        matches!(self.thread, ThreadKind::User)
-            && self.message.as_ref().and_then(|m| m.role.as_deref()) == Some("user")
-    }
-}
-
 /// Trim a prompt for storage: drop trailing whitespace (keeping any
 /// trailing newline) and leading spaces/tabs. Returns `None` when only
 /// whitespace remains.
@@ -307,8 +186,9 @@ fn normalize_prompt(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -597,7 +477,7 @@ mod tests {
         let dir = scratch_dir("task-notification");
         let notice = format!(
             "{}\nBackground task #1 finished: ls (exit 0)\n{}",
-            TASK_NOTIFICATION_OPEN_TAG,
+            aj_agent::tool::TASK_NOTIFICATION_OPEN_TAG,
             aj_agent::tool::TASK_NOTIFICATION_CLOSE_TAG,
         );
         write_jsonl(

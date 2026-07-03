@@ -119,7 +119,7 @@ impl SettingsUi {
 /// Push a titled overlay window wrapping `child` onto the stack, styled from
 /// `chrome`. Returns the window handle so the caller can keep it for a later
 /// re-tint. Does not move focus: the caller (host or dispatch) owns that.
-fn push_window(
+pub(crate) fn push_window(
     stack: &Rc<RefCell<OverlayStack>>,
     chrome: &OverlayChrome,
     title: &str,
