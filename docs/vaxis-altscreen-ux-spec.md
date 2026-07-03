@@ -278,12 +278,12 @@ too, with its own grouped layout (see "The help screen" below). Each is a `vxfw`
 widget in `aj-next`.
 
 Across list overlays, metadata columns (a command's category, a usage row's
-provider) are right-aligned and drawn in a muted tone, matching `aj`, so the
-label column stays vertically aligned across rows. Read-only and scrollable
-overlays (help, usage, session info) scroll line by line with the configured up
-and down bindings (default `up` / `ctrl+p` and `down` / `ctrl+n`, resolved
-through the keymap so a rebind carries), on top of PageUp / PageDown / Home /
-End.
+provider) are right-aligned and drawn in a dim tone (`aj`'s dim prefix column),
+so the label column stays vertically aligned across rows. Read-only and
+scrollable overlays (help, usage, session info) scroll line by line with the
+configured up and down bindings (default `up` / `ctrl+p` and `down` / `ctrl+n`,
+resolved through the keymap so a rebind carries), on top of PageUp / PageDown /
+Home / End.
 
 **Selection highlight.** The selected row in every list-style overlay is drawn as
 a full-width colored band. The whole row (the filter-matched label, the dim
@@ -306,7 +306,7 @@ selectors use the `→ ` marker instead. `aj-next` is the first consumer to rend
 the token, so no theme file changes are needed.
 
 **Row layout and column styling.** A list row keeps `aj`'s column layout: a
-right-aligned metadata column (the command's category, muted), the label, and a
+right-aligned metadata column (the command's category, dim), the label, and a
 right-aligned shortcut column. `aj-next` diverges from `aj` on weight and the
 shortcut color. The label and the shortcut are drawn bold, not only on the
 selected row, and the shortcut uses a dedicated keybinding-hint color, `#275DD0`
@@ -500,7 +500,7 @@ Aligns with the plan's phases 5-9.
   leading `Notice` entries, so they become the normal leading rows once the
   splash is dismissed.
 - **E-10. List row styling and the keybinding-hint color. Resolved.** List rows
-  keep `aj`'s column layout (right-aligned muted category / metadata, label,
+  keep `aj`'s column layout (right-aligned dim category / metadata, label,
   right-aligned shortcut). `aj-next` draws the label and shortcut bold, and the
   shortcut in a new keybinding-hint palette token, `#275DD0` (RGB 39, 93, 208),
   added to the shared palette and both bundled themes (Spec D). The splash
