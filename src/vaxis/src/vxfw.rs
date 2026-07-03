@@ -68,6 +68,7 @@ mod sized_box;
 mod spinner;
 mod split_view;
 mod text;
+mod text_area;
 mod text_field;
 
 pub use crate::vxfw::app::{App, Options};
@@ -96,6 +97,7 @@ pub use crate::vxfw::sized_box::SizedBox;
 pub use crate::vxfw::spinner::Spinner;
 pub use crate::vxfw::split_view::{Constrain, SplitView};
 pub use crate::vxfw::text::{Overflow, Text, TextAlign, WidthBasis};
+pub use crate::vxfw::text_area::{ChordDoc, EditorTheme, PopupStyle, TextArea};
 pub use crate::vxfw::text_field::TextField;
 
 /// A reference-counted, interior-mutable handle to a widget.
