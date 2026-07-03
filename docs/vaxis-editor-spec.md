@@ -11,6 +11,13 @@ This is the largest single widget in the port and the main schedule risk, so it
 is phased. We preserve the full capability of the `aj-tui` `Editor`. We do not
 ship a cut-down input and call it done.
 
+**Not built yet.** `aj-next` currently runs on a stopgap single-line
+`vxfw::TextField` as its prompt input (`Shell.editor: Rc<RefCell<TextField>>`).
+`TextArea` (this spec) does not exist, so multi-line editing, history, paste
+markers, jump mode, and autocomplete are all missing from `aj-next` today.
+Building `TextArea` and swapping the shell's `TextField` for it is outstanding
+work, tracked by phases B1 to B3 below.
+
 ## Where it lives
 
 The widget lives in `vaxis::vxfw` as `TextArea` (the multi-line sibling of the

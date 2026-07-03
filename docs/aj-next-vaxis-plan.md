@@ -414,7 +414,9 @@ debug aids. It resolves the seam question raised in Spec A (A-3).
 
 - **The editor is the biggest single component.** The `aj-tui` editor is rich.
   Re-authoring it on vaxis (D6) is the largest widget-level task and a likely
-  schedule risk. Scope it early.
+  schedule risk. Scope it early. As of now `aj-next` still runs on the stopgap
+  single-line `TextField` and the `TextArea` port (Spec B) has not started, so it
+  is the main outstanding interactive-shell gap.
 
 - **Phase 3 (`SessionCore` extraction) is the riskiest refactor of `aj`.** It
   moves the lifecycle-truth sets out of the pump. Keep it isolated and lean on

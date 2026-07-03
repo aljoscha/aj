@@ -153,6 +153,14 @@ terminal-default cases the JSON schema already supports. `ColorMode` stays on
 capability). We do not pre-downsample in `aj-app`, so no color fidelity is lost
 at the boundary.
 
+A new `ThemeColor` token, `KeybindHint`, is added to the palette for the
+keybinding-hint accent that `aj-next`'s command palette shortcut column and splash
+`Ctrl+O` hint use (Spec E). It defaults to `#275DD0` (RGB 39, 93, 208) in both
+bundled themes and lives in the shared palette like every other token, so it
+resolves as a `ThemeRgb` and downsamples per backend. `aj` does not consume it
+today, but keeping it in the shared palette avoids a literal in `aj-next` and lets
+a user theme it.
+
 #### 2c. Footer data (`modes/interactive/footer_data.rs`)
 
 `AgentFooters`/`AgentFooter` are data-only (strings and scalars keyed by
