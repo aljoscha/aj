@@ -379,7 +379,7 @@ impl Builder for SettingRowBuilder {
 }
 
 /// Render one settings row: an override marker (project mode), the aligned
-/// `label  value` primary columns, and the dim description. On the cursored
+/// `label  value` primary columns, and the muted description. On the cursored
 /// row every cell carries the band background.
 fn build_setting_row(
     row: &SettingRow,

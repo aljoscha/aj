@@ -4819,11 +4819,30 @@ mod tests {
     /// A theme swap followed by `restyle` rebuilds the resolved styles:
     /// the overlay chrome and a widget's drawn colors change from the dark
     /// palette to the light one.
+    ///
+    /// The footer's base text is the faint attribute (theme-independent, the
+    /// same as `aj`'s `style::dim`), so to prove the footer re-resolves we
+    /// drive its context-usage into the Critical band, which colors the
+    /// percentage cell with the themed `error` color (different dark vs light).
     #[test]
     fn theme_swap_restyles_chrome_and_widgets() {
         let theme = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
+        let chat = Rc::new(RefCell::new(ChatState::new(
+            aj_agent::events::AgentSettings {
+                provider: "scripted".into(),
+                model_id: "scripted".into(),
+                thinking: "off".into(),
+                speed: "standard".into(),
+                verbosity: "default".into(),
+            },
+            200_000,
+            Arc::new(Vec::new()),
+        )));
+        chat.borrow_mut()
+            .footers_mut()
+            .set_context_tokens(aj_agent::events::AgentId::Main, 190_000);
         let shell = Rc::new(RefCell::new(Shell::new(
-            empty_chat(),
+            chat,
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
             theme.clone(),

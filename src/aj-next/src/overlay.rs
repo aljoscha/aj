@@ -232,7 +232,9 @@ impl OverlayChrome {
 }
 
 /// Pick-list row styles from the theme: the E-7 full-width band over
-/// `ThemeBg::SelectedBg` with normal text on top, and a dim secondary column.
+/// `ThemeBg::SelectedBg` with normal text on top, and a muted secondary column.
+/// The secondary column is the description column, which `aj` draws in `Muted`
+/// (`#808080`), distinct from the `Dim` (`#666666`) it uses for the subtitle.
 pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
     let mode = theme.color_mode();
     let fg = |token: ThemeColor| Style {
@@ -242,7 +244,7 @@ pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
     SelectStyles {
         selected_bg: vaxis_color(theme.bg_color(ThemeBg::SelectedBg), mode),
         label: fg(ThemeColor::Text),
-        secondary: fg(ThemeColor::Dim),
+        secondary: fg(ThemeColor::Muted),
     }
 }
 

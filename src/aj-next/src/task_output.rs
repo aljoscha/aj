@@ -30,6 +30,7 @@ use vaxis::vxfw::{
 
 use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_top};
 use crate::settings_ui::push_window;
+use crate::transcript::faint;
 
 /// PgUp/PgDn step, in rows. A fixed jump rather than a viewport-derived
 /// one keeps the widget from needing to know its drawn height.
@@ -381,7 +382,7 @@ pub(crate) fn open_task_output(
         id,
         command,
         chrome.select.label,
-        chrome.select.secondary,
+        faint(),
     )));
     {
         let stack_c = Rc::clone(stack);

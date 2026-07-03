@@ -41,6 +41,10 @@ pub(crate) struct TranscriptStyles {
     pub(crate) user: Style,
     pub(crate) thinking: Style,
     pub(crate) dim: Style,
+    /// Gray tint for the chat scrollbar thumb. This is aj-next chrome with no
+    /// `aj` counterpart (aj has no in-app scrollbar), so it stays a concrete
+    /// gray rather than the faint attribute `dim` carries.
+    pub(crate) scrollbar_thumb: Style,
     pub(crate) warning: Style,
     pub(crate) error: Style,
     pub(crate) success: Style,
@@ -60,6 +64,17 @@ pub(crate) struct TranscriptStyles {
     pub(crate) user_message_bg: Color,
 }
 
+/// The SGR-2 faint attribute over the default foreground: the exact analogue of
+/// `aj-tui`'s `style::dim`, which every dim transcript row, tool-cell detail, and
+/// background-task line uses. It is an attribute, not the `Dim` palette gray
+/// (`#666666`), so it tracks the terminal's own foreground the way `aj` does.
+pub(crate) fn faint() -> Style {
+    Style {
+        dim: true,
+        ..Style::default()
+    }
+}
+
 impl TranscriptStyles {
     pub(crate) fn from_theme(theme: &Theme) -> TranscriptStyles {
         let mode = theme.color_mode();
@@ -75,7 +90,8 @@ impl TranscriptStyles {
                 italic: true,
                 ..fg(ThemeColor::ThinkingText)
             },
-            dim: fg(ThemeColor::Dim),
+            dim: faint(),
+            scrollbar_thumb: fg(ThemeColor::Dim),
             warning: fg(ThemeColor::Warning),
             error: fg(ThemeColor::Error),
             success: fg(ThemeColor::Success),
@@ -464,8 +480,8 @@ fn apply_scrollbar_thumbs(bars: &mut ScrollBars<ListView>, styles: &TranscriptSt
         style,
         ..Cell::default()
     };
-    bars.vertical_scrollbar_thumb = thumb("\u{2590}", styles.dim);
-    bars.vertical_scrollbar_hover_thumb = thumb("\u{2588}", styles.dim);
+    bars.vertical_scrollbar_thumb = thumb("\u{2590}", styles.scrollbar_thumb);
+    bars.vertical_scrollbar_hover_thumb = thumb("\u{2588}", styles.scrollbar_thumb);
     bars.vertical_scrollbar_drag_thumb = thumb("\u{2588}", styles.text);
 }
 
