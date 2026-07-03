@@ -216,6 +216,15 @@ abstraction) is aj-tui-specific and is not ported. `aj-next` holds a concrete
 `Rc<RefCell<TextArea>>`. If pluggable editors are ever wanted, aj-next defines its
 own trait then.
 
+**Editing-chord descriptor table.** `TextArea` also exposes its fixed editing
+chords as a static descriptor list (key label, description, display group), an
+associated `fn bindings() -> &'static [ChordDoc]` rather than per-instance state.
+The help screen (Spec E) renders its "Editor shortcuts" section from this table,
+so the editor's own chords are the single source of truth for both the handler and
+the documentation and cannot drift. These chords are fixed and not rebindable, so
+the table is a plain constant, unlike the global chords the help resolves through
+the `Keymap` (Spec F).
+
 ## Height and scroll: constraint-based, not terminal-driven
 
 `aj-tui`'s `Editor` reads terminal rows off a `RenderHandle` to auto-size its
