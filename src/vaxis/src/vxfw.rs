@@ -55,6 +55,7 @@ mod button;
 mod center;
 mod flex_column;
 mod flex_row;
+mod keymap;
 mod list_view;
 mod loop_event;
 mod padding;
@@ -68,6 +69,7 @@ mod text;
 mod text_field;
 
 pub use crate::vxfw::app::{App, Options};
+pub use crate::vxfw::app_core::KeystrokeRecord;
 #[cfg(unix)]
 pub use crate::vxfw::async_app::{AsyncApp, Frame};
 pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
@@ -75,6 +77,10 @@ pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
 pub use crate::vxfw::flex_column::FlexColumn;
 pub use crate::vxfw::flex_row::FlexRow;
+pub use crate::vxfw::keymap::{
+    Activator, Binding, BindingPhase, DEFAULT_SEQUENCE_TIMEOUT_MS, Entry, Keymap, KeymapController,
+    SeqStep,
+};
 pub use crate::vxfw::list_view::{Builder, ListView, Source};
 pub use crate::vxfw::padding::{PadValues, Padding};
 pub use crate::vxfw::rich_text::{RichText, TextSpan};
@@ -129,6 +135,13 @@ pub trait Widget {
     /// only consider widgets that return true. Default false.
     fn wants_events(&self) -> bool {
         false
+    }
+
+    /// A short label for the dispatch-debug aids (the keystroke log, see
+    /// [`KeystrokeRecord`]). Defaults to the type name, so every widget has a
+    /// usable label for free and interesting ones override it.
+    fn debug_label(&self) -> &'static str {
+        std::any::type_name::<Self>()
     }
 }
 

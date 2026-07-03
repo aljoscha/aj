@@ -58,18 +58,27 @@ in the focus tree. It is generic over the action type `A` so `vaxis` carries no
 `aj` vocabulary.
 
 ```
-pub struct KeymapController<A> {
-    keymap: Keymap<A>,                 // compiled bindings -> action
+pub struct KeymapController<A, C> {
+    keymap: Keymap<A, C>,              // compiled bindings -> action
+    context: Rc<RefCell<C>>,           // host state the predicates read
     in_flight: Option<SequenceState>,  // the current leader sequence, if any
     on_action: Box<dyn FnMut(&mut EventContext, &A)>,
     child: WidgetRef,
 }
 
 struct SequenceState {
-    matched_prefix: Vec<Activator>,
+    pressed: Vec<Key>,                 // the keys pressed so far
     deadline: Instant,                 // scheduled via a vxfw Tick
 }
 ```
+
+The controller is generic over a host context type `C`, with predicates as
+plain `fn(&C) -> bool`, so vaxis carries no aj vocabulary. The state stores
+the pressed keys rather than matched activators. Activator matching is loose
+(text and shifted-codepoint equivalence), so one press can satisfy
+differently-spelled activators across candidate entries. Storing the keys and
+replaying the whole prefix on each advance keeps every candidate sequence
+alive.
 
 Behavior:
 
@@ -79,13 +88,23 @@ Behavior:
     reschedule the timeout Tick, consume. On no match, reset the sequence, then
     fall through so the key is dispatched normally (it may start a new sequence
     or reach the focused widget).
-  - Else, if `key` starts a sequence (is a registered prefix), begin the
-    sequence, schedule the timeout Tick, consume.
   - Else, if `key` matches a capture-phase (pre-empting) single binding whose
     context predicate is satisfied, fire the action, consume.
+  - Else, if `key` starts an enabled sequence (is a registered prefix), begin
+    the sequence, schedule the timeout Tick, consume.
 - `handle_event(key)` (bubble): the focused widget declined, so match `key`
   against bubble-phase bindings whose predicate is satisfied and fire, consume.
 - On the timeout Tick: cancel the in-flight sequence and clear its hint.
+
+An enabled capture single shadows a sequence start on the same activator. This
+is what lets the ladder's Cancel binding pre-empt the quit sequence while a
+turn runs, with the single's predicate selecting which applies.
+
+A completion wins immediately: if a key finishes one sequence while extending
+a longer one that shares the prefix, the finished sequence fires at once
+rather than waiting out the timeout to disambiguate, and the longer sequence
+is unreachable. Entry order breaks ties among sequences completing at the same
+step.
 
 The in-flight sequence renders a small hint (the partial chord and what it can
 complete to), matching the affordance users expect from a leader system.

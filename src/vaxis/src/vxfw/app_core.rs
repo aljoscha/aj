@@ -13,11 +13,13 @@
 //! [`MouseHandler`] owns `last_frame`. Because we own the `Surface` tree with
 //! plain `Vec`s, keeping it alive into the next frame is just holding the value.
 
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Instant;
 
 use crate::cell::CursorShape;
 use crate::error::Error;
+use crate::key::Key;
 use crate::mouse::Mouse;
 use crate::tty::Tty;
 use crate::vaxis::Vaxis;
@@ -325,6 +327,21 @@ pub(crate) fn surface_point(surface: &Surface, mouse: Mouse) -> Option<Point> {
     }
 }
 
+/// One entry in the keystroke log: which key went where, and who ate it.
+#[derive(Debug, Clone)]
+pub struct KeystrokeRecord {
+    /// The dispatched key press.
+    pub key: Key,
+    /// Root-first debug labels of the focus path the key walked.
+    pub path: Vec<&'static str>,
+    /// The debug label of the widget that consumed the key and the phase it
+    /// consumed it in, or `None` when the key fell through unconsumed.
+    pub consumed_by: Option<(&'static str, Phase)>,
+}
+
+/// How many keystroke records the focus handler retains.
+const KEYSTROKE_LOG_CAP: usize = 100;
+
 /// Maintains the path from the root to the focused widget and delivers focus
 /// events along it (capture down, at-target, bubble up).
 pub(crate) struct FocusHandler {
@@ -333,6 +350,14 @@ pub(crate) struct FocusHandler {
     /// Root-first path to the focused widget, rebuilt each frame by
     /// [`update`](FocusHandler::update).
     pub(crate) path_to_focused: Vec<WidgetRef>,
+    /// The dispatch-debug log of recent key presses, oldest first.
+    ///
+    /// TODO: a focus-inspector overlay that renders the focus tree and this
+    /// log with per-node handled markers. The record also still lacks the
+    /// "which controller action fired" slot the keymap spec calls for, which
+    /// needs a label channel from `KeymapController::fire` through the
+    /// `EventContext`. Both belong to the inspector work.
+    pub(crate) keystroke_log: VecDeque<KeystrokeRecord>,
 }
 
 impl FocusHandler {
@@ -341,6 +366,7 @@ impl FocusHandler {
             focused: Rc::clone(&root),
             root,
             path_to_focused: Vec::new(),
+            keystroke_log: VecDeque::new(),
         }
     }
 
@@ -402,14 +428,47 @@ impl FocusHandler {
 
     /// Delivers `event` along the focus path: capture root-to-target, at-target,
     /// then bubble target-exclusive back to root. Each phase stops on consume.
-    pub(crate) fn handle_event(&self, ctx: &mut EventContext, event: &Event) {
+    ///
+    /// Key presses are additionally recorded in the keystroke log with the
+    /// path they walked and where (if anywhere) they were consumed.
+    pub(crate) fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
         debug_assert!(!self.path_to_focused.is_empty());
 
+        let Event::KeyPress(key) = event else {
+            self.dispatch_along_path(ctx, event);
+            return;
+        };
+
+        // Collect the labels before dispatch: label borrows are transient, so
+        // they cannot be held across the mutable dispatch borrows below.
+        let path = self
+            .path_to_focused
+            .iter()
+            .map(|w| w.borrow().debug_label())
+            .collect();
+        let consumed_by = self.dispatch_along_path(ctx, event);
+        if self.keystroke_log.len() == KEYSTROKE_LOG_CAP {
+            self.keystroke_log.pop_front();
+        }
+        self.keystroke_log.push_back(KeystrokeRecord {
+            key: key.clone(),
+            path,
+            consumed_by,
+        });
+    }
+
+    /// The three-phase walk itself, returning the label and phase of the
+    /// consuming widget, if any.
+    fn dispatch_along_path(
+        &self,
+        ctx: &mut EventContext,
+        event: &Event,
+    ) -> Option<(&'static str, Phase)> {
         ctx.phase = Phase::Capturing;
         for widget in &self.path_to_focused {
             dispatch_capture(widget, ctx, event);
             if ctx.consume_event {
-                return;
+                return Some((widget.borrow().debug_label(), Phase::Capturing));
             }
         }
 
@@ -420,7 +479,7 @@ impl FocusHandler {
             .expect("focus path is non-empty");
         dispatch_event(target, ctx, event);
         if ctx.consume_event {
-            return;
+            return Some((target.borrow().debug_label(), Phase::AtTarget));
         }
 
         ctx.phase = Phase::Bubbling;
@@ -428,9 +487,10 @@ impl FocusHandler {
         for widget in self.path_to_focused[..target_idx].iter().rev() {
             dispatch_event(widget, ctx, event);
             if ctx.consume_event {
-                return;
+                return Some((widget.borrow().debug_label(), Phase::Bubbling));
             }
         }
+        None
     }
 }
 

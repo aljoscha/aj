@@ -36,7 +36,9 @@ use crate::error::Error;
 use crate::event_loop::{AsyncInput, async_input};
 use crate::tty::Tty;
 use crate::vaxis::Vaxis;
-use crate::vxfw::app_core::{AppCore, FocusHandler, MouseHandler, reset_event_state};
+use crate::vxfw::app_core::{
+    AppCore, FocusHandler, KeystrokeRecord, MouseHandler, reset_event_state,
+};
 use crate::vxfw::loop_event::LoopEvent;
 use crate::vxfw::{Event, EventContext, Options, UserEvent, WidgetRef};
 
@@ -359,6 +361,18 @@ impl AsyncApp {
         &mut self.core.vx
     }
 
+    /// The dispatch-debug log of recent key presses (the last ~100), oldest
+    /// first. Each record carries the focus path the key walked and where (if
+    /// anywhere) it was consumed.
+    pub fn keystroke_log(&self) -> impl Iterator<Item = &KeystrokeRecord> {
+        self.running
+            .as_ref()
+            .expect(NOT_INITIALIZED)
+            .focus
+            .keystroke_log
+            .iter()
+    }
+
     /// Runs `f` with the tty's buffered writer, for custom escape sequences.
     /// The caller flushes if the bytes must go out immediately.
     pub fn with_writer<R>(&mut self, f: impl FnOnce(&mut dyn Write) -> R) -> R {
@@ -485,6 +499,32 @@ mod tests {
         let screen = app.vaxis().screen.borrow();
         assert_eq!(screen.width, 100);
         assert_eq!(screen.height, 50);
+    }
+
+    #[tokio::test]
+    async fn keystroke_log_records_path_and_consumption() {
+        let (mut app, write_fd, _recorder, _root) = init_app().await;
+
+        write_all(&write_fd, b"ab");
+        for _ in 0..2 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+
+        let log: Vec<_> = app.keystroke_log().collect();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].key.codepoint, u32::from('a'));
+        assert_eq!(log[1].key.codepoint, u32::from('b'));
+        for record in log {
+            // The default debug label is the type name, which ends in the
+            // concrete widget type.
+            assert_eq!(record.path.len(), 1);
+            assert!(record.path[0].ends_with("Recorder"));
+            // The Recorder consumes key presses at-target.
+            let (label, phase) = record.consumed_by.expect("key was consumed");
+            assert!(label.ends_with("Recorder"));
+            assert_eq!(phase, crate::vxfw::Phase::AtTarget);
+        }
     }
 
     #[tokio::test]
