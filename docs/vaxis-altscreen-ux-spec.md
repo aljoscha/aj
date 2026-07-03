@@ -279,7 +279,10 @@ widget in `aj-next`.
 
 Across list overlays, metadata columns (a command's category, a usage row's
 provider) are right-aligned and drawn in a dim tone (`aj`'s dim prefix column),
-so the label column stays vertically aligned across rows. Read-only and
+so the label column stays vertically aligned across rows. The row description,
+the scroll-info line, and the no-match text are a step lighter, in `Muted`
+(`#808080`), the same split `aj` draws, so `aj-next` keeps the two grays distinct
+rather than collapsing them into one (Spec D). Read-only and
 scrollable overlays (help, usage, session info) scroll line by line with the
 configured up and down bindings (default `up` / `ctrl+p` and `down` / `ctrl+n`,
 resolved through the keymap so a rebind carries), on top of PageUp / PageDown /

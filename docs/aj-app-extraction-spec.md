@@ -161,6 +161,22 @@ resolves as a `ThemeRgb` and downsamples per backend. `aj` does not consume it
 today, but keeping it in the shared palette avoids a literal in `aj-next` and lets
 a user theme it.
 
+**Two token-parity gotchas for `aj-next`'s builders.** `aj` reaches for two
+different notions of "dim," and `aj-next` must keep them distinct to match:
+
+- `aj-tui`'s `style::dim` is the SGR-2 faint *attribute* (`\x1b[2m`), not a
+  color. `aj` draws its transcript-level dim rows with it: the footer, the header
+  session id, the per-turn token-usage line, info notices, the background-task
+  viewer rows, the pending-box detail, and the sub-agent stub. `aj-next`
+  reproduces these by setting the faint attribute on `vaxis::cell::Style`
+  (`Style { dim: true, .. }`) over the default foreground, not by substituting
+  the `Dim` palette gray (`#666666`), which is a visibly different color.
+- `ThemeColor::Dim` (`#666666`) and `ThemeColor::Muted` (`#808080`) are distinct
+  palette grays. `aj` uses `Dim` for the overlay subtitle, the list category /
+  prefix column, and the settings hint, and `Muted` for list descriptions,
+  scroll-info, no-match text, and the login progress line. `aj-next` keeps the
+  split rather than collapsing both into one gray (see Spec E).
+
 #### 2c. Footer data (`modes/interactive/footer_data.rs`)
 
 `AgentFooters`/`AgentFooter` are data-only (strings and scalars keyed by
