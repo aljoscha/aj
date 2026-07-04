@@ -12,6 +12,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod agent_picker;
+mod autocomplete;
 mod bubble;
 mod content_overlay;
 mod footer;

@@ -19,6 +19,8 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }
+ignore = { workspace = true }
+nucleo = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

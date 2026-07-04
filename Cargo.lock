@@ -155,6 +155,8 @@ dependencies = [
  "chrono",
  "clap",
  "dotenv",
+ "ignore",
+ "nucleo",
  "serde_json",
  "serial_test",
  "tempfile",

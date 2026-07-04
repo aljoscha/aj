@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -51,9 +52,10 @@ use tokio_util::sync::CancellationToken;
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    AsyncApp, DrawContext, EditorTheme, Event, EventContext, FilterableSelect, FlexColumn,
-    FlexItem, KeymapController, ListView, MaxSize, Options, RelativePoint, Size, SubSurface,
-    Surface, Text, TextArea, UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
+    AsyncApp, AutocompleteDelivery, DrawContext, EditorTheme, Event, EventContext,
+    FilterableSelect, FlexColumn, FlexItem, KeymapController, ListView, MaxSize, Options,
+    RelativePoint, Size, SubSurface, Surface, Text, TextArea, UserEvent, Widget, WidgetRef,
+    draw_widget, to_widget_ref,
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
@@ -2295,7 +2297,7 @@ impl Shell {
         queues: MessageQueues,
         theme: ThemeHandle,
         header: String,
-        cwd: String,
+        cwd: PathBuf,
     ) -> Shell {
         let submitted: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let editor = TextArea::new();
@@ -2308,6 +2310,20 @@ impl Shell {
                 *slot.borrow_mut() = Some(text.to_string());
             }));
         }
+        // Install the `@`-file autocomplete provider on the editor, rooted at
+        // the session's working directory. The cwd is per-process and stable
+        // across session switches, and the editor persists across session
+        // rebinds (`rebind` swaps only session-scoped handles, never the
+        // editor), so the provider is set once here and never reinstalled.
+        // Typing `/` at the empty prompt still opens the command palette (see
+        // `on_palette_trigger` below). There is no `/`- or `#`-completion
+        // provider, only `@`-file completion.
+        editor.borrow_mut().set_autocomplete_provider(Arc::new(
+            crate::autocomplete::CombinedAutocompleteProvider::new(cwd.clone()),
+        ));
+        // The footer shows the working directory as text. The provider owns the
+        // path itself.
+        let cwd_display = cwd.display().to_string();
         // Resolve the initial styles and chrome from a single snapshot of
         // the theme, then keep the handle for the runtime re-style path.
         let (styles, transcript, chrome) = {
@@ -2328,7 +2344,7 @@ impl Shell {
             Rc::clone(&chat),
             status,
             styles,
-            cwd,
+            cwd_display,
         )));
         // Slot order mirrors `aj`'s layout: header, chat (flex),
         // status, pending, editor, footer. The status and pending
@@ -2759,7 +2775,7 @@ pub async fn run(args: Args) -> Result<()> {
     let env_mode = ColorMode::detect();
     let theme = ThemeHandle::new(Theme::load_with_mode(&theme_name, env_mode));
     let header = format!("aj-next — {}", world.core.session_id);
-    let cwd = format!("{}", world.core.env.working_directory.display());
+    let cwd = world.core.env.working_directory.clone();
     let shell = Rc::new(RefCell::new(Shell::new(
         Rc::clone(&world.chat),
         Rc::clone(&world.status),
@@ -2812,6 +2828,20 @@ pub async fn run(args: Args) -> Result<()> {
     // the receiver after the one delivery, making its arm a no-op thereafter.
     let mut prompt_history_rx = Some(spawn_prompt_history_bootstrap(persistence.clone()));
 
+    // Take the editor's autocomplete delivery receiver once, before the
+    // session loop. The widget owns the async pipeline (it spawns the query
+    // task, staleness-guards deliveries by request id and buffer snapshot, and
+    // cancels on new input or dismiss). The host just drains this receiver in
+    // `drive` and redraws. The editor, and thus its delivery sender, persists
+    // across session rebinds, so the receiver is taken once here and threaded
+    // through every `drive` call.
+    let mut autocomplete_rx = shell
+        .borrow()
+        .editor
+        .borrow_mut()
+        .take_autocomplete_rx()
+        .expect("editor hands out its autocomplete receiver exactly once");
+
     // Outer session loop. Each iteration drives one session to completion;
     // a new-session or resume request exits `drive` with the matching
     // `SessionExit`, whereupon we tear the outgoing session down and build
@@ -2837,6 +2867,7 @@ pub async fn run(args: Args) -> Result<()> {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
+            &mut autocomplete_rx,
         )
         .await;
 
@@ -2963,6 +2994,7 @@ async fn drive(
     world: &mut World,
     theme_watch: &mut ThemeWatch,
     prompt_history_rx: &mut Option<UnboundedReceiver<Vec<String>>>,
+    autocomplete_rx: &mut UnboundedReceiver<AutocompleteDelivery>,
 ) -> Result<SessionExit> {
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
@@ -3107,6 +3139,20 @@ async fn drive(
                 if maybe_ping.is_some() {
                     app.request_redraw();
                 }
+            }
+
+            // --- Autocomplete delivery ---
+            // A completed one-shot query result or a streaming-session wake
+            // from the editor's autocomplete pipeline. The widget spawned the
+            // work and applies its own staleness guards inside
+            // `apply_autocomplete_delivery`. The host is the single drain
+            // point for the delivery channel (`draw` never drains), so this
+            // arm just forwards each delivery and repaints. A streaming
+            // `SessionProgressed` marker arrives here too and is routed
+            // internally, so no separate arm is needed.
+            Some(delivery) = autocomplete_rx.recv() => {
+                shell.borrow().editor.borrow_mut().apply_autocomplete_delivery(delivery);
+                app.request_redraw();
             }
 
             // --- OAuth login task finished ---
@@ -3281,6 +3327,14 @@ async fn drive(
         // loader an app event to arm its animation chain (the Shell
         // forwards it, see `Shell::capture_event`).
         let busy = sync_status(world);
+        // Advance the editor's autocomplete once per iteration. The delivery
+        // arm above wakes the loop as streaming matches and one-shot results
+        // land, but a narrowing keystroke re-scores an already-walked tree in
+        // place, which need not emit a fresh wake. Pumping here ticks the
+        // active session and rebuilds the popup from its latest snapshot. It is
+        // a no-op when no session is open. The widget still owns the pipeline,
+        // the host just drives the tick from its own loop.
+        shell.borrow().editor.borrow_mut().pump_autocomplete();
         sync_keymap_ctx(world, shell);
         // The close-all chord must not pre-empt the login dialog's own
         // Esc/Ctrl+C teardown, so mirror the login liveness into the
@@ -3422,7 +3476,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj-next".to_string(),
-            "/tmp".to_string(),
+            PathBuf::from("/tmp"),
         )))
     }
 
@@ -3455,7 +3509,90 @@ mod tests {
         (app, writer, shell, root)
     }
 
-    /// Build a [`World`] over a scripted provider through the real
+    /// Like [`init_app`], but roots the shell's editor autocomplete provider
+    /// at `cwd` so a filesystem-backed `@`-completion flow can be driven end to
+    /// end against a temp directory with known files.
+    async fn init_app_in_dir(
+        cwd: PathBuf,
+    ) -> (AsyncApp, PipeWriter, Rc<RefCell<Shell>>, WidgetRef) {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"\x1b[?c").expect("write DA1 reply");
+        let shell = Rc::new(RefCell::new(Shell::new(
+            empty_chat(),
+            Rc::new(RefCell::new(StatusState::default())),
+            MessageQueues::default(),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(
+                aj_app::theme::ColorMode::Truecolor,
+            )),
+            "aj-next".to_string(),
+            cwd,
+        )));
+        let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
+        let mut app = AsyncApp::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+            reader.into(),
+        );
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        (app, writer, shell, root)
+    }
+
+    /// Feed one byte to the app as the drive loop would, then pump the editor's
+    /// autocomplete like the drive loop does once per iteration. Yields and
+    /// sleeps a bounded number of times so the streaming walker and nucleo
+    /// matcher settle before the caller inspects the popup. Bounded so a stuck
+    /// session can never hang the test.
+    async fn type_and_settle_autocomplete(
+        app: &mut AsyncApp,
+        writer: &mut PipeWriter,
+        shell: &Rc<RefCell<Shell>>,
+        byte: u8,
+    ) {
+        writer.write_all(&[byte]).expect("write key byte");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        for _ in 0..80 {
+            tokio::task::yield_now().await;
+            shell.borrow().editor.borrow_mut().pump_autocomplete();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn at_file_autocomplete_end_to_end_through_the_shell() {
+        // End-to-end host wiring: `Shell::new` installs the `@`-file provider
+        // rooted at the session cwd, typing `@` opens the streaming popup, the
+        // narrowing keystrokes keep it, and Tab applies the fuzzy-matched path.
+        // We mirror the drive loop's per-iteration `pump_autocomplete` between
+        // keystrokes so the walker and matcher settle. Only `hello.md` matches
+        // `hel`, and it is a file, so Tab yields `@hello.md ` (trailing space).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("hello.md"), "hi").expect("write file");
+        std::fs::write(tmp.path().join("notes.txt"), "n").expect("write file");
+
+        let (mut app, mut writer, shell, _root) = init_app_in_dir(tmp.path().to_path_buf()).await;
+        assert!(!shell.borrow().editor.borrow().is_showing_autocomplete());
+
+        for byte in b"@hel" {
+            type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
+        }
+        assert!(
+            shell.borrow().editor.borrow().is_showing_autocomplete(),
+            "typing `@hel` opens the file-completion popup",
+        );
+        // `@` opens the file popup, not the `/`-command palette.
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "the command palette must not open on `@`",
+        );
+
+        type_and_settle_autocomplete(&mut app, &mut writer, &shell, b'\t').await;
+        assert_eq!(shell.borrow().editor.borrow().text(), "@hello.md ");
+        assert!(!shell.borrow().editor.borrow().is_showing_autocomplete());
+    }
+
     /// setup path (`build_initial_run_config` + `SessionCore::build`),
     /// with persistence and auth confined to a tempdir. The config layers
     /// default to empty with no project path (persistence is unavailable).
@@ -4229,7 +4366,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj-next".to_string(),
-            "/tmp".to_string(),
+            PathBuf::from("/tmp"),
         )));
         (world, shell)
     }
@@ -4252,7 +4389,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj-next".to_string(),
-            "/tmp".to_string(),
+            PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
         let mut app = AsyncApp::new(
@@ -5161,7 +5298,7 @@ mod tests {
             MessageQueues::default(),
             theme.clone(),
             "aj-next".to_string(),
-            "/tmp/project".to_string(),
+            PathBuf::from("/tmp/project"),
         )));
 
         let dark_border = shell.borrow().chrome.borrow().border;
@@ -5272,7 +5409,7 @@ mod tests {
             world.core.message_queues.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj-next".to_string(),
-            "/tmp".to_string(),
+            PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
         let (reader, mut writer) = std::io::pipe().expect("pipe");
