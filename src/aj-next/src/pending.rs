@@ -29,9 +29,15 @@ use crate::transcript::TranscriptStyles;
 /// the editor off-screen.
 const MAX_BODY_LINES: usize = 6;
 
-/// Display label of the edit gesture in the hint line. The plain Up
-/// arrow is an editor-level convention (`tui.editor.cursorUp` in aj's
-/// vocabulary), not an `aj.*` action, so it is spelled here.
+/// Display label of the edit gesture in the hint line: the editor's up key,
+/// which recalls the queued message for editing when the editor is empty.
+///
+/// Kept as a concise literal on purpose. The gesture is the editor's
+/// cursor-up keystroke, but the editor's chord table
+/// ([`vaxis::vxfw::TextArea::bindings`]) documents it with a verbose
+/// help-screen label (`↑ / Ctrl-P`) that overflows an inline hint. `aj`
+/// renders the concise `Up` here, resolved through its keybindings manager
+/// rather than the editor's fixed chords, so we spell the same concise label.
 const EDIT_KEY_LABEL: &str = "Up";
 
 /// Display label of the steer chord, resolved from the shared default

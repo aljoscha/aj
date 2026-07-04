@@ -29,7 +29,9 @@ use aj_app::settings::{
     ConfigLayers, ConfigTarget, FooterUpdate, MainConfirm, PersistAction, SpeedConfirm, SubConfirm,
 };
 use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_usage_summary};
-use aj_app::theme::{ColorMode, Theme, ThemeHandle, ThemeWatcherGuard, watch_user_theme};
+use aj_app::theme::{
+    ColorMode, Theme, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
+};
 use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn, turn_policy};
 use aj_conf::{
     Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
@@ -49,9 +51,9 @@ use tokio_util::sync::CancellationToken;
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
-    AsyncApp, DrawContext, Event, EventContext, FilterableSelect, FlexColumn, FlexItem,
-    KeymapController, ListView, MaxSize, Options, RelativePoint, Size, SubSurface, Surface, Text,
-    TextField, UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
+    AsyncApp, DrawContext, EditorTheme, Event, EventContext, FilterableSelect, FlexColumn,
+    FlexItem, KeymapController, ListView, MaxSize, Options, RelativePoint, Size, SubSurface,
+    Surface, Text, TextArea, UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
@@ -73,7 +75,7 @@ use crate::settings_ui::{
 };
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::open_task_output;
-use crate::transcript::{TranscriptStyles, TranscriptView};
+use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
 
 /// App-event name the drive loop posts after opening an overlay outside
 /// dispatch. The Shell handles it by moving focus onto the top overlay: the
@@ -715,9 +717,9 @@ fn sync_status(world: &World) -> bool {
 /// A queued message shows in the pending box (which reads the live
 /// queue snapshot at draw) and is delivered by the post-turn wake:
 /// `handle_turn_join` and the `AgentEnd` trigger in [`drain_events`]
-/// both spawn a wake when `message_queues.has_pending`. Editor
-/// history is not recorded here (the vaxis `TextField` has none yet,
-/// where `aj` records the queued text into its editor history).
+/// both spawn a wake when `message_queues.has_pending`. History is
+/// recorded by the callers (the drive loop and [`handle_steer`]), which
+/// own the editor.
 fn handle_submit(world: &mut World, text: String) {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
@@ -893,13 +895,15 @@ fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> bool {
     };
     let shell = shell.borrow();
     let mut editor = shell.editor.borrow_mut();
-    let current = editor.to_owned_slice();
+    let current = editor.text();
     let combined = if current.trim().is_empty() {
         text
     } else {
         format!("{text}\n\n{current}")
     };
-    editor.insert_slice_at_cursor(&combined);
+    // `set_text` replaces the document and drops the cursor at the end, the
+    // sensible spot to keep editing the yanked-plus-draft text.
+    editor.set_text(&combined);
     true
 }
 
@@ -909,13 +913,15 @@ fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> bool {
 /// nothing to steer yet, so a non-empty editor starts a normal turn.
 fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
     let target = world.chat.borrow().active_view();
-    // Draining the editor is right on every branch below: the queue
-    // and spawn paths clear it (matching `aj`), and the no-op branches
-    // only run when it was already empty.
+    // Read and clear the editor upfront: the queue and spawn branches both
+    // consume the draft (matching `aj`), and the promote/no-op branches only
+    // run when it was already empty, so clearing is right on every branch.
     let text = {
         let shell = shell.borrow();
         let mut editor = shell.editor.borrow_mut();
-        editor.to_owned_slice().trim().to_string()
+        let text = editor.text().trim().to_string();
+        editor.clear();
+        text
     };
     let busy = world.turn_cancels.contains_key(&target) || world.core.is_running(target);
     if busy {
@@ -923,8 +929,10 @@ fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
             world.core.message_queues.promote(target);
         } else {
             world.core.message_queues.append_steering(target, &text);
+            shell.borrow().editor.borrow_mut().add_to_history(&text);
         }
     } else if !text.is_empty() {
+        shell.borrow().editor.borrow_mut().add_to_history(&text);
         handle_submit(world, text);
     }
 }
@@ -1413,9 +1421,9 @@ fn apply_picker_outcome(
 /// typed. Recall does not submit, so the user can edit before sending.
 fn recall_into_editor(shell: &Rc<RefCell<Shell>>, text: &str) {
     let shell = shell.borrow();
-    let mut editor = shell.editor.borrow_mut();
-    editor.clear_retaining_capacity();
-    editor.insert_slice_at_cursor(text);
+    // `set_text` replaces the whole document and leaves the cursor at the end,
+    // so the recalled prompt is ready to edit before sending.
+    shell.editor.borrow_mut().set_text(text);
 }
 
 /// The viewed agent's current thinking level, from its footer entry, falling
@@ -2101,6 +2109,76 @@ fn spawn_session_scan(world: &World, tx: &UnboundedSender<Vec<SessionPreview>>) 
     });
 }
 
+/// Bootstrap the editor's prompt-history ring from the workspace's session
+/// logs on a blocking thread, delivering the entries (oldest-first) to the
+/// drive loop over the returned receiver.
+///
+/// The scan walks on-disk JSONL logs (blocking IO), so it runs off the loop
+/// and never delays first paint. We reuse the shared
+/// [`aj_session::workspace_history`] scanner (the same one the prompt-history
+/// overlay uses), capped at the editor's own [`TextArea::HISTORY_LIMIT`]
+/// since the ring keeps no more. The scanner returns entries newest-first;
+/// we reverse to oldest-first for [`TextArea::seed_history`], which splices
+/// them in beneath any prompts submitted this session so an Up press still
+/// reaches the most-recent live submission first.
+fn spawn_prompt_history_bootstrap(
+    persistence: ConversationPersistence,
+) -> UnboundedReceiver<Vec<String>> {
+    let (tx, rx) = unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        let mut entries: Vec<String> =
+            aj_session::workspace_history(&persistence, TextArea::HISTORY_LIMIT)
+                .into_iter()
+                .map(|e| e.text)
+                .collect();
+        entries.reverse();
+        let _ = tx.send(entries);
+    });
+    rx
+}
+
+/// Await the backgrounded prompt-history bootstrap. Mirrors [`recv_theme`]: an
+/// absent receiver (already delivered, so the drive loop cleared it) pends
+/// forever, making the `select!` arm a no-op once the ring is seeded.
+async fn recv_prompt_history(
+    rx: Option<&mut UnboundedReceiver<Vec<String>>>,
+) -> Option<Vec<String>> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The editor's visible-row cap from the terminal height, `aj`'s
+/// `max(5, floor(rows * 0.3))`. In `vxfw` the layout owns the height budget
+/// (the editor sizes to its constraints), so the host computes the cap from
+/// the current frame height and feeds it via
+/// [`TextArea::set_max_visible_rows`]. The editor then grows with content up
+/// to this many rows and scrolls beyond.
+fn editor_row_cap(terminal_rows: usize) -> usize {
+    // Integer multiply-then-divide floors naturally.
+    ((terminal_rows * 3) / 10).max(5)
+}
+
+/// Build the editor's border theme from the shared palette (Spec D structured
+/// colors), the same way the other chrome resolves its styles.
+///
+/// `aj` tints the editor border by the agent's thinking level (and a bash
+/// mode), resolving through a live theme closure. We render the border with
+/// the thinking-off token statically, which matches `aj`'s un-tinted default
+/// (`thinkingOff` and `borderMuted` share a value in the bundled themes).
+///
+/// TODO(aljoscha): tint the border by thinking level via
+/// [`TextArea::set_border_color`], recomputed on thinking changes and session
+/// installs, to reach full parity with `aj`'s editor border.
+fn editor_theme_from_theme(theme: &Theme) -> EditorTheme {
+    let mode = theme.color_mode();
+    EditorTheme {
+        border_color: vaxis_color(theme.fg_color(ThemeColor::ThinkingOff), mode),
+        ..EditorTheme::default()
+    }
+}
+
 /// The shared handles the drive loop hands to a config-editing overlay's open
 /// function. Gathered from the shell in one borrow so the open call site never
 /// holds a shell borrow across it.
@@ -2138,7 +2216,7 @@ struct Shell {
     /// loop's per-iteration sync (see [`sync_keymap_ctx`]).
     keymap_ctx: Rc<RefCell<HostCtx>>,
     /// Typed handle to the editor so `Init` can focus it.
-    editor: Rc<RefCell<TextField>>,
+    editor: Rc<RefCell<TextArea>>,
     /// Typed handle to the loader line so host-posted app events (the
     /// busy-edge wake, see [`drive`]) reach it. The loader is not on
     /// the focus path, so the Shell forwards from its capturing phase.
@@ -2220,10 +2298,10 @@ impl Shell {
         cwd: String,
     ) -> Shell {
         let submitted: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let editor = Rc::new(RefCell::new(TextField::new()));
+        let editor = TextArea::new();
         {
             let slot = Rc::clone(&submitted);
-            // The TextField clears itself on submit. A busy-agent
+            // The editor clears itself on submit. A busy-agent
             // submit is queued (not restored), so the clear is right
             // either way.
             editor.borrow_mut().on_submit = Some(Box::new(move |_ctx, text| {
@@ -2236,6 +2314,7 @@ impl Shell {
             let t = theme.read();
             let styles = Rc::new(TranscriptStyles::from_theme(&t));
             let transcript = Rc::new(RefCell::new(TranscriptView::new(Rc::clone(&chat), &t)));
+            editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
             (styles, transcript, OverlayChrome::from_theme(&t))
         };
         let chrome = Rc::new(RefCell::new(chrome));
@@ -2345,6 +2424,29 @@ impl Shell {
                 }
             })
         };
+        // The `/`-at-empty-prompt palette trigger. The editor swallows the
+        // `/` and fires this instead of inserting it, opening the same
+        // palette the global `PaletteOpen` chord (Ctrl+O) opens. The two
+        // never double-fire: `/` reaches the editor at target/bubble while
+        // the chord matches in the controller's capture phase, and the
+        // editor only fires the trigger for a lone `/`.
+        {
+            let overlays_c = Rc::clone(&overlays);
+            let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
+            let chrome_c = Rc::clone(&chrome);
+            let command_slot_c = Rc::clone(&command_slot);
+            let fetch_slot_c = Rc::clone(&fetch_slot);
+            editor.borrow_mut().on_palette_trigger = Some(Box::new(move |ctx| {
+                open_palette(
+                    &overlays_c,
+                    &editor_widget,
+                    &chrome_c,
+                    &command_slot_c,
+                    &fetch_slot_c,
+                    ctx,
+                );
+            }));
+        }
         let keymap =
             KeymapController::new(build_keymap(), Rc::clone(&keymap_ctx), layout, on_action);
 
@@ -2468,11 +2570,24 @@ impl Shell {
         self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
         self.pending.borrow_mut().set_styles(Rc::clone(&styles));
         self.footer.borrow_mut().set_styles(styles);
+        self.editor
+            .borrow_mut()
+            .set_theme(editor_theme_from_theme(&t));
         let chrome = OverlayChrome::from_theme(&t);
         if let Some(ui) = self.settings_ui.borrow().as_ref() {
             ui.restyle(&chrome);
         }
         *self.chrome.borrow_mut() = chrome;
+    }
+
+    /// Recompute the editor's visible-row cap for a `terminal_rows`-tall frame
+    /// and apply it. The layout owns the height budget (see [`editor_row_cap`]):
+    /// called once at startup and again on every resize so the editor's growth
+    /// ceiling tracks the terminal height.
+    fn set_editor_row_cap(&self, terminal_rows: usize) {
+        self.editor
+            .borrow_mut()
+            .set_max_visible_rows(Some(editor_row_cap(terminal_rows)));
     }
 
     /// Repoint the session-scoped handles a replace-contents swap can't
@@ -2682,6 +2797,21 @@ pub async fn run(args: Args) -> Result<()> {
     // source, so this is inert for `dark` / `light` with no override).
     let mut theme_watch = ThemeWatch::install(&theme_name);
 
+    // Seed the editor's visible-row cap from the startup frame height. The
+    // layout owns the editor's height budget; resizes recompute it inside
+    // `drive`.
+    shell
+        .borrow()
+        .set_editor_row_cap(usize::from(app.vaxis().window().height));
+
+    // Bootstrap the editor's prompt-history ring from the workspace's session
+    // logs. The scan runs off the loop (blocking IO) and `drive`'s seed arm
+    // installs the result once it lands, so a large backlog never delays first
+    // paint. Spawned once here, not per session: the editor persists across
+    // session switches, so re-seeding would duplicate entries. `drive` clears
+    // the receiver after the one delivery, making its arm a no-op thereafter.
+    let mut prompt_history_rx = Some(spawn_prompt_history_bootstrap(persistence.clone()));
+
     // Outer session loop. Each iteration drives one session to completion;
     // a new-session or resume request exits `drive` with the matching
     // `SessionExit`, whereupon we tear the outgoing session down and build
@@ -2700,7 +2830,15 @@ pub async fn run(args: Args) -> Result<()> {
     let run_result: Result<()> = loop {
         // Restore the terminal even when the loop exits with a render error,
         // otherwise the user is left stuck on the alt screen.
-        let exit = drive(&mut app, &root, &shell, &mut world, &mut theme_watch).await;
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+        )
+        .await;
 
         // Wind down the outgoing session's work on every exit path (quit,
         // fatal, or switch): kill the background-task tree before tearing
@@ -2824,6 +2962,7 @@ async fn drive(
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
     theme_watch: &mut ThemeWatch,
+    prompt_history_rx: &mut Option<UnboundedReceiver<Vec<String>>>,
 ) -> Result<SessionExit> {
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
@@ -2907,6 +3046,20 @@ async fn drive(
                 }
             }
 
+            // --- Prompt-history bootstrap seed ---
+            // The one-shot disk scan spawned at startup. `seed_history`
+            // splices the disk entries in beneath any prompts submitted this
+            // session, so an Up press still reaches the most-recent live
+            // submission first. We clear the receiver after any resolution so
+            // this arm pends forever afterward (the seed happens once).
+            maybe_seed = recv_prompt_history(prompt_history_rx.as_mut()) => {
+                if let Some(entries) = maybe_seed {
+                    shell.borrow().editor.borrow_mut().seed_history(&entries);
+                    app.request_redraw();
+                }
+                *prompt_history_rx = None;
+            }
+
             // --- Async read-only overlay fill ---
             maybe_fill = fetch_rx.recv() => {
                 if let Some((kind, rows)) = maybe_fill
@@ -2973,6 +3126,13 @@ async fn drive(
             event = app.next_input() => {
                 match event {
                     Some(event) => {
+                        // The layout owns the editor's height budget, so a
+                        // terminal resize recomputes the visible-row cap. We
+                        // read it off the event before `handle_input` consumes
+                        // it and applies the internal resize.
+                        if let Event::Winsize(ws) = &event {
+                            shell.borrow().set_editor_row_cap(usize::from(ws.rows));
+                        }
                         // Every global chord (the ctrl+c ladder, the
                         // toggles, the overlay openers) is matched by
                         // the keymap controller inside this dispatch.
@@ -2982,6 +3142,15 @@ async fn drive(
                             break Ok(SessionExit::Quit);
                         }
                         if let Some(text) = shell.borrow().take_submitted() {
+                            // Record the submitted prompt into the editor's
+                            // history ring, idle or busy (matching aj). The
+                            // text is already trimmed by the editor's submit;
+                            // `add_to_history` ignores a whitespace-only or
+                            // duplicate entry. In-session submissions stay the
+                            // most-recent entries an Up press reaches, with the
+                            // disk seed spliced in beneath (see
+                            // `spawn_prompt_history_bootstrap`).
+                            shell.borrow().editor.borrow_mut().add_to_history(&text);
                             handle_submit(world, text);
                         }
                         if let Some(action) = shell.borrow().take_host_action()
@@ -3223,6 +3392,8 @@ mod tests {
     use aj_app::chat::EntryKind;
     use clap::Parser;
     use tempfile::TempDir;
+    use vaxis::gwidth;
+    use vaxis::key::{Key, Modifiers};
     use vaxis::tty::TestTty;
     use vaxis::vxfw::{MaxSize, Size};
 
@@ -3323,7 +3494,7 @@ mod tests {
         assert!(!frame.quit);
         assert!(app.needs_redraw());
         // Init focused the editor, so the typed grapheme landed there.
-        assert_eq!(shell.borrow().editor.borrow().graphemes_before_cursor(), 1);
+        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 1));
     }
 
     #[tokio::test]
@@ -3337,8 +3508,155 @@ mod tests {
         }
 
         assert_eq!(shell.borrow().take_submitted().as_deref(), Some("hi"));
-        // The TextField cleared itself on submit.
-        assert_eq!(shell.borrow().editor.borrow().graphemes_before_cursor(), 0);
+        // The editor cleared itself on submit.
+        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 0));
+        assert_eq!(shell.borrow().editor.borrow().text(), "");
+    }
+
+    /// Shift+Enter inserts a newline into the multi-line editor rather than
+    /// submitting: the document grows a line and the text carries the `\n`.
+    #[tokio::test]
+    async fn shift_enter_inserts_a_newline_in_the_editor() {
+        let (_app, _writer, shell, _root) = init_app().await;
+        let mut ctx = EventContext::new();
+        {
+            let shell = shell.borrow();
+            let mut editor = shell.editor.borrow_mut();
+            editor.insert_at_cursor("line1");
+            editor.handle_event(
+                &mut ctx,
+                &Event::KeyPress(Key {
+                    codepoint: Key::ENTER,
+                    mods: Modifiers::SHIFT,
+                    ..Key::default()
+                }),
+            );
+            editor.insert_at_cursor("line2");
+        }
+        let editor = shell.borrow().editor.borrow().text();
+        assert_eq!(editor, "line1\nline2");
+        assert_eq!(shell.borrow().editor.borrow().cursor(), (1, 5));
+    }
+
+    /// History up recalls a seeded entry, newest first, without submitting.
+    #[tokio::test]
+    async fn history_up_recalls_a_seeded_entry() {
+        let (_app, _writer, shell, _root) = init_app().await;
+        shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .seed_history(&["older".to_string(), "newer".to_string()]);
+
+        let up = || {
+            let mut ctx = EventContext::new();
+            shell.borrow().editor.borrow_mut().handle_event(
+                &mut ctx,
+                &Event::KeyPress(Key {
+                    codepoint: Key::UP,
+                    mods: Modifiers::empty(),
+                    ..Key::default()
+                }),
+            );
+        };
+        up();
+        assert_eq!(shell.borrow().editor.borrow().text(), "newer");
+        up();
+        assert_eq!(shell.borrow().editor.borrow().text(), "older");
+    }
+
+    /// A submitted prompt is recorded into the editor's history ring by the
+    /// drive loop's submit path, so a later Up press recalls it. Drives the
+    /// real submit through the app so the record site (not a test shortcut)
+    /// runs.
+    #[tokio::test]
+    async fn submit_records_into_history_and_up_recalls_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        // Type "recall me" and submit with CR. The loop pumps input events
+        // until the editor's submit lands.
+        writer.write_all(b"recall me\r").expect("write prompt");
+        loop {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+            // Mirror the drive loop's submit path: record then spawn.
+            if let Some(text) = shell.borrow().take_submitted() {
+                shell.borrow().editor.borrow_mut().add_to_history(&text);
+                handle_submit(&mut world, text);
+                break;
+            }
+        }
+        assert_eq!(shell.borrow().editor.borrow().text(), "");
+
+        // Up recalls the just-submitted prompt.
+        let mut ctx = EventContext::new();
+        shell.borrow().editor.borrow_mut().handle_event(
+            &mut ctx,
+            &Event::KeyPress(Key {
+                codepoint: Key::UP,
+                mods: Modifiers::empty(),
+                ..Key::default()
+            }),
+        );
+        assert_eq!(shell.borrow().editor.borrow().text(), "recall me");
+
+        // Settle the turn so world teardown is clean.
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// The visible-row cap bounds the editor's drawn height: with more content
+    /// lines than the cap, the editor draws exactly `cap + 2` rows (the two
+    /// border rules) and scrolls the rest.
+    #[test]
+    fn height_cap_bounds_the_editor_growth() {
+        let shell = test_shell_with_chat(empty_chat());
+        let cap = 3;
+        {
+            let shell = shell.borrow();
+            let mut editor = shell.editor.borrow_mut();
+            editor.set_max_visible_rows(Some(cap));
+            editor.insert_at_cursor(
+                &(1..=20)
+                    .map(|n| format!("line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(40),
+                height: Some(100),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+        let surface = shell.borrow().editor.borrow_mut().draw(&ctx);
+        assert_eq!(
+            surface.size.height,
+            u16::try_from(cap + 2).unwrap(),
+            "the cap plus the two border rows bound the editor height"
+        );
+    }
+
+    /// `editor_row_cap` matches aj's `max(5, floor(rows * 0.3))`, with the
+    /// floor of 5 on short terminals.
+    #[test]
+    fn editor_row_cap_matches_the_policy() {
+        assert_eq!(editor_row_cap(0), 5);
+        assert_eq!(editor_row_cap(24), 7);
+        assert_eq!(editor_row_cap(10), 5);
+        assert_eq!(editor_row_cap(50), 15);
     }
 
     /// The tools-expand chord (alt+o) flips the chat model's flag through
@@ -3355,8 +3673,8 @@ mod tests {
         app.handle_input(event);
         assert!(chat.borrow().tools_expanded);
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            0,
+            shell.borrow().editor.borrow().cursor(),
+            (0, 0),
             "the chord never reached the editor"
         );
 
@@ -3365,7 +3683,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert!(chat.borrow().tools_expanded, "unchanged by plain typing");
-        assert_eq!(shell.borrow().editor.borrow().graphemes_before_cursor(), 1);
+        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 1));
     }
 
     /// The thinking toggle (alt+t) flips thinking-block visibility, per
@@ -3419,8 +3737,8 @@ mod tests {
             Some(AjAction::AgentPickerOpen)
         );
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            0,
+            shell.borrow().editor.borrow().cursor(),
+            (0, 0),
             "none of the chords leaked into the editor"
         );
     }
@@ -3539,8 +3857,8 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            1,
+            shell.borrow().editor.borrow().cursor(),
+            (0, 1),
             "focus is back in the editor"
         );
     }
@@ -3964,13 +4282,13 @@ mod tests {
             .borrow()
             .editor
             .borrow_mut()
-            .insert_slice_at_cursor("steer this");
+            .insert_at_cursor("steer this");
         handle_host_action(&mut world, &shell, AjAction::Steer);
         let snapshot = world.core.message_queues.snapshot(AgentId::Main);
         assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
         assert_eq!(snapshot.text, "steer this");
         assert_eq!(
-            shell.borrow().editor.borrow_mut().to_owned_slice(),
+            shell.borrow().editor.borrow().text(),
             "",
             "the steered text left the editor"
         );
@@ -4009,7 +4327,7 @@ mod tests {
             .borrow()
             .editor
             .borrow_mut()
-            .insert_slice_at_cursor("hi there");
+            .insert_at_cursor("hi there");
         handle_host_action(&mut world, &shell, AjAction::Steer);
         assert!(
             world.turn_cancels.contains_key(&AgentId::Main),
@@ -4055,14 +4373,10 @@ mod tests {
             "queued line"
         );
 
-        shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .insert_slice_at_cursor("draft");
+        shell.borrow().editor.borrow_mut().insert_at_cursor("draft");
         assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
         assert_eq!(
-            shell.borrow().editor.borrow_mut().to_owned_slice(),
+            shell.borrow().editor.borrow().text(),
             "queued line\n\ndraft"
         );
         assert!(!world.core.message_queues.has_pending(AgentId::Main));
@@ -4087,7 +4401,7 @@ mod tests {
 
         assert!(handle_host_action(&mut world, &shell, AjAction::CancelTurn));
         assert_eq!(
-            shell.borrow().editor.borrow_mut().to_owned_slice(),
+            shell.borrow().editor.borrow().text(),
             "second",
             "the queued follow-up came back to the editor"
         );
@@ -4357,8 +4671,8 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            0,
+            shell.borrow().editor.borrow().cursor(),
+            (0, 0),
             "typed key went to the palette filter, not the editor"
         );
 
@@ -4373,8 +4687,8 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            1,
+            shell.borrow().editor.borrow().cursor(),
+            (0, 1),
             "focus is back in the editor"
         );
     }
@@ -4411,8 +4725,8 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            1,
+            shell.borrow().editor.borrow().cursor(),
+            (0, 1),
             "focus is back in the editor"
         );
     }
@@ -4469,8 +4783,8 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            1,
+            shell.borrow().editor.borrow().cursor(),
+            (0, 1),
             "focus is back in the editor"
         );
     }
@@ -5598,8 +5912,8 @@ mod tests {
         // does with the parked recall).
         recall_into_editor(&shell, &text);
         assert_eq!(
-            shell.borrow().editor.borrow().graphemes_before_cursor(),
-            u16::try_from("add a test".chars().count()).unwrap(),
+            shell.borrow().editor.borrow().cursor(),
+            (0, "add a test".chars().count()),
             "the recalled prompt is in the editor"
         );
     }
