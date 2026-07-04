@@ -284,9 +284,10 @@ fn entry_spans(
             for block in &a.message.content {
                 let block_span = match block {
                     AssistantContent::Text(t) => span(t.text.clone(), styles.text),
-                    AssistantContent::Thinking(t) if t.redacted => {
-                        span(format!("[Redacted thinking: {}]", t.thinking), styles.dim)
-                    }
+                    AssistantContent::Thinking(t) if t.redacted => span(
+                        format!("[Redacted thinking: {}]", t.thinking),
+                        styles.thinking,
+                    ),
                     AssistantContent::Thinking(_) if hide_thinking => {
                         span("Thinking…".to_string(), styles.thinking)
                     }
