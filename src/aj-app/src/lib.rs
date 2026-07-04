@@ -29,6 +29,7 @@ pub mod diff;
 pub mod export;
 pub mod footer;
 pub mod keybindings;
+pub mod markdown;
 pub mod model;
 pub mod print;
 pub mod scripted;

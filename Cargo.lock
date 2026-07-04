@@ -86,6 +86,7 @@ dependencies = [
  "iana-time-zone",
  "image",
  "notify",
+ "pulldown-cmark",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -95,6 +96,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
