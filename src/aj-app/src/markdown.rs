@@ -19,9 +19,8 @@
 //! Scope. This layer renders prose (headings, paragraphs, inline
 //! emphasis, inline code, links), fenced/indented code blocks with
 //! syntect-driven syntax highlighting, lists (ordered and unordered,
-//! nested), blockquotes, and top-level horizontal rules. Tables parse
-//! into the AST but render through a content-preserving fallback for now
-//! (see [`render_block`]).
+//! nested), blockquotes, top-level horizontal rules, and GFM tables as
+//! their native box-drawing column layout (see [`render_table`]).
 
 use std::sync::OnceLock;
 
@@ -41,8 +40,6 @@ use unicode_width::UnicodeWidthStr;
 /// Semantic role of a rendered span. Frontends map each kind onto their
 /// own palette (heading color, inline-code background, link color, and so
 /// on). The full set is fixed here so backends can match exhaustively.
-/// Every kind but the table pair is emitted today. `TableBorder` and
-/// `TableCell` are reserved until native table layout lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanKind {
     /// Plain body text.
@@ -346,21 +343,12 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
         Block::UnorderedList(items) => render_list(items, false, 0, width, opts),
         Block::OrderedList(items) => render_list(items, true, 0, width, opts),
         Block::Blockquote(sub_blocks) => render_blockquote(sub_blocks, width, opts),
-        // TODO(aljoscha): a3 renders tables as their native column layout.
-        // Until then we render the raw table source as prose so nothing is
-        // dropped, at the cost of the surrounding chrome.
-        Block::Table { raw, .. } => {
-            let mut spans = Vec::new();
-            render_inlines(
-                &[Inline::Text(raw.clone())],
-                SpanKind::Text,
-                opts.default_emphasis,
-                None,
-                opts,
-                &mut spans,
-            );
-            vec![spans]
-        }
+        Block::Table {
+            headers,
+            alignments,
+            rows,
+            raw,
+        } => render_table(headers, alignments, rows, raw, width, opts),
     }
 }
 
@@ -510,6 +498,347 @@ fn render_blockquote(
         rows.push(row);
     }
     rows
+}
+
+// ---------------------------------------------------------------------------
+// Table rendering
+// ---------------------------------------------------------------------------
+
+/// Upper bound on a column's minimum width. A column floor is the longest
+/// unbreakable token it holds, clamped to this many columns so one overlong
+/// token (a URL, hash, or identifier) can't pin the column to its full
+/// width and starve its neighbours. Tokens past the cap are hard-broken by
+/// the shared wrap.
+const MAX_UNBROKEN_TOKEN_WIDTH: usize = 30;
+
+/// Render a GFM table into logical rows of styled spans (pre-wrap).
+///
+/// Layout is box-drawing chrome around per-column cells: a top border, the
+/// header row, a separator rule, the body rows (each pair split by a rule),
+/// and a bottom border. Border and junction glyphs carry
+/// [`SpanKind::TableBorder`] and cell text [`SpanKind::TableCell`], both of
+/// which a frontend paints in the base text color, so the box reads as
+/// plain chrome rather than styled content.
+///
+/// The produced rows are already sized to `width`, so the outer wrap pass
+/// in [`render_markdown`] is a no-op on them, the same as it is on a
+/// blockquote's bordered rows. We therefore emit no trailing blank spacer:
+/// the outer loop owns the single inter-block blank, like every other
+/// [`render_block`] arm.
+fn render_table(
+    headers: &[Vec<Inline>],
+    alignments: &[Alignment],
+    rows: &[Vec<Vec<Inline>>],
+    raw: &str,
+    width: usize,
+    opts: &RenderOpts,
+) -> Vec<Vec<StyledSpan>> {
+    let n_cols = alignments.len();
+    if n_cols == 0 {
+        return vec![Vec::new()];
+    }
+
+    // Border overhead per column: its left border plus the two padding
+    // columns around the cell (3 columns), plus one for the final right
+    // border. Whatever is left is the budget the cells share.
+    let chrome = 3 * n_cols + 1;
+    let available_for_cells = width.saturating_sub(chrome);
+
+    // Narrow fallback: when the budget can't fit even one column per cell, a
+    // bordered table would render broken (a border wider than its content,
+    // or zero-width cells). Fall back to the raw source as prose so no
+    // content is dropped. We return it as one logical line and let the outer
+    // wrap break it to width, exactly as a paragraph renders.
+    if available_for_cells < n_cols {
+        let mut spans = Vec::new();
+        render_inlines(
+            &[Inline::Text(raw.to_string())],
+            SpanKind::Text,
+            opts.default_emphasis,
+            None,
+            opts,
+            &mut spans,
+        );
+        return vec![spans];
+    }
+
+    // Pre-render each cell to spans once so width measurement and the later
+    // wrap share the same content. Cells are paragraph-level independent
+    // (like list items), so they inherit no `default_emphasis` and their
+    // plain text runs are tagged `TableCell`.
+    let header_cells: Vec<Vec<StyledSpan>> = headers.iter().map(|c| render_cell(c, opts)).collect();
+    let body_cells: Vec<Vec<Vec<StyledSpan>>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| render_cell(c, opts)).collect())
+        .collect();
+
+    // Per-column natural width (max visible cell width, uncapped) and
+    // minimum width (longest unbreakable token, capped at
+    // `MAX_UNBROKEN_TOKEN_WIDTH`, floored at 1). `natural` stays uncapped so
+    // short content still gets its preferred width. The cap on `minimum`
+    // keeps an overlong token from pinning the column and starving its
+    // neighbours.
+    let mut natural = vec![0usize; n_cols];
+    let mut minimum = vec![1usize; n_cols];
+    for col in 0..n_cols {
+        if let Some(cell) = header_cells.get(col) {
+            let text = cell_plain_text(cell);
+            natural[col] = natural[col].max(display_width(&text));
+            minimum[col] =
+                minimum[col].max(longest_token_width(&text).min(MAX_UNBROKEN_TOKEN_WIDTH));
+        }
+        for row in &body_cells {
+            if let Some(cell) = row.get(col) {
+                let text = cell_plain_text(cell);
+                natural[col] = natural[col].max(display_width(&text));
+                minimum[col] =
+                    minimum[col].max(longest_token_width(&text).min(MAX_UNBROKEN_TOKEN_WIDTH));
+            }
+        }
+    }
+
+    // Past the fallback gate `available_for_cells >= n_cols >= 1`, so the
+    // distribution always sees a usable budget.
+    let widths = distribute_column_widths(&natural, &minimum, available_for_cells);
+
+    let separator = make_border_row(&widths, '├', '┼', '┤');
+    let mut out: Vec<Vec<StyledSpan>> = Vec::new();
+    out.push(make_border_row(&widths, '┌', '┬', '┐'));
+    out.extend(render_table_row(&header_cells, &widths, alignments));
+    out.push(separator.clone());
+    for (idx, row) in body_cells.iter().enumerate() {
+        // A rule between consecutive body rows matches the header separator,
+        // so every row reads as its own boxed cell.
+        if idx > 0 {
+            out.push(separator.clone());
+        }
+        out.extend(render_table_row(row, &widths, alignments));
+    }
+    out.push(make_border_row(&widths, '└', '┴', '┘'));
+    out
+}
+
+/// Render a table cell's inlines to spans. Plain text runs are tagged
+/// [`SpanKind::TableCell`] and inherit no `default_emphasis`.
+fn render_cell(inlines: &[Inline], opts: &RenderOpts) -> Vec<StyledSpan> {
+    let mut spans = Vec::new();
+    render_inlines(
+        inlines,
+        SpanKind::TableCell,
+        Emphasis::default(),
+        None,
+        opts,
+        &mut spans,
+    );
+    spans
+}
+
+/// Visible text of a pre-rendered cell, used only for column-width math.
+fn cell_plain_text(cell: &[StyledSpan]) -> String {
+    cell.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// Width of the longest whitespace-delimited token in `text`. Callers cap
+/// this at [`MAX_UNBROKEN_TOKEN_WIDTH`] when deriving a column floor, so up
+/// to the cap a column stays wide enough to hold its longest token without
+/// mid-token wrapping.
+fn longest_token_width(text: &str) -> usize {
+    text.split_whitespace()
+        .map(display_width)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Distribute `available` columns of cell width across `natural.len()`
+/// columns, given each column's `natural` (preferred) width and `minimum`
+/// (floor) width.
+///
+/// The allocation proceeds in two stages:
+///
+/// 1. Effective minimums. Start from the per-column `minimum`. If their sum
+///    already exceeds `available`, the table is narrower than its floors:
+///    collapse every column to width 1 and hand the remaining budget out
+///    proportional to each column's `minimum - 1` weight (leftover
+///    distributed one column at a time).
+/// 2. Widths. If every column's `natural` width fits
+///    (`sum(natural) <= available`), give each column
+///    `max(natural, effective_min)`. Otherwise floor each column at its
+///    effective minimum and distribute the leftover budget proportional to
+///    each column's growth potential (`natural - effective_min`), then hand
+///    out any rounding remainder one column at a time to columns still below
+///    their natural width.
+fn distribute_column_widths(natural: &[usize], minimum: &[usize], available: usize) -> Vec<usize> {
+    let n = natural.len();
+
+    // Stage 1: effective minimums.
+    let mut min_widths = minimum.to_vec();
+    let min_total: usize = min_widths.iter().sum();
+    if min_total > available {
+        min_widths = vec![1; n];
+        let remaining = available.saturating_sub(n);
+        if remaining > 0 {
+            let total_weight: usize = minimum.iter().map(|m| m.saturating_sub(1)).sum();
+            let mut allocated = 0_usize;
+            if total_weight > 0 {
+                for i in 0..n {
+                    let weight = minimum[i].saturating_sub(1);
+                    let add = weight * remaining / total_weight;
+                    min_widths[i] += add;
+                    allocated += add;
+                }
+            }
+            let mut leftover = remaining - allocated;
+            for w in min_widths.iter_mut() {
+                if leftover == 0 {
+                    break;
+                }
+                *w += 1;
+                leftover -= 1;
+            }
+        }
+    }
+    let min_cells_width: usize = min_widths.iter().sum();
+
+    // Stage 2: widths.
+    let natural_total: usize = natural.iter().sum();
+    if natural_total <= available {
+        return (0..n).map(|i| natural[i].max(min_widths[i])).collect();
+    }
+
+    let total_grow_potential: usize = (0..n)
+        .map(|i| natural[i].saturating_sub(min_widths[i]))
+        .sum();
+    let extra_width = available.saturating_sub(min_cells_width);
+    let mut widths: Vec<usize> = (0..n)
+        .map(|i| {
+            let delta = natural[i].saturating_sub(min_widths[i]);
+            let grow = if total_grow_potential > 0 {
+                delta * extra_width / total_grow_potential
+            } else {
+                0
+            };
+            min_widths[i] + grow
+        })
+        .collect();
+
+    // Round-off: hand out the remaining budget one column at a time to any
+    // column still below its natural width.
+    let allocated: usize = widths.iter().sum();
+    let mut remaining = available.saturating_sub(allocated);
+    while remaining > 0 {
+        let mut grew = false;
+        for i in 0..n {
+            if remaining == 0 {
+                break;
+            }
+            if widths[i] < natural[i] {
+                widths[i] += 1;
+                remaining -= 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    widths
+}
+
+/// Build a horizontal rule spanning the table with the given corner and
+/// junction glyphs: `left` at the start, `mid` between columns, `right` at
+/// the end. The fill is `─`, sized to each column width plus its two padding
+/// columns so it lines up with the `│ … │` content rows. The whole rule is
+/// one [`SpanKind::TableBorder`] span.
+fn make_border_row(widths: &[usize], left: char, mid: char, right: char) -> Vec<StyledSpan> {
+    let mut border = String::new();
+    border.push(left);
+    for (idx, w) in widths.iter().enumerate() {
+        if idx > 0 {
+            border.push(mid);
+        }
+        // The two padding columns become `─` too, so the rule matches the
+        // width of the `│ … │` rows.
+        for _ in 0..(w + 2) {
+            border.push('─');
+        }
+    }
+    border.push(right);
+    vec![StyledSpan::plain(border, SpanKind::TableBorder)]
+}
+
+/// Render one header or body row into visual rows.
+///
+/// Each cell's spans wrap independently to its column width. A cell taller
+/// than the others (its content wrapped to more visual lines) makes the row
+/// span multiple lines. Shorter cells are blank-padded on the extra lines so
+/// the `│` borders stay aligned down the row. The `│` separators carry
+/// [`SpanKind::TableBorder`]. The single spaces framing each cell are plain
+/// `Text` (invisible either way).
+fn render_table_row(
+    cells: &[Vec<StyledSpan>],
+    widths: &[usize],
+    alignments: &[Alignment],
+) -> Vec<Vec<StyledSpan>> {
+    let n = widths.len();
+    let wrapped_per_cell: Vec<Vec<MarkdownRow>> = (0..n)
+        .map(|c| {
+            let empty = Vec::new();
+            let spans = cells.get(c).unwrap_or(&empty);
+            // A zero-width column holds a single empty line: the shared wrap
+            // makes no progress at width 0, so we short-circuit it.
+            if widths[c] == 0 {
+                vec![Vec::new()]
+            } else {
+                wrap_spans(spans, widths[c])
+            }
+        })
+        .collect();
+
+    let max_lines = wrapped_per_cell.iter().map(Vec::len).max().unwrap_or(1);
+
+    let mut out: Vec<Vec<StyledSpan>> = Vec::with_capacity(max_lines);
+    for line_idx in 0..max_lines {
+        let mut row: MarkdownRow = vec![StyledSpan::plain("│", SpanKind::TableBorder)];
+        for col in 0..n {
+            let cell_line = wrapped_per_cell[col]
+                .get(line_idx)
+                .cloned()
+                .unwrap_or_default();
+            row.push(StyledSpan::plain(" ", SpanKind::Text));
+            pad_cell(&mut row, cell_line, widths[col], alignments[col]);
+            row.push(StyledSpan::plain(" ", SpanKind::Text));
+            row.push(StyledSpan::plain("│", SpanKind::TableBorder));
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// Pad `cell_line` to `width` visible columns per `alignment`, appending the
+/// result to `row`. Padding is plain `Text` spaces, invisible so their kind
+/// never shows. A line already at or over `width` gets no padding: the cell
+/// was pre-wrapped to the column width, and a wide grapheme can still land
+/// one column over at a degenerate width.
+fn pad_cell(row: &mut MarkdownRow, cell_line: MarkdownRow, width: usize, alignment: Alignment) {
+    let vw: usize = cell_line.iter().map(span_width).sum();
+    if vw >= width {
+        row.extend(cell_line);
+        return;
+    }
+    let padding = width - vw;
+    // Center biases the odd extra column to the right (`left = padding / 2`).
+    let (left, right) = match alignment {
+        Alignment::Left => (0, padding),
+        Alignment::Right => (padding, 0),
+        Alignment::Center => (padding / 2, padding - padding / 2),
+    };
+    if left > 0 {
+        row.push(StyledSpan::plain(" ".repeat(left), SpanKind::Text));
+    }
+    row.extend(cell_line);
+    if right > 0 {
+        row.push(StyledSpan::plain(" ".repeat(right), SpanKind::Text));
+    }
 }
 
 /// Render a sequence of inline tokens into `out`, composing emphasis
@@ -769,18 +1098,12 @@ enum Block {
     /// A GitHub-flavored-markdown table: one header row, one alignment spec
     /// per column, zero or more data rows. Each cell is pre-parsed inline
     /// content. `raw` holds the original markdown source for the table
-    /// block (header + separator + body lines joined with `\n`); it is the
-    /// fallback content used when a stable table cannot be rendered.
-    ///
-    /// `headers`, `alignments`, and `rows` are parsed now so the AST is
-    /// complete, but native table layout renders them in a later chunk. The
-    /// current renderer only reads `raw`.
+    /// block (header + separator + body lines joined with `\n`), used as the
+    /// prose fallback when the render width is too narrow for a bordered
+    /// table (see [`render_table`]).
     Table {
-        #[allow(dead_code)]
         headers: Vec<Vec<Inline>>,
-        #[allow(dead_code)]
         alignments: Vec<Alignment>,
-        #[allow(dead_code)]
         rows: Vec<Vec<Vec<Inline>>>,
         raw: String,
     },
@@ -2824,6 +3147,323 @@ mod tests {
         assert!(
             categories(&rows).contains(&SyntaxCategory::Keyword),
             "keyword category should survive wrapping: {:?}",
+            rows_text(&rows),
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Tables
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn distribute_returns_natural_widths_when_everything_fits() {
+        // Every column's natural width fits the budget, so each column is
+        // allocated its natural width (raised to its floor where larger).
+        let widths = distribute_column_widths(&[10, 5, 8], &[3, 3, 3], 100);
+        assert_eq!(widths, vec![10, 5, 8]);
+    }
+
+    #[test]
+    fn distribute_never_exceeds_budget_when_shrinking() {
+        // The allocation stays within budget even when the natural widths
+        // overflow it, and every column keeps at least one column.
+        let widths = distribute_column_widths(&[40, 40, 40], &[5, 5, 5], 30);
+        assert!(
+            widths.iter().sum::<usize>() <= 30,
+            "allocation {widths:?} overflowed the budget",
+        );
+        assert!(widths.iter().all(|&w| w >= 1));
+    }
+
+    #[test]
+    fn distribute_collapses_when_minimums_exceed_budget() {
+        // When even the per-column floors don't fit, columns collapse and
+        // the budget is shared out by floor weight, still one column each
+        // and within budget.
+        let widths = distribute_column_widths(&[30, 30], &[30, 30], 10);
+        assert_eq!(widths.len(), 2);
+        assert!(widths.iter().all(|&w| w >= 1));
+        assert!(widths.iter().sum::<usize>() <= 10);
+    }
+
+    #[test]
+    fn distribute_capped_floor_leaves_room_for_neighbours() {
+        // Column 0 holds a 60-wide token capped to `MAX_UNBROKEN_TOKEN_WIDTH`
+        // so it does not pin itself to the token width and starve column 1.
+        let cap = MAX_UNBROKEN_TOKEN_WIDTH;
+        let widths = distribute_column_widths(&[60, 40], &[cap, 8], 53);
+        assert_eq!(widths.len(), 2);
+        assert!(widths.iter().sum::<usize>() <= 53);
+        assert!(
+            widths[1] >= 8,
+            "neighbour column should keep at least its floor; got {widths:?}",
+        );
+        assert!(
+            widths[0] < 60,
+            "capped column should be narrower than its overlong token; got {widths:?}",
+        );
+    }
+
+    #[test]
+    fn renders_a_basic_two_column_table() {
+        let rows = render_markdown("| A | B |\n| --- | --- |\n| 1 | 2 |", 80, &opts());
+        assert_eq!(
+            rows_text(&rows),
+            vec![
+                "┌───┬───┐",
+                "│ A │ B │",
+                "├───┼───┤",
+                "│ 1 │ 2 │",
+                "└───┴───┘"
+            ],
+        );
+        // Top, separator, and bottom are single `TableBorder` rows.
+        for i in [0, 2, 4] {
+            assert_eq!(rows[i].len(), 1, "border row {i} is a single span");
+            assert_eq!(rows[i][0].kind, SpanKind::TableBorder);
+        }
+        // Content rows open with a `│` `TableBorder` and carry `TableCell`
+        // text between the frame spaces.
+        let header = &rows[1];
+        assert_eq!(header[0].kind, SpanKind::TableBorder);
+        assert_eq!(header[0].text, "│");
+        assert!(
+            header
+                .iter()
+                .any(|s| s.kind == SpanKind::TableCell && s.text == "A"),
+        );
+        assert!(
+            rows[3]
+                .iter()
+                .any(|s| s.kind == SpanKind::TableCell && s.text == "1"),
+        );
+    }
+
+    #[test]
+    fn renders_table_alignments_left_center_right() {
+        let rows = render_markdown(
+            "| Left | Center | Right |\n| :--- | :---: | ---: |\n| a | b | c |",
+            80,
+            &opts(),
+        );
+        let texts = rows_text(&rows);
+        assert_eq!(
+            texts.len(),
+            5,
+            "top, header, separator, one data row, bottom"
+        );
+
+        // Splitting a content row on `│` yields the per-column cell text
+        // framed by its two padding spaces, which pins the padding placement:
+        // left keeps content flush-left, right flush-right, center split with
+        // the odd column biased right.
+        let header_segments: Vec<&str> = texts[1].split('│').collect();
+        assert_eq!(
+            header_segments,
+            vec!["", " Left ", " Center ", " Right ", ""]
+        );
+
+        let data_segments: Vec<&str> = texts[3].split('│').collect();
+        assert_eq!(data_segments, vec!["", " a    ", "   b    ", "     c ", ""]);
+    }
+
+    #[test]
+    fn wraps_a_cell_wider_than_its_column_across_visual_rows() {
+        // At width 20 the columns distribute to [12, 1], so the long first
+        // cell wraps to two visual rows while the short neighbour renders on
+        // the first and is blank-padded (still aligned) on the continuation.
+        let rows = render_markdown(
+            "| A | B |\n| --- | --- |\n| one two three four | x |",
+            20,
+            &opts(),
+        );
+        let texts = rows_text(&rows);
+        assert_eq!(
+            texts.len(),
+            6,
+            "top, header, separator, two data rows, bottom"
+        );
+        // Every row (borders and both visual lines of the wrapped data row)
+        // is the same width, so the table is a clean rectangle: the
+        // continuation line's blank-padded neighbour keeps the `│` aligned.
+        for row in &rows {
+            assert_eq!(
+                row_width(row),
+                row_width(&rows[0]),
+                "row not rectangular: {:?}",
+                row_text(row),
+            );
+        }
+
+        let data0 = &texts[3];
+        let data1 = &texts[4];
+        assert!(
+            data0.contains("one two") && !data0.contains("three"),
+            "first visual row holds the leading words: {data0:?}",
+        );
+        assert!(
+            data1.contains("three four"),
+            "continuation row holds the wrapped words: {data1:?}",
+        );
+
+        // The neighbour column holds `x` on the first row and is blank on the
+        // continuation.
+        let seg0: Vec<&str> = data0.split('│').collect();
+        assert_eq!(seg0.get(2).map(|s| s.trim()), Some("x"));
+        let seg1: Vec<&str> = data1.split('│').collect();
+        assert_eq!(
+            seg1.get(2).map(|s| s.trim()),
+            Some(""),
+            "neighbour column is blank-padded on the wrap continuation: {data1:?}",
+        );
+    }
+
+    #[test]
+    fn narrow_width_falls_back_to_raw_prose() {
+        // Three columns need chrome 10, so width 12 leaves only 2 cells of
+        // budget (< n_cols): a bordered table can't render, and we fall back
+        // to the raw source wrapped as prose. No box-drawing chrome appears.
+        let rows = render_markdown(
+            "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |",
+            12,
+            &opts(),
+        );
+        for row in &rows {
+            assert!(row_width(row) <= 12, "row too wide: {:?}", row_text(row));
+            for span in row {
+                assert_ne!(
+                    span.kind,
+                    SpanKind::TableBorder,
+                    "fallback must not draw table borders: {:?}",
+                    rows_text(&rows),
+                );
+                assert_ne!(span.kind, SpanKind::TableCell);
+            }
+        }
+        let joined = rows_text(&rows).join("\n");
+        assert!(
+            joined.contains('|'),
+            "raw ASCII pipes are preserved: {joined:?}"
+        );
+        assert!(
+            !joined.contains('│'),
+            "no box-drawing borders in the fallback: {joined:?}",
+        );
+        assert!(joined.contains('A') && joined.contains('B') && joined.contains('C'));
+    }
+
+    #[test]
+    fn overlong_token_column_leaves_room_for_its_neighbour() {
+        // A 60-char unbreakable token in column 0 is capped to
+        // `MAX_UNBROKEN_TOKEN_WIDTH`, so column 1 keeps a usable share and
+        // the token hard-breaks across rows rather than widening its column.
+        let token = "a".repeat(60);
+        let src = format!("| Link | Note |\n| --- | --- |\n| {token} | readable |");
+        let rows = render_markdown(&src, 50, &opts());
+        for row in &rows {
+            assert!(row_width(row) <= 50, "row too wide: {:?}", row_text(row));
+        }
+        let texts = rows_text(&rows);
+        assert!(
+            texts.iter().any(|l| l.contains("readable")),
+            "neighbour column content survives: {texts:?}",
+        );
+        assert!(
+            !texts.iter().any(|l| l.contains(&token)),
+            "overlong token wraps rather than widening its column: {texts:?}",
+        );
+    }
+
+    #[test]
+    fn table_cell_inline_code_keeps_its_kind() {
+        let rows = render_markdown("| Code |\n| --- |\n| `x` |", 80, &opts());
+        let data = rows
+            .iter()
+            .find(|r| r.iter().any(|s| s.kind == SpanKind::InlineCode))
+            .expect("a data row with inline code");
+        let code = data
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode)
+            .expect("an inline-code span in the cell");
+        assert_eq!(code.text, "x");
+        // The cell still frames with table borders.
+        assert_eq!(data[0].kind, SpanKind::TableBorder);
+    }
+
+    #[test]
+    fn table_ends_without_a_trailing_blank_row() {
+        let rows = render_markdown("| Name |\n| --- |\n| Alice |", 80, &opts());
+        assert!(
+            !rows.last().is_none_or(is_blank_row),
+            "table must not end in a blank row",
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last[0].kind, SpanKind::TableBorder);
+        assert!(
+            row_text(last).starts_with('└'),
+            "final row is the bottom border"
+        );
+    }
+
+    #[test]
+    fn table_is_followed_by_a_single_blank_before_the_next_block() {
+        // The outer render loop owns the inter-block spacer, so the table
+        // contributes no trailing blank of its own: exactly one blank sits
+        // between the bottom border and the following paragraph.
+        let rows = render_markdown("| A |\n| --- |\n| 1 |\n\nafter", 80, &opts());
+        let texts = rows_text(&rows);
+        assert_eq!(texts.last().map(String::as_str), Some("after"));
+        assert_eq!(
+            texts.iter().filter(|l| l.is_empty()).count(),
+            1,
+            "exactly one blank row: {texts:?}",
+        );
+        let blank_idx = texts.iter().position(String::is_empty).unwrap();
+        assert!(
+            texts[blank_idx - 1].starts_with('└'),
+            "blank follows the bottom border"
+        );
+        assert_eq!(texts[blank_idx + 1], "after");
+    }
+
+    #[test]
+    fn table_inside_a_blockquote_keeps_the_quote_border_on_every_row() {
+        // A table nested in a blockquote reaches `render_table` through the
+        // blockquote recursion. Every table row (border and content alike)
+        // is prefixed with the `│ ` quote border, the box-drawing glyphs
+        // keep `TableBorder`, and the cells keep `TableCell`. Only the
+        // invisible framing spaces (plain `Text`) are retagged to `Quote`.
+        let rows = render_markdown("> | A | B |\n> | --- | --- |\n> | 1 | 2 |", 80, &opts());
+        assert_eq!(
+            rows_text(&rows),
+            vec![
+                "│ ┌───┬───┐",
+                "│ │ A │ B │",
+                "│ ├───┼───┤",
+                "│ │ 1 │ 2 │",
+                "│ └───┴───┘",
+            ],
+        );
+        for row in &rows {
+            assert_eq!(
+                row[0].kind,
+                SpanKind::QuoteBorder,
+                "every row opens with the quote border: {:?}",
+                row_text(row),
+            );
+        }
+        // The box chars stay table chrome, not quote text.
+        assert!(rows[0].iter().any(|s| s.kind == SpanKind::TableBorder));
+        assert!(
+            rows[1]
+                .iter()
+                .any(|s| s.kind == SpanKind::TableCell && s.text == "A"),
+        );
+        // The table stays a clean rectangle even under the quote border.
+        let w = row_width(&rows[0]);
+        assert!(
+            rows.iter().all(|r| row_width(r) == w),
+            "all quoted table rows share one width: {:?}",
             rows_text(&rows),
         );
     }
