@@ -238,7 +238,7 @@ fn is_word_codepoint(cp: u32) -> bool {
 /// grapheme-segmenter output (single-scalar inputs in practice), but the
 /// any-scalar rule keeps behavior predictable for a multi-scalar cluster that
 /// carries a whitespace component.
-fn is_whitespace_grapheme(grapheme: &str) -> bool {
+pub fn is_whitespace_grapheme(grapheme: &str) -> bool {
     grapheme.chars().any(char::is_whitespace)
 }
 
@@ -246,7 +246,7 @@ fn is_whitespace_grapheme(grapheme: &str) -> bool {
 ///
 /// The set is the classic word-segmentation punctuation bag. Returns true if any
 /// scalar in the cluster matches.
-fn is_punctuation_grapheme(grapheme: &str) -> bool {
+pub fn is_punctuation_grapheme(grapheme: &str) -> bool {
     grapheme.chars().any(is_punctuation_char)
 }
 

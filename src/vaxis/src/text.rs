@@ -19,6 +19,6 @@ pub mod word_motion;
 pub use crate::text::kill_ring::KillRing;
 pub use crate::text::undo_stack::UndoStack;
 pub use crate::text::word_motion::{
-    CharClass, EmacsWords, ReadlineWords, WordClassifier, skip_class, skip_separators, word_left,
-    word_right,
+    CharClass, EmacsWords, ReadlineWords, WordClassifier, is_punctuation_grapheme,
+    is_whitespace_grapheme, skip_class, skip_separators, word_left, word_right,
 };

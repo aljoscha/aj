@@ -1,6 +1,6 @@
 //! [`TextArea`]: a multi-line, focusable text editor with word wrapping,
 //! emacs-style editing, a kill ring, undo, sticky-column vertical movement,
-//! and prompt history.
+//! prompt history, large-paste markers, and char-jump mode.
 //!
 //! `TextArea` is the multi-line sibling of [`TextField`](crate::vxfw::TextField).
 //! Where `TextField` is a single-line gap buffer, `TextArea` holds a document as
@@ -33,6 +33,7 @@
 //! so a flex-0 host slot grows with content up to the cap and scrolls beyond.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use unicode_segmentation::UnicodeSegmentation;
@@ -40,8 +41,216 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::cell::{Cell, Character, Color, CursorShape, Style};
 use crate::gwidth;
 use crate::key::{Key, Modifiers};
-use crate::text::{EmacsWords, KillRing, UndoStack, WordClassifier, word_left, word_right};
+use crate::text::{
+    EmacsWords, KillRing, UndoStack, WordClassifier, is_punctuation_grapheme,
+    is_whitespace_grapheme, skip_class, skip_separators, word_left,
+};
 use crate::vxfw::{CursorState, DrawContext, Event, EventContext, Size, Surface, Widget};
+
+/// Prefix every large-paste marker token starts with, e.g. the `[paste #` of
+/// `[paste #1 +20 lines]`. Used as the cheap first check before the fuller
+/// [`find_next_marker`] scan.
+const PASTE_MARKER_PREFIX: &str = "[paste #";
+
+/// Which way [`TextArea::jump_to_char`] scans for its target.
+///
+/// Forward lands on the first occurrence strictly after the cursor. Backward
+/// lands on the last occurrence strictly before it. Both scan across logical
+/// lines when the current line has no match, and both are case-sensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpDirection {
+    Forward,
+    Backward,
+}
+
+/// Finds the next paste-marker token in `line` at or after byte offset `from`,
+/// validated against `pastes`. Returns the `(start, end, id)` byte span of the
+/// match.
+///
+/// A token must be closed with `]` and match one of the two known tail shapes
+/// (see [`parse_marker_tail`]). We also require the parsed id to be present in
+/// `pastes`. That validation is what stops a manually typed marker-like string
+/// (say `[paste #99 +5 lines]` with no matching paste) from being treated as an
+/// atomic unit. Only tokens we actually created are atomic.
+fn find_next_marker(
+    line: &str,
+    from: usize,
+    pastes: &HashMap<u32, String>,
+) -> Option<(usize, usize, u32)> {
+    let bytes = line.as_bytes();
+    let prefix = PASTE_MARKER_PREFIX.as_bytes();
+    let mut i = from;
+    while i + prefix.len() <= bytes.len() {
+        if &bytes[i..i + prefix.len()] != prefix {
+            i += 1;
+            continue;
+        }
+        let id_start = i + prefix.len();
+        let mut id_end = id_start;
+        while id_end < bytes.len() && bytes[id_end].is_ascii_digit() {
+            id_end += 1;
+        }
+        if id_end == id_start {
+            i += 1;
+            continue;
+        }
+        let id: u32 = match line[id_start..id_end].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some(end_rel) = parse_marker_tail(&line[id_end..]) else {
+            i += 1;
+            continue;
+        };
+        // Validation: a marker-shaped token whose id we never issued is not
+        // atomic. Skip it and keep scanning so typed text is never collapsed.
+        if !pastes.contains_key(&id) {
+            i += 1;
+            continue;
+        }
+        return Some((i, id_end + end_rel, id));
+    }
+    None
+}
+
+/// Parses the tail of a paste marker starting right after the id digits.
+///
+/// Returns the byte length of the tail including its closing `]` for the three
+/// accepted shapes, or `None` for anything else:
+///
+/// - `"]"` yields `Some(1)`
+/// - `" +123 lines]"` yields `Some(12)`
+/// - `" 1234 chars]"` yields `Some(12)`
+fn parse_marker_tail(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    if bytes.first() == Some(&b']') {
+        return Some(1);
+    }
+    if bytes.first() != Some(&b' ') {
+        return None;
+    }
+    let is_lines = bytes.get(1) == Some(&b'+');
+    let mut pos = if is_lines { 2 } else { 1 };
+    let digits_start = pos;
+    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    if pos == digits_start {
+        return None;
+    }
+    let suffix = if is_lines { " lines]" } else { " chars]" };
+    if rest[pos..].starts_with(suffix) {
+        Some(pos + suffix.len())
+    } else {
+        None
+    }
+}
+
+/// Byte span of a paste marker that begins exactly at `col`, if any.
+fn marker_starting_at(
+    line: &str,
+    col: usize,
+    pastes: &HashMap<u32, String>,
+) -> Option<(usize, usize)> {
+    find_next_marker(line, col, pastes)
+        .filter(|(s, _, _)| *s == col)
+        .map(|(s, e, _)| (s, e))
+}
+
+/// Byte span of a paste marker that ends exactly at `col`, if any.
+fn marker_ending_at(
+    line: &str,
+    col: usize,
+    pastes: &HashMap<u32, String>,
+) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while let Some((s, e, _id)) = find_next_marker(line, i, pastes) {
+        if e == col {
+            return Some((s, e));
+        }
+        if s >= col {
+            return None;
+        }
+        i = e;
+    }
+    None
+}
+
+/// Decodes Kitty CSI-u `Ctrl+<letter>` sequences embedded in pasted text back to
+/// their literal control byte.
+///
+/// Some terminals (notably tmux popups with `extended-keys-format=csi-u`)
+/// re-encode control bytes inside a bracketed paste as `ESC [ <codepoint> ; 5 u`.
+/// The classic case is `ESC [ 106 ; 5 u` (Ctrl+J, a newline) between pasted
+/// lines. Without this decode the per-char control filter would strip the `ESC`
+/// and leak the printable tail (`[106;5u`) into the buffer, garbling the paste.
+///
+/// Only `Ctrl+<ASCII letter>` codepoints (97..=122 and 65..=90) are decoded.
+/// Other modifier-5 sequences are left intact so the filter handles them as
+/// before.
+fn decode_csi_u_ctrl_letters(text: &str) -> String {
+    // Fast path: no ESC means nothing to decode, so we avoid an allocation on
+    // the common case of pasting normal text.
+    if !text.as_bytes().contains(&0x1b) {
+        return text.to_string();
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Copy a whole non-ASCII codepoint through by scalar so the byte
+        // scanner never splits a multi-byte UTF-8 sequence.
+        if !bytes[i].is_ascii() {
+            let ch = text[i..].chars().next().expect("char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes[i] != 0x1b || i + 1 >= bytes.len() || bytes[i + 1] != b'[' {
+            out.push(char::from(bytes[i]));
+            i += 1;
+            continue;
+        }
+        let digits_start = i + 2;
+        let mut digits_end = digits_start;
+        while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+            digits_end += 1;
+        }
+        // Require at least one digit followed by `;5u`. Anything else (a
+        // cursor-movement sequence, say) is left untouched.
+        let tail_ok = digits_end > digits_start
+            && digits_end + 3 <= bytes.len()
+            && &bytes[digits_end..digits_end + 3] == b";5u";
+        if !tail_ok {
+            out.push(char::from(bytes[i]));
+            i += 1;
+            continue;
+        }
+        let code: u32 = text[digits_start..digits_end].parse().unwrap_or(0);
+        let decoded = match code {
+            97..=122 => char::from_u32(code - 96),
+            65..=90 => char::from_u32(code - 64),
+            _ => None,
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                i = digits_end + 3;
+            }
+            None => {
+                // Out of range: leave the literal `ESC[<digits>;5u` bytes in
+                // place so the existing filter handles them.
+                out.push(char::from(bytes[i]));
+                i += 1;
+            }
+        }
+    }
+    out
+}
 
 /// Theme for [`TextArea`]: structured colors and styles the app builds from its
 /// palette.
@@ -118,11 +327,12 @@ struct VisualLine {
 
 /// One atomic display segment of a logical line.
 ///
-/// For the core editor every grapheme is its own segment, so `text` is one
-/// grapheme cluster. The wrapper and the vertical-move snap treat a segment as
-/// indivisible, which keeps a multi-byte grapheme (a ZWJ emoji, base plus
-/// combining mark) whole across wrap boundaries and stops the cursor landing in
-/// the middle of one.
+/// A segment is one grapheme cluster or one whole paste-marker token. The
+/// wrapper and the vertical-move snap treat a segment as indivisible, which
+/// keeps a multi-byte grapheme (a ZWJ emoji, base plus combining mark) whole
+/// across wrap boundaries, keeps a paste marker from being split in half or
+/// entered mid-token by the cursor, and stops the cursor landing in the middle
+/// of either.
 #[derive(Debug, Clone, Copy)]
 struct AtomicSegment<'a> {
     text: &'a str,
@@ -157,6 +367,29 @@ pub struct TextArea {
     undo_stack: UndoStack<EditorSnapshot>,
     last_action: LastAction,
     word_classifier: Box<dyn WordClassifier>,
+
+    // -- Large-paste markers --
+    //
+    // A large paste is collapsed to a short marker token in `lines` while its
+    // literal content is stashed here, keyed by the id embedded in the token.
+    // `expanded_text` splices the content back in.
+    //
+    // NOTE: The map is deliberately not part of the undo snapshot. Undo restores
+    // the marker *text* in `lines`, and the map persists, so an undone-then-
+    // redone marker still resolves. The counter only ever grows, so a fresh
+    // paste never reuses a live id. Stale entries left after `set_text` or
+    // history navigation are harmless: markers validate against the map, and an
+    // id with no matching token is simply not treated as atomic.
+    pastes: HashMap<u32, String>,
+    /// Monotonic id source for paste markers. Never rewinds except on submit,
+    /// which clears the whole paste state.
+    paste_counter: u32,
+
+    // -- Char-jump mode --
+    /// When set, the next printable key is a jump target rather than input.
+    /// See [`TextArea::jump_to_char`]. The mode is invisible: no prompt or UI
+    /// while it is active.
+    jump_mode: Option<JumpDirection>,
 
     // -- History --
     history: Vec<String>,
@@ -224,6 +457,9 @@ impl TextArea {
             undo_stack: UndoStack::new(),
             last_action: LastAction::None,
             word_classifier: Box::new(EmacsWords),
+            pastes: HashMap::new(),
+            paste_counter: 0,
+            jump_mode: None,
             history: Vec::new(),
             history_index: None,
             theme: EditorTheme::default(),
@@ -253,6 +489,44 @@ impl TextArea {
     /// The full text, logical lines joined by `\n`.
     pub fn text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// The full text with every paste-marker token replaced by the literal
+    /// content it stands in for.
+    ///
+    /// This is the value submitted to `on_submit` and returned by
+    /// [`TextArea::take_submitted`], so a consumer sees the real pasted bytes,
+    /// not the placeholder. Callers wanting the displayed text (markers and all)
+    /// use [`TextArea::text`].
+    pub fn expanded_text(&self) -> String {
+        // Fast path: with no live pastes the document is already literal.
+        if self.pastes.is_empty() {
+            return self.lines.join("\n");
+        }
+        let mut out = String::new();
+        for (idx, line) in self.lines.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            self.append_with_markers_expanded(&mut out, line);
+        }
+        out
+    }
+
+    /// Appends `line` to `out`, splicing each paste-marker token back to its
+    /// stored content. A token whose id is missing from the map falls back to
+    /// the literal token text, so an expansion never drops characters.
+    fn append_with_markers_expanded(&self, out: &mut String, line: &str) {
+        let mut i = 0;
+        while let Some((s, e, id)) = find_next_marker(line, i, &self.pastes) {
+            out.push_str(&line[i..s]);
+            match self.pastes.get(&id) {
+                Some(content) => out.push_str(content),
+                None => out.push_str(&line[s..e]),
+            }
+            i = e;
+        }
+        out.push_str(&line[i..]);
     }
 
     /// The cursor as `(line, col)`, where `col` counts Unicode scalar values
@@ -310,7 +584,86 @@ impl TextArea {
         self.last_action = LastAction::None;
     }
 
+    /// Handles a bracketed paste: normalize, strip control bytes, apply the
+    /// path-prefix separator, then either insert literally or collapse to a
+    /// large-paste marker.
+    ///
+    /// One undo unit. Fires no callback here. The `Event::Paste` handler follows
+    /// this with `check_changed`.
+    fn handle_paste(&mut self, text: &str) {
+        self.save_undo();
+        // Undo re-encoded control bytes some terminals inject into a bracketed
+        // paste before the per-char filter below would strip the ESC and leak
+        // the printable tail.
+        let decoded = decode_csi_u_ctrl_letters(text);
+        let normalized = Self::normalize_text(&decoded);
+        // Drop control characters. The newline and the four-space tab expansion
+        // are already in the normalized text.
+        let mut filtered = String::with_capacity(normalized.len());
+        for ch in normalized.chars() {
+            match ch {
+                '\n' => filtered.push('\n'),
+                c if c.is_control() => {}
+                c => filtered.push(c),
+            }
+        }
+
+        // Path-prefix safety: when the paste begins with `/`, `~`, or `.` and
+        // the cursor sits right after a word-class grapheme, insert a separating
+        // space first so the paste does not read like one token with the
+        // preceding word (`cd` + `/etc/hosts` -> `cd /etc/hosts`). The space
+        // goes into the line buffer, not the stored paste content, so
+        // `expanded_text` reflects it for both inline and marker pastes.
+        if matches!(filtered.chars().next(), Some('/') | Some('~') | Some('.'))
+            && self.cursor_col > 0
+        {
+            let before = &self.lines[self.cursor_line][..self.cursor_col];
+            if let Some(prev) = before.graphemes(true).next_back()
+                && !is_whitespace_grapheme(prev)
+                && !is_punctuation_grapheme(prev)
+            {
+                self.lines[self.cursor_line].insert(self.cursor_col, ' ');
+                self.cursor_col += 1;
+            }
+        }
+
+        // Large-paste threshold: more than 10 lines or more than 1000 characters
+        // collapses to a marker so a long file or a screenful of logs stays
+        // legible in the editor.
+        let line_count = filtered.matches('\n').count() + 1;
+        let char_count = filtered.len();
+        let use_marker = line_count > 10 || char_count > 1000;
+
+        if use_marker {
+            self.paste_counter += 1;
+            let id = self.paste_counter;
+            self.pastes.insert(id, filtered.clone());
+            let marker = if line_count > 10 {
+                format!("[paste #{id} +{line_count} lines]")
+            } else {
+                format!("[paste #{id} {char_count} chars]")
+            };
+            self.lines[self.cursor_line].insert_str(self.cursor_col, &marker);
+            self.cursor_col += marker.len();
+        } else {
+            for ch in filtered.chars() {
+                if ch == '\n' {
+                    self.insert_newline_internal();
+                } else {
+                    self.lines[self.cursor_line].insert(self.cursor_col, ch);
+                    self.cursor_col += ch.len_utf8();
+                }
+            }
+        }
+
+        self.reset_sticky_state();
+        self.last_action = LastAction::None;
+    }
+
     /// Clears the document and undo history, leaving one empty line.
+    ///
+    /// The paste map is intentionally left alone (see the field docs): a stale
+    /// entry is harmless because markers validate against the map.
     pub fn clear(&mut self) {
         self.lines = vec![String::new()];
         self.cursor_line = 0;
@@ -492,6 +845,14 @@ impl TextArea {
     fn move_left(&mut self) {
         self.reset_sticky_state();
         if self.cursor_col > 0 {
+            // Atomic marker jump: when a marker ends exactly at the cursor, step
+            // over the whole token in one move instead of into its text.
+            if let Some((start, _end)) =
+                marker_ending_at(self.current_line(), self.cursor_col, &self.pastes)
+            {
+                self.cursor_col = start;
+                return;
+            }
             let bounds = self.grapheme_boundaries();
             for i in (0..bounds.len()).rev() {
                 if bounds[i] < self.cursor_col {
@@ -511,6 +872,14 @@ impl TextArea {
         self.reset_sticky_state();
         let line_len = self.current_line().len();
         if self.cursor_col < line_len {
+            // Atomic marker jump: when a marker begins exactly at the cursor,
+            // step over the whole token in one move.
+            if let Some((_start, end)) =
+                marker_starting_at(self.current_line(), self.cursor_col, &self.pastes)
+            {
+                self.cursor_col = end;
+                return;
+            }
             let bounds = self.grapheme_boundaries();
             for &b in &bounds {
                 if b > self.cursor_col {
@@ -533,11 +902,21 @@ impl TextArea {
     }
 
     fn word_boundary_right(&self) -> usize {
-        word_right(
-            self.current_line(),
-            self.cursor_col,
-            self.word_classifier.as_ref(),
-        )
+        let line = self.current_line();
+        if self.cursor_col >= line.len() {
+            return line.len();
+        }
+        // Two-phase word-right with a marker splice between the phases. Skip a
+        // leading separator run, and if a marker begins right after it, jump the
+        // whole token atomically. Otherwise fall back to the normal class skip.
+        // Splicing here keeps the marker atomic for Alt-F without a second copy
+        // of the traversal. Word-left has no such branch, matching the
+        // asymmetry of the reference editor.
+        let after_sep = skip_separators(line, self.cursor_col, self.word_classifier.as_ref());
+        if let Some((_start, end)) = marker_starting_at(line, after_sep, &self.pastes) {
+            return end;
+        }
+        skip_class(line, after_sep, self.word_classifier.as_ref())
     }
 
     /// Moves one word left, wrapping to the end of the previous line at column
@@ -567,20 +946,133 @@ impl TextArea {
         self.cursor_col = self.word_boundary_right();
     }
 
+    /// Jumps the cursor to the next (forward) or previous (backward) occurrence
+    /// of `needle` in the document, scanning across logical lines.
+    ///
+    /// Forward scans from just after the cursor to end of line, then each later
+    /// line from column zero. Backward scans from just before the cursor to
+    /// column zero, then each earlier line in full. The search is
+    /// case-sensitive. A match moves the cursor, clears sticky state, and resets
+    /// `last_action` so a following type starts a fresh undo unit. No match
+    /// leaves everything untouched, so an unsuccessful jump does not disturb an
+    /// ongoing undo chain.
+    fn jump_to_char(&mut self, needle: char, direction: JumpDirection) {
+        let mut buf = [0u8; 4];
+        let needle_str: &str = needle.encode_utf8(&mut buf);
+
+        match direction {
+            JumpDirection::Forward => {
+                let current = self.current_line();
+                let search_start = current
+                    .char_indices()
+                    .find(|(i, _)| *i > self.cursor_col)
+                    .map(|(i, _)| i);
+                if let Some(start) = search_start
+                    && let Some(rel) = current[start..].find(needle_str)
+                {
+                    self.cursor_col = start + rel;
+                    self.reset_sticky_state();
+                    self.last_action = LastAction::None;
+                    return;
+                }
+                for line_idx in (self.cursor_line + 1)..self.lines.len() {
+                    if let Some(rel) = self.lines[line_idx].find(needle_str) {
+                        self.cursor_line = line_idx;
+                        self.cursor_col = rel;
+                        self.reset_sticky_state();
+                        self.last_action = LastAction::None;
+                        return;
+                    }
+                }
+            }
+            JumpDirection::Backward => {
+                let current = self.current_line();
+                if self.cursor_col > 0
+                    && let Some(rel) = current[..self.cursor_col].rfind(needle_str)
+                {
+                    self.cursor_col = rel;
+                    self.reset_sticky_state();
+                    self.last_action = LastAction::None;
+                    return;
+                }
+                for line_idx in (0..self.cursor_line).rev() {
+                    if let Some(rel) = self.lines[line_idx].rfind(needle_str) {
+                        self.cursor_line = line_idx;
+                        self.cursor_col = rel;
+                        self.reset_sticky_state();
+                        self.last_action = LastAction::None;
+                        return;
+                    }
+                }
+            }
+        }
+        // No match: leave the cursor and chain state untouched.
+    }
+
     // -- Wrapping --
 
-    /// Atomic display segments of `line`. One grapheme per segment.
+    /// Atomic display segments of `line`. One grapheme per segment, except that
+    /// each valid paste-marker token is a single segment.
     ///
-    /// A named seam even though it is a plain grapheme walk today: the wrapper
-    /// and the vertical-move snap consume segments as indivisible units, which
-    /// is where marker-style atoms would slot in.
+    /// The wrapper and the vertical-move snap consume segments as indivisible
+    /// units, so emitting a whole marker as one segment is what keeps a marker
+    /// from being split across a wrap boundary or entered mid-token.
     fn segment_line<'a>(&self, line: &'a str) -> Vec<AtomicSegment<'a>> {
-        line.grapheme_indices(true)
-            .map(|(i, g)| AtomicSegment {
+        // Fast path: no paste bookkeeping, or no marker-shaped content, means
+        // the line is indistinguishable from its grapheme list.
+        if self.pastes.is_empty() || !line.contains(PASTE_MARKER_PREFIX) {
+            return line
+                .grapheme_indices(true)
+                .map(|(i, g)| AtomicSegment {
+                    text: g,
+                    start_index: i,
+                })
+                .collect();
+        }
+
+        let mut markers: Vec<(usize, usize)> = Vec::new();
+        let mut scan = 0;
+        while let Some((s, e, _id)) = find_next_marker(line, scan, &self.pastes) {
+            markers.push((s, e));
+            scan = e;
+        }
+        if markers.is_empty() {
+            return line
+                .grapheme_indices(true)
+                .map(|(i, g)| AtomicSegment {
+                    text: g,
+                    start_index: i,
+                })
+                .collect();
+        }
+
+        let mut result: Vec<AtomicSegment<'a>> = Vec::new();
+        let mut marker_idx = 0;
+        for (i, g) in line.grapheme_indices(true) {
+            // Advance past any markers that end at or before this grapheme.
+            while marker_idx < markers.len() && markers[marker_idx].1 <= i {
+                marker_idx += 1;
+            }
+            if let Some(&(ms, me)) = markers.get(marker_idx)
+                && i >= ms
+                && i < me
+            {
+                // Emit the whole marker once, at its start, then skip its
+                // interior graphemes so the token stays a single segment.
+                if i == ms {
+                    result.push(AtomicSegment {
+                        text: &line[ms..me],
+                        start_index: ms,
+                    });
+                }
+                continue;
+            }
+            result.push(AtomicSegment {
                 text: g,
                 start_index: i,
-            })
-            .collect()
+            });
+        }
+        result
     }
 
     /// Greedy word-wrap of `line` at `width`, returning `(start, end)` byte
@@ -589,12 +1081,24 @@ impl TextArea {
     /// The walk counts display columns and remembers the last
     /// whitespace-to-non-whitespace transition as a wrap opportunity. On
     /// overflow it backtracks to that opportunity when the run since it still
-    /// fits, otherwise force-breaks at the current segment. A single segment
-    /// wider than `width` (a wide grapheme) stays whole on its own row.
+    /// fits, otherwise force-breaks at the current segment. A single grapheme
+    /// wider than `width` stays whole on its own row. A wider-than-`width` atom
+    /// that is not a single grapheme (a paste marker) sub-splits at grapheme
+    /// granularity while staying one logical atom for cursor and snap purposes.
     fn wrap_line_spans(&self, line: &str, width: usize) -> Vec<(usize, usize)> {
         let width = width.max(1);
         let segments = self.segment_line(line);
+        self.wrap_segments(line, width, &segments)
+    }
 
+    /// The core wrap loop over a pre-built atomic-segment list. See
+    /// [`TextArea::wrap_line_spans`] for the algorithm.
+    fn wrap_segments(
+        &self,
+        line: &str,
+        width: usize,
+        segments: &[AtomicSegment],
+    ) -> Vec<(usize, usize)> {
         let mut chunks: Vec<(usize, usize)> = Vec::new();
         let mut current_width: usize = 0;
         let mut chunk_start: usize = 0;
@@ -627,12 +1131,23 @@ impl TextArea {
                 wrap_opp_index = None;
             }
 
-            // A segment wider than the whole width cannot be split further (a
-            // wide grapheme), so it starts its own chunk and the next segment
-            // begins a fresh row after it.
+            // An atom wider than the whole width. A single grapheme cannot split
+            // further and stays whole, but a wider multi-grapheme atom (a paste
+            // marker in a narrow terminal) sub-splits at grapheme granularity so
+            // it breaks across rows. The split is purely visual: the atom stays
+            // one logical unit for the cursor, word motion, and the snap. All
+            // but the last sub-span become finished rows, and the last is the
+            // leading edge of the next row.
             if g_width > width {
-                chunk_start = char_index;
-                current_width = g_width;
+                let sub = self.wrap_wide_atom(grapheme, char_index, width);
+                for &(s, e) in sub.iter().take(sub.len().saturating_sub(1)) {
+                    chunks.push((s, e));
+                }
+                let &(last_start, last_end) = sub
+                    .last()
+                    .expect("wrap_wide_atom returns at least one span");
+                chunk_start = last_start;
+                current_width = self.measure(&line[last_start..last_end]);
                 wrap_opp_index = None;
                 continue;
             }
@@ -652,6 +1167,33 @@ impl TextArea {
 
         chunks.push((chunk_start, line.len()));
         chunks
+    }
+
+    /// Sub-splits an over-wide atom into byte spans at grapheme granularity,
+    /// offset by `base` into the logical line.
+    ///
+    /// Used only for an atom wider than `width` (a paste marker in a narrow
+    /// terminal). The split re-wraps the atom's own graphemes as plain single
+    /// segments, so it never re-detects the marker and never recurses without
+    /// bound: a lone grapheme wider than `width` is the base case and stays
+    /// whole.
+    fn wrap_wide_atom(&self, atom: &str, base: usize, width: usize) -> Vec<(usize, usize)> {
+        let graphemes: Vec<AtomicSegment> = atom
+            .grapheme_indices(true)
+            .map(|(i, g)| AtomicSegment {
+                text: g,
+                start_index: i,
+            })
+            .collect();
+        let spans = if graphemes.len() <= 1 {
+            vec![(0, atom.len())]
+        } else {
+            self.wrap_segments(atom, width, &graphemes)
+        };
+        spans
+            .into_iter()
+            .map(|(s, e)| (base + s, base + e))
+            .collect()
     }
 
     /// Builds the visual-line map for the whole document at `width`.
@@ -985,12 +1527,20 @@ impl TextArea {
         let line_len = self.current_line().len();
         if self.cursor_col < line_len {
             self.save_undo();
-            let bounds = self.grapheme_boundaries();
-            let next = bounds
-                .iter()
-                .find(|&&b| b > self.cursor_col)
-                .copied()
-                .unwrap_or(line_len);
+            // Atomic marker delete: when a marker begins at the cursor, drain
+            // the whole token in one step rather than a single grapheme of it.
+            let next = if let Some((_start, end)) =
+                marker_starting_at(self.current_line(), self.cursor_col, &self.pastes)
+            {
+                end
+            } else {
+                let bounds = self.grapheme_boundaries();
+                bounds
+                    .iter()
+                    .find(|&&b| b > self.cursor_col)
+                    .copied()
+                    .unwrap_or(line_len)
+            };
             self.lines[self.cursor_line].drain(self.cursor_col..next);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
@@ -1283,8 +1833,11 @@ impl TextArea {
 
     /// Fires `on_submit` with the trimmed contents, records the submitted text
     /// for polling, then resets to an empty document with a clean undo stack.
+    ///
+    /// The submitted value is the paste-marker-expanded text, so a consumer sees
+    /// the literal pasted bytes rather than the marker placeholder.
     fn submit_value(&mut self, ctx: &mut EventContext) {
-        let text = self.text().trim().to_string();
+        let text = self.expanded_text().trim().to_string();
         self.submitted_text = Some(text.clone());
         if let Some(cb) = self.on_submit.as_mut() {
             cb(ctx, &text);
@@ -1294,6 +1847,11 @@ impl TextArea {
         self.cursor_col = 0;
         self.reset_sticky_state();
         self.undo_stack.clear();
+        // Submit is a hard break: the paste content has been consumed into the
+        // submitted value, so drop the whole paste state and let the counter
+        // start fresh for the next message.
+        self.pastes.clear();
+        self.paste_counter = 0;
         self.last_action = LastAction::None;
         self.history_index = None;
     }
@@ -1525,7 +2083,7 @@ impl Widget for TextArea {
         match event {
             Event::FocusIn | Event::FocusOut => ctx.redraw = true,
             Event::Paste(text) => {
-                self.insert_at_cursor(text);
+                self.handle_paste(text);
                 self.check_changed(ctx);
             }
             Event::KeyPress(key) => self.handle_key(ctx, key),
@@ -1551,6 +2109,47 @@ impl TextArea {
         let empty = Modifiers::empty();
         let ctrl = Modifiers::CTRL;
         let alt = Modifiers::ALT;
+
+        // Char-jump mode. Intercepted before every editing chord so the next
+        // key is read as a jump target rather than an edit. The three-way
+        // intercept: (1) re-pressing the same-direction chord cancels, (2) a
+        // printable char with only Shift held is the jump target, (3) anything
+        // else clears the mode and falls through so the key does its normal job
+        // (Esc must still reach the parent surface).
+        if let Some(direction) = self.jump_mode {
+            let cancels = match direction {
+                JumpDirection::Forward => key.matches(u32::from(']'), ctrl),
+                JumpDirection::Backward => key.matches(u32::from(']'), ctrl | alt),
+            };
+            if cancels {
+                self.jump_mode = None;
+                ctx.consume_event();
+                return;
+            }
+            if (mods - Modifiers::SHIFT).is_empty()
+                && let Some(needle) = printable_char(key)
+            {
+                self.jump_to_char(needle, direction);
+                self.jump_mode = None;
+                self.check_changed(ctx);
+                return;
+            }
+            self.jump_mode = None;
+        }
+
+        // Enter char-jump mode. Placed after the active-mode intercept so that
+        // pressing the other direction while in one mode (a non-cancel, non-jump
+        // key) clears the current mode above and then switches here.
+        if key.matches(u32::from(']'), ctrl) {
+            self.jump_mode = Some(JumpDirection::Forward);
+            ctx.consume_event();
+            return;
+        }
+        if key.matches(u32::from(']'), ctrl | alt) {
+            self.jump_mode = Some(JumpDirection::Backward);
+            ctx.consume_event();
+            return;
+        }
 
         // Undo.
         if key.matches(u32::from('_'), ctrl)
@@ -1753,8 +2352,24 @@ fn is_segment_whitespace(seg: &str) -> bool {
     !seg.is_empty() && seg.chars().all(char::is_whitespace)
 }
 
+/// The single printable character a key would insert, if any.
+///
+/// Char-jump mode reads its search target with this. A key qualifies when its
+/// text is exactly one non-control character. Multi-character text (a paste, a
+/// composed sequence) and control keys (Esc, arrows) return `None` so they fall
+/// through to the mode's silent-cancel path.
+fn printable_char(key: &Key) -> Option<char> {
+    let text = key.text.as_deref()?;
+    let mut chars = text.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() || c.is_control() {
+        return None;
+    }
+    Some(c)
+}
+
 /// The fixed editing chords. See [`TextArea::bindings`].
-static BINDINGS: [ChordDoc; 21] = [
+static BINDINGS: [ChordDoc; 23] = [
     ChordDoc {
         keys: "↑ / Ctrl-P",
         description: "Move up, or previous history at the top line",
@@ -1860,6 +2475,16 @@ static BINDINGS: [ChordDoc; 21] = [
         description: "Submit",
         group: "Editing",
     },
+    ChordDoc {
+        keys: "Ctrl-]",
+        description: "Jump to the next occurrence of a character",
+        group: "Movement",
+    },
+    ChordDoc {
+        keys: "Ctrl-Alt-]",
+        description: "Jump to the previous occurrence of a character",
+        group: "Movement",
+    },
 ];
 
 #[cfg(test)]
@@ -1903,6 +2528,108 @@ mod tests {
     fn send(ed: &mut TextArea, event: &Event) {
         let mut ctx = EventContext::new();
         ed.handle_event(&mut ctx, event);
+    }
+
+    /// Sends `event` and reports whether the widget consumed it. Used by the
+    /// jump-mode tests, whose fall-through assertions turn on consumption.
+    fn send_consumed(ed: &mut TextArea, event: &Event) -> bool {
+        let mut ctx = EventContext::new();
+        ed.handle_event(&mut ctx, event);
+        ctx.consume_event
+    }
+
+    /// A bracketed-paste event carrying `text`.
+    fn paste(text: &str) -> Event {
+        Event::Paste(text.to_string())
+    }
+
+    /// The forward and backward char-jump entry chords.
+    fn jump_forward() -> Event {
+        mod_key(']', Modifiers::CTRL)
+    }
+    fn jump_backward() -> Event {
+        mod_key(']', Modifiers::CTRL | Modifiers::ALT)
+    }
+
+    /// Hand-scans the single paste marker in `text`, returning its byte length
+    /// and the matched token. Scans for the prefix and the next closing `]`, so
+    /// no regex test-dependency is needed.
+    fn find_marker(text: &str) -> (usize, String) {
+        let start = text.find("[paste #").expect("marker prefix present");
+        let close = text[start..].find(']').expect("marker close present");
+        let marker = text[start..start + close + 1].to_string();
+        (marker.len(), marker)
+    }
+
+    /// Pastes 20 single-word lines, which crosses the `>10 lines` threshold and
+    /// produces a `+N lines` marker. Returns the resulting displayed text.
+    fn paste_large(ed: &mut TextArea) -> String {
+        let big = "line\n".repeat(20).trim_end().to_string();
+        send(ed, &paste(&big));
+        ed.text()
+    }
+
+    /// Pastes `n_lines` single-word lines, crossing the threshold once
+    /// `n_lines > 10`.
+    fn paste_n_lines(ed: &mut TextArea, n_lines: usize) {
+        let content = "line\n".repeat(n_lines).trim_end().to_string();
+        send(ed, &paste(&content));
+    }
+
+    /// Pastes `n_chars` literal `x` characters, producing a `N chars` marker
+    /// once past the 1000-char threshold.
+    fn paste_n_chars(ed: &mut TextArea, n_chars: usize) {
+        send(ed, &paste(&"x".repeat(n_chars)));
+    }
+
+    // Short key-event constructors, named after the chords they stand for, to
+    // keep the ported test bodies readable.
+    fn right() -> Event {
+        key(Key::RIGHT, Modifiers::empty())
+    }
+    fn left() -> Event {
+        key(Key::LEFT, Modifiers::empty())
+    }
+    fn up() -> Event {
+        key(Key::UP, Modifiers::empty())
+    }
+    fn down() -> Event {
+        key(Key::DOWN, Modifiers::empty())
+    }
+    fn ctrl_right() -> Event {
+        key(Key::RIGHT, Modifiers::CTRL)
+    }
+    fn backspace() -> Event {
+        key(Key::BACKSPACE, Modifiers::empty())
+    }
+    fn delete() -> Event {
+        key(Key::DELETE, Modifiers::empty())
+    }
+    fn escape() -> Event {
+        key(Key::ESCAPE, Modifiers::empty())
+    }
+    fn shift_enter() -> Event {
+        key(Key::ENTER, Modifiers::SHIFT)
+    }
+    fn ctrl(c: char) -> Event {
+        mod_key(c, Modifiers::CTRL)
+    }
+
+    /// Asserts every visual line of the document fits the layout width, the
+    /// property the wide-atom sub-split must maintain. A lone grapheme wider
+    /// than the width is the only permitted overflow.
+    fn assert_all_vls_fit(ed: &TextArea) {
+        let vls = ed.build_visual_line_map(ed.layout_width);
+        for vl in &vls {
+            let line = &ed.lines[vl.logical_line];
+            let span = &line[vl.start_col..vl.start_col + vl.length];
+            let w = ed.measure(span);
+            assert!(
+                w <= ed.layout_width || span.graphemes(true).count() <= 1,
+                "visual line {span:?} width {w} exceeds layout width {}",
+                ed.layout_width,
+            );
+        }
     }
 
     fn type_str(ed: &mut TextArea, s: &str) {
@@ -2438,5 +3165,732 @@ mod tests {
         assert!(bindings.iter().any(|b| b.description.contains("Submit")));
         assert!(bindings.iter().any(|b| b.description.contains("Undo")));
         assert!(bindings.iter().any(|b| b.keys.contains("Ctrl-Y")));
+        assert!(bindings.iter().any(|b| b.keys == "Ctrl-]"));
+        assert!(bindings.iter().any(|b| b.keys == "Ctrl-Alt-]"));
+    }
+
+    // -- Paste markers: creation --
+
+    #[test]
+    fn creates_a_paste_marker_for_large_pastes() {
+        let mut ed = editor();
+        let text = paste_large(&mut ed);
+        let (_len, _marker) = find_marker(&text);
+    }
+
+    // -- Paste markers: atomic navigation --
+
+    #[test]
+    fn treats_paste_marker_as_single_unit_for_right_arrow() {
+        let mut ed = editor();
+        type_str(&mut ed, "A");
+        paste_large(&mut ed);
+        type_str(&mut ed, "B");
+
+        let text = ed.text();
+        let (marker_len, _marker) = find_marker(&text);
+
+        send(&mut ed, &ctrl('a'));
+        assert_eq!(ed.cursor(), (0, 0));
+        send(&mut ed, &right());
+        assert_eq!(ed.cursor(), (0, 1));
+        send(&mut ed, &right());
+        assert_eq!(ed.cursor(), (0, 1 + marker_len));
+        send(&mut ed, &right());
+        assert_eq!(ed.cursor(), (0, 1 + marker_len + 1));
+    }
+
+    #[test]
+    fn treats_paste_marker_as_single_unit_for_left_arrow() {
+        let mut ed = editor();
+        type_str(&mut ed, "A");
+        paste_large(&mut ed);
+        type_str(&mut ed, "B");
+
+        let text = ed.text();
+        let (marker_len, _marker) = find_marker(&text);
+
+        send(&mut ed, &left());
+        assert_eq!(ed.cursor(), (0, 1 + marker_len));
+        send(&mut ed, &left());
+        assert_eq!(ed.cursor(), (0, 1));
+        send(&mut ed, &left());
+        assert_eq!(ed.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn treats_paste_marker_as_single_unit_for_backspace() {
+        let mut ed = editor();
+        type_str(&mut ed, "A");
+        paste_large(&mut ed);
+        type_str(&mut ed, "B");
+
+        let text = ed.text();
+        let (marker_len, _marker) = find_marker(&text);
+
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &right()); // past 'A'
+        send(&mut ed, &right()); // past marker
+        assert_eq!(ed.cursor(), (0, 1 + marker_len));
+
+        send(&mut ed, &backspace());
+        assert_eq!(ed.text(), "AB");
+        assert_eq!(ed.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn treats_paste_marker_as_single_unit_for_forward_delete() {
+        let mut ed = editor();
+        type_str(&mut ed, "A");
+        paste_large(&mut ed);
+        type_str(&mut ed, "B");
+
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &right()); // after 'A', on the marker
+        send(&mut ed, &delete());
+        assert_eq!(ed.text(), "AB");
+        assert_eq!(ed.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn treats_paste_marker_as_single_unit_for_word_movement() {
+        let mut ed = editor();
+        type_str(&mut ed, "X ");
+        paste_large(&mut ed);
+        type_str(&mut ed, " Y");
+
+        let text = ed.text();
+        let (marker_len, _marker) = find_marker(&text);
+
+        send(&mut ed, &ctrl('a'));
+        // Word-right skips "X".
+        send(&mut ed, &ctrl_right());
+        assert_eq!(ed.cursor(), (0, 1));
+        // Word-right skips the space and the whole marker atomically.
+        send(&mut ed, &ctrl_right());
+        assert_eq!(ed.cursor(), (0, 2 + marker_len));
+    }
+
+    #[test]
+    fn undo_restores_marker_after_backspace_deletion() {
+        let mut ed = editor();
+        type_str(&mut ed, "A");
+        paste_large(&mut ed);
+        type_str(&mut ed, "B");
+
+        let text_before = ed.text();
+
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &right()); // past A
+        send(&mut ed, &right()); // past marker
+        send(&mut ed, &backspace());
+        assert_eq!(ed.text(), "AB");
+
+        send(&mut ed, &ctrl('-'));
+        assert_eq!(ed.text(), text_before);
+    }
+
+    #[test]
+    fn handles_multiple_paste_markers_in_same_line() {
+        let mut ed = editor();
+        paste_large(&mut ed);
+        type_str(&mut ed, " ");
+        paste_large(&mut ed);
+
+        let text = ed.text();
+        let (m0, _) = find_marker(&text);
+        // The second marker begins after the first marker plus the space.
+        let second = &text[m0 + 1..];
+        let (m1, _) = find_marker(second);
+
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &right()); // skip first marker
+        assert_eq!(ed.cursor(), (0, m0));
+        send(&mut ed, &right()); // past space
+        assert_eq!(ed.cursor(), (0, m0 + 1));
+        send(&mut ed, &right()); // skip second marker
+        assert_eq!(ed.cursor(), (0, m0 + 1 + m1));
+    }
+
+    #[test]
+    fn does_not_treat_manually_typed_marker_like_text_as_atomic() {
+        let mut ed = editor();
+        // Typing the marker-like string creates no paste entry, so the
+        // validation rule keeps it as ordinary characters.
+        let fake = "[paste #99 +5 lines]";
+        type_str(&mut ed, fake);
+        assert_eq!(ed.text(), fake);
+
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &right());
+        assert_eq!(ed.cursor(), (0, 1));
+    }
+
+    // -- Paste markers: expansion and submission --
+
+    #[test]
+    fn expands_large_pasted_content_literally_in_expanded_text() {
+        let mut ed = editor();
+        let pasted_text = [
+            "line 1",
+            "line 2",
+            "line 3",
+            "line 4",
+            "line 5",
+            "line 6",
+            "line 7",
+            "line 8",
+            "line 9",
+            "line 10",
+            "tokens $1 $2 $& $$ $` $' end",
+        ]
+        .join("\n");
+
+        send(&mut ed, &paste(&pasted_text));
+
+        let text = ed.text();
+        let (_len, _marker) = find_marker(&text);
+        assert_eq!(ed.expanded_text(), pasted_text);
+    }
+
+    #[test]
+    fn submits_large_pasted_content_literally() {
+        let submitted: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let captured = Rc::clone(&submitted);
+
+        let mut ed = editor();
+        ed.on_submit = Some(Box::new(move |_ctx, text| {
+            *captured.borrow_mut() = text.to_string();
+        }));
+
+        let pasted_text = [
+            "line 1",
+            "line 2",
+            "line 3",
+            "line 4",
+            "line 5",
+            "line 6",
+            "line 7",
+            "line 8",
+            "line 9",
+            "line 10",
+            "tokens $1 $2 $& $$ $` $' end",
+        ]
+        .join("\n");
+
+        send(&mut ed, &paste(&pasted_text));
+        send(&mut ed, &key(Key::ENTER, Modifiers::empty()));
+
+        assert_eq!(submitted.borrow().as_str(), pasted_text);
+    }
+
+    // -- Paste markers: small-paste tab handling --
+
+    #[test]
+    fn small_paste_expands_each_tab_to_four_spaces() {
+        let mut ed = editor();
+        send(&mut ed, &paste("a\tb\tc"));
+        assert_eq!(ed.text(), "a    b    c");
+    }
+
+    #[test]
+    fn small_paste_with_tabs_and_newlines_preserves_both() {
+        let mut ed = editor();
+        send(&mut ed, &paste("\tone\n\ttwo"));
+        assert_eq!(ed.text(), "    one\n    two");
+    }
+
+    #[test]
+    fn small_paste_strips_non_tab_control_chars() {
+        let mut ed = editor();
+        send(&mut ed, &paste("a\tb\0\x07c"));
+        assert_eq!(ed.text(), "a    bc");
+    }
+
+    #[test]
+    fn decodes_csi_u_ctrl_letters_inside_bracketed_paste() {
+        // Some terminals re-encode a paste's embedded newlines as the Kitty
+        // CSI-u Ctrl+J sequence `ESC [ 106 ; 5 u`. The paste pipeline must
+        // decode those to `\n` before the per-char control filter runs, or the
+        // filter strips the ESC and leaks the printable tail (`[106;5u`).
+        let mut ed = editor();
+        send(&mut ed, &paste("line1\x1b[106;5uline2\x1b[106;5uline3"));
+        assert_eq!(ed.text(), "line1\nline2\nline3");
+    }
+
+    // -- Paste markers: path-prefix safety --
+
+    #[test]
+    fn paste_with_slash_prefix_after_word_prepends_space() {
+        let mut ed = editor();
+        type_str(&mut ed, "cd");
+        send(&mut ed, &paste("/etc/hosts"));
+        assert_eq!(ed.text(), "cd /etc/hosts");
+    }
+
+    #[test]
+    fn paste_with_tilde_prefix_after_word_prepends_space() {
+        let mut ed = editor();
+        type_str(&mut ed, "ls");
+        send(&mut ed, &paste("~/code"));
+        assert_eq!(ed.text(), "ls ~/code");
+    }
+
+    #[test]
+    fn paste_with_dot_prefix_after_word_prepends_space() {
+        let mut ed = editor();
+        type_str(&mut ed, "ls");
+        send(&mut ed, &paste("./bin"));
+        assert_eq!(ed.text(), "ls ./bin");
+    }
+
+    #[test]
+    fn paste_with_path_prefix_after_space_does_not_prepend() {
+        let mut ed = editor();
+        type_str(&mut ed, "cd ");
+        send(&mut ed, &paste("/etc/hosts"));
+        assert_eq!(ed.text(), "cd /etc/hosts");
+    }
+
+    #[test]
+    fn paste_with_path_prefix_at_start_of_line_does_not_prepend() {
+        let mut ed = editor();
+        send(&mut ed, &paste("/etc/hosts"));
+        assert_eq!(ed.text(), "/etc/hosts");
+    }
+
+    #[test]
+    fn paste_with_path_prefix_after_punctuation_does_not_prepend() {
+        let mut ed = editor();
+        type_str(&mut ed, "(");
+        send(&mut ed, &paste("/etc"));
+        assert_eq!(ed.text(), "(/etc");
+    }
+
+    #[test]
+    fn paste_without_path_prefix_after_word_does_not_prepend() {
+        let mut ed = editor();
+        type_str(&mut ed, "foo");
+        send(&mut ed, &paste("bar"));
+        assert_eq!(ed.text(), "foobar");
+    }
+
+    #[test]
+    fn large_paste_with_path_prefix_after_word_separates_marker_with_space() {
+        let mut ed = editor();
+        type_str(&mut ed, "cd");
+        let big = "/path\n".repeat(20).trim_end().to_string();
+        send(&mut ed, &paste(&big));
+
+        let text = ed.text();
+        assert!(
+            text.starts_with("cd ["),
+            "expected `cd ` + marker, got {text:?}"
+        );
+        assert_eq!(ed.expanded_text(), format!("cd {big}"));
+    }
+
+    // -- Paste markers: layout interaction --
+
+    #[test]
+    fn does_not_crash_when_paste_marker_is_wider_than_terminal_width() {
+        let mut ed = editor();
+        paste_n_lines(&mut ed, 47);
+
+        let text = ed.text();
+        let (marker_len, _marker) = find_marker(&text);
+
+        // Draw narrow. The +1 offsets the reserved caret column so the layout
+        // width is 7. The marker (20 chars) is wider than that and must split.
+        let _ = ed.draw(&ctx(8, 40));
+        assert!(
+            marker_len > ed.layout_width,
+            "marker ({marker_len} chars) should exceed layout width {}",
+            ed.layout_width,
+        );
+        let vls = ed.build_visual_line_map(ed.layout_width);
+        assert!(
+            vls.len() > 1,
+            "wide marker should split across visual lines"
+        );
+        assert_all_vls_fit(&ed);
+    }
+
+    #[test]
+    fn does_not_crash_when_text_plus_marker_exceeds_width_with_cursor_on_marker() {
+        let mut ed = editor();
+        type_str(&mut ed, &"b".repeat(35));
+        paste_n_lines(&mut ed, 27);
+        type_str(&mut ed, &"b".repeat(4));
+
+        // Move the cursor left so it lands atomically on the marker.
+        for _ in 0..5 {
+            send(&mut ed, &left());
+        }
+        let _ = ed.draw(&ctx(55, 40));
+        assert_all_vls_fit(&ed);
+    }
+
+    #[test]
+    fn wide_marker_split_reconstructs_line_byte_for_byte() {
+        // A marker wider than the layout width sub-splits at grapheme
+        // granularity. The split is purely visual, so concatenating the spans
+        // must still yield the logical line exactly, with the marker bytes
+        // intact and the spans contiguous. A drifted sub-span offset would
+        // desync the visual-line map from the cursor math.
+        let mut ed = editor();
+        type_str(&mut ed, "abc");
+        paste_n_lines(&mut ed, 47);
+        type_str(&mut ed, "xyz");
+        let _ = ed.draw(&ctx(8, 40)); // layout width 7, narrower than the marker
+
+        let line = ed.lines[0].clone();
+        let spans = ed.wrap_line_spans(&line, ed.layout_width);
+        assert!(spans.len() > 1, "wide marker should split across rows");
+
+        let joined: String = spans.iter().map(|&(s, e)| &line[s..e]).collect();
+        assert_eq!(joined, line, "spans must reconstruct the marker line");
+
+        let mut prev_end = 0;
+        for &(s, e) in &spans {
+            assert_eq!(s, prev_end, "spans must be contiguous");
+            assert!(s <= e && e <= line.len());
+            prev_end = e;
+        }
+        assert_eq!(prev_end, line.len(), "spans must cover the line");
+
+        assert_all_vls_fit(&ed);
+    }
+
+    #[test]
+    fn wrap_re_checks_overflow_after_backtracking() {
+        // After backtracking to the space, the run of 35 b's plus the atomic
+        // marker must re-check overflow and force-break rather than overflow.
+        let mut ed = editor();
+        type_str(&mut ed, " ");
+        type_str(&mut ed, &"b".repeat(35));
+        paste_n_lines(&mut ed, 27);
+        type_str(&mut ed, &"b".repeat(4));
+
+        let _ = ed.draw(&ctx(55, 40));
+        assert_all_vls_fit(&ed);
+    }
+
+    #[test]
+    fn snaps_to_paste_marker_start_when_navigating_down_into_it() {
+        let mut ed = editor();
+        ed.set_text("12345678901234567890\n\nhello ");
+        paste_n_chars(&mut ed, 2000);
+        let _ = ed.draw(&ctx(80, 40));
+
+        let text = ed.text();
+        let (_len, marker) = find_marker(&text);
+        assert!(
+            marker.contains("chars]"),
+            "expected chars marker in {text:?}"
+        );
+
+        send(&mut ed, &up());
+        send(&mut ed, &up());
+        send(&mut ed, &ctrl('a'));
+        for _ in 0..10 {
+            send(&mut ed, &right());
+        }
+        assert_eq!(ed.cursor(), (0, 10));
+
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (1, 0));
+
+        // Sticky col 10 falls inside the marker (which starts at col 6), so the
+        // cursor snaps to the marker start rather than into it.
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (2, 6));
+    }
+
+    #[test]
+    fn preserves_sticky_column_when_navigating_through_paste_marker_line() {
+        let mut ed = editor();
+        type_str(&mut ed, "1234567890123456");
+        send(&mut ed, &shift_enter());
+        send(&mut ed, &shift_enter());
+        paste_n_chars(&mut ed, 2000);
+        send(&mut ed, &shift_enter());
+        send(&mut ed, &shift_enter());
+        type_str(&mut ed, "abcdefghijklmnop");
+        let _ = ed.draw(&ctx(30, 40));
+
+        for _ in 0..4 {
+            send(&mut ed, &up());
+        }
+        send(&mut ed, &ctrl('a'));
+        for _ in 0..10 {
+            send(&mut ed, &right());
+        }
+        assert_eq!(ed.cursor(), (0, 10));
+
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (1, 0));
+        // Snap onto the marker start (col 0).
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (2, 0));
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (3, 0));
+        // Sticky col 10 restores on the last line.
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (4, 10));
+    }
+
+    #[test]
+    fn does_not_get_stuck_moving_down_from_a_multi_visual_line_paste_marker() {
+        let mut ed = editor();
+        type_str(&mut ed, "abcdefgh");
+        paste_n_lines(&mut ed, 100);
+        type_str(&mut ed, "ijklmnopqr");
+        send(&mut ed, &shift_enter());
+        type_str(&mut ed, "123456789012345678");
+        // ctx width 21 leaves layout width 20 after the reserved caret column,
+        // matching the geometry the assertions assume.
+        let _ = ed.draw(&ctx(21, 40));
+
+        let text = ed.text();
+        let (marker_len, _marker) = find_marker(&text);
+        assert!(
+            marker_len > 20,
+            "marker ({marker_len} chars) should exceed layout width 20",
+        );
+        let marker_start = 8;
+        let marker_end = marker_start + marker_len;
+
+        send(&mut ed, &up());
+        send(&mut ed, &ctrl('a'));
+        for _ in 0..6 {
+            send(&mut ed, &right());
+        }
+        assert_eq!(ed.cursor(), (0, 6));
+
+        // Down lands on the marker start.
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (0, marker_start));
+        // Down again: preferred col 6 lands past the marker tail, on the first
+        // content char after the marker, without snapping back in.
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (0, marker_end));
+        // Round-trip back up.
+        send(&mut ed, &up());
+        assert_eq!(ed.cursor(), (0, marker_start));
+        send(&mut ed, &up());
+        assert_eq!(ed.cursor(), (0, 6));
+    }
+
+    #[test]
+    fn skips_marker_continuation_vls_when_preferred_col_falls_in_marker_tail() {
+        let mut ed = editor();
+        type_str(&mut ed, "abcdefgh");
+        paste_n_lines(&mut ed, 100);
+        type_str(&mut ed, "ijklmnopqr");
+        send(&mut ed, &shift_enter());
+        type_str(&mut ed, "123456789012345678");
+        let _ = ed.draw(&ctx(21, 40));
+
+        send(&mut ed, &up());
+        send(&mut ed, &ctrl('a'));
+        for _ in 0..3 {
+            send(&mut ed, &right());
+        }
+        assert_eq!(ed.cursor(), (0, 3));
+
+        // Down: marker start.
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor().1, 8);
+        // Down: preferred col 3 falls in the marker-tail continuation VL, so the
+        // move skips forward to line 1.
+        send(&mut ed, &down());
+        assert_eq!(ed.cursor(), (1, 3));
+        // Round-trip back.
+        send(&mut ed, &up());
+        assert_eq!(ed.cursor().1, 8);
+        send(&mut ed, &up());
+        assert_eq!(ed.cursor(), (0, 3));
+    }
+
+    // -- Char-jump: forward --
+
+    #[test]
+    fn jumps_forward_to_first_occurrence_on_same_line() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('o'));
+        assert_eq!(ed.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn jumps_forward_to_next_occurrence_after_cursor() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &ctrl('a'));
+        for _ in 0..4 {
+            send(&mut ed, &right());
+        }
+        assert_eq!(ed.cursor(), (0, 4));
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('o'));
+        assert_eq!(ed.cursor(), (0, 7));
+    }
+
+    #[test]
+    fn jumps_forward_across_multiple_lines() {
+        let mut ed = editor();
+        ed.set_text("abc\ndef\nghi");
+        send(&mut ed, &up());
+        send(&mut ed, &up());
+        send(&mut ed, &ctrl('a'));
+        assert_eq!(ed.cursor(), (0, 0));
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('g'));
+        assert_eq!(ed.cursor(), (2, 0));
+    }
+
+    // -- Char-jump: backward --
+
+    #[test]
+    fn jumps_backward_to_occurrence_before_cursor_on_same_line() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        assert_eq!(ed.cursor(), (0, 11));
+        send(&mut ed, &jump_backward());
+        send(&mut ed, &char_key('o'));
+        assert_eq!(ed.cursor(), (0, 7));
+    }
+
+    #[test]
+    fn jumps_backward_across_multiple_lines() {
+        let mut ed = editor();
+        ed.set_text("abc\ndef\nghi");
+        assert_eq!(ed.cursor(), (2, 3));
+        send(&mut ed, &jump_backward());
+        send(&mut ed, &char_key('a'));
+        assert_eq!(ed.cursor(), (0, 0));
+    }
+
+    // -- Char-jump: no-match, case sensitivity --
+
+    #[test]
+    fn jump_does_nothing_when_character_not_found_forward() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('z'));
+        assert_eq!(ed.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn jump_does_nothing_when_character_not_found_backward() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &jump_backward());
+        send(&mut ed, &char_key('z'));
+        assert_eq!(ed.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn jump_is_case_sensitive() {
+        let mut ed = editor();
+        ed.set_text("Hello World");
+        send(&mut ed, &ctrl('a'));
+        // No lowercase 'h' exists, so the jump is a no-op.
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('h'));
+        assert_eq!(ed.cursor(), (0, 0));
+        // Uppercase 'W' does exist.
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('W'));
+        assert_eq!(ed.cursor(), (0, 6));
+    }
+
+    // -- Char-jump: cancelling --
+
+    #[test]
+    fn cancels_jump_mode_when_ctrl_bracket_is_pressed_again() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &jump_forward()); // enter
+        send(&mut ed, &jump_forward()); // cancel
+        // 'o' is now a normal insert, not a jump target.
+        send(&mut ed, &char_key('o'));
+        assert_eq!(ed.text(), "ohello world");
+    }
+
+    #[test]
+    fn cancels_backward_jump_mode_when_ctrl_alt_bracket_is_pressed_again() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &jump_backward()); // enter
+        send(&mut ed, &jump_backward()); // cancel
+        send(&mut ed, &char_key('o'));
+        assert_eq!(ed.text(), "hello worldo");
+    }
+
+    #[test]
+    fn cancels_jump_mode_on_escape_and_does_not_consume_the_escape() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &jump_forward());
+        // Escape must fall through so the parent surface can handle it.
+        let consumed = send_consumed(&mut ed, &escape());
+        assert!(!consumed, "escape in jump mode must not be consumed");
+        assert_eq!(ed.cursor(), (0, 0));
+        // The silent fall-through cleared the mode, so 'o' inserts as text.
+        send(&mut ed, &char_key('o'));
+        assert_eq!(ed.text(), "ohello world");
+    }
+
+    // -- Char-jump: special chars, empty text, last_action reset --
+
+    #[test]
+    fn jump_searches_for_special_characters() {
+        let mut ed = editor();
+        ed.set_text("foo(bar) = baz;");
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('('));
+        assert_eq!(ed.cursor(), (0, 3));
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('='));
+        assert_eq!(ed.cursor(), (0, 9));
+    }
+
+    #[test]
+    fn jump_handles_empty_text_gracefully() {
+        let mut ed = editor();
+        ed.set_text("");
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('x'));
+        assert_eq!(ed.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn jumping_resets_last_action_so_following_type_starts_new_undo_unit() {
+        let mut ed = editor();
+        ed.set_text("hello world");
+        send(&mut ed, &ctrl('a'));
+
+        // Typing sets last_action = TypeWord.
+        send(&mut ed, &char_key('x'));
+        assert_eq!(ed.text(), "xhello world");
+
+        send(&mut ed, &jump_forward());
+        send(&mut ed, &char_key('o'));
+
+        // The jump reset last_action, so this type starts a fresh undo unit.
+        send(&mut ed, &char_key('Y'));
+        assert_eq!(ed.text(), "xhellYo world");
+
+        send(&mut ed, &ctrl('-'));
+        assert_eq!(ed.text(), "xhello world");
     }
 }
