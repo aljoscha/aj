@@ -10,8 +10,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use aj_app::chat::{ChatState, Entry, EntryKind, NoticeLevel, UserEntry};
+use aj_app::chat::{
+    AssistantEntry, ChatState, CompactionEntry, Entry, EntryKind, NoticeLevel, UserEntry,
+};
 use aj_app::footer::format_tokens;
+use aj_app::markdown::{Emphasis, RenderOpts};
 use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256};
 use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
@@ -23,6 +26,7 @@ use vaxis::vxfw::{
 };
 
 use crate::bubble::Bubble;
+use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::subagent_box::{SubAgentBox, build_subagent_box};
 use crate::tool_cell::{EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint};
 
@@ -61,7 +65,23 @@ pub(crate) struct TranscriptStyles {
     pub(crate) tool_error_bg: Color,
     /// The user-message bubble tint.
     pub(crate) user_message_bg: Color,
+    /// Foreground mapper for markdown span roles, consumed by
+    /// [`MarkdownView`]. Rebuilt from the theme here so a runtime swap
+    /// re-tints markdown through the same `set_styles` path.
+    pub(crate) markdown: MarkdownStyles,
+    /// Whether markdown links emit OSC-8 hyperlinks. See
+    /// [`TERMINAL_HYPERLINKS`].
+    pub(crate) hyperlinks: bool,
 }
+
+/// Whether the markdown renderer emits OSC-8 hyperlinks.
+///
+/// vaxis's `Capabilities` surfaces no hyperlink probe, so there is nothing to
+/// read from `app.vaxis().caps`: we optimistically enable OSC-8. vaxis writes
+/// the escape unconditionally and terminals that lack support ignore the
+/// bytes. TODO(aljoscha): thread a real capability once vaxis detects
+/// hyperlink support, wiring it through `from_theme` the way `ColorMode` is.
+const TERMINAL_HYPERLINKS: bool = true;
 
 /// The SGR-2 faint attribute over the default foreground: the exact analogue of
 /// `aj-tui`'s `style::dim`, which every dim transcript row, tool-cell detail, and
@@ -105,6 +125,8 @@ impl TranscriptStyles {
             tool_success_bg: bg(ThemeBg::ToolSuccessBg),
             tool_error_bg: bg(ThemeBg::ToolErrorBg),
             user_message_bg: bg(ThemeBg::UserMessageBg),
+            markdown: MarkdownStyles::from_theme(theme),
+            hyperlinks: TERMINAL_HYPERLINKS,
         }
     }
 }
@@ -151,6 +173,7 @@ impl Builder for EntryBuilder {
             match build_entry_widget(entry, &chat, &self.styles, false) {
                 EntryWidget::Bubble(b) => Rc::new(RefCell::new(b)),
                 EntryWidget::Rich(r) => Rc::new(RefCell::new(r)),
+                EntryWidget::Markdown(m) => Rc::new(RefCell::new(m)),
                 EntryWidget::SubAgent(b) => Rc::new(RefCell::new(b)),
             },
         )
@@ -163,6 +186,7 @@ impl Builder for EntryBuilder {
 pub(crate) enum EntryWidget {
     Bubble(Bubble),
     Rich(RichText),
+    Markdown(MarkdownView),
     SubAgent(SubAgentBox),
 }
 
@@ -172,6 +196,7 @@ impl EntryWidget {
         match self {
             EntryWidget::Bubble(b) => Box::new(b),
             EntryWidget::Rich(r) => Box::new(r),
+            EntryWidget::Markdown(m) => Box::new(m),
             EntryWidget::SubAgent(b) => Box::new(b),
         }
     }
@@ -203,12 +228,19 @@ pub(crate) fn build_entry_widget(
         EntryKind::SubAgent(s) if !nested => {
             EntryWidget::SubAgent(build_subagent_box(s, chat, styles))
         }
-        _ => EntryWidget::Rich(RichText::new(entry_spans(
-            entry,
+        // Assistant prose and the expanded compaction summary render as
+        // markdown through the width-aware `MarkdownView`. A nested assistant
+        // entry (inside a sub-agent box) takes this path too, so a child's
+        // messages render as markdown just like the top-level ones.
+        EntryKind::Assistant(a) => EntryWidget::Markdown(build_assistant_markdown(
+            a,
             chat.hide_thinking_block,
-            chat.tools_expanded,
             styles,
-        ))),
+        )),
+        EntryKind::Compaction(c) => {
+            EntryWidget::Markdown(build_compaction_markdown(c, chat.tools_expanded, styles))
+        }
+        _ => EntryWidget::Rich(RichText::new(entry_spans(entry, styles))),
     }
 }
 
@@ -259,83 +291,32 @@ fn build_user_bubble(user: &UserEntry, expanded: bool, styles: &TranscriptStyles
     Bubble::entry(spans, Some(styles.user_message_bg), styles.text)
 }
 
-/// Build the styled spans for one entry, ending in a blank spacer row
-/// so consecutive entries don't visually collide.
-fn entry_spans(
-    entry: &Entry,
-    hide_thinking: bool,
-    tools_expanded: bool,
-    styles: &TranscriptStyles,
-) -> Vec<TextSpan> {
+/// Build the styled spans for one entry that renders through [`RichText`]
+/// (notices, usage, the defensive nested sub-agent stub), ending in a blank
+/// spacer row so consecutive entries don't visually collide.
+///
+/// Assistant, compaction, tool, and user entries render through their own
+/// widgets (see [`build_entry_widget`]); their arms here return no content and
+/// exist only to keep the match total.
+fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
     let span = |text: String, style: Style| TextSpan {
         text,
         style,
         ..TextSpan::default()
     };
     let mut spans = match &entry.kind {
-        // User entries render through the bubble widget (see
-        // `build_entry_widget`). This arm only exists so the match
-        // stays total.
-        EntryKind::User(_) => Vec::new(),
-        EntryKind::Assistant(a) => {
-            let mut spans = Vec::new();
-            for block in &a.message.content {
-                let block_span = match block {
-                    AssistantContent::Text(t) => span(t.text.clone(), styles.text),
-                    AssistantContent::Thinking(t) if t.redacted => span(
-                        format!("[Redacted thinking: {}]", t.thinking),
-                        styles.thinking,
-                    ),
-                    AssistantContent::Thinking(_) if hide_thinking => {
-                        span("Thinking…".to_string(), styles.thinking)
-                    }
-                    AssistantContent::Thinking(t) => {
-                        span(format!("Thinking: {}", t.thinking), styles.thinking)
-                    }
-                    // Tool calls render as their own `Tool` transcript
-                    // entries, so the inline block would duplicate them.
-                    AssistantContent::ToolCall(_) => continue,
-                };
-                if !spans.is_empty() {
-                    spans.push(span("\n\n".to_string(), styles.text));
-                }
-                spans.push(block_span);
-            }
-            spans
-        }
-        // Tool entries render through the `ToolCell` bubble and
-        // sub-agent entries through the `SubAgentBox` (see
-        // `build_entry_widget`). The `SubAgent` arm is only reachable
-        // as the nested-inside-a-box fallback, which can't occur live
-        // (sub-agents don't spawn sub-agents), so a dim stub is
-        // enough.
-        EntryKind::Tool(_) => Vec::new(),
+        // These render through a dedicated widget: user and tool entries
+        // through a bubble, assistant prose and compaction summaries through
+        // a `MarkdownView`. The builder never routes them here, so these arms
+        // only keep the match total.
+        EntryKind::User(_)
+        | EntryKind::Assistant(_)
+        | EntryKind::Tool(_)
+        | EntryKind::Compaction(_) => Vec::new(),
+        // The `SubAgent` arm is only reachable as the nested-inside-a-box
+        // fallback, which can't occur live (sub-agents don't spawn
+        // sub-agents), so a dim stub is enough.
         EntryKind::SubAgent(s) => vec![span(format!("[sub-agent {}]", s.child), styles.dim)],
-        // The durable record of a context compaction: a dim header
-        // stating the token delta, expandable to the generated
-        // summary. Folding rides the session-wide `tools_expanded`
-        // flag, the same one tool bodies honor, so a compaction
-        // summary expands and collapses together with tool results
-        // under one keystroke.
-        EntryKind::Compaction(c) => {
-            // One-column inset like the notice rows, no vertical
-            // padding of its own (the trailing spacer supplies the
-            // gap).
-            let mut header = format!(" {}", compaction_header(c.tokens_before, c.tokens_after));
-            if !tools_expanded && !c.summary.is_empty() {
-                let key = EXPAND_KEY_LABEL.as_str();
-                header.push_str(&format!(" ({key} to expand)"));
-            }
-            let mut spans = vec![span(header, styles.dim)];
-            if tools_expanded && !c.summary.is_empty() {
-                // Markdown rendering is deferred, so the summary
-                // shows as plain wrapped text, separated from the
-                // header by one blank row.
-                spans.push(span("\n\n".to_string(), styles.text));
-                spans.push(span(c.summary.clone(), styles.text));
-            }
-            spans
-        }
         // Notice and usage rows carry the same one-column left inset
         // the tool bubbles have, so the transcript's left edge lines
         // up. Wrapped continuation lines start at column zero, which
@@ -360,6 +341,101 @@ fn entry_spans(
     // engine renders as a blank spacer row.
     spans.push(span("\n\n".to_string(), styles.text));
     spans
+}
+
+/// Build the [`MarkdownView`] for an assistant entry: one segment per content
+/// block, in order.
+///
+/// Plain text renders under the normal text style; thinking blocks under the
+/// thinking style (its own color plus italic). Tool calls render as their own
+/// `Tool` transcript entries, so the inline block is skipped here to avoid
+/// duplicating them. Redacted and (when `hide_thinking`) hidden thinking
+/// collapse to their placeholders, matching the plain-text renderer they
+/// replace.
+fn build_assistant_markdown(
+    a: &AssistantEntry,
+    hide_thinking: bool,
+    styles: &TranscriptStyles,
+) -> MarkdownView {
+    let text_opts = RenderOpts {
+        hyperlinks: styles.hyperlinks,
+        default_emphasis: Emphasis::default(),
+    };
+    // Thinking prose renders italic by default, the same emphasis `aj` applies
+    // to a thinking block's markdown.
+    let thinking_opts = RenderOpts {
+        hyperlinks: styles.hyperlinks,
+        default_emphasis: Emphasis {
+            italic: true,
+            ..Emphasis::default()
+        },
+    };
+    let mut segments = Vec::new();
+    for block in &a.message.content {
+        let segment = match block {
+            AssistantContent::Text(t) => MarkdownSegment {
+                text: t.text.clone(),
+                opts: text_opts.clone(),
+                base_style: styles.text,
+            },
+            AssistantContent::Thinking(t) if t.redacted => MarkdownSegment {
+                text: format!("[Redacted thinking: {}]", t.thinking),
+                opts: thinking_opts.clone(),
+                base_style: styles.thinking,
+            },
+            AssistantContent::Thinking(_) if hide_thinking => MarkdownSegment {
+                text: "Thinking…".to_string(),
+                opts: thinking_opts.clone(),
+                base_style: styles.thinking,
+            },
+            AssistantContent::Thinking(t) => MarkdownSegment {
+                text: format!("Thinking: {}", t.thinking),
+                opts: thinking_opts.clone(),
+                base_style: styles.thinking,
+            },
+            AssistantContent::ToolCall(_) => continue,
+        };
+        segments.push(segment);
+    }
+    MarkdownView::new(segments, Vec::new(), styles.markdown)
+}
+
+/// Build the [`MarkdownView`] for a compaction entry: a dim plain header above
+/// the markdown-rendered summary.
+///
+/// The header stays a plain (non-markdown) leading row so its one-column inset
+/// and token glyphs survive verbatim, carrying the `(<key> to expand)` hint
+/// while collapsed. Folding rides the session-wide `tools_expanded` flag, the
+/// same one tool bodies honor, so a summary expands and collapses together with
+/// tool results under one keystroke. The summary renders as a markdown segment
+/// only once expanded and non-empty.
+fn build_compaction_markdown(
+    c: &CompactionEntry,
+    tools_expanded: bool,
+    styles: &TranscriptStyles,
+) -> MarkdownView {
+    let mut header = format!(" {}", compaction_header(c.tokens_before, c.tokens_after));
+    if !tools_expanded && !c.summary.is_empty() {
+        let key = EXPAND_KEY_LABEL.as_str();
+        header.push_str(&format!(" ({key} to expand)"));
+    }
+    let leading = vec![TextSpan {
+        text: header,
+        style: styles.dim,
+        ..TextSpan::default()
+    }];
+    let mut segments = Vec::new();
+    if tools_expanded && !c.summary.is_empty() {
+        segments.push(MarkdownSegment {
+            text: c.summary.clone(),
+            opts: RenderOpts {
+                hyperlinks: styles.hyperlinks,
+                default_emphasis: Emphasis::default(),
+            },
+            base_style: styles.text,
+        });
+    }
+    MarkdownView::new(segments, leading, styles.markdown)
 }
 
 /// Header line for a compaction row: `Context compacted: 152k → 48k
@@ -632,6 +708,35 @@ mod tests {
         spans.iter().map(|s| s.text.as_str()).collect()
     }
 
+    /// Draw the assistant entry's `MarkdownView` at `width` and return its
+    /// composited rows.
+    fn assistant_markdown_rows(t: &Transcript, hide_thinking: bool, width: u16) -> Vec<String> {
+        let EntryKind::Assistant(a) = &t.entries()[0].kind else {
+            panic!("expected an assistant entry");
+        };
+        let mut view = build_assistant_markdown(a, hide_thinking, &styles());
+        let surface = view.draw(&crate::test_support::draw_ctx(width, None));
+        crate::test_support::rows(&surface)
+    }
+
+    /// Draw the compaction entry's `MarkdownView` at `width` and return its
+    /// composited rows plus the header's (first visible cell's) style.
+    fn compaction_view_rows(t: &Transcript, expanded: bool, width: u16) -> (Vec<String>, Style) {
+        let EntryKind::Compaction(c) = &t.entries()[0].kind else {
+            panic!("expected a compaction entry");
+        };
+        let mut view = build_compaction_markdown(c, expanded, &styles());
+        let surface = view.draw(&crate::test_support::draw_ctx(width, None));
+        let rows = crate::test_support::rows(&surface);
+        let grid = crate::test_support::flatten(&surface);
+        let header_style = grid[0]
+            .iter()
+            .find(|cell| !cell.char.grapheme().trim().is_empty())
+            .map(|cell| cell.style)
+            .unwrap_or_default();
+        (rows, header_style)
+    }
+
     #[test]
     fn user_entry_spans_are_empty_the_bubble_renders_it() {
         // User entries render through `build_user_bubble`, so the
@@ -640,7 +745,7 @@ mod tests {
             content: vec![UserContent::text("hello")],
             collapsible: false,
         }));
-        let spans = entry_spans(&t.entries()[0], false, false, &styles());
+        let spans = entry_spans(&t.entries()[0], &styles());
         assert_eq!(joined(&spans), "\n\n");
     }
 
@@ -768,6 +873,13 @@ mod tests {
                     thinking_signature: None,
                     redacted: false,
                 }),
+                // Tool calls render as their own transcript entry, so this
+                // block is dropped from the markdown view.
+                AssistantContent::ToolCall(aj_models::types::ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                }),
                 AssistantContent::Text(TextContent {
                     text: "answer\n".into(),
                     text_signature: None,
@@ -775,10 +887,10 @@ mod tests {
             ]),
             finalized: true,
         }));
-        let spans = entry_spans(&t.entries()[0], false, false, &styles());
-        // Trailing newline of the last block is normalized so the
-        // spacer contributes exactly one blank row.
-        assert_eq!(joined(&spans), "Thinking: pondering\n\nanswer\n\n");
+        let rows = assistant_markdown_rows(&t, false, 80);
+        // Segments stack in order with one blank row between them and the
+        // trailing spacer, the tool call contributing nothing.
+        assert_eq!(rows, vec!["Thinking: pondering", "", "answer", ""]);
     }
 
     #[test]
@@ -791,8 +903,8 @@ mod tests {
             })]),
             finalized: true,
         }));
-        let spans = entry_spans(&t.entries()[0], true, false, &styles());
-        assert_eq!(joined(&spans), "Thinking…\n\n");
+        let rows = assistant_markdown_rows(&t, true, 80);
+        assert_eq!(rows, vec!["Thinking…", ""]);
     }
 
     #[test]
@@ -805,8 +917,8 @@ mod tests {
             })]),
             finalized: true,
         }));
-        let spans = entry_spans(&t.entries()[0], false, false, &styles());
-        assert_eq!(joined(&spans), "[Redacted thinking: ]\n\n");
+        let rows = assistant_markdown_rows(&t, false, 80);
+        assert_eq!(rows, vec!["[Redacted thinking: ]", ""]);
     }
 
     #[test]
@@ -846,7 +958,7 @@ mod tests {
                 level,
                 text: "note".into(),
             }));
-            let spans = entry_spans(&t.entries()[0], false, false, &s);
+            let spans = entry_spans(&t.entries()[0], &s);
             assert_eq!(spans[0].style, style);
         }
     }
@@ -859,7 +971,7 @@ mod tests {
             level: NoticeLevel::Info,
             text: "note".into(),
         }));
-        let spans = entry_spans(&t.entries()[0], false, false, &styles());
+        let spans = entry_spans(&t.entries()[0], &styles());
         assert_eq!(joined(&spans), " note\n\n");
 
         let t = transcript_with(EntryKind::TurnUsage(aj_app::chat::TurnUsageEntry {
@@ -875,7 +987,7 @@ mod tests {
                 turn_cache_read: 0,
             },
         }));
-        let spans = entry_spans(&t.entries()[0], false, false, &styles());
+        let spans = entry_spans(&t.entries()[0], &styles());
         assert!(joined(&spans).starts_with(" Token Usage"), "{spans:?}");
     }
 
@@ -908,34 +1020,34 @@ mod tests {
     #[test]
     fn collapsed_compaction_hides_summary_and_advertises_expand() {
         let t = compaction("secret summary body");
-        let spans = entry_spans(&t.entries()[0], false, false, &styles());
-        let text = joined(&spans);
+        let (rows, header) = compaction_view_rows(&t, false, 100);
+        let text = rows.join("\n");
         assert!(text.contains("Context compacted"), "{text:?}");
         assert!(text.contains("(freed 75%)"), "{text:?}");
         assert!(text.contains("(Alt+O to expand)"), "{text:?}");
         assert!(!text.contains("secret summary body"), "{text:?}");
-        assert!(text.starts_with(' '), "one-column inset: {text:?}");
-        assert_eq!(spans[0].style, styles().dim, "dim header");
+        assert!(rows[0].starts_with(' '), "one-column inset: {rows:?}");
+        assert_eq!(header, styles().dim, "dim header");
     }
 
     /// With nothing to reveal there is nothing to advertise.
     #[test]
     fn collapsed_compaction_without_summary_has_no_expand_hint() {
         let t = compaction("");
-        let spans = entry_spans(&t.entries()[0], false, false, &styles());
-        assert!(!joined(&spans).contains("to expand"), "{spans:?}");
+        let (rows, _) = compaction_view_rows(&t, false, 100);
+        assert!(!rows.join("\n").contains("to expand"), "{rows:?}");
     }
 
     #[test]
     fn expanded_compaction_shows_summary_after_a_blank_row() {
         let t = compaction("the full summary body");
-        let spans = entry_spans(&t.entries()[0], false, true, &styles());
-        let text = joined(&spans);
+        let (rows, _) = compaction_view_rows(&t, true, 100);
+        let text = rows.join("\n");
         assert!(!text.contains("to expand"), "{text:?}");
-        assert!(
-            text.contains("tokens (freed 75%)\n\nthe full summary body"),
-            "blank row between header and body: {text:?}",
-        );
+        // Header, one blank separator row, then the markdown summary.
+        assert!(rows[0].contains("tokens (freed 75%)"), "{rows:?}");
+        assert_eq!(rows[1], "", "blank row between header and body: {rows:?}");
+        assert!(rows[2].contains("the full summary body"), "{rows:?}");
     }
 
     /// A full draw over a populated model must not panic and must pin

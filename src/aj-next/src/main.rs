@@ -18,6 +18,7 @@ mod footer;
 mod interactive;
 mod keymap;
 mod login;
+mod markdown_view;
 mod overlay;
 mod palette;
 mod pending;
