@@ -17,15 +17,20 @@
 //! byte stream), because every span carries its full style explicitly.
 //!
 //! Scope. This layer renders prose (headings, paragraphs, inline
-//! emphasis, inline code, links), fenced/indented code blocks, and
-//! top-level horizontal rules. Lists, blockquotes, and tables parse into
-//! the AST but render through a content-preserving fallback for now (see
-//! [`render_block`]). Syntax highlighting of code blocks is not wired yet:
-//! code spans leave [`StyledSpan::syntax`] as `None`.
+//! emphasis, inline code, links), fenced/indented code blocks with
+//! syntect-driven syntax highlighting, lists (ordered and unordered,
+//! nested), blockquotes, and top-level horizontal rules. Tables parse
+//! into the AST but render through a content-preserving fallback for now
+//! (see [`render_block`]).
+
+use std::sync::OnceLock;
 
 use pulldown_cmark::{
     Alignment as PdAlignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
+use syntect::easy::ScopeRegionIterator;
+use syntect::highlighting::ScopeSelectors;
+use syntect::parsing::{MatchPower, ParseState, Scope, ScopeStack, SyntaxSet};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -35,9 +40,9 @@ use unicode_width::UnicodeWidthStr;
 
 /// Semantic role of a rendered span. Frontends map each kind onto their
 /// own palette (heading color, inline-code background, link color, and so
-/// on). The full set is fixed here so backends can match exhaustively even
-/// though the current renderer only emits a subset (list, quote, and table
-/// kinds are reserved for later chunks).
+/// on). The full set is fixed here so backends can match exhaustively.
+/// Every kind but the table pair is emitted today. `TableBorder` and
+/// `TableCell` are reserved until native table layout lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanKind {
     /// Plain body text.
@@ -70,9 +75,9 @@ pub enum SpanKind {
 }
 
 /// Syntax-highlighting category assigned to a code-block span. Populated by
-/// the syntect-based classifier in a later chunk. The current renderer
-/// always leaves [`StyledSpan::syntax`] as `None`; the enum exists now so
-/// the model and backends are stable across chunks.
+/// the syntect-based classifier ([`highlight_code`]) for fenced/indented
+/// code, and `None` for tokens that match no category. Frontends map each
+/// category onto their own palette color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyntaxCategory {
     Comment,
@@ -129,8 +134,9 @@ pub struct StyledSpan {
     pub kind: SpanKind,
     /// Text-decoration bits to apply on top of the role's base style.
     pub emphasis: Emphasis,
-    /// Set only on code-block spans once syntax classification runs;
-    /// `None` everywhere else and for all spans today.
+    /// Set only on code-block spans that syntax classification matched to
+    /// a category. `None` on every other span, and on code-block tokens
+    /// that matched no category (they render in the default foreground).
     pub syntax: Option<SyntaxCategory>,
     /// OSC-8 hyperlink target for link spans. The backend decides whether
     /// to emit the escape based on its own capability. See
@@ -189,8 +195,9 @@ pub struct RenderOpts {
     pub hyperlinks: bool,
     /// Emphasis applied to plain paragraph text. Lets a caller render, for
     /// example, "thinking" prose in italic. Not applied to headings, code
-    /// blocks, or rules, matching the paragraph-only scope of the styling
-    /// it stands in for.
+    /// blocks, rules, or blockquote contents (a quote's own italic is the
+    /// only decoration on quoted prose), matching the paragraph-only scope
+    /// of the styling it stands in for.
     pub default_emphasis: Emphasis,
 }
 
@@ -308,15 +315,26 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
                 fence_open,
                 SpanKind::CodeBlockBorder,
             )]);
-            // Each source line becomes one code-block span, indent folded
-            // in so a backend that backgrounds code covers the inset too.
-            // Long lines are word-wrapped by the shared wrap, matching the
-            // styled renderer, which wraps every emitted line uniformly.
-            for code_line in code.lines() {
-                lines.push(vec![StyledSpan::plain(
-                    format!("{CODE_BLOCK_INDENT}{code_line}"),
-                    SpanKind::CodeBlock,
-                )]);
+            // Classify each source line into (category, text) runs. The
+            // indent is folded into a leading no-syntax `CodeBlock` span so
+            // a backend that backgrounds code covers the inset too. Long
+            // lines are word-wrapped by the shared wrap (via the outer
+            // render loop), which preserves each run's syntax across the
+            // break because a split span copies the `syntax` field. This
+            // matches the styled renderer, which wraps every emitted line
+            // uniformly.
+            for line_runs in highlight_code(code, lang.as_deref()) {
+                let mut spans = vec![StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlock)];
+                for (category, text) in line_runs {
+                    spans.push(StyledSpan {
+                        text,
+                        kind: SpanKind::CodeBlock,
+                        emphasis: Emphasis::default(),
+                        syntax: category,
+                        link: None,
+                    });
+                }
+                lines.push(spans);
             }
             lines.push(vec![StyledSpan::plain("```", SpanKind::CodeBlockBorder)]);
             lines
@@ -325,20 +343,12 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
             let rule = "─".repeat(width.min(HR_MAX_WIDTH));
             vec![vec![StyledSpan::plain(rule, SpanKind::Hr)]]
         }
-        // TODO(aljoscha): a2/a3 render lists, blockquotes, and tables as
-        // their native block structure (markers, borders, column layout).
-        // Until then we render their content as prose so nothing is
+        Block::UnorderedList(items) => render_list(items, false, 0, width, opts),
+        Block::OrderedList(items) => render_list(items, true, 0, width, opts),
+        Block::Blockquote(sub_blocks) => render_blockquote(sub_blocks, width, opts),
+        // TODO(aljoscha): a3 renders tables as their native column layout.
+        // Until then we render the raw table source as prose so nothing is
         // dropped, at the cost of the surrounding chrome.
-        Block::UnorderedList(items) | Block::OrderedList(items) => {
-            render_list_fallback(items, block, opts)
-        }
-        Block::Blockquote(sub_blocks) => {
-            let mut lines = Vec::new();
-            for sub in sub_blocks {
-                lines.extend(render_block(sub, width, opts));
-            }
-            lines
-        }
         Block::Table { raw, .. } => {
             let mut spans = Vec::new();
             render_inlines(
@@ -354,18 +364,42 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
     }
 }
 
-/// Content-preserving list rendering used until native list layout lands.
-/// Emits `- ` / `N. ` markers and recurses into each item's sub-blocks,
-/// styling everything as prose.
-fn render_list_fallback(
+/// Render a list into logical lines of styled spans (pre-wrap).
+///
+/// One logical line per item: a [`SpanKind::ListMarker`] span carrying the
+/// depth indent plus the bullet, followed by the item's inline content.
+/// The indent (`"  "` per level) is folded into the marker span because
+/// the leading spaces carry no visible color. `depth` drives that indent
+/// and grows by one per nesting level.
+///
+/// We stay width-agnostic and emit each item as a single logical line. The
+/// outer wrap in [`render_markdown`] then breaks a long item, and because
+/// that wrap carries no hang indent the continuation rows land flush-left
+/// at column 0 rather than under the bullet. This is the same
+/// continuation-flush-left shape the styled renderer produces by wrapping
+/// list lines uniformly.
+///
+/// Ordered items number from `item.number` when the parser captured a
+/// source marker, falling back to the positional index. Keying off the
+/// captured marker keeps numbering stable across a list that an
+/// intervening block (e.g. a code fence) split into separate lists.
+///
+/// Nested sub-blocks render at `depth + 1`: nested lists recurse here,
+/// every other block goes through [`render_block`]. In this neutral model
+/// [`render_block`] never appends a trailing blank spacer (the outer
+/// [`render_markdown`] loop owns inter-block spacing), so sub-block lines
+/// are extended directly with no spacer to drop, keeping list items tight.
+fn render_list(
     items: &[ListItem],
-    list: &Block,
+    ordered: bool,
+    depth: usize,
+    width: usize,
     opts: &RenderOpts,
 ) -> Vec<Vec<StyledSpan>> {
-    let ordered = matches!(list, Block::OrderedList(_));
+    let indent = "  ".repeat(depth);
     let mut lines = Vec::new();
     for (idx, item) in items.iter().enumerate() {
-        let marker = if ordered {
+        let bullet = if ordered {
             let n = item
                 .number
                 .unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(u32::MAX));
@@ -373,24 +407,109 @@ fn render_list_fallback(
         } else {
             "- ".to_string()
         };
-        let mut spans = vec![StyledSpan::plain(marker, SpanKind::Text)];
+        let mut spans = vec![StyledSpan::plain(
+            format!("{indent}{bullet}"),
+            SpanKind::ListMarker,
+        )];
+        // `default_emphasis` is paragraph-level, so list item content does
+        // not inherit it (a list inside an italic thinking block keeps its
+        // items upright), matching how a blockquote clears it.
         render_inlines(
             &item.content,
             SpanKind::Text,
-            opts.default_emphasis,
+            Emphasis::default(),
             None,
             opts,
             &mut spans,
         );
         lines.push(spans);
         for sub in &item.sub_blocks {
-            // Width is unused by the prose fallbacks these sub-blocks hit;
-            // pass a permissive value so a nested rule (should one appear)
-            // still renders sensibly.
-            lines.extend(render_block(sub, HR_MAX_WIDTH, opts));
+            let sub_lines = match sub {
+                Block::UnorderedList(sub_items) => {
+                    render_list(sub_items, false, depth + 1, width, opts)
+                }
+                Block::OrderedList(sub_items) => {
+                    render_list(sub_items, true, depth + 1, width, opts)
+                }
+                other => render_block(other, width, opts),
+            };
+            lines.extend(sub_lines);
         }
     }
     lines
+}
+
+/// Render a blockquote into logical lines of styled spans (pre-wrap).
+///
+/// The quote body is a full sub-document: each sub-block renders as its
+/// own native block ([`render_block`]) at `inner_width`, so a nested
+/// paragraph, list, code block, heading, or even a nested quote keeps its
+/// own structure. `inner_width` reserves the two columns the `"│ "` border
+/// occupies.
+///
+/// Neutral-model retag. The styled renderer needs an escape-reopen hack:
+/// it splices the quote's opening SGR codes back in after every full reset
+/// so downstream content (syntect code lines end in a reset) re-enters the
+/// quote style. The neutral model carries each span's full style
+/// explicitly, so there is nothing to reopen. We instead prepend a
+/// [`SpanKind::QuoteBorder`] span to every produced row and retag that
+/// row's [`SpanKind::Text`] spans to [`SpanKind::Quote`] with italic
+/// emphasis. Other kinds (heading, inline code, code block, list marker,
+/// link) are left untouched, so nested code and headings keep their own
+/// role and only the plain text runs pick up the quote color and italic.
+///
+/// We wrap each sub-block at `inner_width` before bordering because the
+/// border must lead every visual row. Sub-blocks are separated by one
+/// blank spacer row, matching the one-blank-per-block shape the outer loop
+/// gives top-level blocks, and trailing blanks are dropped so the quote
+/// does not end in a bare border. A surviving mid-quote blank row still
+/// gets the border prefix, rendering as `│ ` rather than an empty line.
+fn render_blockquote(
+    sub_blocks: &[Block],
+    width: usize,
+    opts: &RenderOpts,
+) -> Vec<Vec<StyledSpan>> {
+    // The `"│ "` border is two columns. `.max(1)` keeps a usable inner
+    // width on a degenerate outer width so the recursion still makes
+    // progress. For any non-degenerate width it is a no-op.
+    let inner_width = width.saturating_sub(2).max(1);
+
+    // Clear `default_emphasis` inside the quote. It is a paragraph-level
+    // knob (thinking prose renders italic), but the retag below already
+    // makes every quoted text run italic, and the quote's italic is the
+    // only decoration quoted prose should carry. Clearing it keeps a
+    // future non-italic `default_emphasis` from leaking past the quote
+    // boundary, matching the identity inline context the styled renderer
+    // uses inside quotes. `hyperlinks` still applies.
+    let inner_opts = RenderOpts {
+        default_emphasis: Emphasis::default(),
+        ..opts.clone()
+    };
+
+    let mut inner_rows: Vec<MarkdownRow> = Vec::new();
+    for sub in sub_blocks {
+        for logical_line in render_block(sub, inner_width, &inner_opts) {
+            inner_rows.extend(wrap_spans(&logical_line, inner_width));
+        }
+        inner_rows.push(Vec::new());
+    }
+    while inner_rows.last().is_some_and(is_blank_row) {
+        inner_rows.pop();
+    }
+
+    let mut rows: Vec<MarkdownRow> = Vec::with_capacity(inner_rows.len());
+    for inner in inner_rows {
+        let mut row = vec![StyledSpan::plain("│ ", SpanKind::QuoteBorder)];
+        for mut span in inner {
+            if span.kind == SpanKind::Text {
+                span.kind = SpanKind::Quote;
+                span.emphasis.italic = true;
+            }
+            row.push(span);
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// Render a sequence of inline tokens into `out`, composing emphasis
@@ -477,6 +596,134 @@ fn render_inlines(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Syntax highlighting
+// ---------------------------------------------------------------------------
+
+/// The syntect syntax definitions, loaded once and shared across the whole
+/// process.
+///
+/// syntect compiles a grammar's regexes lazily on first use and caches them
+/// inside the `SyntaxSet`. That first compile is expensive (tens of ms for
+/// a heavy grammar like Rust), so loading a fresh set per code block would
+/// pay it every time. A process-global set means the compile happens once
+/// and every later block reuses the cached regexes. The set is read-only to
+/// callers and its caches are `Sync`, so sharing it is sound.
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+/// TextMate-style scope selectors per category, parsed once.
+///
+/// We classify a token by picking the category whose selector matches its
+/// scope stack with the highest [`MatchPower`], the same most-specific-wins
+/// rule syntect themes use. `keyword` and `keyword.operator` overlap on
+/// purpose: an operator token matches both, and the more specific
+/// `keyword.operator` wins, so operators get their own category rather than
+/// the keyword one.
+fn category_selectors() -> &'static [(SyntaxCategory, ScopeSelectors)] {
+    static SELECTORS: OnceLock<Vec<(SyntaxCategory, ScopeSelectors)>> = OnceLock::new();
+    SELECTORS.get_or_init(|| {
+        let defs: &[(SyntaxCategory, &str)] = &[
+            (SyntaxCategory::Comment, "comment"),
+            (SyntaxCategory::Keyword, "keyword, storage"),
+            (
+                SyntaxCategory::Function,
+                "entity.name.function, support.function, variable.function",
+            ),
+            (SyntaxCategory::Variable, "variable"),
+            (SyntaxCategory::String, "string"),
+            (SyntaxCategory::Number, "constant.numeric"),
+            (
+                SyntaxCategory::Type,
+                "entity.name.type, entity.name.class, support.type, support.class",
+            ),
+            (SyntaxCategory::Operator, "keyword.operator"),
+            (SyntaxCategory::Punctuation, "punctuation"),
+        ];
+        defs.iter()
+            .filter_map(|(cat, sel)| sel.parse::<ScopeSelectors>().ok().map(|s| (*cat, s)))
+            .collect()
+    })
+}
+
+/// Pick the best-matching category for a scope stack, or `None` when no
+/// category's selector matches (the token then renders in the default
+/// foreground). Highest [`MatchPower`] wins, so a more specific selector
+/// beats a broader one on the same token.
+fn classify_scope(
+    scopes: &[Scope],
+    selectors: &[(SyntaxCategory, ScopeSelectors)],
+) -> Option<SyntaxCategory> {
+    let mut best: Option<(MatchPower, SyntaxCategory)> = None;
+    for (cat, sel) in selectors {
+        if let Some(power) = sel.does_match(scopes)
+            && best.is_none_or(|(bp, _)| power > bp)
+        {
+            best = Some((power, *cat));
+        }
+    }
+    best.map(|(_, cat)| cat)
+}
+
+/// Classify `code` into per-line runs of `(category, text)`.
+///
+/// One inner `Vec` per source line, in order. Each run is a maximal slice
+/// of the line that syntect assigned the same category (or `None` when no
+/// category matched). We only use syntect to assign scopes: the concrete
+/// colors are the frontend's job via [`SyntaxCategory`].
+///
+/// A single [`ParseState`] and [`ScopeStack`] span the whole block so
+/// multi-line constructs (block comments, multi-line strings) carry their
+/// scope from one line to the next. When the language is unknown or absent
+/// we fall back to plain-text syntax, which matches no category, so every
+/// run comes back `None`. On a tokenizer error for a line we emit that line
+/// as a single plain run so it still renders.
+fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Vec<(Option<SyntaxCategory>, String)>> {
+    let syntax_set = syntax_set();
+    let syntax = lang
+        .and_then(|l| syntax_set.find_syntax_by_token(l))
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+
+    let selectors = category_selectors();
+    let mut parse_state = ParseState::new(syntax);
+    let mut stack = ScopeStack::new();
+    let mut lines: Vec<Vec<(Option<SyntaxCategory>, String)>> = Vec::new();
+
+    for line in code.lines() {
+        let Ok(ops) = parse_state.parse_line(line, syntax_set) else {
+            lines.push(vec![(None, line.to_string())]);
+            continue;
+        };
+
+        let mut runs: Vec<(Option<SyntaxCategory>, String)> = Vec::new();
+        let mut errored = false;
+        for (text, op) in ScopeRegionIterator::new(&ops, line) {
+            // The op precedes its text region, so apply it before
+            // classifying. The leading region carries a no-op op.
+            if stack.apply(op).is_err() {
+                errored = true;
+                break;
+            }
+            if text.is_empty() {
+                continue;
+            }
+            runs.push((
+                classify_scope(stack.as_slice(), selectors),
+                text.to_string(),
+            ));
+        }
+
+        if errored {
+            lines.push(vec![(None, line.to_string())]);
+        } else {
+            lines.push(runs);
+        }
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -2076,9 +2323,11 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0].kind, SpanKind::CodeBlockBorder);
         assert_eq!(rows[0][0].text, "```rust");
-        assert_eq!(rows[1][0].kind, SpanKind::CodeBlock);
-        assert_eq!(rows[1][0].text, "  let x = 1;");
-        assert!(rows[1][0].syntax.is_none(), "a1 leaves syntax unset");
+        // The body row is split into highlighted runs, all `CodeBlock`
+        // kind, with the indent folded into a leading no-syntax span. Its
+        // concatenated text still reproduces the indented source line.
+        assert!(rows[1].iter().all(|s| s.kind == SpanKind::CodeBlock));
+        assert_eq!(row_text(&rows[1]), "  let x = 1;");
         assert_eq!(rows[2][0].kind, SpanKind::CodeBlockBorder);
         assert_eq!(rows[2][0].text, "```");
     }
@@ -2110,6 +2359,23 @@ mod tests {
     }
 
     #[test]
+    fn mixed_document_places_one_blank_between_top_level_blocks() {
+        // Pins the net blank-row placement across a document that mixes a
+        // paragraph, a list, a multi-paragraph blockquote, and a trailing
+        // paragraph. The spacer-ownership contract: exactly one blank
+        // between adjacent top-level blocks, no blank between list items, a
+        // bordered blank between the quote's two paragraphs, and no
+        // trailing blank.
+        let rows = render_markdown("Para.\n\n- a\n- b\n\n> q1\n>\n> q2\n\nafter", 80, &opts());
+        assert_eq!(
+            rows_text(&rows),
+            vec![
+                "Para.", "", "- a", "- b", "", "│ q1", "│ ", "│ q2", "", "after",
+            ],
+        );
+    }
+
+    #[test]
     fn default_emphasis_styles_paragraph_text_but_not_headings() {
         let render_opts = RenderOpts {
             default_emphasis: Emphasis {
@@ -2137,5 +2403,428 @@ mod tests {
         }
         let joined: String = rows.iter().map(row_text).collect();
         assert!(joined.contains('h') && joined.contains('w'));
+    }
+
+    // -----------------------------------------------------------------
+    // Lists
+    // -----------------------------------------------------------------
+
+    /// The `ListMarker` span leading `row`, or `None` when the row does
+    /// not open with one.
+    fn marker(row: &MarkdownRow) -> Option<&StyledSpan> {
+        row.first().filter(|s| s.kind == SpanKind::ListMarker)
+    }
+
+    #[test]
+    fn nested_unordered_list_indents_two_spaces_per_level() {
+        let rows = render_markdown(
+            "- Item 1\n  - Nested 1.1\n  - Nested 1.2\n- Item 2",
+            80,
+            &opts(),
+        );
+        let texts = rows_text(&rows);
+        assert_eq!(
+            texts,
+            vec!["- Item 1", "  - Nested 1.1", "  - Nested 1.2", "- Item 2",],
+        );
+        // Each row opens with a `ListMarker` whose text is exactly the
+        // indent plus the bullet, and the content carries `Text` kind.
+        assert_eq!(marker(&rows[0]).unwrap().text, "- ");
+        assert_eq!(marker(&rows[1]).unwrap().text, "  - ");
+        assert_eq!(rows[0][1].kind, SpanKind::Text);
+        assert_eq!(rows[0][1].text, "Item 1");
+    }
+
+    #[test]
+    fn deeply_nested_list_grows_indent_by_level() {
+        let rows = render_markdown(
+            "- Level 1\n  - Level 2\n    - Level 3\n      - Level 4",
+            80,
+            &opts(),
+        );
+        assert_eq!(
+            rows_text(&rows),
+            vec![
+                "- Level 1",
+                "  - Level 2",
+                "    - Level 3",
+                "      - Level 4",
+            ],
+        );
+    }
+
+    #[test]
+    fn ordered_list_uses_source_numbers_and_dot_markers() {
+        let rows = render_markdown("1. First\n2. Second\n3. Third", 80, &opts());
+        assert_eq!(rows_text(&rows), vec!["1. First", "2. Second", "3. Third"]);
+        assert_eq!(marker(&rows[0]).unwrap().text, "1. ");
+        assert_eq!(marker(&rows[2]).unwrap().text, "3. ");
+    }
+
+    #[test]
+    fn ordered_numbering_preserved_across_code_block_split() {
+        // A code fence between items makes many parsers restart numbering
+        // at 1. We preserve the captured source markers, so the three
+        // items stay 1./2./3.
+        let rows = render_markdown(
+            "1. First item\n\n```\ncode\n```\n\n2. Second item\n\n```\nmore\n```\n\n3. Third item",
+            80,
+            &opts(),
+        );
+        let numbered: Vec<String> = rows_text(&rows)
+            .into_iter()
+            .filter(|l| marker_line_number(l).is_some())
+            .collect();
+        assert_eq!(
+            numbered,
+            vec!["1. First item", "2. Second item", "3. Third item"]
+        );
+    }
+
+    /// The ordinal a `N. ` list line opens with, if any.
+    fn marker_line_number(line: &str) -> Option<u32> {
+        let (num, rest) = line.split_once(". ")?;
+        num.parse::<u32>().ok().filter(|_| !rest.is_empty())
+    }
+
+    #[test]
+    fn ordered_nested_list_numbers_independently_per_level() {
+        let rows = render_markdown(
+            "1. First\n   1. Nested first\n   2. Nested second\n2. Second",
+            80,
+            &opts(),
+        );
+        assert_eq!(
+            rows_text(&rows),
+            vec![
+                "1. First",
+                "  1. Nested first",
+                "  2. Nested second",
+                "2. Second",
+            ],
+        );
+    }
+
+    #[test]
+    fn mixed_ordered_and_unordered_nesting_renders_each_marker() {
+        let rows = render_markdown(
+            "1. Ordered item\n   - Unordered nested\n   - Another nested\n\
+             2. Second ordered\n   - More nested",
+            80,
+            &opts(),
+        );
+        let texts = rows_text(&rows);
+        assert!(texts.iter().any(|l| l == "1. Ordered item"));
+        assert!(texts.iter().any(|l| l == "  - Unordered nested"));
+        assert!(texts.iter().any(|l| l == "2. Second ordered"));
+        assert!(texts.iter().any(|l| l == "  - More nested"));
+    }
+
+    #[test]
+    fn long_list_item_continuation_lands_flush_left() {
+        // A long item wraps, and because the shared wrap carries no hang
+        // indent the continuation row starts at column 0, not under the
+        // bullet.
+        let rows = render_markdown("- alpha beta gamma delta", 12, &opts());
+        let texts = rows_text(&rows);
+        assert_eq!(texts[0], "- alpha beta");
+        // Continuation rows have no marker and start flush-left.
+        for row in &rows[1..] {
+            assert!(
+                marker(row).is_none(),
+                "continuation must not carry a marker"
+            );
+        }
+        assert!(!texts[1].starts_with(' '), "continuation is flush-left");
+        let joined = texts.join(" ");
+        assert!(joined.contains("gamma") && joined.contains("delta"));
+    }
+
+    #[test]
+    fn list_item_paragraph_sub_block_stays_tight() {
+        // A loose item with a second paragraph renders both on adjacent
+        // rows with no blank spacer between them: the neutral model's
+        // sub-blocks carry no trailing spacer.
+        let rows = render_markdown("- first para\n\n  second para\n- next item", 80, &opts());
+        let texts = rows_text(&rows);
+        assert_eq!(texts, vec!["- first para", "second para", "- next item"],);
+    }
+
+    #[test]
+    fn list_renders_a_single_trailing_blank_before_the_next_block() {
+        let rows = render_markdown("- a\n- b\n\nafter", 80, &opts());
+        let texts = rows_text(&rows);
+        assert_eq!(texts, vec!["- a", "- b", "", "after"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Blockquotes
+    // -----------------------------------------------------------------
+
+    /// True when `row` opens with the `│ ` quote border.
+    fn has_border(row: &MarkdownRow) -> bool {
+        row.first()
+            .is_some_and(|s| s.kind == SpanKind::QuoteBorder && s.text == "│ ")
+    }
+
+    #[test]
+    fn blockquote_borders_and_retags_text_to_quote_italic() {
+        let rows = render_markdown("> hello", 80, &opts());
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(has_border(row));
+        let body = &row[1];
+        assert_eq!(body.text, "hello");
+        assert_eq!(body.kind, SpanKind::Quote);
+        assert!(body.emphasis.italic, "quote text is italic");
+    }
+
+    #[test]
+    fn multiline_blockquote_borders_every_row() {
+        // A soft break inside the quote keeps each line on its own
+        // bordered row.
+        let rows = render_markdown("> Foo\n> bar", 80, &opts());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(has_border));
+        assert_eq!(row_text(&rows[0]), "│ Foo");
+        assert_eq!(row_text(&rows[1]), "│ bar");
+    }
+
+    #[test]
+    fn blockquote_wraps_long_lines_and_borders_each_wrapped_row() {
+        let long = "This is a very long blockquote line that should wrap across rows";
+        let rows = render_markdown(&format!("> {long}"), 24, &opts());
+        assert!(rows.len() > 1, "expected the quote to wrap, got {rows:?}");
+        for row in &rows {
+            assert!(
+                has_border(row),
+                "each wrapped row keeps the border: {row:?}"
+            );
+            assert!(row_width(row) <= 24, "row too wide: {:?}", row_text(row));
+        }
+    }
+
+    #[test]
+    fn blockquote_mid_blank_row_keeps_border() {
+        // Two paragraphs inside the quote produce a mid blank row, which
+        // still gets the border prefix (`│ `) rather than rendering bare.
+        let rows = render_markdown("> first\n>\n> second", 80, &opts());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_text(&rows[0]), "│ first");
+        // The middle row is the border alone.
+        assert_eq!(rows[1].len(), 1);
+        assert!(has_border(&rows[1]));
+        assert_eq!(row_text(&rows[1]), "│ ");
+        assert_eq!(row_text(&rows[2]), "│ second");
+    }
+
+    #[test]
+    fn code_block_inside_blockquote_keeps_its_own_kinds() {
+        let rows = render_markdown("> ```\n> let x = 1;\n> ```", 80, &opts());
+        // Three quoted rows: open fence, body, close fence.
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(has_border));
+        // The fence rows keep `CodeBlockBorder`, the body `CodeBlock`,
+        // none of them get retagged to `Quote`.
+        assert_eq!(rows[0][1].kind, SpanKind::CodeBlockBorder);
+        assert_eq!(rows[2][1].kind, SpanKind::CodeBlockBorder);
+        assert!(rows[1][1..].iter().all(|s| s.kind == SpanKind::CodeBlock));
+        assert_eq!(row_text(&rows[1]), "│   let x = 1;");
+    }
+
+    #[test]
+    fn list_inside_blockquote_keeps_list_marker_kind() {
+        let rows = render_markdown("> 1. bla bla\n> - nested bullet", 80, &opts());
+        assert!(rows.iter().all(has_border));
+        let ordered = rows
+            .iter()
+            .find(|r| row_text(r).contains("1. bla bla"))
+            .expect("ordered item row");
+        // The marker keeps `ListMarker`; only the item text is retagged
+        // to `Quote`.
+        assert_eq!(ordered[1].kind, SpanKind::ListMarker);
+        assert_eq!(ordered[1].text, "1. ");
+        assert_eq!(ordered[2].kind, SpanKind::Quote);
+        assert!(ordered[2].emphasis.italic);
+        assert!(rows.iter().any(|r| row_text(r).contains("- nested bullet")));
+    }
+
+    #[test]
+    fn heading_inside_blockquote_keeps_heading_kind() {
+        let rows = render_markdown("> # Title", 80, &opts());
+        assert_eq!(rows.len(), 1);
+        assert!(has_border(&rows[0]));
+        assert_eq!(rows[0][1].kind, SpanKind::Heading(1));
+        assert_eq!(rows[0][1].text, "Title");
+    }
+
+    #[test]
+    fn nested_blockquote_stacks_borders() {
+        let rows = render_markdown("> > deep", 80, &opts());
+        assert_eq!(rows.len(), 1);
+        // The two stacked borders share styling, so the wrap coalesces
+        // them into one `QuoteBorder` span, then the retagged text.
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(rows[0][0].kind, SpanKind::QuoteBorder);
+        assert_eq!(rows[0][0].text, "│ │ ");
+        assert_eq!(row_text(&rows[0]), "│ │ deep");
+        let body = &rows[0][1];
+        assert_eq!(body.kind, SpanKind::Quote);
+        assert_eq!(body.text, "deep");
+    }
+
+    #[test]
+    fn blockquote_inline_code_keeps_inline_code_kind() {
+        let rows = render_markdown("> use `x` here", 80, &opts());
+        let row = &rows[0];
+        assert!(has_border(row));
+        let code = row
+            .iter()
+            .find(|s| s.kind == SpanKind::InlineCode)
+            .expect("inline code keeps its kind inside a quote");
+        assert_eq!(code.text, "x");
+        // Surrounding prose is retagged to quote+italic.
+        assert!(
+            row.iter()
+                .any(|s| s.kind == SpanKind::Quote && s.emphasis.italic)
+        );
+    }
+
+    #[test]
+    fn blockquote_does_not_inherit_default_emphasis() {
+        // `default_emphasis` is a paragraph-only knob. Inside a quote it is
+        // cleared, so quoted prose carries only the quote's own italic and
+        // not, say, a caller's bold. If it leaked through, the quote text
+        // would come back bold as well.
+        let render_opts = RenderOpts {
+            default_emphasis: Emphasis {
+                bold: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = render_markdown("> quoted", 80, &render_opts);
+        let body = &rows[0][1];
+        assert_eq!(body.kind, SpanKind::Quote);
+        assert!(body.emphasis.italic, "quote text stays italic");
+        assert!(
+            !body.emphasis.bold,
+            "default emphasis must not leak into the quote",
+        );
+    }
+
+    #[test]
+    fn list_item_does_not_inherit_default_emphasis() {
+        // `default_emphasis` is paragraph-only, so a list rendered inside an
+        // italic thinking block keeps its item text upright rather than
+        // carrying the caller's emphasis.
+        let render_opts = RenderOpts {
+            default_emphasis: Emphasis {
+                bold: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = render_markdown("- item", 80, &render_opts);
+        let content = &rows[0][1];
+        assert_eq!(content.kind, SpanKind::Text);
+        assert!(
+            !content.emphasis.bold,
+            "default emphasis must not leak into list item content",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Code-block syntax highlighting
+    // -----------------------------------------------------------------
+
+    /// The set of syntax categories present on a body row.
+    fn categories(rows: &[MarkdownRow]) -> Vec<SyntaxCategory> {
+        rows.iter()
+            .flat_map(|r| r.iter())
+            .filter(|s| s.kind == SpanKind::CodeBlock)
+            .filter_map(|s| s.syntax)
+            .collect()
+    }
+
+    #[test]
+    fn rust_code_block_classifies_keyword_and_comment() {
+        let rows = render_markdown("```rust\n// note\nlet y = 2;\n```", 80, &opts());
+        let cats = categories(&rows);
+        assert!(
+            cats.contains(&SyntaxCategory::Comment),
+            "comment token should classify as Comment: {cats:?}",
+        );
+        assert!(
+            cats.contains(&SyntaxCategory::Keyword),
+            "`let` should classify as Keyword: {cats:?}",
+        );
+        assert!(
+            cats.contains(&SyntaxCategory::Number),
+            "`2` should classify as Number: {cats:?}",
+        );
+    }
+
+    #[test]
+    fn code_block_syntax_spans_carry_category_on_the_syntax_field() {
+        let rows = render_markdown("```rust\nlet y = 2;\n```", 80, &opts());
+        let body = &rows[1];
+        let keyword = body
+            .iter()
+            .find(|s| s.syntax == Some(SyntaxCategory::Keyword))
+            .expect("a keyword-classified span");
+        assert_eq!(keyword.kind, SpanKind::CodeBlock);
+        assert_eq!(keyword.text, "let");
+    }
+
+    #[test]
+    fn unknown_language_leaves_every_run_uncategorized() {
+        let rows = render_markdown("```qwerty\nlet y = 2;\n```", 80, &opts());
+        // An unknown token falls back to plain-text syntax, so no run gets
+        // a category, and the body is preserved verbatim.
+        assert!(categories(&rows).is_empty());
+        assert_eq!(row_text(&rows[1]), "  let y = 2;");
+    }
+
+    #[test]
+    fn code_block_without_a_language_is_plain() {
+        let rows = render_markdown("```\nlet y = 2;\n```", 80, &opts());
+        assert!(categories(&rows).is_empty());
+        assert_eq!(row_text(&rows[1]), "  let y = 2;");
+    }
+
+    #[test]
+    fn block_comment_scope_carries_across_lines() {
+        // A single `ParseState`/`ScopeStack` spans the whole block, so a
+        // Rust `/* ... */` comment opened on one line keeps its comment
+        // scope on the next line's content.
+        let rows = render_markdown("```rust\n/* still\ncomment */\n```", 80, &opts());
+        let cats = categories(&rows);
+        assert!(
+            cats.iter()
+                .filter(|c| **c == SyntaxCategory::Comment)
+                .count()
+                >= 2,
+            "both comment lines should classify as Comment: {cats:?}",
+        );
+    }
+
+    #[test]
+    fn highlighted_run_preserves_its_category_across_a_wrap() {
+        // Wrapping a long code line splits spans, and each split copies
+        // the originating run's `syntax`, so the category survives the
+        // break rather than resetting to `None`.
+        let rows = render_markdown(
+            "```rust\nlet reallylongidentifiername = 2;\n```",
+            12,
+            &opts(),
+        );
+        // The body wrapped over several rows. A keyword classification is
+        // still present somewhere among them.
+        assert!(
+            categories(&rows).contains(&SyntaxCategory::Keyword),
+            "keyword category should survive wrapping: {:?}",
+            rows_text(&rows),
+        );
     }
 }

@@ -91,6 +91,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "syntect",
  "tempfile",
  "thiserror",
  "tokio",
