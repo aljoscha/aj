@@ -416,6 +416,23 @@ green with the implementer/reviewer loop and its own commit:
   terminal title, tmux notice, and the small wired-up stubs (launch-prompt input,
   clipboard image paste, palette subtitle labels, palette-to-selector Esc
   chaining, the E-8 grouped help screen).
+- **9-Debug-overlay.** A small, opt-in frame-statistics box for diagnosing
+  render-loop health. Off by default, toggled by a new `show_frame_stats` `bool`
+  in `aj-conf`'s `Config` + `Config::OPTIONS` (so the settings window picks it up
+  automatically as a cycle row, like `hide_thinking_block`, and the
+  `test_options_table_matches_config_fields` drift test keeps the field and
+  option paired). The flag is seeded onto the shell at build time like the other
+  display toggles and live-applied through `apply_setting_change`, so flipping it
+  in settings takes effect without a restart. The data is
+  `AsyncApp::frame_stats` (Spec A): last/avg/max frame time, render rate (fps),
+  changed-cell count, and screen size. The box is a non-interactive corner
+  `SubSurface` appended in `Shell::draw` (top-right by default), sitting above
+  the base content in the z-stack so it stays visible during interaction. It
+  never takes focus or blocks mouse hit-testing outside its own cells. It shows
+  the previous frame's numbers and freezes when the UI is idle, matching the
+  honest redraw-rate reading (Spec A). Optionally a global debug chord (Spec F)
+  can flip the in-memory flag without persisting, mirroring the thinking-block
+  toggle.
 - **9-Endgame.** Decide whether to keep both binaries or cut `aj-next` over.
 
 ## Design decisions (resolved in companion specs)

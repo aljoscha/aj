@@ -133,6 +133,11 @@ impl AsyncApp {
     /// render() only when needs_redraw(); the common per-iteration call.
     pub fn render_if_needed(&mut self, root: &WidgetRef) -> Result<(), Error>;
 
+    /// A snapshot of recent frame-render statistics, for a host debug overlay.
+    /// Reads state only and is cheap; the profiler runs always-on (see "Frame
+    /// statistics").
+    pub fn frame_stats(&self) -> FrameStats;
+
     /// Escape hatches for host commands vxfw's Command enum does not cover
     /// (kitty graphics, custom sequences): a scoped writer, and the runtime.
     pub fn vaxis(&mut self) -> &mut Vaxis;
@@ -293,6 +298,87 @@ Subtleties of `App`'s loop that `AsyncApp` must reproduce, not simplify:
   mouse, and kitty-keyboard state stay on (the panic hook covers panics).
   Document that hosts must call `shutdown`.
 
+## Frame statistics
+
+`AsyncApp` carries an always-on frame profiler so a host can render a debug
+overlay of render-loop health. The overlay is opt-in at the display layer (a
+setting in `aj-next`, see the plan's 9-Debug-overlay), but the measurement
+itself always runs because it is cheap: two `Instant` reads and a push into a
+small ring buffer per rendered frame.
+
+### What a frame is here
+
+A frame is one call to `AppCore::render`: lay out the root, blit the surface
+into the screen buffer, then diff and write to the tty. The redraw latch
+coalesces many redraw requests into at most one frame per host iteration, so a
+frame is the unit of visible work, not the unit of events. The profiler wraps
+this call at the shared point in `AppCore`, so both `App` and `AsyncApp` collect
+the same data. Only `AsyncApp` exposes an accessor today.
+
+### The profiler and the `FrameStats` snapshot
+
+`AppCore` gains a fixed-capacity ring buffer of recent frame records, each
+`{ end: Instant, draw: Duration, cells: u32 }`. `render` times the
+layout+blit+diff+write span, records the changed-cell count the diff reports
+(see below), and pushes one record. The buffer holds the last N frames (N ~=
+240). `avg` and `max` are computed over the retained window, so they reflect
+recent behavior rather than an all-time accumulation.
+
+```
+pub struct FrameStats {
+    /// Wall time of the most recent frame's render call.
+    pub last: Duration,
+    /// Mean render time over the retained window.
+    pub avg: Duration,
+    /// Worst render time over the retained window. This is the number the
+    /// overlay exists to surface: a single slow frame is an input-latency hitch.
+    pub max: Duration,
+    /// Frames retained in the window (<= capacity).
+    pub frames: usize,
+    /// Render rate over the window: frames divided by the wall span between the
+    /// oldest and newest retained frame. See the nota bene below.
+    pub fps: f32,
+    /// Cells the last frame's diff actually emitted. In a diff-rendered TUI this
+    /// is the true repaint cost: a small scroll that re-lays-out a large block
+    /// shows up here even when `last` looks cheap.
+    pub last_cells: u32,
+    /// Screen size at the last frame (rows * cols is the worst-case repaint).
+    pub size: (u16, u16),
+}
+```
+
+`AsyncApp::frame_stats(&self) -> FrameStats` computes the snapshot from the ring
+buffer. It reads state only, so the host can call it from inside the overlay
+widget while drawing. The values then describe the frames *before* the one being
+drawn, so the overlay is always one frame behind. That is correct: the current
+frame's cost is not known until its render completes.
+
+### Nota bene: "fps" is a render rate, not a cadence
+
+The async loop is redraw-latch driven, not a fixed-cadence game loop. It draws
+only when something set the latch. So `fps` is renders-per-wall-second over the
+retained window, and when the UI is idle it decays toward zero because no frames
+are produced. This is the honest reading and we keep it. We do not add a periodic
+redraw to keep the counter "live", because that would pin the rate to the tick
+interval and hide exactly the idle behavior worth seeing. When idle the overlay
+freezes at the last frame's numbers, which is the intended behavior.
+
+### Cells changed
+
+`Vaxis::render` already walks the new screen buffer against the last one and
+skips unchanged cells. The count of emitted cells is computed and discarded
+today. Return it (or stash it on `Vaxis` for `AppCore` to read) so a frame
+record can carry `cells`. This is the cheapest high-signal metric for a
+diff-rendered UI: it separates a cheap cursor move from a full-screen repaint
+even when both finish quickly.
+
+### Overlay cost is included, by design
+
+The overlay is part of the widget tree, so drawing it is part of the frame it
+measures. We accept that. Its cost is small and bounded, and a debug tool that
+changed the thing it measures the instant you turned it off would confuse more
+than a few microseconds of self-inclusion.
+
 ## Tests
 
 - An async smoke test that feeds bytes through a pipe (mirroring
@@ -302,6 +388,10 @@ Subtleties of `App`'s loop that `AsyncApp` must reproduce, not simplify:
   redraw was latched.
 - A tick test: schedule a `Command::Tick`, advance time, assert `fire_due_timers`
   delivers `Event::Tick` to the target.
+- A frame-stats test: drive several renders over a `TestTty` and assert the
+  profiler retains records, `frames` matches, and `avg`/`max` are non-zero. Then
+  render an unchanged frame and assert it reports zero (or near-zero) changed
+  cells.
 - The refactor keeps `App`'s existing tests green (the shared-core extraction is
   behavior-preserving).
 
@@ -320,6 +410,12 @@ Subtleties of `App`'s loop that `AsyncApp` must reproduce, not simplify:
   bubble phase (shadowable shortcuts). The host loop just calls `handle_input`.
   The keymap, the full leader-sequence engine, and the dispatch-debug aids are
   specified in Spec F (`docs/vaxis-input-keymap-spec.md`).
+- **A-4. Frame-stats instrumentation. Resolved: always-on in `AppCore`, exposed
+  via `AsyncApp::frame_stats`.** A small ring-buffer profiler times each
+  `AppCore::render` and records the diff's changed-cell count, so both runtimes
+  collect it at one shared point. The host renders it behind a display toggle
+  (the plan's 9-Debug-overlay). The reported rate stays a true redraw rate
+  (idle -> 0) rather than being propped up by a periodic redraw.
 
 ## Out of scope
 
