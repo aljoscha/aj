@@ -276,10 +276,15 @@ fn details_body(details: &ToolDetails, expanded: bool, styles: &TranscriptStyles
         .into_iter()
         .map(|(kind, text)| {
             let style = match kind {
-                DiffLineKind::Header | DiffLineKind::Separator => styles.dim,
+                // Context lines, like headers and separators, use the faint
+                // attribute rather than a color, so they track the terminal's
+                // own foreground the way `aj` does. Only add/remove carry a
+                // color.
+                DiffLineKind::Header | DiffLineKind::Separator | DiffLineKind::Context => {
+                    styles.dim
+                }
                 DiffLineKind::Add => styles.diff_add,
                 DiffLineKind::Remove => styles.diff_remove,
-                DiffLineKind::Context => styles.diff_context,
             };
             line(text, style)
         })
@@ -1004,7 +1009,8 @@ mod tests {
         assert!(texts.contains(&"+ ONE".to_string()));
         assert!(texts.contains(&"  a".to_string()));
         assert!(texts.contains(&"…".to_string()), "{texts:?}");
-        // Styling: removals red, additions green, context muted.
+        // Styling: removals red, additions green. Context and headers use
+        // the faint attribute (styles.dim), not a color.
         let style_of = |needle: &str| {
             lines
                 .iter()
@@ -1014,7 +1020,7 @@ mod tests {
         };
         assert_eq!(style_of("- one"), s.diff_remove);
         assert_eq!(style_of("+ ONE"), s.diff_add);
-        assert_eq!(style_of("  a"), s.diff_context);
+        assert_eq!(style_of("  a"), s.dim);
         assert_eq!(style_of("--- a/src/lib.rs"), s.dim);
     }
 

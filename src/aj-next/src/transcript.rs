@@ -55,7 +55,6 @@ pub(crate) struct TranscriptStyles {
     pub(crate) bold: Style,
     pub(crate) diff_add: Style,
     pub(crate) diff_remove: Style,
-    pub(crate) diff_context: Style,
     /// Tool-bubble tints per visual status.
     pub(crate) tool_pending_bg: Color,
     pub(crate) tool_success_bg: Color,
@@ -102,7 +101,6 @@ impl TranscriptStyles {
             },
             diff_add: fg(ThemeColor::ToolDiffAdded),
             diff_remove: fg(ThemeColor::ToolDiffRemoved),
-            diff_context: fg(ThemeColor::ToolDiffContext),
             tool_pending_bg: bg(ThemeBg::ToolPendingBg),
             tool_success_bg: bg(ThemeBg::ToolSuccessBg),
             tool_error_bg: bg(ThemeBg::ToolErrorBg),

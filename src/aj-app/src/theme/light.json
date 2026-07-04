@@ -6,6 +6,8 @@
     "lightBlue": "#5277a3",
     "green": "#588458",
     "red": "#aa5555",
+    "ansiGreen": 2,
+    "ansiRed": 1,
     "yellow": "#9a7326",
     "mediumGray": "#6c6c6c",
     "dimGray": "#767676",
@@ -51,8 +53,8 @@
     "mdHr": "mediumGray",
     "mdListBullet": "green",
 
-    "toolDiffAdded": "green",
-    "toolDiffRemoved": "red",
+    "toolDiffAdded": "ansiGreen",
+    "toolDiffRemoved": "ansiRed",
     "toolDiffContext": "mediumGray",
 
     "syntaxComment": "#008000",
