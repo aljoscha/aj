@@ -35,7 +35,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::cell::{Cell, Character, Color, CursorShape, Style};
@@ -45,12 +50,33 @@ use crate::text::{
     EmacsWords, KillRing, UndoStack, WordClassifier, is_punctuation_grapheme,
     is_whitespace_grapheme, skip_class, skip_separators, word_left,
 };
-use crate::vxfw::{CursorState, DrawContext, Event, EventContext, Size, Surface, Widget};
+use crate::vxfw::{
+    AutocompleteItem, AutocompleteProvider, AutocompleteSession, AutocompleteSuggestions,
+    CursorState, DrawContext, Event, EventContext, SessionInvalid, Size, SuggestOpts, Surface,
+    Widget,
+};
 
 /// Prefix every large-paste marker token starts with, e.g. the `[paste #` of
 /// `[paste #1 +20 lines]`. Used as the cheap first check before the fuller
 /// [`find_next_marker`] scan.
 const PASTE_MARKER_PREFIX: &str = "[paste #";
+
+/// Coalescing window for the implicit `@` / `#` symbol-completion triggers. A
+/// burst of keystrokes inside a symbol token faster than this collapses into a
+/// single provider call rather than one call per character. Tab (force) and
+/// non-symbol contexts fire immediately.
+const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE: Duration = Duration::from_millis(20);
+
+/// Default popup height cap, in rows, before the suggestion list scrolls.
+/// Clamped to `[3, 20]` by
+/// [`set_autocomplete_max_visible`](TextArea::set_autocomplete_max_visible).
+const AUTOCOMPLETE_MAX_VISIBLE_DEFAULT: usize = 5;
+
+/// Gap, in columns, between the popup's label column and its description
+/// column. The label column is sized to the widest visible label, so a row's
+/// description always starts at `widest_label + this` from the popup's left
+/// edge.
+const AUTOCOMPLETE_POPUP_COLUMN_GAP: usize = 2;
 
 /// Which way [`TextArea::jump_to_char`] scans for its target.
 ///
@@ -252,8 +278,50 @@ fn decode_csi_u_ctrl_letters(text: &str) -> String {
     out
 }
 
-/// Theme for [`TextArea`]: structured colors and styles the app builds from its
-/// palette.
+/// Whether `c`, typed inside an existing `@` / `#` symbol context, keeps the
+/// popup open. Matches the character class `[A-Za-z0-9.\-_]` the trigger gating
+/// uses to decide a keystroke continues a symbol token.
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+/// Whether `before` (the text on the current line up to the cursor) ends in an
+/// `@`- or `#`-prefixed token at a token boundary. Equivalent to the regex
+/// `(?:^|\s)[@#][^\s]*$`.
+///
+/// The trigger, re-trigger, and debounce predicates all route through this so
+/// they agree on where a symbol token starts. Both `@` and `#` are recognized:
+/// the mechanism is provider-agnostic, and a provider with no candidates for a
+/// symbol simply returns nothing.
+///
+/// NOTE: an in-progress quoted attachment like `@"has spaces` (no closing quote
+/// yet) is rejected as soon as a space lands. Closing that gap would need a
+/// stateful scan that tracks the open quote, which no caller needs today.
+fn ends_in_symbol_context(before: &str) -> bool {
+    // The rightmost of the two symbols wins, so `@a #b` matches on the `#`,
+    // matching the single-symbol regex.
+    let sym_byte_idx = match (before.rfind('@'), before.rfind('#')) {
+        (None, None) => return false,
+        (Some(a), None) => a,
+        (None, Some(h)) => h,
+        (Some(a), Some(h)) => a.max(h),
+    };
+    let sym_char = before[sym_byte_idx..]
+        .chars()
+        .next()
+        .expect("rfind returned a valid char boundary");
+    let after_sym = &before[sym_byte_idx + sym_char.len_utf8()..];
+    if after_sym.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if sym_byte_idx == 0 {
+        return true;
+    }
+    before[..sym_byte_idx]
+        .chars()
+        .last()
+        .is_some_and(char::is_whitespace)
+}
 ///
 /// The B3 autocomplete popup styling lands in [`PopupStyle`]. It is reserved
 /// today so callers that build a theme now do not have to change the shape
@@ -310,6 +378,89 @@ enum LastAction {
     Kill,
     Yank,
     TypeWord,
+}
+
+/// Why an autocomplete popup is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutocompleteMode {
+    /// Triggered implicitly by typing `@` / `#`. Closes automatically when the
+    /// typed prefix stops matching or the cursor leaves the trigger context.
+    Regular,
+    /// Triggered explicitly by Tab. Stays open across typing so the user can
+    /// narrow a result set, and applies the highlighted item on a second Tab.
+    Force,
+}
+
+/// Captured buffer state used to detect stale autocomplete deliveries. Any
+/// field changing between dispatch and delivery means the user has moved on and
+/// the result no longer applies to the current cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutocompleteSnapshot {
+    text: String,
+    cursor_line: usize,
+    cursor_col: usize,
+}
+
+/// A message an autocomplete worker sends back to the widget.
+///
+/// Opaque to the host: the host drains one from the receiver handed out by
+/// [`TextArea::take_autocomplete_rx`] and passes it straight to
+/// [`TextArea::apply_autocomplete_delivery`], which applies the staleness
+/// guards. Two kinds ride the same channel so the host needs a single arm: a
+/// completed one-shot query, and a "session progressed" wake from a streaming
+/// session's worker threads.
+pub struct AutocompleteDelivery {
+    kind: DeliveryKind,
+}
+
+enum DeliveryKind {
+    /// A completed one-shot [`AutocompleteProvider::get_suggestions`] call.
+    Query {
+        /// Identifier of the request that produced this delivery. Compared
+        /// against the widget's current id before any state changes. A stale
+        /// delivery is dropped silently.
+        request_id: u64,
+        /// Buffer state captured when the request was dispatched. Compared
+        /// against the current buffer before the list is applied.
+        snapshot: AutocompleteSnapshot,
+        /// The suggestions, or `None` when the provider found nothing.
+        suggestions: Option<AutocompleteSuggestions>,
+        /// The popup mode the request was dispatched in, preserved across the
+        /// round-trip so a late delivery still opens the popup in the right
+        /// mode.
+        mode: AutocompleteMode,
+        /// Whether to auto-apply a single result (the Tab / force path).
+        auto_apply_single: bool,
+    },
+    /// A streaming session's worker pushed new matches. The widget ticks the
+    /// session and rebuilds the popup.
+    SessionProgressed,
+}
+
+impl AutocompleteDelivery {
+    fn query(
+        request_id: u64,
+        snapshot: AutocompleteSnapshot,
+        suggestions: Option<AutocompleteSuggestions>,
+        mode: AutocompleteMode,
+        auto_apply_single: bool,
+    ) -> Self {
+        Self {
+            kind: DeliveryKind::Query {
+                request_id,
+                snapshot,
+                suggestions,
+                mode,
+                auto_apply_single,
+            },
+        }
+    }
+
+    fn session_progressed() -> Self {
+        Self {
+            kind: DeliveryKind::SessionProgressed,
+        }
+    }
 }
 
 /// A single visual (screen) line produced by wrapping one logical document line
@@ -395,6 +546,53 @@ pub struct TextArea {
     history: Vec<String>,
     history_index: Option<usize>,
 
+    // -- Autocomplete --
+    //
+    // The widget owns its autocomplete state machine: the popup pops up inside
+    // this widget's own surface, and keystrokes route between the document
+    // (typing, cursor) and the popup (navigation, accept) inline, so splitting
+    // it into an overlay would push routing into every caller.
+    //
+    // The async pipeline lives here too, but the host owns the wake: the widget
+    // spawns workers that deliver results down `autocomplete_tx`, and the host
+    // drains the paired receiver (see `take_autocomplete_rx`) from its own
+    // `select!`. The widget never runs a reader thread of its own.
+    /// The installed provider, shared with every spawned worker.
+    autocomplete_provider: Option<Arc<dyn AutocompleteProvider>>,
+    /// `None` = popup closed. `Some(mode)` = popup open in that mode.
+    autocomplete_state: Option<AutocompleteMode>,
+    /// The suggestions currently shown. Empty while a Force popup has no
+    /// matches (still open so the user can narrow).
+    autocomplete_items: Vec<AutocompleteItem>,
+    /// Index of the highlighted row in `autocomplete_items`.
+    autocomplete_selected: usize,
+    /// Substring the suggestions match against. The chosen item's `value`
+    /// replaces exactly this many bytes before the cursor when applied.
+    autocomplete_prefix: String,
+    /// Popup height cap, in rows, clamped to `[3, 20]`.
+    autocomplete_max_visible: usize,
+    /// A live streaming session, when a provider opted into
+    /// [`AutocompleteProvider::try_start_session`] for the current context.
+    /// Mutually exclusive with a pending one-shot request: the widget prefers
+    /// the session and only dispatches when `try_start_session` returned `None`.
+    autocomplete_session: Option<Box<dyn AutocompleteSession>>,
+    /// Monotonically-increasing token bumped on every request start. A delivery
+    /// whose id no longer matches is stale and dropped.
+    autocomplete_request_id: u64,
+    /// Cancellation token for the pending request, tripped before a new request
+    /// spawns and when the popup is dismissed.
+    autocomplete_cancel: Option<CancellationToken>,
+    /// Join handle for the pending worker. Held only so tests can await
+    /// completion deterministically; production relies on the cancel token and
+    /// the delivery channel and never joins.
+    autocomplete_task: Option<JoinHandle<()>>,
+    /// Sender half of the delivery channel, cloned into every worker.
+    autocomplete_tx: mpsc::UnboundedSender<AutocompleteDelivery>,
+    /// Receiver half, until the host takes it via `take_autocomplete_rx`. While
+    /// the widget still holds it, `pump_autocomplete` drains it in-place so a
+    /// host that prefers a single pump entry point still sees deliveries.
+    autocomplete_rx: Option<mpsc::UnboundedReceiver<AutocompleteDelivery>>,
+
     // -- Presentation --
     theme: EditorTheme,
     padding_x: usize,
@@ -446,6 +644,7 @@ impl TextArea {
     /// in-crate tests can drive a plain `TextArea` without the `Rc<RefCell<..>>`
     /// wrapper.
     fn new_state() -> TextArea {
+        let (autocomplete_tx, autocomplete_rx) = mpsc::unbounded_channel();
         TextArea {
             lines: vec![String::new()],
             cursor_line: 0,
@@ -462,6 +661,18 @@ impl TextArea {
             jump_mode: None,
             history: Vec::new(),
             history_index: None,
+            autocomplete_provider: None,
+            autocomplete_state: None,
+            autocomplete_items: Vec::new(),
+            autocomplete_selected: 0,
+            autocomplete_prefix: String::new(),
+            autocomplete_max_visible: AUTOCOMPLETE_MAX_VISIBLE_DEFAULT,
+            autocomplete_session: None,
+            autocomplete_request_id: 0,
+            autocomplete_cancel: None,
+            autocomplete_task: None,
+            autocomplete_tx,
+            autocomplete_rx: Some(autocomplete_rx),
             theme: EditorTheme::default(),
             padding_x: 0,
             top_bar_label: None,
@@ -570,6 +781,7 @@ impl TextArea {
     /// characters are stripped so a pasted `\0` never lands in the document.
     pub fn insert_at_cursor(&mut self, text: &str) {
         self.save_undo();
+        self.cancel_autocomplete();
         self.history_index = None;
         let normalized = Self::normalize_text(text);
         for ch in normalized.chars() {
@@ -592,6 +804,9 @@ impl TextArea {
     /// this with `check_changed`.
     fn handle_paste(&mut self, text: &str) {
         self.save_undo();
+        // A paste is a bulk insert, not a keystroke, so it closes any popup
+        // rather than re-querying per pasted character.
+        self.cancel_autocomplete();
         // Undo re-encoded control bytes some terminals inject into a bracketed
         // paste before the per-char filter below would strip the ESC and leak
         // the printable tail.
@@ -773,6 +988,120 @@ impl TextArea {
     /// default is [`EmacsWords`].
     pub fn set_word_classifier(&mut self, classifier: Box<dyn WordClassifier>) {
         self.word_classifier = classifier;
+    }
+
+    // -- Autocomplete: public API --
+
+    /// Installs the completion provider. Any open popup and pending request are
+    /// cancelled first, so switching providers never applies a stale result.
+    ///
+    /// Held as an `Arc` because the widget hands a cloned reference to every
+    /// spawned worker task. `Send + Sync` is what makes that share safe.
+    pub fn set_autocomplete_provider(&mut self, provider: Arc<dyn AutocompleteProvider>) {
+        self.cancel_autocomplete();
+        self.autocomplete_provider = Some(provider);
+    }
+
+    /// Caps the popup height, in rows, before the list scrolls. Clamped to
+    /// `[3, 20]`.
+    pub fn set_autocomplete_max_visible(&mut self, max: usize) {
+        self.autocomplete_max_visible = max.clamp(3, 20);
+    }
+
+    /// Whether the autocomplete popup is currently open.
+    pub fn is_showing_autocomplete(&self) -> bool {
+        self.autocomplete_state.is_some()
+    }
+
+    /// Takes the delivery receiver so the host can `select!` on it. Returns
+    /// `None` on a second call: the receiver is handed out once, at wiring.
+    ///
+    /// The host adds one arm that, on each delivery, calls
+    /// [`apply_autocomplete_delivery`](Self::apply_autocomplete_delivery) and
+    /// requests a redraw. This keeps the widget a library: it owns the pipeline
+    /// but never runs the `select!`. A host that would rather poll can skip
+    /// this and call [`pump_autocomplete`](Self::pump_autocomplete), which
+    /// drains the receiver in place while the widget still holds it.
+    pub fn take_autocomplete_rx(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<AutocompleteDelivery>> {
+        self.autocomplete_rx.take()
+    }
+
+    /// Advances autocomplete without a specific delivery in hand: ticks any
+    /// streaming session, and, while the widget still owns the receiver, drains
+    /// pending deliveries and applies the freshest one.
+    ///
+    /// A host that took the receiver via
+    /// [`take_autocomplete_rx`](Self::take_autocomplete_rx) feeds deliveries
+    /// through [`apply_autocomplete_delivery`](Self::apply_autocomplete_delivery)
+    /// instead; for that host this only ticks the session. Either way the host
+    /// calls it from its own loop, not the widget: `draw` never drains, so the
+    /// host's `select!` arm stays the single drain point.
+    pub fn pump_autocomplete(&mut self) {
+        self.pump_autocomplete_session();
+
+        // If the host took the receiver, there is nothing to drain here.
+        // Otherwise keep only the freshest matching query and apply it, exactly
+        // as the host's arm would. We read the id into a local first so the
+        // receiver borrow does not overlap the later `&mut self` apply.
+        let current_id = self.autocomplete_request_id;
+        let mut latest: Option<AutocompleteDelivery> = None;
+        if let Some(rx) = self.autocomplete_rx.as_mut() {
+            while let Ok(delivery) = rx.try_recv() {
+                match &delivery.kind {
+                    DeliveryKind::Query { request_id, .. } if *request_id == current_id => {
+                        latest = Some(delivery);
+                    }
+                    // A stale query or an already-pumped session wake.
+                    DeliveryKind::Query { .. } | DeliveryKind::SessionProgressed => {}
+                }
+            }
+        }
+        if let Some(delivery) = latest {
+            self.apply_autocomplete_delivery(delivery);
+        }
+    }
+
+    /// Applies one delivery after the staleness guards pass. The host calls
+    /// this from its `select!` arm; [`pump_autocomplete`](Self::pump_autocomplete)
+    /// calls it for hosts that poll instead.
+    ///
+    /// # Async race safety
+    ///
+    /// A fast query landing between two keystrokes must never apply to a buffer
+    /// the user has already moved past. Two guards enforce that: the request id
+    /// (a superseded request's delivery is dropped) and the buffer snapshot (if
+    /// the text or cursor moved since dispatch, the delivery is dropped even
+    /// when the id still matches). A session that took over since dispatch also
+    /// wins: its list must not be clobbered by an older one-shot result.
+    pub fn apply_autocomplete_delivery(&mut self, delivery: AutocompleteDelivery) {
+        match delivery.kind {
+            DeliveryKind::SessionProgressed => self.pump_autocomplete_session(),
+            DeliveryKind::Query {
+                request_id,
+                snapshot,
+                suggestions,
+                mode,
+                auto_apply_single,
+            } => {
+                if request_id != self.autocomplete_request_id {
+                    return;
+                }
+                if self.autocomplete_session.is_some() {
+                    return;
+                }
+                let current = AutocompleteSnapshot {
+                    text: self.text(),
+                    cursor_line: self.cursor_line,
+                    cursor_col: self.cursor_col,
+                };
+                if current != snapshot {
+                    return;
+                }
+                self.apply_suggestions(suggestions, mode, auto_apply_single);
+            }
+        }
     }
 
     // -- Private: text normalization and undo --
@@ -1478,6 +1807,9 @@ impl TextArea {
 
     /// Inserts a newline at the cursor, splitting the current line.
     fn insert_newline_internal(&mut self) {
+        // A hard line break leaves any symbol context on the previous line
+        // behind, so it closes the popup.
+        self.cancel_autocomplete();
         let rest = self.lines[self.cursor_line][self.cursor_col..].to_string();
         self.lines[self.cursor_line].truncate(self.cursor_col);
         self.cursor_line += 1;
@@ -1499,6 +1831,7 @@ impl TextArea {
         self.cursor_col += c.len_utf8();
         self.last_action = LastAction::TypeWord;
         self.reset_sticky_state();
+        self.maybe_trigger_autocomplete_on_insert(c);
     }
 
     /// Deletes one grapheme backward, merging with the previous line at column
@@ -1511,6 +1844,7 @@ impl TextArea {
             self.lines[self.cursor_line].drain(self.cursor_col..old_col);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
+            self.maybe_retrigger_autocomplete_after_delete();
         } else if self.cursor_line > 0 {
             self.save_undo();
             let current = self.lines.remove(self.cursor_line);
@@ -1519,6 +1853,7 @@ impl TextArea {
             self.lines[self.cursor_line].push_str(&current);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
+            self.maybe_retrigger_autocomplete_after_delete();
         }
     }
 
@@ -1544,12 +1879,14 @@ impl TextArea {
             self.lines[self.cursor_line].drain(self.cursor_col..next);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
+            self.maybe_retrigger_autocomplete_after_delete();
         } else if self.cursor_line < self.lines.len() - 1 {
             self.save_undo();
             let next = self.lines.remove(self.cursor_line + 1);
             self.lines[self.cursor_line].push_str(&next);
             self.last_action = LastAction::None;
             self.reset_sticky_state();
+            self.maybe_retrigger_autocomplete_after_delete();
         }
     }
 
@@ -1912,6 +2249,457 @@ impl TextArea {
         self.last_action = LastAction::None;
     }
 
+    // -- Autocomplete: engine --
+
+    /// Cancels the popup and any pending work: clears popup state, drops the
+    /// streaming session (whose `Drop` stops its worker), and cancels the
+    /// one-shot request. Idempotent.
+    fn cancel_autocomplete(&mut self) {
+        self.autocomplete_state = None;
+        self.autocomplete_items.clear();
+        self.autocomplete_selected = 0;
+        self.autocomplete_prefix.clear();
+        self.autocomplete_session = None;
+        self.cancel_pending_autocomplete_request();
+    }
+
+    /// Cancels the in-flight one-shot request without touching popup state.
+    ///
+    /// Tripping the token is what stops a spawned worker: dropping the
+    /// `JoinHandle` does not abort the task, so we rely on the worker checking
+    /// the token. Tests may still await the handle to sync with termination.
+    fn cancel_pending_autocomplete_request(&mut self) {
+        if let Some(token) = self.autocomplete_cancel.take() {
+            token.cancel();
+        }
+        self.autocomplete_task = None;
+        // Advance the request id so a delivery already past its cancel check no
+        // longer matches. A worker races between observing the token and its
+        // send (no await sits between those two, so the token can fire in
+        // between), and a bare cancel (Esc, a provider swap) edits neither the
+        // buffer nor the cursor, so the snapshot guard would let the late
+        // delivery through. Bumping the id here is what actually drops it, so
+        // the popup never resurrects after Esc and an old provider's result
+        // never applies under a newly installed one.
+        self.autocomplete_request_id = self.autocomplete_request_id.wrapping_add(1);
+    }
+
+    /// Asks the provider for suggestions and updates the popup. `force` drives
+    /// the Tab path (stays open on narrow); otherwise the trigger is implicit.
+    ///
+    /// Streaming-first: an existing session absorbs the new cursor, or a new one
+    /// opens through [`AutocompleteProvider::try_start_session`]. Only when no
+    /// session serves the context does this fall back to the one-shot async
+    /// dispatch.
+    fn update_autocomplete(&mut self, force: bool) {
+        let Some(provider) = self.autocomplete_provider.clone() else {
+            return;
+        };
+
+        let mode = if force {
+            AutocompleteMode::Force
+        } else {
+            // Keep an existing Force popup in Force mode across a narrowing
+            // keystroke so its stays-open close semantics do not downgrade.
+            match self.autocomplete_state {
+                Some(AutocompleteMode::Force) => AutocompleteMode::Force,
+                _ => AutocompleteMode::Regular,
+            }
+        };
+
+        // Path 1: an existing session absorbs the new cursor. On failure we
+        // drop it and fall through to open a fresh one.
+        if let Some(session) = self.autocomplete_session.as_mut() {
+            match session.update(&self.lines, self.cursor_line, self.cursor_col) {
+                Ok(()) => {
+                    self.autocomplete_prefix = session.prefix().to_string();
+                    return;
+                }
+                Err(SessionInvalid) => {
+                    self.autocomplete_session = None;
+                }
+            }
+        }
+
+        // Path 2: open a new streaming session for this context.
+        let notify = self.make_autocomplete_notify();
+        if let Some(session) =
+            provider.try_start_session(&self.lines, self.cursor_line, self.cursor_col, notify)
+        {
+            // A session in charge makes any pending one-shot delivery moot.
+            self.cancel_pending_autocomplete_request();
+            self.autocomplete_prefix = session.prefix().to_string();
+            self.autocomplete_session = Some(session);
+            self.autocomplete_state = Some(mode);
+            // Cleared so the popup does not show a previous session's snapshot;
+            // the next pump repopulates it.
+            self.autocomplete_items.clear();
+            self.autocomplete_selected = 0;
+            return;
+        }
+
+        // Path 3: one-shot async dispatch.
+        self.dispatch_autocomplete_request(mode, false);
+    }
+
+    /// Spawns a worker that runs the provider off the widget thread and delivers
+    /// the result down `autocomplete_tx`. Bumps the request id and cancels the
+    /// prior request first, so only the newest delivery ever applies.
+    fn dispatch_autocomplete_request(&mut self, mode: AutocompleteMode, auto_apply_single: bool) {
+        let Some(provider) = self.autocomplete_provider.clone() else {
+            return;
+        };
+
+        self.cancel_pending_autocomplete_request();
+        self.autocomplete_request_id = self.autocomplete_request_id.wrapping_add(1);
+        let request_id = self.autocomplete_request_id;
+        let cancel = CancellationToken::new();
+        self.autocomplete_cancel = Some(cancel.clone());
+
+        let snapshot = AutocompleteSnapshot {
+            text: self.text(),
+            cursor_line: self.cursor_line,
+            cursor_col: self.cursor_col,
+        };
+        let lines = self.lines.clone();
+        let cursor_line = self.cursor_line;
+        let cursor_col = self.cursor_col;
+        let tx = self.autocomplete_tx.clone();
+        let force = matches!(mode, AutocompleteMode::Force);
+
+        // Only the implicit `@` / `#` symbol path debounces; Tab and everything
+        // else fire immediately.
+        let debounce = self.autocomplete_debounce_for(mode);
+
+        // !Send boundary: the widget is `Rc<RefCell<..>>` and !Send, so it must
+        // never be captured here. The task closes over Send data only (the
+        // provider `Arc`, the snapshot, the sender, the ids, the cancel token,
+        // the line clone). Capturing `self` would fail the `spawn` Send bound,
+        // which is the compile-time proof that this stays clean.
+        let task = tokio::spawn(async move {
+            if debounce > Duration::ZERO {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(debounce) => {}
+                }
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            let opts = SuggestOpts {
+                cancel: cancel.clone(),
+                force,
+            };
+            let suggestions = provider
+                .get_suggestions(&lines, cursor_line, cursor_col, opts)
+                .await;
+
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            // Fire-and-forget: a closed receiver means the widget is gone and
+            // there is nothing useful left to do.
+            let _ = tx.send(AutocompleteDelivery::query(
+                request_id,
+                snapshot,
+                suggestions,
+                mode,
+                auto_apply_single,
+            ));
+        });
+
+        self.autocomplete_task = Some(task);
+    }
+
+    /// The debounce for a request: a coalescing window for the implicit symbol
+    /// path, zero for Tab (force) and non-symbol contexts.
+    fn autocomplete_debounce_for(&self, mode: AutocompleteMode) -> Duration {
+        if matches!(mode, AutocompleteMode::Force) {
+            return Duration::ZERO;
+        }
+        if self.is_in_symbol_context() {
+            ATTACHMENT_AUTOCOMPLETE_DEBOUNCE
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Builds the wake a streaming session invokes from its worker threads.
+    ///
+    /// notify -> delivery wake: the worker cannot touch the !Send widget, so it
+    /// only pushes a marker down the same channel the host already drains. The
+    /// host wakes, calls `pump_autocomplete`, and the session is ticked on the
+    /// widget's own thread. The closure is `Arc<dyn Fn + Send + Sync>` because
+    /// sessions may call it from any worker thread.
+    fn make_autocomplete_notify(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let tx = self.autocomplete_tx.clone();
+        Arc::new(move || {
+            let _ = tx.send(AutocompleteDelivery::session_progressed());
+        })
+    }
+
+    /// Ticks the active streaming session and rebuilds the popup when its
+    /// snapshot changed. A no-op with no session. Safe to call on every pump.
+    fn pump_autocomplete_session(&mut self) {
+        // Take the snapshot inside a scope so the `&mut` borrow of the session
+        // ends before we read `&self` in `item_matches_typed_prefix` below. An
+        // early return here returns from the function, which is why the block
+        // can type-check as a plain tuple.
+        let (running, items) = {
+            let Some(session) = self.autocomplete_session.as_mut() else {
+                return;
+            };
+            let status = session.tick(10);
+            if !status.changed && !self.autocomplete_items.is_empty() {
+                return;
+            }
+            (status.running, session.snapshot())
+        };
+
+        if items.is_empty() {
+            // No matches yet. Close a Regular popup once the worker is done (so
+            // a stray `@xyz` matching nothing does not linger), but keep a Force
+            // popup open so the user can keep narrowing.
+            if !running && matches!(self.autocomplete_state, Some(AutocompleteMode::Regular)) {
+                self.cancel_autocomplete();
+            } else {
+                self.autocomplete_items.clear();
+                self.autocomplete_selected = 0;
+            }
+            return;
+        }
+
+        let selected = items
+            .iter()
+            .position(|it| self.item_matches_typed_prefix(it))
+            .unwrap_or(0);
+        self.autocomplete_items = items;
+        self.autocomplete_selected = selected;
+    }
+
+    /// Applies a one-shot query result to the popup: auto-applies a lone item on
+    /// the force path, otherwise opens (or closes) the popup per its mode.
+    fn apply_suggestions(
+        &mut self,
+        suggestions: Option<AutocompleteSuggestions>,
+        mode: AutocompleteMode,
+        auto_apply_single: bool,
+    ) {
+        let Some(suggestions) = suggestions else {
+            // No matches. Force keeps the popup open (and empty) so the user can
+            // narrow; Regular closes it.
+            self.autocomplete_items.clear();
+            self.autocomplete_selected = 0;
+            self.autocomplete_prefix.clear();
+            self.autocomplete_state = match mode {
+                AutocompleteMode::Force => Some(AutocompleteMode::Force),
+                AutocompleteMode::Regular => None,
+            };
+            return;
+        };
+
+        if auto_apply_single && suggestions.items.len() == 1 {
+            let item = suggestions.items[0].clone();
+            self.autocomplete_prefix = suggestions.prefix;
+            self.apply_autocomplete_item(item);
+            return;
+        }
+
+        if suggestions.items.is_empty() {
+            if !matches!(mode, AutocompleteMode::Force) {
+                self.autocomplete_state = None;
+                self.autocomplete_items.clear();
+                self.autocomplete_selected = 0;
+                self.autocomplete_prefix.clear();
+            }
+            return;
+        }
+
+        self.autocomplete_prefix = suggestions.prefix;
+        let items = suggestions.items;
+        // Pre-highlight the first item whose value extends the typed text so a
+        // unique prefix match lights up without further navigation.
+        let selected = items
+            .iter()
+            .position(|it| self.item_matches_typed_prefix(it))
+            .unwrap_or(0);
+        self.autocomplete_items = items;
+        self.autocomplete_selected = selected;
+        self.autocomplete_state = Some(mode);
+    }
+
+    /// Whether `item`'s value begins with the text typed at the cursor (the
+    /// `autocomplete_prefix`-long span ending at the cursor).
+    fn item_matches_typed_prefix(&self, item: &AutocompleteItem) -> bool {
+        let line = &self.lines[self.cursor_line];
+        let prefix_len = self.autocomplete_prefix.len();
+        let typed_start = self.cursor_col.saturating_sub(prefix_len);
+        let typed = &line[typed_start..self.cursor_col];
+        item.value.starts_with(typed)
+    }
+
+    /// Force-requests suggestions from Tab when the popup is closed. Honors the
+    /// provider's [`AutocompleteProvider::should_trigger_file_completion`] hook.
+    /// If exactly one result lands it is applied directly; multiple open the
+    /// popup in Force mode.
+    fn trigger_force_autocomplete(&mut self) {
+        if let Some(provider) = self.autocomplete_provider.as_ref()
+            && !provider.should_trigger_file_completion(
+                &self.lines,
+                self.cursor_line,
+                self.cursor_col,
+            )
+        {
+            return;
+        }
+        self.dispatch_autocomplete_request(AutocompleteMode::Force, true);
+    }
+
+    /// Splices `item`'s value over the `autocomplete_prefix`-long span ending at
+    /// the cursor, saving one undo step and closing the popup.
+    ///
+    /// Does not fire `on_change`: it has no `EventContext`. The Tab and Enter
+    /// apply paths run inside `handle_key` and follow this with `check_changed`,
+    /// so those fire. A delivery-driven auto-apply (a lone force result) runs
+    /// without a context, so `on_change` does not fire there. The host requests
+    /// a redraw on the delivery instead. No current consumer wires `on_change`
+    /// on this widget, so the asymmetry is invisible today.
+    fn apply_autocomplete_item(&mut self, item: AutocompleteItem) {
+        let Some(provider) = self.autocomplete_provider.clone() else {
+            return;
+        };
+        let prefix = self.autocomplete_prefix.clone();
+        let result = provider.apply_completion(
+            &self.lines,
+            self.cursor_line,
+            self.cursor_col,
+            &item,
+            &prefix,
+        );
+        self.save_undo();
+        self.lines = result.lines;
+        self.cursor_line = result.cursor_line;
+        self.cursor_col = result.cursor_col;
+        self.cancel_autocomplete();
+        self.reset_sticky_state();
+        self.last_action = LastAction::None;
+    }
+
+    /// Moves the popup highlight one row, clamped to the item bounds.
+    fn move_autocomplete_selection(&mut self, forward: bool) {
+        let len = self.autocomplete_items.len();
+        if len == 0 {
+            return;
+        }
+        if forward {
+            self.autocomplete_selected = (self.autocomplete_selected + 1).min(len - 1);
+        } else {
+            self.autocomplete_selected = self.autocomplete_selected.saturating_sub(1);
+        }
+    }
+
+    /// Applies the highlighted item (Tab on an open popup). Closes the popup if
+    /// there is nothing to apply.
+    fn apply_selected_autocomplete(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            self.cancel_autocomplete();
+            return;
+        }
+        let item = self.autocomplete_items[self.autocomplete_selected].clone();
+        self.apply_autocomplete_item(item);
+    }
+
+    /// Resolves Enter on an open popup: if the typed text is exactly one item's
+    /// value, keep it verbatim and close; otherwise apply the highlighted item.
+    /// Always consumes the keystroke, so Enter on a popup never submits.
+    fn accept_autocomplete_on_enter(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            self.cancel_autocomplete();
+            return;
+        }
+        let line = &self.lines[self.cursor_line];
+        let prefix_len = self.autocomplete_prefix.len();
+        let typed_start = self.cursor_col.saturating_sub(prefix_len);
+        let typed = line[typed_start..self.cursor_col].to_string();
+        let exact = self.autocomplete_items.iter().any(|i| i.value == typed);
+        if exact {
+            self.cancel_autocomplete();
+        } else {
+            let item = self.autocomplete_items[self.autocomplete_selected].clone();
+            self.apply_autocomplete_item(item);
+        }
+    }
+
+    /// Called after inserting one `char`. Opens the popup only when the typed
+    /// character plausibly starts or continues a completable context:
+    ///
+    /// - `@` / `#` right after whitespace or start-of-line opens a symbol popup.
+    /// - an identifier char inside an existing `@` / `#` context refines it.
+    ///
+    /// Any other character (plain prose, whitespace, a `/` that is not the
+    /// palette trigger) opens nothing. A `/` is not a symbol context char, so
+    /// prose never fires a "list every candidate" query. An already-open popup
+    /// refreshes on every insert so narrowing keeps working.
+    fn maybe_trigger_autocomplete_on_insert(&mut self, c: char) {
+        if self.autocomplete_provider.is_none() {
+            return;
+        }
+        if self.autocomplete_state.is_some() {
+            let force = matches!(self.autocomplete_state, Some(AutocompleteMode::Force));
+            self.update_autocomplete(force);
+            return;
+        }
+        let should_trigger = match c {
+            '@' | '#' => self.symbol_follows_whitespace_or_start(c),
+            c if is_identifier_char(c) => self.is_in_symbol_context(),
+            _ => false,
+        };
+        if should_trigger {
+            self.update_autocomplete(false);
+        }
+    }
+
+    /// Called after a deletion. Refreshes an open popup, or re-opens one only
+    /// when the deletion left the cursor inside an `@` / `#` symbol context.
+    fn maybe_retrigger_autocomplete_after_delete(&mut self) {
+        if self.autocomplete_provider.is_none() {
+            return;
+        }
+        if self.autocomplete_state.is_some() {
+            let force = matches!(self.autocomplete_state, Some(AutocompleteMode::Force));
+            self.update_autocomplete(force);
+            return;
+        }
+        if self.is_in_symbol_context() {
+            self.update_autocomplete(false);
+        }
+    }
+
+    /// Whether the just-inserted `@` / `#` sits at a token boundary: the char
+    /// before it is whitespace, or it is at the start of the line. Stops `@foo`
+    /// or `#bar` inside a word from opening a symbol popup.
+    fn symbol_follows_whitespace_or_start(&self, sym: char) -> bool {
+        let before = &self.lines[self.cursor_line][..self.cursor_col];
+        let mut buf = [0u8; 4];
+        let s: &str = sym.encode_utf8(&mut buf);
+        let Some(before_sym) = before.strip_suffix(s) else {
+            return false;
+        };
+        match before_sym.chars().last() {
+            None => true,
+            Some(c) => c == ' ' || c == '\t',
+        }
+    }
+
+    /// Whether the cursor sits inside an `@`- or `#`-prefixed symbol token. See
+    /// [`ends_in_symbol_context`].
+    fn is_in_symbol_context(&self) -> bool {
+        let before = &self.lines[self.cursor_line][..self.cursor_col];
+        ends_in_symbol_context(before)
+    }
+
     // -- Drawing --
 
     /// Writes one border rule into `surf` at `row`: `inlay` text followed by `─`
@@ -1925,6 +2713,117 @@ impl TextArea {
         }
         let mut col: u16 = 0;
         for g in s.graphemes(true) {
+            let gw = gwidth::gwidth(g, self.width_method);
+            if usize::from(col) + usize::from(gw) > width_usize {
+                break;
+            }
+            surf.write_cell(
+                col,
+                row,
+                Cell {
+                    char: Character::new(g, u8::try_from(gw).expect("grapheme width fits a u8")),
+                    style,
+                    ..Cell::default()
+                },
+            );
+            col = col.saturating_add(gw);
+        }
+    }
+
+    /// The popup's visible window as `(first_item_index, row_count)`.
+    ///
+    /// `(0, 0)` when the popup is closed or has no items to show. Otherwise the
+    /// window is `min(max_visible, len)` rows, scrolled to keep the selected row
+    /// roughly centered: the start clamps `selected - count/2` into
+    /// `[0, len - count]`, so the highlight stays visible while the list never
+    /// scrolls past either end.
+    fn autocomplete_popup_window(&self) -> (usize, usize) {
+        if self.autocomplete_state.is_none() || self.autocomplete_items.is_empty() {
+            return (0, 0);
+        }
+        let len = self.autocomplete_items.len();
+        let count = self.autocomplete_max_visible.min(len);
+        let start = if len <= count {
+            0
+        } else {
+            let half = count / 2;
+            self.autocomplete_selected
+                .saturating_sub(half)
+                .min(len - count)
+        };
+        (start, count)
+    }
+
+    /// Draws `popup_count` suggestion rows starting at `first_row`, one item per
+    /// row from `popup_start`. Each row is filled edge-to-edge with its style
+    /// (so the selected row reads as a band), the label left-aligned at
+    /// `padding_x`, and any description in a second column sized to the widest
+    /// visible label.
+    fn draw_autocomplete_popup(
+        &self,
+        surf: &mut Surface,
+        first_row: u16,
+        width: u16,
+        popup_start: usize,
+        popup_count: usize,
+    ) {
+        let width_usize = usize::from(width);
+        let visible = &self.autocomplete_items[popup_start..popup_start + popup_count];
+
+        // Description column start, relative to the popup's left edge: the
+        // widest visible label plus a fixed gap, clamped to the content width.
+        let content_width = width_usize.saturating_sub(self.padding_x * 2);
+        let widest_label = visible
+            .iter()
+            .map(|it| self.measure(&it.label))
+            .max()
+            .unwrap_or(0);
+        let desc_col = (widest_label + AUTOCOMPLETE_POPUP_COLUMN_GAP).min(content_width);
+
+        for (offset, item) in visible.iter().enumerate() {
+            let row =
+                first_row.saturating_add(u16::try_from(offset).expect("popup row fits a u16"));
+            let selected = popup_start + offset == self.autocomplete_selected;
+            let style = if selected {
+                self.theme.popup.selected
+            } else {
+                self.theme.popup.item
+            };
+
+            // Fill the whole row so the row style paints the full band.
+            for c in 0..width {
+                surf.write_cell(
+                    c,
+                    row,
+                    Cell {
+                        char: Character::new(" ", 1),
+                        style,
+                        ..Cell::default()
+                    },
+                );
+            }
+
+            self.draw_popup_text(surf, row, width, self.padding_x, &item.label, style);
+            if let Some(desc) = &item.description {
+                self.draw_popup_text(surf, row, width, self.padding_x + desc_col, desc, style);
+            }
+        }
+    }
+
+    /// Writes `text` into `surf` at `row`, starting at column `start_col`, in
+    /// `style`, clipped to `width`. Advances by measured grapheme width.
+    fn draw_popup_text(
+        &self,
+        surf: &mut Surface,
+        row: u16,
+        width: u16,
+        start_col: usize,
+        text: &str,
+        style: Style,
+    ) {
+        let width_usize = usize::from(width);
+        let mut col = u16::try_from(start_col.min(width_usize)).expect("popup col fits a u16");
+        for g in text.graphemes(true) {
             let gw = gwidth::gwidth(g, self.width_method);
             if usize::from(col) + usize::from(gw) > width_usize {
                 break;
@@ -2006,7 +2905,12 @@ impl Widget for TextArea {
         scroll_start = scroll_start.min(total_visual.saturating_sub(visible_count));
         self.scroll_offset = scroll_start;
 
-        let height = u16::try_from(visible_count + 2).expect("editor height fits a u16");
+        // Autocomplete popup window below the bottom border. The surface grows
+        // to include these rows when the popup is showing with items.
+        let (popup_start, popup_count) = self.autocomplete_popup_window();
+
+        let height =
+            u16::try_from(visible_count + 2 + popup_count).expect("editor height fits a u16");
         let mut surf = Surface::with_size(Size { width, height });
 
         // Top rule with optional scroll indicator and top-bar label.
@@ -2056,6 +2960,18 @@ impl Widget for TextArea {
             bottom_inlay.push_str(&format!("─── ↓ {lines_below} more "));
         }
         self.draw_rule(&mut surf, bottom_row, width, &bottom_inlay, border_style);
+
+        // Autocomplete popup rows, drawn below the bottom rule.
+        if popup_count > 0 {
+            let first_popup_row = u16::try_from(visible_count + 2).expect("popup row fits a u16");
+            self.draw_autocomplete_popup(
+                &mut surf,
+                first_popup_row,
+                width,
+                popup_start,
+                popup_count,
+            );
+        }
 
         // Report the caret when its visual line is inside the window. The
         // framework renders it only while this widget is focused.
@@ -2109,6 +3025,47 @@ impl TextArea {
         let empty = Modifiers::empty();
         let ctrl = Modifiers::CTRL;
         let alt = Modifiers::ALT;
+
+        // Autocomplete popup intercept, ahead of the jump-mode and editing
+        // chains. While the popup is open its navigation / accept / cancel keys
+        // are consumed here; a printable char falls through to the normal insert
+        // path, which re-triggers and narrows the popup.
+        if self.autocomplete_state.is_some() {
+            if key.matches(Key::ESCAPE, empty) {
+                self.cancel_autocomplete();
+                ctx.consume_and_redraw();
+                return;
+            }
+            let up = key.matches(Key::UP, empty) || key.matches(u32::from('p'), ctrl);
+            let down = key.matches(Key::DOWN, empty) || key.matches(u32::from('n'), ctrl);
+            if (up || down) && !self.autocomplete_items.is_empty() {
+                self.move_autocomplete_selection(down);
+                ctx.consume_and_redraw();
+                return;
+            }
+            if key.matches(Key::TAB, empty) {
+                // Tab applies the current selection without re-querying.
+                self.apply_selected_autocomplete();
+                self.check_changed(ctx);
+                return;
+            }
+            if key.matches(Key::ENTER, empty) {
+                self.accept_autocomplete_on_enter();
+                self.check_changed(ctx);
+                return;
+            }
+            // Any other key (printable, motion, deletion) falls through.
+        }
+
+        // Tab with the popup closed: force a completion request.
+        if self.autocomplete_provider.is_some()
+            && self.autocomplete_state.is_none()
+            && key.matches(Key::TAB, empty)
+        {
+            self.trigger_force_autocomplete();
+            ctx.consume_and_redraw();
+            return;
+        }
 
         // Char-jump mode. Intercepted before every editing chord so the next
         // key is read as a jump target rather than an edit. The three-way
@@ -2369,7 +3326,7 @@ fn printable_char(key: &Key) -> Option<char> {
 }
 
 /// The fixed editing chords. See [`TextArea::bindings`].
-static BINDINGS: [ChordDoc; 23] = [
+static BINDINGS: [ChordDoc; 25] = [
     ChordDoc {
         keys: "↑ / Ctrl-P",
         description: "Move up, or previous history at the top line",
@@ -2484,6 +3441,16 @@ static BINDINGS: [ChordDoc; 23] = [
         keys: "Ctrl-Alt-]",
         description: "Jump to the previous occurrence of a character",
         group: "Movement",
+    },
+    ChordDoc {
+        keys: "Tab",
+        description: "Complete: apply a suggestion, or open the popup",
+        group: "Autocomplete",
+    },
+    ChordDoc {
+        keys: "Esc",
+        description: "Dismiss the autocomplete popup (when open)",
+        group: "Autocomplete",
     },
 ];
 
@@ -3892,5 +4859,631 @@ mod tests {
 
         send(&mut ed, &ctrl('-'));
         assert_eq!(ed.text(), "xhello world");
+    }
+
+    // -- Autocomplete --
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use tokio::sync::Notify;
+
+    use crate::vxfw::CompletionApplied;
+
+    /// A `Tab` key press.
+    fn tab() -> Event {
+        key(Key::TAB, Modifiers::empty())
+    }
+
+    /// Convenience: item whose value and label are the same, no description.
+    fn item(v: &str) -> AutocompleteItem {
+        AutocompleteItem::new(v.to_string(), v.to_string())
+    }
+
+    /// Standard apply behavior: replace exactly `prefix.len()` bytes before the
+    /// cursor with the item's value, moving the cursor to the end of the insert.
+    fn apply_prefix_replace(
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        item: &AutocompleteItem,
+        prefix: &str,
+    ) -> CompletionApplied {
+        let mut new_lines = lines.to_vec();
+        let line = new_lines[cursor_line].clone();
+        let before = &line[..cursor_col - prefix.len()];
+        let after = &line[cursor_col..];
+        new_lines[cursor_line] = format!("{}{}{}", before, item.value, after);
+        CompletionApplied {
+            lines: new_lines,
+            cursor_line,
+            cursor_col: cursor_col - prefix.len() + item.value.len(),
+        }
+    }
+
+    /// A closure-backed provider that returns `(items, prefix)` given `(lines,
+    /// cursor_line, cursor_col, force)`. Lets a test control provider behavior
+    /// inline without a full named type.
+    struct MockProvider<F>
+    where
+        F: Fn(&[String], usize, usize, bool) -> Option<(Vec<AutocompleteItem>, String)>,
+    {
+        get: F,
+    }
+
+    #[async_trait]
+    impl<F> AutocompleteProvider for MockProvider<F>
+    where
+        F: Fn(&[String], usize, usize, bool) -> Option<(Vec<AutocompleteItem>, String)>
+            + Send
+            + Sync
+            + 'static,
+    {
+        async fn get_suggestions(
+            &self,
+            lines: &[String],
+            cursor_line: usize,
+            cursor_col: usize,
+            opts: SuggestOpts,
+        ) -> Option<AutocompleteSuggestions> {
+            let (items, prefix) = (self.get)(lines, cursor_line, cursor_col, opts.force)?;
+            Some(AutocompleteSuggestions { items, prefix })
+        }
+
+        fn apply_completion(
+            &self,
+            lines: &[String],
+            cursor_line: usize,
+            cursor_col: usize,
+            item: &AutocompleteItem,
+            prefix: &str,
+        ) -> CompletionApplied {
+            apply_prefix_replace(lines, cursor_line, cursor_col, item, prefix)
+        }
+    }
+
+    /// Drives autocomplete to a settled state for a deterministic test: awaits
+    /// the pending worker (so its delivery is on the channel), then pumps. The
+    /// widget still owns the receiver in tests, so `pump_autocomplete` drains it
+    /// in place, exactly as the host's `select!` arm would call
+    /// `apply_autocomplete_delivery`.
+    async fn wait_autocomplete(ed: &mut TextArea) {
+        if let Some(handle) = ed.autocomplete_task.take() {
+            let _ = handle.await;
+        }
+        ed.pump_autocomplete();
+    }
+
+    /// Types `s` one key at a time, settling autocomplete after each keystroke.
+    async fn type_settle(ed: &mut TextArea, s: &str) {
+        for c in s.chars() {
+            send(ed, &char_key(c));
+            wait_autocomplete(ed).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_applies_single_force_file_suggestion_without_showing_menu() {
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: |lines, _l, col, force| {
+                if !force {
+                    return None;
+                }
+                let prefix = &lines[0][..col];
+                if prefix == "Work" {
+                    Some((vec![item("Workspace/")], "Work".to_string()))
+                } else {
+                    None
+                }
+            },
+        }));
+
+        type_settle(&mut ed, "Work").await;
+        assert_eq!(ed.text(), "Work");
+
+        // Tab auto-applies the single suggestion.
+        send(&mut ed, &tab());
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(ed.text(), "Workspace/");
+        assert!(!ed.is_showing_autocomplete());
+
+        // Undo restores "Work".
+        send(&mut ed, &ctrl('-'));
+        assert_eq!(ed.text(), "Work");
+    }
+
+    #[tokio::test]
+    async fn shows_menu_when_force_file_has_multiple_suggestions() {
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: |lines, _l, col, force| {
+                if !force {
+                    return None;
+                }
+                let prefix = &lines[0][..col];
+                if prefix == "src" {
+                    Some((vec![item("src/"), item("src.txt")], "src".to_string()))
+                } else {
+                    None
+                }
+            },
+        }));
+
+        type_settle(&mut ed, "src").await;
+
+        // Tab shows the menu (multiple suggestions).
+        send(&mut ed, &tab());
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(ed.text(), "src");
+        assert!(ed.is_showing_autocomplete());
+
+        // A second Tab applies the highlighted (first) suggestion.
+        send(&mut ed, &tab());
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(ed.text(), "src/");
+        assert!(!ed.is_showing_autocomplete());
+    }
+
+    #[tokio::test]
+    async fn keeps_suggestions_open_when_typing_in_force_mode() {
+        let all_files = [
+            item("readme.md"),
+            item("package.json"),
+            item("src/"),
+            item("dist/"),
+        ];
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: move |lines, _l, col, force| {
+                let prefix = &lines[0][..col];
+                let should_match = force || prefix.contains('/') || prefix.starts_with('.');
+                if !should_match {
+                    return None;
+                }
+                let filtered: Vec<AutocompleteItem> = all_files
+                    .iter()
+                    .filter(|f| f.value.to_lowercase().starts_with(&prefix.to_lowercase()))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    return None;
+                }
+                Some((filtered, prefix.to_string()))
+            },
+        }));
+
+        // Tab on an empty prompt: force mode, shows all.
+        send(&mut ed, &tab());
+        wait_autocomplete(&mut ed).await;
+        assert!(ed.is_showing_autocomplete());
+
+        // Typing narrows but stays in force mode.
+        send(&mut ed, &char_key('r'));
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(ed.text(), "r");
+        assert!(ed.is_showing_autocomplete());
+
+        send(&mut ed, &char_key('e'));
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(ed.text(), "re");
+        assert!(ed.is_showing_autocomplete());
+
+        // Tab applies the first remaining suggestion ("readme.md").
+        send(&mut ed, &tab());
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(ed.text(), "readme.md");
+        assert!(!ed.is_showing_autocomplete());
+    }
+
+    /// The `@`-attachment context debounces: a synchronous burst of keystrokes
+    /// coalesces into a single provider call once the window expires.
+    #[tokio::test]
+    async fn debounces_at_autocomplete_while_typing() {
+        struct RecordingProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl AutocompleteProvider for RecordingProvider {
+            async fn get_suggestions(
+                &self,
+                lines: &[String],
+                _cursor_line: usize,
+                cursor_col: usize,
+                _opts: SuggestOpts,
+            ) -> Option<AutocompleteSuggestions> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let before = &lines[0][..cursor_col];
+                if before.contains('@') {
+                    Some(AutocompleteSuggestions {
+                        prefix: before.rsplit(' ').next().unwrap_or("").to_string(),
+                        items: vec![AutocompleteItem::new("@file.rs", "file.rs")],
+                    })
+                } else {
+                    None
+                }
+            }
+            fn apply_completion(
+                &self,
+                lines: &[String],
+                cursor_line: usize,
+                cursor_col: usize,
+                item: &AutocompleteItem,
+                _prefix: &str,
+            ) -> CompletionApplied {
+                CompletionApplied {
+                    lines: lines.to_vec(),
+                    cursor_line,
+                    cursor_col: cursor_col + item.value.len(),
+                }
+            }
+        }
+
+        let mut ed = editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        ed.set_autocomplete_provider(Arc::new(RecordingProvider {
+            calls: Arc::clone(&calls),
+        }));
+
+        // A rapid burst inside an `@` context: no keystroke is awaited, so no
+        // worker runs and the debounce window has not expired.
+        for ch in "@abcdefgh".chars() {
+            send(&mut ed, &char_key(ch));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "provider must not be called until the @ debounce window expires",
+        );
+
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one debounced provider call should land after the @ burst",
+        );
+        assert!(ed.is_showing_autocomplete());
+    }
+
+    /// A `#` at a token boundary is a symbol trigger just like `@`, and debounces
+    /// the same way.
+    #[tokio::test]
+    async fn debounces_hash_autocomplete_while_typing() {
+        struct RecordingProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl AutocompleteProvider for RecordingProvider {
+            async fn get_suggestions(
+                &self,
+                lines: &[String],
+                _cursor_line: usize,
+                cursor_col: usize,
+                _opts: SuggestOpts,
+            ) -> Option<AutocompleteSuggestions> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let before = &lines[0][..cursor_col];
+                Some(AutocompleteSuggestions {
+                    prefix: before.to_string(),
+                    items: vec![AutocompleteItem::new("#2983", "#2983")],
+                })
+            }
+            fn apply_completion(
+                &self,
+                lines: &[String],
+                cursor_line: usize,
+                cursor_col: usize,
+                item: &AutocompleteItem,
+                _prefix: &str,
+            ) -> CompletionApplied {
+                CompletionApplied {
+                    lines: lines.to_vec(),
+                    cursor_line,
+                    cursor_col: cursor_col + item.value.len(),
+                }
+            }
+        }
+
+        let mut ed = editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        ed.set_autocomplete_provider(Arc::new(RecordingProvider {
+            calls: Arc::clone(&calls),
+        }));
+
+        for ch in "#2983".chars() {
+            send(&mut ed, &char_key(ch));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "provider must not be called until the # debounce window expires",
+        );
+
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one debounced provider call should land after the # burst",
+        );
+        assert!(ed.is_showing_autocomplete());
+    }
+
+    /// A new request cancels the in-flight one: the first, slow call observes
+    /// cancellation when a second request supersedes it.
+    #[tokio::test]
+    async fn aborts_active_at_autocomplete_when_typing_continues() {
+        struct SlowProvider {
+            calls: Arc<AtomicUsize>,
+            release: Arc<Notify>,
+            first_call_saw_cancel: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl AutocompleteProvider for SlowProvider {
+            async fn get_suggestions(
+                &self,
+                _lines: &[String],
+                _cursor_line: usize,
+                _cursor_col: usize,
+                opts: SuggestOpts,
+            ) -> Option<AutocompleteSuggestions> {
+                let call_n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_n == 0 {
+                    // First call: wait to be released, or to be cancelled.
+                    tokio::select! {
+                        _ = opts.cancel.cancelled() => {
+                            self.first_call_saw_cancel.store(true, Ordering::SeqCst);
+                            return None;
+                        }
+                        _ = self.release.notified() => {}
+                    }
+                    return None;
+                }
+                Some(AutocompleteSuggestions {
+                    prefix: "@".to_string(),
+                    items: vec![AutocompleteItem::new("@file.rs", "file.rs")],
+                })
+            }
+            fn apply_completion(
+                &self,
+                lines: &[String],
+                cursor_line: usize,
+                cursor_col: usize,
+                _item: &AutocompleteItem,
+                _prefix: &str,
+            ) -> CompletionApplied {
+                CompletionApplied {
+                    lines: lines.to_vec(),
+                    cursor_line,
+                    cursor_col,
+                }
+            }
+        }
+
+        let mut ed = editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let first_call_saw_cancel = Arc::new(AtomicBool::new(false));
+        ed.set_autocomplete_provider(Arc::new(SlowProvider {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+            first_call_saw_cancel: Arc::clone(&first_call_saw_cancel),
+        }));
+
+        // First request. Tab fires immediately (no @ debounce).
+        send(&mut ed, &tab());
+        // Give the worker time to reach the `select!` inside get_suggestions.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Second Tab: cancels the first request before releasing it.
+        send(&mut ed, &tab());
+        wait_autocomplete(&mut ed).await;
+
+        // Nobody should be blocked anymore, but make sure.
+        release.notify_waiters();
+        tokio::task::yield_now().await;
+
+        assert!(
+            first_call_saw_cancel.load(Ordering::SeqCst),
+            "the first in-flight request must observe cancellation when superseded",
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "both requests must dispatch",
+        );
+    }
+
+    /// A counter-backed provider that records how often it is asked and always
+    /// returns nothing.
+    struct CountingProvider {
+        count: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl AutocompleteProvider for CountingProvider {
+        async fn get_suggestions(
+            &self,
+            _lines: &[String],
+            _cursor_line: usize,
+            _cursor_col: usize,
+            _opts: SuggestOpts,
+        ) -> Option<AutocompleteSuggestions> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+        fn apply_completion(
+            &self,
+            lines: &[String],
+            cursor_line: usize,
+            cursor_col: usize,
+            item: &AutocompleteItem,
+            _prefix: &str,
+        ) -> CompletionApplied {
+            CompletionApplied {
+                lines: lines.to_vec(),
+                cursor_line,
+                cursor_col: cursor_col + item.value.len(),
+            }
+        }
+    }
+
+    fn counting_editor() -> (TextArea, Arc<AtomicUsize>) {
+        let mut ed = editor();
+        let count = Arc::new(AtomicUsize::new(0));
+        ed.set_autocomplete_provider(Arc::new(CountingProvider {
+            count: Arc::clone(&count),
+        }));
+        (ed, count)
+    }
+
+    #[tokio::test]
+    async fn typing_prose_does_not_call_provider() {
+        let (mut ed, count) = counting_editor();
+        type_settle(&mut ed, "hello world ").await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "prose with no @/# trigger must not query the provider",
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_a_bare_space_does_not_call_provider() {
+        let (mut ed, count) = counting_editor();
+        send(&mut ed, &char_key(' '));
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn at_sign_after_whitespace_calls_provider() {
+        let (mut ed, count) = counting_editor();
+        send(&mut ed, &char_key('@'));
+        wait_autocomplete(&mut ed).await;
+        let after_bare_at = count.load(Ordering::SeqCst);
+        assert!(after_bare_at >= 1, "a bare `@` should query the provider");
+
+        type_settle(&mut ed, "hi @").await;
+        assert!(
+            count.load(Ordering::SeqCst) > after_bare_at,
+            "`@` after whitespace should query the provider again",
+        );
+    }
+
+    #[tokio::test]
+    async fn at_sign_inside_a_word_does_not_call_provider() {
+        let (mut ed, count) = counting_editor();
+        type_settle(&mut ed, "user").await;
+        let before_at = count.load(Ordering::SeqCst);
+        send(&mut ed, &char_key('@'));
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            before_at,
+            "`@` immediately after a word must not open the popup",
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_on_at_file_popup_applies_completion_but_does_not_submit() {
+        struct AtProvider;
+        #[async_trait]
+        impl AutocompleteProvider for AtProvider {
+            async fn get_suggestions(
+                &self,
+                lines: &[String],
+                _cursor_line: usize,
+                cursor_col: usize,
+                _opts: SuggestOpts,
+            ) -> Option<AutocompleteSuggestions> {
+                let before = &lines[0][..cursor_col];
+                let at_idx = before.rfind('@')?;
+                let prefix = &before[at_idx..];
+                Some(AutocompleteSuggestions {
+                    prefix: prefix.to_string(),
+                    items: vec![AutocompleteItem {
+                        value: format!("{}src/main.rs", &prefix[..1]),
+                        label: "src/main.rs".to_string(),
+                        description: None,
+                    }],
+                })
+            }
+            fn apply_completion(
+                &self,
+                lines: &[String],
+                cursor_line: usize,
+                cursor_col: usize,
+                item: &AutocompleteItem,
+                prefix: &str,
+            ) -> CompletionApplied {
+                let mut new_lines = lines.to_vec();
+                let line = new_lines[cursor_line].clone();
+                let before = &line[..cursor_col - prefix.len()];
+                let after = &line[cursor_col..];
+                new_lines[cursor_line] = format!("{}{}{}", before, item.value, after);
+                CompletionApplied {
+                    lines: new_lines,
+                    cursor_line,
+                    cursor_col: before.len() + item.value.len(),
+                }
+            }
+        }
+
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(AtProvider));
+
+        type_settle(&mut ed, "look at @").await;
+        assert!(ed.is_showing_autocomplete());
+
+        send(&mut ed, &key(Key::ENTER, Modifiers::empty()));
+        assert_eq!(
+            ed.take_submitted(),
+            None,
+            "Enter on an @-file popup applies the completion, it does not submit",
+        );
+        assert!(
+            !ed.is_showing_autocomplete(),
+            "the popup is dismissed after Enter",
+        );
+        assert_eq!(ed.text(), "look at @src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn at_prefix_autocomplete_draws_aligned_description_column() {
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: |lines, _l, col, _force| {
+                let before = &lines[0][..col];
+                if !before.contains('@') {
+                    return None;
+                }
+                Some((
+                    vec![
+                        AutocompleteItem::new("@file.rs", "@file.rs")
+                            .with_description("first file"),
+                        AutocompleteItem::new("@other.rs", "@other.rs")
+                            .with_description("second file"),
+                    ],
+                    "@".to_string(),
+                ))
+            },
+        }));
+
+        send(&mut ed, &char_key('@'));
+        wait_autocomplete(&mut ed).await;
+        assert!(ed.is_showing_autocomplete());
+
+        let surf = ed.draw(&ctx(60, 12));
+        let popup_row = (0..surf.size.height)
+            .map(|r| row_text(&surf, r))
+            .find(|t| t.contains("@file.rs") && t.contains("first file"))
+            .unwrap_or_else(|| panic!("expected a popup row with `@file.rs` / `first file`"));
+
+        // The label column is sized to the widest visible label ("@other.rs",
+        // 9 cells) plus the 2-cell gap, so the description starts at column 11.
+        assert_eq!(
+            popup_row.find("first file"),
+            Some(11),
+            "description should align at column 11; row: {popup_row:?}",
+        );
     }
 }

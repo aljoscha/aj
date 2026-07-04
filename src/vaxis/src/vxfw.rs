@@ -50,6 +50,7 @@ mod app;
 mod app_core;
 #[cfg(unix)]
 mod async_app;
+mod autocomplete;
 mod border;
 mod button;
 mod center;
@@ -75,6 +76,10 @@ pub use crate::vxfw::app::{App, Options};
 pub use crate::vxfw::app_core::KeystrokeRecord;
 #[cfg(unix)]
 pub use crate::vxfw::async_app::{AsyncApp, Frame};
+pub use crate::vxfw::autocomplete::{
+    AutocompleteItem, AutocompleteProvider, AutocompleteSession, AutocompleteSuggestions,
+    CompletionApplied, SessionInvalid, SessionStatus, SuggestOpts,
+};
 pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
 pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
@@ -97,7 +102,9 @@ pub use crate::vxfw::sized_box::SizedBox;
 pub use crate::vxfw::spinner::Spinner;
 pub use crate::vxfw::split_view::{Constrain, SplitView};
 pub use crate::vxfw::text::{Overflow, Text, TextAlign, WidthBasis};
-pub use crate::vxfw::text_area::{ChordDoc, EditorTheme, PopupStyle, TextArea};
+pub use crate::vxfw::text_area::{
+    AutocompleteDelivery, ChordDoc, EditorTheme, PopupStyle, TextArea,
+};
 pub use crate::vxfw::text_field::TextField;
 
 /// A reference-counted, interior-mutable handle to a widget.
