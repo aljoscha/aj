@@ -1,0 +1,68 @@
+{
+  "name": "light-ansi",
+  "vars": {
+    "black": 0, "red": 1, "green": 2, "yellow": 3,
+    "blue": 4, "magenta": 5, "cyan": 6, "white": 7,
+    "brightBlack": 8, "brightRed": 9, "brightGreen": 10, "brightYellow": 11,
+    "brightBlue": 12, "brightMagenta": 13, "brightCyan": 14, "brightWhite": 15
+  },
+  "colors": {
+    "accent": "blue",
+    "border": "blue",
+    "borderAccent": "cyan",
+    "borderMuted": "white",
+    "success": "green",
+    "error": "red",
+    "warning": "yellow",
+    "muted": "brightBlack",
+    "dim": "white",
+    "text": "",
+    "thinkingText": "white",
+
+    "selectedBg": "white",
+    "userMessageBg": "",
+    "userMessageText": "",
+    "customMessageBg": "",
+    "customMessageText": "",
+    "customMessageLabel": "magenta",
+    "toolPendingBg": "",
+    "toolSuccessBg": "",
+    "toolErrorBg": "",
+    "toolTitle": "",
+    "toolOutput": "brightBlack",
+
+    "mdHeading": "",
+    "mdLink": "blue",
+    "mdLinkUrl": "brightBlack",
+    "mdCode": "blue",
+    "mdCodeBlock": "",
+    "mdCodeBlockBorder": "brightBlack",
+    "mdQuote": "brightBlack",
+    "mdQuoteBorder": "brightBlack",
+    "mdHr": "brightBlack",
+    "mdListBullet": "green",
+
+    "toolDiffAdded": "green",
+    "toolDiffRemoved": "red",
+    "toolDiffContext": "brightBlack",
+
+    "syntaxComment": "brightBlack",
+    "syntaxKeyword": "magenta",
+    "syntaxFunction": "blue",
+    "syntaxVariable": "",
+    "syntaxString": "green",
+    "syntaxNumber": "yellow",
+    "syntaxType": "yellow",
+    "syntaxOperator": "cyan",
+    "syntaxPunctuation": "",
+
+    "thinkingOff": "white",
+    "thinkingMinimal": "brightBlack",
+    "thinkingLow": "blue",
+    "thinkingMedium": "cyan",
+    "thinkingHigh": "magenta",
+    "thinkingXhigh": "brightMagenta",
+
+    "bashMode": "green"
+  }
+}

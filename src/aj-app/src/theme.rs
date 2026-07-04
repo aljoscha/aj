@@ -68,6 +68,15 @@ const DARK_THEME_JSON: &str = include_str!("theme/dark.json");
 /// in `config.toml`, also picked explicitly via `theme = "light"`.
 const LIGHT_THEME_JSON: &str = include_str!("theme/light.json");
 
+/// Bundled "dark-ansi" palette JSON. Every token resolves to a
+/// 16-color ANSI palette index (or the terminal default), so the
+/// whole UI tracks the terminal's own palette rather than fixed RGB.
+const DARK_ANSI_THEME_JSON: &str = include_str!("theme/dark-ansi.json");
+
+/// Bundled "light-ansi" palette JSON. The light-background companion
+/// to `dark-ansi`, same ANSI-only contract.
+const LIGHT_ANSI_THEME_JSON: &str = include_str!("theme/light-ansi.json");
+
 // ============================================================================
 // Semantic tokens
 // ============================================================================
@@ -759,6 +768,12 @@ impl Theme {
         match name {
             "dark" => Self::from_json_with_mode("dark (bundled)", DARK_THEME_JSON, mode),
             "light" => Self::from_json_with_mode("light (bundled)", LIGHT_THEME_JSON, mode),
+            "dark-ansi" => {
+                Self::from_json_with_mode("dark-ansi (bundled)", DARK_ANSI_THEME_JSON, mode)
+            }
+            "light-ansi" => {
+                Self::from_json_with_mode("light-ansi (bundled)", LIGHT_ANSI_THEME_JSON, mode)
+            }
             other => Err(ThemeError::NotFound(other.to_string())),
         }
     }
@@ -794,7 +809,12 @@ impl Theme {
     /// by future `/theme` selector autocomplete; the loader doesn't
     /// otherwise care about discovery.
     pub fn available() -> Vec<String> {
-        let mut names: Vec<String> = vec!["dark".to_string(), "light".to_string()];
+        let mut names: Vec<String> = vec![
+            "dark".to_string(),
+            "light".to_string(),
+            "dark-ansi".to_string(),
+            "light-ansi".to_string(),
+        ];
         if let Some(dir) = user_themes_dir()
             && let Ok(read) = fs::read_dir(&dir)
         {
@@ -1162,6 +1182,57 @@ mod tests {
         let names = Theme::available();
         assert!(names.contains(&"dark".to_string()));
         assert!(names.contains(&"light".to_string()));
+        assert!(names.contains(&"dark-ansi".to_string()));
+        assert!(names.contains(&"light-ansi".to_string()));
+    }
+
+    #[test]
+    fn bundled_diff_colors_track_terminal_red_green() {
+        // `dark`/`light` stay pure-RGB; only the diff add/remove take
+        // the terminal palette's regular green (#009900) and red
+        // (#c31633) as fixed hex, matching aj's SGR 32/31.
+        for name in ["dark", "light"] {
+            let theme = Theme::load_strict_with_mode(name, ColorMode::Truecolor).unwrap();
+            assert_eq!(
+                theme.fg_color(ThemeColor::ToolDiffAdded),
+                ThemeRgb::Rgb(0x00, 0x99, 0x00),
+                "{name} diff added"
+            );
+            assert_eq!(
+                theme.fg_color(ThemeColor::ToolDiffRemoved),
+                ThemeRgb::Rgb(0xc3, 0x16, 0x33),
+                "{name} diff removed"
+            );
+        }
+    }
+
+    #[test]
+    fn ansi_themes_use_only_palette_colors() {
+        // The `*-ansi` themes exist so the whole UI tracks the
+        // terminal's own 16-color palette. Assert the invariant that
+        // every resolved token is a palette index or the terminal
+        // default, never a fixed RGB triple. The mode is irrelevant to
+        // the resolved value (it only bites at render time), so we pin
+        // one for determinism.
+        for name in ["dark-ansi", "light-ansi"] {
+            let theme = Theme::load_strict_with_mode(name, ColorMode::Truecolor)
+                .unwrap_or_else(|e| panic!("bundled {name} must parse: {e}"));
+            assert_eq!(theme.name(), name);
+            for &token in ThemeColor::all() {
+                assert!(
+                    !matches!(theme.fg_color(token), ThemeRgb::Rgb(..)),
+                    "{name}: {} resolved to fixed RGB, expected ANSI index or default",
+                    token.json_key()
+                );
+            }
+            for &token in ThemeBg::all() {
+                assert!(
+                    !matches!(theme.bg_color(token), ThemeRgb::Rgb(..)),
+                    "{name}: {} resolved to fixed RGB, expected ANSI index or default",
+                    token.json_key()
+                );
+            }
+        }
     }
 
     // ------------------------------------------------------------
