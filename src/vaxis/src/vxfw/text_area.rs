@@ -336,7 +336,8 @@ pub struct EditorTheme {
 }
 
 /// Styling for the inline autocomplete popup: one style for unselected rows and
-/// one for the highlighted row, which the popup fills edge-to-edge as a band.
+/// one for the highlighted row, which the popup paints as a compact band that
+/// hugs the row's text.
 #[derive(Debug, Clone, Default)]
 pub struct PopupStyle {
     /// Style for an unselected suggestion row.
@@ -2850,14 +2851,17 @@ impl TextArea {
         }
     }
 
-    /// The popup's visible window as `(first_item_index, row_count)`, with the
-    /// window height clamped to at most `max_rows`.
+    /// The popup's visible window over the items as `(first_item_index,
+    /// item_count)`.
     ///
-    /// `(0, 0)` when the popup is closed, has no items, or `max_rows` is zero.
-    /// Otherwise the window is `min(max_visible, len, max_rows)` rows, scrolled
-    /// to keep the selected row roughly centered: the start clamps
-    /// `selected - count/2` into `[0, len - count]`, so the highlight stays
-    /// visible while the list never scrolls past either end.
+    /// `max_rows` is the total surface budget above the editor, which includes
+    /// the popup's top rule, so the items get `max_rows - 1` rows. Returns
+    /// `(0, 0)` when the popup is closed, has no items, or the budget leaves no
+    /// room for an item. Otherwise the window is
+    /// `min(max_visible, len, max_rows - 1)` rows, scrolled to keep the
+    /// selected row roughly centered: the start clamps `selected - count/2`
+    /// into `[0, len - count]`, so the highlight stays visible while the list
+    /// never scrolls past either end.
     ///
     /// The host clamps `max_rows` to the space above the editor, so it can
     /// shrink the window below `max_visible`. Recentering uses the clamped
@@ -2866,8 +2870,12 @@ impl TextArea {
         if self.autocomplete_state.is_none() || self.autocomplete_items.is_empty() {
             return (0, 0);
         }
+        // Reserve one row of the budget for the top rule so the surface (items
+        // plus the rule) never exceeds `max_rows` and cannot push into the
+        // header.
+        let item_budget = max_rows.saturating_sub(1);
         let len = self.autocomplete_items.len();
-        let count = self.autocomplete_max_visible.min(len).min(max_rows);
+        let count = self.autocomplete_max_visible.min(len).min(item_budget);
         if count == 0 {
             return (0, 0);
         }
@@ -2882,10 +2890,35 @@ impl TextArea {
         (start, count)
     }
 
+    /// The exact text a popup row draws for `item`: its full path.
+    ///
+    /// Fuzzy items carry the full relative path in `description`, while
+    /// direct-path items have no `description` and hold the path fragment in
+    /// `label`, so we prefer `description` and fall back to `label`. A fuzzy
+    /// directory item's `description` is the path without a trailing slash
+    /// while its `label` ends in one, so we re-append the slash to preserve the
+    /// directory affordance. The band-measuring pass and the draw both call
+    /// this, so the band width and the rendered text can never diverge.
+    fn autocomplete_shown_text(item: &AutocompleteItem) -> String {
+        let shown = item.description.as_deref().unwrap_or(item.label.as_str());
+        if item.label.ends_with('/') && !shown.ends_with('/') {
+            let mut text = shown.to_string();
+            text.push('/');
+            text
+        } else {
+            shown.to_string()
+        }
+    }
+
     /// Draws `popup_count` suggestion rows starting at `first_row`, one item per
-    /// row from `popup_start`. Each row is filled edge-to-edge with its style
-    /// (so the selected row reads as a band) and shows a single column: the
-    /// item's full path, left-aligned at `padding_x`.
+    /// row from `popup_start`. Each row shows the item's full path, left-aligned
+    /// at `padding_x`, over a compact colored band.
+    ///
+    /// The band is `min(width, 2*padding_x + max_shown_text_width)` cells wide,
+    /// where `max_shown_text_width` is the widest shown text among the visible
+    /// items. Only cells `0..band_width` carry the row's style, so the selected
+    /// row's band hugs the text instead of spanning the full width. Cells beyond
+    /// the band keep the surface's blank default.
     fn draw_autocomplete_popup(
         &self,
         surf: &mut Surface,
@@ -2895,6 +2928,17 @@ impl TextArea {
         popup_count: usize,
     ) {
         let visible = &self.autocomplete_items[popup_start..popup_start + popup_count];
+
+        // Size the band to the widest shown text among the visible items (plus
+        // the symmetric padding), clamped to the surface. Measuring the exact
+        // text each row draws keeps the band and the text in lockstep.
+        let max_text = visible
+            .iter()
+            .map(|item| self.measure(&Self::autocomplete_shown_text(item)))
+            .max()
+            .unwrap_or(0);
+        let band_width = u16::try_from(usize::from(width).min(2 * self.padding_x + max_text))
+            .expect("band width fits a u16");
 
         for (offset, item) in visible.iter().enumerate() {
             let row =
@@ -2906,8 +2950,9 @@ impl TextArea {
                 self.theme.popup.item
             };
 
-            // Fill the whole row so the row style paints the full band.
-            for c in 0..width {
+            // Fill only the band so the row style paints a compact block. Cells
+            // beyond `band_width` keep the surface's blank default.
+            for c in 0..band_width {
                 surf.write_cell(
                     c,
                     row,
@@ -2919,23 +2964,10 @@ impl TextArea {
                 );
             }
 
-            // Single column: the item's full path. Fuzzy items carry the full
-            // relative path in `description`; direct-path items have no
-            // `description` and hold the path fragment in `label`. So we show
-            // the description when present, otherwise the label.
-            //
-            // Preserve the directory affordance: a fuzzy directory item's
-            // `description` is the path without a trailing slash while its
-            // `label` ends in one, so append the slash when the label marks a
-            // directory and the shown text does not already carry it.
-            let shown = item.description.as_deref().unwrap_or(item.label.as_str());
-            if item.label.ends_with('/') && !shown.ends_with('/') {
-                let mut text = shown.to_string();
-                text.push('/');
-                self.draw_popup_text(surf, row, width, self.padding_x, &text, style);
-            } else {
-                self.draw_popup_text(surf, row, width, self.padding_x, shown, style);
-            }
+            // Single column: the item's full path, clipped to the band. It
+            // always fits, since the band was measured from this same text.
+            let shown = Self::autocomplete_shown_text(item);
+            self.draw_popup_text(surf, row, band_width, self.padding_x, &shown, style);
         }
     }
 
@@ -2970,24 +3002,29 @@ impl TextArea {
         }
     }
 
-    /// The number of autocomplete popup rows to show, capped at `max_rows`.
+    /// The number of autocomplete item rows to show for a total surface budget
+    /// of `max_rows`.
     ///
-    /// `min(autocomplete_max_visible, items.len(), max_rows)`, or `0` when the
-    /// popup is closed or empty. The host passes the space available above the
-    /// editor so the overlay never overflows the screen.
+    /// `min(autocomplete_max_visible, items.len(), max_rows - 1)`, or `0` when
+    /// the popup is closed or empty or the budget leaves no room for an item.
+    /// One row of the budget is reserved for the popup's top rule. The host
+    /// passes the space available above the editor so the overlay never
+    /// overflows the screen.
     pub fn autocomplete_popup_rows(&self, max_rows: usize) -> usize {
         self.autocomplete_popup_window(max_rows).1
     }
 
-    /// A standalone popup surface of `width x rows` for the host to float as an
-    /// overlay above the editor, where `rows = autocomplete_popup_rows(max_rows)`.
+    /// A standalone popup surface for the host to float as an overlay above the
+    /// editor, `width` wide and `autocomplete_popup_rows(max_rows) + 1` tall.
     ///
-    /// Returns `None` when the popup is closed, empty, or `rows` is zero. The
-    /// surface holds the single-column full-path rows with the full-row band
-    /// fill and the item/selected styles, drawn from its own row 0. The scroll
-    /// window recenters on the selected row using the clamped `rows`, so the
-    /// selection stays visible even when `max_rows` is smaller than the item
-    /// count.
+    /// Returns `None` when the popup is closed, empty, or the budget leaves no
+    /// room for an item. Row 0 is a full-width border-color rule that
+    /// delineates the popup from the transcript above, matching the editor's
+    /// own border rules. The item rows follow from row 1, each a full-path
+    /// entry with the item/selected styles painted as a compact band that hugs
+    /// the text. The scroll window recenters on the selected row using the
+    /// clamped row count, so the selection stays visible even when `max_rows`
+    /// is smaller than the item count.
     ///
     /// Reads presentation state the editor's own `draw` sets (`width_method`,
     /// `theme`, the items, `last_visible_rows`), so the host must call it only
@@ -2999,9 +3036,15 @@ impl TextArea {
         if count == 0 {
             return None;
         }
-        let height = u16::try_from(count).expect("popup row count fits a u16");
+        // The surface is the top rule row plus the item rows.
+        let height = u16::try_from(count + 1).expect("popup row count fits a u16");
         let mut surf = Surface::with_size(Size { width, height });
-        self.draw_autocomplete_popup(&mut surf, 0, width, start, count);
+        let border_style = Style {
+            fg: self.theme.border_color,
+            ..Style::default()
+        };
+        self.draw_rule(&mut surf, 0, width, "", border_style);
+        self.draw_autocomplete_popup(&mut surf, 1, width, start, count);
         Some(surf)
     }
 
@@ -5784,6 +5827,24 @@ mod tests {
     #[tokio::test]
     async fn at_prefix_autocomplete_draws_single_full_path_column() {
         let mut ed = editor();
+        // A distinctive theme so the top rule and the selected band carry
+        // colors the assertions can check.
+        let border = Color::Index(4);
+        let selected_bg = Color::Index(6);
+        ed.set_theme(EditorTheme {
+            border_color: border,
+            popup: PopupStyle {
+                item: Style {
+                    fg: Color::Index(7),
+                    ..Style::default()
+                },
+                selected: Style {
+                    fg: Color::Index(7),
+                    bg: selected_bg,
+                    ..Style::default()
+                },
+            },
+        });
         ed.set_autocomplete_provider(Arc::new(MockProvider {
             get: |lines, _l, col, _force| {
                 let before = &lines[0][..col];
@@ -5815,16 +5876,53 @@ mod tests {
         let popup = ed
             .draw_autocomplete_popup_surface(60, 10)
             .expect("a popup surface while showing with items");
-        let popup_row = (0..popup.size.height)
-            .map(|r| row_text(&popup, r))
-            .find(|t| t.contains("src/main.rs"))
-            .unwrap_or_else(|| panic!("expected a popup row with `src/main.rs`"));
+
+        // Two items plus the top rule row.
+        assert_eq!(popup.size.height, 3, "two items plus the top rule row");
+
+        // Row 0 is a full-width rule in the border color, matching the editor's
+        // own border rules.
+        for col in 0..popup.size.width {
+            let cell = popup.read_cell(col, 0);
+            assert_eq!(cell.char.grapheme(), "─", "row 0 col {col} is a rule glyph");
+            assert_eq!(
+                cell.style.fg, border,
+                "row 0 col {col} carries the border color",
+            );
+        }
+
+        // Item 0 (`src/main.rs`) is selected by default and drawn at row 1.
+        let popup_row = row_text(&popup, 1);
 
         // Single column: the full path (the item's `description`) is drawn at
         // `padding_x` (column 0 here) and there is no second filename column,
         // so the row is exactly the path once trailing band fill is trimmed.
         assert_eq!(popup_row.find("src/main.rs"), Some(0));
         assert_eq!(popup_row.trim_end(), "src/main.rs");
+
+        // The selected row's band is compact: it spans exactly the widest
+        // visible entry's measured width (with `padding_x = 0`), not the full
+        // surface. `src/other.rs` is the widest at 12 cells, wider than the
+        // selected `src/main.rs`.
+        let band_width = u16::try_from(ed.measure("src/other.rs")).unwrap();
+        assert_eq!(band_width, 12);
+        for col in 0..band_width {
+            assert_eq!(
+                popup.read_cell(col, 1).style.bg,
+                selected_bg,
+                "selected band cell {col} carries SelectedBg",
+            );
+        }
+        // The cell just past the band is the surface's blank default, not band.
+        let past = popup.read_cell(band_width, 1);
+        assert_ne!(
+            past.style.bg, selected_bg,
+            "the cell past the band is outside the selected band",
+        );
+        assert!(
+            past.default,
+            "the cell past the band keeps the surface's blank default",
+        );
     }
 
     #[tokio::test]
@@ -5868,11 +5966,15 @@ mod tests {
         let cursor = surf.cursor.expect("caret is reported while focused");
         assert_eq!(cursor.row, 1);
 
-        // The overlay surface holds the popup, sized to the item count.
+        // The overlay surface holds the popup, sized to the item count plus the
+        // top rule row.
         let popup = ed
             .draw_autocomplete_popup_surface(40, 10)
             .expect("a popup surface while showing with items");
-        assert_eq!(popup.size.height, 2, "two items, both within the window");
+        assert_eq!(
+            popup.size.height, 3,
+            "two items within the window, plus the top rule row",
+        );
     }
 
     #[tokio::test]
@@ -5901,12 +6003,14 @@ mod tests {
         assert!(ed.is_showing_autocomplete());
         let _ = ed.draw(&ctx(40, 12));
 
-        // `max_rows` clamps the row count below the item count and below
-        // `max_visible`.
-        assert_eq!(ed.autocomplete_popup_rows(4), 4);
+        // `max_rows` is the total surface budget. One row is reserved for the
+        // top rule, so the item count is `max_rows - 1`, clamped below the item
+        // count and below `max_visible`.
+        assert_eq!(ed.autocomplete_popup_rows(4), 3);
         let popup = ed
             .draw_autocomplete_popup_surface(40, 4)
             .expect("a clamped popup surface");
+        // Three item rows plus the top rule fill the four-row budget.
         assert_eq!(popup.size.height, 4);
 
         // Move the selection to the bottom of the list. With a four-row window

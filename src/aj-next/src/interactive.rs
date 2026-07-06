@@ -2250,12 +2250,13 @@ const HEADER_ROWS: u16 = 1;
 /// installs, to reach full parity with `aj`'s editor border.
 fn editor_theme_from_theme(theme: &Theme) -> EditorTheme {
     let mode = theme.color_mode();
-    // The autocomplete popup paints its selected row as a full-width band over
-    // `ThemeBg::SelectedBg`. That band is the selection idiom every other
+    // The autocomplete popup paints its selected row as a compact band over
+    // `ThemeBg::SelectedBg`, sized to hug the entry text rather than spanning
+    // the full editor width. That band is the selection idiom every other
     // selector in this shell uses (see `select_styles_from_theme`), so the
     // completion popup matches. The unselected `item` style keeps the default
-    // background because the popup draw fills each row edge to edge, which keeps
-    // it opaque over the transcript underneath.
+    // background, which is the surface's own blank fill, so the popup stays
+    // opaque over the transcript underneath.
     let popup = PopupStyle {
         item: Style {
             fg: vaxis_color(theme.fg_color(ThemeColor::Text), mode),
@@ -4117,9 +4118,9 @@ mod tests {
     }
 
     /// The editor theme wires the autocomplete popup's selection band so the
-    /// selected row reads as a visible full-width band, not plain text. The
-    /// selected style must carry a non-default background (the `SelectedBg`
-    /// band) while the unselected item keeps the default background.
+    /// selected row reads as a visible band, not plain text. The selected style
+    /// must carry a non-default background (the `SelectedBg` band) while the
+    /// unselected item keeps the default background.
     #[test]
     fn editor_theme_wires_the_popup_selection_band() {
         let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
