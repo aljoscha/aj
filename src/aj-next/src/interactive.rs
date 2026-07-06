@@ -2162,6 +2162,20 @@ fn editor_row_cap(terminal_rows: usize) -> usize {
     ((terminal_rows * 3) / 10).max(5)
 }
 
+/// Rows the footer occupies below the editor in the shell's `FlexColumn`.
+///
+/// The footer is a single softwrap-off `RichText` line, so it is always exactly
+/// one row. The autocomplete overlay anchor math in [`Shell`]'s `draw`
+/// subtracts this to find the editor's top row. If the footer ever wraps to
+/// more than one row, this must change.
+const FOOTER_ROWS: u16 = 1;
+
+/// Rows the header occupies at the top of the shell's `FlexColumn`.
+///
+/// The header is the single title line. The autocomplete overlay leaves at
+/// least this many rows on screen above itself so the title stays visible.
+const HEADER_ROWS: u16 = 1;
+
 /// Build the editor's border theme from the shared palette (Spec D structured
 /// colors), the same way the other chrome resolves its styles.
 ///
@@ -2321,6 +2335,11 @@ impl Shell {
         editor.borrow_mut().set_autocomplete_provider(Arc::new(
             crate::autocomplete::CombinedAutocompleteProvider::new(cwd.clone()),
         ));
+        // Cap the popup at 20 rows, its fixed ceiling. The session already caps
+        // matches at 20, and `Shell::draw` clamps per frame to the space above
+        // the editor, so this only bounds a tall terminal. Set once here: the
+        // editor persists across session rebinds, so it never needs resetting.
+        editor.borrow_mut().set_autocomplete_max_visible(20);
         // The footer shows the working directory as text. The provider owns the
         // path itself.
         let cwd_display = cwd.display().to_string();
@@ -2642,6 +2661,47 @@ impl Widget for Shell {
         // capture chords (close-all) run before the overlay's widgets
         // see the key.
         let mut inner = draw_widget(&to_widget_ref(Rc::clone(&self.keymap)), ctx);
+
+        // Autocomplete popup overlay. We float the editor's popup as a
+        // z-indexed subsurface OVER the transcript, anchored just above the
+        // editor, rather than drawing it inside the editor's own surface. That
+        // keeps every widget's height fixed: opening or closing the popup never
+        // pushes the transcript up and never moves the input line or the
+        // footer. The popup simply covers the transcript rows it overlaps and
+        // uncovers them, unchanged, when it closes.
+        //
+        // We place it only when no modal overlay is open. A modal and the
+        // editor popup are mutually exclusive: under a modal the editor is not
+        // focused and cannot be driving a completion. That guard is also why
+        // there is no z clash with the scrim (z 1) and modal (z 2) pushes
+        // below, which run only when a modal IS open.
+        if self.overlays.borrow().top().is_none() {
+            let term = ctx.max.size();
+            let editor = self.editor.borrow();
+            // The editor sits directly above the footer in the `FlexColumn`,
+            // and only the footer is below it, so the editor's top row is the
+            // terminal height minus the footer and the editor's own block.
+            let editor_top = term
+                .height
+                .saturating_sub(FOOTER_ROWS)
+                .saturating_sub(editor.drawn_height());
+            // Rows available above the editor, keeping the header on screen.
+            let max_rows = usize::from(editor_top.saturating_sub(HEADER_ROWS));
+            if let Some(popup) = editor.draw_autocomplete_popup_surface(term.width, max_rows) {
+                // Anchor so the popup's bottom edge abuts the editor's top.
+                let anchor = editor_top.saturating_sub(popup.size.height);
+                inner.children.push(SubSurface {
+                    origin: RelativePoint {
+                        row: i32::from(anchor),
+                        col: 0,
+                    },
+                    surface: popup,
+                    // z 1 draws over the base `FlexColumn` (z 0), like the scrim.
+                    z_index: 1,
+                });
+            }
+        }
+
         let overlays = self.overlays.borrow();
         if let Some(top) = overlays.top() {
             let term = ctx.max.size();
@@ -3558,6 +3618,115 @@ mod tests {
             shell.borrow().editor.borrow_mut().pump_autocomplete();
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
+    }
+
+    /// A bounded draw context of `width x height` cells, matching the shape the
+    /// app builds from the terminal window.
+    fn draw_ctx(width: u16, height: u16) -> DrawContext {
+        DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(width),
+                height: Some(height),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        }
+    }
+
+    /// Finds the shell's autocomplete popup overlay in a composed `Shell`
+    /// surface, if present. The shell wraps the keymap surface as its single
+    /// z-0 child and pushes the popup onto that surface at z 1.
+    fn popup_overlay(composed: &Surface) -> Option<&SubSurface> {
+        composed.children[0]
+            .surface
+            .children
+            .iter()
+            .find(|c| c.z_index == 1)
+    }
+
+    /// The editor's autocomplete popup is floated as a z-indexed overlay ABOVE
+    /// the editor, so opening it never changes the editor block's height and so
+    /// never shrinks the flex transcript or moves the input line and footer.
+    /// The popup shrinks to fit the space above the editor on a short terminal.
+    #[tokio::test]
+    async fn autocomplete_popup_is_an_overlay_above_the_fixed_editor() {
+        let tmp = TempDir::new().unwrap();
+        // Fifteen files all match the fuzzy query `file`, so the popup wants
+        // more rows than a short terminal can give above the editor.
+        for n in 0..15 {
+            std::fs::write(tmp.path().join(format!("file{n:02}.rs")), "x").expect("write file");
+        }
+        let (mut app, mut writer, shell, _root) = init_app_in_dir(tmp.path().to_path_buf()).await;
+
+        // Baseline: popup closed. Record the editor block height.
+        let ctx = draw_ctx(100, 30);
+        let closed = shell.borrow_mut().draw(&ctx);
+        let editor_h_closed = shell.borrow().editor.borrow().drawn_height();
+        assert!(!shell.borrow().editor.borrow().is_showing_autocomplete());
+        assert!(
+            popup_overlay(&closed).is_none(),
+            "no popup overlay while the popup is closed",
+        );
+
+        // Open the popup with a query that matches every file.
+        for byte in b"@file" {
+            type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
+        }
+        assert!(
+            shell.borrow().editor.borrow().is_showing_autocomplete(),
+            "typing `@file` opens the file-completion popup",
+        );
+
+        // Tall terminal: the editor block height is unchanged by the popup, so
+        // the transcript (the only flex child) keeps its size and the input
+        // line and footer do not move.
+        let composed = shell.borrow_mut().draw(&ctx);
+        let editor_h_open = shell.borrow().editor.borrow().drawn_height();
+        assert_eq!(
+            editor_h_open, editor_h_closed,
+            "opening the popup must not change the editor block height",
+        );
+
+        let popup = popup_overlay(&composed).expect("a popup overlay floats above the base layout");
+        assert_eq!(popup.origin.col, 0);
+        assert!(popup.surface.size.height >= 1, "the popup has rows");
+        // The editor sits directly above the footer, so its top row is the
+        // popup's bottom edge.
+        let editor_top = 30 - FOOTER_ROWS - editor_h_open;
+        assert_eq!(
+            popup.origin.row + i32::from(popup.surface.size.height),
+            i32::from(editor_top),
+            "the popup's bottom edge abuts the editor's top row",
+        );
+
+        // Short terminal: the popup shrinks to the rows above the editor,
+        // keeping the header, input line, and footer visible, and nothing
+        // panics. Fifteen items would overflow, so the window is clamped.
+        let short = draw_ctx(100, 16);
+        let composed = shell.borrow_mut().draw(&short);
+        let editor_h_short = shell.borrow().editor.borrow().drawn_height();
+        let editor_top_short = 16 - FOOTER_ROWS - editor_h_short;
+        let popup = popup_overlay(&composed).expect("a popup overlay on the short terminal");
+        assert!(
+            popup.origin.row >= i32::from(HEADER_ROWS),
+            "the popup leaves the header row visible",
+        );
+        assert_eq!(
+            popup.origin.row + i32::from(popup.surface.size.height),
+            i32::from(editor_top_short),
+            "the shrunk popup still abuts the editor's top row",
+        );
+        assert!(
+            popup.surface.size.height < 15,
+            "the popup shrank below the item count to fit the short terminal",
+        );
     }
 
     #[tokio::test]

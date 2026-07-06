@@ -72,12 +72,6 @@ const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE: Duration = Duration::from_millis(20);
 /// [`set_autocomplete_max_visible`](TextArea::set_autocomplete_max_visible).
 const AUTOCOMPLETE_MAX_VISIBLE_DEFAULT: usize = 5;
 
-/// Gap, in columns, between the popup's label column and its description
-/// column. The label column is sized to the widest visible label, so a row's
-/// description always starts at `widest_label + this` from the popup's left
-/// edge.
-const AUTOCOMPLETE_POPUP_COLUMN_GAP: usize = 2;
-
 /// Which way [`TextArea::jump_to_char`] scans for its target.
 ///
 /// Forward lands on the first occurrence strictly after the cursor. Backward
@@ -2744,19 +2738,27 @@ impl TextArea {
         }
     }
 
-    /// The popup's visible window as `(first_item_index, row_count)`.
+    /// The popup's visible window as `(first_item_index, row_count)`, with the
+    /// window height clamped to at most `max_rows`.
     ///
-    /// `(0, 0)` when the popup is closed or has no items to show. Otherwise the
-    /// window is `min(max_visible, len)` rows, scrolled to keep the selected row
-    /// roughly centered: the start clamps `selected - count/2` into
-    /// `[0, len - count]`, so the highlight stays visible while the list never
-    /// scrolls past either end.
-    fn autocomplete_popup_window(&self) -> (usize, usize) {
+    /// `(0, 0)` when the popup is closed, has no items, or `max_rows` is zero.
+    /// Otherwise the window is `min(max_visible, len, max_rows)` rows, scrolled
+    /// to keep the selected row roughly centered: the start clamps
+    /// `selected - count/2` into `[0, len - count]`, so the highlight stays
+    /// visible while the list never scrolls past either end.
+    ///
+    /// The host clamps `max_rows` to the space above the editor, so it can
+    /// shrink the window below `max_visible`. Recentering uses the clamped
+    /// `count`, which keeps the selected row on screen even for a short window.
+    fn autocomplete_popup_window(&self, max_rows: usize) -> (usize, usize) {
         if self.autocomplete_state.is_none() || self.autocomplete_items.is_empty() {
             return (0, 0);
         }
         let len = self.autocomplete_items.len();
-        let count = self.autocomplete_max_visible.min(len);
+        let count = self.autocomplete_max_visible.min(len).min(max_rows);
+        if count == 0 {
+            return (0, 0);
+        }
         let start = if len <= count {
             0
         } else {
@@ -2770,9 +2772,8 @@ impl TextArea {
 
     /// Draws `popup_count` suggestion rows starting at `first_row`, one item per
     /// row from `popup_start`. Each row is filled edge-to-edge with its style
-    /// (so the selected row reads as a band), the label left-aligned at
-    /// `padding_x`, and any description in a second column sized to the widest
-    /// visible label.
+    /// (so the selected row reads as a band) and shows a single column: the
+    /// item's full path, left-aligned at `padding_x`.
     fn draw_autocomplete_popup(
         &self,
         surf: &mut Surface,
@@ -2781,18 +2782,7 @@ impl TextArea {
         popup_start: usize,
         popup_count: usize,
     ) {
-        let width_usize = usize::from(width);
         let visible = &self.autocomplete_items[popup_start..popup_start + popup_count];
-
-        // Description column start, relative to the popup's left edge: the
-        // widest visible label plus a fixed gap, clamped to the content width.
-        let content_width = width_usize.saturating_sub(self.padding_x * 2);
-        let widest_label = visible
-            .iter()
-            .map(|it| self.measure(&it.label))
-            .max()
-            .unwrap_or(0);
-        let desc_col = (widest_label + AUTOCOMPLETE_POPUP_COLUMN_GAP).min(content_width);
 
         for (offset, item) in visible.iter().enumerate() {
             let row =
@@ -2817,9 +2807,22 @@ impl TextArea {
                 );
             }
 
-            self.draw_popup_text(surf, row, width, self.padding_x, &item.label, style);
-            if let Some(desc) = &item.description {
-                self.draw_popup_text(surf, row, width, self.padding_x + desc_col, desc, style);
+            // Single column: the item's full path. Fuzzy items carry the full
+            // relative path in `description`; direct-path items have no
+            // `description` and hold the path fragment in `label`. So we show
+            // the description when present, otherwise the label.
+            //
+            // Preserve the directory affordance: a fuzzy directory item's
+            // `description` is the path without a trailing slash while its
+            // `label` ends in one, so append the slash when the label marks a
+            // directory and the shown text does not already carry it.
+            let shown = item.description.as_deref().unwrap_or(item.label.as_str());
+            if item.label.ends_with('/') && !shown.ends_with('/') {
+                let mut text = shown.to_string();
+                text.push('/');
+                self.draw_popup_text(surf, row, width, self.padding_x, &text, style);
+            } else {
+                self.draw_popup_text(surf, row, width, self.padding_x, shown, style);
             }
         }
     }
@@ -2853,6 +2856,51 @@ impl TextArea {
             );
             col = col.saturating_add(gw);
         }
+    }
+
+    /// The number of autocomplete popup rows to show, capped at `max_rows`.
+    ///
+    /// `min(autocomplete_max_visible, items.len(), max_rows)`, or `0` when the
+    /// popup is closed or empty. The host passes the space available above the
+    /// editor so the overlay never overflows the screen.
+    pub fn autocomplete_popup_rows(&self, max_rows: usize) -> usize {
+        self.autocomplete_popup_window(max_rows).1
+    }
+
+    /// A standalone popup surface of `width x rows` for the host to float as an
+    /// overlay above the editor, where `rows = autocomplete_popup_rows(max_rows)`.
+    ///
+    /// Returns `None` when the popup is closed, empty, or `rows` is zero. The
+    /// surface holds the single-column full-path rows with the full-row band
+    /// fill and the item/selected styles, drawn from its own row 0. The scroll
+    /// window recenters on the selected row using the clamped `rows`, so the
+    /// selection stays visible even when `max_rows` is smaller than the item
+    /// count.
+    ///
+    /// Reads presentation state the editor's own `draw` sets (`width_method`,
+    /// `theme`, the items, `last_visible_rows`), so the host must call it only
+    /// after the editor has drawn this frame. The shell layout guarantees that
+    /// ordering: the editor draws inside the base column before the host places
+    /// the overlay.
+    pub fn draw_autocomplete_popup_surface(&self, width: u16, max_rows: usize) -> Option<Surface> {
+        let (start, count) = self.autocomplete_popup_window(max_rows);
+        if count == 0 {
+            return None;
+        }
+        let height = u16::try_from(count).expect("popup row count fits a u16");
+        let mut surf = Surface::with_size(Size { width, height });
+        self.draw_autocomplete_popup(&mut surf, 0, width, start, count);
+        Some(surf)
+    }
+
+    /// The height, in rows, of the editor block drawn by [`draw`](Widget::draw):
+    /// the visible input rows plus the top and bottom border rules
+    /// (`last_visible_rows + 2`).
+    ///
+    /// Reflects the last completed draw. The host reads it right after the
+    /// editor draws to anchor the autocomplete overlay directly above the block.
+    pub fn drawn_height(&self) -> u16 {
+        u16::try_from(self.last_visible_rows + 2).expect("editor height fits a u16")
     }
 }
 
@@ -2919,12 +2967,15 @@ impl Widget for TextArea {
         scroll_start = scroll_start.min(total_visual.saturating_sub(visible_count));
         self.scroll_offset = scroll_start;
 
-        // Autocomplete popup window below the bottom border. The surface grows
-        // to include these rows when the popup is showing with items.
-        let (popup_start, popup_count) = self.autocomplete_popup_window();
-
-        let height =
-            u16::try_from(visible_count + 2 + popup_count).expect("editor height fits a u16");
+        // The editor block is independent of the autocomplete popup: the popup
+        // is an overlay the host floats above this block (see
+        // `draw_autocomplete_popup_surface`), so it never grows this surface.
+        //
+        // Row layout, top to bottom:
+        //   0                              top border rule
+        //   [1, visible_count]             input content rows
+        //   visible_count + 1              bottom border rule
+        let height = u16::try_from(visible_count + 2).expect("editor height fits a u16");
         let mut surf = Surface::with_size(Size { width, height });
 
         // Top rule with optional scroll indicator and top-bar label.
@@ -2937,7 +2988,7 @@ impl Widget for TextArea {
         }
         self.draw_rule(&mut surf, 0, width, &top_inlay, border_style);
 
-        // Content rows.
+        // Content rows, below the top rule.
         let padding_col = u16::try_from(self.padding_x).expect("padding fits a u16");
         for (offset, vl_idx) in (scroll_start..scroll_start + visible_count).enumerate() {
             let row = u16::try_from(offset + 1).expect("row fits a u16");
@@ -2974,18 +3025,6 @@ impl Widget for TextArea {
             bottom_inlay.push_str(&format!("─── ↓ {lines_below} more "));
         }
         self.draw_rule(&mut surf, bottom_row, width, &bottom_inlay, border_style);
-
-        // Autocomplete popup rows, drawn below the bottom rule.
-        if popup_count > 0 {
-            let first_popup_row = u16::try_from(visible_count + 2).expect("popup row fits a u16");
-            self.draw_autocomplete_popup(
-                &mut surf,
-                first_popup_row,
-                width,
-                popup_start,
-                popup_count,
-            );
-        }
 
         // Report the caret when its visual line is inside the window. The
         // framework renders it only while this widget is focused.
@@ -5517,7 +5556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn at_prefix_autocomplete_draws_aligned_description_column() {
+    async fn at_prefix_autocomplete_draws_single_full_path_column() {
         let mut ed = editor();
         ed.set_autocomplete_provider(Arc::new(MockProvider {
             get: |lines, _l, col, _force| {
@@ -5525,12 +5564,14 @@ mod tests {
                 if !before.contains('@') {
                     return None;
                 }
+                // Fuzzy file items carry the full relative path in
+                // `description` and the bare filename in `label`.
                 Some((
                     vec![
-                        AutocompleteItem::new("@file.rs", "@file.rs")
-                            .with_description("first file"),
-                        AutocompleteItem::new("@other.rs", "@other.rs")
-                            .with_description("second file"),
+                        AutocompleteItem::new("@src/main.rs", "main.rs")
+                            .with_description("src/main.rs"),
+                        AutocompleteItem::new("@src/other.rs", "other.rs")
+                            .with_description("src/other.rs"),
                     ],
                     "@".to_string(),
                 ))
@@ -5541,18 +5582,196 @@ mod tests {
         wait_autocomplete(&mut ed).await;
         assert!(ed.is_showing_autocomplete());
 
-        let surf = ed.draw(&ctx(60, 12));
-        let popup_row = (0..surf.size.height)
-            .map(|r| row_text(&surf, r))
-            .find(|t| t.contains("@file.rs") && t.contains("first file"))
-            .unwrap_or_else(|| panic!("expected a popup row with `@file.rs` / `first file`"));
+        // The popup is an overlay surface, not part of the editor's own draw.
+        // Draw the editor first so the popup surface reads the width method and
+        // theme the editor stashed, then render the overlay.
+        let _ = ed.draw(&ctx(60, 12));
+        let popup = ed
+            .draw_autocomplete_popup_surface(60, 10)
+            .expect("a popup surface while showing with items");
+        let popup_row = (0..popup.size.height)
+            .map(|r| row_text(&popup, r))
+            .find(|t| t.contains("src/main.rs"))
+            .unwrap_or_else(|| panic!("expected a popup row with `src/main.rs`"));
 
-        // The label column is sized to the widest visible label ("@other.rs",
-        // 9 cells) plus the 2-cell gap, so the description starts at column 11.
-        assert_eq!(
-            popup_row.find("first file"),
-            Some(11),
-            "description should align at column 11; row: {popup_row:?}",
+        // Single column: the full path (the item's `description`) is drawn at
+        // `padding_x` (column 0 here) and there is no second filename column,
+        // so the row is exactly the path once trailing band fill is trimmed.
+        assert_eq!(popup_row.find("src/main.rs"), Some(0));
+        assert_eq!(popup_row.trim_end(), "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn popup_is_an_overlay_and_never_grows_the_editor_surface() {
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: |lines, _l, col, _force| {
+                let before = &lines[0][..col];
+                if !before.contains('@') {
+                    return None;
+                }
+                Some((
+                    vec![
+                        AutocompleteItem::new("@a.rs", "a.rs").with_description("a.rs"),
+                        AutocompleteItem::new("@b.rs", "b.rs").with_description("b.rs"),
+                    ],
+                    "@".to_string(),
+                ))
+            },
+        }));
+
+        send(&mut ed, &char_key('@'));
+        wait_autocomplete(&mut ed).await;
+        assert!(ed.is_showing_autocomplete());
+
+        // With the popup open, the editor surface is still just the input block:
+        // one content row plus the two border rules, and `drawn_height` agrees.
+        let surf = ed.draw(&ctx(40, 12));
+        assert_eq!(surf.size.height, 3, "editor surface is input + two borders");
+        assert_eq!(ed.drawn_height(), surf.size.height);
+
+        // Row 0 is the top border rule, not a popup row.
+        assert!(
+            row_text(&surf, 0).chars().all(|c| c == '─'),
+            "row 0 is the top border, not a popup row",
+        );
+        // The single content row carries the typed `@`, and the caret sits on
+        // it with no popup shift.
+        let input_row = row_text(&surf, 1);
+        assert!(input_row.starts_with('@'), "input row: {input_row:?}");
+        let cursor = surf.cursor.expect("caret is reported while focused");
+        assert_eq!(cursor.row, 1);
+
+        // The overlay surface holds the popup, sized to the item count.
+        let popup = ed
+            .draw_autocomplete_popup_surface(40, 10)
+            .expect("a popup surface while showing with items");
+        assert_eq!(popup.size.height, 2, "two items, both within the window");
+    }
+
+    #[tokio::test]
+    async fn popup_surface_clamps_rows_and_keeps_the_selection_visible() {
+        let items: Vec<AutocompleteItem> = (0..10)
+            .map(|n| {
+                let path = format!("f{n}.rs");
+                AutocompleteItem::new(format!("@{path}"), path.clone()).with_description(path)
+            })
+            .collect();
+        let mut ed = editor();
+        // Allow the full ten-row window before the host clamp applies.
+        ed.set_autocomplete_max_visible(10);
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: move |lines, _l, col, _force| {
+                let before = &lines[0][..col];
+                if !before.contains('@') {
+                    return None;
+                }
+                Some((items.clone(), "@".to_string()))
+            },
+        }));
+
+        send(&mut ed, &char_key('@'));
+        wait_autocomplete(&mut ed).await;
+        assert!(ed.is_showing_autocomplete());
+        let _ = ed.draw(&ctx(40, 12));
+
+        // `max_rows` clamps the row count below the item count and below
+        // `max_visible`.
+        assert_eq!(ed.autocomplete_popup_rows(4), 4);
+        let popup = ed
+            .draw_autocomplete_popup_surface(40, 4)
+            .expect("a clamped popup surface");
+        assert_eq!(popup.size.height, 4);
+
+        // Move the selection to the bottom of the list. With a four-row window
+        // the recenter must scroll so the selected row stays on screen.
+        for _ in 0..9 {
+            send(&mut ed, &down());
+        }
+        let popup = ed
+            .draw_autocomplete_popup_surface(40, 4)
+            .expect("a clamped popup surface");
+        let selected = (0..popup.size.height)
+            .map(|r| row_text(&popup, r))
+            .any(|t| t.trim_end() == "f9.rs");
+        assert!(
+            selected,
+            "the selected last item stays visible in the clamped window",
+        );
+    }
+
+    #[tokio::test]
+    async fn popup_directory_item_renders_with_a_trailing_slash() {
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: |lines, _l, col, _force| {
+                let before = &lines[0][..col];
+                if !before.contains('@') {
+                    return None;
+                }
+                // A fuzzy directory item's `label` ends in `/` while its
+                // `description` (the path) does not carry the slash.
+                Some((
+                    vec![AutocompleteItem::new("@src/", "src/").with_description("src")],
+                    "@".to_string(),
+                ))
+            },
+        }));
+
+        send(&mut ed, &char_key('@'));
+        wait_autocomplete(&mut ed).await;
+        assert!(ed.is_showing_autocomplete());
+
+        let _ = ed.draw(&ctx(60, 12));
+        let popup = ed
+            .draw_autocomplete_popup_surface(60, 10)
+            .expect("a popup surface while showing with items");
+        let dir_row = (0..popup.size.height)
+            .map(|r| row_text(&popup, r))
+            .find(|t| t.trim_end() == "src/")
+            .unwrap_or_else(|| panic!("expected a dir row rendered as `src/`"));
+        assert_eq!(dir_row.find("src/"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn popup_scrolls_when_selection_moves_past_the_window() {
+        let items: Vec<AutocompleteItem> = (0..10)
+            .map(|n| {
+                let path = format!("f{n}.rs");
+                AutocompleteItem::new(format!("@{path}"), path.clone()).with_description(path)
+            })
+            .collect();
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: move |lines, _l, col, _force| {
+                let before = &lines[0][..col];
+                if !before.contains('@') {
+                    return None;
+                }
+                Some((items.clone(), "@".to_string()))
+            },
+        }));
+
+        send(&mut ed, &char_key('@'));
+        wait_autocomplete(&mut ed).await;
+        assert!(ed.is_showing_autocomplete());
+
+        // The list exceeds the visible window, which starts pinned at the top.
+        // `usize::MAX` for `max_rows` means the host imposes no extra clamp, so
+        // the window is `min(max_visible, len)`.
+        let (start_before, count) = ed.autocomplete_popup_window(usize::MAX);
+        assert_eq!(start_before, 0);
+        assert!(count < 10, "the list must exceed the window to scroll");
+
+        // Moving the selection down past the bottom of the window advances the
+        // recenter window's start (Down and Ctrl+N share this path).
+        for _ in 0..8 {
+            send(&mut ed, &down());
+        }
+        let (start_after, _) = ed.autocomplete_popup_window(usize::MAX);
+        assert!(
+            start_after > start_before,
+            "the popup window scrolled: {start_before} -> {start_after}",
         );
     }
 }

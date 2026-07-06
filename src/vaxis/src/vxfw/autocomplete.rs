@@ -49,7 +49,9 @@ pub struct AutocompleteItem {
     pub value: String,
     /// Short human-readable label shown in the suggestion list.
     pub label: String,
-    /// Optional second column / hint shown beside the label.
+    /// Optional secondary text, such as a fuller path or a hint. How a widget
+    /// presents it (beside the label, on its own, or not at all) is the
+    /// widget's choice.
     pub description: Option<String>,
 }
 
@@ -63,7 +65,7 @@ impl AutocompleteItem {
         }
     }
 
-    /// Adds a secondary description column shown beside the label.
+    /// Adds optional secondary text, such as a fuller path or a hint.
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
