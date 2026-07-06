@@ -34,6 +34,7 @@ use aj_app::theme::{
     ColorMode, Theme, ThemeBg, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
 };
 use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn, turn_policy};
+use aj_conf::skills::Skill;
 use aj_conf::{
     Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
 };
@@ -1031,13 +1032,20 @@ enum ActionEffect {
 /// The palette handles the read-only overlays (help, auth, session info,
 /// usage), `Quit`, and re-open in its confirm callback, where the focus
 /// context is available. The config-editing surfaces (thinking, model,
-/// settings, skills) need the session world, which only the host owns, so they
-/// open here and rely on the [`REFOCUS_OVERLAY_EVENT`] the caller posts to move
+/// settings) need the session world, which only the host owns, so they open
+/// here and rely on the [`REFOCUS_OVERLAY_EVENT`] the caller posts to move
 /// focus onto them.
+///
+/// Skills discovery and HTML export do blocking work, so they don't run here.
+/// They spawn off the loop via `skills_tx` / `export_tx` and land in the drive
+/// loop's fill arms, which open the skills window (posting the same refocus
+/// event) or fold the export notice.
 async fn apply_command_action(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     action: CommandAction,
+    skills_tx: &UnboundedSender<Vec<Skill>>,
+    export_tx: &UnboundedSender<String>,
 ) -> ActionEffect {
     match action {
         CommandAction::Compact => {
@@ -1066,16 +1074,13 @@ async fn apply_command_action(
             ActionEffect::Redraw
         }
         CommandAction::ExportHtml => {
-            // Render under the log lock (read-only, so it can't deadlock a
-            // turn), then write with the guard already dropped. Both
-            // outcomes surface as a notice.
-            let html = aj_app::export::render_session_html(&*world.core.log.lock().await);
-            let notice = match write_session_export(&world.core.session_id, &html) {
-                Ok(path) => format!("Exported session to {}", aj_conf::display_path(&path)),
-                Err(e) => format!("Export failed: {e}"),
-            };
-            fold_notice(world, &notice);
-            ActionEffect::Redraw
+            // Rendering the whole session to HTML (CPU) plus the file write
+            // would park the single drive loop, so `spawn_session_export` runs
+            // them off the loop and delivers the result notice to the export
+            // fill arm. The action just spawns and returns. See that helper for
+            // the log-lock reasoning.
+            spawn_session_export(world, export_tx);
+            ActionEffect::None
         }
         CommandAction::OpenThinkingSelector => {
             let target = world.chat.borrow().active_view();
@@ -1174,38 +1179,13 @@ async fn apply_command_action(
         CommandAction::OpenSkills => {
             // Rediscover skills at open time so the window reflects the on-disk
             // state (and the current `disabled_skills`) rather than the frozen
-            // session snapshot.
-            let (skills, _diag) = {
-                let cfg = world.config.lock().expect("config mutex poisoned");
-                aj_conf::skills::discover_skills(&cfg.disabled_skills)
-            };
-            if skills.is_empty() {
-                fold_notice(
-                    world,
-                    "No skills found. Put skills in ~/.agents/skills/ or .agents/skills/ \
-                     (also: .aj/, .claude/).",
-                );
-                return ActionEffect::Redraw;
-            }
-            let rows: Vec<SkillRow> = skills
-                .into_iter()
-                .map(|s| SkillRow {
-                    name: s.name,
-                    description: s.description,
-                    path: aj_conf::display_path(&s.path),
-                    enabled: s.enabled,
-                    disable_model_invocation: s.disable_model_invocation,
-                })
-                .collect();
-            let handles = shell.borrow().overlay_handles();
-            open_skills(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.activity,
-                rows,
-            );
-            ActionEffect::OpenedOverlay
+            // session snapshot. The walk reads `SKILL.md` files up to the git
+            // root (blocking IO), so we run it off the loop via
+            // `spawn_skills_discovery` and open the window in the skills fill
+            // arm when it lands. The action just spawns and returns, keeping
+            // the loop responsive while discovery runs.
+            spawn_skills_discovery(world, skills_tx);
+            ActionEffect::None
         }
         // Session-changing commands tear down the current world and rebuild
         // it, which must never abort in-flight work, so refuse them mid-turn
@@ -1342,6 +1322,34 @@ async fn apply_command_action(
         | CommandAction::Quit
         | CommandAction::OpenTaskOutput { .. } => ActionEffect::None,
     }
+}
+
+/// Build the skills-window rows from discovered skills and open the window
+/// over `shell`'s overlay stack.
+///
+/// The rows and the window widget are `!Send`, so they are built here on the
+/// host after the discovery walk delivered the (Send) skills. The caller (the
+/// drive loop's skills fill arm) posts the refocus event and requests the
+/// redraw, matching how a host-opened overlay takes focus.
+fn open_skills_window(shell: &Rc<RefCell<Shell>>, skills: Vec<Skill>) {
+    let rows: Vec<SkillRow> = skills
+        .into_iter()
+        .map(|s| SkillRow {
+            name: s.name,
+            description: s.description,
+            path: aj_conf::display_path(&s.path),
+            enabled: s.enabled,
+            disable_model_invocation: s.disable_model_invocation,
+        })
+        .collect();
+    let handles = shell.borrow().overlay_handles();
+    open_skills(
+        &handles.stack,
+        &handles.editor,
+        &handles.chrome,
+        &handles.activity,
+        rows,
+    );
 }
 
 /// Apply an agent-picker outcome the widget parked. Observing an agent
@@ -2109,6 +2117,58 @@ fn spawn_session_scan(world: &World, tx: &UnboundedSender<Vec<SessionPreview>>) 
         let mut previews = Vec::new();
         persistence.list_session_previews_streaming(&mut |batch| previews.extend(batch));
         let _ = tx.send(previews);
+    });
+}
+
+/// Discover skills off the drive loop, delivering the discovered skills back
+/// to the host over `tx`.
+///
+/// `discover_skills` walks the working directory up to the git root reading
+/// `SKILL.md` files (blocking IO), so it runs on the blocking pool rather than
+/// the loop. Only the discovered skills (all `Send`) cross the task boundary.
+/// The host builds the `!Send` skills window in its fill arm once the walk
+/// lands, so discovery never delays input or render.
+fn spawn_skills_discovery(world: &World, tx: &UnboundedSender<Vec<Skill>>) {
+    let tx = tx.clone();
+    // Clone the disabled set out under a brief lock and drop the guard before
+    // the blocking walk, so the config lock is never held off the loop.
+    let disabled = world
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .disabled_skills
+        .clone();
+    tokio::task::spawn_blocking(move || {
+        let (skills, _diagnostics) = aj_conf::skills::discover_skills(&disabled);
+        let _ = tx.send(skills);
+    });
+}
+
+/// Render the session to HTML and write it out off the drive loop, delivering
+/// the result notice back to the host over `tx`.
+///
+/// `render_session_html` walks the whole log (CPU) and the file write is
+/// blocking IO, both of which would park the single drive loop. We run them on
+/// the blocking pool and hold the log lock there for the render, so the UI
+/// stays responsive. A concurrent turn wanting the log briefly waits on the
+/// lock, which is acceptable for a rare manual export, and cheaper than
+/// cloning the whole log. Only the notice string (Send) crosses back.
+fn spawn_session_export(world: &World, tx: &UnboundedSender<String>) {
+    let tx = tx.clone();
+    let log = Arc::clone(&world.core.log);
+    let session_id = world.core.session_id.clone();
+    tokio::task::spawn_blocking(move || {
+        // `blocking_lock` is safe here: this closure runs on the blocking
+        // pool, not inside an async context.
+        let html = {
+            let guard = log.blocking_lock();
+            aj_app::export::render_session_html(&guard)
+        };
+        let notice = match write_session_export(&session_id, &html) {
+            Ok(path) => format!("Exported session to {}", aj_conf::display_path(&path)),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        let _ = tx.send(notice);
     });
 }
 
@@ -3099,6 +3159,13 @@ async fn drive(
     // while the blocking scan sends only the (Send) previews back.
     let (session_tx, mut session_rx) = unbounded_channel::<Vec<SessionPreview>>();
     let mut pending_session: Option<SessionScan> = None;
+    // Skills discovery for the skills window runs off the loop. The walk reads
+    // `SKILL.md` files (blocking IO); only the discovered skills (Send) come
+    // back, and the host builds the `!Send` window in the fill arm below.
+    let (skills_tx, mut skills_rx) = unbounded_channel::<Vec<Skill>>();
+    // Session HTML export renders and writes off the loop, delivering only its
+    // result notice string back here.
+    let (export_tx, mut export_rx) = unbounded_channel::<String>();
     // OAuth login redraw pings. The login task runs on tokio, off this
     // `!Send` thread, so it can't call `request_redraw` itself. Each ping
     // it sends turns into one repaint via the select arm below. The sender
@@ -3196,6 +3263,41 @@ async fn drive(
                 }
             }
 
+            // --- Skills window fill ---
+            // Discovery finished off the loop. An empty result means nothing
+            // was found, so fold the same notice the synchronous path used.
+            // Otherwise open the window here (the host owns the overlay stack)
+            // and move focus onto it, the same way a host-opened overlay takes
+            // focus. The window appears when discovery completes. The UI stayed
+            // responsive meanwhile.
+            maybe_skills = skills_rx.recv() => {
+                if let Some(skills) = maybe_skills {
+                    if skills.is_empty() {
+                        fold_notice(
+                            world,
+                            "No skills found. Put skills in ~/.agents/skills/ or \
+                             .agents/skills/ (also: .aj/, .claude/).",
+                        );
+                    } else {
+                        open_skills_window(shell, skills);
+                        app.post_app_event(UserEvent {
+                            name: REFOCUS_OVERLAY_EVENT.to_string(),
+                            data: None,
+                        });
+                    }
+                    app.request_redraw();
+                }
+            }
+
+            // --- Session export notice fill ---
+            // The render + write finished off the loop. Fold its result notice.
+            maybe_export = export_rx.recv() => {
+                if let Some(notice) = maybe_export {
+                    fold_notice(world, &notice);
+                    app.request_redraw();
+                }
+            }
+
             // --- Login dialog redraw ping ---
             // The login task pushed a line (or revealed the paste prompt)
             // and pinged for a repaint. This is the cross-thread redraw
@@ -3261,7 +3363,9 @@ async fn drive(
                         // RefCell ref is held across the await below.
                         let command = shell.borrow().take_command();
                         if let Some(action) = command {
-                            match apply_command_action(world, shell, action).await {
+                            match apply_command_action(world, shell, action, &skills_tx, &export_tx)
+                                .await
+                            {
                                 ActionEffect::None => {}
                                 ActionEffect::Redraw => app.request_redraw(),
                                 ActionEffect::OpenedOverlay => {
@@ -3403,11 +3507,13 @@ async fn drive(
                     // Coalesce the wake flood: apply the first delivery, then
                     // drain everything else already queued so a burst collapses
                     // into one iteration instead of one iteration per notify. The
-                    // delivery kind is opaque to the host, so apply all (a
-                    // one-shot Query carries results that must be applied, a
-                    // SessionProgressed just ticks the session). We hold the
-                    // editor borrow across the drain (no await inside) and drop
-                    // it before the single redraw below.
+                    // delivery kind is opaque to the host, so apply all. A
+                    // one-shot Query carries results that must be applied. A
+                    // SessionProgressed is only a wake, so applying it is a
+                    // no-op, and the per-iteration `pump_autocomplete` at the
+                    // loop bottom does the single tick. We hold the editor
+                    // borrow across the drain (no await inside) and drop it
+                    // before the single redraw below.
                     let shell = shell.borrow();
                     let mut editor = shell.editor.borrow_mut();
                     editor.apply_autocomplete_delivery(delivery);
@@ -4606,7 +4712,20 @@ mod tests {
         (world, shell)
     }
 
-    /// Like [`init_app`] but over a real scripted [`World`] plus a [`Shell`]
+    /// Invoke [`apply_command_action`] with throwaway skills/export delivery
+    /// channels, for the tests that exercise actions other than `OpenSkills`
+    /// and `ExportHtml` (which never send on those channels). Tests that do
+    /// exercise the offload keep the receivers and call `apply_command_action`
+    /// directly.
+    async fn apply_command(
+        world: &mut World,
+        shell: &Rc<RefCell<Shell>>,
+        action: CommandAction,
+    ) -> ActionEffect {
+        let (skills_tx, _skills_rx) = unbounded_channel();
+        let (export_tx, _export_rx) = unbounded_channel();
+        apply_command_action(world, shell, action, &skills_tx, &export_tx).await
+    }
     /// bound to it, so tests can exercise the host arms that need all three
     /// of the app, the world, and the shell (the login/logout flow).
     async fn init_app_with_world(
@@ -5232,8 +5351,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        let effect =
-            apply_command_action(&mut world, &shell, CommandAction::OpenLoginSelector).await;
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "picker open");
     }
@@ -5245,8 +5363,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        let effect =
-            apply_command_action(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
         assert!(matches!(effect, ActionEffect::Redraw));
         assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "no picker");
         assert!(
@@ -5279,8 +5396,7 @@ mod tests {
             .expect("seed stored credential");
 
         // The picker would list it.
-        let effect =
-            apply_command_action(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
 
         // Confirming parks a Logout request; drain it the way the loop does.
@@ -5491,6 +5607,95 @@ mod tests {
         let filled = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(filled.contains("session-xyz"), "filled state: {filled}");
         assert!(!filled.contains("Loading"), "loading replaced: {filled}");
+    }
+
+    /// `OpenSkills` no longer walks the skill tree on the loop: the action
+    /// spawns discovery off the loop and returns immediately, and the walk
+    /// delivers its skills back over the channel the drive loop's fill arm
+    /// drains. We assert the offload (the spawn delivered exactly one result)
+    /// rather than a specific skill set, which depends on the environment.
+    #[tokio::test]
+    async fn open_skills_spawns_discovery_off_the_loop() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (skills_tx, mut skills_rx) = unbounded_channel();
+        let (export_tx, _export_rx) = unbounded_channel();
+
+        let effect = apply_command_action(
+            &mut world,
+            &shell,
+            CommandAction::OpenSkills,
+            &skills_tx,
+            &export_tx,
+        )
+        .await;
+
+        // The action just spawns: nothing opens synchronously.
+        assert!(matches!(effect, ActionEffect::None));
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "no window yet");
+        // Discovery runs off the loop and delivers exactly one result.
+        assert!(
+            skills_rx.recv().await.is_some(),
+            "discovery delivered a result"
+        );
+    }
+
+    /// The skills fill arm's non-empty branch: given discovered skills, the
+    /// host builds the rows and opens the window over the overlay stack. This
+    /// is the open logic the arm runs when discovery lands.
+    #[tokio::test]
+    async fn open_skills_window_opens_the_overlay() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
+
+        open_skills_window(
+            &shell,
+            vec![Skill {
+                name: "demo".to_string(),
+                description: "a demo skill".to_string(),
+                path: PathBuf::from("/tmp/demo/SKILL.md"),
+                enabled: true,
+                disable_model_invocation: false,
+            }],
+        );
+
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "skills window opened"
+        );
+    }
+
+    /// `ExportHtml` no longer renders on the loop: the action spawns the
+    /// render + write off the loop and returns immediately, and the resulting
+    /// notice comes back over the channel the drive loop's fill arm folds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn export_html_spawns_and_delivers_notice() {
+        let dir = TempDir::new().expect("tempdir");
+        // The export writes under `$HOME/.aj/exports`, so redirect HOME into
+        // the tempdir rather than the real home.
+        let _home = HomeGuard::set(dir.path());
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (skills_tx, _skills_rx) = unbounded_channel();
+        let (export_tx, mut export_rx) = unbounded_channel();
+
+        let effect = apply_command_action(
+            &mut world,
+            &shell,
+            CommandAction::ExportHtml,
+            &skills_tx,
+            &export_tx,
+        )
+        .await;
+
+        assert!(matches!(effect, ActionEffect::None));
+        let notice = export_rx.recv().await.expect("export delivered a notice");
+        assert!(
+            notice.starts_with("Exported session to"),
+            "export succeeded: {notice}"
+        );
     }
 
     /// The theme name resolves from config, defaulting to `light` like
@@ -5717,7 +5922,7 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
 
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenThinkingSelector).await,
+            apply_command(&mut world, &shell, CommandAction::OpenThinkingSelector).await,
             ActionEffect::OpenedOverlay
         ));
         focus_overlay(&mut app, &root);
@@ -5823,7 +6028,7 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
 
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenSettings).await,
+            apply_command(&mut world, &shell, CommandAction::OpenSettings).await,
             ActionEffect::OpenedOverlay
         ));
         focus_overlay(&mut app, &root);
@@ -5923,7 +6128,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenProjectSettings).await,
+            apply_command(&mut world, &shell, CommandAction::OpenProjectSettings).await,
             ActionEffect::Redraw
         ));
         assert!(
@@ -5957,7 +6162,7 @@ mod tests {
         let mut watch = inert_theme_watch();
 
         // Open the settings window so the revert has a live row to fix.
-        apply_command_action(&mut world, &shell, CommandAction::OpenSettings).await;
+        apply_command(&mut world, &shell, CommandAction::OpenSettings).await;
         // Simulate the widget's optimistic edit before the apply fails.
         {
             let ui = shell.borrow();
@@ -6133,7 +6338,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         seed_sub_and_task(&mut world);
-        let effect = apply_command_action(&mut world, &shell, CommandAction::OpenAgentPicker).await;
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenAgentPicker).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         assert!(shell.borrow().overlays.borrow().is_open());
     }
@@ -6232,8 +6437,7 @@ mod tests {
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
 
-        let effect =
-            apply_command_action(&mut world, &shell, CommandAction::OpenPromptHistory).await;
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenPromptHistory).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         focus_overlay(&mut app, &root);
 
@@ -6297,7 +6501,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
-        apply_command_action(&mut world, &shell, CommandAction::OpenPromptHistory).await;
+        apply_command(&mut world, &shell, CommandAction::OpenPromptHistory).await;
         focus_overlay(&mut app, &root);
         // Drop the initial workspace scan.
         shell.borrow().take_history_fetch();
@@ -6346,7 +6550,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::NewSession).await,
+            apply_command(&mut world, &shell, CommandAction::NewSession).await,
             ActionEffect::Redraw
         ));
         assert!(matches!(
@@ -6366,7 +6570,7 @@ mod tests {
         assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
 
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await,
+            apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await,
             ActionEffect::Redraw
         ));
         assert!(
@@ -6374,7 +6578,7 @@ mod tests {
             "no selector opened mid-turn"
         );
         assert!(matches!(
-            apply_command_action(&mut world, &shell, CommandAction::NewSession).await,
+            apply_command(&mut world, &shell, CommandAction::NewSession).await,
             ActionEffect::Redraw
         ));
         assert!(
@@ -6414,8 +6618,7 @@ mod tests {
         // scans in and can carry the `(current)` tag.
         run_prompt(&mut world, "current session prompt").await;
 
-        let effect =
-            apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         focus_overlay(&mut app, &root);
         let scan = shell
@@ -6472,7 +6675,7 @@ mod tests {
         run_prompt(&mut world, "current session prompt").await;
 
         // Confirm the pre-selected current row: no switch parked.
-        apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         focus_overlay(&mut app, &root);
         let scan = shell.borrow().take_session_scan().expect("scan parked");
         let mut previews = Vec::new();
@@ -6494,7 +6697,7 @@ mod tests {
         );
 
         // Re-open and Esc: cancels without parking a switch.
-        apply_command_action(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         focus_overlay(&mut app, &root);
         shell.borrow().take_session_scan();
         writer.write_all(b"\x1b").expect("esc");
