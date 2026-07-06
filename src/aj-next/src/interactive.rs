@@ -3122,20 +3122,6 @@ async fn drive(
                 app.request_redraw();
             }
 
-            // --- Agent bus event ---
-            maybe_event = world.core.event_rx.recv() => {
-                // `None` (channel closed) can't happen while the core
-                // holds its forwarder subscription. Treat it as a
-                // no-op rather than tearing the session down.
-                if let Some(event) = maybe_event {
-                    let (redraw, wake_targets) = drain_events(world, event);
-                    spawn_wakes(world, wake_targets);
-                    if redraw {
-                        app.request_redraw();
-                    }
-                }
-            }
-
             // --- Theme reload (fs-watcher) ---
             // Coalesced re-parses of `~/.aj/themes/<name>.json` land
             // here. Replacing the handle and re-styling rebuilds every
@@ -3375,6 +3361,26 @@ async fn drive(
                     // The reader ended (EOF or a read error), so no
                     // further input can arrive.
                     None => break Ok(SessionExit::Quit),
+                }
+            }
+
+            // --- Agent bus event ---
+            // This arm sits BELOW the input arm on purpose. A fast streaming
+            // turn floods the agent-event stream, and under `biased` an arm
+            // above input would keep winning and starve typing until the turn
+            // quiesced, so a typed follow-up or steer would render late. Below
+            // input, typed input always wins. `drain_events` still coalesces the
+            // whole channel into one batch, so a burst collapses into one redraw.
+            maybe_event = world.core.event_rx.recv() => {
+                // `None` (channel closed) can't happen while the core
+                // holds its forwarder subscription. Treat it as a
+                // no-op rather than tearing the session down.
+                if let Some(event) = maybe_event {
+                    let (redraw, wake_targets) = drain_events(world, event);
+                    spawn_wakes(world, wake_targets);
+                    if redraw {
+                        app.request_redraw();
+                    }
                 }
             }
 
