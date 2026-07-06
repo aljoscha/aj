@@ -1083,8 +1083,16 @@ impl TextArea {
     }
 
     /// Applies one delivery after the staleness guards pass. The host calls
-    /// this from its `select!` arm; [`pump_autocomplete`](Self::pump_autocomplete)
+    /// this from its `select!` arm. [`pump_autocomplete`](Self::pump_autocomplete)
     /// calls it for hosts that poll instead.
+    ///
+    /// A `SessionProgressed` delivery is only a wake, not a tick. It exists so
+    /// the host's `select!` becomes ready. The session's tick happens once per
+    /// iteration in [`pump_autocomplete`](Self::pump_autocomplete), which the
+    /// host calls at the bottom of every loop iteration. So a flood of wakes
+    /// drained in one iteration does not multiply matcher ticks. This mirrors
+    /// how `pump_autocomplete`'s own drain already ignores `SessionProgressed`.
+    /// A `Query` delivery still applies here, staleness-guarded as below.
     ///
     /// # Async race safety
     ///
@@ -1096,7 +1104,10 @@ impl TextArea {
     /// wins: its list must not be clobbered by an older one-shot result.
     pub fn apply_autocomplete_delivery(&mut self, delivery: AutocompleteDelivery) {
         match delivery.kind {
-            DeliveryKind::SessionProgressed => self.pump_autocomplete_session(),
+            // A wake, not a tick. The session advance happens once per iteration
+            // in `pump_autocomplete`, so draining a flood of wakes here does not
+            // multiply matcher ticks.
+            DeliveryKind::SessionProgressed => {}
             DeliveryKind::Query {
                 request_id,
                 snapshot,
