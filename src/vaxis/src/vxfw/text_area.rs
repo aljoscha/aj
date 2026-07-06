@@ -325,23 +325,18 @@ fn ends_in_symbol_context(before: &str) -> bool {
         .last()
         .is_some_and(char::is_whitespace)
 }
-///
-/// The B3 autocomplete popup styling lands in [`PopupStyle`]. It is reserved
-/// today so callers that build a theme now do not have to change the shape
-/// later.
+/// Colors and styles the editor draws with: the border rules and the inline
+/// autocomplete popup.
 #[derive(Debug, Clone, Default)]
 pub struct EditorTheme {
     /// Color of the top and bottom border rules and their inlaid text.
     pub border_color: Color,
-    /// Styling for the inline autocomplete popup. Unused in the core editor,
-    /// reserved for the autocomplete phase.
+    /// Styling for the inline autocomplete popup.
     pub popup: PopupStyle,
 }
 
-/// Styling for the inline autocomplete popup.
-///
-/// A placeholder for the autocomplete phase. The fields are the styles the
-/// popup will draw with once it lands.
+/// Styling for the inline autocomplete popup: one style for unselected rows and
+/// one for the highlighted row, which the popup fills edge-to-edge as a band.
 #[derive(Debug, Clone, Default)]
 pub struct PopupStyle {
     /// Style for an unselected suggestion row.

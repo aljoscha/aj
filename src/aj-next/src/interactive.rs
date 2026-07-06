@@ -31,7 +31,7 @@ use aj_app::settings::{
 };
 use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_usage_summary};
 use aj_app::theme::{
-    ColorMode, Theme, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
+    ColorMode, Theme, ThemeBg, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
 };
 use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn, turn_policy};
 use aj_conf::{
@@ -49,13 +49,14 @@ use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use vaxis::cell::Style;
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
     AsyncApp, AutocompleteDelivery, DrawContext, EditorTheme, Event, EventContext,
     FilterableSelect, FlexColumn, FlexItem, KeymapController, ListView, MaxSize, Options,
-    RelativePoint, Size, SubSurface, Surface, Text, TextArea, UserEvent, Widget, WidgetRef,
-    draw_widget, to_widget_ref,
+    PopupStyle, RelativePoint, Size, SubSurface, Surface, Text, TextArea, UserEvent, Widget,
+    WidgetRef, draw_widget, to_widget_ref,
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
@@ -2189,8 +2190,26 @@ const HEADER_ROWS: u16 = 1;
 /// installs, to reach full parity with `aj`'s editor border.
 fn editor_theme_from_theme(theme: &Theme) -> EditorTheme {
     let mode = theme.color_mode();
+    // The autocomplete popup paints its selected row as a full-width band over
+    // `ThemeBg::SelectedBg`. That band is the selection idiom every other
+    // selector in this shell uses (see `select_styles_from_theme`), so the
+    // completion popup matches. The unselected `item` style keeps the default
+    // background because the popup draw fills each row edge to edge, which keeps
+    // it opaque over the transcript underneath.
+    let popup = PopupStyle {
+        item: Style {
+            fg: vaxis_color(theme.fg_color(ThemeColor::Text), mode),
+            ..Style::default()
+        },
+        selected: Style {
+            fg: vaxis_color(theme.fg_color(ThemeColor::Text), mode),
+            bg: vaxis_color(theme.bg_color(ThemeBg::SelectedBg), mode),
+            ..Style::default()
+        },
+    };
     EditorTheme {
         border_color: vaxis_color(theme.fg_color(ThemeColor::ThinkingOff), mode),
+        popup,
         ..EditorTheme::default()
     }
 }
@@ -3983,6 +4002,27 @@ mod tests {
         assert_eq!(editor_row_cap(24), 7);
         assert_eq!(editor_row_cap(10), 5);
         assert_eq!(editor_row_cap(50), 15);
+    }
+
+    /// The editor theme wires the autocomplete popup's selection band so the
+    /// selected row reads as a visible full-width band, not plain text. The
+    /// selected style must carry a non-default background (the `SelectedBg`
+    /// band) while the unselected item keeps the default background.
+    #[test]
+    fn editor_theme_wires_the_popup_selection_band() {
+        let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
+        let editor_theme = editor_theme_from_theme(&theme);
+        assert_ne!(
+            editor_theme.popup.selected.bg,
+            Style::default().bg,
+            "selected row needs a visible band background"
+        );
+        assert_eq!(
+            editor_theme.popup.item.bg,
+            Style::default().bg,
+            "unselected rows keep the default background"
+        );
+        assert_ne!(editor_theme.popup.selected, editor_theme.popup.item);
     }
 
     /// The tools-expand chord (alt+o) flips the chat model's flag through
