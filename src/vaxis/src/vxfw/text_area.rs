@@ -474,6 +474,17 @@ struct VisualLine {
     length: usize,
 }
 
+/// The visual-line map cached from the last build, keyed by the width it was
+/// built at.
+///
+/// Valid only while the document is unchanged. Any edit to `lines` drops it via
+/// [`TextArea::invalidate_visual_line_cache`], and a width change is detected by
+/// [`TextArea::visual_line_map`] which rebuilds.
+struct VisualLineCache {
+    width: usize,
+    lines: Vec<VisualLine>,
+}
+
 /// One atomic display segment of a logical line.
 ///
 /// A segment is one grapheme cluster or one whole paste-marker token. The
@@ -609,6 +620,11 @@ pub struct TextArea {
     /// Visible-row count from the last draw. Used as the page size for
     /// PageUp/PageDown.
     last_visible_rows: usize,
+    /// Cached visual-line map, keyed by the width it was built at. See
+    /// [`TextArea::visual_line_map`]. Dropped by
+    /// [`TextArea::invalidate_visual_line_cache`] on every document edit, so it
+    /// is never served stale.
+    visual_line_cache: Option<VisualLineCache>,
 
     // -- Submission --
     /// If false, Enter is silently consumed instead of submitting.
@@ -678,6 +694,7 @@ impl TextArea {
             layout_width: 80,
             width_method: gwidth::Method::Unicode,
             last_visible_rows: 10,
+            visual_line_cache: None,
             submit_enabled: true,
             submitted_text: None,
             previous_val: String::new(),
@@ -752,6 +769,7 @@ impl TextArea {
     /// expands to four spaces. `on_change` does not fire here, only on
     /// interactive edits (see [`TextArea::handle_event`]).
     pub fn set_text(&mut self, text: &str) {
+        self.invalidate_visual_line_cache();
         self.save_undo();
         let normalized = Self::normalize_text(text);
         self.lines = if normalized.is_empty() {
@@ -778,6 +796,7 @@ impl TextArea {
     /// Input is normalized like [`TextArea::set_text`]. Other control
     /// characters are stripped so a pasted `\0` never lands in the document.
     pub fn insert_at_cursor(&mut self, text: &str) {
+        self.invalidate_visual_line_cache();
         self.save_undo();
         self.cancel_autocomplete();
         self.history_index = None;
@@ -801,6 +820,7 @@ impl TextArea {
     /// One undo unit. Fires no callback here. The `Event::Paste` handler follows
     /// this with `check_changed`.
     fn handle_paste(&mut self, text: &str) {
+        self.invalidate_visual_line_cache();
         self.save_undo();
         // A paste is a bulk insert, not a keystroke, so it closes any popup
         // rather than re-querying per pasted character.
@@ -878,6 +898,7 @@ impl TextArea {
     /// The paste map is intentionally left alone (see the field docs): a stale
     /// entry is harmless because markers validate against the map.
     pub fn clear(&mut self) {
+        self.invalidate_visual_line_cache();
         self.lines = vec![String::new()];
         self.cursor_line = 0;
         self.cursor_col = 0;
@@ -1130,6 +1151,7 @@ impl TextArea {
                 self.history_index = None;
             }
             self.lines = snapshot.lines;
+            self.invalidate_visual_line_cache();
             self.cursor_line = snapshot.cursor_line;
             self.cursor_col = snapshot.cursor_col;
             self.reset_sticky_state();
@@ -1528,7 +1550,10 @@ impl TextArea {
     /// An empty logical line yields one zero-length visual line. A line that
     /// fits yields one visual line spanning its content. Wider lines are
     /// word-wrapped.
-    fn build_visual_line_map(&self, width: usize) -> Vec<VisualLine> {
+    ///
+    /// Pure over the document: callers that hit this per frame should go
+    /// through [`TextArea::visual_line_map`], which caches the result.
+    fn compute_visual_line_map(&self, width: usize) -> Vec<VisualLine> {
         let width = width.max(1);
         let mut visual_lines: Vec<VisualLine> = Vec::new();
 
@@ -1559,6 +1584,53 @@ impl TextArea {
         }
 
         visual_lines
+    }
+
+    /// Returns the visual-line map for the whole document at `width`, rebuilding
+    /// and caching it when the cache is empty or was built at a different width.
+    ///
+    /// The width is clamped to at least 1 (matching `compute_visual_line_map`),
+    /// so the stored key equals the width the map was actually built at.
+    ///
+    /// Contract: the returned slice is valid only while the document is
+    /// unchanged. A caller must not hold it across a mutation of `self.lines`.
+    /// Every edit drops the cache through `invalidate_visual_line_cache`, so a
+    /// borrow taken after an edit reflects the current document.
+    fn visual_line_map(&mut self, width: usize) -> &[VisualLine] {
+        let width = width.max(1);
+        if self.visual_line_cache.as_ref().map(|c| c.width) != Some(width) {
+            let lines = self.compute_visual_line_map(width);
+            self.visual_line_cache = Some(VisualLineCache { width, lines });
+        }
+        &self
+            .visual_line_cache
+            .as_ref()
+            .expect("cache populated above")
+            .lines
+    }
+
+    /// The cached map as a `&self` borrow, without touching the cache.
+    ///
+    /// The caller must have primed the cache with [`TextArea::visual_line_map`]
+    /// at the intended width first. We hand out a shared borrow (rather than the
+    /// mutable-borrow-derived slice from `visual_line_map`) so `draw` can read
+    /// `self.lines` while iterating the map: both are then shared borrows of
+    /// `self` and coexist.
+    fn cached_visual_line_map(&self) -> &[VisualLine] {
+        &self
+            .visual_line_cache
+            .as_ref()
+            .expect("visual-line cache primed by visual_line_map")
+            .lines
+    }
+
+    /// Drops the cached visual-line map.
+    ///
+    /// Called at every site that mutates the logical-line buffer, so a stale map
+    /// can never be served. Over-invalidating is harmless: it forces one lazy
+    /// rebuild on the next `visual_line_map` call.
+    fn invalidate_visual_line_cache(&mut self) {
+        self.visual_line_cache = None;
     }
 
     /// Index into `vls` of the visual line containing `(line, col)`. For the
@@ -1755,7 +1827,11 @@ impl TextArea {
 
     /// Moves the cursor up one visual line.
     fn move_up(&mut self) {
-        let vls = self.build_visual_line_map(self.layout_width);
+        // We must not hold the cached map borrow across `move_to_visual_line`
+        // (it takes `&mut self`), so copy the map out. This is a cache hit while
+        // the document is unchanged, so it avoids the expensive rebuild even
+        // though it clones the small `VisualLine` vec.
+        let vls = self.visual_line_map(self.layout_width).to_vec();
         if vls.is_empty() {
             return;
         }
@@ -1768,7 +1844,7 @@ impl TextArea {
 
     /// Moves the cursor down one visual line.
     fn move_down(&mut self) {
-        let vls = self.build_visual_line_map(self.layout_width);
+        let vls = self.visual_line_map(self.layout_width).to_vec();
         if vls.is_empty() {
             return;
         }
@@ -1784,7 +1860,7 @@ impl TextArea {
     /// target row is clamped so paging past an edge is a no-op.
     fn page_scroll(&mut self, direction: i32) {
         self.last_action = LastAction::None;
-        let vls = self.build_visual_line_map(self.layout_width);
+        let vls = self.visual_line_map(self.layout_width).to_vec();
         if vls.is_empty() {
             return;
         }
@@ -1805,6 +1881,7 @@ impl TextArea {
 
     /// Inserts a newline at the cursor, splitting the current line.
     fn insert_newline_internal(&mut self) {
+        self.invalidate_visual_line_cache();
         // A hard line break leaves any symbol context on the previous line
         // behind, so it closes the popup.
         self.cancel_autocomplete();
@@ -1817,6 +1894,7 @@ impl TextArea {
 
     /// Inserts one character at the cursor with fish-style undo coalescing.
     fn insert_char(&mut self, c: char) {
+        self.invalidate_visual_line_cache();
         // Coalescing rule: consecutive non-whitespace characters share one undo
         // unit, while every whitespace character pushes its own snapshot. The
         // word after whitespace does not push a fresh snapshot because
@@ -1835,6 +1913,7 @@ impl TextArea {
     /// Deletes one grapheme backward, merging with the previous line at column
     /// zero.
     fn backspace(&mut self) {
+        self.invalidate_visual_line_cache();
         if self.cursor_col > 0 {
             self.save_undo();
             let old_col = self.cursor_col;
@@ -1857,6 +1936,7 @@ impl TextArea {
 
     /// Deletes one grapheme forward, merging with the next line at end-of-line.
     fn delete_forward(&mut self) {
+        self.invalidate_visual_line_cache();
         let line_len = self.current_line().len();
         if self.cursor_col < line_len {
             self.save_undo();
@@ -1896,6 +1976,7 @@ impl TextArea {
 
     /// Kills from the cursor to end of line, or the newline when already there.
     fn kill_to_end(&mut self) {
+        self.invalidate_visual_line_cache();
         let line_len = self.current_line().len();
         if self.cursor_col >= line_len {
             if self.cursor_line < self.lines.len() - 1 {
@@ -1920,6 +2001,7 @@ impl TextArea {
     /// Kills from the cursor to start of line, or merges with the previous line
     /// when already there.
     fn kill_to_start(&mut self) {
+        self.invalidate_visual_line_cache();
         if self.cursor_col == 0 {
             if self.cursor_line > 0 {
                 self.save_undo();
@@ -1946,6 +2028,7 @@ impl TextArea {
     /// Kills the word before the cursor, or merges with the previous line at
     /// column zero.
     fn kill_word_backward(&mut self) {
+        self.invalidate_visual_line_cache();
         if self.cursor_col == 0 {
             if self.cursor_line == 0 {
                 return;
@@ -1976,6 +2059,7 @@ impl TextArea {
 
     /// Kills the word after the cursor, or merges the next line at end-of-line.
     fn kill_word_forward(&mut self) {
+        self.invalidate_visual_line_cache();
         let line_len = self.current_line().len();
         if self.cursor_col >= line_len {
             if self.cursor_line + 1 >= self.lines.len() {
@@ -2039,6 +2123,7 @@ impl TextArea {
     /// Inserts `text` at the cursor, handling embedded newlines, leaving the
     /// cursor just after the inserted region. Shared by yank and yank-pop.
     fn insert_yanked_text(&mut self, text: &str) {
+        self.invalidate_visual_line_cache();
         for ch in text.chars() {
             if ch == '\n' {
                 self.insert_newline_internal();
@@ -2052,6 +2137,7 @@ impl TextArea {
     /// Removes `text` ending at the cursor, reversing the last yank so yank-pop
     /// can replace it without disturbing surrounding content.
     fn delete_yanked_text(&mut self, text: &str) {
+        self.invalidate_visual_line_cache();
         let yank_lines: Vec<&str> = text.split('\n').collect();
         if yank_lines.len() == 1 {
             let byte_len = text.len();
@@ -2137,6 +2223,7 @@ impl TextArea {
     /// Replaces the document with `text` (already normalized), cursor to end.
     /// Used by history navigation, which owns the ring shape itself.
     fn set_document(&mut self, text: &str) {
+        self.invalidate_visual_line_cache();
         self.lines = if text.is_empty() {
             vec![String::new()]
         } else {
@@ -2172,6 +2259,7 @@ impl TextArea {
     /// The submitted value is the paste-marker-expanded text, so a consumer sees
     /// the literal pasted bytes rather than the marker placeholder.
     fn submit_value(&mut self, ctx: &mut EventContext) {
+        self.invalidate_visual_line_cache();
         let text = self.expanded_text().trim().to_string();
         self.submitted_text = Some(text.clone());
         if let Some(cb) = self.on_submit.as_mut() {
@@ -2216,8 +2304,13 @@ impl TextArea {
     /// Handles an Up press: history at an empty or already-browsing top line,
     /// jump-to-start on an otherwise top line, else move up one visual line.
     fn on_cursor_up(&mut self) {
-        let vls = self.build_visual_line_map(self.layout_width);
-        let current_vl = self.find_current_visual_line(&vls);
+        // Prime the cache, then read the one value we need off a shared borrow so
+        // the borrow is dropped before we delegate to a `&mut self` mover below.
+        self.visual_line_map(self.layout_width);
+        let current_vl = {
+            let vls = self.cached_visual_line_map();
+            self.find_current_visual_line(vls)
+        };
         if self.is_empty_doc() {
             self.history_up();
         } else if self.history_index.is_some() && current_vl == 0 {
@@ -2233,9 +2326,12 @@ impl TextArea {
 
     /// Handles a Down press: symmetric to [`TextArea::on_cursor_up`].
     fn on_cursor_down(&mut self) {
-        let vls = self.build_visual_line_map(self.layout_width);
-        let current_vl = self.find_current_visual_line(&vls);
-        let on_last_vl = current_vl + 1 >= vls.len();
+        self.visual_line_map(self.layout_width);
+        let on_last_vl = {
+            let vls = self.cached_visual_line_map();
+            let current = self.find_current_visual_line(vls);
+            current + 1 >= vls.len()
+        };
         if self.history_index.is_some() && on_last_vl {
             self.history_down();
         } else if on_last_vl {
@@ -2578,6 +2674,7 @@ impl TextArea {
         );
         self.save_undo();
         self.lines = result.lines;
+        self.invalidate_visual_line_cache();
         self.cursor_line = result.cursor_line;
         self.cursor_col = result.cursor_col;
         self.cancel_autocomplete();
@@ -2953,11 +3050,15 @@ impl Widget for TextArea {
             .unwrap_or(available)
             .min(available);
 
-        let vls = self.build_visual_line_map(layout_width);
+        // Prime the cache at `layout_width`, then take a *shared* borrow of the
+        // map so the content loop and cursor block below can read `self.lines`
+        // alongside it. `visual_line_map` borrows `self` mutably to (re)build, so
+        // we prime it as a separate statement and re-borrow shared here.
+        self.visual_line_map(layout_width);
+        let vls = self.cached_visual_line_map();
         let total_visual = vls.len();
-        let cursor_vl_idx = self.find_current_visual_line(&vls);
+        let cursor_vl_idx = self.find_current_visual_line(vls);
         let visible_count = total_visual.min(cap);
-        self.last_visible_rows = visible_count;
 
         // Scroll window: keep the cursor's visual line inside it, then clamp so
         // we never scroll past the last row.
@@ -2969,7 +3070,9 @@ impl Widget for TextArea {
             self.scroll_offset
         };
         scroll_start = scroll_start.min(total_visual.saturating_sub(visible_count));
-        self.scroll_offset = scroll_start;
+        // `scroll_offset` and `last_visible_rows` are written at the end of draw,
+        // once `vls` is last used, since writing them mutates `self` while `vls`
+        // borrows it.
 
         // The editor block is independent of the autocomplete popup: the popup
         // is an overlay the host floats above this block (see
@@ -3048,6 +3151,10 @@ impl Widget for TextArea {
                 shape: CursorShape::Default,
             });
         }
+
+        // Deferred until `vls`'s last use above: these mutate `self`.
+        self.last_visible_rows = visible_count;
+        self.scroll_offset = scroll_start;
 
         surf
     }
@@ -3200,7 +3307,13 @@ impl TextArea {
             }
             if self.cursor_preceded_by_backslash() {
                 self.save_undo();
+                // This is the only direct `self.lines` edit outside the
+                // dedicated editing methods, so it invalidates the cache here
+                // to keep the "every mutation invalidates" invariant local.
+                // `insert_newline_internal` below also invalidates, which is
+                // harmless.
                 self.lines[self.cursor_line].remove(self.cursor_col - 1);
+                self.invalidate_visual_line_cache();
                 self.cursor_col -= 1;
                 self.insert_newline_internal();
                 self.reset_sticky_state();
@@ -3656,7 +3769,7 @@ mod tests {
     /// property the wide-atom sub-split must maintain. A lone grapheme wider
     /// than the width is the only permitted overflow.
     fn assert_all_vls_fit(ed: &TextArea) {
-        let vls = ed.build_visual_line_map(ed.layout_width);
+        let vls = ed.compute_visual_line_map(ed.layout_width);
         for vl in &vls {
             let line = &ed.lines[vl.logical_line];
             let span = &line[vl.start_col..vl.start_col + vl.length];
@@ -3718,6 +3831,91 @@ mod tests {
         let surf = ed.draw(&ctx(20, 10));
         assert_eq!(surf.size.height, 3);
         assert!(surf.cursor.is_some());
+    }
+
+    // -- Visual-line cache --
+
+    /// The visual-line cache's only failure mode is staleness: an edit path
+    /// that mutates `lines` without invalidating would serve a map that no
+    /// longer matches the document. After every representative edit we assert
+    /// the cached map equals a freshly computed one. Because `visual_line_map`
+    /// returns the cache unchanged when the width matches, a missing
+    /// invalidation surfaces here as a stale hit that differs from
+    /// `compute_visual_line_map`. This test fails if any edit path forgets to
+    /// invalidate.
+    #[test]
+    fn visual_line_cache_never_serves_stale_map() {
+        // Navigation primes the cache at `layout_width`, so pin `layout_width`
+        // to the width we assert at. Otherwise a resize-driven rebuild would
+        // mask a missing invalidation.
+        let w = 12usize;
+        let mut ed = editor();
+        ed.layout_width = w;
+
+        // Asserts the cached map matches a fresh build, then leaves the cache
+        // primed at `w` for the next edit.
+        fn check(ed: &mut TextArea, w: usize, label: &str) {
+            let fresh = ed.compute_visual_line_map(w);
+            let cached = ed.visual_line_map(w).to_vec();
+            assert_eq!(cached, fresh, "stale visual-line cache after {label}");
+        }
+
+        // Prime before the first edit so a missing invalidation is a stale hit,
+        // not a cold miss.
+        ed.visual_line_map(w);
+
+        type_str(&mut ed, "hello world foo bar baz");
+        check(&mut ed, w, "insert chars");
+
+        send(&mut ed, &shift_enter());
+        check(&mut ed, w, "insert newline");
+
+        send(&mut ed, &backspace());
+        check(&mut ed, w, "backspace");
+
+        type_str(&mut ed, "abc");
+        send(&mut ed, &left());
+        send(&mut ed, &delete());
+        check(&mut ed, w, "delete forward");
+
+        paste_n_lines(&mut ed, 20);
+        check(&mut ed, w, "large paste (marker collapse)");
+
+        send(&mut ed, &ctrl('a'));
+        send(&mut ed, &ctrl('k'));
+        check(&mut ed, w, "kill to end of line");
+
+        send(&mut ed, &ctrl('y'));
+        check(&mut ed, w, "yank");
+
+        send(&mut ed, &ctrl('z'));
+        check(&mut ed, w, "undo");
+
+        ed.set_text("a\nbb\nccc\ndddd eeee ffff gggg hhhh");
+        check(&mut ed, w, "set_text");
+
+        // History up then down each swap the whole document through
+        // `set_document`.
+        ed.clear();
+        check(&mut ed, w, "clear");
+        ed.add_to_history("history entry one two three four");
+        send(&mut ed, &up());
+        check(&mut ed, w, "history up");
+        send(&mut ed, &down());
+        check(&mut ed, w, "history down");
+
+        // A width change must rebuild even with no edit: the accessor keys on
+        // width. Use a document that wraps differently at the two widths so the
+        // rebuilt map is observably different.
+        ed.set_text("dddd eeee ffff gggg hhhh iiii jjjj");
+        let narrow = ed.visual_line_map(w).to_vec();
+        let wide = ed.visual_line_map(40).to_vec();
+        assert_eq!(
+            wide,
+            ed.compute_visual_line_map(40),
+            "resize did not rebuild the map"
+        );
+        assert_ne!(narrow, wide, "resize should produce a different map");
     }
 
     // -- Insert / delete --
@@ -4545,7 +4743,7 @@ mod tests {
             "marker ({marker_len} chars) should exceed layout width {}",
             ed.layout_width,
         );
-        let vls = ed.build_visual_line_map(ed.layout_width);
+        let vls = ed.compute_visual_line_map(ed.layout_width);
         assert!(
             vls.len() > 1,
             "wide marker should split across visual lines"
