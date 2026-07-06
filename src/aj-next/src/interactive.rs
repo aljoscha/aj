@@ -3201,20 +3201,6 @@ async fn drive(
                 }
             }
 
-            // --- Autocomplete delivery ---
-            // A completed one-shot query result or a streaming-session wake
-            // from the editor's autocomplete pipeline. The widget spawned the
-            // work and applies its own staleness guards inside
-            // `apply_autocomplete_delivery`. The host is the single drain
-            // point for the delivery channel (`draw` never drains), so this
-            // arm just forwards each delivery and repaints. A streaming
-            // `SessionProgressed` marker arrives here too and is routed
-            // internally, so no separate arm is needed.
-            Some(delivery) = autocomplete_rx.recv() => {
-                shell.borrow().editor.borrow_mut().apply_autocomplete_delivery(delivery);
-                app.request_redraw();
-            }
-
             // --- OAuth login task finished ---
             // Pends forever while no login is in flight. When one is, the
             // handle resolves on success, failure, or abort; `finish_login`
@@ -3371,6 +3357,40 @@ async fn drive(
                     // further input can arrive.
                     None => break Ok(SessionExit::Quit),
                 }
+            }
+
+            // --- Autocomplete delivery ---
+            // A completed one-shot query result or a streaming-session wake
+            // from the editor's autocomplete pipeline. The widget spawned the
+            // work and applies its own staleness guards inside
+            // `apply_autocomplete_delivery`. The host is the single drain
+            // point for the delivery channel (`draw` never drains).
+            //
+            // This arm sits BELOW the input arm on purpose. During a directory
+            // walk the streaming session fires its `notify` repeatedly, flooding
+            // this channel with `SessionProgressed` wakes. Under `biased`, an arm
+            // above input would keep winning and starve typing until the walk
+            // quiesced, so keystrokes would render late. Below input, typed input
+            // always wins. The popup still catches up via the coalescing drain
+            // here and the per-iteration `pump_autocomplete` at the loop bottom.
+            Some(delivery) = autocomplete_rx.recv() => {
+                {
+                    // Coalesce the wake flood: apply the first delivery, then
+                    // drain everything else already queued so a burst collapses
+                    // into one iteration instead of one iteration per notify. The
+                    // delivery kind is opaque to the host, so apply all (a
+                    // one-shot Query carries results that must be applied, a
+                    // SessionProgressed just ticks the session). We hold the
+                    // editor borrow across the drain (no await inside) and drop
+                    // it before the single redraw below.
+                    let shell = shell.borrow();
+                    let mut editor = shell.editor.borrow_mut();
+                    editor.apply_autocomplete_delivery(delivery);
+                    while let Ok(delivery) = autocomplete_rx.try_recv() {
+                        editor.apply_autocomplete_delivery(delivery);
+                    }
+                }
+                app.request_redraw();
             }
 
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now).into()),

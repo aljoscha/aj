@@ -72,6 +72,15 @@ const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE: Duration = Duration::from_millis(20);
 /// [`set_autocomplete_max_visible`](TextArea::set_autocomplete_max_visible).
 const AUTOCOMPLETE_MAX_VISIBLE_DEFAULT: usize = 5;
 
+/// Per-frame budget the UI thread spends advancing the incremental matcher of a
+/// streaming autocomplete session.
+///
+/// The fs walk runs on a blocking task and nucleo converges over multiple
+/// notify-driven frames, so a small budget keeps typing snappy without stalling
+/// popup population: we do a little matching work each frame rather than one big
+/// blocking pass that would delay the render after a keystroke.
+const AUTOCOMPLETE_TICK_BUDGET_MS: u64 = 2;
+
 /// Which way [`TextArea::jump_to_char`] scans for its target.
 ///
 /// Forward lands on the first occurrence strictly after the cursor. Backward
@@ -2445,7 +2454,7 @@ impl TextArea {
             let Some(session) = self.autocomplete_session.as_mut() else {
                 return;
             };
-            let status = session.tick(10);
+            let status = session.tick(AUTOCOMPLETE_TICK_BUDGET_MS);
             if !status.changed && !self.autocomplete_items.is_empty() {
                 return;
             }
@@ -3510,6 +3519,19 @@ static BINDINGS: [ChordDoc; 25] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The per-frame matcher budget must stay small: it runs on the UI thread
+    // before every render while a streaming session is open, so a large budget
+    // reintroduces the keystroke latency this const exists to prevent. Nucleo
+    // converges over multiple notify-driven frames, so a couple of milliseconds
+    // per frame is enough to keep the popup populating.
+    #[test]
+    fn autocomplete_tick_budget_stays_small() {
+        assert!(
+            AUTOCOMPLETE_TICK_BUDGET_MS <= 5,
+            "tick budget {AUTOCOMPLETE_TICK_BUDGET_MS}ms is too large to keep typing snappy",
+        );
+    }
 
     // -- Test harness --
 
