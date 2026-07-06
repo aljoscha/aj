@@ -128,14 +128,36 @@ impl FuzzyMatcher {
         I: IntoIterator<Item = T>,
         F: Fn(&T) -> &str,
     {
+        self.filter_scored(items, query, get_text)
+            .into_iter()
+            .map(|(item, _)| item)
+            .collect()
+    }
+
+    /// Like [`filter`](Self::filter) but pairs each surviving item with its
+    /// score. Sorted best-first with ties broken by the original iteration
+    /// index, exactly matching `filter`'s ordering.
+    ///
+    /// An empty (or whitespace-only) `query` returns every item with score
+    /// `0` in input order, so `filter` yields the items unchanged.
+    ///
+    /// The score is exposed so callers can merge already-ranked lists (e.g.
+    /// streamed batches) without a full rescore. Scoring is per-item and
+    /// independent of the rest of the input set, so a subset rescore yields
+    /// the same scores a full rescore would.
+    pub fn filter_scored<T, I, F>(&mut self, items: I, query: &str, get_text: F) -> Vec<(T, u32)>
+    where
+        I: IntoIterator<Item = T>,
+        F: Fn(&T) -> &str,
+    {
         let query = query.trim();
         if query.is_empty() {
-            return items.into_iter().collect();
+            return items.into_iter().map(|item| (item, 0)).collect();
         }
 
         let tokens: Vec<&str> = query.split_whitespace().collect();
         if tokens.is_empty() {
-            return items.into_iter().collect();
+            return items.into_iter().map(|item| (item, 0)).collect();
         }
 
         let mut scored: Vec<(T, u32, usize)> = Vec::new();
@@ -160,7 +182,10 @@ impl FuzzyMatcher {
         // Highest score first; stable tiebreak via original index so that
         // equally-matched items preserve their input order.
         scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
-        scored.into_iter().map(|(item, _, _)| item).collect()
+        scored
+            .into_iter()
+            .map(|(item, score, _)| (item, score))
+            .collect()
     }
 }
 
@@ -258,5 +283,43 @@ mod tests {
         let out = m.filter(items, "br", |s| s);
         assert!(out.contains(&"bravo") && out.contains(&"abracadabra"));
         assert!(!out.contains(&"alpha"));
+    }
+
+    #[test]
+    fn filter_scored_is_descending_and_ties_keep_input_order() {
+        let mut m = FuzzyMatcher::new();
+        // Three items all matching `a`; two of them are identical text so
+        // they tie on score and must keep their input order.
+        let items = ["aa", "aa", "abracadabra"];
+        let out = m.filter_scored(items, "a", |s| s);
+        assert_eq!(out.len(), 3);
+        // Scores are non-increasing.
+        for pair in out.windows(2) {
+            assert!(pair[0].1 >= pair[1].1, "not descending: {out:?}");
+        }
+        // The two tied `aa` entries keep input order (index 0 before index 1).
+        let positions: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, (t, _))| *t == "aa")
+            .map(|(pos, _)| pos)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![0, 1],
+            "tied items kept input order: {out:?}"
+        );
+    }
+
+    #[test]
+    fn filter_scored_empty_query_returns_all_with_zero() {
+        let mut m = FuzzyMatcher::new();
+        let items = ["one", "two", "three"];
+        let out = m.filter_scored(items, "", |s| s);
+        assert_eq!(
+            out,
+            vec![("one", 0), ("two", 0), ("three", 0)],
+            "empty query keeps input order with score 0"
+        );
     }
 }

@@ -111,8 +111,12 @@ impl SelectItem {
 /// matcher.
 struct SelectState {
     items: Vec<SelectItem>,
-    /// Indices into `items`, filtered and ranked best-first.
-    visible: Vec<usize>,
+    /// Indices into `items`, filtered and ranked best-first, each paired with
+    /// its match score. Always kept in rank order: score descending, then
+    /// original index ascending. Readers use only the index; the score is
+    /// retained so streamed batches can be merged into the ranking without a
+    /// full rescore.
+    visible: Vec<(usize, u32)>,
     /// The current filter text, mirrored from the `TextField` on change.
     query: String,
     matcher: FuzzyMatcher,
@@ -129,7 +133,7 @@ struct RowBuilder {
 impl Builder for RowBuilder {
     fn item_at_idx(&self, idx: usize, cursor: usize) -> Option<WidgetRef> {
         let state = self.state.borrow();
-        let &item_idx = state.visible.get(idx)?;
+        let &(item_idx, _) = state.visible.get(idx)?;
         let styles = self.styles.borrow();
         Some(build_row(&state.items[item_idx], idx == cursor, &styles))
     }
@@ -181,25 +185,119 @@ fn build_row(item: &SelectItem, selected: bool, styles: &SelectStyles) -> Widget
     widget
 }
 
-/// Recomputes `visible` from the current query and resets the cursor to the
-/// top so it can never point past the narrowed set. The row [`Builder`] is
-/// permanent, so this only refreshes the filtered view and the item count.
-fn apply_filter(state: &mut SelectState, list: &mut ListView) {
+/// Recomputes `visible` by scoring the full item set from scratch and resets
+/// the cursor to the top so it can never point past the narrowed set. The row
+/// [`Builder`] is permanent, so this only refreshes the filtered view and the
+/// item count.
+///
+/// Used by `set_items` and by `on_change` on any non-append query change.
+fn full_filter(state: &mut SelectState, list: &mut ListView) {
     let SelectState {
         items,
         visible,
         query,
         matcher,
     } = state;
+    // Enumerate all items in order, so `filter_scored`'s positional tiebreak
+    // is the original index.
     *visible = matcher
-        .filter(items.iter().enumerate(), query, |(_, item)| {
+        .filter_scored(items.iter().enumerate(), query, |(_, item)| {
             item.filter_key.as_str()
         })
         .into_iter()
-        .map(|(i, _)| i)
+        .map(|((i, _), score)| (i, score))
         .collect();
     list.item_count = Some(u32::try_from(visible.len()).expect("row count fits u32"));
     list.jump_to_item(0);
+}
+
+/// Recomputes `visible` by rescoring only the current visible subset, for a
+/// query change that is a pure append. Resets the cursor to the top.
+///
+/// # Monotonicity invariant
+///
+/// When the query change is a pure append (`new.starts_with(&old) && new is
+/// longer`), the new match set is a subset of the current one. Fuzzy matching
+/// requires each whitespace-split token to be an ordered, case-insensitive
+/// subsequence of the text, and appending to the query can only extend the
+/// last token or add a token. Extending a token makes its match strictly
+/// harder (a longer needle that still requires the old prefix as a
+/// subsequence), and adding a token adds a requirement. Either way an item can
+/// only drop out, never enter. So it is sound to rescore just the survivors.
+fn narrow_filter(state: &mut SelectState, list: &mut ListView) {
+    let SelectState {
+        items,
+        visible,
+        query,
+        matcher,
+    } = state;
+    // Sort the candidate indices ascending before rescoring so that
+    // `filter_scored`'s positional tiebreak (its internal enumeration order)
+    // equals the original-index tiebreak. That makes the narrowed order
+    // byte-identical to a full rescore's order over the same survivors: the
+    // scores are per-item and identical either way, and ties break the same.
+    let mut indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
+    indices.sort_unstable();
+    *visible = matcher
+        .filter_scored(
+            indices.into_iter().map(|i| (i, &items[i])),
+            query,
+            |(_, item)| item.filter_key.as_str(),
+        )
+        .into_iter()
+        .map(|((i, _), score)| (i, score))
+        .collect();
+    list.item_count = Some(u32::try_from(visible.len()).expect("row count fits u32"));
+    list.jump_to_item(0);
+}
+
+/// Extends `visible` for a streamed batch: scores only the newly appended
+/// items (`items[old_len..]`) and merges them into the existing ranking,
+/// avoiding a full rescore of the accumulated set. Leaves the cursor to the
+/// caller (`extend_items` restores it); only the item count is updated here.
+fn merge_extend(state: &mut SelectState, list: &mut ListView, old_len: usize) {
+    let SelectState {
+        items,
+        visible,
+        query,
+        matcher,
+    } = state;
+    // Score just the new tail. `filter_scored` enumerates the tail from 0, so
+    // its positional tiebreak matches ascending real index (`old_len + pos`),
+    // keeping the batch's own ranking correct.
+    let new_ranked: Vec<(usize, u32)> = matcher
+        .filter_scored(items[old_len..].iter().enumerate(), query, |(_, item)| {
+            item.filter_key.as_str()
+        })
+        .into_iter()
+        .map(|((pos, _), score)| (old_len + pos, score))
+        .collect();
+    // Both lists are already in rank order (score desc, index asc), so a
+    // linear two-way merge reproduces a full rescore's order. New indices all
+    // exceed old ones, so a score tie between an old and a new item keeps the
+    // old (lower index) first, matching the stable tiebreak.
+    *visible = merge_ranked(std::mem::take(visible), new_ranked);
+    list.item_count = Some(u32::try_from(visible.len()).expect("row count fits u32"));
+}
+
+/// Merge two rank-ordered lists (score descending, then index ascending) into
+/// one preserving that order. Ties (equal score) keep the smaller index first.
+fn merge_ranked(a: Vec<(usize, u32)>, b: Vec<(usize, u32)>) -> Vec<(usize, u32)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut ai = a.into_iter().peekable();
+    let mut bi = b.into_iter().peekable();
+    loop {
+        match (ai.peek(), bi.peek()) {
+            (Some(&(a_idx, a_score)), Some(&(b_idx, b_score))) => {
+                let take_a = a_score > b_score || (a_score == b_score && a_idx < b_idx);
+                out.push(if take_a { ai.next() } else { bi.next() }.expect("peeked"));
+            }
+            (Some(_), None) => out.push(ai.next().expect("peeked")),
+            (None, Some(_)) => out.push(bi.next().expect("peeked")),
+            (None, None) => break,
+        }
+    }
+    out
 }
 
 /// A fuzzy-filterable select list: a [`TextField`] filter row, a blank
@@ -238,7 +336,7 @@ impl FilterableSelect {
             // The band replaces the arrow gutter, so the list draws no cursor
             // indicator of its own.
             list.draw_cursor = false;
-            apply_filter(&mut state.borrow_mut(), &mut list);
+            full_filter(&mut state.borrow_mut(), &mut list);
         }
 
         let filter = Rc::new(RefCell::new(TextField::new()));
@@ -251,8 +349,18 @@ impl FilterableSelect {
             // collide with the widget's own borrows.
             filter.borrow_mut().on_change = Some(Box::new(move |ctx, text| {
                 let mut state = state.borrow_mut();
+                let mut list = list.borrow_mut();
+                // A pure append can only shrink the match set (see
+                // `narrow_filter`'s monotonicity invariant), so rescore just
+                // the current survivors. Any other edit (backspace, paste,
+                // mid-string change) may add matches, so rescore everything.
+                let is_append = text.starts_with(&state.query) && text.len() > state.query.len();
                 state.query = text.to_string();
-                apply_filter(&mut state, &mut list.borrow_mut());
+                if is_append {
+                    narrow_filter(&mut state, &mut list);
+                } else {
+                    full_filter(&mut state, &mut list);
+                }
                 ctx.redraw = true;
             }));
         }
@@ -291,7 +399,7 @@ impl FilterableSelect {
     pub fn set_items(&self, items: Vec<SelectItem>) {
         let mut state = self.state.borrow_mut();
         state.items = items;
-        apply_filter(&mut state, &mut self.list.borrow_mut());
+        full_filter(&mut state, &mut self.list.borrow_mut());
     }
 
     /// Append `items` to the row set and re-apply the active filter,
@@ -302,11 +410,14 @@ impl FilterableSelect {
         let cursor = self.list.borrow().cursor;
         {
             let mut state = self.state.borrow_mut();
+            let old_len = state.items.len();
             state.items.extend(items);
-            apply_filter(&mut state, &mut self.list.borrow_mut());
+            // Score only the new tail and merge it into the ranking, rather
+            // than rescoring the whole accumulated set.
+            merge_extend(&mut state, &mut self.list.borrow_mut(), old_len);
         }
-        // `apply_filter` reset the cursor to the top; restore it so a
-        // streamed append doesn't yank the highlight back up.
+        // `merge_extend` left the cursor alone but the count grew; restore the
+        // same index so a streamed append doesn't yank the highlight up.
         self.list.borrow_mut().jump_to_item(cursor);
     }
 
@@ -316,7 +427,10 @@ impl FilterableSelect {
     pub fn select_matching(&self, pred: impl Fn(&SelectItem) -> bool) {
         let pos = {
             let state = self.state.borrow();
-            state.visible.iter().position(|&i| pred(&state.items[i]))
+            state
+                .visible
+                .iter()
+                .position(|&(i, _)| pred(&state.items[i]))
         };
         if let Some(pos) = pos {
             self.list
@@ -331,7 +445,7 @@ impl FilterableSelect {
         state
             .visible
             .iter()
-            .map(|&i| state.items[i].label.clone())
+            .map(|&(i, _)| state.items[i].label.clone())
             .collect()
     }
 
@@ -339,7 +453,10 @@ impl FilterableSelect {
     pub fn selected(&self) -> Option<SelectItem> {
         let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
         let state = self.state.borrow();
-        state.visible.get(cursor).map(|&i| state.items[i].clone())
+        state
+            .visible
+            .get(cursor)
+            .map(|&(i, _)| state.items[i].clone())
     }
 }
 
@@ -681,4 +798,276 @@ mod tests {
         select.select_matching(|item| item.filter_key == "nope");
         assert_eq!(select.selected().map(|i| i.label), Some("charlie".into()));
     }
+
+    // --- Parity between the incremental paths and a full rescore. ---
+    //
+    // The optimization only holds if the incremental `visible` order stays
+    // byte-identical to scoring the whole set from scratch. These tests pin
+    // that down against an independent full-rescore oracle.
+
+    fn items(keys: &[&str]) -> Vec<SelectItem> {
+        keys.iter().map(|k| SelectItem::new(*k, *k)).collect()
+    }
+
+    /// The private `visible` indices (score dropped), for direct comparison.
+    fn visible_indices(select: &FilterableSelect) -> Vec<usize> {
+        select
+            .state
+            .borrow()
+            .visible
+            .iter()
+            .map(|&(i, _)| i)
+            .collect()
+    }
+
+    /// The full-rescore oracle: score every item from scratch at `query`,
+    /// exactly as `full_filter` does. Independent of the incremental paths.
+    fn full_rescore_indices(items: &[SelectItem], query: &str) -> Vec<usize> {
+        let mut matcher = FuzzyMatcher::new();
+        matcher
+            .filter_scored(items.iter().enumerate(), query, |(_, item)| {
+                item.filter_key.as_str()
+            })
+            .into_iter()
+            .map(|((i, _), _)| i)
+            .collect()
+    }
+
+    fn type_str(select: &mut FilterableSelect, s: &str) {
+        for c in s.chars() {
+            send(select, &typed(c));
+        }
+    }
+
+    /// One step in a keystroke script: append a char or delete the last one.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Type(char),
+        Backspace,
+    }
+
+    /// Drive `keys` one step at a time through the real `on_change` path and,
+    /// after every step, assert the incremental `visible` equals a full
+    /// rescore at the same query. Typing exercises `narrow_filter` (append),
+    /// backspace exercises `full_filter` (non-append).
+    fn assert_incremental_matches_full(item_keys: &[&str], keys: &[Step]) {
+        let items = items(item_keys);
+        let mut select = FilterableSelect::new(items.clone(), SelectStyles::default());
+        let mut query = String::new();
+        assert_eq!(
+            visible_indices(&select),
+            full_rescore_indices(&items, &query)
+        );
+        for step in keys {
+            match step {
+                Step::Type(c) => {
+                    send(&mut select, &typed(*c));
+                    query.push(*c);
+                }
+                Step::Backspace => {
+                    send(&mut select, &key(Key::BACKSPACE, Modifiers::empty()));
+                    query.pop();
+                }
+            }
+            assert_eq!(
+                visible_indices(&select),
+                full_rescore_indices(&items, &query),
+                "visible diverged from full rescore at query {query:?}"
+            );
+            // Every filter change resets the cursor to the top.
+            assert_eq!(
+                select.list.borrow().cursor,
+                0,
+                "cursor not reset to top at query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_path_matches_full_rescore_multi_token() {
+        // Multi-token filter keys plus a duplicate key (items 1 and 4) that
+        // ties on score and must keep original order.
+        let keys = &[
+            "openai gpt-5.5",
+            "openai gpt-5.1",
+            "anthropic claude",
+            "openai o3",
+            "openai gpt-5.1",
+        ];
+        // Appends only, including the space that opens a second token.
+        let script: Vec<Step> = "openai 5".chars().map(Step::Type).collect();
+        assert_incremental_matches_full(keys, &script);
+        // Different token first, then narrow.
+        let script: Vec<Step> = "anthro cl".chars().map(Step::Type).collect();
+        assert_incremental_matches_full(keys, &script);
+    }
+
+    #[test]
+    fn narrow_path_matches_full_rescore_exact_bonus() {
+        // "cl" is an exact match and must outrank the longer partials.
+        let keys = &["cl", "clone", "close", "clang"];
+        let script: Vec<Step> = "clos".chars().map(Step::Type).collect();
+        assert_incremental_matches_full(keys, &script);
+    }
+
+    #[test]
+    fn narrow_path_matches_full_rescore_ties() {
+        // Three identical keys tie on score; a fourth scores differently.
+        let keys = &["aa", "aa", "aa", "abracadabra"];
+        let script: Vec<Step> = "aaa".chars().map(Step::Type).collect();
+        assert_incremental_matches_full(keys, &script);
+    }
+
+    #[test]
+    fn full_path_matches_on_backspace_and_edits() {
+        // Interleave appends and backspaces so both the narrow and full
+        // branches of `on_change` are exercised against the oracle.
+        let keys = &["cl", "clone", "close", "clang", "abracadabra", "cl"];
+        use Step::{Backspace as B, Type as T};
+        let script = [
+            T('c'),
+            T('l'),
+            T('o'),
+            B,
+            B,
+            T('a'),
+            B,
+            T('l'),
+            T('o'),
+            T('s'),
+            B,
+            B,
+            B,
+        ];
+        assert_incremental_matches_full(keys, &script);
+    }
+
+    /// Build a full-rescore reference: an empty select, the query typed in,
+    /// then `set_items` of the whole set (a single full rescore at `query`).
+    fn full_rescore_select(item_keys: &[&str], query: &str) -> FilterableSelect {
+        let mut select = FilterableSelect::new(Vec::new(), SelectStyles::default());
+        type_str(&mut select, query);
+        select.set_items(items(item_keys));
+        select
+    }
+
+    /// Stream `item_keys` through `extend_items` in `batch_sizes` batches (at
+    /// the fixed `query`) and assert the final `visible` and `item_count`
+    /// match a single full rescore of the whole set at that query.
+    fn assert_extend_matches_full(item_keys: &[&str], query: &str, batch_sizes: &[usize]) {
+        assert_eq!(
+            batch_sizes.iter().sum::<usize>(),
+            item_keys.len(),
+            "batch sizes must cover the item set"
+        );
+        let mut select = FilterableSelect::new(Vec::new(), SelectStyles::default());
+        type_str(&mut select, query);
+        let mut start = 0;
+        for &size in batch_sizes {
+            let batch = items(&item_keys[start..start + size]);
+            select.extend_items(batch);
+            start += size;
+        }
+
+        let reference = full_rescore_select(item_keys, query);
+        assert_eq!(
+            visible_indices(&select),
+            visible_indices(&reference),
+            "streamed visible diverged from full rescore at query {query:?}"
+        );
+        assert_eq!(
+            select.list.borrow().item_count,
+            reference.list.borrow().item_count,
+            "streamed item_count diverged at query {query:?}"
+        );
+    }
+
+    #[test]
+    fn incremental_extend_matches_full_rescore() {
+        // Scores vary and exact matches (indices 0 and 6) tie, so the merge
+        // must interleave a late high-scoring batch ahead of earlier rows.
+        let keys = &["cl", "clone", "xcl", "close", "clang", "recall", "cl"];
+        // Non-empty query, several batch splittings.
+        for batches in [
+            vec![7],
+            vec![3, 2, 2],
+            vec![1, 1, 1, 1, 1, 1, 1],
+            vec![6, 1],
+            vec![1, 6],
+        ] {
+            assert_extend_matches_full(keys, "cl", &batches);
+        }
+        // Empty query: extend appends in index order.
+        for batches in [vec![3, 2, 2], vec![1, 1, 1, 1, 1, 1, 1]] {
+            assert_extend_matches_full(keys, "", &batches);
+        }
+    }
+
+    #[test]
+    fn on_change_resets_cursor_to_top() {
+        let mut select = sample();
+        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(select.list.borrow().cursor, 1);
+        // Typing narrows and pulls the cursor back to the first row.
+        send(&mut select, &typed('a'));
+        assert_eq!(select.list.borrow().cursor, 0);
+    }
+
+    #[test]
+    fn extend_items_preserves_the_cursor() {
+        // No query, so all rows stay visible and the cursor index is stable.
+        let mut select =
+            FilterableSelect::new(items(&["a0", "a1", "a2", "a3"]), SelectStyles::default());
+        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(select.list.borrow().cursor, 2);
+        select.extend_items(items(&["a4", "a5"]));
+        assert_eq!(
+            select.list.borrow().cursor,
+            2,
+            "streamed append kept the highlight in place"
+        );
+        assert_eq!(select.list.borrow().item_count, Some(6));
+    }
+
+    /// `narrow_filter` sorts its candidates by original index before rescoring
+    /// so its output does not depend on the order the current `visible` holds
+    /// them in. This locks that invariant down directly: a rank-order `visible`
+    /// never reverses tied items in practice, but the sort makes the result
+    /// order-independent, which is what keeps a narrow byte-identical to a full
+    /// rescore over any surviving set (including future scoring changes).
+    #[test]
+    fn narrow_filter_output_is_independent_of_visible_order() {
+        // These four keys all tie at "ab" (equal score), so a full rescore
+        // keeps them in index order.
+        let keys = ["abc", "ab_c", "abcz", "abcabc"];
+        let item_vec = items(&keys);
+        let select = FilterableSelect::new(item_vec.clone(), SelectStyles::default());
+        {
+            let mut state = select.state.borrow_mut();
+            let mut list = select.list.borrow_mut();
+            state.query = "ab".to_string();
+            full_filter(&mut state, &mut list);
+            assert_eq!(
+                visible_indices_of(&state),
+                vec![0, 1, 2, 3],
+                "sanity: the tied keys start in index order"
+            );
+            // Scramble the ranked view, then narrow at the same query. The
+            // candidate sort must restore index order for the tie.
+            state.visible.reverse();
+            narrow_filter(&mut state, &mut list);
+        }
+        assert_eq!(
+            visible_indices(&select),
+            full_rescore_indices(&item_vec, "ab")
+        );
+        assert_eq!(visible_indices(&select), vec![0, 1, 2, 3]);
+    }
+}
+
+/// Helper shared by tests that hold a `SelectState` borrow directly.
+#[cfg(test)]
+fn visible_indices_of(state: &SelectState) -> Vec<usize> {
+    state.visible.iter().map(|&(i, _)| i).collect()
 }
