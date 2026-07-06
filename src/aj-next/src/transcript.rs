@@ -8,16 +8,25 @@
 //! box, which lays the same widgets out inside its own frame.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+use aj_agent::events::AgentId;
+use aj_agent::tool::{
+    BashStreamTruncation, TaskStatus, TodoPriority, TodoStatus, ToolDetails, TruncationCause,
+};
 use aj_app::chat::{
-    AssistantEntry, ChatState, CompactionEntry, Entry, EntryKind, NoticeLevel, UserEntry,
+    AssistantEntry, ChatState, CompactionEntry, Entry, EntryId, EntryKind, NoticeLevel,
+    SubAgentEntry, SubAgentStatus, ToolEntry, ToolStatus, UserEntry,
 };
 use aj_app::footer::format_tokens;
 use aj_app::markdown::{Emphasis, RenderOpts};
 use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256};
 use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
+use serde_json::Value;
 use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::mouse;
 use vaxis::vxfw::{
@@ -156,27 +165,538 @@ pub(crate) fn vaxis_color(rgb: ThemeRgb, mode: ColorMode) -> Color {
 /// its first (and most informative) line.
 const USER_COLLAPSED_LINES: usize = 10;
 
-/// Lazily builds one row widget per transcript entry of the active
-/// view. Shared with the [`ListView`] it feeds.
+/// Upper bound on cached slots. The live working set is the viewport (a
+/// screen's worth of entries), so this sits comfortably above it. Overflow
+/// evicts the least-recently-used slot, which is correctness-neutral: a
+/// dropped slot simply rebuilds on its next draw. Bounding the map keeps a
+/// long append-only session from growing it without limit.
+const ENTRY_CACHE_CAPACITY: usize = 512;
+
+/// One cached per-entry render: the drawn surface plus the
+/// `(fingerprint, width)` it was drawn for. A lookup hits only when both
+/// match the live entry, so a slot never serves stale content.
+struct CachedEntry {
+    fingerprint: u64,
+    width: u16,
+    surface: Surface,
+    /// Access tick of the last lookup that touched this slot, for LRU
+    /// eviction.
+    last_used: u64,
+}
+
+/// Memoizes drawn per-entry surfaces keyed by `(active view, entry id)`.
+///
+/// Owned by [`TranscriptView`] and shared into the [`EntryBuilder`] by
+/// `Rc<RefCell<..>>`. One slot per key, so stale `(fingerprint, width)`
+/// variants never accumulate. Session-wide render inputs (the theme,
+/// `tools_expanded`, `hide_thinking_block`, the active view) are handled by
+/// clearing the whole cache when they change rather than folding them into
+/// every fingerprint (see [`TranscriptView::draw`] and
+/// [`TranscriptView::set_styles`]). Width is a per-slot key.
+///
+/// Storing surfaces is safe today: no transcript entry participates in event
+/// dispatch and the list draws no cursor, so replaying a stored surface
+/// (whose `widget` stamp is `None`, then re-stamped onto the outer
+/// [`CachingEntry`] by `draw_widget`) does not break hit-testing.
+/// NOTE(aljoscha): a later transcript-focus mode would make entries
+/// interactive, at which point the wrapper must forward events to the real
+/// widget or the cache must store widgets for those kinds.
+struct EntryRenderCache {
+    slots: HashMap<(AgentId, EntryId), CachedEntry>,
+    /// Monotonic lookup counter stamped onto a slot's `last_used` on every
+    /// access, so eviction can drop the coldest slot.
+    tick: u64,
+    /// Effectiveness/correctness instrumentation asserted by tests: a hit
+    /// replayed a stored surface, a miss rebuilt it.
+    hits: u64,
+    misses: u64,
+}
+
+impl EntryRenderCache {
+    fn new() -> EntryRenderCache {
+        EntryRenderCache {
+            slots: HashMap::new(),
+            tick: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Drop every cached surface. Called when a session-wide render input
+    /// changes (theme swap, a display toggle, a view switch), since those are
+    /// not part of any per-entry fingerprint.
+    fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    /// The cached surface for `key` when the slot's fingerprint and width both
+    /// match (a HIT). Otherwise `None` (a MISS), and the caller rebuilds and
+    /// calls [`insert`](Self::insert).
+    fn get(&mut self, key: (AgentId, EntryId), fingerprint: u64, width: u16) -> Option<Surface> {
+        self.tick += 1;
+        let tick = self.tick;
+        match self.slots.get_mut(&key) {
+            Some(slot) if slot.fingerprint == fingerprint && slot.width == width => {
+                slot.last_used = tick;
+                self.hits += 1;
+                Some(slot.surface.clone())
+            }
+            _ => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Store `surface` for `key` under `(fingerprint, width)`, replacing any
+    /// prior slot for the key, and evict the coldest slot when over capacity.
+    fn insert(&mut self, key: (AgentId, EntryId), fingerprint: u64, width: u16, surface: Surface) {
+        let last_used = self.tick;
+        self.slots.insert(
+            key,
+            CachedEntry {
+                fingerprint,
+                width,
+                surface,
+                last_used,
+            },
+        );
+        if self.slots.len() > ENTRY_CACHE_CAPACITY {
+            self.evict_coldest();
+        }
+    }
+
+    /// Remove the least-recently-used slot. O(n) over the map, but only fires
+    /// on an insert past capacity, and the map is bounded.
+    fn evict_coldest(&mut self) {
+        if let Some(key) = self
+            .slots
+            .iter()
+            .min_by_key(|(_, slot)| slot.last_used)
+            .map(|(key, _)| *key)
+        {
+            self.slots.remove(&key);
+        }
+    }
+}
+
+/// Lazily builds one row widget per transcript entry of the active view.
+/// Shared with the [`ListView`] it feeds.
+///
+/// The widget it returns is a [`CachingEntry`]: `item_at_idx` computes only
+/// the cheap [`entry_fingerprint`] here (it has the `ChatState` borrow but not
+/// the draw width) and defers the real build+draw to the wrapper's `draw`,
+/// which has the width and only rebuilds on a cache miss.
 struct EntryBuilder {
     chat: Rc<RefCell<ChatState>>,
     styles: Rc<TranscriptStyles>,
+    cache: Rc<RefCell<EntryRenderCache>>,
 }
 
 impl Builder for EntryBuilder {
     fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         let chat = self.chat.borrow();
-        let entry = chat.transcript(chat.active_view())?.entries().get(idx)?;
-        // Widgets read the display flags at build time, so flipping a
-        // flag only needs a redraw.
-        Some(
-            match build_entry_widget(entry, &chat, &self.styles, false) {
-                EntryWidget::Bubble(b) => Rc::new(RefCell::new(b)),
-                EntryWidget::Rich(r) => Rc::new(RefCell::new(r)),
-                EntryWidget::Markdown(m) => Rc::new(RefCell::new(m)),
-                EntryWidget::SubAgent(b) => Rc::new(RefCell::new(b)),
-            },
-        )
+        let agent = chat.active_view();
+        let entry = chat.transcript(agent)?.entries().get(idx)?;
+        // Cheap, layout-free fingerprint of the live entry. The wrapper's
+        // draw compares it against the cached slot to decide hit vs miss.
+        let fingerprint = entry_fingerprint(entry, &chat);
+        Some(Rc::new(RefCell::new(CachingEntry {
+            cache: Rc::clone(&self.cache),
+            chat: Rc::clone(&self.chat),
+            styles: Rc::clone(&self.styles),
+            agent,
+            entry_id: entry.id,
+            fingerprint,
+        })))
+    }
+}
+
+/// A per-entry list item that memoizes its drawn surface in the shared
+/// [`EntryRenderCache`].
+///
+/// The cache key needs the draw width, which `item_at_idx` does not have, so
+/// the builder hands back one of these carrying the pre-computed fingerprint
+/// and the `Rc` handles. The real build+draw happens here, in `draw`, and only
+/// on a cache miss, so a hit skips both.
+struct CachingEntry {
+    cache: Rc<RefCell<EntryRenderCache>>,
+    chat: Rc<RefCell<ChatState>>,
+    styles: Rc<TranscriptStyles>,
+    agent: AgentId,
+    entry_id: EntryId,
+    fingerprint: u64,
+}
+
+impl Widget for CachingEntry {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        let width = ctx.max.width.unwrap_or(ctx.min.width);
+        let key = (self.agent, self.entry_id);
+
+        // HIT: the stored surface was drawn for this fingerprint and width, so
+        // replay it verbatim. Bind the lookup to a `let` so the cache's
+        // `RefMut` is released before the miss path re-borrows it.
+        let cached = self.cache.borrow_mut().get(key, self.fingerprint, width);
+        if let Some(surface) = cached {
+            return surface;
+        }
+
+        // MISS: rebuild the real widget and draw it. The `item_at_idx` chat
+        // borrow is already dropped (draw_builder resolves the WidgetRef, then
+        // draw_widget draws it), so this re-borrow never overlaps.
+        let surface = {
+            let chat = self.chat.borrow();
+            let Some(entry) = chat
+                .transcript(self.agent)
+                .and_then(|t| t.get(self.entry_id))
+            else {
+                // Append-only transcripts mean the entry can't vanish; return
+                // an empty surface defensively rather than panic.
+                return Surface::empty();
+            };
+            let mut widget = build_entry_widget(entry, &chat, &self.styles, false).into_boxed();
+            widget.draw(ctx)
+        };
+        self.cache
+            .borrow_mut()
+            .insert(key, self.fingerprint, width, surface.clone());
+        surface
+    }
+}
+
+/// A layout-free hash of the cheap per-entry fields that change an entry's
+/// rendered surface. The render cache keys a slot's validity on this: if the
+/// fingerprint (and the draw width) match the live entry, the stored surface
+/// is replayed instead of rebuilt.
+///
+/// Philosophy: over-fingerprint. A field we forget shows stale content (a real
+/// bug); a field we include that doesn't affect rendering only costs a
+/// harmless rebuild. Session-wide render inputs (`tools_expanded`,
+/// `hide_thinking_block`, the active view, the theme, the draw width) are NOT
+/// hashed here: the cache clears wholesale when they change, and width is a
+/// per-slot key.
+fn entry_fingerprint(entry: &Entry, chat: &ChatState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    fingerprint_into(entry, chat, &mut hasher);
+    hasher.finish()
+}
+
+/// Fold `entry`'s render-affecting fields into `hasher`. Split out from
+/// [`entry_fingerprint`] so the sub-agent arm can recurse into its child
+/// entries with the same logic.
+fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher) {
+    // A per-kind tag so identical numeric payloads across kinds never collide.
+    match &entry.kind {
+        EntryKind::Assistant(a) => {
+            0u8.hash(hasher);
+            assistant_fingerprint(a, hasher);
+        }
+        EntryKind::Tool(t) => {
+            1u8.hash(hasher);
+            tool_fingerprint(t, chat, hasher);
+        }
+        EntryKind::User(u) => {
+            2u8.hash(hasher);
+            u.joined_text().len().hash(hasher);
+            u.collapsible.hash(hasher);
+        }
+        EntryKind::SubAgent(s) => {
+            3u8.hash(hasher);
+            subagent_fingerprint(s, chat, hasher);
+        }
+        EntryKind::Compaction(c) => {
+            4u8.hash(hasher);
+            c.summary.len().hash(hasher);
+            c.tokens_before.hash(hasher);
+            c.tokens_after.hash(hasher);
+        }
+        // Notice and turn-usage rows are immutable after append, so the id and
+        // width already distinguish them. We fold a stable discriminant (plus
+        // a couple of trivially cheap fields) for defence in depth.
+        EntryKind::Notice(n) => {
+            5u8.hash(hasher);
+            notice_level_tag(n.level).hash(hasher);
+            n.text.len().hash(hasher);
+        }
+        EntryKind::TurnUsage(_) => {
+            6u8.hash(hasher);
+        }
+    }
+}
+
+/// Assistant / reasoning fields: the content-block count, a per-block tag (so
+/// a block changing kind is caught), the summed text and thinking byte
+/// lengths, the thinking `redacted` flag (which flips the placeholder text
+/// without changing its length), and `finalized`. `hide_thinking_block` is a
+/// global clear, so it is not folded in.
+fn assistant_fingerprint(a: &AssistantEntry, hasher: &mut DefaultHasher) {
+    a.message.content.len().hash(hasher);
+    let mut text_len = 0usize;
+    let mut thinking_len = 0usize;
+    for block in &a.message.content {
+        match block {
+            AssistantContent::Text(t) => {
+                0u8.hash(hasher);
+                text_len += t.text.len();
+            }
+            AssistantContent::Thinking(t) => {
+                1u8.hash(hasher);
+                t.redacted.hash(hasher);
+                thinking_len += t.thinking.len();
+            }
+            AssistantContent::ToolCall(_) => 2u8.hash(hasher),
+        }
+    }
+    text_len.hash(hasher);
+    thinking_len.hash(hasher);
+    a.finalized.hash(hasher);
+}
+
+/// Tool-cell fields: the status (plus `is_error`), `header_only`, the details
+/// presence, the details variant discriminant with a per-variant size proxy,
+/// and the badge task's live status (which drives the badge text and the cell
+/// tint and changes over the cell's life). `tools_expanded` is a global clear.
+///
+/// The header also renders `entry.tool` and `entry.args`, and the badge gating
+/// reads the task's `kind`. None are folded in: all three are fixed when the
+/// cell is appended (`ToolExecutionStart` carries the fully-validated args, and
+/// a task's `kind` is set at `TaskStart`) and never mutate for a given entry
+/// id, so the first miss captures them for good. If a future change lets tool
+/// args stream into an existing cell, they must move into the fingerprint.
+fn tool_fingerprint(t: &ToolEntry, chat: &ChatState, hasher: &mut DefaultHasher) {
+    match t.status {
+        ToolStatus::Running => 0u8.hash(hasher),
+        ToolStatus::Done { is_error } => {
+            1u8.hash(hasher);
+            is_error.hash(hasher);
+        }
+    }
+    t.header_only.hash(hasher);
+    match &t.details {
+        None => 0u8.hash(hasher),
+        Some(details) => {
+            1u8.hash(hasher);
+            details_fingerprint(details, hasher);
+        }
+    }
+    // Mirror `tool_cell::badge_task_id`: the persisted Bash `task_id` wins,
+    // else the live `entry.task`. The badge and tint follow that task's status.
+    let badge_id = match &t.details {
+        Some(ToolDetails::Bash {
+            task_id: Some(id), ..
+        }) => Some(*id),
+        _ => t.task,
+    };
+    badge_id.hash(hasher);
+    if let Some(id) = badge_id {
+        let status = chat.tasks().get(&id).map(|info| info.status);
+        task_status_fingerprint(status, hasher);
+    }
+}
+
+/// The details variant discriminant plus a cheap, layout-free size proxy. For
+/// the streaming variants (bash streams, text/report bodies) the payload only
+/// ever grows, so a length proxy reliably changes as content arrives. `Json`
+/// hashes its structure since it is the escape hatch and not append-only.
+fn details_fingerprint(details: &ToolDetails, hasher: &mut DefaultHasher) {
+    match details {
+        ToolDetails::Text { summary, body } => {
+            0u8.hash(hasher);
+            summary.len().hash(hasher);
+            body.len().hash(hasher);
+        }
+        ToolDetails::Diff {
+            path,
+            before,
+            after,
+        } => {
+            1u8.hash(hasher);
+            path.len().hash(hasher);
+            before.len().hash(hasher);
+            after.len().hash(hasher);
+        }
+        ToolDetails::Bash {
+            command,
+            stdout,
+            stderr,
+            exit_code,
+            truncated,
+            full_output_path,
+            stdout_truncation,
+            stderr_truncation,
+            task_id,
+        } => {
+            2u8.hash(hasher);
+            command.len().hash(hasher);
+            stdout.len().hash(hasher);
+            stderr.len().hash(hasher);
+            exit_code.hash(hasher);
+            truncated.hash(hasher);
+            full_output_path
+                .as_ref()
+                .map(|p| p.as_os_str().len())
+                .hash(hasher);
+            truncation_fingerprint(stdout_truncation, hasher);
+            truncation_fingerprint(stderr_truncation, hasher);
+            task_id.hash(hasher);
+        }
+        ToolDetails::SubAgentReport {
+            agent_id,
+            task,
+            report,
+        } => {
+            3u8.hash(hasher);
+            agent_id.hash(hasher);
+            task.len().hash(hasher);
+            report.len().hash(hasher);
+        }
+        ToolDetails::Todos { items } => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                item.content.len().hash(hasher);
+                todo_status_tag(item.status).hash(hasher);
+                todo_priority_tag(item.priority).hash(hasher);
+            }
+        }
+        ToolDetails::Image {
+            summary,
+            mime_type,
+            original_dimensions,
+            displayed_dimensions,
+        } => {
+            5u8.hash(hasher);
+            summary.len().hash(hasher);
+            mime_type.len().hash(hasher);
+            original_dimensions.hash(hasher);
+            displayed_dimensions.hash(hasher);
+        }
+        ToolDetails::Json(value) => {
+            6u8.hash(hasher);
+            json_fingerprint(value, hasher);
+        }
+    }
+}
+
+/// A per-stream truncation summary's presence plus the numeric fields that
+/// feed its marker line.
+fn truncation_fingerprint(t: &Option<BashStreamTruncation>, hasher: &mut DefaultHasher) {
+    match t {
+        None => 0u8.hash(hasher),
+        Some(t) => {
+            1u8.hash(hasher);
+            t.total_lines.hash(hasher);
+            t.total_bytes.hash(hasher);
+            t.output_lines.hash(hasher);
+            t.output_bytes.hash(hasher);
+            t.last_line_partial.hash(hasher);
+            t.last_line_bytes.hash(hasher);
+            match t.truncated_by {
+                TruncationCause::Lines => 0u8,
+                TruncationCause::Bytes => 1u8,
+            }
+            .hash(hasher);
+        }
+    }
+}
+
+/// Structure-only hash of a JSON value: the variant tag, the scalar value (for
+/// number/bool/string, so `1` and `2` don't collide), and container lengths,
+/// recursing into children. Layout-free and allocation-light.
+fn json_fingerprint(value: &Value, hasher: &mut DefaultHasher) {
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::Number(n) => {
+            2u8.hash(hasher);
+            n.to_string().hash(hasher);
+        }
+        Value::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Array(items) => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                json_fingerprint(item, hasher);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(hasher);
+            map.len().hash(hasher);
+            for (key, val) in map {
+                key.hash(hasher);
+                json_fingerprint(val, hasher);
+            }
+        }
+    }
+}
+
+/// Sub-agent box fields: its run status, the child transcript's entry count,
+/// and the fold of every child entry's fingerprint. Folding ALL children (not
+/// just the tail) is required: a background task can update a non-tail child
+/// cell. This is O(child entries) but layout-free, far cheaper than building
+/// and drawing them.
+///
+/// The box title also renders `s.child` and `s.task`, neither folded in: both
+/// are fixed at `SubAgentStart` and never mutate, so the first miss captures
+/// them. `s.report` is not rendered by the box (the parent's tool cell carries
+/// it), so it needs no coverage here.
+fn subagent_fingerprint(s: &SubAgentEntry, chat: &ChatState, hasher: &mut DefaultHasher) {
+    match s.status {
+        SubAgentStatus::Running => 0u8.hash(hasher),
+        SubAgentStatus::Done => 1u8.hash(hasher),
+    }
+    match chat.transcript(AgentId::Sub(s.child)) {
+        Some(t) => {
+            t.entries().len().hash(hasher);
+            for child in t.entries() {
+                fingerprint_into(child, chat, hasher);
+            }
+        }
+        None => 0usize.hash(hasher),
+    }
+}
+
+fn notice_level_tag(level: NoticeLevel) -> u8 {
+    match level {
+        NoticeLevel::Info => 0,
+        NoticeLevel::Warning => 1,
+        NoticeLevel::Error => 2,
+    }
+}
+
+fn task_status_fingerprint(status: Option<TaskStatus>, hasher: &mut DefaultHasher) {
+    match status {
+        None => 0u8.hash(hasher),
+        Some(TaskStatus::Running) => 1u8.hash(hasher),
+        Some(TaskStatus::Killed) => 2u8.hash(hasher),
+        Some(TaskStatus::Exited(code)) => {
+            // The exit code drives the badge text and the cell tint, so fold
+            // it in. `Option<i32>` hashes directly.
+            3u8.hash(hasher);
+            code.hash(hasher);
+        }
+    }
+}
+
+fn todo_status_tag(status: TodoStatus) -> u8 {
+    match status {
+        TodoStatus::Todo => 0,
+        TodoStatus::InProgress => 1,
+        TodoStatus::Completed => 2,
+    }
+}
+
+fn todo_priority_tag(priority: TodoPriority) -> u8 {
+    match priority {
+        TodoPriority::Low => 0,
+        TodoPriority::Medium => 1,
+        TodoPriority::High => 2,
     }
 }
 
@@ -472,6 +992,14 @@ pub struct TranscriptView {
     /// thumb drag-to-jump into it.
     list: Rc<RefCell<ListView>>,
     bars: ScrollBars<ListView>,
+    /// Memoized per-entry surfaces, shared into the [`EntryBuilder`]. See
+    /// [`EntryRenderCache`]. Owned here so it survives across frames and so a
+    /// theme swap or a global-toggle change can clear it.
+    cache: Rc<RefCell<EntryRenderCache>>,
+    /// Last-seen session-wide render inputs. When any of these changes the
+    /// whole cache is cleared, since they are not part of any per-entry
+    /// fingerprint.
+    last_globals: GlobalRenderInputs,
     /// While true, every draw pins the viewport to the bottom so a
     /// streaming turn stays in view. Wheel-up and thumb drags
     /// disengage, a scroll that lands back at the bottom re-engages
@@ -479,12 +1007,35 @@ pub struct TranscriptView {
     follow_tail: bool,
 }
 
+/// The session-wide render inputs the transcript cache does not fingerprint
+/// per entry. A change to any of them invalidates every cached surface, so
+/// [`TranscriptView::draw`] clears the cache wholesale on a change. These
+/// toggles are rare, so a full clear costs one all-miss frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GlobalRenderInputs {
+    active_view: AgentId,
+    tools_expanded: bool,
+    hide_thinking_block: bool,
+}
+
+impl GlobalRenderInputs {
+    fn read(chat: &ChatState) -> GlobalRenderInputs {
+        GlobalRenderInputs {
+            active_view: chat.active_view(),
+            tools_expanded: chat.tools_expanded,
+            hide_thinking_block: chat.hide_thinking_block,
+        }
+    }
+}
+
 impl TranscriptView {
     pub fn new(chat: Rc<RefCell<ChatState>>, theme: &Theme) -> TranscriptView {
         let styles = Rc::new(TranscriptStyles::from_theme(theme));
+        let cache = Rc::new(RefCell::new(EntryRenderCache::new()));
         let builder = EntryBuilder {
             chat: Rc::clone(&chat),
             styles: Rc::clone(&styles),
+            cache: Rc::clone(&cache),
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
         // Free-scroll mode: no item cursor while the editor owns the
@@ -494,10 +1045,13 @@ impl TranscriptView {
         bars.draw_horizontal_scrollbar = false;
         apply_scrollbar_thumbs(&mut bars, &styles);
         let list = Rc::clone(&bars.view);
+        let last_globals = GlobalRenderInputs::read(&chat.borrow());
         TranscriptView {
             chat,
             list,
             bars,
+            cache,
+            last_globals,
             follow_tail: true,
         }
     }
@@ -510,6 +1064,16 @@ impl TranscriptView {
     /// refreshes `item_count` before scrolling, so we needn't touch the
     /// list's scroll offset here.
     pub(crate) fn reset_to_tail(&mut self) {
+        // Clear the cache: the reused `chat` cell now holds a different
+        // session whose transcript restarts `EntryId` at 0, so its entries
+        // collide with the previous session's cache keys `(AgentId, EntryId)`.
+        // The draw-time global clear can't be relied on to catch this. A fresh
+        // session's globals `(Main, tools_expanded=false, hide_thinking=false)`
+        // usually match the outgoing session's, so no global change fires, and
+        // a coincidental fingerprint+width match would then replay the old
+        // session's surface. Length-proxy fingerprints make that coincidence
+        // easy (two same-length prompts collide), so we drop every slot here.
+        self.cache.borrow_mut().clear();
         self.follow_tail = true;
     }
 
@@ -519,9 +1083,12 @@ impl TranscriptView {
     /// and re-applies the scrollbar thumb tints. Scroll position is
     /// left untouched, so a reload doesn't jump the viewport.
     pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>) {
+        // A theme swap re-tints every entry, so every cached surface is stale.
+        self.cache.borrow_mut().clear();
         let builder = EntryBuilder {
             chat: Rc::clone(&self.chat),
             styles: Rc::clone(&styles),
+            cache: Rc::clone(&self.cache),
         };
         self.list.borrow_mut().children = Source::Builder(Box::new(builder));
         apply_scrollbar_thumbs(&mut self.bars, &styles);
@@ -571,6 +1138,16 @@ impl Widget for TranscriptView {
                 width: ctx.max.width.unwrap_or(0),
                 height: 0,
             });
+        }
+        // Global render inputs are not fingerprinted per entry, so a change to
+        // any of them invalidates every cached surface. Compare against last
+        // frame and clear wholesale on a change. These toggles are rare, so a
+        // full clear costs one all-miss frame. A width change is handled
+        // per-slot (width mismatch = miss), so it needs no global clear.
+        let globals = GlobalRenderInputs::read(&self.chat.borrow());
+        if globals != self.last_globals {
+            self.cache.borrow_mut().clear();
+            self.last_globals = globals;
         }
         let count = {
             let chat = self.chat.borrow();
@@ -648,11 +1225,19 @@ impl Widget for TranscriptView {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use aj_agent::events::AgentEvent;
+    use aj_agent::message::AgentMessage;
+    use aj_agent::tool::TaskKind;
     use aj_app::chat::{
-        AssistantEntry, CompactionEntry, EntryId, NoticeEntry, Transcript, UserEntry,
+        AssistantEntry, CompactionEntry, EntryId, NoticeEntry, Transcript, UserEntry, reduce,
     };
+    use aj_app::session::AgentLifecycle;
+    use aj_models::streaming::AssistantMessageEvent;
     use aj_models::types::{
-        AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, UserContent,
+        AssistantContent, AssistantMessage, Message, StopReason, TextContent, ThinkingContent,
+        UserContent,
     };
     use vaxis::vxfw::{MaxSize, Size};
 
@@ -1068,7 +1653,6 @@ mod tests {
     /// each, counting the spacer).
     fn chat_with_notices(n: usize) -> Rc<RefCell<ChatState>> {
         use aj_agent::events::AgentSettings;
-        use std::sync::Arc;
 
         let mut chat = ChatState::new(
             AgentSettings {
@@ -1213,5 +1797,810 @@ mod tests {
         view.capture_event(&mut ec, &wheel_up);
         assert!(!ec.consume_event, "the wheel still reaches the list");
         assert!(!view.follow_tail, "capture path disengages");
+    }
+
+    // ---- Render cache: helpers -------------------------------------------
+
+    fn cache_settings() -> aj_agent::events::AgentSettings {
+        aj_agent::events::AgentSettings {
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        }
+    }
+
+    fn empty_chat() -> Rc<RefCell<ChatState>> {
+        Rc::new(RefCell::new(ChatState::new(
+            cache_settings(),
+            0,
+            Arc::new(Vec::new()),
+        )))
+    }
+
+    fn apply(chat: &Rc<RefCell<ChatState>>, life: &mut AgentLifecycle, event: AgentEvent) {
+        let _ = reduce(&mut chat.borrow_mut(), life, event);
+    }
+
+    /// A caching builder over `chat` with a fresh cache and a concrete styles
+    /// instance the uncached reference reuses, so cached and uncached renders
+    /// are byte-comparable.
+    fn caching_builder(chat: &Rc<RefCell<ChatState>>) -> EntryBuilder {
+        EntryBuilder {
+            chat: Rc::clone(chat),
+            styles: Rc::new(styles()),
+            cache: Rc::new(RefCell::new(EntryRenderCache::new())),
+        }
+    }
+
+    /// Draw entry `idx` of the active view through the caching path, the way
+    /// the list does: `item_at_idx` (computes the fingerprint) then draw
+    /// (hit or miss).
+    fn draw_cached(builder: &EntryBuilder, idx: usize, width: u16) -> Surface {
+        let widget = builder.item_at_idx(idx, 0).expect("entry present");
+        widget
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(width, None))
+    }
+
+    /// Draw entry `idx` of `agent` with a fresh, uncached widget: the
+    /// reference a cached render must match byte-for-byte.
+    fn draw_uncached(builder: &EntryBuilder, agent: AgentId, idx: usize, width: u16) -> Surface {
+        let chat = builder.chat.borrow();
+        let entry = &chat.transcript(agent).expect("transcript").entries()[idx];
+        let mut widget = build_entry_widget(entry, &chat, &builder.styles, false).into_boxed();
+        widget.draw(&crate::test_support::draw_ctx(width, None))
+    }
+
+    /// Draw `idx` through the cache and assert the result matches a fresh
+    /// uncached render of the same entry, proving the cached surface is not
+    /// stale. Returns the cached surface.
+    fn draw_and_assert_fresh(
+        builder: &EntryBuilder,
+        agent: AgentId,
+        idx: usize,
+        width: u16,
+    ) -> Surface {
+        let cached = draw_cached(builder, idx, width);
+        let uncached = draw_uncached(builder, agent, idx, width);
+        assert_same_surface(&cached, &uncached);
+        cached
+    }
+
+    fn assert_same_surface(a: &Surface, b: &Surface) {
+        assert_eq!(a.size, b.size, "surface sizes differ");
+        assert_eq!(
+            crate::test_support::flatten(a),
+            crate::test_support::flatten(b),
+            "composited cells differ (stale cache?)",
+        );
+    }
+
+    fn misses(builder: &EntryBuilder) -> u64 {
+        builder.cache.borrow().misses
+    }
+
+    fn hits(builder: &EntryBuilder) -> u64 {
+        builder.cache.borrow().hits
+    }
+
+    fn text_message(text: &str) -> AssistantMessage {
+        assistant_message(vec![AssistantContent::Text(TextContent {
+            text: text.into(),
+            text_signature: None,
+        })])
+    }
+
+    fn assistant_text_delta(text: &str) -> AgentEvent {
+        AgentEvent::MessageUpdate {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::Assistant(assistant_message(Vec::new()))),
+            event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: text.into(),
+                partial: text_message(text),
+            },
+        }
+    }
+
+    fn assistant_message_end(message: AssistantMessage) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::Assistant(message)),
+        }
+    }
+
+    fn user_end(text: &str) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::User(aj_models::types::UserMessage::text(text))),
+        }
+    }
+
+    fn tool_start(agent: AgentId, call_id: &str, tool: &str) -> AgentEvent {
+        AgentEvent::ToolExecutionStart {
+            agent_id: agent,
+            call_id: call_id.into(),
+            tool: tool.into(),
+            args: serde_json::json!({}),
+        }
+    }
+
+    fn tool_end(agent: AgentId, call_id: &str, tool: &str, result: ToolDetails) -> AgentEvent {
+        AgentEvent::ToolExecutionEnd {
+            agent_id: agent,
+            call_id: call_id.into(),
+            tool: tool.into(),
+            result,
+            content: Vec::new().into(),
+            is_error: false,
+        }
+    }
+
+    fn bash(command: &str, stdout: &str, exit: Option<i32>, task_id: Option<usize>) -> ToolDetails {
+        ToolDetails::Bash {
+            command: command.into(),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code: exit,
+            truncated: false,
+            full_output_path: None,
+            stdout_truncation: None,
+            stderr_truncation: None,
+            task_id,
+        }
+    }
+
+    // ---- Render cache: effectiveness (hits happen) -----------------------
+
+    /// Rendering an unchanged transcript twice records HITS on the second
+    /// pass and no new misses, so the cache actually elides work.
+    #[test]
+    fn unchanged_transcript_hits_on_the_second_pass() {
+        let chat = chat_with_notices(4);
+        let builder = caching_builder(&chat);
+        for i in 0..4 {
+            draw_cached(&builder, i, 80);
+        }
+        let misses_after_first = misses(&builder);
+        let hits_after_first = hits(&builder);
+        assert_eq!(misses_after_first, 4, "first pass is all misses");
+        for i in 0..4 {
+            draw_cached(&builder, i, 80);
+        }
+        assert_eq!(misses(&builder), misses_after_first, "no new misses");
+        assert_eq!(hits(&builder), hits_after_first + 4, "second pass all hits");
+    }
+
+    /// A width change is a per-slot miss even when the fingerprint is
+    /// unchanged, and the re-rendered surface matches a fresh uncached draw
+    /// at the new width.
+    #[test]
+    fn width_change_forces_a_per_slot_miss() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "bash",
+                bash("echo hi", "hi\n", Some(0), None),
+            ),
+        );
+        let builder = caching_builder(&chat);
+        draw_cached(&builder, 0, 80);
+        draw_cached(&builder, 0, 80);
+        assert_eq!(misses(&builder), 1, "same width hits");
+        assert_eq!(hits(&builder), 1);
+        let narrow = draw_and_assert_fresh(&builder, AgentId::Main, 0, 40);
+        assert_eq!(misses(&builder), 2, "width change missed");
+        assert_eq!(
+            usize::from(narrow.size.width),
+            40,
+            "re-rendered at the new width"
+        );
+    }
+
+    // ---- Render cache: per-kind no-stale ---------------------------------
+
+    /// Assistant text growth changes the fingerprint, so the second render
+    /// misses and matches a fresh uncached draw of the grown message.
+    #[test]
+    fn assistant_text_delta_growth_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, assistant_text_delta("Hel"));
+        let builder = caching_builder(&chat);
+        let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 80);
+
+        apply(&chat, &mut life, assistant_text_delta("Hello world"));
+        let grown = draw_and_assert_fresh(&builder, AgentId::Main, 0, 80);
+        assert_eq!(misses(&builder), 2, "growth forced a rebuild");
+        assert_ne!(
+            crate::test_support::flatten(&first),
+            crate::test_support::flatten(&grown),
+            "the render actually changed",
+        );
+        assert!(
+            crate::test_support::rows(&grown)
+                .join("\n")
+                .contains("Hello world"),
+            "grown text rendered",
+        );
+    }
+
+    /// Finalizing an assistant entry flips `finalized`, which the fingerprint
+    /// tracks, so the post-finalize render is fresh.
+    #[test]
+    fn assistant_finalize_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, assistant_text_delta("Answer"));
+        let builder = caching_builder(&chat);
+        draw_and_assert_fresh(&builder, AgentId::Main, 0, 80);
+
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("Answer")),
+        );
+        draw_and_assert_fresh(&builder, AgentId::Main, 0, 80);
+        assert_eq!(misses(&builder), 2, "finalize forced a rebuild");
+    }
+
+    /// A tool cell walking pending -> details -> done stays fresh at each
+    /// step (status, details presence, and payload all ride the fingerprint).
+    #[test]
+    fn tool_pending_details_done_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+        let builder = caching_builder(&chat);
+        // Pending: header only, no body.
+        draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
+        // Done with a result body.
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "bash",
+                bash("echo hi", "hi\n", Some(0), None),
+            ),
+        );
+        let done = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
+        assert_eq!(misses(&builder), 2, "details+status change rebuilt");
+        assert!(
+            crate::test_support::rows(&done)
+                .join("\n")
+                .contains("[exit 0]"),
+            "result body rendered",
+        );
+    }
+
+    /// Streaming bash stdout growth (the size proxy) changes the fingerprint,
+    /// so the grown output is not served stale.
+    #[test]
+    fn tool_streaming_output_growth_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "bash",
+                bash("run", "line 1\n", Some(0), None),
+            ),
+        );
+        let builder = caching_builder(&chat);
+        let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
+
+        // The result payload grows (a later TaskOutput-style update).
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::ToolExecutionUpdate {
+                agent_id: AgentId::Main,
+                call_id: "c1".into(),
+                tool: "bash".into(),
+                args: serde_json::json!({}),
+                partial: bash("run", "line 1\nline 2\nline 3\n", Some(0), None),
+                content: Vec::new().into(),
+            },
+        );
+        let grown = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
+        assert_eq!(misses(&builder), 2, "output growth rebuilt");
+        assert_ne!(
+            crate::test_support::flatten(&first),
+            crate::test_support::flatten(&grown),
+            "the render actually changed",
+        );
+    }
+
+    /// A background task's terminal status changes the cell's badge and tint,
+    /// which the fingerprint tracks through the task-status field.
+    #[test]
+    fn tool_task_status_change_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                kind: TaskKind::Bash {
+                    command: "sleep 1".into(),
+                },
+                label: "sleep 1".into(),
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "bash",
+                bash("sleep 1", "", None, Some(1)),
+            ),
+        );
+        let builder = caching_builder(&chat);
+        let running = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
+        assert!(
+            crate::test_support::rows(&running)
+                .join("\n")
+                .contains("[task #1]"),
+            "running badge",
+        );
+
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::TaskEnd {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                status: TaskStatus::Exited(Some(0)),
+                label: "sleep 1".into(),
+            },
+        );
+        let done = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
+        assert_eq!(misses(&builder), 2, "task status change rebuilt");
+        assert!(
+            crate::test_support::rows(&done)
+                .join("\n")
+                .contains("exited 0"),
+            "terminal badge rendered: {:?}",
+            crate::test_support::rows(&done),
+        );
+    }
+
+    /// The fingerprint distinguishes user-entry content and the collapsible
+    /// flag, so a slot could never serve one user render for another. User
+    /// entries are immutable after append, so this fingerprint sensitivity is
+    /// the anti-stale guarantee for them.
+    #[test]
+    fn user_entry_fingerprint_tracks_content_and_collapsible() {
+        let hello = transcript_with(EntryKind::User(UserEntry {
+            content: vec![UserContent::text("hello")],
+            collapsible: false,
+        }));
+        let longer = transcript_with(EntryKind::User(UserEntry {
+            content: vec![UserContent::text("hello, world")],
+            collapsible: false,
+        }));
+        let collapsible = transcript_with(EntryKind::User(UserEntry {
+            content: vec![UserContent::text("hello")],
+            collapsible: true,
+        }));
+        let chat = empty_chat();
+        let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
+        assert_ne!(fp(&hello), fp(&longer), "content length is fingerprinted");
+        assert_ne!(fp(&hello), fp(&collapsible), "collapsible is fingerprinted");
+    }
+
+    /// A user entry renders through the cache and hits when unchanged.
+    #[test]
+    fn user_entry_hits_when_unchanged() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::User(aj_models::types::UserMessage::text(
+                    "hi there",
+                ))),
+            },
+        );
+        let builder = caching_builder(&chat);
+        draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
+        draw_cached(&builder, 0, 60);
+        assert_eq!(misses(&builder), 1, "second draw hit");
+        assert_eq!(hits(&builder), 1);
+    }
+
+    /// The fingerprint tracks a compaction entry's summary length and both
+    /// token counts. Compaction entries are immutable after append, so this
+    /// is their anti-stale guarantee.
+    #[test]
+    fn compaction_fingerprint_tracks_summary_and_tokens() {
+        let base = transcript_with(EntryKind::Compaction(CompactionEntry {
+            tokens_before: 100_000,
+            tokens_after: 25_000,
+            summary: "one".into(),
+        }));
+        let other_summary = transcript_with(EntryKind::Compaction(CompactionEntry {
+            tokens_before: 100_000,
+            tokens_after: 25_000,
+            summary: "one two".into(),
+        }));
+        let other_tokens = transcript_with(EntryKind::Compaction(CompactionEntry {
+            tokens_before: 90_000,
+            tokens_after: 25_000,
+            summary: "one".into(),
+        }));
+        let chat = empty_chat();
+        let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
+        assert_ne!(
+            fp(&base),
+            fp(&other_summary),
+            "summary length fingerprinted"
+        );
+        assert_ne!(fp(&base), fp(&other_tokens), "token counts fingerprinted");
+    }
+
+    // ---- Render cache: sub-agent box -------------------------------------
+
+    /// Spawn a sub-agent with one assistant line in its child transcript, and
+    /// return the (Main) index of the box entry (always 0 here).
+    fn spawn_sub(chat: &Rc<RefCell<ChatState>>, life: &mut AgentLifecycle) {
+        apply(
+            chat,
+            life,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(0),
+                task: "scout the code".into(),
+                settings: cache_settings(),
+            },
+        );
+        apply(
+            chat,
+            life,
+            AgentEvent::MessageEnd {
+                agent_id: AgentId::Sub(0),
+                message: AgentMessage::wire(Message::Assistant(text_message("starting"))),
+            },
+        );
+    }
+
+    /// Appending a new child entry to the sub transcript changes the box's
+    /// fingerprint (child count + fold), so the box render is not stale.
+    #[test]
+    fn subagent_child_append_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        let builder = caching_builder(&chat);
+        draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Sub(0),
+                text: "sub-child-marker".into(),
+            },
+        );
+        let after = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        assert_eq!(misses(&builder), 2, "child append rebuilt the box");
+        assert!(
+            crate::test_support::rows(&after)
+                .join("\n")
+                .contains("sub-child-marker"),
+            "appended child rendered inside the box",
+        );
+    }
+
+    /// Growth of the sub's tail child (a streaming assistant line) changes the
+    /// box fingerprint through the child fold.
+    #[test]
+    fn subagent_last_child_streaming_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        let builder = caching_builder(&chat);
+        let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+
+        // Replace the sub's single assistant line with a longer one.
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::MessageEnd {
+                agent_id: AgentId::Sub(0),
+                message: AgentMessage::wire(Message::Assistant(text_message(
+                    "starting the investigation now",
+                ))),
+            },
+        );
+        let grown = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        assert_eq!(misses(&builder), 2, "tail-child growth rebuilt the box");
+        assert_ne!(
+            crate::test_support::flatten(&first),
+            crate::test_support::flatten(&grown),
+            "the box render actually changed",
+        );
+    }
+
+    /// A background task updating a NON-tail child (its badge flips on
+    /// `TaskEnd`) changes the box fingerprint. This only holds because the
+    /// fold covers every child, not just the tail.
+    #[test]
+    fn subagent_non_tail_child_update_is_not_stale() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(0),
+                task: "scout".into(),
+                settings: cache_settings(),
+            },
+        );
+        // A bash tool cell with a background task, then a trailing notice, so
+        // the tool cell is a NON-tail child.
+        apply(&chat, &mut life, tool_start(AgentId::Sub(0), "c1", "bash"));
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Sub(0),
+                task_id: 1,
+                call_id: "c1".into(),
+                kind: TaskKind::Bash {
+                    command: "sleep 1".into(),
+                },
+                label: "sleep 1".into(),
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Sub(0),
+                "c1",
+                "bash",
+                bash("sleep 1", "", None, Some(1)),
+            ),
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Sub(0),
+                text: "tail notice".into(),
+            },
+        );
+        let builder = caching_builder(&chat);
+        let running = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        assert!(
+            crate::test_support::rows(&running)
+                .join("\n")
+                .contains("[task #1]"),
+            "running badge on the non-tail child: {:?}",
+            crate::test_support::rows(&running),
+        );
+
+        // Terminal status flips the non-tail child's badge.
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::TaskEnd {
+                agent_id: AgentId::Sub(0),
+                task_id: 1,
+                call_id: "c1".into(),
+                status: TaskStatus::Exited(Some(0)),
+                label: "sleep 1".into(),
+            },
+        );
+        let done = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        assert_eq!(misses(&builder), 2, "non-tail child change rebuilt the box");
+        assert!(
+            crate::test_support::rows(&done)
+                .join("\n")
+                .contains("exited 0"),
+            "non-tail child badge updated: {:?}",
+            crate::test_support::rows(&done),
+        );
+    }
+
+    // ---- Render cache: global clears -------------------------------------
+
+    /// A chat with an assistant line and a done tool cell, wrapped for a
+    /// full `TranscriptView` draw.
+    fn chat_with_tool() -> Rc<RefCell<ChatState>> {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, assistant_text_delta("hi"));
+        apply(&chat, &mut life, assistant_message_end(text_message("hi")));
+        apply(
+            &chat,
+            &mut life,
+            tool_start(AgentId::Main, "c1", "read_file"),
+        );
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "read_file",
+                ToolDetails::Text {
+                    summary: "/tmp/x".into(),
+                    body: (1..=20)
+                        .map(|i| format!("line {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                },
+            ),
+        );
+        chat
+    }
+
+    /// Toggling `tools_expanded` clears the whole cache, forcing a full miss
+    /// on the next draw.
+    #[test]
+    fn toggling_tools_expanded_clears_the_cache() {
+        let chat = chat_with_tool();
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        let _ = view.draw(&ctx);
+        let hits_before = view.cache.borrow().hits;
+        let misses_before = view.cache.borrow().misses;
+        assert!(hits_before > 0, "second draw hit");
+
+        chat.borrow_mut().tools_expanded = true;
+        let _ = view.draw(&ctx);
+        assert!(
+            view.cache.borrow().misses > misses_before,
+            "toggling tools_expanded forced misses",
+        );
+    }
+
+    /// Toggling `hide_thinking_block` clears the whole cache.
+    #[test]
+    fn toggling_hide_thinking_clears_the_cache() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::MessageUpdate {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::Assistant(assistant_message(Vec::new()))),
+                event: AssistantMessageEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: "pondering".into(),
+                    partial: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
+                        thinking: "pondering".into(),
+                        thinking_signature: None,
+                        redacted: false,
+                    })]),
+                },
+            },
+        );
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        let _ = view.draw(&ctx);
+        let misses_before = view.cache.borrow().misses;
+        assert!(view.cache.borrow().hits > 0, "second draw hit");
+
+        chat.borrow_mut().hide_thinking_block = true;
+        let _ = view.draw(&ctx);
+        assert!(
+            view.cache.borrow().misses > misses_before,
+            "toggling hide_thinking_block forced misses",
+        );
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        assert!(
+            rows.join("\n").contains("Thinking…"),
+            "placeholder shown: {rows:?}"
+        );
+    }
+
+    /// Switching the active view clears the whole cache.
+    #[test]
+    fn switching_active_view_clears_the_cache() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        let _ = view.draw(&ctx);
+        let misses_before = view.cache.borrow().misses;
+        assert!(view.cache.borrow().hits > 0, "second draw hit");
+
+        chat.borrow_mut().set_active_view(AgentId::Sub(0));
+        let _ = view.draw(&ctx);
+        assert!(
+            view.cache.borrow().misses > misses_before,
+            "switching the active view forced misses",
+        );
+    }
+
+    /// A theme swap through `set_styles` clears the cache.
+    #[test]
+    fn set_styles_clears_the_cache() {
+        let chat = chat_with_notices(2);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        assert!(!view.cache.borrow().slots.is_empty(), "cache populated");
+        view.set_styles(Rc::new(styles()));
+        assert!(
+            view.cache.borrow().slots.is_empty(),
+            "set_styles cleared it"
+        );
+    }
+
+    /// A session rebuild reuses the `chat` cell but installs a fresh session
+    /// whose transcript restarts `EntryId` at 0. With same-length content the
+    /// new entry's fingerprint collides with the cached slot, and the globals
+    /// are unchanged, so only the `reset_to_tail` clear stops the previous
+    /// session's surface from being replayed. Without that clear this test
+    /// reads the stale "hello".
+    #[test]
+    fn session_rebuild_does_not_serve_the_previous_sessions_surface() {
+        // The shell holds `chat` by identity across a swap; the view shares it.
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, user_end("hello"));
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        // Second draw hits the cache, so the (Main, EntryId(0)) slot is warm.
+        let first = crate::test_support::rows(&view.draw(&ctx));
+        assert!(
+            first.join("\n").contains("hello"),
+            "first session: {first:?}"
+        );
+        assert!(view.cache.borrow().hits > 0, "first session slot cached");
+
+        // Swap in a fresh session in place. Its first entry reuses EntryId(0)
+        // with different, same-length content ("world" vs "hello"), so the
+        // fingerprint collides, and its globals (Main, false, false) match the
+        // outgoing session's, so the draw-time global clear does not fire.
+        {
+            let mut fresh = ChatState::new(cache_settings(), 0, Arc::new(Vec::new()));
+            let mut fresh_life = AgentLifecycle::default();
+            let _ = reduce(&mut fresh, &mut fresh_life, user_end("world"));
+            *chat.borrow_mut() = fresh;
+        }
+        // The rebind hook the shell runs on install.
+        view.reset_to_tail();
+
+        let rows = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            rows.contains("world") && !rows.contains("hello"),
+            "fresh session content, not the previous session's cached surface: {rows:?}",
+        );
     }
 }
