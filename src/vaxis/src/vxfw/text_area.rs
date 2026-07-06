@@ -2647,8 +2647,7 @@ impl TextArea {
             return;
         }
         if self.autocomplete_state.is_some() {
-            let force = matches!(self.autocomplete_state, Some(AutocompleteMode::Force));
-            self.update_autocomplete(force);
+            self.refresh_open_autocomplete();
             return;
         }
         let should_trigger = match c {
@@ -2668,12 +2667,27 @@ impl TextArea {
             return;
         }
         if self.autocomplete_state.is_some() {
-            let force = matches!(self.autocomplete_state, Some(AutocompleteMode::Force));
-            self.update_autocomplete(force);
+            self.refresh_open_autocomplete();
             return;
         }
         if self.is_in_symbol_context() {
             self.update_autocomplete(false);
+        }
+    }
+
+    /// Re-runs the dispatch for an already-open popup after an edit.
+    ///
+    /// A `Force` popup (opened via Tab) refines a direct path unconditionally,
+    /// so it re-dispatches on every edit. A `Regular` popup is anchored to an
+    /// `@` / `#` token: once the cursor leaves that token, for example after
+    /// typing a space, the completion no longer applies. We close it rather
+    /// than re-dispatch, because a bare re-dispatch would fall through to the
+    /// one-shot direct-path branch and list the whole working directory.
+    fn refresh_open_autocomplete(&mut self) {
+        match self.autocomplete_state {
+            Some(AutocompleteMode::Force) => self.update_autocomplete(true),
+            _ if self.is_in_symbol_context() => self.update_autocomplete(false),
+            _ => self.cancel_autocomplete(),
         }
     }
 
@@ -5380,6 +5394,61 @@ mod tests {
             count.load(Ordering::SeqCst),
             before_at,
             "`@` immediately after a word must not open the popup",
+        );
+    }
+
+    /// Regression: with an `@` popup open, typing a space leaves the `@` token,
+    /// so the Regular popup closes rather than re-dispatching into a raw
+    /// directory listing of the working directory.
+    #[tokio::test]
+    async fn space_leaving_at_token_closes_regular_popup() {
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            // Matches on any text still containing an `@`, so a re-dispatch after
+            // the space would keep the popup open if the gate did not fire.
+            get: |lines, _l, col, _force| {
+                let before = &lines[0][..col];
+                let at_idx = before.rfind('@')?;
+                let prefix = &before[at_idx..];
+                Some((vec![item("@src/main.rs")], prefix.to_string()))
+            },
+        }));
+
+        type_settle(&mut ed, "@ma").await;
+        assert!(ed.is_showing_autocomplete(), "the @ popup should be open");
+
+        send(&mut ed, &char_key(' '));
+        wait_autocomplete(&mut ed).await;
+        assert!(
+            !ed.is_showing_autocomplete(),
+            "leaving the @ token with a space must close the popup",
+        );
+        assert!(ed.autocomplete_state.is_none());
+    }
+
+    /// A narrowing character typed inside the `@` token keeps the Regular popup
+    /// open, distinguishing genuine narrowing from leaving the token.
+    #[tokio::test]
+    async fn narrowing_inside_at_token_keeps_regular_popup_open() {
+        let mut ed = editor();
+        ed.set_autocomplete_provider(Arc::new(MockProvider {
+            get: |lines, _l, col, _force| {
+                let before = &lines[0][..col];
+                let at_idx = before.rfind('@')?;
+                let prefix = &before[at_idx..];
+                Some((vec![item("@abc.rs")], prefix.to_string()))
+            },
+        }));
+
+        type_settle(&mut ed, "@ab").await;
+        assert!(ed.is_showing_autocomplete());
+
+        send(&mut ed, &char_key('c'));
+        wait_autocomplete(&mut ed).await;
+        assert_eq!(ed.text(), "@abc");
+        assert!(
+            ed.is_showing_autocomplete(),
+            "narrowing within the @ token must keep the popup open",
         );
     }
 

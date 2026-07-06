@@ -791,6 +791,39 @@ mod provider {
         );
     }
 
+    #[test]
+    fn direct_path_listing_excludes_dot_git_but_keeps_other_dotfiles() {
+        // The direct-path listing reads the working directory with `read_dir`.
+        // It must skip `.git` to match the fuzzy walkers while keeping other
+        // dotfiles like `.github` visible.
+        let tmp = TempDir::new().unwrap();
+        setup_folder(
+            tmp.path(),
+            FolderShape {
+                dirs: &[".git", ".github"],
+                files: &[("README.md", "readme"), (".git/config", "[core]")],
+            },
+        );
+
+        let provider = CombinedAutocompleteProvider::new(tmp.path());
+        let result = suggest(&provider, "./", true).expect("suggestions");
+        let vs = values(&result);
+        assert!(
+            vs.iter().any(|v| v.contains(".github")),
+            "other dotfiles must remain visible, got: {vs:?}",
+        );
+        assert!(
+            vs.iter().any(|v| v.contains("README.md")),
+            "regular files must be listed, got: {vs:?}",
+        );
+        // `.github/` never contains the substring `.git/`, so this only trips
+        // on an actual `.git` entry.
+        assert!(
+            !vs.iter().any(|v| v.contains(".git/")),
+            ".git must be excluded from the direct-path listing, got: {vs:?}",
+        );
+    }
+
     // -- Quoted direct path completion --
 
     #[test]

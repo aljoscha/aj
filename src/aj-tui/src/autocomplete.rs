@@ -493,6 +493,13 @@ impl FsConfig {
                 break;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Exclude the `.git` subtree to mirror the fuzzy walkers, which
+            // skip `.git` while keeping other dotfiles like `.github` visible.
+            // The direct-path listing reads entries with `read_dir`, which does
+            // not apply that rule on its own, so we filter here.
+            if name == ".git" {
+                continue;
+            }
             if !name.to_lowercase().starts_with(&search_prefix_lower) {
                 continue;
             }

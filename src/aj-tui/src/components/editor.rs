@@ -2776,8 +2776,7 @@ impl Editor {
         }
         // Already open: keep refreshing so the user can narrow.
         if self.autocomplete_state.is_some() {
-            let force = matches!(self.autocomplete_state, Some(AutocompleteMode::Force));
-            self.update_autocomplete(force);
+            self.refresh_open_autocomplete();
             return;
         }
         let should_trigger = match c {
@@ -2799,12 +2798,27 @@ impl Editor {
             return;
         }
         if self.autocomplete_state.is_some() {
-            let force = matches!(self.autocomplete_state, Some(AutocompleteMode::Force));
-            self.update_autocomplete(force);
+            self.refresh_open_autocomplete();
             return;
         }
         if self.is_in_symbol_context() {
             self.update_autocomplete(false);
+        }
+    }
+
+    /// Re-runs the dispatch for an already-open popup after an edit.
+    ///
+    /// A `Force` popup (opened via Tab) refines a direct path unconditionally,
+    /// so it re-dispatches on every edit. A `Regular` popup is anchored to an
+    /// `@` / `#` token: once the cursor leaves that token, for example after
+    /// typing a space, the completion no longer applies. We close it rather
+    /// than re-dispatch, because a bare re-dispatch would fall through to the
+    /// one-shot direct-path branch and list the whole working directory.
+    fn refresh_open_autocomplete(&mut self) {
+        match self.autocomplete_state {
+            Some(AutocompleteMode::Force) => self.update_autocomplete(true),
+            _ if self.is_in_symbol_context() => self.update_autocomplete(false),
+            _ => self.cancel_autocomplete(),
         }
     }
 

@@ -662,6 +662,61 @@ async fn at_sign_inside_a_word_does_not_call_provider() {
 }
 
 #[tokio::test]
+async fn space_leaving_at_token_closes_open_popup() {
+    // With an `@` popup open, a space leaves the `@` token. The popup closes
+    // rather than re-dispatching, which would otherwise fall through to a raw
+    // working-directory listing. The provider matches on any text containing an
+    // `@`, so a re-dispatch after the space would keep the popup open if the
+    // gate did not fire.
+    let mut e = editor();
+    e.set_autocomplete_provider(Arc::new(MockProvider {
+        get: |lines, _l, col, _force| {
+            let before = &lines[0][..col];
+            let at_idx = before.rfind('@')?;
+            let prefix = &before[at_idx..];
+            Some((vec![item("@src/main.rs")], prefix.to_string()))
+        },
+    }));
+
+    type_str(&mut e, "@main").await;
+    assert!(e.is_showing_autocomplete(), "the @ popup should be open");
+
+    e.handle_input(&Key::char(' '));
+    e.wait_for_pending_autocomplete().await;
+    assert!(
+        !e.is_showing_autocomplete(),
+        "leaving the @ token with a space must close the popup",
+    );
+    assert_eq!(e.get_text(), "@main ");
+}
+
+#[tokio::test]
+async fn narrowing_inside_at_token_keeps_open_popup() {
+    // A narrowing character inside the `@` token keeps the popup open,
+    // distinguishing genuine narrowing from leaving the token.
+    let mut e = editor();
+    e.set_autocomplete_provider(Arc::new(MockProvider {
+        get: |lines, _l, col, _force| {
+            let before = &lines[0][..col];
+            let at_idx = before.rfind('@')?;
+            let prefix = &before[at_idx..];
+            Some((vec![item("@abc.rs")], prefix.to_string()))
+        },
+    }));
+
+    type_str(&mut e, "@ab").await;
+    assert!(e.is_showing_autocomplete());
+
+    e.handle_input(&Key::char('c'));
+    e.wait_for_pending_autocomplete().await;
+    assert_eq!(e.get_text(), "@abc");
+    assert!(
+        e.is_showing_autocomplete(),
+        "narrowing within the @ token must keep the popup open",
+    );
+}
+
+#[tokio::test]
 async fn enter_on_at_file_popup_applies_completion_but_does_not_submit() {
     // `@`-file and similar prefixes apply the completion and *stop*,
     // because the user is mid-message and hasn't indicated they're
