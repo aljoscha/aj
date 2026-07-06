@@ -433,6 +433,68 @@ green with the implementer/reviewer loop and its own commit:
   honest redraw-rate reading (Spec A). Optionally a global debug chord (Spec F)
   can flip the in-memory flag without persisting, mirroring the thinking-block
   toggle.
+- **9-Perf (responsiveness).** A pass over the drive loop and the widgets to
+  remove UI-thread stalls and per-frame rebuilds. Several land as small fixes,
+  one is an involved cache.
+  - **Drive-loop arm order.** The `biased;` `select!` polls arms top-to-bottom
+    and takes the first ready. High-frequency arms that can flood (the
+    autocomplete delivery channel, the agent-event bus) must sit BELOW the
+    terminal-input arm, so a burst cannot starve typing. One-shot fill arms and
+    the turn-join arm stay above input.
+  - **Autocomplete tick budget + delivery coalescing.** The matcher tick runs on
+    the UI thread, so its per-frame budget is a couple of milliseconds, and the
+    host drains the whole delivery backlog per wake instead of once per notify.
+  - **`TextArea` visual-line map cache.** The wrap map is memoized behind a width
+    key and dropped on any edit, so streaming frames and repeated navigation
+    reuse it instead of rebuilding an O(document) map every draw.
+  - **Transcript entry render cache.** The involved one. During a streaming turn
+    the transcript redraws every frame and the `ListView` `Builder` mints a fresh
+    widget per visible entry (so `MarkdownView`'s width cache never survives a
+    frame and tool diffs recompute), and the sub-agent box builds and draws its
+    ENTIRE child transcript every frame before tail-windowing it. The fix is one
+    cache of drawn surfaces keyed by entry identity, owned by the persistent
+    `TranscriptView` and shared by `Rc<RefCell<..>>` into the `EntryBuilder`.
+    - **Seam.** `item_at_idx` has the `ChatState` borrow but no width, and the
+      cache lookup needs the width. So `item_at_idx` computes only the cheap
+      per-entry fingerprint and returns a caching wrapper widget carrying
+      `(AgentId, EntryId, fingerprint)` plus `Rc` handles. The wrapper's `draw`
+      (which has the width) does the hit or miss: a hit clones the stored
+      surface, a miss re-borrows `ChatState`, runs today's `build_entry_widget`
+      plus a real draw, stores the surface, and returns it. Building the real
+      widget therefore happens only on a miss, so a hit skips both build and
+      draw. The `item_at_idx` borrow is dropped before the wrapper draws, so the
+      miss re-borrow never overlaps.
+    - **Key and slot.** One slot per `(AgentId active_view, EntryId)` holding
+      `{ fingerprint, width, surface }`. A lookup hits only when the live
+      fingerprint and width both match, else it rebuilds and replaces the slot,
+      so stale `(fingerprint, width)` variants never accumulate.
+    - **Fingerprint (the correctness lynchpin).** Computed layout-free from the
+      cheap fields that change an entry's rendering. Assistant and reasoning: the
+      content-block count, the summed text and thinking byte lengths, and
+      `finalized`. Tool: the status, the `ToolDetails` presence and discriminant,
+      a size proxy for streaming variants, `header_only`, and the entry's task
+      status read from `chat.tasks()`. User: joined-text length and collapsible.
+      Compaction: summary length and the two token counts. Notice and turn-usage
+      are immutable after append. Sub-agent: its status plus the fold of every
+      child entry's fingerprint, so a background-task update to a non-tail child
+      cell still changes it. A missing field shows stale content, so the field
+      set is the review focus and is pinned by a per-kind test that mutates the
+      entry and asserts the render changed.
+    - **Global clears.** Session-wide render inputs are handled by clearing the
+      whole cache rather than threading them into every fingerprint. A theme swap
+      already rebuilds the builder in `set_styles`. `TranscriptView::draw`
+      compares the active view, `tools_expanded`, and `hide_thinking_block`
+      against the last frame and clears on a change. A width change is a per-slot
+      miss.
+    - **Storing surfaces is safe today.** No transcript entry participates in
+      event dispatch and the list draws no cursor, so replaying a stored surface
+      (whose `widget` stamp points at the wrapper) does not break hit-testing.
+      NOTE: the later transcript-focus mode would make entries interactive, at
+      which point the wrapper must forward events to the real widget or the cache
+      must store widgets for those kinds.
+    - **Eviction.** The transcript is append-only and unbounded, so the map is
+      bounded (the working set is the viewport). The policy is correctness-neutral
+      since a stale-key miss just rebuilds.
 - **9-Endgame.** Decide whether to keep both binaries or cut `aj-next` over.
 
 ## Design decisions (resolved in companion specs)
