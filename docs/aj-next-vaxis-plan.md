@@ -516,15 +516,19 @@ green with the implementer/reviewer loop and its own commit:
     entries through per-entry text providers laid out on demand from `ChatState`
     (which holds every entry independent of the view), so no `ListView` keep-alive
     is needed.
-  - **Markdown parse / wrap split (width-independent cache).** `render_markdown`
-    bundles parse (tabs → block AST → styled logical lines) with the width-only
-    `wrap_spans`, so a width change re-parses every visible entry from scratch. The
-    amp model separates the two: parse once into width-independent styled lines and
-    cache them per entry, then run only the wrap in a width-keyed after pass (amp
-    parses in `build`, which reruns only on a content change, and wraps in the text
-    render object's layout, cached by width). This mainly sharpens resize and the
-    focus-mode gutter shift. It does not help streaming, where the entry's text
-    changes each frame and must re-parse regardless.
+  - **Markdown highlight memo (done).** A width change (a resize, or the
+    transcript-focus gutter shift) invalidates the entry render cache by width
+    and re-lays-out every visible entry, which re-ran the whole markdown
+    pipeline including syntect highlighting. We first considered a parse/wrap
+    split that caches width-independent styled lines per entry, but the width
+    dependence cascades: blockquotes and tables wrap internally and nest
+    arbitrary content, so "styled lines" are not width-independent in general,
+    and the AST is the cheap part anyway. The actual cost is syntect. So we
+    memoize `highlight_code` (a pure function of `(lang, code)`) behind a small
+    thread-local LRU inside `markdown.rs`. A re-layout at a new width then
+    skips syntect on unchanged code with byte-identical output and no per-entry
+    cache. It does not help streaming, where the code text changes each chunk
+    and must re-highlight regardless.
 - **9-Endgame.** Decide whether to keep both binaries or cut `aj-next` over.
 
 ## Design decisions (resolved in companion specs)
