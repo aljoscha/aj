@@ -43,9 +43,20 @@ pub(crate) struct SessionScan {
     /// The active session id, for the `(current)` tag, the pre-selection,
     /// and the no-op-on-current confirm check.
     current: String,
-    /// filter_key -> session_id, filled by [`fill_session_scan`] and read
+    /// filter_key -> session_id, filled by [`extend_session_scan`] and read
     /// by the confirm callback (which sees only the row's filter key).
     ids: Rc<RefCell<HashMap<String, String>>>,
+}
+
+impl SessionScan {
+    /// The filter key of the currently highlighted row, or `None` while the
+    /// filtered set is empty. The host compares this across batches to tell
+    /// whether the user has moved the selection off where the chase last
+    /// parked it, so a late batch can stop chasing rather than yank the
+    /// cursor.
+    pub(crate) fn selected_filter_key(&self) -> Option<String> {
+        self.select.borrow().selected().map(|item| item.filter_key)
+    }
 }
 
 /// The single loading placeholder shown until the scan lands. Its empty
@@ -116,13 +127,14 @@ pub(crate) fn open_session_selector(
 
 /// Append a streamed batch of previews to the selector's list: build one
 /// row per preview (newest-first, as scanned), record the filter-key -> id
-/// map for confirm, and chase the active session's row until it appears.
+/// map for confirm, and optionally pre-select the active session's row.
 ///
 /// `first` replaces the loading placeholder with this batch (the initial
-/// fill), later batches append in place keeping the cursor. `chase_current`
-/// asks to pre-select the active session's row this batch. Returns whether
-/// that row was found and selected, so the host can stop chasing (a late
-/// batch must not yank the cursor once the user is navigating).
+/// fill), later batches append in place keeping the cursor and scroll.
+/// `chase_current` asks to pre-select the active session's row this batch.
+/// Returns whether that row was found and selected, so the host can stop
+/// chasing once it lands. Deciding when the chase should give up (e.g. the
+/// user has started navigating) is the host's call, not this function's.
 pub(crate) fn extend_session_scan(
     scan: &SessionScan,
     previews: &[SessionPreview],
@@ -379,6 +391,95 @@ mod tests {
             cb(&mut ctx, &picked);
         }
         assert!(request.borrow().is_none(), "the current row is a no-op");
+    }
+
+    /// Batches accumulate across a streamed fill: the first replaces the
+    /// loading placeholder, later batches append, and the current-session
+    /// chase lands the highlight once its row streams in.
+    #[test]
+    fn streaming_appends_batches_and_chases_current_across_them() {
+        let select = Rc::new(RefCell::new(FilterableSelect::new(
+            loading_items(),
+            SelectStyles::default(),
+        )));
+        let ids = Rc::new(RefCell::new(HashMap::new()));
+        let scan = SessionScan {
+            select,
+            current: "2025-05-08".to_string(),
+            ids,
+        };
+
+        // First batch: two newer sessions, no current row. Replaces the
+        // placeholder and lands the cursor on the first row.
+        let batch1 = vec![
+            preview("2025-05-10", Some("newest"), 1, Duration::minutes(1)),
+            preview("2025-05-09", Some("second"), 1, Duration::hours(1)),
+        ];
+        let found = extend_session_scan(&scan, &batch1, Utc::now(), true, true);
+        assert!(!found, "current is not in the first batch");
+        assert_eq!(scan.select.borrow().visible_labels().len(), 2);
+        assert!(
+            scan.selected_filter_key().unwrap().contains("2025-05-10"),
+            "cursor on the first streamed row"
+        );
+
+        // Second batch carries the current session; the chase selects it.
+        let batch2 = vec![preview(
+            "2025-05-08",
+            Some("current one"),
+            1,
+            Duration::hours(2),
+        )];
+        let found = extend_session_scan(&scan, &batch2, Utc::now(), false, true);
+        assert!(found, "current row found and selected in the second batch");
+        assert_eq!(
+            scan.select.borrow().visible_labels().len(),
+            3,
+            "rows accumulated across batches"
+        );
+        assert!(scan.selected_filter_key().unwrap().contains("2025-05-08"));
+    }
+
+    /// With the chase disabled (the host saw the user navigate), a later
+    /// batch carrying the current session does not move the selection.
+    #[test]
+    fn streaming_without_chase_keeps_the_user_selection() {
+        let select = Rc::new(RefCell::new(FilterableSelect::new(
+            loading_items(),
+            SelectStyles::default(),
+        )));
+        let ids = Rc::new(RefCell::new(HashMap::new()));
+        let scan = SessionScan {
+            select,
+            current: "2025-05-08".to_string(),
+            ids,
+        };
+
+        let batch1 = vec![
+            preview("2025-05-10", Some("newest"), 1, Duration::minutes(1)),
+            preview("2025-05-09", Some("second"), 1, Duration::hours(1)),
+        ];
+        extend_session_scan(&scan, &batch1, Utc::now(), true, true);
+        // The user navigates to the second row.
+        scan.select
+            .borrow()
+            .select_matching(|item| item.filter_key.contains("2025-05-09"));
+        let anchor = scan.selected_filter_key();
+
+        // Current streams in, but the chase is off, so the selection stays.
+        let batch2 = vec![preview(
+            "2025-05-08",
+            Some("current one"),
+            1,
+            Duration::hours(2),
+        )];
+        let found = extend_session_scan(&scan, &batch2, Utc::now(), false, false);
+        assert!(!found, "chase disabled reports no selection change");
+        assert_eq!(
+            scan.selected_filter_key(),
+            anchor,
+            "the user's selection stayed put"
+        );
     }
 
     #[test]

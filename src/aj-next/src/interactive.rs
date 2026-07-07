@@ -2277,6 +2277,10 @@ struct SessionFill {
     /// Chase the active session's row until it streams in, then stop so a
     /// late batch can't yank the cursor away from the user's navigation.
     select_current_pending: bool,
+    /// The row the chase last parked the selection on. Once a later batch
+    /// finds the selection sitting elsewhere, the user has navigated, so
+    /// the chase gives up rather than yanking the cursor.
+    anchor: Option<String>,
 }
 
 /// The editor's visible-row cap from the terminal height, `aj`'s
@@ -3372,11 +3376,22 @@ async fn drive(
             // Stream the scan's per-file preview batches into the selector:
             // build the rows, append them (the first batch replaces the
             // loading placeholder), and chase the active session's row until
-            // it appears so a late batch can't yank the cursor.
+            // it appears, giving up once the user has navigated so a late
+            // batch can't yank the cursor.
             maybe_sessions = recv_scan(pending_session.as_mut().map(|f| &mut f.rx)) => {
                 if let Some(fill) = pending_session.as_mut() {
                     match maybe_sessions {
                         Some(ScanMsg::Batch(previews)) => {
+                            // If the user moved the selection off where the
+                            // chase last parked it, stop chasing so this batch's
+                            // pre-select can't yank the cursor back. Skipped on
+                            // the first batch, which establishes the anchor.
+                            if !fill.first
+                                && fill.select_current_pending
+                                && fill.scan.selected_filter_key() != fill.anchor
+                            {
+                                fill.select_current_pending = false;
+                            }
                             let selected = extend_session_scan(
                                 &fill.scan,
                                 &previews,
@@ -3388,6 +3403,9 @@ async fn drive(
                             if selected {
                                 fill.select_current_pending = false;
                             }
+                            // Re-anchor to wherever the selection now sits so
+                            // later user movement is measured against it.
+                            fill.anchor = fill.scan.selected_filter_key();
                             app.request_redraw();
                         }
                         // Done, or the sender was dropped: clear the loading
@@ -3584,6 +3602,7 @@ async fn drive(
                                 rx,
                                 first: true,
                                 select_current_pending: true,
+                                anchor: None,
                             });
                         }
                         // A confirmed login/logout provider pick from the

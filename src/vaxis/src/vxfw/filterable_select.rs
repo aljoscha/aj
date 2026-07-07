@@ -403,22 +403,23 @@ impl FilterableSelect {
     }
 
     /// Append `items` to the row set and re-apply the active filter,
-    /// keeping the widgets and the cursor position. Used to stream in
-    /// batches of an incremental scan without clearing what already
-    /// showed.
+    /// keeping the widgets, the cursor, and the scroll position. Used to
+    /// stream in batches of an incremental scan without clearing or
+    /// re-anchoring what already showed.
+    ///
+    /// Appended items take fresh indices past the existing ones, so every
+    /// row already on screen keeps its index, visible position, and scroll
+    /// anchor. We deliberately touch neither the cursor nor the scroll: a
+    /// batch that lands while the user is scrolled partway down must not
+    /// yank the view. `merge_extend` only grows the item count and merges
+    /// the new tail into the ranking.
     pub fn extend_items(&self, items: Vec<SelectItem>) {
-        let cursor = self.list.borrow().cursor;
-        {
-            let mut state = self.state.borrow_mut();
-            let old_len = state.items.len();
-            state.items.extend(items);
-            // Score only the new tail and merge it into the ranking, rather
-            // than rescoring the whole accumulated set.
-            merge_extend(&mut state, &mut self.list.borrow_mut(), old_len);
-        }
-        // `merge_extend` left the cursor alone but the count grew; restore the
-        // same index so a streamed append doesn't yank the highlight up.
-        self.list.borrow_mut().jump_to_item(cursor);
+        let mut state = self.state.borrow_mut();
+        let old_len = state.items.len();
+        state.items.extend(items);
+        // Score only the new tail and merge it into the ranking, rather
+        // than rescoring the whole accumulated set.
+        merge_extend(&mut state, &mut self.list.borrow_mut(), old_len);
     }
 
     /// Move the cursor onto the first visible item matching `pred`, used to
@@ -1032,6 +1033,30 @@ mod tests {
             "streamed append kept the highlight in place"
         );
         assert_eq!(select.list.borrow().item_count, Some(6));
+    }
+
+    /// A streamed append must not re-anchor the scroll onto the cursor row.
+    /// Moving the cursor down leaves the scroll `top` where it was
+    /// (`ensure_scroll` defers the reveal to draw via `wants_cursor`), so an
+    /// append that re-pinned `top` to the cursor would yank the viewport.
+    #[test]
+    fn extend_items_preserves_the_scroll_anchor() {
+        let mut select =
+            FilterableSelect::new(items(&["a0", "a1", "a2", "a3"]), SelectStyles::default());
+        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(select.list.borrow().cursor, 2);
+        assert_eq!(
+            select.list.borrow().scroll_top(),
+            0,
+            "moving the cursor down leaves the anchor at the top"
+        );
+        select.extend_items(items(&["a4", "a5"]));
+        assert_eq!(
+            select.list.borrow().scroll_top(),
+            0,
+            "append kept the scroll anchor instead of re-pinning it to the cursor"
+        );
     }
 
     /// `narrow_filter` sorts its candidates by original index before rescoring
