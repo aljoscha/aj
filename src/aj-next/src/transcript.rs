@@ -28,16 +28,17 @@ use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
 use serde_json::Value;
 use vaxis::cell::{Cell, Character, Color, Style};
+use vaxis::gwidth;
 use vaxis::key::{Key, Modifiers};
 use vaxis::mouse;
 use vaxis::vxfw::{
-    Builder, DrawContext, Event, EventContext, ListView, RelativePoint, RichText, ScrollBars,
-    Source, SubSurface, Surface, TextSpan, Widget, WidgetRef,
+    Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, RichText,
+    ScrollBars, Size, Source, SubSurface, Surface, TextSpan, Widget, WidgetRef,
 };
 
 use crate::bubble::Bubble;
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
-use crate::subagent_box::{SubAgentBox, build_subagent_box};
+use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::tool_cell::{EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint};
 
 /// Pre-resolved vaxis styles for the transcript's row kinds. The
@@ -1010,6 +1011,28 @@ pub struct TranscriptView {
     /// [`EntryRenderCache`]. Owned here so it survives across frames and so a
     /// theme swap or a global-toggle change can clear it.
     cache: Rc<RefCell<EntryRenderCache>>,
+    /// The transcript's styles, shared into the [`EntryBuilder`]. Kept here so
+    /// the off-screen [`rendered_lines`](Self::rendered_lines) layout builds
+    /// entries with the same styles the visible list does. Replaced by
+    /// [`set_styles`](Self::set_styles) on a theme swap.
+    styles: Rc<TranscriptStyles>,
+    /// The full-transcript rendered-text layout, laid out off-screen at a
+    /// content width and cached. Copy and search build on it (Spec E sections
+    /// 2 and 3). A single slot, keyed by `(active view, width, signature)`, so
+    /// a transcript, width, or view change recomputes it. See
+    /// [`rendered_lines`](Self::rendered_lines).
+    rendered_layout: Option<RenderedTextLayout>,
+    /// Count of off-screen layout rebuilds (cache misses), a sentinel the tests
+    /// assert against to prove a hit elided the rebuild.
+    rendered_layout_rebuilds: u64,
+    /// `DrawContext` presentation state stashed from the last [`draw`], so the
+    /// off-screen layout builds under the same cell size and width-measurement
+    /// method the visible render used and therefore wraps identically. The
+    /// defaults are only a pre-first-draw fallback, and the layout is built
+    /// on demand well after the first draw, so the stashed runtime values are
+    /// what it actually uses.
+    cell_size: Size,
+    width_method: gwidth::Method,
     /// Last-seen session-wide render inputs. When any of these changes the
     /// whole cache is cleared, since they are not part of any per-entry
     /// fingerprint.
@@ -1048,6 +1071,96 @@ impl GlobalRenderInputs {
     }
 }
 
+/// The full-transcript rendered-text layout: every entry of one view laid out
+/// off-screen at a content width into a single row-major grid of cells. Copy
+/// and search read positions out of this shared grid (Spec E sections 2 and 3).
+/// See [`TranscriptView::rendered_lines`] for the coordinate contract.
+struct RenderedTextLayout {
+    key: RenderedTextKey,
+    lines: Vec<Vec<Cell>>,
+}
+
+/// The identity of a cached [`RenderedTextLayout`]. A lookup hits only when the
+/// active view, the content width, and the content signature all match, so a
+/// transcript, width, or view change recomputes the layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RenderedTextKey {
+    view: AgentId,
+    width: u16,
+    signature: u64,
+}
+
+/// A layout-free content hash of one view's transcript: the entry count folded
+/// with every entry's [`entry_fingerprint`], so a new, streaming, or edited
+/// entry changes it and invalidates the cached layout.
+///
+/// The global render inputs (`tools_expanded`, `hide_thinking_block`) are
+/// folded in too: they are not part of any per-entry fingerprint yet they
+/// change how entries wrap (an expanded tool body, a hidden thinking block), so
+/// a toggle must recompute the layout rather than serve a stale one.
+#[allow(dead_code)] // See the rendered-text layout `impl` block.
+fn transcript_signature(chat: &ChatState, agent: AgentId) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    chat.tools_expanded.hash(&mut hasher);
+    chat.hide_thinking_block.hash(&mut hasher);
+    match chat.transcript(agent) {
+        Some(t) => {
+            t.entries().len().hash(&mut hasher);
+            for entry in t.entries() {
+                fingerprint_into(entry, chat, &mut hasher);
+            }
+        }
+        None => 0usize.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// The graphemes of `row`, trailing blank cells trimmed. Interior blanks are
+/// kept, so only the run of blanks at the end (default padding, or a selection
+/// that ran to end-of-line) is dropped.
+#[allow(dead_code)] // See the rendered-text layout `impl` block.
+fn row_text(row: &[Cell]) -> String {
+    let end = row
+        .iter()
+        .rposition(|cell| !cell.char.grapheme().trim().is_empty())
+        .map_or(0, |i| i + 1);
+    row[..end].iter().map(|cell| cell.char.grapheme()).collect()
+}
+
+/// Read the graphemes of the cell range `a..=b` out of `lines`, joining rows
+/// with `\n`. Backs [`TranscriptView::extract_text`]; see it for the contract.
+#[allow(dead_code)] // See the rendered-text layout `impl` block.
+fn extract_from_lines(lines: &[Vec<Cell>], a: (usize, usize), b: (usize, usize)) -> String {
+    // A selection's anchor and caret may be in either order; normalize to
+    // min..=max in (row, col) lexicographic order (tuples compare that way).
+    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+    if start == end {
+        return String::new();
+    }
+    let (start_row, start_col) = start;
+    let (end_row, end_col) = end;
+
+    let mut out = String::new();
+    for row in start_row..=end_row {
+        // Rows only increase, so an out-of-range row means nothing more to read.
+        let Some(cells) = lines.get(row) else {
+            break;
+        };
+        // The covered column span on this row: from `start_col` on the first
+        // row, up to `end_col` on the last, whole otherwise. Clamped to the
+        // row so an out-of-range column reads nothing rather than panicking.
+        let from = if row == start_row { start_col } else { 0 };
+        let to = if row == end_row { end_col } else { cells.len() };
+        let from = from.min(cells.len());
+        let to = to.min(cells.len()).max(from);
+        if row != start_row {
+            out.push('\n');
+        }
+        out.push_str(&row_text(&cells[from..to]));
+    }
+    out
+}
+
 impl TranscriptView {
     pub fn new(chat: Rc<RefCell<ChatState>>, theme: &Theme) -> TranscriptView {
         let styles = Rc::new(TranscriptStyles::from_theme(theme));
@@ -1072,6 +1185,16 @@ impl TranscriptView {
             list,
             bars,
             cache,
+            styles,
+            rendered_layout: None,
+            rendered_layout_rebuilds: 0,
+            // Match the shell's `DrawContext` defaults so a layout built before
+            // the first draw wraps the same way the first visible frame will.
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
             last_globals,
             follow_tail: true,
             on_exit_focus: None,
@@ -1103,6 +1226,12 @@ impl TranscriptView {
         // the draw's global-input clear catches the change anyway, so the
         // clear here is redundant but harmless.
         self.cache.borrow_mut().clear();
+        // The reused `chat` cell may now hold a different session whose
+        // signature collides with the cached layout's (length-proxy
+        // fingerprints), the same hazard the render cache clear above guards.
+        // Drop the off-screen layout so copy and search re-lay the new
+        // transcript out rather than reading the previous session's grid.
+        self.rendered_layout = None;
         self.follow_tail = true;
     }
 
@@ -1244,6 +1373,8 @@ impl TranscriptView {
     pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>) {
         // A theme swap re-tints every entry, so every cached surface is stale.
         self.cache.borrow_mut().clear();
+        // The off-screen layout holds re-tinted cells too, so drop it.
+        self.rendered_layout = None;
         let builder = EntryBuilder {
             chat: Rc::clone(&self.chat),
             styles: Rc::clone(&styles),
@@ -1251,8 +1382,154 @@ impl TranscriptView {
         };
         self.list.borrow_mut().children = Source::Builder(Box::new(builder));
         apply_scrollbar_thumbs(&mut self.bars, &styles);
+        self.styles = styles;
+    }
+}
+
+/// The full-transcript rendered-text layout API (Spec E sections 2 and 3): the
+/// off-screen layout plus text extraction over it in the absolute `(row, col)`
+/// coordinate space.
+///
+/// NOTE(aljoscha): these are `dead_code` for now. They are the shared substrate
+/// in-app selection/copy and in-transcript search build on, landed and unit
+/// tested on their own ahead of those consumers, so nothing calls them outside
+/// the tests yet.
+#[allow(dead_code)]
+impl TranscriptView {
+    /// The active transcript laid out at content width `width` into one grid of
+    /// cells, cached. Copy and in-transcript search build on this shared layout
+    /// (Spec E sections 2 and 3).
+    ///
+    /// # Coordinate contract
+    ///
+    /// A position in the returned grid is `(row, col)`: `row` is the absolute
+    /// line index into the full layout at `width` (row 0 is the first line of
+    /// the first entry), and `col` is the cell (grapheme) column within a line.
+    /// This is the space selections and search matches live in. It is a content
+    /// coordinate, not a screen coordinate: entries are laid out at col 0, so
+    /// `col` is unaffected by the visible list's scrollbar column or its cursor
+    /// gutter. `width` is the content width the visible list lays entries out at
+    /// (the viewport width minus the reserved scrollbar column, and minus the
+    /// cursor gutter in transcript-focus mode), so the caller passes the same
+    /// width to keep the two aligned.
+    ///
+    /// The layout wraps identically to the visible `ListView`, which is the
+    /// property the highlight and match coordinates depend on. See
+    /// [`build_rendered_lines`](Self::build_rendered_lines) for how that holds.
+    pub(crate) fn rendered_lines(&mut self, width: u16) -> &[Vec<Cell>] {
+        let (view, signature) = {
+            let chat = self.chat.borrow();
+            let view = chat.active_view();
+            (view, transcript_signature(&chat, view))
+        };
+        let key = RenderedTextKey {
+            view,
+            width,
+            signature,
+        };
+        let hit = self
+            .rendered_layout
+            .as_ref()
+            .is_some_and(|layout| layout.key == key);
+        if !hit {
+            let lines = self.build_rendered_lines(width);
+            self.rendered_layout_rebuilds += 1;
+            self.rendered_layout = Some(RenderedTextLayout { key, lines });
+        }
+        &self
+            .rendered_layout
+            .as_ref()
+            .expect("layout populated on a miss")
+            .lines
     }
 
+    /// Line count of the off-screen layout at `width`. See
+    /// [`rendered_lines`](Self::rendered_lines).
+    pub(crate) fn line_count(&mut self, width: u16) -> usize {
+        self.rendered_lines(width).len()
+    }
+
+    /// The text of layout row `row` at `width`, trailing blank cells trimmed.
+    /// An out-of-range row yields an empty string. See
+    /// [`rendered_lines`](Self::rendered_lines) for the coordinate space.
+    pub(crate) fn line_text(&mut self, width: u16, row: usize) -> String {
+        self.rendered_lines(width)
+            .get(row)
+            .map(|line| row_text(line))
+            .unwrap_or_default()
+    }
+
+    /// The text covered by the cell range `start..=end` of the off-screen
+    /// layout at `width`, as the selection/search coordinate space defines it
+    /// (see [`rendered_lines`](Self::rendered_lines)).
+    ///
+    /// `start` and `end` are `(row, col)` positions; either may come first (a
+    /// selection anchor and caret can be in either order), so they are
+    /// normalized to `min..=max` before reading. The first row is read from
+    /// `start.col`, the last row up to `end.col`, and whole rows in between.
+    /// Trailing blank cells are trimmed per line so a selection running to
+    /// end-of-line carries no padding, and lines are joined with `\n`.
+    /// Out-of-range rows and columns are clamped, and an empty or degenerate
+    /// range yields an empty string.
+    pub(crate) fn extract_text(
+        &mut self,
+        width: u16,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> String {
+        extract_from_lines(self.rendered_lines(width), start, end)
+    }
+
+    /// Lay every entry of the active view out at `width` and concatenate their
+    /// composited rows, top to bottom. The miss path behind
+    /// [`rendered_lines`](Self::rendered_lines).
+    ///
+    /// This wraps identically to the visible `ListView` because it builds each
+    /// entry with the same [`build_entry_widget`] under the same per-entry
+    /// constraints, using the cell size and width method stashed from the last
+    /// visible draw. The list places entries back to back at col 0 and pads a
+    /// short row to the list width, both of which we reproduce below, so the
+    /// concatenated rows land at the same absolute coordinates as the render.
+    fn build_rendered_lines(&self, width: u16) -> Vec<Vec<Cell>> {
+        // The per-entry constraints the visible `ListView` draws each child
+        // under: min and max width both `width`, height unbounded so an entry
+        // yields every one of its rows rather than a viewport-clipped window.
+        let ctx = DrawContext {
+            min: Size { width, height: 0 },
+            max: MaxSize {
+                width: Some(width),
+                height: None,
+            },
+            cell_size: self.cell_size,
+            width_method: self.width_method,
+        };
+        let chat = self.chat.borrow();
+        let agent = chat.active_view();
+        let mut lines: Vec<Vec<Cell>> = Vec::new();
+        let Some(transcript) = chat.transcript(agent) else {
+            return lines;
+        };
+        for entry in transcript.entries() {
+            // Bypass the visible render cache (`CachingEntry`): this is a
+            // distinct full-transcript pass, like the sub-agent box's own child
+            // layout, not the viewport-windowed one the list keeps warm.
+            let mut widget = build_entry_widget(entry, &chat, &self.styles, false).into_boxed();
+            let surface = widget.draw(&ctx);
+            for mut row in surface_rows(&surface) {
+                // The list composites entries into a `width`-wide surface, so a
+                // row narrower than `width` is padded with default cells there.
+                // Match that so a padded coordinate lines up with the visible
+                // grid; `Vec::resize` also clips an over-wide row, which the
+                // list's out-of-bounds cell writes do too.
+                row.resize(usize::from(width), Cell::default());
+                lines.push(row);
+            }
+        }
+        lines
+    }
+}
+
+impl TranscriptView {
     /// Mouse observation shared by both dispatch phases: an active
     /// thumb drag is handed to the bars (and disengages follow-tail
     /// when it moves the viewport), and any manual wheel-up means the
@@ -1288,6 +1565,12 @@ fn apply_scrollbar_thumbs(bars: &mut ScrollBars<ListView>, styles: &TranscriptSt
 
 impl Widget for TranscriptView {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        // Stash the presentation state the off-screen layout reuses, so
+        // `rendered_lines` wraps under the same cell size and width method the
+        // visible render just used. A measuring pass carries the same values,
+        // so we stash before the unbounded-height early return below.
+        self.cell_size = ctx.cell_size;
+        self.width_method = ctx.width_method;
         // A flex parent's measuring pass draws children under an
         // unbounded height. The transcript has no inherent height (its
         // flex share decides it), so report zero and skip the list
@@ -3040,6 +3323,237 @@ mod tests {
         assert!(
             rows.contains("world") && !rows.contains("hello"),
             "fresh session content, not the previous session's cached surface: {rows:?}",
+        );
+    }
+
+    // ---- Rendered-text layout (Spec E sections 2 and 3) ------------------
+
+    /// A chat carrying `n` one-line notice rows, each two layout rows (the
+    /// notice line plus its blank spacer), so the extraction and cache tests
+    /// work over a fully deterministic grid.
+    fn notices_grid(w: u16, n: usize) -> (TranscriptView, Vec<String>) {
+        let chat = chat_with_notices(n);
+        let mut view = transcript_view(&chat);
+        let lines = (0..view.line_count(w))
+            .map(|r| view.line_text(w, r))
+            .collect();
+        (view, lines)
+    }
+
+    /// A user message and an assistant message that both wrap at a narrow
+    /// width lay out into the expected rows: the bubble frames and one-column
+    /// inset for the user entry, the un-inset prose for the assistant entry,
+    /// each followed by its blank spacer row.
+    #[test]
+    fn rendered_lines_wrap_user_and_assistant_at_a_narrow_width() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, user_end("the quick brown fox jumps over"));
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("lazy dogs sleeping soundly here")),
+        );
+        let mut view = transcript_view(&chat);
+        let w = 16u16;
+
+        assert_eq!(
+            view.line_count(w),
+            10,
+            "user bubble (6 rows) then assistant prose (4 rows)",
+        );
+        // User bubble: a blank tinted pad row, three wrapped content rows inset
+        // one column, a blank pad row, then the untinted spacer.
+        assert_eq!(view.line_text(w, 0), "");
+        assert_eq!(view.line_text(w, 1), " the quick");
+        assert_eq!(view.line_text(w, 2), " brown fox");
+        assert_eq!(view.line_text(w, 3), " jumps over");
+        assert_eq!(view.line_text(w, 4), "");
+        assert_eq!(view.line_text(w, 5), "");
+        // Assistant prose wraps with no bubble inset, then its spacer row.
+        assert_eq!(view.line_text(w, 6), "lazy dogs");
+        assert_eq!(view.line_text(w, 7), "sleeping soundly");
+        assert_eq!(view.line_text(w, 8), "here");
+        assert_eq!(view.line_text(w, 9), "");
+    }
+
+    /// The alignment guarantee: the off-screen layout wraps byte-identically to
+    /// the visible `ListView`. Draw the view into a viewport taller than the
+    /// content (so the list shows every line from the top) and assert each
+    /// off-screen row equals the visible grid at the same content width. This
+    /// is the property the selection highlight and search-match coordinates
+    /// depend on.
+    #[test]
+    fn offscreen_layout_matches_the_visible_render() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            user_end("the quick brown fox jumps over the lazy dog"),
+        );
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message(
+                "a reply long enough to wrap across several rows at this width",
+            )),
+        );
+        let mut view = transcript_view(&chat);
+        let (vw, vh) = (20u16, 40u16);
+
+        // Drawing the visible view lays entries out through the `ListView` and
+        // stashes the cell size / width method the off-screen layout reuses.
+        let surface = view.draw(&draw_ctx(vw, vh));
+        let grid = crate::test_support::flatten(&surface);
+
+        // The bars reserve the last column for the scrollbar and the list draws
+        // entries at col 0, so the content width the entries wrap at is vw - 1.
+        let content_w = vw - 1;
+        let lines = view.rendered_lines(content_w).to_vec();
+        assert!(lines.len() > 4, "content spans several wrapped rows");
+        assert!(
+            lines.len() < usize::from(vh),
+            "content fits, so the list top-anchors it at row 0",
+        );
+        for (r, line) in lines.iter().enumerate() {
+            assert_eq!(
+                &grid[r][..usize::from(content_w)],
+                line.as_slice(),
+                "off-screen row {r} differs from the visible render",
+            );
+        }
+        // The reserved scrollbar column stays blank while the transcript fits.
+        for r in 0..lines.len() {
+            assert_eq!(grid[r][usize::from(content_w)], Cell::default());
+        }
+    }
+
+    /// `extract_text` over single-line, multi-line, full-transcript, reversed,
+    /// degenerate, and out-of-range ranges, trailing blanks trimmed and lines
+    /// `\n`-joined.
+    #[test]
+    fn extract_text_reads_normalized_cell_ranges() {
+        let w = 40u16;
+        // Rows: " row 0", "", " row 1", "", " row 2", "" (index 5 is blank).
+        let (mut view, lines) = notices_grid(w, 3);
+        assert_eq!(lines[0], " row 0");
+        assert_eq!(lines[1], "");
+
+        // A substring within one line: cols [1, 4) of " row 0" is "row".
+        assert_eq!(view.extract_text(w, (0, 1), (0, 4)), "row");
+        // Reversed endpoints normalize to the same range.
+        assert_eq!(view.extract_text(w, (0, 4), (0, 1)), "row");
+
+        // A whole-line range trims the trailing blank padding rather than
+        // carrying the pad cells out to the width.
+        assert_eq!(view.extract_text(w, (0, 0), (0, 40)), " row 0");
+
+        // Partial first row, whole middle rows, partial last row.
+        assert_eq!(
+            view.extract_text(w, (0, 3), (4, 4)),
+            "w 0\n\n row 1\n\n row",
+        );
+
+        // The full transcript, first cell to past the last.
+        assert_eq!(
+            view.extract_text(w, (0, 0), (5, 40)),
+            " row 0\n\n row 1\n\n row 2\n",
+        );
+
+        // An empty range yields an empty string.
+        assert_eq!(view.extract_text(w, (2, 2), (2, 2)), "");
+
+        // Out-of-range rows and columns clamp rather than panic.
+        assert_eq!(
+            view.extract_text(w, (0, 1), (99, 3)),
+            "row 0\n\n row 1\n\n row 2\n",
+        );
+    }
+
+    /// The layout is cached in a single slot: an unchanged transcript at the
+    /// same width hits without rebuilding, while a width change or an appended
+    /// entry recomputes.
+    #[test]
+    fn rendered_layout_caches_and_recomputes_on_width_or_append() {
+        let chat = chat_with_notices(3);
+        let mut view = transcript_view(&chat);
+        let w = 40u16;
+
+        let first = view.rendered_lines(w).to_vec();
+        assert_eq!(view.rendered_layout_rebuilds, 1, "first call rebuilt");
+        let second = view.rendered_lines(w).to_vec();
+        assert_eq!(
+            view.rendered_layout_rebuilds, 1,
+            "an unchanged transcript at the same width hits the slot",
+        );
+        assert_eq!(first, second, "the hit returns the same grid");
+
+        // A width change recomputes; the single slot is replaced, so returning
+        // to the first width recomputes again.
+        let _ = view.rendered_lines(30);
+        assert_eq!(
+            view.rendered_layout_rebuilds, 2,
+            "a width change recomputes"
+        );
+        let _ = view.rendered_lines(w);
+        assert_eq!(
+            view.rendered_layout_rebuilds, 3,
+            "one slot only, so the prior width is no longer cached",
+        );
+
+        // Appending an entry changes the signature and recomputes.
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: "row 3".into(),
+            },
+        );
+        let grown = view.rendered_lines(w).to_vec();
+        assert_eq!(view.rendered_layout_rebuilds, 4, "an append recomputes");
+        assert_eq!(
+            grown.len(),
+            first.len() + 2,
+            "one more notice is two more layout rows",
+        );
+    }
+
+    /// Switching the active view recomputes the layout (the key's view differs)
+    /// and lays out the switched-to transcript.
+    #[test]
+    fn rendered_layout_recomputes_on_view_switch() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: "main note".into(),
+            },
+        );
+        let mut view = transcript_view(&chat);
+        let w = 50u16;
+
+        let _ = view.rendered_lines(w);
+        assert_eq!(view.rendered_layout_rebuilds, 1);
+        let _ = view.rendered_lines(w);
+        assert_eq!(view.rendered_layout_rebuilds, 1, "same view hits");
+
+        chat.borrow_mut().set_active_view(AgentId::Sub(0));
+        let _ = view.rendered_lines(w);
+        assert_eq!(view.rendered_layout_rebuilds, 2, "a view switch recomputes");
+        let sub_text = (0..view.line_count(w))
+            .map(|r| view.line_text(w, r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            sub_text.contains("starting"),
+            "the switched-to view's content is laid out: {sub_text:?}",
         );
     }
 }
